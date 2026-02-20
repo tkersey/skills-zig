@@ -66,31 +66,46 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const seq = addInstalledExecutable(b, "seq", seq_root);
-    const seq_perf = addInstalledExecutable(b, "seq-perf", seq_perf_root);
-    const bench_stats = addInstalledExecutable(b, "bench_stats", lift_bench_root);
-    const perf_report = addInstalledExecutable(b, "perf_report", lift_report_root);
-    const cas_smoke_check = addInstalledExecutable(b, "cas_smoke_check", cas_smoke_root);
-    const cas_instance_runner = addInstalledExecutable(b, "cas_instance_runner", cas_runner_root);
+    const seq = addExecutable(b, "seq", seq_root);
+    const seq_perf = addExecutable(b, "seq-perf", seq_perf_root);
+    const bench_stats = addExecutable(b, "bench_stats", lift_bench_root);
+    const perf_report = addExecutable(b, "perf_report", lift_report_root);
+    const cas_smoke_check = addExecutable(b, "cas_smoke_check", cas_smoke_root);
+    const cas_instance_runner = addExecutable(b, "cas_instance_runner", cas_runner_root);
+
+    const seq_install = addInstallStep(b, seq);
+    const seq_perf_install = addInstallStep(b, seq_perf);
+    const bench_stats_install = addInstallStep(b, bench_stats);
+    const perf_report_install = addInstallStep(b, perf_report);
+    const cas_smoke_check_install = addInstallStep(b, cas_smoke_check);
+    const cas_instance_runner_install = addInstallStep(b, cas_instance_runner);
+
+    const install_all = b.getInstallStep();
+    install_all.dependOn(&seq_install.step);
+    install_all.dependOn(&seq_perf_install.step);
+    install_all.dependOn(&bench_stats_install.step);
+    install_all.dependOn(&perf_report_install.step);
+    install_all.dependOn(&cas_smoke_check_install.step);
+    install_all.dependOn(&cas_instance_runner_install.step);
 
     const build_seq = b.step("build-seq", "Build seq binaries");
-    build_seq.dependOn(&seq.step);
-    build_seq.dependOn(&seq_perf.step);
+    build_seq.dependOn(&seq_install.step);
+    build_seq.dependOn(&seq_perf_install.step);
 
     const build_lift = b.step("build-lift", "Build lift binaries");
-    build_lift.dependOn(&bench_stats.step);
-    build_lift.dependOn(&perf_report.step);
+    build_lift.dependOn(&bench_stats_install.step);
+    build_lift.dependOn(&perf_report_install.step);
 
     const build_cas = b.step("build-cas", "Build cas binaries");
-    build_cas.dependOn(&cas_smoke_check.step);
-    build_cas.dependOn(&cas_instance_runner.step);
+    build_cas.dependOn(&cas_smoke_check_install.step);
+    build_cas.dependOn(&cas_instance_runner_install.step);
 
     addRunStep(b, seq, "run-seq", "Run seq", &.{});
     addRunStep(b, bench_stats, "run-bench-stats", "Run bench_stats", &.{"--help"});
     addRunStep(b, cas_smoke_check, "run-cas-smoke-check", "Run cas_smoke_check", &.{"--help"});
 }
 
-fn addInstalledExecutable(
+fn addExecutable(
     b: *std.Build,
     name: []const u8,
     root_module: *std.Build.Module,
@@ -99,8 +114,14 @@ fn addInstalledExecutable(
         .name = name,
         .root_module = root_module,
     });
-    b.installArtifact(exe);
     return exe;
+}
+
+fn addInstallStep(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+) *std.Build.Step.InstallArtifact {
+    return b.addInstallArtifact(exe, .{});
 }
 
 fn addRunStep(
