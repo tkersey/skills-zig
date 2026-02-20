@@ -1,0 +1,77 @@
+name: PR CI
+
+on:
+  pull_request:
+    paths:
+      - "apps/seq/**"
+      - "apps/lift/**"
+      - "apps/cas/**"
+      - "libs/core/**"
+      - ".github/workflows/pr-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      seq: ${{ steps.filter.outputs.seq }}
+      lift: ${{ steps.filter.outputs.lift }}
+      cas: ${{ steps.filter.outputs.cas }}
+      core: ${{ steps.filter.outputs.core }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            seq:
+              - "apps/seq/**"
+            lift:
+              - "apps/lift/**"
+            cas:
+              - "apps/cas/**"
+            core:
+              - "libs/core/**"
+
+  seq:
+    needs: changes
+    if: needs.changes.outputs.seq == 'true' || needs.changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/seq
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Build seq
+        run: zig build -Doptimize=ReleaseFast
+      - name: Test seq
+        run: zig build test
+
+  lift:
+    needs: changes
+    if: needs.changes.outputs.lift == 'true' || needs.changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Build lift binaries
+        run: zig build build-lift -Doptimize=ReleaseFast
+
+  cas:
+    needs: changes
+    if: needs.changes.outputs.cas == 'true' || needs.changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Build cas binaries
+        run: zig build build-cas -Doptimize=ReleaseFast

@@ -1,0 +1,20 @@
+[
+  {
+    "skill": "fix",
+    "user": 0,
+    "assistant": 1,
+    "total": 1
+  },
+  {
+    "skill": "mesh",
+    "user": 1,
+    "assistant": 0,
+    "total": 1
+  },
+  {
+    "skill": "tk",
+    "user": 0,
+    "assistant": 1,
+    "total": 1
+  }
+]

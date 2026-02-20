@@ -1,0 +1,9 @@
+{
+  "dataset": "tool_calls",
+  "group_by": ["tool"],
+  "metrics": [
+    { "op": "count", "as": "count" }
+  ],
+  "sort": ["-count"],
+  "format": "jsonl"
+}

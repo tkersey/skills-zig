@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "python_oracle": "/Users/tk/.dotfiles/codex/skills/seq/scripts/seq.py",
+  "required": [
+    {
+      "id": "query_tool_calls_day_tool",
+      "kind": "query_spec",
+      "spec": "testdata/parity/specs/query_tool_calls_day_tool.json"
+    },
+    {
+      "id": "query_token_deltas_day",
+      "kind": "query_spec",
+      "spec": "testdata/parity/specs/query_token_deltas_day.json"
+    },
+    {
+      "id": "query_token_sessions_day",
+      "kind": "query_spec",
+      "spec": "testdata/parity/specs/query_token_sessions_day.json"
+    },
+    {
+      "id": "role_breakdown_json",
+      "kind": "command",
+      "args": ["role-breakdown", "--format", "json", "--roles", "user,assistant"]
+    },
+    {
+      "id": "skill_trend_mesh_day_json",
+      "kind": "command",
+      "args": ["skill-trend", "--skill", "mesh", "--bucket", "day", "--format", "json", "--roles", "user,assistant"]
+    }
+  ]
+}

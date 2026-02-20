@@ -1,0 +1,43 @@
+name: Release lift
+
+on:
+  push:
+    tags:
+      - "lift-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate tag matches apps/lift/VERSION
+        run: |
+          expected_tag="lift-v$(tr -d '[:space:]' < apps/lift/VERSION)"
+          if [ "${GITHUB_REF_NAME}" != "${expected_tag}" ]; then
+            echo "Tag/version mismatch: got ${GITHUB_REF_NAME}, expected ${expected_tag}" >&2
+            exit 1
+          fi
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Build lift binaries
+        run: zig build build-lift -Doptimize=ReleaseFast
+      - name: Package lift artifact
+        run: |
+          mkdir -p dist/lift
+          cp zig-out/bin/bench_stats dist/lift/lift-bench-stats
+          cp zig-out/bin/perf_report dist/lift/lift-perf-report
+          TAR_NAME="${GITHUB_REF_NAME}-linux-x86_64.tar.gz"
+          tar -czf "${TAR_NAME}" -C dist/lift .
+      - name: Upload lift workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.ref_name }}-linux-x86_64.tar.gz
+          path: ${{ github.ref_name }}-linux-x86_64.tar.gz
+      - name: Publish lift release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ github.ref_name }}-linux-x86_64.tar.gz

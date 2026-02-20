@@ -1,0 +1,72 @@
+const std = @import("std");
+
+pub const Command = enum {
+    skills_rank,
+    skill_trend,
+    skill_report,
+    role_breakdown,
+    occurrence_export,
+    find_session,
+    session_prompts,
+    report_bundle,
+    section_audit,
+    token_usage,
+    datasets,
+    dataset_schema,
+    query,
+    unknown,
+};
+
+pub const CommandDef = struct {
+    name: []const u8,
+    cmd: Command,
+};
+
+const command_defs = [_]CommandDef{
+    .{ .name = "skills-rank", .cmd = .skills_rank },
+    .{ .name = "skill-trend", .cmd = .skill_trend },
+    .{ .name = "skill-report", .cmd = .skill_report },
+    .{ .name = "role-breakdown", .cmd = .role_breakdown },
+    .{ .name = "occurrence-export", .cmd = .occurrence_export },
+    .{ .name = "find-session", .cmd = .find_session },
+    .{ .name = "session-prompts", .cmd = .session_prompts },
+    .{ .name = "report-bundle", .cmd = .report_bundle },
+    .{ .name = "section-audit", .cmd = .section_audit },
+    .{ .name = "token-usage", .cmd = .token_usage },
+    .{ .name = "datasets", .cmd = .datasets },
+    .{ .name = "dataset-schema", .cmd = .dataset_schema },
+    .{ .name = "query", .cmd = .query },
+};
+
+pub fn parseCommand(arg: []const u8) Command {
+    for (command_defs) |def| {
+        if (std.mem.eql(u8, arg, def.name)) return def.cmd;
+    }
+    return .unknown;
+}
+
+pub fn isHelpArg(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h");
+}
+
+pub fn commandName(cmd: Command) []const u8 {
+    for (command_defs) |def| {
+        if (def.cmd == cmd) return def.name;
+    }
+    return "unknown";
+}
+
+pub fn commandNames() []const CommandDef {
+    return command_defs[0..];
+}
+
+test "parseCommand recognizes full CLI surface" {
+    for (command_defs) |def| {
+        try std.testing.expectEqual(def.cmd, parseCommand(def.name));
+        try std.testing.expect(std.mem.eql(u8, def.name, commandName(def.cmd)));
+    }
+    try std.testing.expectEqual(Command.unknown, parseCommand("else"));
+    try std.testing.expect(isHelpArg("--help"));
+    try std.testing.expect(isHelpArg("-h"));
+    try std.testing.expect(!isHelpArg("query"));
+}

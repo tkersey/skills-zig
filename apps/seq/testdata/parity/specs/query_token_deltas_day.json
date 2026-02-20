@@ -1,0 +1,10 @@
+{
+  "dataset": "token_deltas",
+  "group_by": ["day"],
+  "metrics": [
+    { "op": "sum", "field": "delta_total_tokens", "as": "total_tokens" },
+    { "op": "count", "as": "rows" }
+  ],
+  "sort": ["day"],
+  "format": "jsonl"
+}

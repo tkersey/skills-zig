@@ -1,0 +1,44 @@
+name: Release cas
+
+on:
+  push:
+    tags:
+      - "cas-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate cas tag matches VERSION
+        run: |
+          expected_tag="cas-v$(tr -d '[:space:]' < apps/cas/VERSION)"
+          if [ "${GITHUB_REF_NAME}" != "${expected_tag}" ]; then
+            echo "Tag mismatch: expected ${expected_tag}, got ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Build cas binaries
+        run: zig build build-cas -Doptimize=ReleaseFast
+      - name: Package cas artifact
+        run: |
+          TAR_NAME="${GITHUB_REF_NAME}-linux-x86_64.tar.gz"
+          echo "TAR_NAME=${TAR_NAME}" >> "$GITHUB_ENV"
+          mkdir -p dist/cas
+          cp zig-out/bin/cas_smoke_check dist/cas/cas-smoke-check
+          cp zig-out/bin/cas_instance_runner dist/cas/cas-instance-runner
+          tar -czf "${TAR_NAME}" -C dist/cas .
+      - name: Upload cas workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TAR_NAME }}
+          path: ${{ env.TAR_NAME }}
+      - name: Publish cas release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.TAR_NAME }}

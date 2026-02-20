@@ -1,0 +1,45 @@
+name: Release seq
+
+on:
+  push:
+    tags:
+      - "seq-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate tag matches apps/seq/VERSION
+        run: |
+          version="$(tr -d '[:space:]' < apps/seq/VERSION)"
+          expected_tag="seq-v${version}"
+          if [ "${GITHUB_REF_NAME}" != "${expected_tag}" ]; then
+            echo "Tag mismatch: got '${GITHUB_REF_NAME}', expected '${expected_tag}'"
+            exit 1
+          fi
+      - name: Set tarball name
+        run: echo "TAR_NAME=${GITHUB_REF_NAME}-linux-x86_64.tar.gz" >> "$GITHUB_ENV"
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Build seq binary
+        working-directory: apps/seq
+        run: zig build -Doptimize=ReleaseFast
+      - name: Package seq artifact
+        run: |
+          mkdir -p dist/seq
+          cp apps/seq/zig-out/bin/seq dist/seq/seq
+          tar -czf "${TAR_NAME}" -C dist/seq seq
+      - name: Upload seq workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TAR_NAME }}
+          path: ${{ env.TAR_NAME }}
+      - name: Publish seq release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.TAR_NAME }}

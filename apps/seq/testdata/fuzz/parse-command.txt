@@ -1,0 +1,8 @@
+skills-rank
+skill-trend
+query
+dataset-schema
+token-usage
+unknown-command
+--help
+$tk

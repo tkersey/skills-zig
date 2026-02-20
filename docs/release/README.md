@@ -1,0 +1,40 @@
+# Release Automation
+
+This monorepo uses independent GitHub Actions release workflows per CLI:
+
+- `seq`: `.github/workflows/release-seq.yml` on tag `seq-v*`
+- `lift`: `.github/workflows/release-lift.yml` on tag `lift-v*`
+- `cas`: `.github/workflows/release-cas.yml` on tag `cas-v*`
+
+Per-app VERSION files:
+
+- `apps/seq/VERSION`
+- `apps/lift/VERSION`
+- `apps/cas/VERSION`
+
+Release tags must match file versions:
+
+- `seq-v<version>` where `<version>` equals `apps/seq/VERSION`
+- `lift-v<version>` where `<version>` equals `apps/lift/VERSION`
+- `cas-v<version>` where `<version>` equals `apps/cas/VERSION`
+
+Each workflow builds only binaries from its own CLI path and publishes a release archive named:
+
+- `<tag>-linux-x86_64.tar.gz`
+
+Examples:
+
+- `seq-v1.2.3-linux-x86_64.tar.gz`
+- `lift-v1.2.3-linux-x86_64.tar.gz`
+- `cas-v1.2.3-linux-x86_64.tar.gz`
+
+## Homebrew Tap Handoff
+
+Homebrew formula updates are intentionally handled in a separate tap repository.
+After a tagged release in this repo:
+
+1. Copy the release asset URL and SHA256 for the relevant CLI archive.
+2. Open the separate tap repo and update only that CLI formula.
+3. Ship the formula change from the tap repo as a separate PR/release step.
+
+This keeps binary publishing (this repo) decoupled from tap formula maintenance (tap repo).

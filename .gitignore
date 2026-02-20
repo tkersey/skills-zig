@@ -1,0 +1,5 @@
+
+.step/st-plan.jsonl.lock
+.zig-cache/
+zig-out/
+dist/
