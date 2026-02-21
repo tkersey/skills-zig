@@ -14,6 +14,7 @@ const UsageText =
     \\  --scale F64    Scale factor (default: 1.0)
     \\  --unit TEXT    Unit label (default: empty)
     \\  --all          Parse all numbers in each line (default: first only)
+    \\  --json         Emit JSON (numbers stay unformatted)
     \\  --help         Show help
 ;
 
@@ -22,6 +23,7 @@ const Config = struct {
     scale: f64 = 1.0,
     unit: []const u8 = "",
     parse_all: bool = false,
+    output_json: bool = false,
 };
 
 pub fn main() !void {
@@ -63,21 +65,36 @@ pub fn main() !void {
     std.mem.sort(f64, values.items, {}, comptime std.sort.asc(f64));
 
     const count = values.items.len;
+    const min_v = values.items[0];
+    const p50_v = percentile(values.items, 50.0);
+    const p90_v = percentile(values.items, 90.0);
+    const p95_v = percentile(values.items, 95.0);
+    const p99_v = percentile(values.items, 99.0);
+    const max_v = values.items[count - 1];
     const mean = computeMean(values.items);
     const median = computeMedian(values.items);
     const stdev = computePopulationStdDev(values.items, mean);
 
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
-    const writer = output.writer(allocator);
+    var writer = output.writer(allocator);
+
+    if (cfg.output_json) {
+        try writer.print(
+            "{{\"count\":{d},\"min\":{d:.6},\"p50\":{d:.6},\"p90\":{d:.6},\"p95\":{d:.6},\"p99\":{d:.6},\"max\":{d:.6},\"mean\":{d:.6},\"median\":{d:.6},\"stdev\":{d:.6},\"unit\":\"{s}\"}}\n",
+            .{ count, min_v, p50_v, p90_v, p95_v, p99_v, max_v, mean, median, stdev, cfg.unit },
+        );
+        try core_io.writeToStreamAllowBrokenPipe(std.fs.File.stdout(), output.items);
+        return;
+    }
 
     try writer.print("count  : {d}\n", .{count});
-    try printMetric(allocator, writer, "min", values.items[0], cfg.unit);
-    try printMetric(allocator, writer, "p50", percentile(values.items, 50.0), cfg.unit);
-    try printMetric(allocator, writer, "p90", percentile(values.items, 90.0), cfg.unit);
-    try printMetric(allocator, writer, "p95", percentile(values.items, 95.0), cfg.unit);
-    try printMetric(allocator, writer, "p99", percentile(values.items, 99.0), cfg.unit);
-    try printMetric(allocator, writer, "max", values.items[count - 1], cfg.unit);
+    try printMetric(allocator, writer, "min", min_v, cfg.unit);
+    try printMetric(allocator, writer, "p50", p50_v, cfg.unit);
+    try printMetric(allocator, writer, "p90", p90_v, cfg.unit);
+    try printMetric(allocator, writer, "p95", p95_v, cfg.unit);
+    try printMetric(allocator, writer, "p99", p99_v, cfg.unit);
+    try printMetric(allocator, writer, "max", max_v, cfg.unit);
     try printMetric(allocator, writer, "mean", mean, cfg.unit);
     try printMetric(allocator, writer, "median", median, cfg.unit);
     try printMetric(allocator, writer, "stdev", stdev, cfg.unit);
@@ -114,6 +131,10 @@ fn parseArgs(argv: []const []const u8) !Config {
         }
         if (std.mem.eql(u8, arg, "--all")) {
             cfg.parse_all = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--json")) {
+            cfg.output_json = true;
             continue;
         }
         return error.UnknownArg;
@@ -242,6 +263,12 @@ test "parse numbers all values" {
     try std.testing.expectApproxEqAbs(@as(f64, 1.5), list.items[0], 0.000_001);
     try std.testing.expectApproxEqAbs(@as(f64, -2.25), list.items[1], 0.000_001);
     try std.testing.expectApproxEqAbs(@as(f64, 3.0), list.items[2], 0.000_001);
+}
+
+test "parse args enables json output" {
+    const argv = [_][]const u8{ "bench_stats.zig", "--json" };
+    const cfg = try parseArgs(&argv);
+    try std.testing.expect(cfg.output_json);
 }
 
 fn parseLineWithAlloc(alloc: std.mem.Allocator, line: []const u8) !void {
