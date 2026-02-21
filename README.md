@@ -7,6 +7,9 @@ Monorepo for Zig CLIs with shared internal libraries and independent release str
 - `seq` (session/memory mining)
 - `lift` (`bench_stats`, `perf_report`)
 - `cas` (`cas_smoke_check`, `cas_instance_runner`)
+- `cron` (`cron`)
+- `puff` (`puff`)
+- `learnings` (`learnings`, `append_learning`)
 
 No unified umbrella CLI is introduced. Binaries remain separate.
 
@@ -15,6 +18,9 @@ No unified umbrella CLI is introduced. Binaries remain separate.
 - `apps/seq`
 - `apps/lift`
 - `apps/cas`
+- `apps/cron`
+- `apps/puff`
+- `apps/learnings`
 - `libs/core`
 - `.github/workflows`
 - `docs/release`
@@ -31,6 +37,9 @@ Targeted build steps:
 zig build build-seq -Doptimize=ReleaseFast
 zig build build-lift -Doptimize=ReleaseFast
 zig build build-cas -Doptimize=ReleaseFast
+zig build build-cron -Doptimize=ReleaseFast
+zig build build-puff -Doptimize=ReleaseFast
+zig build build-learnings -Doptimize=ReleaseFast
 ```
 
 Run helpers:
@@ -48,18 +57,27 @@ Per-app VERSION files are the source of truth:
 - `apps/seq/VERSION`
 - `apps/lift/VERSION`
 - `apps/cas/VERSION`
+- `apps/cron/VERSION`
+- `apps/puff/VERSION`
+- `apps/learnings/VERSION`
 
 Independent tags trigger independent workflows, and each tag must match its app VERSION file:
 
 - `seq-v*` -> `.github/workflows/release-seq.yml`
 - `lift-v*` -> `.github/workflows/release-lift.yml`
 - `cas-v*` -> `.github/workflows/release-cas.yml`
+- `cron-v*` -> `.github/workflows/release-cron.yml`
+- `puff-v*` -> `.github/workflows/release-puff.yml`
+- `learnings-v*` -> `.github/workflows/release-learnings.yml`
 
 Required tag forms:
 
 - `seq-v<version>` where `<version>` equals `apps/seq/VERSION`
 - `lift-v<version>` where `<version>` equals `apps/lift/VERSION`
 - `cas-v<version>` where `<version>` equals `apps/cas/VERSION`
+- `cron-v<version>` where `<version>` equals `apps/cron/VERSION`
+- `puff-v<version>` where `<version>` equals `apps/puff/VERSION`
+- `learnings-v<version>` where `<version>` equals `apps/learnings/VERSION`
 
 Artifacts are published as `<tag>-linux-x86_64.tar.gz` (no `*-cli` prefix).
 

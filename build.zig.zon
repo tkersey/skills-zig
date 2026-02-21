@@ -11,6 +11,9 @@
         "apps/seq/perf",
         "apps/lift/scripts",
         "apps/cas/scripts",
+        "apps/cron/scripts",
+        "apps/puff/scripts",
+        "apps/learnings/scripts",
         "libs/core/src",
     },
 }

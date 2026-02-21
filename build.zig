@@ -65,6 +65,26 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_json", .module = core_json },
         },
     });
+    const cron_root = b.createModule(.{
+        .root_source_file = b.path("apps/cron/scripts/cron.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const puff_root = b.createModule(.{
+        .root_source_file = b.path("apps/puff/scripts/puff.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const learnings_root = b.createModule(.{
+        .root_source_file = b.path("apps/learnings/scripts/learnings.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const append_learning_root = b.createModule(.{
+        .root_source_file = b.path("apps/learnings/scripts/append_learning.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const seq = addExecutable(b, "seq", seq_root);
     const seq_perf = addExecutable(b, "seq-perf", seq_perf_root);
@@ -72,6 +92,10 @@ pub fn build(b: *std.Build) void {
     const perf_report = addExecutable(b, "perf_report", lift_report_root);
     const cas_smoke_check = addExecutable(b, "cas_smoke_check", cas_smoke_root);
     const cas_instance_runner = addExecutable(b, "cas_instance_runner", cas_runner_root);
+    const cron = addExecutable(b, "cron", cron_root);
+    const puff = addExecutable(b, "puff", puff_root);
+    const learnings = addExecutable(b, "learnings", learnings_root);
+    const append_learning = addExecutable(b, "append_learning", append_learning_root);
 
     const seq_install = addInstallStep(b, seq);
     const seq_perf_install = addInstallStep(b, seq_perf);
@@ -79,6 +103,10 @@ pub fn build(b: *std.Build) void {
     const perf_report_install = addInstallStep(b, perf_report);
     const cas_smoke_check_install = addInstallStep(b, cas_smoke_check);
     const cas_instance_runner_install = addInstallStep(b, cas_instance_runner);
+    const cron_install = addInstallStep(b, cron);
+    const puff_install = addInstallStep(b, puff);
+    const learnings_install = addInstallStep(b, learnings);
+    const append_learning_install = addInstallStep(b, append_learning);
 
     const install_all = b.getInstallStep();
     install_all.dependOn(&seq_install.step);
@@ -87,6 +115,10 @@ pub fn build(b: *std.Build) void {
     install_all.dependOn(&perf_report_install.step);
     install_all.dependOn(&cas_smoke_check_install.step);
     install_all.dependOn(&cas_instance_runner_install.step);
+    install_all.dependOn(&cron_install.step);
+    install_all.dependOn(&puff_install.step);
+    install_all.dependOn(&learnings_install.step);
+    install_all.dependOn(&append_learning_install.step);
 
     const build_seq = b.step("build-seq", "Build seq binaries");
     build_seq.dependOn(&seq_install.step);
@@ -99,6 +131,16 @@ pub fn build(b: *std.Build) void {
     const build_cas = b.step("build-cas", "Build cas binaries");
     build_cas.dependOn(&cas_smoke_check_install.step);
     build_cas.dependOn(&cas_instance_runner_install.step);
+
+    const build_cron = b.step("build-cron", "Build cron binaries");
+    build_cron.dependOn(&cron_install.step);
+
+    const build_puff = b.step("build-puff", "Build puff binaries");
+    build_puff.dependOn(&puff_install.step);
+
+    const build_learnings = b.step("build-learnings", "Build learnings binaries");
+    build_learnings.dependOn(&learnings_install.step);
+    build_learnings.dependOn(&append_learning_install.step);
 
     addRunStep(b, seq, "run-seq", "Run seq", &.{});
     addRunStep(b, bench_stats, "run-bench-stats", "Run bench_stats", &.{"--help"});

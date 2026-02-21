@@ -6,6 +6,9 @@ on:
       - "apps/seq/**"
       - "apps/lift/**"
       - "apps/cas/**"
+      - "apps/cron/**"
+      - "apps/puff/**"
+      - "apps/learnings/**"
       - "libs/core/**"
       - ".github/workflows/pr-ci.yml"
 
@@ -19,6 +22,9 @@ jobs:
       seq: ${{ steps.filter.outputs.seq }}
       lift: ${{ steps.filter.outputs.lift }}
       cas: ${{ steps.filter.outputs.cas }}
+      cron: ${{ steps.filter.outputs.cron }}
+      puff: ${{ steps.filter.outputs.puff }}
+      learnings: ${{ steps.filter.outputs.learnings }}
       core: ${{ steps.filter.outputs.core }}
     steps:
       - uses: actions/checkout@v4
@@ -32,6 +38,12 @@ jobs:
               - "apps/lift/**"
             cas:
               - "apps/cas/**"
+            cron:
+              - "apps/cron/**"
+            puff:
+              - "apps/puff/**"
+            learnings:
+              - "apps/learnings/**"
             core:
               - "libs/core/**"
 
@@ -75,3 +87,39 @@ jobs:
           version: 0.15.2
       - name: Build cas binaries
         run: zig build build-cas -Doptimize=ReleaseFast
+
+  cron:
+    needs: changes
+    if: needs.changes.outputs.cron == 'true' || needs.changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Build cron binaries
+        run: zig build build-cron -Doptimize=ReleaseFast
+
+  puff:
+    needs: changes
+    if: needs.changes.outputs.puff == 'true' || needs.changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Build puff binaries
+        run: zig build build-puff -Doptimize=ReleaseFast
+
+  learnings:
+    needs: changes
+    if: needs.changes.outputs.learnings == 'true' || needs.changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Build learnings binaries
+        run: zig build build-learnings -Doptimize=ReleaseFast

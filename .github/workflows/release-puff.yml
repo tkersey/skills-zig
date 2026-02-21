@@ -1,0 +1,43 @@
+name: Release puff
+
+on:
+  push:
+    tags:
+      - "puff-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate puff tag matches VERSION
+        run: |
+          expected_tag="puff-v$(tr -d '[:space:]' < apps/puff/VERSION)"
+          if [ "${GITHUB_REF_NAME}" != "${expected_tag}" ]; then
+            echo "Tag mismatch: expected ${expected_tag}, got ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Build puff binaries
+        run: zig build build-puff -Doptimize=ReleaseFast
+      - name: Package puff artifact
+        run: |
+          TAR_NAME="${GITHUB_REF_NAME}-linux-x86_64.tar.gz"
+          echo "TAR_NAME=${TAR_NAME}" >> "$GITHUB_ENV"
+          mkdir -p dist/puff
+          cp zig-out/bin/puff dist/puff/puff
+          tar -czf "${TAR_NAME}" -C dist/puff .
+      - name: Upload puff workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TAR_NAME }}
+          path: ${{ env.TAR_NAME }}
+      - name: Publish puff release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.TAR_NAME }}

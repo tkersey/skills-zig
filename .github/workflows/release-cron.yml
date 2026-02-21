@@ -1,0 +1,43 @@
+name: Release cron
+
+on:
+  push:
+    tags:
+      - "cron-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate cron tag matches VERSION
+        run: |
+          expected_tag="cron-v$(tr -d '[:space:]' < apps/cron/VERSION)"
+          if [ "${GITHUB_REF_NAME}" != "${expected_tag}" ]; then
+            echo "Tag mismatch: expected ${expected_tag}, got ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Build cron binaries
+        run: zig build build-cron -Doptimize=ReleaseFast
+      - name: Package cron artifact
+        run: |
+          TAR_NAME="${GITHUB_REF_NAME}-linux-x86_64.tar.gz"
+          echo "TAR_NAME=${TAR_NAME}" >> "$GITHUB_ENV"
+          mkdir -p dist/cron
+          cp zig-out/bin/cron dist/cron/cron
+          tar -czf "${TAR_NAME}" -C dist/cron .
+      - name: Upload cron workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TAR_NAME }}
+          path: ${{ env.TAR_NAME }}
+      - name: Publish cron release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.TAR_NAME }}
