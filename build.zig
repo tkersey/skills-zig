@@ -19,6 +19,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const core_delegate = b.createModule(.{
+        .root_source_file = b.path("libs/core/src/delegate_helpers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const seq_root = b.createModule(.{
         .root_source_file = b.path("apps/seq/src/main.zig"),
@@ -69,21 +74,33 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("apps/cron/scripts/cron.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_delegate", .module = core_delegate },
+        },
     });
     const puff_root = b.createModule(.{
         .root_source_file = b.path("apps/puff/scripts/puff.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_delegate", .module = core_delegate },
+        },
     });
     const learnings_root = b.createModule(.{
         .root_source_file = b.path("apps/learnings/scripts/learnings.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_delegate", .module = core_delegate },
+        },
     });
     const append_learning_root = b.createModule(.{
         .root_source_file = b.path("apps/learnings/scripts/append_learning.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_delegate", .module = core_delegate },
+        },
     });
 
     const seq = addExecutable(b, "seq", seq_root);
