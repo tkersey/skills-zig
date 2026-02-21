@@ -1,0 +1,82 @@
+const std = @import("std");
+const delegate = @import("core_delegate");
+
+const UsageText =
+    \\cas.zig
+    \\
+    \\CAS dispatcher for subcommand-style usage.
+    \\
+    \\Usage:
+    \\  cas <subcommand> [args...]
+    \\
+    \\Subcommands:
+    \\  instance_runner | instance-runner   Run cas_instance_runner.
+    \\  smoke_check     | smoke-check       Run cas_smoke_check.
+    \\
+    \\Examples:
+    \\  cas instance_runner --cwd /path/to/repo --instances 4
+    \\  cas smoke_check --cwd /path/to/repo --json
+    \\
+    \\Options:
+    \\  --help                              Show this help.
+;
+
+pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const argv = try std.process.argsAlloc(allocator);
+    if (argv.len <= 1) {
+        var stderr_writer = std.fs.File.stderr().writer(&.{});
+        const stderr = &stderr_writer.interface;
+        try stderr.print("Missing subcommand\n{s}\n", .{UsageText});
+        std.process.exit(2);
+    }
+
+    if (delegate.isHelpRequested(argv) or std.mem.eql(u8, argv[1], "help")) {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try stdout.print("{s}\n", .{UsageText});
+        return;
+    }
+
+    const target_name = resolveTarget(argv[1]) orelse {
+        var stderr_writer = std.fs.File.stderr().writer(&.{});
+        const stderr = &stderr_writer.interface;
+        try stderr.print("Unknown subcommand: {s}\n{s}\n", .{ argv[1], UsageText });
+        std.process.exit(2);
+    };
+
+    const target_exec = blk: {
+        const exe_dir = std.fs.selfExeDirPathAlloc(allocator) catch null;
+        if (exe_dir) |dir| break :blk try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, target_name });
+        break :blk try allocator.dupe(u8, target_name);
+    };
+
+    var child_argv: std.ArrayList([]const u8) = .empty;
+    defer child_argv.deinit(allocator);
+    try child_argv.append(allocator, target_exec);
+    try child_argv.appendSlice(allocator, argv[2..]);
+
+    const exit_code = try delegate.runCommand(allocator, child_argv.items);
+    std.process.exit(exit_code);
+}
+
+fn resolveTarget(subcommand: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, subcommand, "instance_runner") or std.mem.eql(u8, subcommand, "instance-runner")) {
+        return "cas_instance_runner";
+    }
+    if (std.mem.eql(u8, subcommand, "smoke_check") or std.mem.eql(u8, subcommand, "smoke-check")) {
+        return "cas_smoke_check";
+    }
+    return null;
+}
+
+test "resolveTarget supports supported subcommands" {
+    try std.testing.expectEqualStrings("cas_instance_runner", resolveTarget("instance_runner").?);
+    try std.testing.expectEqualStrings("cas_instance_runner", resolveTarget("instance-runner").?);
+    try std.testing.expectEqualStrings("cas_smoke_check", resolveTarget("smoke_check").?);
+    try std.testing.expectEqualStrings("cas_smoke_check", resolveTarget("smoke-check").?);
+    try std.testing.expect(resolveTarget("unknown") == null);
+}

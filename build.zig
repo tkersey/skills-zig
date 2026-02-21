@@ -70,6 +70,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_json", .module = core_json },
         },
     });
+    const cas_root = b.createModule(.{
+        .root_source_file = b.path("apps/cas/scripts/cas.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_delegate", .module = core_delegate },
+        },
+    });
     const cron_root = b.createModule(.{
         .root_source_file = b.path("apps/cron/scripts/cron.zig"),
         .target = target,
@@ -109,6 +117,7 @@ pub fn build(b: *std.Build) void {
     const perf_report = addExecutable(b, "perf_report", lift_report_root);
     const cas_smoke_check = addExecutable(b, "cas_smoke_check", cas_smoke_root);
     const cas_instance_runner = addExecutable(b, "cas_instance_runner", cas_runner_root);
+    const cas = addExecutable(b, "cas", cas_root);
     const cron = addExecutable(b, "cron", cron_root);
     const puff = addExecutable(b, "puff", puff_root);
     const learnings = addExecutable(b, "learnings", learnings_root);
@@ -120,6 +129,7 @@ pub fn build(b: *std.Build) void {
     const perf_report_install = addInstallStep(b, perf_report);
     const cas_smoke_check_install = addInstallStep(b, cas_smoke_check);
     const cas_instance_runner_install = addInstallStep(b, cas_instance_runner);
+    const cas_install = addInstallStep(b, cas);
     const cron_install = addInstallStep(b, cron);
     const puff_install = addInstallStep(b, puff);
     const learnings_install = addInstallStep(b, learnings);
@@ -132,6 +142,7 @@ pub fn build(b: *std.Build) void {
     install_all.dependOn(&perf_report_install.step);
     install_all.dependOn(&cas_smoke_check_install.step);
     install_all.dependOn(&cas_instance_runner_install.step);
+    install_all.dependOn(&cas_install.step);
     install_all.dependOn(&cron_install.step);
     install_all.dependOn(&puff_install.step);
     install_all.dependOn(&learnings_install.step);
@@ -148,6 +159,7 @@ pub fn build(b: *std.Build) void {
     const build_cas = b.step("build-cas", "Build cas binaries");
     build_cas.dependOn(&cas_smoke_check_install.step);
     build_cas.dependOn(&cas_instance_runner_install.step);
+    build_cas.dependOn(&cas_install.step);
 
     const build_cron = b.step("build-cron", "Build cron binaries");
     build_cron.dependOn(&cron_install.step);
