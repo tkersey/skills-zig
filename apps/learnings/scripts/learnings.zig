@@ -26,27 +26,13 @@ pub fn main() !void {
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
 
-    if (core_delegate.isHelpRequested(argv)) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
-        const stdout = &stdout_writer.interface;
-        try stdout.print("{s}\n", .{UsageText});
-        return;
-    }
-
-    const script_path = core_delegate.resolveScriptPath(allocator, SkillName, ScriptName) catch {
-        var stderr_writer = std.fs.File.stderr().writer(&.{});
-        const stderr = &stderr_writer.interface;
-        try stderr.print("{s}: unable to locate delegated script {s}\n", .{ SourceFile, ScriptName });
-        std.process.exit(1);
-    };
-    defer allocator.free(script_path);
-
-    const exit_code = core_delegate.runUvPython(allocator, script_path, argv[1..]) catch |err| {
-        var stderr_writer = std.fs.File.stderr().writer(&.{});
-        const stderr = &stderr_writer.interface;
-        try stderr.print("{s}: delegate execution failed: {s}\n", .{ SourceFile, @errorName(err) });
-        std.process.exit(1);
-    };
-
-    if (exit_code != 0) std.process.exit(exit_code);
+    try core_delegate.runDelegatedCli(
+        allocator,
+        argv,
+        UsageText,
+        SourceFile,
+        SkillName,
+        ScriptName,
+        .uv_python,
+    );
 }

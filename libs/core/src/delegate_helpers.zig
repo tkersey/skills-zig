@@ -6,17 +6,50 @@ pub fn isHelpRequested(argv: []const []const u8) bool {
     return std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h");
 }
 
+pub const DelegateRuntime = enum {
+    uv_python,
+    bash,
+};
+
+pub fn runDelegatedCli(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    usage_text: []const u8,
+    source_file: []const u8,
+    skill_name: []const u8,
+    script_name: []const u8,
+    runtime: DelegateRuntime,
+) !void {
+    if (isHelpRequested(argv)) {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try stdout.print("{s}\n", .{usage_text});
+        return;
+    }
+
+    const script_path = resolveScriptPath(allocator, skill_name, script_name) catch {
+        var stderr_writer = std.fs.File.stderr().writer(&.{});
+        const stderr = &stderr_writer.interface;
+        try stderr.print("{s}: unable to locate delegated script {s}\n", .{ source_file, script_name });
+        std.process.exit(1);
+    };
+    defer allocator.free(script_path);
+
+    const exit_code = runDelegateRuntime(allocator, runtime, script_path, argv[1..]) catch |err| {
+        var stderr_writer = std.fs.File.stderr().writer(&.{});
+        const stderr = &stderr_writer.interface;
+        try stderr.print("{s}: delegate execution failed: {s}\n", .{ source_file, @errorName(err) });
+        std.process.exit(1);
+    };
+    if (exit_code != 0) std.process.exit(exit_code);
+}
+
 pub fn runUvPython(
     allocator: std.mem.Allocator,
     script_path: []const u8,
     passthrough_args: []const []const u8,
 ) !u8 {
-    var child_argv: std.ArrayList([]const u8) = .empty;
-    defer child_argv.deinit(allocator);
-
-    try child_argv.appendSlice(allocator, &.{ "uv", "run", "python", script_path });
-    try child_argv.appendSlice(allocator, passthrough_args);
-    return runCommand(allocator, child_argv.items);
+    return runDelegateRuntime(allocator, .uv_python, script_path, passthrough_args);
 }
 
 pub fn runBash(
@@ -24,12 +57,34 @@ pub fn runBash(
     script_path: []const u8,
     passthrough_args: []const []const u8,
 ) !u8 {
+    return runDelegateRuntime(allocator, .bash, script_path, passthrough_args);
+}
+
+fn runDelegateRuntime(
+    allocator: std.mem.Allocator,
+    runtime: DelegateRuntime,
+    script_path: []const u8,
+    passthrough_args: []const []const u8,
+) !u8 {
     var child_argv: std.ArrayList([]const u8) = .empty;
     defer child_argv.deinit(allocator);
 
-    try child_argv.appendSlice(allocator, &.{ "bash", script_path });
-    try child_argv.appendSlice(allocator, passthrough_args);
+    try appendDelegateArgs(allocator, &child_argv, runtime, script_path, passthrough_args);
     return runCommand(allocator, child_argv.items);
+}
+
+fn appendDelegateArgs(
+    allocator: std.mem.Allocator,
+    child_argv: *std.ArrayList([]const u8),
+    runtime: DelegateRuntime,
+    script_path: []const u8,
+    passthrough_args: []const []const u8,
+) !void {
+    switch (runtime) {
+        .uv_python => try child_argv.appendSlice(allocator, &.{ "uv", "run", "python", script_path }),
+        .bash => try child_argv.appendSlice(allocator, &.{ "bash", script_path }),
+    }
+    try child_argv.appendSlice(allocator, passthrough_args);
 }
 
 pub fn runCommand(allocator: std.mem.Allocator, args: []const []const u8) !u8 {
@@ -138,6 +193,36 @@ test "allocation failures resolving missing script path" {
         resolveMissingWithAlloc,
         .{ "__alloc_missing_skill__", "__alloc_missing_script__.py" },
     );
+}
+
+test "appendDelegateArgs maps runtimes to command prefixes" {
+    var uv_args: std.ArrayList([]const u8) = .empty;
+    defer uv_args.deinit(std.testing.allocator);
+    try appendDelegateArgs(
+        std.testing.allocator,
+        &uv_args,
+        .uv_python,
+        "/tmp/x.py",
+        &.{"--flag"},
+    );
+    try std.testing.expectEqualStrings("uv", uv_args.items[0]);
+    try std.testing.expectEqualStrings("run", uv_args.items[1]);
+    try std.testing.expectEqualStrings("python", uv_args.items[2]);
+    try std.testing.expectEqualStrings("/tmp/x.py", uv_args.items[3]);
+    try std.testing.expectEqualStrings("--flag", uv_args.items[4]);
+
+    var bash_args: std.ArrayList([]const u8) = .empty;
+    defer bash_args.deinit(std.testing.allocator);
+    try appendDelegateArgs(
+        std.testing.allocator,
+        &bash_args,
+        .bash,
+        "/tmp/x.sh",
+        &.{"--flag"},
+    );
+    try std.testing.expectEqualStrings("bash", bash_args.items[0]);
+    try std.testing.expectEqualStrings("/tmp/x.sh", bash_args.items[1]);
+    try std.testing.expectEqualStrings("--flag", bash_args.items[2]);
 }
 
 fn fuzzHelpRequestedTarget(_: void, input: []const u8) !void {
