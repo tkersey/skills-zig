@@ -1,0 +1,5 @@
+{
+  "captured_unix_s": 1771784400,
+  "p95_ns_per_eval": 19000,
+  "p50_alloc_calls_per_eval": 12
+}

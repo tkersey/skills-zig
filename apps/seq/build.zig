@@ -8,6 +8,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const core_perf = b.createModule(.{
+        .root_source_file = b.path("../../libs/core/src/perf_helpers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -67,4 +72,26 @@ pub fn build(b: *std.Build) void {
 
     const bench_step = b.step("bench", "Run frozen workload performance harness");
     bench_step.dependOn(&perf_run.step);
+
+    const parser_perf_mod = b.createModule(.{
+        .root_source_file = b.path("src/perf_parser.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_perf", .module = core_perf },
+        },
+    });
+
+    const parser_perf_exe = b.addExecutable(.{
+        .name = "seq-perf-parser",
+        .root_module = parser_perf_mod,
+    });
+    b.installArtifact(parser_perf_exe);
+
+    const parser_perf_run = b.addRunArtifact(parser_perf_exe);
+    parser_perf_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| parser_perf_run.addArgs(args);
+
+    const parser_bench_step = b.step("bench-parser", "Run token parser performance harness");
+    parser_bench_step.dependOn(&parser_perf_run.step);
 }

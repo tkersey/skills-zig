@@ -161,7 +161,7 @@ fn isNumberBodyChar(c: u8) bool {
     return std.ascii.isDigit(c) or c == '.' or c == 'e' or c == 'E' or c == '+' or c == '-';
 }
 
-fn parseNumbersFromLine(
+pub fn parseNumbersFromLine(
     line: []const u8,
     parse_all: bool,
     allocator: std.mem.Allocator,

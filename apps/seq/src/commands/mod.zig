@@ -695,11 +695,7 @@ fn collectTokenEventsRows(
     defer freePathList(allocator, &paths);
 
     for (paths.items) |path| {
-        const content = try readFileAllocOrSkip(allocator, path);
-        if (content == null) continue;
-        defer allocator.free(content.?);
-
-        var parsed = try datasets.token_events.parseTokenEvents(allocator, path, content.?, true);
+        var parsed = try datasets.token_events.parseTokenEventsFile(allocator, path, true);
         defer parsed.deinit(allocator);
 
         for (parsed.items) |row| {
@@ -734,11 +730,7 @@ fn collectTokenDeltasRows(
     defer freePathList(allocator, &paths);
 
     for (paths.items) |path| {
-        const content = try readFileAllocOrSkip(allocator, path);
-        if (content == null) continue;
-        defer allocator.free(content.?);
-
-        var events = try datasets.token_events.parseTokenEvents(allocator, path, content.?, true);
+        var events = try datasets.token_events.parseTokenEventsFile(allocator, path, true);
         defer events.deinit(allocator);
         var deltas = try datasets.token_deltas.buildDeltas(allocator, events.items, .{});
         defer deltas.deinit(allocator);
@@ -776,11 +768,7 @@ fn collectTokenSessionsRows(
     defer freePathList(allocator, &paths);
 
     for (paths.items) |path| {
-        const content = try readFileAllocOrSkip(allocator, path);
-        if (content == null) continue;
-        defer allocator.free(content.?);
-
-        const maybe_row = try datasets.token_sessions.summarizeFromContent(allocator, path, content.?);
+        const maybe_row = try datasets.token_sessions.summarizeFromFile(allocator, path);
         const row = maybe_row orelse continue;
 
         var qrow = query.Row.init(allocator);

@@ -1,0 +1,7 @@
+{
+  "mode": "synthetic",
+  "captured_unix_s": 1771780800,
+  "speedup_pct": 80.000000,
+  "alloc_call_reduction_pct": 95.000000,
+  "fast_p95_ns_per_line": 6000
+}

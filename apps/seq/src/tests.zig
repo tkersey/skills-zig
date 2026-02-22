@@ -16,6 +16,7 @@ comptime {
     _ = @import("datasets/token_sessions.zig");
     _ = @import("datasets/tool_calls.zig");
     _ = @import("datasets/memory_files.zig");
+    _ = @import("perf_parser.zig");
     _ = @import("main.zig");
 }
 

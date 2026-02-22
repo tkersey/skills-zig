@@ -32,7 +32,7 @@ const WindowOut = struct {
     effectiveTier: []const u8 = "on_track",
 };
 
-const GovernorOut = struct {
+pub const GovernorOut = struct {
     ok: bool = false,
     bucketSource: []const u8 = "missing",
     bucketKey: ?[]const u8 = null,
@@ -109,15 +109,7 @@ pub fn main() !void {
     const input = try std.fs.File.stdin().readToEndAlloc(allocator, 16 * 1024 * 1024);
     defer allocator.free(input);
 
-    var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, input, .{});
-    defer parsed_json.deinit();
-
-    const root = switch (parsed_json.value) {
-        .object => |obj| obj,
-        else => return error.ExpectedJsonObject,
-    };
-
-    const out = computeBudgetGovernor(root, parsed.now_sec);
+    const out = try computeBudgetGovernorFromSlice(allocator, input, parsed.now_sec);
 
     var stdout_writer = std.fs.File.stdout().writer(&.{});
     const stdout = &stdout_writer.interface;
@@ -136,6 +128,22 @@ pub fn main() !void {
         if (core_io.isClosedPipeError(err)) return;
         return err;
     };
+}
+
+pub fn computeBudgetGovernorFromSlice(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    now_sec_opt: ?i64,
+) !GovernorOut {
+    var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, input, .{});
+    defer parsed_json.deinit();
+
+    const root = switch (parsed_json.value) {
+        .object => |obj| obj,
+        else => return error.ExpectedJsonObject,
+    };
+
+    return computeBudgetGovernor(root, now_sec_opt);
 }
 
 const ParsedArgs = struct {
@@ -469,13 +477,7 @@ test "governor chooses stricter secondary window" {
 }
 
 fn parseAndComputeWithAlloc(alloc: std.mem.Allocator, json: []const u8) !void {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
-    defer parsed.deinit();
-    const root = switch (parsed.value) {
-        .object => |obj| obj,
-        else => return,
-    };
-    _ = computeBudgetGovernor(root, 1700000000);
+    _ = try computeBudgetGovernorFromSlice(alloc, json, 1700000000);
 }
 
 test "allocation failures parse governor json" {

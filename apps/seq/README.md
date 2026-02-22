@@ -36,6 +36,10 @@ Binary output:
 zig build test
 # Note: `zig build test --fuzz` may fail on macOS due Zig InvalidElfMagic runtime issue.
 zig build bench -Doptimize=ReleaseFast -- --config perf/frozen/workload_config.json
+bash scripts/perf/parser_gate.sh
+
+# Linux-only bounded fuzz smoke (matches CI behavior).
+timeout 180 zig test --dep core_path -Mroot=src/tests.zig -Mcore_path=../../libs/core/src/path_helpers.zig -ffuzz --test-filter "fuzz "
 
 # Differential parity against Python oracle
 scripts/parity/run_diff.sh --root ~/.codex/sessions/2026/02/19

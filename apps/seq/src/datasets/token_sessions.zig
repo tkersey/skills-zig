@@ -72,3 +72,12 @@ pub fn summarizeFromContent(
     defer events.deinit(allocator);
     return summarizeSession(path, events.items);
 }
+
+pub fn summarizeFromFile(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+) !?Row {
+    var events = try token_events.parseTokenEventsFile(allocator, path, false);
+    defer events.deinit(allocator);
+    return summarizeSession(path, events.items);
+}

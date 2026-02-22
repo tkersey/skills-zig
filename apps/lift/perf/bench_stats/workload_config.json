@@ -1,0 +1,7 @@
+{
+  "iterations": 25000,
+  "rounds": 9,
+  "max_p95_ns_per_line": 2000,
+  "max_p50_alloc_calls_per_round": 40,
+  "trend_tolerance_pct": 20.0
+}

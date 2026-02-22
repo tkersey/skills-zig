@@ -22,6 +22,15 @@ pub const Client = struct {
     next_request_id: i64 = 1,
     last_error: ?[]u8 = null,
 
+    const request_loop_event_types = [_][]const u8{
+        "cas/fromServer",
+        "cas/error",
+    };
+    const ready_loop_event_types = [_][]const u8{
+        "cas/ready",
+        "cas/error",
+    };
+
     pub fn start(allocator: std.mem.Allocator, opts: ClientOptions) !Client {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(allocator);
@@ -113,6 +122,7 @@ pub const Client = struct {
         while (true) {
             const line = (try self.readLineAlloc()) orelse return error.ProxyClosed;
             defer self.allocator.free(line);
+            if (!shouldAttemptEventParse(line, request_loop_event_types[0..])) continue;
 
             var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch continue;
             defer parsed.deinit();
@@ -204,6 +214,7 @@ pub const Client = struct {
         while (true) {
             const line = (try self.readLineAlloc()) orelse return error.ProxyClosedBeforeReady;
             defer self.allocator.free(line);
+            if (!shouldAttemptEventParse(line, ready_loop_event_types[0..])) continue;
 
             var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch continue;
             defer parsed.deinit();
@@ -253,6 +264,18 @@ pub const Client = struct {
             }
             try self.line_buf.appendSlice(self.allocator, tmp[0..n]);
         }
+    }
+
+    fn shouldAttemptEventParse(line: []const u8, expected_types: []const []const u8) bool {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len == 0) return false;
+        if (trimmed[0] != '{') return false;
+        if (!std.mem.containsAtLeast(u8, trimmed, 1, "\"type\"")) return false;
+        if (!std.mem.containsAtLeast(u8, trimmed, 1, "cas/")) return false;
+        for (expected_types) |event_type| {
+            if (std.mem.containsAtLeast(u8, trimmed, 1, event_type)) return true;
+        }
+        return false;
     }
 };
 

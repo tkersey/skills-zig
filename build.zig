@@ -24,6 +24,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const core_perf = b.createModule(.{
+        .root_source_file = b.path("libs/core/src/perf_helpers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const seq_root = b.createModule(.{
         .root_source_file = b.path("apps/seq/src/main.zig"),
@@ -54,6 +59,15 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_io", .module = core_io },
         },
     });
+    const lift_bench_perf_root = b.createModule(.{
+        .root_source_file = b.path("apps/lift/scripts/perf_bench_stats.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_io", .module = core_io },
+            .{ .name = "core_perf", .module = core_perf },
+        },
+    });
     const cas_smoke_root = b.createModule(.{
         .root_source_file = b.path("apps/cas/scripts/cas_smoke_check.zig"),
         .target = target,
@@ -68,6 +82,25 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core_json", .module = core_json },
+        },
+    });
+    const cas_budget_governor_root = b.createModule(.{
+        .root_source_file = b.path("apps/cas/scripts/budget_governor.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_json", .module = core_json },
+            .{ .name = "core_io", .module = core_io },
+        },
+    });
+    const cas_budget_perf_root = b.createModule(.{
+        .root_source_file = b.path("apps/cas/scripts/perf_budget_governor.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_json", .module = core_json },
+            .{ .name = "core_io", .module = core_io },
+            .{ .name = "core_perf", .module = core_perf },
         },
     });
     const cas_root = b.createModule(.{
@@ -115,8 +148,10 @@ pub fn build(b: *std.Build) void {
     const seq_perf = addExecutable(b, "seq-perf", seq_perf_root);
     const bench_stats = addExecutable(b, "bench_stats", lift_bench_root);
     const perf_report = addExecutable(b, "perf_report", lift_report_root);
+    const lift_bench_perf = addExecutable(b, "lift-perf-bench-stats", lift_bench_perf_root);
     const cas_smoke_check = addExecutable(b, "cas_smoke_check", cas_smoke_root);
     const cas_instance_runner = addExecutable(b, "cas_instance_runner", cas_runner_root);
+    const cas_budget_perf = addExecutable(b, "cas-perf-budget-governor", cas_budget_perf_root);
     const cas = addExecutable(b, "cas", cas_root);
     const cron = addExecutable(b, "cron", cron_root);
     const puff = addExecutable(b, "puff", puff_root);
@@ -127,8 +162,10 @@ pub fn build(b: *std.Build) void {
     const seq_perf_install = addInstallStep(b, seq_perf);
     const bench_stats_install = addInstallStep(b, bench_stats);
     const perf_report_install = addInstallStep(b, perf_report);
+    const lift_bench_perf_install = addInstallStep(b, lift_bench_perf);
     const cas_smoke_check_install = addInstallStep(b, cas_smoke_check);
     const cas_instance_runner_install = addInstallStep(b, cas_instance_runner);
+    const cas_budget_perf_install = addInstallStep(b, cas_budget_perf);
     const cas_install = addInstallStep(b, cas);
     const cron_install = addInstallStep(b, cron);
     const puff_install = addInstallStep(b, puff);
@@ -140,8 +177,10 @@ pub fn build(b: *std.Build) void {
     install_all.dependOn(&seq_perf_install.step);
     install_all.dependOn(&bench_stats_install.step);
     install_all.dependOn(&perf_report_install.step);
+    install_all.dependOn(&lift_bench_perf_install.step);
     install_all.dependOn(&cas_smoke_check_install.step);
     install_all.dependOn(&cas_instance_runner_install.step);
+    install_all.dependOn(&cas_budget_perf_install.step);
     install_all.dependOn(&cas_install.step);
     install_all.dependOn(&cron_install.step);
     install_all.dependOn(&puff_install.step);
@@ -155,11 +194,56 @@ pub fn build(b: *std.Build) void {
     const build_lift = b.step("build-lift", "Build lift binaries");
     build_lift.dependOn(&bench_stats_install.step);
     build_lift.dependOn(&perf_report_install.step);
+    build_lift.dependOn(&lift_bench_perf_install.step);
+
+    addBenchStep(
+        b,
+        lift_bench_perf,
+        "bench-lift-bench-stats",
+        "Run bench_stats performance harness",
+    );
+    const run_lift_bench_tests = addTestStep(
+        b,
+        lift_bench_root,
+        "test-lift-bench-stats",
+        "Run bench_stats tests",
+    );
+    const run_lift_report_tests = addTestStep(
+        b,
+        lift_report_root,
+        "test-lift-perf-report",
+        "Run perf_report tests",
+    );
+    const run_lift_bench_perf_tests = addTestStep(
+        b,
+        lift_bench_perf_root,
+        "test-lift-perf-bench-stats",
+        "Run perf_bench_stats tests",
+    );
+
+    const test_lift = b.step("test-lift", "Run all lift tests");
+    test_lift.dependOn(&run_lift_bench_tests.step);
+    test_lift.dependOn(&run_lift_report_tests.step);
+    test_lift.dependOn(&run_lift_bench_perf_tests.step);
 
     const build_cas = b.step("build-cas", "Build cas binaries");
     build_cas.dependOn(&cas_smoke_check_install.step);
     build_cas.dependOn(&cas_instance_runner_install.step);
     build_cas.dependOn(&cas_install.step);
+
+    addBenchStep(
+        b,
+        cas_budget_perf,
+        "bench-cas-budget-governor",
+        "Run budget_governor performance harness",
+    );
+
+    _ = addTestStep(
+        b,
+        cas_budget_governor_root,
+        "test-cas-budget-governor",
+        "Run budget_governor tests",
+    );
 
     const build_cron = b.step("build-cron", "Build cron binaries");
     build_cron.dependOn(&cron_install.step);
@@ -212,4 +296,30 @@ fn addRunStep(
 
     const run_step = b.step(step_name, description);
     run_step.dependOn(&run_cmd.step);
+}
+
+fn addBenchStep(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    step_name: []const u8,
+    description: []const u8,
+) void {
+    const run_cmd = b.addRunArtifact(exe);
+    if (b.args) |args| run_cmd.addArgs(args);
+    const step = b.step(step_name, description);
+    step.dependOn(&run_cmd.step);
+}
+
+fn addTestStep(
+    b: *std.Build,
+    root_module: *std.Build.Module,
+    step_name: []const u8,
+    description: []const u8,
+) *std.Build.Step.Run {
+    const tests = b.addTest(.{ .root_module = root_module });
+    const run_tests = b.addRunArtifact(tests);
+    if (b.args) |args| run_tests.addArgs(args);
+    const step = b.step(step_name, description);
+    step.dependOn(&run_tests.step);
+    return run_tests;
 }
