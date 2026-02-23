@@ -1,9 +1,16 @@
 const std = @import("std");
+const core_cli = @import("core_cli");
 
 pub fn isHelpRequested(argv: []const []const u8) bool {
     if (argv.len <= 1) return false;
     const arg = argv[1];
-    return std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h");
+    return core_cli.isHelpArg(arg);
+}
+
+pub fn isVersionRequested(argv: []const []const u8) bool {
+    if (argv.len <= 1) return false;
+    const arg = argv[1];
+    return core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg);
 }
 
 pub const DelegateRuntime = enum {
@@ -15,15 +22,23 @@ pub fn runDelegatedCli(
     allocator: std.mem.Allocator,
     argv: []const []const u8,
     usage_text: []const u8,
+    version_text: []const u8,
     source_file: []const u8,
     skill_name: []const u8,
     script_name: []const u8,
     runtime: DelegateRuntime,
 ) !void {
-    if (isHelpRequested(argv)) {
+    if (argv.len <= 1 or isHelpRequested(argv)) {
         var stdout_writer = std.fs.File.stdout().writer(&.{});
         const stdout = &stdout_writer.interface;
-        try stdout.print("{s}\n", .{usage_text});
+        try core_cli.printHelpWithVersion(stdout, usage_text, version_text);
+        return;
+    }
+
+    if (isVersionRequested(argv)) {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try core_cli.printVersion(stdout, version_text);
         return;
     }
 
@@ -167,6 +182,20 @@ test "isHelpRequested recognizes flags" {
 
     const argv_other = [_][]const u8{ "x", "--version" };
     try std.testing.expect(!isHelpRequested(&argv_other));
+}
+
+test "isVersionRequested recognizes flags and subcommand" {
+    const argv_long = [_][]const u8{ "x", "--version" };
+    try std.testing.expect(isVersionRequested(&argv_long));
+
+    const argv_short = [_][]const u8{ "x", "-V" };
+    try std.testing.expect(isVersionRequested(&argv_short));
+
+    const argv_subcommand = [_][]const u8{ "x", "version" };
+    try std.testing.expect(isVersionRequested(&argv_subcommand));
+
+    const argv_other = [_][]const u8{ "x", "--help" };
+    try std.testing.expect(!isVersionRequested(&argv_other));
 }
 
 test "resolveScriptPath returns ScriptNotFound for unknown script" {

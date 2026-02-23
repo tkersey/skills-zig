@@ -19,16 +19,30 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const core_cli = b.createModule(.{
+        .root_source_file = b.path("libs/core/src/cli_helpers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const core_delegate = b.createModule(.{
         .root_source_file = b.path("libs/core/src/delegate_helpers.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_cli", .module = core_cli },
+        },
     });
     const core_perf = b.createModule(.{
         .root_source_file = b.path("libs/core/src/perf_helpers.zig"),
         .target = target,
         .optimize = optimize,
     });
+    const seq_meta = addVersionModule(b, @embedFile("apps/seq/VERSION"));
+    const lift_meta = addVersionModule(b, @embedFile("apps/lift/VERSION"));
+    const cas_meta = addVersionModule(b, @embedFile("apps/cas/VERSION"));
+    const cron_meta = addVersionModule(b, @embedFile("apps/cron/VERSION"));
+    const puff_meta = addVersionModule(b, @embedFile("apps/puff/VERSION"));
+    const learnings_meta = addVersionModule(b, @embedFile("apps/learnings/VERSION"));
 
     const seq_root = b.createModule(.{
         .root_source_file = b.path("apps/seq/src/main.zig"),
@@ -36,12 +50,18 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core_path", .module = core_path },
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = seq_meta },
         },
     });
     const seq_perf_root = b.createModule(.{
         .root_source_file = b.path("apps/seq/src/perf_harness.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = seq_meta },
+        },
     });
     const lift_bench_root = b.createModule(.{
         .root_source_file = b.path("apps/lift/scripts/bench_stats.zig"),
@@ -49,6 +69,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core_io", .module = core_io },
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = lift_meta },
         },
     });
     const lift_report_root = b.createModule(.{
@@ -57,6 +79,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core_io", .module = core_io },
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = lift_meta },
         },
     });
     const lift_bench_perf_root = b.createModule(.{
@@ -66,6 +90,8 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "core_io", .module = core_io },
             .{ .name = "core_perf", .module = core_perf },
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = lift_meta },
         },
     });
     const cas_smoke_root = b.createModule(.{
@@ -74,6 +100,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core_json", .module = core_json },
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = cas_meta },
         },
     });
     const cas_runner_root = b.createModule(.{
@@ -82,6 +110,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core_json", .module = core_json },
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = cas_meta },
         },
     });
     const cas_budget_governor_root = b.createModule(.{
@@ -91,6 +121,8 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "core_json", .module = core_json },
             .{ .name = "core_io", .module = core_io },
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = cas_meta },
         },
     });
     const cas_budget_perf_root = b.createModule(.{
@@ -101,6 +133,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_json", .module = core_json },
             .{ .name = "core_io", .module = core_io },
             .{ .name = "core_perf", .module = core_perf },
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = cas_meta },
         },
     });
     const cas_root = b.createModule(.{
@@ -109,6 +143,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core_delegate", .module = core_delegate },
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = cas_meta },
         },
     });
     const cron_root = b.createModule(.{
@@ -117,6 +153,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core_delegate", .module = core_delegate },
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = cron_meta },
         },
     });
     const puff_root = b.createModule(.{
@@ -125,6 +163,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core_delegate", .module = core_delegate },
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = puff_meta },
         },
     });
     const learnings_root = b.createModule(.{
@@ -133,6 +173,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core_delegate", .module = core_delegate },
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = learnings_meta },
         },
     });
     const append_learning_root = b.createModule(.{
@@ -141,6 +183,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core_delegate", .module = core_delegate },
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = learnings_meta },
         },
     });
 
@@ -322,4 +366,10 @@ fn addTestStep(
     const step = b.step(step_name, description);
     step.dependOn(&run_tests.step);
     return run_tests;
+}
+
+fn addVersionModule(b: *std.Build, raw_version: []const u8) *std.Build.Module {
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", std.mem.trim(u8, raw_version, " \t\r\n"));
+    return options.createModule();
 }

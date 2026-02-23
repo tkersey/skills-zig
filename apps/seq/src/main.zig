@@ -1,16 +1,23 @@
 const std = @import("std");
 const lib = @import("lib.zig");
 const commands = @import("commands/mod.zig");
+const core_cli = @import("core_cli");
+const app_meta = @import("app_meta");
+
+const Version = core_cli.normalizeVersion(app_meta.version);
 
 fn shouldIgnoreWriteError(err: anyerror) bool {
     return err == error.WriteFailed or err == error.BrokenPipe;
 }
 
 fn printCommandList(stdout: anytype) !void {
-    try stdout.print("seq bootstrap ready. commands:\n", .{});
+    try stdout.print("seq\n", .{});
+    try stdout.print("Version: {s}\n", .{Version});
+    try stdout.print("Commands:\n", .{});
     for (lib.commandNames()) |def| {
         try stdout.print("- {s}\n", .{def.name});
     }
+    try stdout.writeAll("\nUse: seq <command> [options]\n");
 }
 
 fn writeIntegerSequence(stdout: anytype, start: i64, step: i64, last: i64) !void {
@@ -70,6 +77,10 @@ fn runMain() !void {
 
     if (lib.isHelpArg(arg)) {
         try printCommandList(stdout);
+        return;
+    }
+    if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
+        try core_cli.printVersion(stdout, Version);
         return;
     }
 

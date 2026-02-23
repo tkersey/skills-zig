@@ -1,6 +1,27 @@
 const std = @import("std");
 const governor = @import("budget_governor.zig");
 const core_perf = @import("core_perf");
+const core_cli = @import("core_cli");
+const app_meta = @import("app_meta");
+
+const Version = core_cli.normalizeVersion(app_meta.version);
+const UsageText =
+    \\perf_budget_governor.zig
+    \\
+    \\Performance harness for budget_governor.
+    \\
+    \\Usage:
+    \\  cas-perf-budget-governor [options]
+    \\
+    \\Options:
+    \\  --config PATH               Override config file path.
+    \\  --artifact PATH             Read/write benchmark artifact.
+    \\  --trend-tolerance-pct N     Override trend tolerance percent.
+    \\  --report-only               Skip failure gates.
+    \\  --help                      Show help.
+    \\  --version                   Show version.
+    \\  version                     Show version.
+;
 
 const PerfConfig = struct {
     iterations: usize = 20_000,
@@ -73,6 +94,10 @@ pub fn main() !void {
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
 
+    const argv = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, argv);
+    if (try core_cli.handleDefaultHelpAndVersion(argv, UsageText, Version)) return;
+
     var cli = try parseCliOptions(allocator);
     defer freeCliOptions(allocator, &cli);
 
@@ -123,6 +148,18 @@ fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
     _ = args.next();
 
     while (args.next()) |arg| {
+        if (core_cli.isHelpArg(arg)) {
+            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            const stdout = &stdout_writer.interface;
+            try core_cli.printHelpWithVersion(stdout, UsageText, Version);
+            std.process.exit(0);
+        }
+        if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
+            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            const stdout = &stdout_writer.interface;
+            try core_cli.printVersion(stdout, Version);
+            std.process.exit(0);
+        }
         if (std.mem.eql(u8, arg, "--config")) {
             const path = args.next() orelse return error.MissingConfigPath;
             allocator.free(out.config_path);

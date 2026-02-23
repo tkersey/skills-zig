@@ -1,9 +1,12 @@
 const std = @import("std");
 const core_delegate = @import("core_delegate");
+const core_cli = @import("core_cli");
+const app_meta = @import("app_meta");
 
 const SourceFile = "learnings.zig";
 const SkillName = "learnings";
 const ScriptName = "learnings.py";
+const Version = core_cli.normalizeVersion(app_meta.version);
 
 const UsageText =
     \\learnings.zig
@@ -16,6 +19,10 @@ const UsageText =
     \\  1. ${CODEX_HOME:-$HOME/.codex}/skills/learnings/scripts/learnings.py
     \\  2. ${CLAUDE_HOME:-$HOME/.claude}/skills/learnings/scripts/learnings.py
     \\  3. /Users/tk/.dotfiles/codex/skills/learnings/scripts/learnings.py
+    \\
+    \\Options:
+    \\  -h, --help                        Show help.
+    \\  -V, --version | version           Show version.
 ;
 
 pub fn main() !void {
@@ -30,6 +37,7 @@ pub fn main() !void {
         allocator,
         argv,
         UsageText,
+        Version,
         SourceFile,
         SkillName,
         ScriptName,

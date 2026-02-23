@@ -13,6 +13,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const core_cli = b.createModule(.{
+        .root_source_file = b.path("../../libs/core/src/cli_helpers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const seq_meta = addVersionModule(b, @embedFile("VERSION"));
 
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -20,6 +26,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core_path", .module = core_path },
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = seq_meta },
         },
     });
 
@@ -43,6 +51,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core_path", .module = core_path },
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = seq_meta },
         },
     });
 
@@ -58,6 +68,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/perf_harness.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = seq_meta },
+        },
     });
 
     const perf_exe = b.addExecutable(.{
@@ -79,6 +93,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core_perf", .module = core_perf },
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = seq_meta },
         },
     });
 
@@ -94,4 +110,10 @@ pub fn build(b: *std.Build) void {
 
     const parser_bench_step = b.step("bench-parser", "Run token parser performance harness");
     parser_bench_step.dependOn(&parser_perf_run.step);
+}
+
+fn addVersionModule(b: *std.Build, raw_version: []const u8) *std.Build.Module {
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", std.mem.trim(u8, raw_version, " \t\r\n"));
+    return options.createModule();
 }

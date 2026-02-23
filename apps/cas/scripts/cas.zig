@@ -1,5 +1,9 @@
 const std = @import("std");
 const delegate = @import("core_delegate");
+const core_cli = @import("core_cli");
+const app_meta = @import("app_meta");
+
+const Version = core_cli.normalizeVersion(app_meta.version);
 
 const UsageText =
     \\cas.zig
@@ -19,6 +23,7 @@ const UsageText =
     \\
     \\Options:
     \\  --help                              Show this help.
+    \\  --version | version                 Show version.
 ;
 
 pub fn main() !void {
@@ -27,24 +32,25 @@ pub fn main() !void {
     const allocator = arena.allocator();
 
     const argv = try std.process.argsAlloc(allocator);
-    if (argv.len <= 1) {
-        var stderr_writer = std.fs.File.stderr().writer(&.{});
-        const stderr = &stderr_writer.interface;
-        try stderr.print("Missing subcommand\n{s}\n", .{UsageText});
-        std.process.exit(2);
-    }
-
-    if (delegate.isHelpRequested(argv) or std.mem.eql(u8, argv[1], "help")) {
+    if (argv.len <= 1 or delegate.isHelpRequested(argv) or std.mem.eql(u8, argv[1], "help")) {
         var stdout_writer = std.fs.File.stdout().writer(&.{});
         const stdout = &stdout_writer.interface;
-        try stdout.print("{s}\n", .{UsageText});
+        try core_cli.printHelpWithVersion(stdout, UsageText, Version);
+        return;
+    }
+
+    if (delegate.isVersionRequested(argv)) {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try core_cli.printVersion(stdout, Version);
         return;
     }
 
     const target_name = resolveTarget(argv[1]) orelse {
         var stderr_writer = std.fs.File.stderr().writer(&.{});
         const stderr = &stderr_writer.interface;
-        try stderr.print("Unknown subcommand: {s}\n{s}\n", .{ argv[1], UsageText });
+        try stderr.print("Unknown subcommand: {s}\n", .{argv[1]});
+        try core_cli.printHelpWithVersion(stderr, UsageText, Version);
         std.process.exit(2);
     };
 

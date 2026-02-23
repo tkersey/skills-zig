@@ -84,7 +84,7 @@ jobs:
         with:
           version: 0.15.2
       - name: Fuzz seq (Linux)
-        run: ../../.github/scripts/linux_fuzz_gate.sh -- zig test --dep core_path -Mroot=src/tests.zig -Mcore_path=../../libs/core/src/path_helpers.zig -ffuzz --test-filter "fuzz "
+        run: ../../.github/scripts/linux_fuzz_gate.sh -- zig test --dep core_path --dep core_cli -Mroot=src/tests.zig -Mcore_path=../../libs/core/src/path_helpers.zig -Mcore_cli=../../libs/core/src/cli_helpers.zig -ffuzz --test-filter "fuzz "
 
   lift:
     needs: changes
@@ -113,7 +113,7 @@ jobs:
         with:
           version: 0.15.2
       - name: Fuzz lift bench_stats (Linux)
-        run: .github/scripts/linux_fuzz_gate.sh -- zig test --dep core_io -Mroot=apps/lift/scripts/bench_stats.zig -Mcore_io=libs/core/src/io_helpers.zig -ffuzz --test-filter "fuzz "
+        run: .github/scripts/linux_fuzz_gate.sh -- zig test --dep core_io --dep core_cli -Mroot=apps/lift/scripts/bench_stats.zig -Mcore_io=libs/core/src/io_helpers.zig -Mcore_cli=libs/core/src/cli_helpers.zig -ffuzz --test-filter "fuzz "
 
   cas:
     needs: changes
@@ -142,7 +142,7 @@ jobs:
         with:
           version: 0.15.2
       - name: Fuzz CAS budget governor (Linux)
-        run: .github/scripts/linux_fuzz_gate.sh -- zig test --dep core_json --dep core_io -Mroot=apps/cas/scripts/budget_governor.zig -Mcore_json=libs/core/src/json_helpers.zig -Mcore_io=libs/core/src/io_helpers.zig -ffuzz --test-filter "fuzz governor"
+        run: .github/scripts/linux_fuzz_gate.sh -- zig test --dep core_json --dep core_io --dep core_cli -Mroot=apps/cas/scripts/budget_governor.zig -Mcore_json=libs/core/src/json_helpers.zig -Mcore_io=libs/core/src/io_helpers.zig -Mcore_cli=libs/core/src/cli_helpers.zig -ffuzz --test-filter "fuzz governor"
 
   cron:
     needs: changes

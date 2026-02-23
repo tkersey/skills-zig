@@ -1,5 +1,9 @@
 const std = @import("std");
 const core_io = @import("core_io");
+const core_cli = @import("core_cli");
+const app_meta = @import("app_meta");
+
+const Version = core_cli.normalizeVersion(app_meta.version);
 
 const UsageText =
     \\bench_stats.zig
@@ -16,6 +20,8 @@ const UsageText =
     \\  --all          Parse all numbers in each line (default: first only)
     \\  --json         Emit JSON (numbers stay unformatted)
     \\  --help         Show help
+    \\  --version      Show version
+    \\  version        Show version
 ;
 
 const Config = struct {
@@ -33,6 +39,8 @@ pub fn main() !void {
 
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
+
+    if (try core_cli.handleDefaultHelpAndVersion(argv, UsageText, Version)) return;
 
     var cfg = try parseArgs(argv);
     if (cfg.input_path != null and cfg.input_path.?.len == 0) cfg.input_path = null;
@@ -107,8 +115,16 @@ fn parseArgs(argv: []const []const u8) !Config {
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
-        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            try core_io.writeToStreamAllowBrokenPipe(std.fs.File.stderr(), UsageText ++ "\n");
+        if (core_cli.isHelpArg(arg)) {
+            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            const stdout = &stdout_writer.interface;
+            try core_cli.printHelpWithVersion(stdout, UsageText, Version);
+            std.process.exit(0);
+        }
+        if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
+            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            const stdout = &stdout_writer.interface;
+            try core_cli.printVersion(stdout, Version);
             std.process.exit(0);
         }
         if (std.mem.eql(u8, arg, "--input")) {

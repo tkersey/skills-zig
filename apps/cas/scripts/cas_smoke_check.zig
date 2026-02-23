@@ -1,5 +1,9 @@
 const std = @import("std");
 const cas = @import("cas_proxy_client.zig");
+const core_cli = @import("core_cli");
+const app_meta = @import("app_meta");
+
+const Version = core_cli.normalizeVersion(app_meta.version);
 
 const UsageText =
     \\cas_smoke_check.zig
@@ -18,6 +22,8 @@ const UsageText =
     \\  --opt-out-notification-method M  Suppress notification method (repeatable).
     \\  --json                           Emit machine-readable JSON report.
     \\  --help                           Show this help.
+    \\  --version                        Show version.
+    \\  version                          Show version.
 ;
 
 const CheckResult = struct {
@@ -33,6 +39,7 @@ const ParsedArgs = struct {
     opt_out_methods: []const []const u8 = &.{},
     json: bool = false,
     show_help: bool = false,
+    show_version: bool = false,
 };
 
 pub fn main() !void {
@@ -40,17 +47,28 @@ pub fn main() !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const parsed = parseArgs(allocator) catch |err| {
+    const argv = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, argv);
+    if (try core_cli.handleDefaultHelpAndVersion(argv, UsageText, Version)) return;
+
+    const parsed = parseArgs(allocator, argv) catch |err| {
         var stderr_writer = std.fs.File.stderr().writer(&.{});
         const stderr = &stderr_writer.interface;
-        try stderr.print("{s}\n{s}\n", .{@errorName(err), UsageText});
+        try stderr.print("{s}\n{s}\n", .{ @errorName(err), UsageText });
         return;
     };
 
+    if (parsed.show_version) {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try core_cli.printVersion(stdout, Version);
+        return;
+    }
+
     if (parsed.show_help) {
-        var stderr_writer = std.fs.File.stderr().writer(&.{});
-        const stderr = &stderr_writer.interface;
-        try stderr.print("{s}\n", .{UsageText});
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try core_cli.printHelpWithVersion(stdout, UsageText, Version);
         return;
     }
 
@@ -250,17 +268,19 @@ pub fn main() !void {
     std.process.exit(if (overall_ok) 0 else 1);
 }
 
-fn parseArgs(allocator: std.mem.Allocator) !ParsedArgs {
-    const argv = try std.process.argsAlloc(allocator);
-
+fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs {
     var out = ParsedArgs{};
     var methods: std.ArrayList([]const u8) = .empty;
 
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
-        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+        if (core_cli.isHelpArg(arg)) {
             out.show_help = true;
+            continue;
+        }
+        if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
+            out.show_version = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "--json")) {

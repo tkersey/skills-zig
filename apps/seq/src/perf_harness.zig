@@ -1,6 +1,24 @@
 const std = @import("std");
 const query = @import("query/engine.zig");
 const spec = @import("types/spec.zig");
+const core_cli = @import("core_cli");
+const app_meta = @import("app_meta");
+
+const Version = core_cli.normalizeVersion(app_meta.version);
+const UsageText =
+    \\perf_harness.zig
+    \\
+    \\Frozen workload harness for seq query engine.
+    \\
+    \\Usage:
+    \\  seq-perf [options]
+    \\
+    \\Options:
+    \\  --config PATH   Config file path (default: perf/frozen/workload_config.json)
+    \\  --help          Show help
+    \\  --version       Show version
+    \\  version         Show version
+;
 
 const WorkloadConfig = struct {
     rows: usize = 12000,
@@ -11,6 +29,10 @@ pub fn main() !void {
     var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
+
+    const argv = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, argv);
+    if (try core_cli.handleDefaultHelpAndVersion(argv, UsageText, Version)) return;
 
     const config_path = try parseConfigPath(allocator);
     defer allocator.free(config_path);
@@ -60,6 +82,18 @@ fn parseConfigPath(allocator: std.mem.Allocator) ![]u8 {
     _ = args.next();
 
     while (args.next()) |arg| {
+        if (core_cli.isHelpArg(arg)) {
+            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            const stdout = &stdout_writer.interface;
+            try core_cli.printHelpWithVersion(stdout, UsageText, Version);
+            std.process.exit(0);
+        }
+        if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
+            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            const stdout = &stdout_writer.interface;
+            try core_cli.printVersion(stdout, Version);
+            std.process.exit(0);
+        }
         if (std.mem.eql(u8, arg, "--config")) {
             const path = args.next() orelse return error.MissingConfigPath;
             return allocator.dupe(u8, path);
