@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-seq-${{ github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   release:
     strategy:
@@ -47,7 +51,29 @@ jobs:
         with:
           name: ${{ env.TAR_NAME }}
           path: ${{ env.TAR_NAME }}
-      - name: Publish seq release asset
+          if-no-files-found: error
+          overwrite: false
+
+  publish:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download seq release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ github.ref_name }}-*.tar.gz
+          path: release-assets
+          merge-multiple: true
+      - name: Verify seq artifact set
+        run: |
+          set -euo pipefail
+          count="$(find release-assets -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d '[:space:]')"
+          if [ "${count}" -ne 2 ]; then
+            echo "Expected 2 release archives, got ${count}" >&2
+            exit 1
+          fi
+      - name: Publish seq release assets
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.TAR_NAME }}
+          fail_on_unmatched_files: true
+          files: release-assets/*.tar.gz
