@@ -10,7 +10,15 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            runs_on: ubuntu-latest
+          - target: darwin-arm64
+            runs_on: macos-14
+    runs-on: ${{ matrix.runs_on }}
     steps:
       - uses: actions/checkout@v4
       - name: Validate puff tag matches VERSION
@@ -27,7 +35,7 @@ jobs:
         run: zig build build-puff -Doptimize=ReleaseFast
       - name: Package puff artifact
         run: |
-          TAR_NAME="${GITHUB_REF_NAME}-linux-x86_64.tar.gz"
+          TAR_NAME="${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
           echo "TAR_NAME=${TAR_NAME}" >> "$GITHUB_ENV"
           mkdir -p dist/puff
           cp zig-out/bin/puff dist/puff/puff

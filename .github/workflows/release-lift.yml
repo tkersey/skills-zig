@@ -10,7 +10,15 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            runs_on: ubuntu-latest
+          - target: darwin-arm64
+            runs_on: macos-14
+    runs-on: ${{ matrix.runs_on }}
     steps:
       - uses: actions/checkout@v4
       - name: Validate tag matches apps/lift/VERSION
@@ -30,14 +38,14 @@ jobs:
           mkdir -p dist/lift
           cp zig-out/bin/bench_stats dist/lift/lift-bench-stats
           cp zig-out/bin/perf_report dist/lift/lift-perf-report
-          TAR_NAME="${GITHUB_REF_NAME}-linux-x86_64.tar.gz"
+          TAR_NAME="${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
           tar -czf "${TAR_NAME}" -C dist/lift .
       - name: Upload lift workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ github.ref_name }}-linux-x86_64.tar.gz
-          path: ${{ github.ref_name }}-linux-x86_64.tar.gz
+          name: ${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          path: ${{ github.ref_name }}-${{ matrix.target }}.tar.gz
       - name: Publish lift release asset
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ github.ref_name }}-linux-x86_64.tar.gz
+          files: ${{ github.ref_name }}-${{ matrix.target }}.tar.gz

@@ -10,7 +10,15 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            runs_on: ubuntu-latest
+          - target: darwin-arm64
+            runs_on: macos-14
+    runs-on: ${{ matrix.runs_on }}
     steps:
       - uses: actions/checkout@v4
       - name: Validate tag matches apps/seq/VERSION
@@ -22,7 +30,7 @@ jobs:
             exit 1
           fi
       - name: Set tarball name
-        run: echo "TAR_NAME=${GITHUB_REF_NAME}-linux-x86_64.tar.gz" >> "$GITHUB_ENV"
+        run: echo "TAR_NAME=${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" >> "$GITHUB_ENV"
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
