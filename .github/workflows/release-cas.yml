@@ -38,6 +38,7 @@ jobs:
           TAR_NAME="${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
           echo "TAR_NAME=${TAR_NAME}" >> "$GITHUB_ENV"
           mkdir -p dist/cas
+          cp zig-out/bin/cas dist/cas/cas
           cp zig-out/bin/cas_smoke_check dist/cas/cas-smoke-check
           cp zig-out/bin/cas_instance_runner dist/cas/cas-instance-runner
           tar -czf "${TAR_NAME}" -C dist/cas .
