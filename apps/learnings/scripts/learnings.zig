@@ -1,29 +1,218 @@
 const std = @import("std");
-const core_delegate = @import("core_delegate");
 const core_cli = @import("core_cli");
 const app_meta = @import("app_meta");
+const seq_bundle = @import("seq_bundle");
+const query_engine = seq_bundle.query_engine;
+const query_output = seq_bundle.query_output;
+const query_spec = seq_bundle.query_spec;
 
-const SourceFile = "learnings.zig";
-const SkillName = "learnings";
-const ScriptName = "learnings.py";
 const Version = core_cli.normalizeVersion(app_meta.version);
+const ProgramName = "learnings.py";
 
 const UsageText =
     \\learnings.zig
     \\
     \\Marker: learnings.zig
-    \\Delegates non-help invocations to:
-    \\  uv run python <resolved learnings.py>
     \\
-    \\Resolution order:
-    \\  1. ${CODEX_HOME:-$HOME/.codex}/skills/learnings/scripts/learnings.py
-    \\  2. ${CLAUDE_HOME:-$HOME/.claude}/skills/learnings/scripts/learnings.py
-    \\  3. /Users/tk/.dotfiles/codex/skills/learnings/scripts/learnings.py
+    \\usage: learnings.py [-h] [--path PATH] {datasets,dataset-schema,query,recent,recall,codify-candidates} ...
     \\
-    \\Options:
-    \\  -h, --help                        Show help.
-    \\  -V, --version | version           Show version.
+    \\Mine, recall, and promote records from repo-root .learnings.jsonl.
+    \\
+    \\positional arguments:
+    \\  {datasets,dataset-schema,query,recent,recall,codify-candidates}
+    \\    datasets            List datasets
+    \\    dataset-schema      Show dataset schema
+    \\    query               Run a JSON spec query
+    \\    recent              Show most recent learnings
+    \\    recall              Rank relevant learnings for a task
+    \\    codify-candidates   Suggest repeated/high-impact learnings to promote into durable docs
+    \\
+    \\options:
+    \\  -h, --help            show this help message and exit
+    \\  --path PATH           Path to learnings JSONL file (relative to repo root by default)
+    \\  -V, --version         Show version
+    \\  version               Show version
 ;
+
+const LearningsFields = [_][]const u8{
+    "id",
+    "captured_at",
+    "day",
+    "week",
+    "month",
+    "status",
+    "learning",
+    "learning_snippet",
+    "application",
+    "source",
+    "fingerprint",
+    "repo",
+    "branch",
+    "tags_text",
+    "tags_count",
+    "paths_text",
+    "paths_count",
+    "evidence_text",
+    "evidence_count",
+    "related_ids_text",
+    "supersedes_id",
+    "text",
+};
+
+const LearningPathsFields = [_][]const u8{
+    "id",
+    "captured_at",
+    "day",
+    "week",
+    "month",
+    "status",
+    "repo",
+    "branch",
+    "path",
+    "fingerprint",
+    "source",
+};
+
+const LearningTagsFields = [_][]const u8{
+    "id",
+    "captured_at",
+    "day",
+    "week",
+    "month",
+    "status",
+    "repo",
+    "branch",
+    "tag",
+    "fingerprint",
+    "source",
+};
+
+const STOPWORDS = [_][]const u8{
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "because",
+    "but",
+    "by",
+    "for",
+    "from",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "no",
+    "not",
+    "of",
+    "on",
+    "or",
+    "over",
+    "so",
+    "such",
+    "that",
+    "the",
+    "their",
+    "then",
+    "there",
+    "these",
+    "this",
+    "to",
+    "too",
+    "up",
+    "was",
+    "were",
+    "when",
+    "with",
+};
+
+const TOOL_KEYWORDS = [_][]const u8{
+    "git",
+    "gh",
+    "uv",
+    "pytest",
+    "ruff",
+    "mypy",
+    "zig",
+    "go",
+    "npm",
+    "bun",
+    "docker",
+    "make",
+    "ci",
+    "pre_commit",
+    "precommit",
+};
+
+const StatusBoost = struct {
+    status: []const u8,
+    value: f64,
+};
+
+const STATUS_BOOSTS = [_]StatusBoost{
+    .{ .status = "codify_now", .value = 0.30 },
+    .{ .status = "avoid_for_now", .value = 0.25 },
+    .{ .status = "do_less", .value = 0.15 },
+    .{ .status = "do_more", .value = 0.15 },
+    .{ .status = "investigate_more", .value = 0.10 },
+    .{ .status = "review_later", .value = -0.05 },
+};
+
+const Command = enum {
+    datasets,
+    dataset_schema,
+    query,
+    recent,
+    recall,
+    codify_candidates,
+};
+
+const Args = struct {
+    path: []const u8 = ".learnings.jsonl",
+    command: ?Command = null,
+    dataset: ?[]const u8 = null,
+    spec: ?[]const u8 = null,
+    limit: usize = 0,
+    query: ?[]const u8 = null,
+    paths: []const u8 = "",
+    format: []const u8 = "table",
+    drop_superseded: bool = false,
+    min_count: usize = 3,
+};
+
+const RecallCandidate = struct {
+    row_index: usize,
+    score: f64,
+    overlap: usize,
+    jaccard: f64,
+    tool_match: f64,
+    path_match: f64,
+};
+
+const CodifyCandidate = struct {
+    score: f64,
+    count: usize,
+    last_seen: []const u8,
+    status: []const u8,
+    theme: []u8,
+    learning: []u8,
+
+    fn deinit(self: *CodifyCandidate, allocator: std.mem.Allocator) void {
+        allocator.free(self.last_seen);
+        allocator.free(self.status);
+        allocator.free(self.theme);
+        allocator.free(self.learning);
+    }
+};
+
+const DateParts = struct {
+    year: i32,
+    month: i32,
+    day: i32,
+};
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -33,14 +222,1848 @@ pub fn main() !void {
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
 
-    try core_delegate.runDelegatedCli(
-        allocator,
-        argv,
-        UsageText,
-        Version,
-        SourceFile,
-        SkillName,
-        ScriptName,
-        .uv_python,
-    );
+    if (argv.len <= 1) {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try core_cli.printHelpWithVersion(stdout, UsageText, Version);
+        return;
+    }
+
+    if (core_cli.isHelpArg(argv[1])) {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try core_cli.printHelpWithVersion(stdout, UsageText, Version);
+        return;
+    }
+    if (core_cli.isVersionArg(argv[1]) or core_cli.isVersionSubcommand(argv[1])) {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try core_cli.printVersion(stdout, Version);
+        return;
+    }
+
+    const parsed = parseArgs(argv) catch |err| {
+        printParseError(err, argv);
+    };
+
+    const cwd = try std.process.getCwdAlloc(allocator);
+    defer allocator.free(cwd);
+    const repo_root = try discoverRepoRootAlloc(allocator, cwd);
+    defer allocator.free(repo_root);
+    const jsonl_path = try resolveJsonlPathAlloc(allocator, repo_root, parsed.path);
+    defer allocator.free(jsonl_path);
+
+    switch (parsed.command orelse unreachable) {
+        .datasets => try cmdDatasets(allocator),
+        .dataset_schema => try cmdDatasetSchema(allocator, parsed.dataset.?),
+        .query => try cmdQuery(allocator, repo_root, jsonl_path, parsed.spec.?),
+        .recent => try cmdRecent(allocator, repo_root, jsonl_path, if (parsed.limit == 0) 20 else parsed.limit),
+        .recall => try cmdRecall(
+            allocator,
+            repo_root,
+            jsonl_path,
+            parsed.query.?,
+            parsed.paths,
+            if (parsed.limit == 0) 8 else parsed.limit,
+            parsed.format,
+            parsed.drop_superseded,
+        ),
+        .codify_candidates => try cmdCodifyCandidates(
+            allocator,
+            repo_root,
+            jsonl_path,
+            if (parsed.limit == 0) 20 else parsed.limit,
+            parsed.min_count,
+            parsed.format,
+            parsed.drop_superseded,
+        ),
+    }
+}
+
+fn parseArgs(argv: []const []const u8) !Args {
+    var args = Args{};
+    var i: usize = 1;
+
+    while (i < argv.len) : (i += 1) {
+        const arg = argv[i];
+        if (std.mem.eql(u8, arg, "--path")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingPathValue;
+            args.path = argv[i];
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "datasets")) {
+            args.command = .datasets;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "dataset-schema")) {
+            args.command = .dataset_schema;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "query")) {
+            args.command = .query;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "recent")) {
+            args.command = .recent;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "recall")) {
+            args.command = .recall;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "codify-candidates")) {
+            args.command = .codify_candidates;
+            continue;
+        }
+
+        if (args.command == null) return error.MissingCommand;
+
+        switch (args.command.?) {
+            .dataset_schema => {
+                if (std.mem.eql(u8, arg, "--dataset")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingDatasetValue;
+                    args.dataset = argv[i];
+                    continue;
+                }
+                return error.InvalidDatasetSchemaArg;
+            },
+            .query => {
+                if (std.mem.eql(u8, arg, "--spec")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingSpecValue;
+                    args.spec = argv[i];
+                    continue;
+                }
+                return error.InvalidQueryArg;
+            },
+            .recent => {
+                if (std.mem.eql(u8, arg, "--limit")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingLimitValue;
+                    args.limit = try parsePositiveInt(argv[i]);
+                    continue;
+                }
+                return error.InvalidRecentArg;
+            },
+            .recall => {
+                if (std.mem.eql(u8, arg, "--query")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingQueryValue;
+                    args.query = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--paths")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingPathsValue;
+                    args.paths = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--limit")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingLimitValue;
+                    args.limit = try parsePositiveInt(argv[i]);
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--format")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingFormatValue;
+                    args.format = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--drop-superseded")) {
+                    args.drop_superseded = true;
+                    continue;
+                }
+                return error.InvalidRecallArg;
+            },
+            .codify_candidates => {
+                if (std.mem.eql(u8, arg, "--min-count")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingMinCountValue;
+                    args.min_count = try parsePositiveInt(argv[i]);
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--limit")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingLimitValue;
+                    args.limit = try parsePositiveInt(argv[i]);
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--format")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingFormatValue;
+                    args.format = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--drop-superseded")) {
+                    args.drop_superseded = true;
+                    continue;
+                }
+                return error.InvalidCodifyArg;
+            },
+            .datasets => return error.InvalidDatasetsArg,
+        }
+    }
+
+    if (args.command == null) return error.MissingCommand;
+    switch (args.command.?) {
+        .dataset_schema => if (args.dataset == null) return error.MissingDatasetValue,
+        .query => if (args.spec == null) return error.MissingSpecValue,
+        .recall => if (args.query == null) return error.MissingQueryValue,
+        else => {},
+    }
+
+    return args;
+}
+
+fn printParseError(err: anyerror, argv: []const []const u8) noreturn {
+    _ = argv;
+    var stderr_writer = std.fs.File.stderr().writer(&.{});
+    const stderr = &stderr_writer.interface;
+
+    switch (err) {
+        error.MissingCommand => {
+            stderr.print("error: missing command\n", .{}) catch {};
+        },
+        error.MissingPathValue => {
+            stderr.print("error: argument --path: expected one argument\n", .{}) catch {};
+        },
+        error.MissingDatasetValue => {
+            stderr.print("error: argument --dataset: expected one argument\n", .{}) catch {};
+        },
+        error.MissingSpecValue => {
+            stderr.print("error: argument --spec: expected one argument\n", .{}) catch {};
+        },
+        error.MissingLimitValue => {
+            stderr.print("error: argument --limit: expected one argument\n", .{}) catch {};
+        },
+        error.MissingQueryValue => {
+            stderr.print("error: argument --query: expected one argument\n", .{}) catch {};
+        },
+        error.MissingPathsValue => {
+            stderr.print("error: argument --paths: expected one argument\n", .{}) catch {};
+        },
+        error.MissingMinCountValue => {
+            stderr.print("error: argument --min-count: expected one argument\n", .{}) catch {};
+        },
+        error.MissingFormatValue => {
+            stderr.print("error: argument --format: expected one argument\n", .{}) catch {};
+        },
+        error.InvalidPositiveInt => {
+            stderr.print("error: expected non-negative integer\n", .{}) catch {};
+        },
+        error.InvalidDatasetsArg,
+        error.InvalidDatasetSchemaArg,
+        error.InvalidQueryArg,
+        error.InvalidRecentArg,
+        error.InvalidRecallArg,
+        error.InvalidCodifyArg,
+        => {
+            stderr.print("error: invalid arguments\n", .{}) catch {};
+        },
+        else => {
+            stderr.print("error: {s}\n", .{@errorName(err)}) catch {};
+        },
+    }
+
+    stderr.print("{s}\n", .{UsageText}) catch {};
+    std.process.exit(2);
+}
+
+fn parsePositiveInt(text: []const u8) !usize {
+    const value = std.fmt.parseInt(i64, text, 10) catch return error.InvalidPositiveInt;
+    if (value < 0) return error.InvalidPositiveInt;
+    return @intCast(value);
+}
+
+fn cmdDatasets(allocator: std.mem.Allocator) !void {
+    var rows: std.ArrayList(query_engine.Row) = .empty;
+    defer {
+        for (rows.items) |*row| row.deinit();
+        rows.deinit(allocator);
+    }
+
+    try appendDatasetRow(allocator, &rows, "learnings", "Learning records from .learnings.jsonl (1 row per record)");
+    try appendDatasetRow(allocator, &rows, "learning_paths", "Exploded context.paths (1 row per record-path)");
+    try appendDatasetRow(allocator, &rows, "learning_tags", "Exploded tags (1 row per record-tag)");
+
+    const cols = [_][]const u8{ "dataset", "description" };
+    const rendered = try query_output.render(allocator, .table, rows.items, cols[0..]);
+    defer allocator.free(rendered);
+
+    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    try stdout_writer.interface.writeAll(rendered);
+}
+
+fn appendDatasetRow(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayList(query_engine.Row),
+    dataset: []const u8,
+    description: []const u8,
+) !void {
+    var row = query_engine.Row.init(allocator);
+    errdefer row.deinit();
+
+    try row.putOwnedKey("dataset", .{ .string = dataset });
+    try row.putOwnedKey("description", .{ .string = description });
+
+    try rows.append(allocator, row);
+}
+
+fn cmdDatasetSchema(allocator: std.mem.Allocator, dataset: []const u8) !void {
+    _ = allocator;
+    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    const stdout = &stdout_writer.interface;
+
+    if (std.mem.eql(u8, dataset, "learnings")) {
+        try stdout.print("Dataset: learnings\n", .{});
+        try stdout.print("Description: Learning records from .learnings.jsonl (1 row per record)\n", .{});
+        try stdout.print("Fields:\n", .{});
+        for (LearningsFields) |field| {
+            try stdout.print("- {s}\n", .{field});
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, dataset, "learning_paths")) {
+        try stdout.print("Dataset: learning_paths\n", .{});
+        try stdout.print("Description: Exploded context.paths (1 row per record-path)\n", .{});
+        try stdout.print("Fields:\n", .{});
+        for (LearningPathsFields) |field| {
+            try stdout.print("- {s}\n", .{field});
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, dataset, "learning_tags")) {
+        try stdout.print("Dataset: learning_tags\n", .{});
+        try stdout.print("Description: Exploded tags (1 row per record-tag)\n", .{});
+        try stdout.print("Fields:\n", .{});
+        for (LearningTagsFields) |field| {
+            try stdout.print("- {s}\n", .{field});
+        }
+        return;
+    }
+
+    try stdout.print("Unknown dataset: {s}\n", .{dataset});
+}
+
+fn cmdQuery(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    jsonl_path: []const u8,
+    spec_arg: []const u8,
+) !void {
+    const spec_json = parseJsonArgAlloc(allocator, repo_root, spec_arg) catch |err| {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try stdout.print("Invalid --spec JSON: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer allocator.free(spec_json);
+
+    var parsed_spec_value = std.json.parseFromSlice(std.json.Value, allocator, spec_json, .{}) catch {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try stdout.print("Spec must be a JSON object.\n", .{});
+        return;
+    };
+    defer parsed_spec_value.deinit();
+
+    const root = switch (parsed_spec_value.value) {
+        .object => |obj| obj,
+        else => {
+            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            const stdout = &stdout_writer.interface;
+            try stdout.print("Spec must be a JSON object.\n", .{});
+            return;
+        },
+    };
+
+    const dataset_name = switch (root.get("dataset") orelse .null) {
+        .string => |value| value,
+        else => {
+            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            const stdout = &stdout_writer.interface;
+            try stdout.print("Spec must include dataset (string).\n", .{});
+            return;
+        },
+    };
+
+    const format = blk: {
+        if (root.get("format")) |fmt_value| {
+            const fmt_text = switch (fmt_value) {
+                .string => |value| value,
+                else => {
+                    var stdout_writer = std.fs.File.stdout().writer(&.{});
+                    const stdout = &stdout_writer.interface;
+                    try stdout.print("Spec format must be one of: table, json, csv, jsonl.\n", .{});
+                    return;
+                },
+            };
+            break :blk query_output.Format.parse(fmt_text) catch {
+                var stdout_writer = std.fs.File.stdout().writer(&.{});
+                const stdout = &stdout_writer.interface;
+                try stdout.print("Spec format must be one of: table, json, csv, jsonl.\n", .{});
+                return;
+            };
+        }
+
+        const group_by = switch (root.get("group_by") orelse .null) {
+            .array => |arr| arr.items.len,
+            else => 0,
+        };
+        break :blk if (group_by > 0) query_output.Format.table else query_output.Format.jsonl;
+    };
+
+    var rows = collectDatasetRows(allocator, jsonl_path, dataset_name) catch {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try stdout.print("Unknown dataset: {s}\n", .{dataset_name});
+        return;
+    };
+    defer {
+        for (rows.items) |*row| row.deinit();
+        rows.deinit(allocator);
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const query_spec_value = query_spec.parseQuerySpecValue(arena.allocator(), parsed_spec_value.value) catch |err| {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try stdout.print("Invalid --spec JSON: {s}\n", .{@errorName(err)});
+        return;
+    };
+
+    var result = try query_engine.execute(allocator, rows.items, query_spec_value);
+    defer result.deinit(allocator);
+
+    const columns_opt: ?[]const []const u8 = if (query_spec_value.select.len > 0)
+        query_spec_value.select
+    else
+        null;
+
+    const rendered = try query_output.render(allocator, format, result.rows.items, columns_opt);
+    defer allocator.free(rendered);
+
+    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    try stdout_writer.interface.writeAll(rendered);
+}
+
+fn cmdRecent(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    jsonl_path: []const u8,
+    limit: usize,
+) !void {
+    _ = repo_root;
+    var rows = try collectDatasetRows(allocator, jsonl_path, "learnings");
+    defer {
+        for (rows.items) |*row| row.deinit();
+        rows.deinit(allocator);
+    }
+
+    std.mem.sort(query_engine.Row, rows.items, {}, lessRecentRows);
+
+    const capped = if (limit > 0 and rows.items.len > limit) rows.items[0..limit] else rows.items;
+
+    var out_rows: std.ArrayList(query_engine.Row) = .empty;
+    defer {
+        for (out_rows.items) |*row| row.deinit();
+        out_rows.deinit(allocator);
+    }
+
+    for (capped) |row| {
+        var out = query_engine.Row.init(allocator);
+        errdefer out.deinit();
+
+        try out.putOwnedKey("captured_at", valueAsScalarString(row.valueOrNull("captured_at")));
+        try out.putOwnedKey("status", valueAsScalarString(row.valueOrNull("status")));
+
+        const learning = rowString(row, "learning");
+        const tags = rowString(row, "tags_text");
+        const paths = rowString(row, "paths_text");
+
+        const learning_short = try shortenAlloc(allocator, learning, 120);
+        defer allocator.free(learning_short);
+        const tags_short = try shortenAlloc(allocator, tags, 30);
+        defer allocator.free(tags_short);
+        const paths_short = try shortenAlloc(allocator, paths, 40);
+        defer allocator.free(paths_short);
+
+        try out.putOwnedKey("learning", .{ .string = learning_short });
+        try out.putOwnedKey("tags", .{ .string = tags_short });
+        try out.putOwnedKey("paths", .{ .string = paths_short });
+
+        try out_rows.append(allocator, out);
+    }
+
+    const cols = [_][]const u8{ "captured_at", "status", "learning", "tags", "paths" };
+    const rendered = try query_output.render(allocator, .table, out_rows.items, cols[0..]);
+    defer allocator.free(rendered);
+
+    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    try stdout_writer.interface.writeAll(rendered);
+}
+
+fn cmdRecall(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    jsonl_path: []const u8,
+    query_text: []const u8,
+    raw_paths: []const u8,
+    limit: usize,
+    format_text: []const u8,
+    drop_superseded: bool,
+) !void {
+    _ = repo_root;
+
+    if (std.mem.trim(u8, query_text, " \t\r\n").len == 0) {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try stdout.print("error: --query is required\n", .{});
+        return;
+    }
+
+    var rows = try collectDatasetRows(allocator, jsonl_path, "learnings");
+    defer {
+        for (rows.items) |*row| row.deinit();
+        rows.deinit(allocator);
+    }
+
+    if (rows.items.len == 0) {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try stdout.print("(no learnings file at {s})\n", .{jsonl_path});
+        return;
+    }
+
+    var superseded = std.StringHashMap(void).init(allocator);
+    defer deinitOwnedStringSet(allocator, &superseded);
+
+    for (rows.items) |row| {
+        const supersedes_id = rowString(row, "supersedes_id");
+        if (supersedes_id.len == 0) continue;
+        const key = try allocator.dupe(u8, supersedes_id);
+        errdefer allocator.free(key);
+        if (superseded.contains(key)) {
+            allocator.free(key);
+            continue;
+        }
+        try superseded.put(key, {});
+    }
+
+    var query_tokens = try tokenizeSet(allocator, query_text);
+    defer deinitOwnedStringSet(allocator, &query_tokens);
+
+    var query_tool_tokens = std.StringHashMap(void).init(allocator);
+    defer deinitOwnedStringSet(allocator, &query_tool_tokens);
+
+    var it_q = query_tokens.iterator();
+    while (it_q.next()) |entry| {
+        if (isToolKeyword(entry.key_ptr.*)) {
+            const key = try allocator.dupe(u8, entry.key_ptr.*);
+            errdefer allocator.free(key);
+            if (query_tool_tokens.contains(key)) {
+                allocator.free(key);
+            } else {
+                try query_tool_tokens.put(key, {});
+            }
+        }
+    }
+
+    var path_hints: std.ArrayList([]u8) = .empty;
+    defer freeOwnedStringList(allocator, &path_hints);
+
+    try appendPathHintsFromCsv(allocator, &path_hints, raw_paths);
+    try appendPathHintsFromQuery(allocator, &path_hints, query_text);
+
+    const now_sec = std.time.timestamp();
+
+    var candidates: std.ArrayList(RecallCandidate) = .empty;
+    defer candidates.deinit(allocator);
+
+    for (rows.items, 0..) |row, row_index| {
+        const row_id = rowString(row, "id");
+        if (drop_superseded and row_id.len > 0 and superseded.contains(row_id)) continue;
+
+        const learning = rowString(row, "learning");
+        const application = rowString(row, "application");
+        const tags_text = rowString(row, "tags_text");
+        var evidence_text = rowString(row, "evidence_text");
+        if (std.mem.eql(u8, evidence_text, "none_provided")) {
+            evidence_text = "";
+        }
+
+        var match_text: std.ArrayList(u8) = .empty;
+        defer match_text.deinit(allocator);
+        try appendJoinText(allocator, &match_text, learning);
+        try appendJoinText(allocator, &match_text, application);
+        try appendJoinText(allocator, &match_text, tags_text);
+        try appendJoinText(allocator, &match_text, evidence_text);
+
+        var record_tokens = try tokenizeSet(allocator, match_text.items);
+        defer deinitOwnedStringSet(allocator, &record_tokens);
+
+        const overlap = intersectionCount(&query_tokens, &record_tokens);
+        const union_count = unionCount(&query_tokens, &record_tokens, overlap);
+        const jaccard = if (union_count == 0) 0.0 else @as(f64, @floatFromInt(overlap)) / @as(f64, @floatFromInt(union_count));
+
+        const tool_match: f64 = if (hasIntersection(&query_tool_tokens, &record_tokens)) 1.0 else 0.0;
+
+        const paths_text = rowString(row, "paths_text");
+        const path_match: f64 = if (containsAnyHint(paths_text, path_hints.items)) 1.0 else 0.0;
+
+        if (overlap == 0 and tool_match == 0.0 and path_match == 0.0) continue;
+
+        const captured_at = rowString(row, "captured_at");
+        const recency = blk: {
+            if (captured_at.len == 0) break :blk 0.0;
+            if (parseIsoTimestampSeconds(captured_at)) |captured_sec| {
+                const delta = @as(f64, @floatFromInt(@max(now_sec - captured_sec, 0)));
+                const age_days = delta / 86_400.0;
+                break :blk std.math.exp(-(age_days / 45.0));
+            }
+            break :blk 0.0;
+        };
+
+        const status_boost = statusBoost(rowString(row, "status"));
+        const success_boost: f64 = if (evidence_text.len > 0) 0.5 else 0.0;
+
+        const score =
+            (3.0 * jaccard) +
+            (1.5 * path_match) +
+            (1.0 * tool_match) +
+            (1.0 * recency) +
+            (0.5 * success_boost) +
+            status_boost;
+
+        try candidates.append(allocator, .{
+            .row_index = row_index,
+            .score = score,
+            .overlap = overlap,
+            .jaccard = jaccard,
+            .tool_match = tool_match,
+            .path_match = path_match,
+        });
+    }
+
+    std.mem.sort(RecallCandidate, candidates.items, rows.items, lessRecallCandidate);
+
+    var kept: std.ArrayList(RecallCandidate) = .empty;
+    defer kept.deinit(allocator);
+
+    var theme_counts = std.StringHashMap(usize).init(allocator);
+    defer deinitOwnedStringMapValues(allocator, &theme_counts);
+
+    for (candidates.items) |candidate| {
+        const row = rows.items[candidate.row_index];
+        const theme = try computeThemeAlloc(allocator, rowString(row, "tags_text"), rowString(row, "learning"));
+        defer allocator.free(theme);
+
+        var allow = true;
+        if (theme.len > 0) {
+            if (theme_counts.get(theme)) |count| {
+                if (count >= 2) {
+                    allow = false;
+                } else {
+                    const owned = try allocator.dupe(u8, theme);
+                    _ = owned;
+                }
+            }
+            if (allow) {
+                if (theme_counts.getEntry(theme)) |entry| {
+                    entry.value_ptr.* += 1;
+                } else {
+                    const owned_theme = try allocator.dupe(u8, theme);
+                    errdefer allocator.free(owned_theme);
+                    try theme_counts.put(owned_theme, 1);
+                }
+            }
+        }
+
+        if (!allow) continue;
+
+        try kept.append(allocator, candidate);
+        if (limit > 0 and kept.items.len >= limit) break;
+    }
+
+    if (kept.items.len == 0 and limit > 0 and candidates.items.len > 0) {
+        try kept.append(allocator, candidates.items[0]);
+    }
+
+    if (std.ascii.eqlIgnoreCase(format_text, "json")) {
+        try renderRecallJson(allocator, rows.items, kept.items);
+        return;
+    }
+
+    try renderRecallTable(allocator, rows.items, kept.items);
+}
+
+fn cmdCodifyCandidates(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    jsonl_path: []const u8,
+    limit: usize,
+    min_count: usize,
+    format_text: []const u8,
+    drop_superseded: bool,
+) !void {
+    _ = repo_root;
+
+    var rows = try collectDatasetRows(allocator, jsonl_path, "learnings");
+    defer {
+        for (rows.items) |*row| row.deinit();
+        rows.deinit(allocator);
+    }
+
+    if (rows.items.len == 0) {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try stdout.print("(no learnings file at {s})\n", .{jsonl_path});
+        return;
+    }
+
+    var superseded = std.StringHashMap(void).init(allocator);
+    defer deinitOwnedStringSet(allocator, &superseded);
+
+    for (rows.items) |row| {
+        const supersedes_id = rowString(row, "supersedes_id");
+        if (supersedes_id.len == 0) continue;
+        const key = try allocator.dupe(u8, supersedes_id);
+        errdefer allocator.free(key);
+        if (superseded.contains(key)) {
+            allocator.free(key);
+            continue;
+        }
+        try superseded.put(key, {});
+    }
+
+    var active_indices: std.ArrayList(usize) = .empty;
+    defer active_indices.deinit(allocator);
+
+    for (rows.items, 0..) |row, idx| {
+        const row_id = rowString(row, "id");
+        if (drop_superseded and row_id.len > 0 and superseded.contains(row_id)) continue;
+        try active_indices.append(allocator, idx);
+    }
+
+    var groups = std.StringHashMap(std.ArrayList(usize)).init(allocator);
+    defer {
+        var it_groups = groups.iterator();
+        while (it_groups.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(allocator);
+        }
+        groups.deinit();
+    }
+
+    for (active_indices.items) |idx| {
+        const row = rows.items[idx];
+        const theme = try computeThemeAlloc(allocator, rowString(row, "learning"), rowString(row, "application"));
+        defer allocator.free(theme);
+
+        const key_value = if (theme.len == 0) "(untagged)" else theme;
+
+        if (groups.getEntry(key_value)) |entry| {
+            try entry.value_ptr.append(allocator, idx);
+        } else {
+            const key = try allocator.dupe(u8, key_value);
+            errdefer allocator.free(key);
+            var list: std.ArrayList(usize) = .empty;
+            errdefer list.deinit(allocator);
+            try list.append(allocator, idx);
+            try groups.put(key, list);
+        }
+    }
+
+    var results: std.ArrayList(CodifyCandidate) = .empty;
+    defer {
+        for (results.items) |*item| item.deinit(allocator);
+        results.deinit(allocator);
+    }
+
+    const now_sec = std.time.timestamp();
+
+    var it = groups.iterator();
+    while (it.next()) |entry| {
+        const theme = entry.key_ptr.*;
+        const list = entry.value_ptr.*;
+        if (list.items.len == 0) continue;
+
+        var rep_idx = list.items[0];
+        var saw_codify_now = false;
+        var max_impact: f64 = 0.0;
+
+        for (list.items) |idx| {
+            const row = rows.items[idx];
+            const captured = rowString(row, "captured_at");
+            const rep_captured = rowString(rows.items[rep_idx], "captured_at");
+            if (std.mem.order(u8, captured, rep_captured) == .gt) {
+                rep_idx = idx;
+            }
+
+            if (std.mem.eql(u8, rowString(row, "status"), "codify_now")) {
+                saw_codify_now = true;
+            }
+
+            const impact = impactScore(
+                rowString(row, "text"),
+                rowString(row, "status"),
+                rowString(row, "tags_text"),
+            );
+            if (impact > max_impact) max_impact = impact;
+        }
+
+        const count = list.items.len;
+        if (count < min_count and !saw_codify_now) continue;
+
+        const rep_row = rows.items[rep_idx];
+        const last_seen = rowString(rep_row, "captured_at");
+
+        const recency = blk: {
+            if (last_seen.len == 0) break :blk 0.0;
+            if (parseIsoTimestampSeconds(last_seen)) |captured_sec| {
+                const delta = @as(f64, @floatFromInt(@max(now_sec - captured_sec, 0)));
+                const age_days = delta / 86_400.0;
+                break :blk std.math.exp(-(age_days / 60.0));
+            }
+            break :blk 0.0;
+        };
+
+        const score = (@as(f64, @floatFromInt(count)) * 2.0) + (recency * 2.0) + max_impact;
+
+        const theme_short = try shortenAlloc(allocator, theme, 36);
+        const learning_short = try shortenAlloc(allocator, rowString(rep_row, "learning"), 120);
+
+        try results.append(allocator, .{
+            .score = score,
+            .count = count,
+            .last_seen = try allocator.dupe(u8, last_seen),
+            .status = try allocator.dupe(u8, rowString(rep_row, "status")),
+            .theme = theme_short,
+            .learning = learning_short,
+        });
+    }
+
+    std.mem.sort(CodifyCandidate, results.items, {}, lessCodifyCandidate);
+
+    const capped = if (limit > 0 and results.items.len > limit) results.items[0..limit] else results.items;
+
+    if (std.ascii.eqlIgnoreCase(format_text, "json")) {
+        try renderCodifyJson(allocator, capped);
+        return;
+    }
+
+    try renderCodifyTable(allocator, capped);
+}
+
+fn collectDatasetRows(
+    allocator: std.mem.Allocator,
+    jsonl_path: []const u8,
+    dataset_name: []const u8,
+) !std.ArrayList(query_engine.Row) {
+    if (std.mem.eql(u8, dataset_name, "learnings")) {
+        return collectLearningRows(allocator, jsonl_path);
+    }
+    if (std.mem.eql(u8, dataset_name, "learning_paths")) {
+        return collectLearningPathsRows(allocator, jsonl_path);
+    }
+    if (std.mem.eql(u8, dataset_name, "learning_tags")) {
+        return collectLearningTagsRows(allocator, jsonl_path);
+    }
+    return error.UnknownDataset;
+}
+
+fn collectLearningRows(
+    allocator: std.mem.Allocator,
+    jsonl_path: []const u8,
+) !std.ArrayList(query_engine.Row) {
+    var rows: std.ArrayList(query_engine.Row) = .empty;
+
+    const file = std.fs.openFileAbsolute(jsonl_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return rows,
+        else => return err,
+    };
+    defer file.close();
+
+    const data = try file.readToEndAlloc(allocator, 64 * 1024 * 1024);
+    defer allocator.free(data);
+
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r\n");
+        if (line.len == 0) continue;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+        defer parsed.deinit();
+
+        const obj = switch (parsed.value) {
+            .object => |value| value,
+            else => continue,
+        };
+
+        var row = query_engine.Row.init(allocator);
+        errdefer row.deinit();
+
+        const captured_at = jsonObjectString(obj, "captured_at");
+        const status = jsonObjectString(obj, "status");
+        const learning = jsonObjectString(obj, "learning");
+        const application = jsonObjectString(obj, "application");
+        const source = jsonObjectString(obj, "source");
+        const fingerprint = jsonObjectString(obj, "fingerprint");
+        const supersedes_id = jsonObjectString(obj, "supersedes_id");
+
+        const evidence = jsonArrayStringsAlloc(allocator, obj.get("evidence"));
+        defer freeOwnedSlice(allocator, evidence);
+        const tags = jsonArrayStringsAlloc(allocator, obj.get("tags"));
+        defer freeOwnedSlice(allocator, tags);
+        const related_ids = jsonArrayStringsAlloc(allocator, obj.get("related_ids"));
+        defer freeOwnedSlice(allocator, related_ids);
+
+        var repo: []u8 = &.{};
+        var branch: []u8 = &.{};
+        var paths = std.ArrayList([]u8).empty;
+        defer freeOwnedStringList(allocator, &paths);
+
+        if (obj.get("context")) |context_value| {
+            if (context_value == .object) {
+                const context = context_value.object;
+                repo = try allocator.dupe(u8, jsonObjectString(context, "repo"));
+                branch = try allocator.dupe(u8, jsonObjectString(context, "branch"));
+                paths = jsonArrayStringsListAlloc(allocator, context.get("paths")) catch .empty;
+            }
+        }
+        defer allocator.free(repo);
+        defer allocator.free(branch);
+
+        const evidence_text = try joinLinesAlloc(allocator, evidence);
+        defer allocator.free(evidence_text);
+        const tags_text = try joinCsvAlloc(allocator, tags);
+        defer allocator.free(tags_text);
+        const paths_text = try joinCsvAlloc(allocator, paths.items);
+        defer allocator.free(paths_text);
+        const related_ids_text = try joinCsvAlloc(allocator, related_ids);
+        defer allocator.free(related_ids_text);
+
+        const day = dayLabel(captured_at);
+        const week = try weekLabelAlloc(allocator, captured_at);
+        defer allocator.free(week);
+        const month = monthLabel(captured_at);
+
+        var text_builder: std.ArrayList(u8) = .empty;
+        defer text_builder.deinit(allocator);
+        try appendJoinText(allocator, &text_builder, learning);
+        try appendJoinText(allocator, &text_builder, application);
+        try appendJoinText(allocator, &text_builder, evidence_text);
+        try appendJoinText(allocator, &text_builder, tags_text);
+        try appendJoinText(allocator, &text_builder, paths_text);
+
+        const learning_snippet = try shortenAlloc(allocator, learning, 160);
+        defer allocator.free(learning_snippet);
+
+        try row.putOwnedKey("id", valueAsScalarString(.{ .string = jsonObjectString(obj, "id") }));
+        try row.putOwnedKey("captured_at", .{ .string = captured_at });
+        try row.putOwnedKey("day", .{ .string = day });
+        try row.putOwnedKey("week", .{ .string = week });
+        try row.putOwnedKey("month", .{ .string = month });
+        try row.putOwnedKey("status", .{ .string = status });
+        try row.putOwnedKey("learning", .{ .string = learning });
+        try row.putOwnedKey("learning_snippet", .{ .string = learning_snippet });
+        try row.putOwnedKey("application", .{ .string = application });
+        try row.putOwnedKey("source", .{ .string = source });
+        try row.putOwnedKey("fingerprint", .{ .string = fingerprint });
+        try row.putOwnedKey("repo", .{ .string = repo });
+        try row.putOwnedKey("branch", .{ .string = branch });
+        try row.putOwnedKey("tags_text", .{ .string = tags_text });
+        try row.putOwnedKey("tags_count", .{ .int = @intCast(tags.len) });
+        try row.putOwnedKey("paths_text", .{ .string = paths_text });
+        try row.putOwnedKey("paths_count", .{ .int = @intCast(paths.items.len) });
+        try row.putOwnedKey("evidence_text", .{ .string = evidence_text });
+        try row.putOwnedKey("evidence_count", .{ .int = @intCast(evidence.len) });
+        try row.putOwnedKey("related_ids_text", .{ .string = related_ids_text });
+        try row.putOwnedKey("supersedes_id", .{ .string = supersedes_id });
+        try row.putOwnedKey("text", .{ .string = text_builder.items });
+
+        try rows.append(allocator, row);
+    }
+
+    return rows;
+}
+
+fn collectLearningPathsRows(
+    allocator: std.mem.Allocator,
+    jsonl_path: []const u8,
+) !std.ArrayList(query_engine.Row) {
+    var learnings = try collectLearningRows(allocator, jsonl_path);
+    defer {
+        for (learnings.items) |*row| row.deinit();
+        learnings.deinit(allocator);
+    }
+
+    var out: std.ArrayList(query_engine.Row) = .empty;
+
+    for (learnings.items) |row| {
+        const paths_text = rowString(row, "paths_text");
+        if (paths_text.len == 0) continue;
+
+        var parts = std.mem.splitScalar(u8, paths_text, ',');
+        while (parts.next()) |part| {
+            const path = std.mem.trim(u8, part, " \t\r\n");
+            if (path.len == 0) continue;
+
+            var out_row = query_engine.Row.init(allocator);
+            errdefer out_row.deinit();
+            try out_row.putOwnedKey("id", valueAsScalarString(row.valueOrNull("id")));
+            try out_row.putOwnedKey("captured_at", valueAsScalarString(row.valueOrNull("captured_at")));
+            try out_row.putOwnedKey("day", valueAsScalarString(row.valueOrNull("day")));
+            try out_row.putOwnedKey("week", valueAsScalarString(row.valueOrNull("week")));
+            try out_row.putOwnedKey("month", valueAsScalarString(row.valueOrNull("month")));
+            try out_row.putOwnedKey("status", valueAsScalarString(row.valueOrNull("status")));
+            try out_row.putOwnedKey("repo", valueAsScalarString(row.valueOrNull("repo")));
+            try out_row.putOwnedKey("branch", valueAsScalarString(row.valueOrNull("branch")));
+            try out_row.putOwnedKey("path", .{ .string = path });
+            try out_row.putOwnedKey("fingerprint", valueAsScalarString(row.valueOrNull("fingerprint")));
+            try out_row.putOwnedKey("source", valueAsScalarString(row.valueOrNull("source")));
+            try out.append(allocator, out_row);
+        }
+    }
+
+    return out;
+}
+
+fn collectLearningTagsRows(
+    allocator: std.mem.Allocator,
+    jsonl_path: []const u8,
+) !std.ArrayList(query_engine.Row) {
+    var learnings = try collectLearningRows(allocator, jsonl_path);
+    defer {
+        for (learnings.items) |*row| row.deinit();
+        learnings.deinit(allocator);
+    }
+
+    var out: std.ArrayList(query_engine.Row) = .empty;
+
+    for (learnings.items) |row| {
+        const tags_text = rowString(row, "tags_text");
+        if (tags_text.len == 0) continue;
+
+        var parts = std.mem.splitScalar(u8, tags_text, ',');
+        while (parts.next()) |part| {
+            const tag = std.mem.trim(u8, part, " \t\r\n");
+            if (tag.len == 0) continue;
+
+            var out_row = query_engine.Row.init(allocator);
+            errdefer out_row.deinit();
+            try out_row.putOwnedKey("id", valueAsScalarString(row.valueOrNull("id")));
+            try out_row.putOwnedKey("captured_at", valueAsScalarString(row.valueOrNull("captured_at")));
+            try out_row.putOwnedKey("day", valueAsScalarString(row.valueOrNull("day")));
+            try out_row.putOwnedKey("week", valueAsScalarString(row.valueOrNull("week")));
+            try out_row.putOwnedKey("month", valueAsScalarString(row.valueOrNull("month")));
+            try out_row.putOwnedKey("status", valueAsScalarString(row.valueOrNull("status")));
+            try out_row.putOwnedKey("repo", valueAsScalarString(row.valueOrNull("repo")));
+            try out_row.putOwnedKey("branch", valueAsScalarString(row.valueOrNull("branch")));
+            try out_row.putOwnedKey("tag", .{ .string = tag });
+            try out_row.putOwnedKey("fingerprint", valueAsScalarString(row.valueOrNull("fingerprint")));
+            try out_row.putOwnedKey("source", valueAsScalarString(row.valueOrNull("source")));
+            try out.append(allocator, out_row);
+        }
+    }
+
+    return out;
+}
+
+fn lessRecentRows(_: void, a: query_engine.Row, b: query_engine.Row) bool {
+    const a_ts = rowString(a, "captured_at");
+    const b_ts = rowString(b, "captured_at");
+    return std.mem.order(u8, a_ts, b_ts) == .gt;
+}
+
+fn lessRecallCandidate(rows: []const query_engine.Row, a: RecallCandidate, b: RecallCandidate) bool {
+    if (a.score != b.score) return a.score > b.score;
+    const a_ts = rowString(rows[a.row_index], "captured_at");
+    const b_ts = rowString(rows[b.row_index], "captured_at");
+    return std.mem.order(u8, a_ts, b_ts) == .lt;
+}
+
+fn lessCodifyCandidate(_: void, a: CodifyCandidate, b: CodifyCandidate) bool {
+    if (a.score != b.score) return a.score > b.score;
+    if (a.count != b.count) return a.count > b.count;
+    return std.mem.order(u8, a.last_seen, b.last_seen) == .gt;
+}
+
+fn renderRecallTable(
+    allocator: std.mem.Allocator,
+    rows: []const query_engine.Row,
+    kept: []const RecallCandidate,
+) !void {
+    var out_rows: std.ArrayList(query_engine.Row) = .empty;
+    defer {
+        for (out_rows.items) |*row| row.deinit();
+        out_rows.deinit(allocator);
+    }
+
+    for (kept) |candidate| {
+        const row = rows[candidate.row_index];
+        var out = query_engine.Row.init(allocator);
+        errdefer out.deinit();
+
+        const score_text = try std.fmt.allocPrint(allocator, "{d:.3}", .{candidate.score});
+        defer allocator.free(score_text);
+
+        const learning_short = try shortenAlloc(allocator, rowString(row, "learning"), 120);
+        defer allocator.free(learning_short);
+        const tags_short = try shortenAlloc(allocator, rowString(row, "tags_text"), 30);
+        defer allocator.free(tags_short);
+        const paths_short = try shortenAlloc(allocator, rowString(row, "paths_text"), 40);
+        defer allocator.free(paths_short);
+
+        try out.putOwnedKey("score", .{ .string = score_text });
+        try out.putOwnedKey("captured_at", valueAsScalarString(row.valueOrNull("captured_at")));
+        try out.putOwnedKey("status", valueAsScalarString(row.valueOrNull("status")));
+        try out.putOwnedKey("learning", .{ .string = learning_short });
+        try out.putOwnedKey("tags", .{ .string = tags_short });
+        try out.putOwnedKey("paths", .{ .string = paths_short });
+
+        try out_rows.append(allocator, out);
+    }
+
+    const cols = [_][]const u8{ "score", "captured_at", "status", "learning", "tags", "paths" };
+    const rendered = try query_output.render(allocator, .table, out_rows.items, cols[0..]);
+    defer allocator.free(rendered);
+
+    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    try stdout_writer.interface.writeAll(rendered);
+}
+
+fn renderRecallJson(
+    allocator: std.mem.Allocator,
+    rows: []const query_engine.Row,
+    kept: []const RecallCandidate,
+) !void {
+    var out_rows: std.ArrayList(query_engine.Row) = .empty;
+    defer {
+        for (out_rows.items) |*row| row.deinit();
+        out_rows.deinit(allocator);
+    }
+
+    for (kept) |candidate| {
+        const base = rows[candidate.row_index];
+        var out = try base.cloneAll(allocator);
+        errdefer out.deinit();
+        try out.putOwnedKey("score", .{ .float = candidate.score });
+        try out_rows.append(allocator, out);
+    }
+
+    const rendered = try query_output.render(allocator, .json, out_rows.items, null);
+    defer allocator.free(rendered);
+
+    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    try stdout_writer.interface.writeAll(rendered);
+}
+
+fn renderCodifyTable(
+    allocator: std.mem.Allocator,
+    items: []const CodifyCandidate,
+) !void {
+    var out_rows: std.ArrayList(query_engine.Row) = .empty;
+    defer {
+        for (out_rows.items) |*row| row.deinit();
+        out_rows.deinit(allocator);
+    }
+
+    for (items) |item| {
+        var out = query_engine.Row.init(allocator);
+        errdefer out.deinit();
+
+        try out.putOwnedKey("score", .{ .float = item.score });
+        try out.putOwnedKey("count", .{ .int = @intCast(item.count) });
+        try out.putOwnedKey("last_seen", .{ .string = item.last_seen });
+        try out.putOwnedKey("status", .{ .string = item.status });
+        try out.putOwnedKey("theme", .{ .string = item.theme });
+        try out.putOwnedKey("learning", .{ .string = item.learning });
+
+        try out_rows.append(allocator, out);
+    }
+
+    const cols = [_][]const u8{ "score", "count", "last_seen", "status", "theme", "learning" };
+    const rendered = try query_output.render(allocator, .table, out_rows.items, cols[0..]);
+    defer allocator.free(rendered);
+
+    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    try stdout_writer.interface.writeAll(rendered);
+}
+
+fn renderCodifyJson(
+    allocator: std.mem.Allocator,
+    items: []const CodifyCandidate,
+) !void {
+    var out_rows: std.ArrayList(query_engine.Row) = .empty;
+    defer {
+        for (out_rows.items) |*row| row.deinit();
+        out_rows.deinit(allocator);
+    }
+
+    for (items) |item| {
+        var out = query_engine.Row.init(allocator);
+        errdefer out.deinit();
+        try out.putOwnedKey("score", .{ .float = item.score });
+        try out.putOwnedKey("count", .{ .int = @intCast(item.count) });
+        try out.putOwnedKey("last_seen", .{ .string = item.last_seen });
+        try out.putOwnedKey("status", .{ .string = item.status });
+        try out.putOwnedKey("theme", .{ .string = item.theme });
+        try out.putOwnedKey("learning", .{ .string = item.learning });
+        try out_rows.append(allocator, out);
+    }
+
+    const rendered = try query_output.render(allocator, .json, out_rows.items, null);
+    defer allocator.free(rendered);
+
+    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    try stdout_writer.interface.writeAll(rendered);
+}
+
+fn appendJoinText(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    text: []const u8,
+) !void {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return;
+    if (out.items.len > 0) try out.append(allocator, '\n');
+    try out.appendSlice(allocator, trimmed);
+}
+
+fn containsAnyHint(paths_text: []const u8, hints: []const []u8) bool {
+    for (hints) |hint| {
+        if (hint.len == 0) continue;
+        if (std.mem.indexOf(u8, paths_text, hint) != null) return true;
+    }
+    return false;
+}
+
+fn statusBoost(status: []const u8) f64 {
+    for (STATUS_BOOSTS) |entry| {
+        if (std.mem.eql(u8, entry.status, status)) return entry.value;
+    }
+    return 0.0;
+}
+
+fn impactScore(text: []const u8, status: []const u8, tags_text: []const u8) f64 {
+    var score: f64 = 0.0;
+
+    if (std.mem.eql(u8, status, "codify_now")) score += 3.0;
+    if (std.mem.eql(u8, status, "avoid_for_now")) score += 2.0;
+
+    if (containsAny(tags_text, &.{ "security", "data_loss", "corruption", "invariant", "ci" })) score += 2.0;
+    if (containsAny(text, &.{ "data loss", "corrupt", "credential", "secret", "leak", "force", "--hard" })) score += 2.0;
+    if (containsAny(text, &.{ "pre-commit", "precommit", "flake", "flaky", "timeout", "loop" })) score += 1.0;
+
+    return score;
+}
+
+fn containsAny(haystack: []const u8, needles: []const []const u8) bool {
+    var lower_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer lower_arena.deinit();
+    const alloc = lower_arena.allocator();
+
+    const lowered = asciiLowerAlloc(alloc, haystack) catch return false;
+    for (needles) |needle| {
+        if (std.mem.indexOf(u8, lowered, needle) != null) return true;
+    }
+    return false;
+}
+
+fn isToolKeyword(token: []const u8) bool {
+    for (TOOL_KEYWORDS) |keyword| {
+        if (std.mem.eql(u8, keyword, token)) return true;
+    }
+    return false;
+}
+
+fn tokenizeSet(allocator: std.mem.Allocator, text: []const u8) !std.StringHashMap(void) {
+    var out = std.StringHashMap(void).init(allocator);
+    errdefer deinitOwnedStringSet(allocator, &out);
+
+    var token_buf: std.ArrayList(u8) = .empty;
+    defer token_buf.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const c = toLowerAscii(text[i]);
+        if (isAsciiLower(c) or std.ascii.isDigit(c)) {
+            try token_buf.append(allocator, c);
+            continue;
+        }
+
+        try flushToken(allocator, &out, &token_buf);
+    }
+    try flushToken(allocator, &out, &token_buf);
+
+    return out;
+}
+
+fn flushToken(
+    allocator: std.mem.Allocator,
+    set: *std.StringHashMap(void),
+    token_buf: *std.ArrayList(u8),
+) !void {
+    if (token_buf.items.len == 0) return;
+
+    const stemmed = try stemTokenAlloc(allocator, token_buf.items);
+    defer allocator.free(stemmed);
+
+    token_buf.clearRetainingCapacity();
+
+    if (stemmed.len <= 2) return;
+    if (isStopword(stemmed)) return;
+
+    const key = try allocator.dupe(u8, stemmed);
+    errdefer allocator.free(key);
+
+    if (set.contains(key)) {
+        allocator.free(key);
+        return;
+    }
+
+    try set.put(key, {});
+}
+
+fn stemTokenAlloc(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
+    if (token.len > 5 and std.mem.endsWith(u8, token, "ing")) return allocator.dupe(u8, token[0 .. token.len - 3]);
+    if (token.len > 4 and std.mem.endsWith(u8, token, "ed")) return allocator.dupe(u8, token[0 .. token.len - 2]);
+    if (token.len > 4 and std.mem.endsWith(u8, token, "es")) return allocator.dupe(u8, token[0 .. token.len - 2]);
+    if (token.len > 3 and std.mem.endsWith(u8, token, "s")) return allocator.dupe(u8, token[0 .. token.len - 1]);
+    return allocator.dupe(u8, token);
+}
+
+fn isStopword(token: []const u8) bool {
+    for (STOPWORDS) |word| {
+        if (std.mem.eql(u8, word, token)) return true;
+    }
+    return false;
+}
+
+fn intersectionCount(a: *const std.StringHashMap(void), b: *const std.StringHashMap(void)) usize {
+    var count: usize = 0;
+    var it = a.iterator();
+    while (it.next()) |entry| {
+        if (b.contains(entry.key_ptr.*)) count += 1;
+    }
+    return count;
+}
+
+fn hasIntersection(a: *const std.StringHashMap(void), b: *const std.StringHashMap(void)) bool {
+    var it = a.iterator();
+    while (it.next()) |entry| {
+        if (b.contains(entry.key_ptr.*)) return true;
+    }
+    return false;
+}
+
+fn unionCount(a: *const std.StringHashMap(void), b: *const std.StringHashMap(void), overlap: usize) usize {
+    return a.count() + b.count() - overlap;
+}
+
+fn appendPathHintsFromCsv(
+    allocator: std.mem.Allocator,
+    hints: *std.ArrayList([]u8),
+    csv: []const u8,
+) !void {
+    var parts = std.mem.splitScalar(u8, csv, ',');
+    while (parts.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        try appendUniqueHint(allocator, hints, trimmed);
+    }
+}
+
+fn appendPathHintsFromQuery(
+    allocator: std.mem.Allocator,
+    hints: *std.ArrayList([]u8),
+    query: []const u8,
+) !void {
+    var token_buf: std.ArrayList(u8) = .empty;
+    defer token_buf.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < query.len) : (i += 1) {
+        const c = query[i];
+        if (isPathTokenChar(c)) {
+            try token_buf.append(allocator, c);
+            continue;
+        }
+
+        try flushPathHintToken(allocator, hints, token_buf.items);
+        token_buf.clearRetainingCapacity();
+    }
+
+    try flushPathHintToken(allocator, hints, token_buf.items);
+}
+
+fn flushPathHintToken(
+    allocator: std.mem.Allocator,
+    hints: *std.ArrayList([]u8),
+    token: []const u8,
+) !void {
+    if (token.len < 3) return;
+    if (std.mem.indexOfScalar(u8, token, '/') == null and std.mem.indexOfScalar(u8, token, '.') == null) {
+        return;
+    }
+    try appendUniqueHint(allocator, hints, token);
+}
+
+fn appendUniqueHint(
+    allocator: std.mem.Allocator,
+    hints: *std.ArrayList([]u8),
+    hint: []const u8,
+) !void {
+    for (hints.items) |existing| {
+        if (std.mem.eql(u8, existing, hint)) return;
+    }
+    try hints.append(allocator, try allocator.dupe(u8, hint));
+}
+
+fn computeThemeAlloc(
+    allocator: std.mem.Allocator,
+    part_a: []const u8,
+    part_b: []const u8,
+) ![]u8 {
+    var combined: std.ArrayList(u8) = .empty;
+    defer combined.deinit(allocator);
+
+    if (part_a.len > 0) try combined.appendSlice(allocator, part_a);
+    if (part_b.len > 0) {
+        if (combined.items.len > 0) try combined.append(allocator, ' ');
+        try combined.appendSlice(allocator, part_b);
+    }
+
+    var tokens = try tokenizeSet(allocator, combined.items);
+    defer deinitOwnedStringSet(allocator, &tokens);
+
+    if (tokens.count() == 0) return allocator.dupe(u8, "");
+
+    var items: std.ArrayList([]const u8) = .empty;
+    defer items.deinit(allocator);
+
+    var it = tokens.iterator();
+    while (it.next()) |entry| {
+        try items.append(allocator, entry.key_ptr.*);
+    }
+
+    std.mem.sort([]const u8, items.items, {}, lessStringAsc);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    const take = @min(items.items.len, 6);
+    var idx: usize = 0;
+    while (idx < take) : (idx += 1) {
+        if (idx > 0) try out.append(allocator, ' ');
+        try out.appendSlice(allocator, items.items[idx]);
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn lessStringAsc(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
+}
+
+fn renderErrorLine(comptime fmt: []const u8, args: anytype) !void {
+    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.print(fmt, args);
+}
+
+fn parseJsonArgAlloc(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    arg: []const u8,
+) ![]u8 {
+    if (arg.len == 0) return error.InvalidSpec;
+    if (arg[0] != '@') return allocator.dupe(u8, arg);
+
+    const raw = arg[1..];
+    if (raw.len == 0) return error.InvalidSpec;
+
+    const path = if (std.fs.path.isAbsolute(raw))
+        try allocator.dupe(u8, raw)
+    else
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ repo_root, raw });
+    defer allocator.free(path);
+
+    return std.fs.cwd().readFileAlloc(allocator, path, 8 * 1024 * 1024);
+}
+
+fn valueAsScalarString(value: query_spec.Scalar) query_spec.Scalar {
+    return switch (value) {
+        .string => value,
+        .int => .{ .string = "" },
+        .float => .{ .string = "" },
+        .bool => .{ .string = "" },
+        .null => .{ .string = "" },
+    };
+}
+
+fn rowString(row: query_engine.Row, field: []const u8) []const u8 {
+    return switch (row.valueOrNull(field)) {
+        .string => |value| value,
+        else => "",
+    };
+}
+
+fn jsonObjectString(obj: std.json.ObjectMap, key: []const u8) []const u8 {
+    if (obj.get(key)) |value| {
+        return switch (value) {
+            .string => |text| text,
+            .number_string => |text| text,
+            else => "",
+        };
+    }
+    return "";
+}
+
+fn jsonArrayStringsAlloc(allocator: std.mem.Allocator, value_opt: ?std.json.Value) []const []u8 {
+    var out: std.ArrayList([]u8) = .empty;
+
+    if (value_opt) |value| {
+        if (value == .array) {
+            for (value.array.items) |item| {
+                const text = switch (item) {
+                    .string => |v| v,
+                    .number_string => |v| v,
+                    else => continue,
+                };
+                const duped = allocator.dupe(u8, text) catch continue;
+                out.append(allocator, duped) catch {
+                    allocator.free(duped);
+                    continue;
+                };
+            }
+        }
+    }
+
+    return out.toOwnedSlice(allocator) catch &.{};
+}
+
+fn jsonArrayStringsListAlloc(allocator: std.mem.Allocator, value_opt: ?std.json.Value) !std.ArrayList([]u8) {
+    var out: std.ArrayList([]u8) = .empty;
+
+    if (value_opt) |value| {
+        if (value == .array) {
+            for (value.array.items) |item| {
+                const text = switch (item) {
+                    .string => |v| v,
+                    .number_string => |v| v,
+                    else => continue,
+                };
+                try out.append(allocator, try allocator.dupe(u8, text));
+            }
+        }
+    }
+
+    return out;
+}
+
+fn joinLinesAlloc(allocator: std.mem.Allocator, items: []const []u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    for (items, 0..) |item, idx| {
+        if (idx > 0) try out.append(allocator, '\n');
+        try out.appendSlice(allocator, item);
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn joinCsvAlloc(allocator: std.mem.Allocator, items: []const []u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    for (items, 0..) |item, idx| {
+        if (idx > 0) try out.append(allocator, ',');
+        try out.appendSlice(allocator, item);
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn shortenAlloc(allocator: std.mem.Allocator, text: []const u8, max_len: usize) ![]u8 {
+    if (text.len <= max_len) return allocator.dupe(u8, text);
+    if (max_len <= 3) return allocator.dupe(u8, text[0..max_len]);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    try out.appendSlice(allocator, text[0 .. max_len - 3]);
+    try out.appendSlice(allocator, "...");
+    return out.toOwnedSlice(allocator);
+}
+
+fn dayLabel(captured_at: []const u8) []const u8 {
+    if (captured_at.len >= 10 and captured_at[4] == '-' and captured_at[7] == '-') {
+        return captured_at[0..10];
+    }
+    return "";
+}
+
+fn monthLabel(captured_at: []const u8) []const u8 {
+    if (captured_at.len >= 7 and captured_at[4] == '-') {
+        return captured_at[0..7];
+    }
+    return "";
+}
+
+fn weekLabelAlloc(allocator: std.mem.Allocator, captured_at: []const u8) ![]u8 {
+    const parts = parseDateParts(captured_at) orelse return allocator.dupe(u8, "");
+    const iso = isoWeek(parts.year, parts.month, parts.day);
+    return std.fmt.allocPrint(allocator, "{d}-W{d:0>2}", .{ iso.year, iso.week });
+}
+
+const IsoWeek = struct {
+    year: i32,
+    week: i32,
+};
+
+fn isoWeek(year: i32, month: i32, day: i32) IsoWeek {
+    const doy = dayOfYear(year, month, day);
+    const weekday = weekdayMon1(year, month, day);
+
+    var week = @divFloor(doy - weekday + 10, 7);
+    var week_year = year;
+
+    if (week < 1) {
+        week_year = year - 1;
+        week = isoWeeksInYear(week_year);
+    } else if (week > isoWeeksInYear(year)) {
+        week_year = year + 1;
+        week = 1;
+    }
+
+    return .{ .year = week_year, .week = week };
+}
+
+fn isLeapYear(year: i32) bool {
+    if (@mod(year, 400) == 0) return true;
+    if (@mod(year, 100) == 0) return false;
+    return @mod(year, 4) == 0;
+}
+
+fn dayOfYear(year: i32, month: i32, day: i32) i32 {
+    const month_days = [_]i32{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    var total: i32 = day;
+    var m: i32 = 1;
+    while (m < month) : (m += 1) {
+        total += month_days[@intCast(m - 1)];
+        if (m == 2 and isLeapYear(year)) total += 1;
+    }
+    return total;
+}
+
+fn weekdayMon1(year: i32, month: i32, day: i32) i32 {
+    const offsets = [_]i32{ 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+    var y = year;
+    if (month < 3) y -= 1;
+    const weekday_sun0 = @mod(y + @divFloor(y, 4) - @divFloor(y, 100) + @divFloor(y, 400) + offsets[@intCast(month - 1)] + day, 7);
+    return if (weekday_sun0 == 0) 7 else weekday_sun0;
+}
+
+fn isoWeeksInYear(year: i32) i32 {
+    const jan1_weekday = weekdayMon1(year, 1, 1);
+    if (jan1_weekday == 4) return 53;
+    if (jan1_weekday == 3 and isLeapYear(year)) return 53;
+    return 52;
+}
+
+fn parseDateParts(captured_at: []const u8) ?DateParts {
+    if (captured_at.len < 10) return null;
+    if (!(captured_at[4] == '-' and captured_at[7] == '-')) return null;
+
+    const year = std.fmt.parseInt(i32, captured_at[0..4], 10) catch return null;
+    const month = std.fmt.parseInt(i32, captured_at[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(i32, captured_at[8..10], 10) catch return null;
+
+    if (month < 1 or month > 12) return null;
+    if (day < 1 or day > 31) return null;
+
+    return .{ .year = year, .month = month, .day = day };
+}
+
+fn parseIsoTimestampSeconds(timestamp: []const u8) ?i64 {
+    if (timestamp.len < 19) return null;
+    if (!(timestamp[4] == '-' and timestamp[7] == '-' and timestamp[10] == 'T' and timestamp[13] == ':' and timestamp[16] == ':')) {
+        return null;
+    }
+
+    const year = std.fmt.parseInt(i64, timestamp[0..4], 10) catch return null;
+    const month = std.fmt.parseInt(i64, timestamp[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(i64, timestamp[8..10], 10) catch return null;
+    const hour = std.fmt.parseInt(i64, timestamp[11..13], 10) catch return null;
+    const minute = std.fmt.parseInt(i64, timestamp[14..16], 10) catch return null;
+    const second = std.fmt.parseInt(i64, timestamp[17..19], 10) catch return null;
+
+    const days = daysFromCivil(year, month, day);
+    return (days * 86_400) + (hour * 3600) + (minute * 60) + second;
+}
+
+fn daysFromCivil(year_in: i64, month_in: i64, day: i64) i64 {
+    var year = year_in;
+    const month = month_in;
+
+    year -= if (month <= 2) 1 else 0;
+    const era = @divFloor(if (year >= 0) year else year - 399, 400);
+    const yoe = year - era * 400;
+    const mp = month + (if (month > 2) @as(i64, -3) else @as(i64, 9));
+    const doy = @divFloor(153 * mp + 2, 5) + day - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146_097 + doe - 719_468;
+}
+
+fn discoverRepoRootAlloc(allocator: std.mem.Allocator, start: []const u8) ![]u8 {
+    const out = try runGitAlloc(allocator, start, &.{ "rev-parse", "--show-toplevel" });
+    defer allocator.free(out);
+
+    const trimmed = std.mem.trim(u8, out, " \t\r\n");
+    if (trimmed.len == 0) return allocator.dupe(u8, start);
+    return allocator.dupe(u8, trimmed);
+}
+
+fn resolveJsonlPathAlloc(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    raw_path: []const u8,
+) ![]u8 {
+    const effective = if (raw_path.len == 0) ".learnings.jsonl" else raw_path;
+    if (std.fs.path.isAbsolute(effective)) return allocator.dupe(u8, effective);
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ repo_root, effective });
+}
+
+fn runGitAlloc(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    args: []const []const u8,
+) ![]u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+
+    try argv.append(allocator, "git");
+    try argv.appendSlice(allocator, args);
+
+    var child = std.process.Child.init(argv.items, allocator);
+    child.cwd = cwd;
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    try child.spawn();
+
+    const stdout_data = try child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024);
+    const stderr_data = try child.stderr.?.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(stderr_data);
+
+    const term = try child.wait();
+    switch (term) {
+        .Exited => |code| {
+            if (code != 0) {
+                allocator.free(stdout_data);
+                return error.GitCommandFailed;
+            }
+        },
+        else => {
+            allocator.free(stdout_data);
+            return error.GitCommandFailed;
+        },
+    }
+
+    return stdout_data;
+}
+
+fn toLowerAscii(c: u8) u8 {
+    return if (c >= 'A' and c <= 'Z') c + 32 else c;
+}
+
+fn isAsciiLower(c: u8) bool {
+    return c >= 'a' and c <= 'z';
+}
+
+fn isPathTokenChar(c: u8) bool {
+    return isAsciiLower(toLowerAscii(c)) or std.ascii.isDigit(c) or c == '_' or c == '.' or c == '/' or c == '-';
+}
+
+fn asciiLowerAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    const out = try allocator.alloc(u8, text.len);
+    for (text, 0..) |char, idx| {
+        out[idx] = toLowerAscii(char);
+    }
+    return out;
+}
+
+fn freeOwnedSlice(allocator: std.mem.Allocator, items: []const []u8) void {
+    for (items) |item| allocator.free(item);
+    allocator.free(items);
+}
+
+fn freeOwnedStringList(allocator: std.mem.Allocator, list: *std.ArrayList([]u8)) void {
+    for (list.items) |item| allocator.free(item);
+    list.deinit(allocator);
+}
+
+fn deinitOwnedStringSet(allocator: std.mem.Allocator, set: *std.StringHashMap(void)) void {
+    var it = set.iterator();
+    while (it.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+    }
+    set.deinit();
+}
+
+fn deinitOwnedStringMapValues(allocator: std.mem.Allocator, map: *std.StringHashMap(usize)) void {
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+    }
+    map.deinit();
+}
+
+test "parse args datasets" {
+    const argv = [_][]const u8{ ProgramName, "datasets" };
+    const parsed = try parseArgs(&argv);
+    try std.testing.expect(parsed.command.? == .datasets);
+}
+
+test "parse args recall" {
+    const argv = [_][]const u8{ ProgramName, "--path", ".learnings.jsonl", "recall", "--query", "zig" };
+    const parsed = try parseArgs(&argv);
+    try std.testing.expect(parsed.command.? == .recall);
+    try std.testing.expectEqualStrings(".learnings.jsonl", parsed.path);
+    try std.testing.expectEqualStrings("zig", parsed.query.?);
+}
+
+test "iso week basic" {
+    const w = isoWeek(2026, 2, 23);
+    try std.testing.expect(w.week >= 1);
+}
+
+fn fuzzTokenizeTarget(_: void, input: []const u8) !void {
+    var set = try tokenizeSet(std.testing.allocator, input);
+    defer deinitOwnedStringSet(std.testing.allocator, &set);
+}
+
+test "fuzz tokenize set" {
+    try std.testing.fuzz({}, fuzzTokenizeTarget, .{});
+}
+
+fn allocThemeTarget(allocator: std.mem.Allocator, text: []const u8) !void {
+    const theme = try computeThemeAlloc(allocator, text, "");
+    allocator.free(theme);
+}
+
+test "allocation failures computeThemeAlloc" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocThemeTarget, .{"zig token token token"});
 }

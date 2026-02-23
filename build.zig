@@ -37,6 +37,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const seq_bundle = b.createModule(.{
+        .root_source_file = b.path("apps/seq/src/bundle.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const seq_meta = addVersionModule(b, @embedFile("apps/seq/VERSION"));
     const lift_meta = addVersionModule(b, @embedFile("apps/lift/VERSION"));
     const cas_meta = addVersionModule(b, @embedFile("apps/cas/VERSION"));
@@ -175,6 +180,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_delegate", .module = core_delegate },
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "app_meta", .module = learnings_meta },
+            .{ .name = "seq_bundle", .module = seq_bundle },
         },
     });
     const append_learning_root = b.createModule(.{
@@ -298,6 +304,19 @@ pub fn build(b: *std.Build) void {
     const build_learnings = b.step("build-learnings", "Build learnings binaries");
     build_learnings.dependOn(&learnings_install.step);
     build_learnings.dependOn(&append_learning_install.step);
+
+    _ = addTestStep(
+        b,
+        learnings_root,
+        "test-learnings",
+        "Run learnings tests",
+    );
+    _ = addTestStep(
+        b,
+        append_learning_root,
+        "test-append-learning",
+        "Run append_learning tests",
+    );
 
     addRunStep(b, seq, "run-seq", "Run seq", &.{});
     addRunStep(b, bench_stats, "run-bench-stats", "Run bench_stats", &.{"--help"});
