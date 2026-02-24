@@ -538,14 +538,11 @@ fn regexLikeMatch(haystack: []const u8, pattern: []const u8, case_insensitive: b
 
 fn sortRows(rows: []Row, sort_specs: []const spec.SortSpec) void {
     if (rows.len < 2 or sort_specs.len == 0) return;
+    std.mem.sort(Row, rows, sort_specs, lessThanRowForSort);
+}
 
-    var i: usize = 1;
-    while (i < rows.len) : (i += 1) {
-        var j = i;
-        while (j > 0 and compareRowsForSort(rows[j - 1], rows[j], sort_specs) == .gt) : (j -= 1) {
-            std.mem.swap(Row, &rows[j - 1], &rows[j]);
-        }
-    }
+fn lessThanRowForSort(sort_specs: []const spec.SortSpec, lhs: Row, rhs: Row) bool {
+    return compareRowsForSort(lhs, rhs, sort_specs) == .lt;
 }
 
 fn compareRowsForSort(lhs: Row, rhs: Row, sort_specs: []const spec.SortSpec) std.math.Order {
@@ -921,6 +918,59 @@ test "non-grouped where/select/sort/limit parity" {
     try expectIntField(result.rows.items[0], "arguments_len", 15);
     try expectStringField(result.rows.items[1], "path", "s1.jsonl");
     try expectIntField(result.rows.items[1], "arguments_len", 9);
+}
+
+test "non-grouped sort preserves input order for equal keys" {
+    var rows: std.ArrayList(Row) = .empty;
+    defer deinitRows(std.testing.allocator, &rows);
+
+    try rows.append(std.testing.allocator, try rowFromEntries(std.testing.allocator, &.{
+        .{ .key = "id", .value = .{ .int = 101 } },
+        .{ .key = "score", .value = .{ .int = 5 } },
+    }));
+    try rows.append(std.testing.allocator, try rowFromEntries(std.testing.allocator, &.{
+        .{ .key = "id", .value = .{ .int = 102 } },
+        .{ .key = "score", .value = .{ .int = 5 } },
+    }));
+    try rows.append(std.testing.allocator, try rowFromEntries(std.testing.allocator, &.{
+        .{ .key = "id", .value = .{ .int = 103 } },
+        .{ .key = "score", .value = .{ .int = 5 } },
+    }));
+
+    const query = spec.QuerySpec{
+        .select = &.{ "id", "score" },
+        .sort = &.{.{ .field = "score" }},
+    };
+
+    var result = try execute(std.testing.allocator, rows.items, query);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), result.rows.items.len);
+    try expectIntField(result.rows.items[0], "id", 101);
+    try expectIntField(result.rows.items[1], "id", 102);
+    try expectIntField(result.rows.items[2], "id", 103);
+}
+
+test "non-grouped descending sort keeps nulls last" {
+    var rows = try buildToolRows(std.testing.allocator);
+    defer deinitRows(std.testing.allocator, &rows);
+
+    const query = spec.QuerySpec{
+        .select = &.{ "id", "arguments_len" },
+        .sort = &.{.{ .field = "arguments_len", .descending = true }},
+    };
+
+    var result = try execute(std.testing.allocator, rows.items, query);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 7), result.rows.items.len);
+    try expectIntField(result.rows.items[0], "id", 3);
+    try expectIntField(result.rows.items[1], "id", 6);
+    try expectIntField(result.rows.items[2], "id", 1);
+    try expectIntField(result.rows.items[3], "id", 4);
+    try expectIntField(result.rows.items[4], "id", 2);
+    try expectIntField(result.rows.items[5], "id", 5);
+    try expectIntField(result.rows.items[6], "id", 7);
 }
 
 test "non-grouped limit without sort short-circuits" {
