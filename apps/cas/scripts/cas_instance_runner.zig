@@ -26,7 +26,8 @@ const UsageText =
     \\  --server-request-timeout-ms N       Forwarded server-request timeout.
     \\  --exec-approval VALUE               auto|accept|acceptForSession|decline|cancel.
     \\  --file-approval VALUE               auto|accept|acceptForSession|decline|cancel.
-    \\  --read-only                         Decline exec + file approvals.
+    \\  --skill-approval VALUE              auto|approve|decline.
+    \\  --read-only                         Decline exec + file + skill approvals.
     \\  --opt-out-notification-method M     Suppress notification method (repeatable).
     \\  --client-prefix NAME                Instance client prefix (default: cas-instance).
     \\  --sample N                          Sample count in output (default: 3).
@@ -48,6 +49,7 @@ const ParsedArgs = struct {
     server_request_timeout_ms: ?u32 = null,
     exec_approval: ?[]const u8 = null,
     file_approval: ?[]const u8 = null,
+    skill_approval: ?[]const u8 = null,
     read_only: bool = false,
     opt_out_methods: []const []const u8 = &.{},
     client_prefix: []const u8 = "cas-instance",
@@ -148,6 +150,7 @@ pub fn main() !void {
             .server_request_timeout_ms = opts.server_request_timeout_ms,
             .exec_approval = opts.exec_approval,
             .file_approval = opts.file_approval,
+            .skill_approval = opts.skill_approval,
             .read_only = opts.read_only,
             .opt_out_notification_methods = opts.opt_out_methods,
         }) catch |err| {
@@ -360,6 +363,10 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
         }
         if (std.mem.eql(u8, arg, "--file-approval")) {
             out.file_approval = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--skill-approval")) {
+            out.skill_approval = value;
             continue;
         }
         if (std.mem.eql(u8, arg, "--opt-out-notification-method")) {

@@ -9,6 +9,7 @@ pub const ClientOptions = struct {
     server_request_timeout_ms: ?u32 = null,
     exec_approval: ?[]const u8 = null,
     file_approval: ?[]const u8 = null,
+    skill_approval: ?[]const u8 = null,
     read_only: bool = false,
     opt_out_notification_methods: []const []const u8 = &.{},
 };
@@ -66,6 +67,10 @@ pub const Client = struct {
         }
         if (opts.file_approval) |decision| {
             try argv.append(allocator, "--file-approval");
+            try argv.append(allocator, decision);
+        }
+        if (opts.skill_approval) |decision| {
+            try argv.append(allocator, "--skill-approval");
             try argv.append(allocator, decision);
         }
         for (opts.opt_out_notification_methods) |method| {
