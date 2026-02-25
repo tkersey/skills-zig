@@ -64,6 +64,7 @@ pub fn main() !void {
         \\- Metric:
         \\- Target:
         \\- Percentile:
+        \\- Workload command:
         \\- Dataset:
         \\- Environment:
         \\- Constraints:
@@ -110,7 +111,17 @@ pub fn main() !void {
         \\- Benchmark or budget:
         \\- Alert or threshold:
         \\
-        \\## 9. Next Steps
+        \\## 9. Validation
+        \\
+        \\- Correctness command(s) -> pass/fail:
+        \\- Performance command(s) -> numbers:
+        \\
+        \\## 10. Lift Compliance
+        \\
+        \\- mode (measured|unmeasured):
+        \\- proof artifacts (bench + profile paths):
+        \\
+        \\## 11. Next Steps
         \\
         \\- Follow-up experiments:
         \\- Rollout plan:
