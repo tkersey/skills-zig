@@ -13,7 +13,6 @@ pub const ClientOptions = struct {
     server_request_timeout_ms: ?u32 = null,
     exec_approval: ?[]const u8 = null,
     file_approval: ?[]const u8 = null,
-    skill_approval: ?[]const u8 = null,
     read_only: bool = false,
     opt_out_notification_methods: []const []const u8 = &.{},
 };
@@ -28,7 +27,6 @@ pub const Client = struct {
     last_error: ?[]u8 = null,
     exec_approval: ?[]const u8,
     file_approval: ?[]const u8,
-    skill_approval: ?[]const u8,
     read_only: bool,
 
     pub fn start(allocator: std.mem.Allocator, opts: ClientOptions) !Client {
@@ -58,7 +56,6 @@ pub const Client = struct {
             .last_error = null,
             .exec_approval = opts.exec_approval,
             .file_approval = opts.file_approval,
-            .skill_approval = opts.skill_approval,
             .read_only = opts.read_only,
         };
         try client.handshake(opts);
@@ -275,18 +272,19 @@ pub const Client = struct {
 
         if (std.mem.eql(u8, method, "item/commandExecution/requestApproval")) {
             const decision = self.resolveExecDecision();
+            if (std.mem.eql(u8, decision, "acceptForSession")) {
+                const params_obj = core_json.objectField(msg_obj, "params");
+                if (self.resolveAutoExecDecision(params_obj)) |available_decision| {
+                    try self.sendApprovalDecisionValue(id, available_decision);
+                    return;
+                }
+            }
             try self.sendApprovalDecision(id, decision);
             return;
         }
 
         if (std.mem.eql(u8, method, "item/fileChange/requestApproval")) {
             const decision = self.resolveFileDecision();
-            try self.sendApprovalDecision(id, decision);
-            return;
-        }
-
-        if (std.mem.eql(u8, method, "skill/requestApproval")) {
-            const decision = self.resolveSkillDecision();
             try self.sendApprovalDecision(id, decision);
             return;
         }
@@ -305,6 +303,19 @@ pub const Client = struct {
             id: i64,
             result: struct {
                 decision: []const u8,
+            },
+        };
+        try self.sendToServer(Response{
+            .id = id,
+            .result = .{ .decision = decision },
+        });
+    }
+
+    fn sendApprovalDecisionValue(self: *Client, id: i64, decision: std.json.Value) !void {
+        const Response = struct {
+            id: i64,
+            result: struct {
+                decision: std.json.Value,
             },
         };
         try self.sendToServer(Response{
@@ -338,20 +349,60 @@ pub const Client = struct {
         return "acceptForSession";
     }
 
+    fn resolveAutoExecDecision(self: *const Client, params_obj: ?core_json.ObjectMap) ?std.json.Value {
+        _ = self;
+        const params = params_obj orelse return null;
+        const available_val = params.get("availableDecisions") orelse return null;
+        const decisions = switch (available_val) {
+            .array => |arr| arr.items,
+            else => return null,
+        };
+
+        var accept_for_session: ?std.json.Value = null;
+        var accept: ?std.json.Value = null;
+        var accept_with_execpolicy_amendment: ?std.json.Value = null;
+        var apply_network_policy_amendment: ?std.json.Value = null;
+        var decline: ?std.json.Value = null;
+        var cancel: ?std.json.Value = null;
+
+        for (decisions) |decision| {
+            switch (decision) {
+                .string => |decision_tag| {
+                    if (std.mem.eql(u8, decision_tag, "acceptForSession")) {
+                        accept_for_session = decision;
+                    } else if (std.mem.eql(u8, decision_tag, "accept")) {
+                        accept = decision;
+                    } else if (std.mem.eql(u8, decision_tag, "decline")) {
+                        decline = decision;
+                    } else if (std.mem.eql(u8, decision_tag, "cancel")) {
+                        cancel = decision;
+                    }
+                },
+                .object => |decision_obj| {
+                    if (decision_obj.get("acceptWithExecpolicyAmendment") != null) {
+                        accept_with_execpolicy_amendment = decision;
+                    } else if (decision_obj.get("applyNetworkPolicyAmendment") != null) {
+                        apply_network_policy_amendment = decision;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        return accept_for_session orelse
+            accept orelse
+            accept_with_execpolicy_amendment orelse
+            apply_network_policy_amendment orelse
+            decline orelse
+            cancel;
+    }
+
     fn resolveFileDecision(self: *const Client) []const u8 {
         if (self.read_only) return "decline";
         if (self.file_approval) |decision| {
             if (!std.mem.eql(u8, decision, "auto")) return decision;
         }
         return "acceptForSession";
-    }
-
-    fn resolveSkillDecision(self: *const Client) []const u8 {
-        if (self.read_only) return "decline";
-        if (self.skill_approval) |decision| {
-            if (!std.mem.eql(u8, decision, "auto")) return decision;
-        }
-        return "approve";
     }
 
     fn setLastErrorOwned(self: *Client, owned: []u8) void {

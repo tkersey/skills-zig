@@ -8,6 +8,24 @@ Zig CLI utilities extracted from dotfiles CAS skill.
 - `scripts/cas_instance_runner.zig`
 - `scripts/cas_proxy_client.zig`
 
+## API Examples
+
+```bash
+# Filter thread/list by title substring.
+cas instance_runner \
+  --cwd /path/to/workspace \
+  --method thread/list \
+  --params-json '{"cursor":null,"limit":10,"searchTerm":"rollback"}' \
+  --json
+
+# Unsubscribe a connection from a loaded thread.
+cas instance_runner \
+  --cwd /path/to/workspace \
+  --method thread/unsubscribe \
+  --params-json '{"threadId":"thr_123"}' \
+  --json
+```
+
 ## Validation
 
 ```bash

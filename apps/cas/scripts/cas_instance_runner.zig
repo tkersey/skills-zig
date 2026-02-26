@@ -26,8 +26,7 @@ const UsageText =
     \\  --server-request-timeout-ms N       Forwarded server-request timeout.
     \\  --exec-approval VALUE               auto|accept|acceptForSession|decline|cancel.
     \\  --file-approval VALUE               auto|accept|acceptForSession|decline|cancel.
-    \\  --skill-approval VALUE              auto|approve|decline.
-    \\  --read-only                         Decline exec + file + skill approvals.
+    \\  --read-only                         Decline exec + file approvals.
     \\  --opt-out-notification-method M     Suppress notification method (repeatable).
     \\  --client-prefix NAME                Instance client prefix (default: cas-instance).
     \\  --sample N                          Sample count in output (default: 3).
@@ -36,6 +35,10 @@ const UsageText =
     \\  --help                              Show help.
     \\  --version                           Show version.
     \\  version                             Show version.
+    \\
+    \\Examples:
+    \\  --method thread/list --params-json '{"cursor":null,"limit":1,"searchTerm":"rollback"}'
+    \\  --method thread/unsubscribe --params-json '{"threadId":"thr_123"}'
 ;
 
 const ParsedArgs = struct {
@@ -49,7 +52,6 @@ const ParsedArgs = struct {
     server_request_timeout_ms: ?u32 = null,
     exec_approval: ?[]const u8 = null,
     file_approval: ?[]const u8 = null,
-    skill_approval: ?[]const u8 = null,
     read_only: bool = false,
     opt_out_methods: []const []const u8 = &.{},
     client_prefix: []const u8 = "cas-instance",
@@ -150,7 +152,6 @@ pub fn main() !void {
             .server_request_timeout_ms = opts.server_request_timeout_ms,
             .exec_approval = opts.exec_approval,
             .file_approval = opts.file_approval,
-            .skill_approval = opts.skill_approval,
             .read_only = opts.read_only,
             .opt_out_notification_methods = opts.opt_out_methods,
         }) catch |err| {
@@ -365,10 +366,6 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             out.file_approval = value;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--skill-approval")) {
-            out.skill_approval = value;
-            continue;
-        }
         if (std.mem.eql(u8, arg, "--opt-out-notification-method")) {
             try methods.append(allocator, value);
             continue;
@@ -465,6 +462,19 @@ fn summarizeResult(allocator: std.mem.Allocator, method: []const u8, result_json
         return stringifyAnyAlloc(allocator, .{
             .threadId = thread_id,
             .turns = turns_count,
+        });
+    }
+
+    if (std.mem.eql(u8, method, "thread/unsubscribe")) {
+        const status = if (root_obj.get("status")) |status_val|
+            switch (status_val) {
+                .string => |s| s,
+                else => null,
+            }
+        else
+            null;
+        return stringifyAnyAlloc(allocator, .{
+            .status = status,
         });
     }
 
