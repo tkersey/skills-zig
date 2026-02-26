@@ -8,6 +8,7 @@ This monorepo uses independent GitHub Actions release workflows per CLI:
 - `cron`: `.github/workflows/release-cron.yml` on tag `cron-v*`
 - `puff`: `.github/workflows/release-puff.yml` on tag `puff-v*`
 - `learnings`: `.github/workflows/release-learnings.yml` on tag `learnings-v*`
+- `mesh`: `.github/workflows/release-mesh.yml` on tag `mesh-v*`
 - `st`: `.github/workflows/release-st.yml` on tag `st-v*`
 
 Per-app VERSION files:
@@ -18,6 +19,7 @@ Per-app VERSION files:
 - `apps/cron/VERSION`
 - `apps/puff/VERSION`
 - `apps/learnings/VERSION`
+- `apps/mesh/VERSION`
 - `apps/st/VERSION`
 
 Release tags must match file versions:
@@ -28,6 +30,7 @@ Release tags must match file versions:
 - `cron-v<version>` where `<version>` equals `apps/cron/VERSION`
 - `puff-v<version>` where `<version>` equals `apps/puff/VERSION`
 - `learnings-v<version>` where `<version>` equals `apps/learnings/VERSION`
+- `mesh-v<version>` where `<version>` equals `apps/mesh/VERSION`
 - `st-v<version>` where `<version>` equals `apps/st/VERSION`
 
 Each workflow builds only binaries from its own CLI path and publishes a release archive named:
@@ -42,6 +45,7 @@ Examples:
 - `cron-v1.2.3-linux-x86_64.tar.gz`
 - `puff-v1.2.3-linux-x86_64.tar.gz`
 - `learnings-v1.2.3-linux-x86_64.tar.gz`
+- `mesh-v1.2.3-linux-x86_64.tar.gz`
 - `st-v1.2.3-linux-x86_64.tar.gz`
 
 ## Homebrew Tap Handoff

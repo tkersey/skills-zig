@@ -10,6 +10,7 @@ Monorepo for Zig CLIs with shared internal libraries and independent release str
 - `cron` (`cron`)
 - `puff` (`puff`)
 - `learnings` (`learnings`, `append_learning`)
+- `mesh` (`mesh`)
 - `st` (`st`)
 
 No unified umbrella CLI is introduced. Binaries remain separate.
@@ -22,6 +23,7 @@ No unified umbrella CLI is introduced. Binaries remain separate.
 - `apps/cron`
 - `apps/puff`
 - `apps/learnings`
+- `apps/mesh`
 - `apps/st`
 - `libs/core`
 - `.github/workflows`
@@ -42,6 +44,7 @@ zig build build-cas -Doptimize=ReleaseFast
 zig build build-cron -Doptimize=ReleaseFast
 zig build build-puff -Doptimize=ReleaseFast
 zig build build-learnings -Doptimize=ReleaseFast
+zig build build-mesh -Doptimize=ReleaseFast
 zig build build-st -Doptimize=ReleaseFast
 ```
 
@@ -63,6 +66,7 @@ Per-app VERSION files are the source of truth:
 - `apps/cron/VERSION`
 - `apps/puff/VERSION`
 - `apps/learnings/VERSION`
+- `apps/mesh/VERSION`
 - `apps/st/VERSION`
 
 Independent tags trigger independent workflows, and each tag must match its app VERSION file:
@@ -73,6 +77,7 @@ Independent tags trigger independent workflows, and each tag must match its app 
 - `cron-v*` -> `.github/workflows/release-cron.yml`
 - `puff-v*` -> `.github/workflows/release-puff.yml`
 - `learnings-v*` -> `.github/workflows/release-learnings.yml`
+- `mesh-v*` -> `.github/workflows/release-mesh.yml`
 - `st-v*` -> `.github/workflows/release-st.yml`
 
 Required tag forms:
@@ -83,6 +88,7 @@ Required tag forms:
 - `cron-v<version>` where `<version>` equals `apps/cron/VERSION`
 - `puff-v<version>` where `<version>` equals `apps/puff/VERSION`
 - `learnings-v<version>` where `<version>` equals `apps/learnings/VERSION`
+- `mesh-v<version>` where `<version>` equals `apps/mesh/VERSION`
 - `st-v<version>` where `<version>` equals `apps/st/VERSION`
 
 Artifacts are published as `<tag>-linux-x86_64.tar.gz` (no `*-cli` prefix).

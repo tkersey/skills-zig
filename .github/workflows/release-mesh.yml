@@ -1,0 +1,77 @@
+name: Release mesh
+
+on:
+  push:
+    tags:
+      - "mesh-v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-mesh-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            runs_on: ubuntu-latest
+          - target: darwin-arm64
+            runs_on: macos-14
+    runs-on: ${{ matrix.runs_on }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate mesh tag matches VERSION
+        run: |
+          expected_tag="mesh-v$(tr -d '[:space:]' < apps/mesh/VERSION)"
+          if [ "${GITHUB_REF_NAME}" != "${expected_tag}" ]; then
+            echo "Tag mismatch: expected ${expected_tag}, got ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Build mesh binary
+        run: zig build build-mesh -Doptimize=ReleaseFast
+      - name: Package mesh artifact
+        run: |
+          TAR_NAME="${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+          echo "TAR_NAME=${TAR_NAME}" >> "$GITHUB_ENV"
+          mkdir -p dist/mesh
+          cp zig-out/bin/mesh dist/mesh/mesh
+          tar -czf "${TAR_NAME}" -C dist/mesh mesh
+      - name: Upload mesh workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TAR_NAME }}
+          path: ${{ env.TAR_NAME }}
+          if-no-files-found: error
+          overwrite: false
+
+  publish:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download mesh release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ github.ref_name }}-*.tar.gz
+          path: release-assets
+          merge-multiple: true
+      - name: Verify mesh artifact set
+        run: |
+          set -euo pipefail
+          count="$(find release-assets -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d '[:space:]')"
+          if [ "${count}" -ne 2 ]; then
+            echo "Expected 2 release archives, got ${count}" >&2
+            exit 1
+          fi
+      - name: Publish mesh release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: true
+          files: release-assets/*.tar.gz

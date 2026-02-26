@@ -9,6 +9,7 @@ on:
       - "apps/cron/**"
       - "apps/puff/**"
       - "apps/learnings/**"
+      - "apps/mesh/**"
       - "apps/st/**"
       - "libs/core/**"
       - ".github/scripts/**"
@@ -28,6 +29,7 @@ jobs:
       cron: ${{ steps.filter.outputs.cron }}
       puff: ${{ steps.filter.outputs.puff }}
       learnings: ${{ steps.filter.outputs.learnings }}
+      mesh: ${{ steps.filter.outputs.mesh }}
       st: ${{ steps.filter.outputs.st }}
       core: ${{ steps.filter.outputs.core }}
     steps:
@@ -48,6 +50,8 @@ jobs:
               - "apps/puff/**"
             learnings:
               - "apps/learnings/**"
+            mesh:
+              - "apps/mesh/**"
             st:
               - "apps/st/**"
             core:
@@ -197,3 +201,17 @@ jobs:
         run: zig build build-st -Doptimize=ReleaseFast
       - name: Test st
         run: zig build test-st
+
+  mesh:
+    needs: changes
+    if: needs.changes.outputs.mesh == 'true' || needs.changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Build mesh
+        run: zig build build-mesh -Doptimize=ReleaseFast
+      - name: Test mesh
+        run: zig build test-mesh
