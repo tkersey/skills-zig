@@ -1,0 +1,77 @@
+name: Release st
+
+on:
+  push:
+    tags:
+      - "st-v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-st-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            runs_on: ubuntu-latest
+          - target: darwin-arm64
+            runs_on: macos-14
+    runs-on: ${{ matrix.runs_on }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate st tag matches VERSION
+        run: |
+          expected_tag="st-v$(tr -d '[:space:]' < apps/st/VERSION)"
+          if [ "${GITHUB_REF_NAME}" != "${expected_tag}" ]; then
+            echo "Tag mismatch: expected ${expected_tag}, got ${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Build st binary
+        run: zig build build-st -Doptimize=ReleaseFast
+      - name: Package st artifact
+        run: |
+          TAR_NAME="${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+          echo "TAR_NAME=${TAR_NAME}" >> "$GITHUB_ENV"
+          mkdir -p dist/st
+          cp zig-out/bin/st dist/st/st
+          tar -czf "${TAR_NAME}" -C dist/st st
+      - name: Upload st workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.TAR_NAME }}
+          path: ${{ env.TAR_NAME }}
+          if-no-files-found: error
+          overwrite: false
+
+  publish:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download st release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ github.ref_name }}-*.tar.gz
+          path: release-assets
+          merge-multiple: true
+      - name: Verify st artifact set
+        run: |
+          set -euo pipefail
+          count="$(find release-assets -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d '[:space:]')"
+          if [ "${count}" -ne 2 ]; then
+            echo "Expected 2 release archives, got ${count}" >&2
+            exit 1
+          fi
+      - name: Publish st release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: true
+          files: release-assets/*.tar.gz

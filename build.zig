@@ -48,6 +48,7 @@ pub fn build(b: *std.Build) void {
     const cron_meta = addVersionModule(b, @embedFile("apps/cron/VERSION"));
     const puff_meta = addVersionModule(b, @embedFile("apps/puff/VERSION"));
     const learnings_meta = addVersionModule(b, @embedFile("apps/learnings/VERSION"));
+    const st_meta = addVersionModule(b, @embedFile("apps/st/VERSION"));
 
     const seq_root = b.createModule(.{
         .root_source_file = b.path("apps/seq/src/main.zig"),
@@ -193,6 +194,15 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = learnings_meta },
         },
     });
+    const st_root = b.createModule(.{
+        .root_source_file = b.path("apps/st/scripts/st.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = st_meta },
+        },
+    });
 
     const seq = addExecutable(b, "seq", seq_root);
     const seq_perf = addExecutable(b, "seq-perf", seq_perf_root);
@@ -207,6 +217,7 @@ pub fn build(b: *std.Build) void {
     const puff = addExecutable(b, "puff", puff_root);
     const learnings = addExecutable(b, "learnings", learnings_root);
     const append_learning = addExecutable(b, "append_learning", append_learning_root);
+    const st = addExecutable(b, "st", st_root);
 
     const seq_install = addInstallStep(b, seq);
     const seq_perf_install = addInstallStep(b, seq_perf);
@@ -221,6 +232,7 @@ pub fn build(b: *std.Build) void {
     const puff_install = addInstallStep(b, puff);
     const learnings_install = addInstallStep(b, learnings);
     const append_learning_install = addInstallStep(b, append_learning);
+    const st_install = addInstallStep(b, st);
 
     const install_all = b.getInstallStep();
     install_all.dependOn(&seq_install.step);
@@ -236,6 +248,7 @@ pub fn build(b: *std.Build) void {
     install_all.dependOn(&puff_install.step);
     install_all.dependOn(&learnings_install.step);
     install_all.dependOn(&append_learning_install.step);
+    install_all.dependOn(&st_install.step);
 
     const build_seq = b.step("build-seq", "Build seq binaries");
     build_seq.dependOn(&seq_install.step);
@@ -305,6 +318,9 @@ pub fn build(b: *std.Build) void {
     build_learnings.dependOn(&learnings_install.step);
     build_learnings.dependOn(&append_learning_install.step);
 
+    const build_st = b.step("build-st", "Build st binary");
+    build_st.dependOn(&st_install.step);
+
     _ = addTestStep(
         b,
         learnings_root,
@@ -317,8 +333,15 @@ pub fn build(b: *std.Build) void {
         "test-append-learning",
         "Run append_learning tests",
     );
+    _ = addTestStep(
+        b,
+        st_root,
+        "test-st",
+        "Run st tests",
+    );
 
     addRunStep(b, seq, "run-seq", "Run seq", &.{});
+    addRunStep(b, st, "run-st", "Run st", &.{"--help"});
     addRunStep(b, bench_stats, "run-bench-stats", "Run bench_stats", &.{"--help"});
     addRunStep(b, cas_smoke_check, "run-cas-smoke-check", "Run cas_smoke_check", &.{"--help"});
 }

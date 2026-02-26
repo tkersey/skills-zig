@@ -9,6 +9,7 @@ on:
       - "apps/cron/**"
       - "apps/puff/**"
       - "apps/learnings/**"
+      - "apps/st/**"
       - "libs/core/**"
       - ".github/scripts/**"
       - "scripts/perf/**"
@@ -27,6 +28,7 @@ jobs:
       cron: ${{ steps.filter.outputs.cron }}
       puff: ${{ steps.filter.outputs.puff }}
       learnings: ${{ steps.filter.outputs.learnings }}
+      st: ${{ steps.filter.outputs.st }}
       core: ${{ steps.filter.outputs.core }}
     steps:
       - uses: actions/checkout@v4
@@ -46,6 +48,8 @@ jobs:
               - "apps/puff/**"
             learnings:
               - "apps/learnings/**"
+            st:
+              - "apps/st/**"
             core:
               - "libs/core/**"
               - ".github/scripts/**"
@@ -179,3 +183,17 @@ jobs:
           version: 0.15.2
       - name: Build learnings binaries
         run: zig build build-learnings -Doptimize=ReleaseFast
+
+  st:
+    needs: changes
+    if: needs.changes.outputs.st == 'true' || needs.changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Build st
+        run: zig build build-st -Doptimize=ReleaseFast
+      - name: Test st
+        run: zig build test-st

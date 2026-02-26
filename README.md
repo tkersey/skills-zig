@@ -10,6 +10,7 @@ Monorepo for Zig CLIs with shared internal libraries and independent release str
 - `cron` (`cron`)
 - `puff` (`puff`)
 - `learnings` (`learnings`, `append_learning`)
+- `st` (`st`)
 
 No unified umbrella CLI is introduced. Binaries remain separate.
 
@@ -21,6 +22,7 @@ No unified umbrella CLI is introduced. Binaries remain separate.
 - `apps/cron`
 - `apps/puff`
 - `apps/learnings`
+- `apps/st`
 - `libs/core`
 - `.github/workflows`
 - `docs/release`
@@ -40,6 +42,7 @@ zig build build-cas -Doptimize=ReleaseFast
 zig build build-cron -Doptimize=ReleaseFast
 zig build build-puff -Doptimize=ReleaseFast
 zig build build-learnings -Doptimize=ReleaseFast
+zig build build-st -Doptimize=ReleaseFast
 ```
 
 Run helpers:
@@ -60,6 +63,7 @@ Per-app VERSION files are the source of truth:
 - `apps/cron/VERSION`
 - `apps/puff/VERSION`
 - `apps/learnings/VERSION`
+- `apps/st/VERSION`
 
 Independent tags trigger independent workflows, and each tag must match its app VERSION file:
 
@@ -69,6 +73,7 @@ Independent tags trigger independent workflows, and each tag must match its app 
 - `cron-v*` -> `.github/workflows/release-cron.yml`
 - `puff-v*` -> `.github/workflows/release-puff.yml`
 - `learnings-v*` -> `.github/workflows/release-learnings.yml`
+- `st-v*` -> `.github/workflows/release-st.yml`
 
 Required tag forms:
 
@@ -78,6 +83,7 @@ Required tag forms:
 - `cron-v<version>` where `<version>` equals `apps/cron/VERSION`
 - `puff-v<version>` where `<version>` equals `apps/puff/VERSION`
 - `learnings-v<version>` where `<version>` equals `apps/learnings/VERSION`
+- `st-v<version>` where `<version>` equals `apps/st/VERSION`
 
 Artifacts are published as `<tag>-linux-x86_64.tar.gz` (no `*-cli` prefix).
 
