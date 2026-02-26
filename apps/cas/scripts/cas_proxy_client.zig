@@ -3,9 +3,13 @@ const core_json = @import("core_json");
 
 pub const ClientOptions = struct {
     cwd: []const u8,
+    // Kept for API compatibility with prior Node-backed client.
     proxy_script: ?[]const u8 = null,
     state_file: ?[]const u8 = null,
+    codex_path: []const u8 = "codex",
     client_name: ?[]const u8 = null,
+    client_title: ?[]const u8 = null,
+    client_version: ?[]const u8 = null,
     server_request_timeout_ms: ?u32 = null,
     exec_approval: ?[]const u8 = null,
     file_approval: ?[]const u8 = null,
@@ -22,61 +26,17 @@ pub const Client = struct {
     line_buf: std.ArrayList(u8) = .empty,
     next_request_id: i64 = 1,
     last_error: ?[]u8 = null,
-
-    const request_loop_event_types = [_][]const u8{
-        "cas/fromServer",
-        "cas/error",
-    };
-    const ready_loop_event_types = [_][]const u8{
-        "cas/ready",
-        "cas/error",
-    };
+    exec_approval: ?[]const u8,
+    file_approval: ?[]const u8,
+    skill_approval: ?[]const u8,
+    read_only: bool,
 
     pub fn start(allocator: std.mem.Allocator, opts: ClientOptions) !Client {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(allocator);
 
-        const proxy_script = if (opts.proxy_script) |path| path else try discoverProxyPath(allocator, opts.cwd);
-        defer if (opts.proxy_script == null) allocator.free(proxy_script);
-
-        try argv.append(allocator, "node");
-        try argv.append(allocator, proxy_script);
-        try argv.append(allocator, "--cwd");
-        try argv.append(allocator, opts.cwd);
-
-        if (opts.state_file) |state_file| {
-            try argv.append(allocator, "--state-file");
-            try argv.append(allocator, state_file);
-        }
-        if (opts.client_name) |client_name| {
-            try argv.append(allocator, "--client-name");
-            try argv.append(allocator, client_name);
-        }
-        if (opts.server_request_timeout_ms) |timeout_ms| {
-            const timeout_text = try std.fmt.allocPrint(allocator, "{d}", .{timeout_ms});
-            defer allocator.free(timeout_text);
-            try argv.append(allocator, "--server-request-timeout-ms");
-            try argv.append(allocator, timeout_text);
-        }
-        if (opts.read_only) {
-            try argv.append(allocator, "--read-only");
-        }
-        if (opts.exec_approval) |decision| {
-            try argv.append(allocator, "--exec-approval");
-            try argv.append(allocator, decision);
-        }
-        if (opts.file_approval) |decision| {
-            try argv.append(allocator, "--file-approval");
-            try argv.append(allocator, decision);
-        }
-        if (opts.skill_approval) |decision| {
-            try argv.append(allocator, "--skill-approval");
-            try argv.append(allocator, decision);
-        }
-        for (opts.opt_out_notification_methods) |method| {
-            try argv.append(allocator, "--opt-out-notification-method");
-            try argv.append(allocator, method);
-        }
+        try argv.append(allocator, opts.codex_path);
+        try argv.append(allocator, "app-server");
 
         var child = std.process.Child.init(argv.items, allocator);
         child.cwd = opts.cwd;
@@ -96,8 +56,12 @@ pub const Client = struct {
             .line_buf = .empty,
             .next_request_id = 1,
             .last_error = null,
+            .exec_approval = opts.exec_approval,
+            .file_approval = opts.file_approval,
+            .skill_approval = opts.skill_approval,
+            .read_only = opts.read_only,
         };
-        try client.waitForReady();
+        try client.handshake(opts);
         return client;
     }
 
@@ -108,9 +72,7 @@ pub const Client = struct {
     }
 
     pub fn close(self: *Client) void {
-        const exit_msg = "{\"type\":\"cas/exit\"}";
-        _ = self.stdin_file.writeAll(exit_msg) catch {};
-        _ = self.stdin_file.writeAll("\n") catch {};
+        self.stdin_file.close();
         _ = self.child.wait() catch {};
     }
 
@@ -125,36 +87,23 @@ pub const Client = struct {
         try self.sendRequest(request_id, method, params_json);
 
         while (true) {
-            const line = (try self.readLineAlloc()) orelse return error.ProxyClosed;
+            const line = (try self.readLineAlloc()) orelse return error.AppServerClosed;
             defer self.allocator.free(line);
-            if (!shouldAttemptEventParse(line, request_loop_event_types[0..])) continue;
 
             var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch continue;
             defer parsed.deinit();
-            const event_obj = switch (parsed.value) {
+            const msg_obj = switch (parsed.value) {
                 .object => |obj| obj,
                 else => continue,
             };
 
-            const event_type = core_json.stringField(event_obj, "type") orelse continue;
-            if (std.mem.eql(u8, event_type, "cas/error")) {
-                if (core_json.stringField(event_obj, "message")) |msg| {
-                    try self.setLastError(msg);
-                }
-                continue;
-            }
+            try self.autoHandleServerRequest(msg_obj);
 
-            if (!std.mem.eql(u8, event_type, "cas/fromServer")) continue;
-            const kind = core_json.stringField(event_obj, "kind") orelse continue;
-            if (!std.mem.eql(u8, kind, "response")) continue;
-            const id = core_json.intField(event_obj, "id") orelse continue;
-            if (id != request_id) continue;
-
-            const msg_val = event_obj.get("msg") orelse return error.InvalidProxyResponse;
-            const msg_obj = switch (msg_val) {
-                .object => |obj| obj,
-                else => return error.InvalidProxyResponse,
+            const response_id = blk: {
+                const id_val = msg_obj.get("id") orelse break :blk null;
+                break :blk core_json.intFromValue(id_val);
             };
+            if (response_id == null or response_id.? != request_id) continue;
 
             if (msg_obj.get("error")) |err_val| {
                 const err_json = try core_json.stringifyAlloc(self.allocator, err_val);
@@ -164,76 +113,245 @@ pub const Client = struct {
             if (msg_obj.get("result")) |result_val| {
                 return core_json.stringifyAlloc(self.allocator, result_val);
             }
-            return error.InvalidProxyResponse;
+            return error.InvalidAppServerResponse;
         }
     }
 
+    fn handshake(self: *Client, opts: ClientOptions) !void {
+        const handshake_id: i64 = -1;
+
+        const client_name = opts.client_name orelse "cas-zig";
+        const client_title = opts.client_title orelse "CAS Zig Client";
+        const client_version = opts.client_version orelse "0.1.0";
+
+        if (opts.opt_out_notification_methods.len > 0) {
+            const InitWithOptOut = struct {
+                method: []const u8,
+                id: i64,
+                params: struct {
+                    clientInfo: struct {
+                        name: []const u8,
+                        title: []const u8,
+                        version: []const u8,
+                    },
+                    capabilities: struct {
+                        experimentalApi: bool,
+                        optOutNotificationMethods: []const []const u8,
+                    },
+                },
+            };
+            const initialize = InitWithOptOut{
+                .method = "initialize",
+                .id = handshake_id,
+                .params = .{
+                    .clientInfo = .{
+                        .name = client_name,
+                        .title = client_title,
+                        .version = client_version,
+                    },
+                    .capabilities = .{
+                        .experimentalApi = true,
+                        .optOutNotificationMethods = opts.opt_out_notification_methods,
+                    },
+                },
+            };
+            try self.sendToServer(initialize);
+        } else {
+            const InitNoOptOut = struct {
+                method: []const u8,
+                id: i64,
+                params: struct {
+                    clientInfo: struct {
+                        name: []const u8,
+                        title: []const u8,
+                        version: []const u8,
+                    },
+                    capabilities: struct {
+                        experimentalApi: bool,
+                    },
+                },
+            };
+            const initialize = InitNoOptOut{
+                .method = "initialize",
+                .id = handshake_id,
+                .params = .{
+                    .clientInfo = .{
+                        .name = client_name,
+                        .title = client_title,
+                        .version = client_version,
+                    },
+                    .capabilities = .{
+                        .experimentalApi = true,
+                    },
+                },
+            };
+            try self.sendToServer(initialize);
+        }
+
+        const started_ms = std.time.milliTimestamp();
+        const timeout_ms: i64 = 10_000;
+        while (std.time.milliTimestamp() - started_ms < timeout_ms) {
+            const line = (try self.readLineAlloc()) orelse return error.AppServerClosed;
+            defer self.allocator.free(line);
+
+            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch continue;
+            defer parsed.deinit();
+            const msg_obj = switch (parsed.value) {
+                .object => |obj| obj,
+                else => continue,
+            };
+
+            try self.autoHandleServerRequest(msg_obj);
+
+            const response_id = blk: {
+                const id_val = msg_obj.get("id") orelse break :blk null;
+                break :blk core_json.intFromValue(id_val);
+            };
+            if (response_id == null or response_id.? != handshake_id) continue;
+
+            if (msg_obj.get("error")) |err_val| {
+                const err_json = try core_json.stringifyAlloc(self.allocator, err_val);
+                self.setLastErrorOwned(err_json);
+                return error.HandshakeFailed;
+            }
+
+            const Initialized = struct {
+                method: []const u8,
+            };
+            try self.sendToServer(Initialized{ .method = "initialized" });
+            return;
+        }
+
+        try self.setLastError("Handshake timed out waiting for initialize response");
+        return error.HandshakeTimeout;
+    }
+
     fn sendRequest(self: *Client, request_id: i64, method: []const u8, params_json: ?[]const u8) !void {
-        const client_request_id = try std.fmt.allocPrint(self.allocator, "cas-zig-{d}", .{request_id});
-        defer self.allocator.free(client_request_id);
-
-        var payload_writer: std.Io.Writer.Allocating = .init(self.allocator);
-        defer payload_writer.deinit();
-
         if (params_json) |raw| {
             var parsed_params = try std.json.parseFromSlice(std.json.Value, self.allocator, raw, .{});
             defer parsed_params.deinit();
 
             const ReqWithParams = struct {
-                type: []const u8,
-                clientRequestId: []const u8,
-                id: i64,
                 method: []const u8,
+                id: i64,
                 params: std.json.Value,
             };
             const req = ReqWithParams{
-                .type = "cas/request",
-                .clientRequestId = client_request_id,
-                .id = request_id,
                 .method = method,
+                .id = request_id,
                 .params = parsed_params.value,
             };
-            try std.json.Stringify.value(req, .{}, &payload_writer.writer);
+            try self.sendToServer(req);
         } else {
             const ReqNoParams = struct {
-                type: []const u8,
-                clientRequestId: []const u8,
-                id: i64,
                 method: []const u8,
+                id: i64,
             };
             const req = ReqNoParams{
-                .type = "cas/request",
-                .clientRequestId = client_request_id,
-                .id = request_id,
                 .method = method,
+                .id = request_id,
             };
-            try std.json.Stringify.value(req, .{}, &payload_writer.writer);
+            try self.sendToServer(req);
         }
+    }
 
+    fn sendToServer(self: *Client, msg: anytype) !void {
+        var payload_writer: std.Io.Writer.Allocating = .init(self.allocator);
+        defer payload_writer.deinit();
+        try std.json.Stringify.value(msg, .{}, &payload_writer.writer);
         const payload = payload_writer.written();
         try self.stdin_file.writeAll(payload);
         try self.stdin_file.writeAll("\n");
     }
 
-    fn waitForReady(self: *Client) !void {
-        while (true) {
-            const line = (try self.readLineAlloc()) orelse return error.ProxyClosedBeforeReady;
-            defer self.allocator.free(line);
-            if (!shouldAttemptEventParse(line, ready_loop_event_types[0..])) continue;
+    fn autoHandleServerRequest(self: *Client, msg_obj: core_json.ObjectMap) !void {
+        const method = core_json.stringField(msg_obj, "method") orelse return;
 
-            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch continue;
-            defer parsed.deinit();
-            const event_obj = switch (parsed.value) {
-                .object => |obj| obj,
-                else => continue,
-            };
+        const id = blk: {
+            const id_val = msg_obj.get("id") orelse return;
+            const parsed_id = core_json.intFromValue(id_val) orelse return;
+            break :blk parsed_id;
+        };
 
-            const event_type = core_json.stringField(event_obj, "type") orelse continue;
-            if (std.mem.eql(u8, event_type, "cas/ready")) return;
-            if (std.mem.eql(u8, event_type, "cas/error")) {
-                if (core_json.stringField(event_obj, "message")) |msg| try self.setLastError(msg);
-            }
+        if (std.mem.eql(u8, method, "item/commandExecution/requestApproval")) {
+            const decision = self.resolveExecDecision();
+            try self.sendApprovalDecision(id, decision);
+            return;
         }
+
+        if (std.mem.eql(u8, method, "item/fileChange/requestApproval")) {
+            const decision = self.resolveFileDecision();
+            try self.sendApprovalDecision(id, decision);
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "skill/requestApproval")) {
+            const decision = self.resolveSkillDecision();
+            try self.sendApprovalDecision(id, decision);
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "execCommandApproval") or std.mem.eql(u8, method, "applyPatchApproval")) {
+            try self.sendServerError(id, -32602, "Unsupported deprecated server request");
+            return;
+        }
+
+        // Reject unknown server requests to avoid deadlocking request/response calls.
+        try self.sendServerError(id, -32601, "Unsupported server request in native cas client");
+    }
+
+    fn sendApprovalDecision(self: *Client, id: i64, decision: []const u8) !void {
+        const Response = struct {
+            id: i64,
+            result: struct {
+                decision: []const u8,
+            },
+        };
+        try self.sendToServer(Response{
+            .id = id,
+            .result = .{ .decision = decision },
+        });
+    }
+
+    fn sendServerError(self: *Client, id: i64, code: i64, message: []const u8) !void {
+        const Response = struct {
+            id: i64,
+            @"error": struct {
+                code: i64,
+                message: []const u8,
+            },
+        };
+        try self.sendToServer(Response{
+            .id = id,
+            .@"error" = .{
+                .code = code,
+                .message = message,
+            },
+        });
+    }
+
+    fn resolveExecDecision(self: *const Client) []const u8 {
+        if (self.read_only) return "decline";
+        if (self.exec_approval) |decision| {
+            if (!std.mem.eql(u8, decision, "auto")) return decision;
+        }
+        return "acceptForSession";
+    }
+
+    fn resolveFileDecision(self: *const Client) []const u8 {
+        if (self.read_only) return "decline";
+        if (self.file_approval) |decision| {
+            if (!std.mem.eql(u8, decision, "auto")) return decision;
+        }
+        return "acceptForSession";
+    }
+
+    fn resolveSkillDecision(self: *const Client) []const u8 {
+        if (self.read_only) return "decline";
+        if (self.skill_approval) |decision| {
+            if (!std.mem.eql(u8, decision, "auto")) return decision;
+        }
+        return "approve";
     }
 
     fn setLastErrorOwned(self: *Client, owned: []u8) void {
@@ -270,52 +388,7 @@ pub const Client = struct {
             try self.line_buf.appendSlice(self.allocator, tmp[0..n]);
         }
     }
-
-    fn shouldAttemptEventParse(line: []const u8, expected_types: []const []const u8) bool {
-        const trimmed = std.mem.trim(u8, line, " \t\r\n");
-        if (trimmed.len == 0) return false;
-        if (trimmed[0] != '{') return false;
-        if (!std.mem.containsAtLeast(u8, trimmed, 1, "\"type\"")) return false;
-        if (!std.mem.containsAtLeast(u8, trimmed, 1, "cas/")) return false;
-        for (expected_types) |event_type| {
-            if (std.mem.containsAtLeast(u8, trimmed, 1, event_type)) return true;
-        }
-        return false;
-    }
 };
-
-fn discoverProxyPath(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
-    const from_cwd = try std.fmt.allocPrint(allocator, "{s}/codex/skills/cas/scripts/cas_proxy.mjs", .{cwd});
-    if (pathExists(from_cwd)) return from_cwd;
-    allocator.free(from_cwd);
-
-    if (std.posix.getenv("CODEX_HOME")) |codex_home_ptr| {
-        const codex_home = codex_home_ptr;
-        const candidate = try std.fmt.allocPrint(allocator, "{s}/skills/cas/scripts/cas_proxy.mjs", .{codex_home});
-        if (pathExists(candidate)) return candidate;
-        allocator.free(candidate);
-    }
-
-    if (std.posix.getenv("CLAUDE_HOME")) |claude_home_ptr| {
-        const claude_home = claude_home_ptr;
-        const candidate = try std.fmt.allocPrint(allocator, "{s}/skills/cas/scripts/cas_proxy.mjs", .{claude_home});
-        if (pathExists(candidate)) return candidate;
-        allocator.free(candidate);
-    }
-
-    if (pathExists("codex/skills/cas/scripts/cas_proxy.mjs")) {
-        return allocator.dupe(u8, "codex/skills/cas/scripts/cas_proxy.mjs");
-    }
-    if (pathExists("cas_proxy.mjs")) {
-        return allocator.dupe(u8, "cas_proxy.mjs");
-    }
-    return allocator.dupe(u8, "cas_proxy.mjs");
-}
-
-fn pathExists(path: []const u8) bool {
-    std.fs.cwd().access(path, .{}) catch return false;
-    return true;
-}
 
 pub const ObjectMap = core_json.ObjectMap;
 
