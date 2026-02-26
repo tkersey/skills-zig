@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const core_cli = @import("core_cli");
 const app_meta = @import("app_meta");
 
@@ -1960,6 +1961,14 @@ fn defaultCommentAuthor() []const u8 {
     return "unknown";
 }
 
+fn currentProcessId() i64 {
+    return switch (builtin.os.tag) {
+        .linux => @intCast(std.os.linux.getpid()),
+        .plan9 => @intCast(std.os.plan9.getpid()),
+        else => @intCast(std.c.getpid()),
+    };
+}
+
 fn buildMutationMeta(allocator: std.mem.Allocator, allow_multiple: bool) MutationMeta {
     const actor = blk: {
         if (std.process.getEnvVarOwned(allocator, "ST_ACTOR")) |v| {
@@ -1984,7 +1993,7 @@ fn buildMutationMeta(allocator: std.mem.Allocator, allow_multiple: bool) Mutatio
     return .{
         .allow_multiple_in_progress = allow_multiple,
         .actor = actor,
-        .pid = @intCast(std.c.getpid()),
+        .pid = currentProcessId(),
         .session = session,
     };
 }
