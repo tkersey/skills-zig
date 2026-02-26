@@ -18,6 +18,16 @@
       "spec": "testdata/parity/specs/query_token_sessions_day.json"
     },
     {
+      "id": "query_tool_calls_regex_alternation",
+      "kind": "query_spec",
+      "spec": "testdata/parity/specs/query_tool_calls_regex_alternation.json"
+    },
+    {
+      "id": "query_tool_calls_regex_any",
+      "kind": "query_spec",
+      "spec": "testdata/parity/specs/query_tool_calls_regex_any.json"
+    },
+    {
       "id": "role_breakdown_json",
       "kind": "command",
       "args": ["role-breakdown", "--format", "json", "--roles", "user,assistant"]

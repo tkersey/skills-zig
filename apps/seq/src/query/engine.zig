@@ -225,6 +225,38 @@ const GroupKeyData = struct {
     values: []spec.Scalar,
 };
 
+const RegexAtomMode = enum {
+    exact,
+    prefix,
+    suffix,
+    contains,
+};
+
+const RegexAtom = struct {
+    mode: RegexAtomMode,
+    text: []const u8,
+};
+
+const CompiledWhereClause = struct {
+    field: []const u8,
+    op: spec.WhereOp,
+    case_insensitive: bool,
+    scalar: spec.Scalar = .null,
+    list: ?[]const spec.Scalar = null,
+    regex_atoms: ?[]const RegexAtom = null,
+};
+
+const CompiledWhere = struct {
+    clauses: []CompiledWhereClause,
+
+    fn deinit(self: CompiledWhere, allocator: std.mem.Allocator) void {
+        for (self.clauses) |clause| {
+            if (clause.regex_atoms) |atoms| allocator.free(atoms);
+        }
+        allocator.free(self.clauses);
+    }
+};
+
 pub fn execute(
     allocator: std.mem.Allocator,
     input_rows: []const Row,
@@ -233,10 +265,13 @@ pub fn execute(
     var result = QueryResult{};
     errdefer result.deinit(allocator);
 
+    const compiled_where = try compileWhereClauses(allocator, query.where);
+    defer compiled_where.deinit(allocator);
+
     if (query.group_by.len == 0) {
-        try executeUngrouped(allocator, input_rows, query, &result);
+        try executeUngrouped(allocator, input_rows, query, compiled_where.clauses, &result);
     } else {
-        try executeGrouped(allocator, input_rows, query, &result);
+        try executeGrouped(allocator, input_rows, query, compiled_where.clauses, &result);
     }
 
     return result;
@@ -246,11 +281,12 @@ fn executeUngrouped(
     allocator: std.mem.Allocator,
     input_rows: []const Row,
     query: spec.QuerySpec,
+    where_clauses: []const CompiledWhereClause,
     result: *QueryResult,
 ) !void {
     for (input_rows) |row| {
         result.scanned_rows += 1;
-        if (!try rowMatches(row, query.where)) continue;
+        if (!try rowMatches(row, where_clauses)) continue;
 
         const projected = if (query.select.len > 0)
             try row.cloneSelected(allocator, query.select)
@@ -273,6 +309,7 @@ fn executeGrouped(
     allocator: std.mem.Allocator,
     input_rows: []const Row,
     query: spec.QuerySpec,
+    where_clauses: []const CompiledWhereClause,
     result: *QueryResult,
 ) !void {
     var metrics: std.ArrayList(CompiledMetric) = .empty;
@@ -318,7 +355,7 @@ fn executeGrouped(
 
     for (input_rows) |row| {
         result.scanned_rows += 1;
-        if (!try rowMatches(row, query.where)) continue;
+        if (!try rowMatches(row, where_clauses)) continue;
 
         const key_data = try buildGroupKey(allocator, row, query.group_by);
         if (group_index.get(key_data.key)) |idx| {
@@ -411,7 +448,139 @@ fn appendScalarKey(
     }
 }
 
-fn rowMatches(row: Row, clauses: []const spec.WhereClause) !bool {
+fn compileWhereClauses(
+    allocator: std.mem.Allocator,
+    clauses: []const spec.WhereClause,
+) !CompiledWhere {
+    const out = try allocator.alloc(CompiledWhereClause, clauses.len);
+    errdefer allocator.free(out);
+
+    var i: usize = 0;
+    errdefer {
+        var j: usize = 0;
+        while (j < i) : (j += 1) {
+            if (out[j].regex_atoms) |atoms| allocator.free(atoms);
+        }
+    }
+
+    for (clauses) |clause| {
+        out[i] = try compileWhereClause(allocator, clause);
+        i += 1;
+    }
+
+    return .{ .clauses = out };
+}
+
+fn compileWhereClause(
+    allocator: std.mem.Allocator,
+    clause: spec.WhereClause,
+) !CompiledWhereClause {
+    var out = CompiledWhereClause{
+        .field = clause.field,
+        .op = clause.op,
+        .case_insensitive = clause.case_insensitive,
+    };
+
+    switch (clause.op) {
+        .exists, .not_exists => {},
+        .contains, .eq, .neq, .gt, .gte, .lt, .lte => {
+            out.scalar = clauseScalar(clause);
+        },
+        .in, .nin, .contains_any => {
+            out.list = clauseList(clause) orelse return error.InvalidWhereListValue;
+        },
+        .regex => {
+            const pattern = clauseNeedle(clause) orelse return error.InvalidRegexValue;
+            out.regex_atoms = try compileRegexAtoms(allocator, pattern);
+        },
+        .regex_any => {
+            const patterns = clauseList(clause) orelse return error.InvalidRegexValue;
+            out.regex_atoms = try compileRegexAnyAtoms(allocator, patterns);
+        },
+    }
+
+    return out;
+}
+
+fn compileRegexAtoms(
+    allocator: std.mem.Allocator,
+    pattern: []const u8,
+) ![]const RegexAtom {
+    var atoms: std.ArrayList(RegexAtom) = .empty;
+    defer atoms.deinit(allocator);
+
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i <= pattern.len) : (i += 1) {
+        if (i < pattern.len and pattern[i] != '|') continue;
+        const part = pattern[start..i];
+        try atoms.append(allocator, try compileRegexAtom(part));
+        start = i + 1;
+    }
+
+    if (atoms.items.len == 0) return error.InvalidRegexValue;
+    return atoms.toOwnedSlice(allocator);
+}
+
+fn compileRegexAnyAtoms(
+    allocator: std.mem.Allocator,
+    patterns: []const spec.Scalar,
+) ![]const RegexAtom {
+    var atoms: std.ArrayList(RegexAtom) = .empty;
+    defer atoms.deinit(allocator);
+
+    for (patterns) |value| {
+        const pattern = switch (value) {
+            .string => |text| text,
+            else => return error.InvalidRegexValue,
+        };
+        const compiled = try compileRegexAtoms(allocator, pattern);
+        defer allocator.free(compiled);
+        try atoms.appendSlice(allocator, compiled);
+    }
+
+    if (atoms.items.len == 0) return error.InvalidRegexValue;
+    return atoms.toOwnedSlice(allocator);
+}
+
+fn compileRegexAtom(part: []const u8) !RegexAtom {
+    if (std.mem.indexOfScalar(u8, part, '\\') != null) return error.UnsupportedRegexConstruct;
+
+    var inner = part;
+    const anchored_start = inner.len > 0 and inner[0] == '^';
+    if (anchored_start) inner = inner[1..];
+
+    const anchored_end = inner.len > 0 and inner[inner.len - 1] == '$';
+    if (anchored_end) inner = inner[0 .. inner.len - 1];
+
+    if (hasUnsupportedRegexLiteral(inner)) return error.UnsupportedRegexConstruct;
+
+    const mode: RegexAtomMode = if (anchored_start and anchored_end)
+        .exact
+    else if (anchored_start)
+        .prefix
+    else if (anchored_end)
+        .suffix
+    else
+        .contains;
+
+    return .{
+        .mode = mode,
+        .text = inner,
+    };
+}
+
+fn hasUnsupportedRegexLiteral(text: []const u8) bool {
+    for (text) |c| {
+        switch (c) {
+            '.', '*', '+', '?', '[', ']', '(', ')', '{', '}' => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn rowMatches(row: Row, clauses: []const CompiledWhereClause) !bool {
     for (clauses) |clause| {
         const value = row.valueOrNull(clause.field);
         switch (clause.op) {
@@ -422,25 +591,37 @@ fn rowMatches(row: Row, clauses: []const spec.WhereClause) !bool {
                 if (!value.isNull()) return false;
             },
             .contains => {
-                const needle = clauseNeedle(clause) orelse return false;
-                if (!scalarContains(value, needle)) return false;
+                const needle = scalarNeedle(clause.scalar) orelse return false;
+                if (!scalarContains(value, needle, clause.case_insensitive)) return false;
             },
-            .regex => {
-                const pattern = clauseNeedle(clause) orelse return error.InvalidRegexValue;
+            .contains_any => {
+                const needles = clause.list orelse return error.InvalidWhereListValue;
+                var matched = false;
+                for (needles) |candidate| {
+                    const needle = scalarNeedle(candidate) orelse continue;
+                    if (scalarContains(value, needle, clause.case_insensitive)) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) return false;
+            },
+            .regex, .regex_any => {
+                const atoms = clause.regex_atoms orelse return error.InvalidRegexValue;
                 var buf: [160]u8 = undefined;
-                if (!regexLikeMatch(scalarToText(value, buf[0..]), pattern, clause.case_insensitive)) return false;
+                if (!regexMatchAny(scalarToText(value, buf[0..]), atoms, clause.case_insensitive)) return false;
             },
             .eq => {
-                if (!scalarEq(value, clauseScalar(clause))) return false;
+                if (!scalarEq(value, clause.scalar)) return false;
             },
             .neq => {
-                if (scalarEq(value, clauseScalar(clause))) return false;
+                if (scalarEq(value, clause.scalar)) return false;
             },
             .gt, .gte, .lt, .lte => {
-                if (!relationalMatch(value, clauseScalar(clause), clause.op)) return false;
+                if (!relationalMatch(value, clause.scalar, clause.op)) return false;
             },
             .in, .nin => {
-                const options = clauseList(clause) orelse return false;
+                const options = clause.list orelse return error.InvalidWhereListValue;
                 var inside = false;
                 for (options) |candidate| {
                     if (scalarEq(value, candidate)) {
@@ -515,25 +696,36 @@ fn compareOrderByTag(lhs: spec.Scalar, rhs: spec.Scalar, op: spec.WhereOp) bool 
     };
 }
 
-fn scalarContains(value: spec.Scalar, needle: []const u8) bool {
-    var buf: [160]u8 = undefined;
-    return std.mem.indexOf(u8, scalarToText(value, buf[0..]), needle) != null;
+fn scalarNeedle(value: spec.Scalar) ?[]const u8 {
+    return switch (value) {
+        .string => |text| text,
+        else => null,
+    };
 }
 
-fn regexLikeMatch(haystack: []const u8, pattern: []const u8, case_insensitive: bool) bool {
-    if (pattern.len >= 2 and pattern[0] == '^' and pattern[pattern.len - 1] == '$') {
-        const inner = pattern[1 .. pattern.len - 1];
-        return if (case_insensitive) eqlIgnoreCaseAscii(haystack, inner) else std.mem.eql(u8, haystack, inner);
+fn scalarContains(value: spec.Scalar, needle: []const u8, case_insensitive: bool) bool {
+    var buf: [160]u8 = undefined;
+    const haystack = scalarToText(value, buf[0..]);
+    return if (case_insensitive)
+        containsIgnoreCaseAscii(haystack, needle)
+    else
+        std.mem.indexOf(u8, haystack, needle) != null;
+}
+
+fn regexMatchAny(haystack: []const u8, atoms: []const RegexAtom, case_insensitive: bool) bool {
+    for (atoms) |atom| {
+        if (regexAtomMatch(haystack, atom, case_insensitive)) return true;
     }
-    if (pattern.len > 0 and pattern[0] == '^') {
-        const inner = pattern[1..];
-        return if (case_insensitive) startsWithIgnoreCaseAscii(haystack, inner) else std.mem.startsWith(u8, haystack, inner);
-    }
-    if (pattern.len > 0 and pattern[pattern.len - 1] == '$') {
-        const inner = pattern[0 .. pattern.len - 1];
-        return if (case_insensitive) endsWithIgnoreCaseAscii(haystack, inner) else std.mem.endsWith(u8, haystack, inner);
-    }
-    return if (case_insensitive) containsIgnoreCaseAscii(haystack, pattern) else std.mem.indexOf(u8, haystack, pattern) != null;
+    return false;
+}
+
+fn regexAtomMatch(haystack: []const u8, atom: RegexAtom, case_insensitive: bool) bool {
+    return switch (atom.mode) {
+        .exact => if (case_insensitive) eqlIgnoreCaseAscii(haystack, atom.text) else std.mem.eql(u8, haystack, atom.text),
+        .prefix => if (case_insensitive) startsWithIgnoreCaseAscii(haystack, atom.text) else std.mem.startsWith(u8, haystack, atom.text),
+        .suffix => if (case_insensitive) endsWithIgnoreCaseAscii(haystack, atom.text) else std.mem.endsWith(u8, haystack, atom.text),
+        .contains => if (case_insensitive) containsIgnoreCaseAscii(haystack, atom.text) else std.mem.indexOf(u8, haystack, atom.text) != null,
+    };
 }
 
 fn sortRows(rows: []Row, sort_specs: []const spec.SortSpec) void {
@@ -918,6 +1110,89 @@ test "non-grouped where/select/sort/limit parity" {
     try expectIntField(result.rows.items[0], "arguments_len", 15);
     try expectStringField(result.rows.items[1], "path", "s1.jsonl");
     try expectIntField(result.rows.items[1], "arguments_len", 9);
+}
+
+test "non-grouped regex alternation matches expected tools" {
+    var rows = try buildToolRows(std.testing.allocator);
+    defer deinitRows(std.testing.allocator, &rows);
+
+    const query = spec.QuerySpec{
+        .where = &.{
+            .{
+                .field = "tool",
+                .op = .regex,
+                .value = .{ .scalar = .{ .string = "search|shell" } },
+            },
+        },
+        .select = &.{ "id", "tool" },
+        .sort = &.{.{ .field = "id" }},
+    };
+
+    var result = try execute(std.testing.allocator, rows.items, query);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 5), result.rows.items.len);
+    try expectIntField(result.rows.items[0], "id", 1);
+    try expectIntField(result.rows.items[1], "id", 2);
+    try expectIntField(result.rows.items[2], "id", 3);
+    try expectIntField(result.rows.items[3], "id", 4);
+    try expectIntField(result.rows.items[4], "id", 5);
+}
+
+test "non-grouped contains_any and regex_any operators" {
+    var rows = try buildToolRows(std.testing.allocator);
+    defer deinitRows(std.testing.allocator, &rows);
+
+    const contains_query = spec.QuerySpec{
+        .where = &.{
+            .{
+                .field = "tool",
+                .op = .contains_any,
+                .value = .{ .list = &.{
+                    .{ .string = "sea" },
+                    .{ .string = "hell" },
+                } },
+            },
+        },
+    };
+
+    var contains_result = try execute(std.testing.allocator, rows.items, contains_query);
+    defer contains_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 5), contains_result.rows.items.len);
+
+    const regex_query = spec.QuerySpec{
+        .where = &.{
+            .{
+                .field = "tool",
+                .op = .regex_any,
+                .value = .{ .list = &.{
+                    .{ .string = "^search$" },
+                    .{ .string = "^shell$" },
+                } },
+            },
+        },
+    };
+
+    var regex_result = try execute(std.testing.allocator, rows.items, regex_query);
+    defer regex_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 4), regex_result.rows.items.len);
+}
+
+test "regex unsupported constructs fail fast" {
+    var rows = try buildToolRows(std.testing.allocator);
+    defer deinitRows(std.testing.allocator, &rows);
+
+    const query = spec.QuerySpec{
+        .where = &.{
+            .{
+                .field = "tool",
+                .op = .regex,
+                .value = .{ .scalar = .{ .string = "(search|shell)" } },
+            },
+        },
+    };
+
+    try std.testing.expectError(error.UnsupportedRegexConstruct, execute(std.testing.allocator, rows.items, query));
 }
 
 test "non-grouped sort preserves input order for equal keys" {

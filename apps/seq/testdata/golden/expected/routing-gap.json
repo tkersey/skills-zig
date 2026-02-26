@@ -1,0 +1,20 @@
+[
+  {
+    "cue": "mesh_request",
+    "pattern": "$mesh",
+    "cue_messages": 1,
+    "cue_sessions": 1,
+    "invoked_sessions": 1,
+    "gap_sessions": 0,
+    "invoked_rate_pct": 100
+  },
+  {
+    "cue": "__all__",
+    "pattern": "-",
+    "cue_messages": 1,
+    "cue_sessions": 1,
+    "invoked_sessions": 1,
+    "gap_sessions": 0,
+    "invoked_rate_pct": 100
+  }
+]

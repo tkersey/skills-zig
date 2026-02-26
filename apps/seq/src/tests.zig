@@ -34,6 +34,7 @@ test "bootstrap parse coverage" {
     try std.testing.expectEqual(lib.Command.report_bundle, lib.parseCommand("report-bundle"));
     try std.testing.expectEqual(lib.Command.section_audit, lib.parseCommand("section-audit"));
     try std.testing.expectEqual(lib.Command.token_usage, lib.parseCommand("token-usage"));
+    try std.testing.expectEqual(lib.Command.routing_gap, lib.parseCommand("routing-gap"));
     try std.testing.expectEqual(lib.Command.datasets, lib.parseCommand("datasets"));
     try std.testing.expectEqual(lib.Command.dataset_schema, lib.parseCommand("dataset-schema"));
     try std.testing.expectEqual(lib.Command.query, lib.parseCommand("query"));

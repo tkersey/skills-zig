@@ -109,6 +109,8 @@ const Options = struct {
     bucket: ?[]const u8 = null,
     prompt: ?[]const u8 = null,
     sections: ?[]const u8 = null,
+    cue_spec_text: ?[]const u8 = null,
+    discovery_skills: ?[]const u8 = null,
     limit: usize = 0,
 };
 
@@ -138,6 +140,7 @@ pub fn run(
         .report_bundle => try cmdReportBundle(allocator, sessions_root, opts),
         .section_audit => try cmdSectionAudit(allocator, sessions_root, opts),
         .token_usage => try cmdTokenUsage(allocator, sessions_root, opts),
+        .routing_gap => try cmdRoutingGap(allocator, sessions_root, opts),
         .datasets => try cmdDatasets(allocator, opts),
         .dataset_schema => try cmdDatasetSchema(allocator, opts),
         .query => try cmdQuery(allocator, sessions_root, opts),
@@ -190,6 +193,9 @@ fn printCommandHelp(cmd: lib.Command) !void {
         .token_usage =>
         \\usage: seq token-usage [--top N]
         ,
+        .routing_gap =>
+        \\usage: seq routing-gap --cue-spec <json|@path> [--discovery-skills <csv>] [--format table|json|csv|jsonl]
+        ,
         .datasets =>
         \\usage: seq datasets
         ,
@@ -218,7 +224,7 @@ fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
         .occurrence_export => {
             if (fmt == .table) return error.InvalidFormatForCommand;
         },
-        .find_session, .session_prompts, .query, .token_usage => {},
+        .find_session, .session_prompts, .query, .token_usage, .routing_gap => {},
         .unknown => return error.InvalidCommand,
     }
 }
@@ -383,8 +389,6 @@ fn cmdRoleBreakdown(allocator: std.mem.Allocator, sessions_root: []const u8, opt
 
     var grouped = try query.execute(allocator, occ_rows.items, query_spec);
     defer grouped.deinit(allocator);
-    var known_skills = try loadKnownSkillNames(allocator);
-    defer deinitStringSet(allocator, &known_skills);
 
     const Counts = struct {
         skill: []u8,
@@ -403,7 +407,6 @@ fn cmdRoleBreakdown(allocator: std.mem.Allocator, sessions_root: []const u8, opt
         const role_scalar = row.valueOrNull("role");
         const count_scalar = row.valueOrNull("count");
         if (skill_scalar != .string or role_scalar != .string) continue;
-        if (!known_skills.contains(skill_scalar.string)) continue;
         const count = scalarAsInt(count_scalar) orelse 0;
 
         var idx_opt: ?usize = null;
@@ -573,6 +576,250 @@ fn cmdTokenUsage(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
         .limit = opts.limit,
     };
     try runDatasetQuery(allocator, "token_deltas", sessions_root, query_spec, opts.format, opts.out_path, null);
+}
+
+const CueSpec = struct {
+    name: []u8,
+    pattern: []u8,
+    case_insensitive: bool,
+};
+
+fn cmdRoutingGap(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    const cue_spec_text = opts.cue_spec_text orelse return error.MissingCueSpecArg;
+    const cue_specs = try parseCueSpecJson(allocator, cue_spec_text);
+    defer freeCueSpecs(allocator, cue_specs);
+
+    var discovery_skills = try parseDiscoverySkills(allocator, opts.discovery_skills);
+    defer deinitStringSet(allocator, &discovery_skills);
+
+    var skill_rows = try collectDatasetRows(allocator, "skill_mentions", sessions_root);
+    defer deinitQueryRows(allocator, &skill_rows);
+
+    var invoked_sessions: std.StringHashMap(void) = .init(allocator);
+    defer deinitStringSet(allocator, &invoked_sessions);
+
+    for (skill_rows.items) |row| {
+        const skill = row.valueOrNull("skill");
+        const path = row.valueOrNull("path");
+        if (skill != .string or path != .string) continue;
+        if (!discovery_skills.contains(skill.string)) continue;
+        try addToStringSet(allocator, &invoked_sessions, path.string);
+    }
+
+    var message_rows = try collectDatasetRows(allocator, "messages", sessions_root);
+    defer deinitQueryRows(allocator, &message_rows);
+
+    var out_rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &out_rows);
+
+    var total_cue_sessions: std.StringHashMap(void) = .init(allocator);
+    defer deinitStringSet(allocator, &total_cue_sessions);
+    var total_invoked_sessions: std.StringHashMap(void) = .init(allocator);
+    defer deinitStringSet(allocator, &total_invoked_sessions);
+    var total_cue_messages: i64 = 0;
+
+    for (cue_specs) |cue| {
+        const where = [_]spec.WhereClause{
+            .{
+                .field = "role",
+                .op = .eq,
+                .value = .{ .scalar = .{ .string = "user" } },
+            },
+            .{
+                .field = "text",
+                .op = .regex,
+                .value = .{ .scalar = .{ .string = cue.pattern } },
+                .case_insensitive = cue.case_insensitive,
+            },
+        };
+
+        const query_spec = spec.QuerySpec{
+            .where = where[0..],
+            .select = &.{"path"},
+        };
+        var matched = try query.execute(allocator, message_rows.items, query_spec);
+        defer matched.deinit(allocator);
+
+        const cue_message_count: i64 = @intCast(matched.rows.items.len);
+        total_cue_messages += cue_message_count;
+
+        var cue_sessions: std.StringHashMap(void) = .init(allocator);
+        defer deinitStringSet(allocator, &cue_sessions);
+
+        for (matched.rows.items) |matched_row| {
+            const path = matched_row.valueOrNull("path");
+            if (path != .string) continue;
+            try addToStringSet(allocator, &cue_sessions, path.string);
+            try addToStringSet(allocator, &total_cue_sessions, path.string);
+        }
+
+        const invoked_count = try countIntersectionAndFill(
+            allocator,
+            &cue_sessions,
+            &invoked_sessions,
+            &total_invoked_sessions,
+        );
+        const cue_session_count = cue_sessions.count();
+        const gap_count = cue_session_count - invoked_count;
+        const rate_pct: spec.Scalar = if (cue_session_count == 0)
+            .null
+        else
+            .{ .float = (@as(f64, @floatFromInt(invoked_count)) * 100.0) / @as(f64, @floatFromInt(cue_session_count)) };
+
+        var out = query.Row.init(allocator);
+        try out.putOwnedKey("cue", .{ .string = cue.name });
+        try out.putOwnedKey("pattern", .{ .string = cue.pattern });
+        try out.putOwnedKey("cue_messages", .{ .int = cue_message_count });
+        try out.putOwnedKey("cue_sessions", .{ .int = @intCast(cue_session_count) });
+        try out.putOwnedKey("invoked_sessions", .{ .int = @intCast(invoked_count) });
+        try out.putOwnedKey("gap_sessions", .{ .int = @intCast(gap_count) });
+        try out.putOwnedKey("invoked_rate_pct", rate_pct);
+        try out_rows.append(allocator, out);
+    }
+
+    const total_cue_count = total_cue_sessions.count();
+    const total_invoked_count = total_invoked_sessions.count();
+    const total_rate_pct: spec.Scalar = if (total_cue_count == 0)
+        .null
+    else
+        .{ .float = (@as(f64, @floatFromInt(total_invoked_count)) * 100.0) / @as(f64, @floatFromInt(total_cue_count)) };
+
+    var summary = query.Row.init(allocator);
+    try summary.putOwnedKey("cue", .{ .string = "__all__" });
+    try summary.putOwnedKey("pattern", .{ .string = "-" });
+    try summary.putOwnedKey("cue_messages", .{ .int = total_cue_messages });
+    try summary.putOwnedKey("cue_sessions", .{ .int = @intCast(total_cue_count) });
+    try summary.putOwnedKey("invoked_sessions", .{ .int = @intCast(total_invoked_count) });
+    try summary.putOwnedKey("gap_sessions", .{ .int = @intCast(total_cue_count - total_invoked_count) });
+    try summary.putOwnedKey("invoked_rate_pct", total_rate_pct);
+    try out_rows.append(allocator, summary);
+
+    const cols = [_][]const u8{
+        "cue",
+        "pattern",
+        "cue_messages",
+        "cue_sessions",
+        "invoked_sessions",
+        "gap_sessions",
+        "invoked_rate_pct",
+    };
+    try output.writeOutput(allocator, opts.format, out_rows.items, cols[0..], opts.out_path);
+}
+
+fn parseCueSpecJson(allocator: std.mem.Allocator, raw: []const u8) ![]CueSpec {
+    const text = try loadSpecText(allocator, raw);
+    defer allocator.free(text);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
+    defer parsed.deinit();
+
+    const cue_values = switch (parsed.value) {
+        .array => |arr| arr.items,
+        .object => |obj| blk: {
+            const cues_value = obj.get("cues") orelse return error.InvalidCueSpec;
+            switch (cues_value) {
+                .array => |arr| break :blk arr.items,
+                else => return error.InvalidCueSpec,
+            }
+        },
+        else => return error.InvalidCueSpec,
+    };
+    if (cue_values.len == 0) return error.InvalidCueSpec;
+
+    var out: std.ArrayList(CueSpec) = .empty;
+    defer out.deinit(allocator);
+    errdefer {
+        for (out.items) |cue| {
+            allocator.free(cue.name);
+            allocator.free(cue.pattern);
+        }
+    }
+
+    for (cue_values) |cue_value| {
+        const cue_obj = switch (cue_value) {
+            .object => |obj| obj,
+            else => return error.InvalidCueSpec,
+        };
+        const name = cue_obj.get("name") orelse return error.InvalidCueSpec;
+        const pattern = cue_obj.get("pattern") orelse return error.InvalidCueSpec;
+
+        const name_text = switch (name) {
+            .string => |v| v,
+            else => return error.InvalidCueSpec,
+        };
+        const pattern_text = switch (pattern) {
+            .string => |v| v,
+            else => return error.InvalidCueSpec,
+        };
+        const case_insensitive = if (cue_obj.get("case_insensitive")) |ci| switch (ci) {
+            .bool => |v| v,
+            else => return error.InvalidCueSpec,
+        } else false;
+
+        try out.append(allocator, .{
+            .name = try allocator.dupe(u8, name_text),
+            .pattern = try allocator.dupe(u8, pattern_text),
+            .case_insensitive = case_insensitive,
+        });
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn freeCueSpecs(allocator: std.mem.Allocator, cues: []const CueSpec) void {
+    for (cues) |cue| {
+        allocator.free(cue.name);
+        allocator.free(cue.pattern);
+    }
+    allocator.free(cues);
+}
+
+fn parseDiscoverySkills(
+    allocator: std.mem.Allocator,
+    raw_opt: ?[]const u8,
+) !std.StringHashMap(void) {
+    const defaults = "grill-me,prove-it,complexity-mitigator,invariant-ace,tk";
+    const raw = raw_opt orelse defaults;
+
+    var set: std.StringHashMap(void) = .init(allocator);
+    errdefer deinitStringSet(allocator, &set);
+
+    var split = std.mem.splitScalar(u8, raw, ',');
+    while (split.next()) |segment| {
+        const trimmed = std.mem.trim(u8, segment, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        try addToStringSet(allocator, &set, trimmed);
+    }
+    if (set.count() == 0) return error.InvalidDiscoverySkills;
+    return set;
+}
+
+fn addToStringSet(
+    allocator: std.mem.Allocator,
+    set: *std.StringHashMap(void),
+    text: []const u8,
+) !void {
+    if (set.contains(text)) return;
+    const key = try allocator.dupe(u8, text);
+    errdefer allocator.free(key);
+    try set.put(key, {});
+}
+
+fn countIntersectionAndFill(
+    allocator: std.mem.Allocator,
+    lhs: *const std.StringHashMap(void),
+    rhs: *const std.StringHashMap(void),
+    out_union: *std.StringHashMap(void),
+) !usize {
+    var count: usize = 0;
+    var it = lhs.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (!rhs.contains(key)) continue;
+        count += 1;
+        try addToStringSet(allocator, out_union, key);
+    }
+    return count;
 }
 
 fn runDatasetQuery(
@@ -963,6 +1210,14 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.sections = args[i];
+        } else if (std.mem.eql(u8, arg, "--cue-spec")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.cue_spec_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--discovery-skills")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.discovery_skills = args[i];
         } else if (std.mem.eql(u8, arg, "--limit") or std.mem.eql(u8, arg, "--max") or std.mem.eql(u8, arg, "--top")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -1060,11 +1315,25 @@ fn deinitQueryRows(allocator: std.mem.Allocator, rows: *std.ArrayList(query.Row)
 }
 
 test "parse options supports common flags" {
-    const args = [_][]const u8{ "--format", "jsonl", "--root", "~/sessions", "--max", "7", "--help" };
+    const args = [_][]const u8{
+        "--format",
+        "jsonl",
+        "--root",
+        "~/sessions",
+        "--max",
+        "7",
+        "--cue-spec",
+        "@cues.json",
+        "--discovery-skills",
+        "grill-me,prove-it",
+        "--help",
+    };
     const opts = try parseOptions(args[0..]);
     try std.testing.expectEqual(output.Format.jsonl, opts.format);
     try std.testing.expect(opts.format_set);
     try std.testing.expectEqualStrings("~/sessions", opts.root.?);
     try std.testing.expectEqual(@as(usize, 7), opts.limit);
+    try std.testing.expectEqualStrings("@cues.json", opts.cue_spec_text.?);
+    try std.testing.expectEqualStrings("grill-me,prove-it", opts.discovery_skills.?);
     try std.testing.expect(opts.help);
 }

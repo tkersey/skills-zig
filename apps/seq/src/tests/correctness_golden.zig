@@ -94,3 +94,24 @@ test "golden skill-trend mesh day json" {
 
     try std.testing.expectEqualStrings(expected, got);
 }
+
+test "golden routing-gap json" {
+    const args = [_][]const u8{
+        "--root",
+        "testdata/golden/sessions",
+        "--cue-spec",
+        "@testdata/golden/routing-gap-cues.json",
+        "--discovery-skills",
+        "mesh",
+        "--format",
+        "json",
+    };
+
+    const got = try runAndReadOutput(std.testing.allocator, .routing_gap, args[0..], ".zig-cache/golden-routing-gap.json");
+    defer std.testing.allocator.free(got);
+
+    const expected = try readExpected(std.testing.allocator, "testdata/golden/expected/routing-gap.json");
+    defer std.testing.allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, got);
+}

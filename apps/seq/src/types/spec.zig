@@ -27,7 +27,9 @@ pub const WhereOp = enum {
     exists,
     not_exists,
     contains,
+    contains_any,
     regex,
+    regex_any,
 
     pub fn parse(text: []const u8) !WhereOp {
         if (std.ascii.eqlIgnoreCase(text, "eq")) return .eq;
@@ -41,7 +43,9 @@ pub const WhereOp = enum {
         if (std.ascii.eqlIgnoreCase(text, "exists")) return .exists;
         if (std.ascii.eqlIgnoreCase(text, "not_exists")) return .not_exists;
         if (std.ascii.eqlIgnoreCase(text, "contains")) return .contains;
+        if (std.ascii.eqlIgnoreCase(text, "contains_any")) return .contains_any;
         if (std.ascii.eqlIgnoreCase(text, "regex")) return .regex;
+        if (std.ascii.eqlIgnoreCase(text, "regex_any")) return .regex_any;
         return error.InvalidWhereOp;
     }
 };
@@ -376,5 +380,24 @@ test "parse where list and case_insensitive regex" {
     try std.testing.expectEqual(@as(usize, 2), query.where.len);
     try std.testing.expectEqual(WhereOp.in, query.where[0].op);
     try std.testing.expectEqual(WhereOp.regex, query.where[1].op);
+    try std.testing.expect(query.where[1].case_insensitive);
+}
+
+test "parse where supports contains_any and regex_any operators" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const query = try parseQuerySpecJson(arena.allocator(),
+        \\{
+        \\  "where": [
+        \\    {"field":"tool","op":"contains_any","value":["sea","she"]},
+        \\    {"field":"tool","op":"regex_any","value":["^search$","^shell$"],"case_insensitive": true}
+        \\  ]
+        \\}
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), query.where.len);
+    try std.testing.expectEqual(WhereOp.contains_any, query.where[0].op);
+    try std.testing.expectEqual(WhereOp.regex_any, query.where[1].op);
     try std.testing.expect(query.where[1].case_insensitive);
 }
