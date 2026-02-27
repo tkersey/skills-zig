@@ -726,7 +726,7 @@ fn writeCompareJson(
     try writeDeltaPctJson(writer, delta_pct);
     try writer.print(",\"ci\":{{\"samples\":{d},\"alpha\":{d:.6},\"delta\":", .{ ci_samples, ci_alpha });
     try writeCiDeltaJson(writer, ci);
-    try writer.writeAll("}}");
+    try writer.writeAll("}");
     try writer.writeAll("}");
 }
 
@@ -850,6 +850,46 @@ test "bootstrap CI returns ordered interval" {
         &prng,
     );
     try std.testing.expect(ci.lo <= ci.hi);
+}
+
+test "compare json output is valid json" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    const writer = out.writer(std.testing.allocator);
+
+    const baseline = Report{
+        .count = 3,
+        .min = 10.0,
+        .p50 = 12.0,
+        .p90 = 14.0,
+        .p95 = 14.5,
+        .p99 = 14.9,
+        .max = 15.0,
+        .mean = 12.0,
+        .median = 12.0,
+        .stdev = 2.0,
+        .unit = "ms",
+    };
+    const variant = Report{
+        .count = 3,
+        .min = 9.0,
+        .p50 = 11.0,
+        .p90 = 13.0,
+        .p95 = 13.5,
+        .p99 = 13.9,
+        .max = 14.0,
+        .mean = 11.0,
+        .median = 11.0,
+        .stdev = 2.0,
+        .unit = "ms",
+    };
+
+    const delta = computeDelta(baseline, variant);
+    const delta_pct = computeDeltaPct(baseline, delta);
+    try writeCompareJson(writer, baseline, variant, delta, delta_pct, 0, 0.05, .{});
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.items, .{});
+    defer parsed.deinit();
 }
 
 fn parseLineWithAlloc(alloc: std.mem.Allocator, line: []const u8) !void {
