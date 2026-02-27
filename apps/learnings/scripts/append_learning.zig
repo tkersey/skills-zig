@@ -3,15 +3,15 @@ const core_cli = @import("core_cli");
 const app_meta = @import("app_meta");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
-const ProgramName = "append_learning.py";
+const ProgramName = "append_learning";
 const UsageLine =
-    "usage: append_learning.py [-h] [--status STATUS] --learning LEARNING [--evidence EVIDENCE] [--application APPLICATION] [--tag TAG] [--related-id RELATED_ID] [--supersedes-id SUPERSEDES_ID] [--repo REPO] [--path PATH] [--source SOURCE] [--allow-duplicate]";
+    "usage: append_learning [-h] [--status STATUS] --learning LEARNING [--evidence EVIDENCE] [--application APPLICATION] [--tag TAG] [--related-id RELATED_ID] [--supersedes-id SUPERSEDES_ID] [--repo REPO] [--path PATH] [--source SOURCE] [--allow-duplicate] [--quality-mode {strict,best_effort}] [--allow-temp-path]";
 const HelpText =
     \\append_learning.zig
     \\
     \\Marker: append_learning.zig
     \\
-    \\usage: append_learning.py [-h] [--status STATUS] --learning LEARNING [--evidence EVIDENCE] [--application APPLICATION] [--tag TAG] [--related-id RELATED_ID] [--supersedes-id SUPERSEDES_ID] [--repo REPO] [--path PATH] [--source SOURCE] [--allow-duplicate]
+    \\usage: append_learning [-h] [--status STATUS] --learning LEARNING [--evidence EVIDENCE] [--application APPLICATION] [--tag TAG] [--related-id RELATED_ID] [--supersedes-id SUPERSEDES_ID] [--repo REPO] [--path PATH] [--source SOURCE] [--allow-duplicate] [--quality-mode {strict,best_effort}] [--allow-temp-path]
     \\
     \\Append a structured learning record to repo-root .learnings.jsonl.
     \\
@@ -31,9 +31,58 @@ const HelpText =
     \\  --path PATH           Path to JSONL file, relative to repo root by default
     \\  --source SOURCE       Source marker for the record
     \\  --allow-duplicate     Append even if an existing record has the same fingerprint
+    \\  --quality-mode {strict,best_effort}
+    \\                        Record quality gate mode; strict rejects weak records, best_effort keeps legacy placeholder behavior.
+    \\  --allow-temp-path     Allow capture when repo root is under temporary paths (/tmp or /var/folders).
     \\  -V, --version         Show version
     \\  version               Show version
 ;
+
+const QualityMode = enum {
+    strict,
+    best_effort,
+};
+
+const TEMP_PATH_PREFIXES = [_][]const u8{
+    "/tmp",
+    "/tmp/",
+    "/private/tmp",
+    "/private/tmp/",
+    "/var/folders/",
+    "/private/var/folders/",
+};
+
+const PLACEHOLDER_VALUES = [_][]const u8{
+    "none_provided",
+    "capture_follow_up_later",
+    "n/a",
+    "na",
+    "todo",
+    "unknown",
+    "tbd",
+};
+
+const CONDITION_TOKENS = [_][]const u8{ "when", "if", "for" };
+const ACTION_TOKENS = [_][]const u8{
+    "prefer",
+    "use",
+    "avoid",
+    "set",
+    "run",
+    "keep",
+    "add",
+    "remove",
+    "require",
+    "enforce",
+    "treat",
+    "encode",
+    "split",
+    "move",
+    "mirror",
+    "pin",
+    "gate",
+};
+const COUNTERFACTUAL_TOKENS = [_][]const u8{ "because", "prevent", "otherwise" };
 
 const Options = struct {
     status: []const u8 = "review_later",
@@ -47,6 +96,8 @@ const Options = struct {
     path: []const u8 = ".learnings.jsonl",
     source: []const u8 = "skill:learnings",
     allow_duplicate: bool = false,
+    quality_mode: QualityMode = .strict,
+    allow_temp_path: bool = false,
 
     fn deinit(self: *Options, allocator: std.mem.Allocator) void {
         self.evidence.deinit(allocator);
@@ -106,6 +157,23 @@ pub fn main() !void {
         }
         if (std.mem.eql(u8, arg, "--allow-duplicate")) {
             opts.allow_duplicate = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--allow-temp-path")) {
+            opts.allow_temp_path = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--quality-mode")) {
+            i += 1;
+            if (i >= argv.len) exitParseError("argument --quality-mode: expected one argument", .{});
+            const mode = argv[i];
+            if (std.mem.eql(u8, mode, "strict")) {
+                opts.quality_mode = .strict;
+            } else if (std.mem.eql(u8, mode, "best_effort")) {
+                opts.quality_mode = .best_effort;
+            } else {
+                exitParseError("argument --quality-mode: expected one of strict,best_effort", .{});
+            }
             continue;
         }
 
@@ -209,15 +277,30 @@ pub fn main() !void {
         }
         try evidence.append(allocator, normalized);
     }
-    if (evidence.items.len == 0) {
+    if (opts.quality_mode == .best_effort and evidence.items.len == 0) {
         try evidence.append(allocator, try allocator.dupe(u8, "none_provided"));
     }
 
     var application = try normalizeLearningAlloc(allocator, opts.application);
     defer allocator.free(application);
-    if (application.len == 0) {
+    if (opts.quality_mode == .best_effort and application.len == 0) {
         allocator.free(application);
         application = try allocator.dupe(u8, "capture_follow_up_later");
+    }
+
+    if (opts.quality_mode == .strict) {
+        const quality_ok = try validateQuality(
+            allocator,
+            status,
+            learning,
+            evidence.items,
+            application,
+            repo_root,
+            opts.allow_temp_path,
+        );
+        if (!quality_ok) {
+            std.process.exit(2);
+        }
     }
 
     var tags: std.ArrayList([]u8) = .empty;
@@ -384,6 +467,206 @@ fn normalizeLearningAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
 
 fn normalizeTagAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     return normalizeStatusAlloc(allocator, raw);
+}
+
+fn validateQuality(
+    allocator: std.mem.Allocator,
+    status: []const u8,
+    learning: []const u8,
+    evidence: []const []u8,
+    application: []const u8,
+    repo_root: []const u8,
+    allow_temp_path: bool,
+) !bool {
+    var stderr_writer = std.fs.File.stderr().writer(&.{});
+    const stderr = &stderr_writer.interface;
+
+    var has_errors = false;
+
+    if (isEphemeralPath(repo_root) and !allow_temp_path) {
+        has_errors = true;
+        try stderr.print(
+            "quality-error: repo root is ephemeral: {s}. Use --allow-temp-path only when capture must be temporary.\n",
+            .{repo_root},
+        );
+    }
+
+    if (learning.len < 24) {
+        has_errors = true;
+        try stderr.print("quality-error: learning is too short; include a durable decision rule.\n", .{});
+    }
+
+    const learning_lower = try asciiLowerAlloc(allocator, learning);
+    defer allocator.free(learning_lower);
+
+    if (!hasConditionAction(learning_lower)) {
+        has_errors = true;
+        try stderr.print(
+            "quality-error: learning must include explicit condition + action (for example: 'When X, prefer Y ...').\n",
+            .{},
+        );
+    }
+
+    if (!hasCounterfactual(learning_lower)) {
+        try stderr.print(
+            "quality-warning: learning lacks explicit consequence wording (because/to avoid/prevent/otherwise).\n",
+            .{},
+        );
+    }
+
+    if (evidence.len == 0) {
+        has_errors = true;
+        try stderr.print("quality-error: at least one --evidence value is required in strict mode.\n", .{});
+    } else if (containsPlaceholderValue(evidence)) {
+        has_errors = true;
+        try stderr.print("quality-error: evidence contains placeholder text.\n", .{});
+    } else if (!hasAnchoredEvidence(evidence)) {
+        has_errors = true;
+        try stderr.print(
+            "quality-error: evidence needs at least one concrete anchor (command outcome, sha/run id, file path, or exact error).\n",
+            .{},
+        );
+    }
+
+    if (isPlaceholderValue(application)) {
+        has_errors = true;
+        try stderr.print("quality-error: application must be concrete in strict mode.\n", .{});
+    }
+
+    if (std.mem.eql(u8, status, "review_later")) {
+        try stderr.print(
+            "quality-warning: status=review_later used; ensure this uncertainty is itself decision-shaping.\n",
+            .{},
+        );
+    }
+
+    if (has_errors) {
+        try stderr.print(
+            "quality-error: use --quality-mode best_effort only for intentional exceptions.\n",
+            .{},
+        );
+    }
+    return !has_errors;
+}
+
+fn isEphemeralPath(path: []const u8) bool {
+    for (TEMP_PATH_PREFIXES) |prefix| {
+        if (std.mem.startsWith(u8, path, prefix)) return true;
+    }
+    return false;
+}
+
+fn containsPlaceholderValue(values: []const []const u8) bool {
+    for (values) |value| {
+        if (isPlaceholderValue(value)) return true;
+    }
+    return false;
+}
+
+fn isPlaceholderValue(value: []const u8) bool {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) return true;
+    for (PLACEHOLDER_VALUES) |placeholder| {
+        if (std.ascii.eqlIgnoreCase(trimmed, placeholder)) return true;
+    }
+    return false;
+}
+
+fn hasConditionAction(learning_lower: []const u8) bool {
+    var has_condition = false;
+    for (CONDITION_TOKENS) |token| {
+        if (containsWordLower(learning_lower, token)) {
+            has_condition = true;
+            break;
+        }
+    }
+    if (!has_condition) return false;
+
+    for (ACTION_TOKENS) |token| {
+        if (containsWordLower(learning_lower, token)) return true;
+    }
+    return false;
+}
+
+fn hasCounterfactual(learning_lower: []const u8) bool {
+    if (std.mem.indexOf(u8, learning_lower, "to avoid") != null) return true;
+    for (COUNTERFACTUAL_TOKENS) |token| {
+        if (containsWordLower(learning_lower, token)) return true;
+    }
+    return false;
+}
+
+fn containsWordLower(haystack: []const u8, needle: []const u8) bool {
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, start, needle)) |idx| {
+        const before_ok = idx == 0 or !isAsciiAlnum(haystack[idx - 1]);
+        const after_idx = idx + needle.len;
+        const after_ok = after_idx >= haystack.len or !isAsciiAlnum(haystack[after_idx]);
+        if (before_ok and after_ok) return true;
+        start = idx + 1;
+    }
+    return false;
+}
+
+fn hasAnchoredEvidence(evidence: []const []const u8) bool {
+    for (evidence) |item| {
+        if (hasEvidenceAnchor(item)) return true;
+    }
+    return false;
+}
+
+fn hasEvidenceAnchor(text: []const u8) bool {
+    if (containsCaseInsensitive(text, "task_")) return true;
+    if (containsCaseInsensitive(text, "passed")) return true;
+    if (containsCaseInsensitive(text, "failed")) return true;
+    if (containsCaseInsensitive(text, "error")) return true;
+    if (containsCaseInsensitive(text, "exit ")) return true;
+    if (containsCaseInsensitive(text, "exited ")) return true;
+
+    var tokens = std.mem.tokenizeAny(u8, text, " \t\r\n,;:()[]{}<>\"'`");
+    while (tokens.next()) |tok| {
+        if (isHexishToken(tok)) return true;
+        if (isFileLikeToken(tok)) return true;
+        if (isRunNumberToken(tok)) return true;
+    }
+    return false;
+}
+
+fn containsCaseInsensitive(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > haystack.len) return false;
+    var idx: usize = 0;
+    while (idx + needle.len <= haystack.len) : (idx += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[idx .. idx + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn isHexishToken(token: []const u8) bool {
+    if (token.len < 7 or token.len > 40) return false;
+    for (token) |c| {
+        if (!std.ascii.isHex(c)) return false;
+    }
+    return true;
+}
+
+fn isFileLikeToken(token: []const u8) bool {
+    if (token.len < 3) return false;
+    if (std.mem.startsWith(u8, token, "--")) return false;
+    if (std.mem.indexOfScalar(u8, token, '.') == null) return false;
+    return true;
+}
+
+fn isRunNumberToken(token: []const u8) bool {
+    if (!std.mem.startsWith(u8, token, "run")) return false;
+    if (token.len <= 3) return false;
+    var idx: usize = 3;
+    while (idx < token.len and (token[idx] == '_' or token[idx] == '-' or token[idx] == ':')) : (idx += 1) {}
+    if (idx >= token.len) return false;
+    var digits: usize = 0;
+    while (idx < token.len and std.ascii.isDigit(token[idx])) : (idx += 1) {
+        digits += 1;
+    }
+    return digits >= 6;
 }
 
 fn discoverRepoRootAlloc(allocator: std.mem.Allocator, start: []const u8) ![]u8 {

@@ -7,14 +7,14 @@ const query_output = seq_bundle.query_output;
 const query_spec = seq_bundle.query_spec;
 
 const Version = core_cli.normalizeVersion(app_meta.version);
-const ProgramName = "learnings.py";
+const ProgramName = "learnings";
 
 const UsageText =
     \\learnings.zig
     \\
     \\Marker: learnings.zig
     \\
-    \\usage: learnings.py [-h] [--path PATH] {datasets,dataset-schema,query,recent,recall,codify-candidates} ...
+    \\usage: learnings [-h] [--path PATH] {datasets,dataset-schema,query,recent,recall,codify-candidates} ...
     \\
     \\Mine, recall, and promote records from repo-root .learnings.jsonl.
     \\
