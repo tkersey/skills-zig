@@ -38,6 +38,12 @@ const RequiredCsvHeaders = [_][]const u8{
     "attempt",
     "variant",
     "budget_tier",
+    "cohort_id",
+    "triplet_index",
+    "candidate_id",
+    "role_in_lane",
+    "challenge_targets",
+    "quorum_rule",
 };
 
 const Command = enum {
@@ -67,6 +73,21 @@ const BudgetDecision = struct {
     max_active_units: usize,
     mode: BudgetMode,
     cas_scaleout_allowed: bool,
+    triplet_width: usize,
+    triplet_degrade_reason: []const u8,
+    triplet_restored: bool,
+};
+
+const Lane = enum {
+    coder,
+    fixer,
+    integrator,
+};
+
+const TripletDecision = struct {
+    width: usize,
+    degrade_reason: []const u8,
+    restored: bool,
 };
 
 const PlanStep = struct {
@@ -164,6 +185,10 @@ fn cmdBudget(args: []const []const u8) !void {
     var single_agent_threshold: f64 = 10;
     var linear_start_threshold: f64 = 33;
     var scaleout_threshold: f64 = 25;
+    var previous_triplet_width: usize = 3;
+    var prior_wave_instability = false;
+    var consecutive_unstable_waves: usize = 0;
+    var consecutive_clean_waves: usize = 0;
     var format_json = true;
 
     var i: usize = 0;
@@ -205,6 +230,30 @@ fn cmdBudget(args: []const []const u8) !void {
             scaleout_threshold = try std.fmt.parseFloat(f64, args[i]);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--previous-triplet-width")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            previous_triplet_width = try std.fmt.parseUnsigned(usize, args[i], 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--prior-wave-instability")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            prior_wave_instability = try parseBool(args[i]);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--consecutive-unstable-waves")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            consecutive_unstable_waves = try std.fmt.parseUnsigned(usize, args[i], 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--consecutive-clean-waves")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            consecutive_clean_waves = try std.fmt.parseUnsigned(usize, args[i], 10);
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--format")) {
             i += 1;
             if (i >= args.len) return error.MissingValue;
@@ -225,6 +274,10 @@ fn cmdBudget(args: []const []const u8) !void {
         linear_start_threshold,
         single_agent_threshold,
         scaleout_threshold,
+        previous_triplet_width,
+        prior_wave_instability,
+        consecutive_unstable_waves,
+        consecutive_clean_waves,
     );
 
     var stdout_writer = std.fs.File.stdout().writer(&.{});
@@ -232,19 +285,22 @@ fn cmdBudget(args: []const []const u8) !void {
 
     if (!format_json) {
         try stdout.print(
-            "mode={s} strict_remaining={d:.2} max_active_units={d} cas_scaleout_allowed={s}\n",
+            "mode={s} strict_remaining={d:.2} max_active_units={d} cas_scaleout_allowed={s} triplet_width={d} triplet_degrade_reason={s} triplet_restored={s}\n",
             .{
                 budgetModeString(decision.mode),
                 decision.remaining_strict,
                 decision.max_active_units,
                 if (decision.cas_scaleout_allowed) "true" else "false",
+                decision.triplet_width,
+                decision.triplet_degrade_reason,
+                if (decision.triplet_restored) "true" else "false",
             },
         );
         return;
     }
 
     try stdout.print(
-        "{{\"command\":\"budget\",\"remaining_five_hour\":{d:.4},\"remaining_weekly\":{d:.4},\"remaining_strict\":{d:.4},\"linear_start_threshold\":{d:.4},\"single_agent_threshold\":{d:.4},\"scaleout_threshold\":{d:.4},\"max_threads\":{d},\"max_active_units\":{d},\"mode\":\"{s}\",\"cas_scaleout_allowed\":{s}}}\n",
+        "{{\"command\":\"budget\",\"remaining_five_hour\":{d:.4},\"remaining_weekly\":{d:.4},\"remaining_strict\":{d:.4},\"linear_start_threshold\":{d:.4},\"single_agent_threshold\":{d:.4},\"scaleout_threshold\":{d:.4},\"max_threads\":{d},\"max_active_units\":{d},\"mode\":\"{s}\",\"cas_scaleout_allowed\":{s},\"triplet_width\":{d},\"triplet_degrade_reason\":",
         .{
             decision.remaining_five_hour,
             decision.remaining_weekly,
@@ -256,8 +312,11 @@ fn cmdBudget(args: []const []const u8) !void {
             decision.max_active_units,
             budgetModeString(decision.mode),
             if (decision.cas_scaleout_allowed) "true" else "false",
+            decision.triplet_width,
         },
     );
+    try std.json.Stringify.value(decision.triplet_degrade_reason, .{}, stdout);
+    try stdout.print(",\"triplet_restored\":{s}}}\n", .{if (decision.triplet_restored) "true" else "false"});
 }
 
 fn cmdReplay(args: []const []const u8) !void {
@@ -265,6 +324,10 @@ fn cmdReplay(args: []const []const u8) !void {
     var remaining_weekly: ?f64 = null;
     var max_threads: usize = 12;
     var ready_units: ?usize = null;
+    var previous_triplet_width: usize = 3;
+    var prior_wave_instability = false;
+    var consecutive_unstable_waves: usize = 0;
+    var consecutive_clean_waves: usize = 0;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -293,6 +356,30 @@ fn cmdReplay(args: []const []const u8) !void {
             ready_units = try std.fmt.parseUnsigned(usize, args[i], 10);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--previous-triplet-width")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            previous_triplet_width = try std.fmt.parseUnsigned(usize, args[i], 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--prior-wave-instability")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            prior_wave_instability = try parseBool(args[i]);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--consecutive-unstable-waves")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            consecutive_unstable_waves = try std.fmt.parseUnsigned(usize, args[i], 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--consecutive-clean-waves")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            consecutive_clean_waves = try std.fmt.parseUnsigned(usize, args[i], 10);
+            continue;
+        }
         return error.UnknownFlag;
     }
 
@@ -300,7 +387,18 @@ fn cmdReplay(args: []const []const u8) !void {
         return error.MissingRequiredOption;
     }
 
-    const decision = computeBudgetDecision(remaining_five_hour.?, remaining_weekly.?, max_threads, 33, 10, 25);
+    const decision = computeBudgetDecision(
+        remaining_five_hour.?,
+        remaining_weekly.?,
+        max_threads,
+        33,
+        10,
+        25,
+        previous_triplet_width,
+        prior_wave_instability,
+        consecutive_unstable_waves,
+        consecutive_clean_waves,
+    );
     const per_wave = @max(@as(usize, 1), decision.max_active_units);
     var remaining = ready_units.?;
     var wave_sizes: std.ArrayList(usize) = .empty;
@@ -316,12 +414,23 @@ fn cmdReplay(args: []const []const u8) !void {
     const stdout = &stdout_writer.interface;
 
     try stdout.print(
-        "{{\"command\":\"replay\",\"mode\":\"{s}\",\"max_active_units\":{d},\"ready_units\":{d},\"wave_count\":{d},\"waves\":[",
-        .{ budgetModeString(decision.mode), decision.max_active_units, ready_units.?, wave_sizes.items.len },
+        "{{\"command\":\"replay\",\"mode\":\"{s}\",\"max_active_units\":{d},\"triplet_width\":{d},\"triplet_degrade_reason\":",
+        .{ budgetModeString(decision.mode), decision.max_active_units, decision.triplet_width },
     );
+    try std.json.Stringify.value(decision.triplet_degrade_reason, .{}, stdout);
+    try stdout.print(",\"triplet_restored\":{s},\"ready_units\":{d},\"wave_count\":{d},\"waves\":[", .{
+        if (decision.triplet_restored) "true" else "false",
+        ready_units.?,
+        wave_sizes.items.len,
+    });
     for (wave_sizes.items, 0..) |n, idx| {
         if (idx > 0) try stdout.print(",", .{});
         try stdout.print("{d}", .{n});
+    }
+    try stdout.writeAll("],\"rows_per_lane\":[");
+    for (wave_sizes.items, 0..) |n, idx| {
+        if (idx > 0) try stdout.print(",", .{});
+        try stdout.print("{d}", .{n * decision.triplet_width});
     }
     try stdout.writeAll("]}\n");
 }
@@ -395,6 +504,11 @@ fn cmdWave(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const units_path = try parseRequiredPath(args, "--units-json");
     const csv_path = try parseRequiredPath(args, "--csv-path");
     const max_active = parseOptionalUsize(args, "--max-active") orelse 1;
+    const lane = parseOptionalLane(args, "--lane") orelse .coder;
+    const triplet_width = parseOptionalUsize(args, "--triplet-width") orelse 3;
+    const degrade_reason = parseOptionalPath(args, "--degrade-reason") orelse "";
+
+    if (triplet_width == 0 or triplet_width > 3) return error.InvalidTripletWidth;
 
     const units = try parseSliceUnits(allocator, units_path);
 
@@ -402,39 +516,66 @@ fn cmdWave(allocator: std.mem.Allocator, args: []const []const u8) !void {
     defer csv.deinit(allocator);
     var writer = csv.writer(allocator);
 
-    try writer.writeAll("id,objective,unit_scope,constraints,invariants,proof_command,delivery_mode,attempt,variant,budget_tier\n");
+    try writer.writeAll("id,objective,unit_scope,constraints,invariants,proof_command,delivery_mode,attempt,variant,budget_tier,cohort_id,triplet_index,candidate_id,role_in_lane,challenge_targets,quorum_rule,lane,degrade_reason\n");
 
-    var selected: usize = 0;
+    var selected_units: usize = 0;
+    var emitted_rows: usize = 0;
     var scopes = std.StringHashMap(void).init(allocator);
     defer scopes.deinit();
 
     for (units) |unit| {
-        if (selected >= max_active) break;
+        if (selected_units >= max_active) break;
         if (scopes.contains(unit.unit_scope)) continue;
         try scopes.put(unit.unit_scope, {});
 
-        try writeCsvField(writer, unit.id);
-        try writer.writeByte(',');
-        try writeCsvField(writer, unit.objective);
-        try writer.writeByte(',');
-        try writeCsvField(writer, unit.unit_scope);
-        try writer.writeByte(',');
-        try writeCsvField(writer, unit.constraints);
-        try writer.writeByte(',');
-        try writeCsvField(writer, unit.invariants);
-        try writer.writeByte(',');
-        try writeCsvField(writer, unit.proof_command);
-        try writer.writeByte(',');
-        try writeCsvField(writer, unit.delivery_mode);
-        try writer.writeByte(',');
-        try writeCsvField(writer, unit.attempt);
-        try writer.writeByte(',');
-        try writeCsvField(writer, unit.variant);
-        try writer.writeByte(',');
-        try writeCsvField(writer, unit.budget_tier);
-        try writer.writeByte('\n');
+        var idx: usize = 1;
+        while (idx <= triplet_width) : (idx += 1) {
+            var row_id_buf: [256]u8 = undefined;
+            const row_id = try std.fmt.bufPrint(&row_id_buf, "{s}-{s}-{d}", .{ unit.id, laneString(lane), idx });
+            var index_buf: [8]u8 = undefined;
+            const index_text = try std.fmt.bufPrint(&index_buf, "{d}", .{idx});
 
-        selected += 1;
+            try writeCsvField(writer, row_id);
+            try writer.writeByte(',');
+            try writeCsvField(writer, unit.objective);
+            try writer.writeByte(',');
+            try writeCsvField(writer, unit.unit_scope);
+            try writer.writeByte(',');
+            try writeCsvField(writer, unit.constraints);
+            try writer.writeByte(',');
+            try writeCsvField(writer, unit.invariants);
+            try writer.writeByte(',');
+            try writeCsvField(writer, unit.proof_command);
+            try writer.writeByte(',');
+            try writeCsvField(writer, unit.delivery_mode);
+            try writer.writeByte(',');
+            try writeCsvField(writer, unit.attempt);
+            try writer.writeByte(',');
+            try writeCsvField(writer, unit.variant);
+            try writer.writeByte(',');
+            try writeCsvField(writer, unit.budget_tier);
+            try writer.writeByte(',');
+            try writeCsvField(writer, unit.id);
+            try writer.writeByte(',');
+            try writeCsvField(writer, index_text);
+            try writer.writeByte(',');
+            try writeCsvField(writer, row_id);
+            try writer.writeByte(',');
+            try writeCsvField(writer, roleInLane(lane, idx));
+            try writer.writeByte(',');
+            try writeCsvField(writer, challengeTargets(lane, triplet_width, idx));
+            try writer.writeByte(',');
+            try writeCsvField(writer, quorumRule(lane));
+            try writer.writeByte(',');
+            try writeCsvField(writer, laneString(lane));
+            try writer.writeByte(',');
+            try writeCsvField(writer, degrade_reason);
+            try writer.writeByte('\n');
+
+            emitted_rows += 1;
+        }
+
+        selected_units += 1;
     }
 
     try writeTextFile(csv_path, csv.items);
@@ -442,8 +583,8 @@ fn cmdWave(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var stdout_writer = std.fs.File.stdout().writer(&.{});
     const stdout = &stdout_writer.interface;
     try stdout.print(
-        "{{\"command\":\"wave\",\"units_in\":{d},\"units_selected\":{d},\"csv_path\":",
-        .{ units.len, selected },
+        "{{\"command\":\"wave\",\"lane\":\"{s}\",\"triplet_width\":{d},\"units_in\":{d},\"units_selected\":{d},\"rows_emitted\":{d},\"csv_path\":",
+        .{ laneString(lane), triplet_width, units.len, selected_units, emitted_rows },
     );
     try std.json.Stringify.value(csv_path, .{}, stdout);
     try stdout.writeAll("}\n");
@@ -467,12 +608,14 @@ fn cmdRunCsv(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     const id_index = findHeaderIndex(headers, "id") orelse return error.MissingIdHeader;
+    const candidate_id_index = findHeaderIndex(headers, "candidate_id") orelse return error.MissingCandidateIdHeader;
+    const triplet_index_index = findHeaderIndex(headers, "triplet_index") orelse return error.MissingTripletIndexHeader;
 
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
     var outw = output.writer(allocator);
 
-    try outw.writeAll("id,decision,proof_status,failure_code,notes\n");
+    try outw.writeAll("id,candidate_id,triplet_index,decision,proof_status,failure_code,notes\n");
 
     var row_count: usize = 0;
     while (lines.next()) |line| {
@@ -481,8 +624,14 @@ fn cmdRunCsv(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
         const id = nthCsvField(trimmed, id_index) orelse "";
         if (id.len == 0) continue;
+        const candidate_id = nthCsvField(trimmed, candidate_id_index) orelse id;
+        const triplet_index = nthCsvField(trimmed, triplet_index_index) orelse "1";
 
         try writeCsvField(outw, id);
+        try outw.writeByte(',');
+        try writeCsvField(outw, candidate_id);
+        try outw.writeByte(',');
+        try writeCsvField(outw, triplet_index);
         try outw.writeAll(",queued,pending,,\n");
         row_count += 1;
     }
@@ -551,6 +700,30 @@ fn parseOptionalUsize(args: []const []const u8, flag: []const u8) ?usize {
         }
     }
     return null;
+}
+
+fn parseOptionalLane(args: []const []const u8, flag: []const u8) ?Lane {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], flag)) {
+            if (i + 1 >= args.len) return null;
+            return parseLane(args[i + 1]) catch return null;
+        }
+    }
+    return null;
+}
+
+fn parseBool(raw: []const u8) !bool {
+    if (std.mem.eql(u8, raw, "true") or std.mem.eql(u8, raw, "1")) return true;
+    if (std.mem.eql(u8, raw, "false") or std.mem.eql(u8, raw, "0")) return false;
+    return error.InvalidBoolean;
+}
+
+fn parseLane(raw: []const u8) !Lane {
+    if (std.mem.eql(u8, raw, "coder")) return .coder;
+    if (std.mem.eql(u8, raw, "fixer")) return .fixer;
+    if (std.mem.eql(u8, raw, "integrator")) return .integrator;
+    return error.InvalidLane;
 }
 
 fn parsePlanSteps(allocator: std.mem.Allocator, json_bytes: []const u8) ![]PlanStep {
@@ -622,6 +795,10 @@ fn computeBudgetDecision(
     linear_start_threshold_raw: f64,
     single_agent_threshold_raw: f64,
     scaleout_threshold_raw: f64,
+    previous_triplet_width_raw: usize,
+    prior_wave_instability: bool,
+    consecutive_unstable_waves: usize,
+    consecutive_clean_waves: usize,
 ) BudgetDecision {
     const remaining_five_hour = clampPercent(remaining_five_hour_raw);
     const remaining_weekly = clampPercent(remaining_weekly_raw);
@@ -646,6 +823,17 @@ fn computeBudgetDecision(
         max_active_units = @max(@as(usize, 1), @as(usize, @intFromFloat(@floor(scaled))));
     }
 
+    const triplet = computeTripletDecision(
+        previous_triplet_width_raw,
+        remaining_strict,
+        prior_wave_instability,
+        consecutive_unstable_waves,
+        consecutive_clean_waves,
+        15,
+        10,
+        20,
+    );
+
     return .{
         .remaining_five_hour = remaining_five_hour,
         .remaining_weekly = remaining_weekly,
@@ -657,6 +845,51 @@ fn computeBudgetDecision(
         .max_active_units = max_active_units,
         .mode = mode,
         .cas_scaleout_allowed = remaining_strict > scaleout_threshold,
+        .triplet_width = triplet.width,
+        .triplet_degrade_reason = triplet.degrade_reason,
+        .triplet_restored = triplet.restored,
+    };
+}
+
+fn computeTripletDecision(
+    previous_triplet_width_raw: usize,
+    remaining_strict: f64,
+    prior_wave_instability: bool,
+    consecutive_unstable_waves: usize,
+    consecutive_clean_waves: usize,
+    low_threshold_raw: f64,
+    critical_threshold_raw: f64,
+    restore_threshold_raw: f64,
+) TripletDecision {
+    const low_threshold = clampPercent(low_threshold_raw);
+    const critical_threshold = clampPercent(critical_threshold_raw);
+    const restore_threshold = clampPercent(restore_threshold_raw);
+    var width = std.math.clamp(previous_triplet_width_raw, 1, 3);
+    var degrade_reason: []const u8 = "";
+    var restored = false;
+
+    if (remaining_strict <= critical_threshold or consecutive_unstable_waves >= 2) {
+        width = 1;
+        degrade_reason = if (remaining_strict <= critical_threshold) "budget_critical" else "two_unstable_waves";
+    } else if (remaining_strict <= low_threshold or prior_wave_instability) {
+        if (width > 2) width = 2;
+        if (remaining_strict <= low_threshold and prior_wave_instability) {
+            degrade_reason = "budget_low_and_instability";
+        } else if (remaining_strict <= low_threshold) {
+            degrade_reason = "budget_low";
+        } else {
+            degrade_reason = "prior_wave_instability";
+        }
+    } else if (width < 3 and remaining_strict > restore_threshold and consecutive_clean_waves >= 2) {
+        width += 1;
+        restored = true;
+        degrade_reason = "restored_after_clean_waves";
+    }
+
+    return .{
+        .width = width,
+        .degrade_reason = degrade_reason,
+        .restored = restored,
     };
 }
 
@@ -665,6 +898,43 @@ fn budgetModeString(mode: BudgetMode) []const u8 {
         .full_fanout => "full_fanout",
         .linear_clamp => "linear_clamp",
         .single_agent => "single_agent",
+    };
+}
+
+fn laneString(lane: Lane) []const u8 {
+    return switch (lane) {
+        .coder => "coder",
+        .fixer => "fixer",
+        .integrator => "integrator",
+    };
+}
+
+fn roleInLane(lane: Lane, triplet_index: usize) []const u8 {
+    if (lane != .integrator) return "";
+    if (triplet_index == 1) return "writer";
+    return "shadow";
+}
+
+fn quorumRule(lane: Lane) []const u8 {
+    return switch (lane) {
+        .coder => "adjudicate_one",
+        .fixer => "min_accept=2,no_blocker_reject",
+        .integrator => "writer_pass,shadow_accepts=2",
+    };
+}
+
+fn challengeTargets(lane: Lane, width: usize, self: usize) []const u8 {
+    if (lane == .integrator or width <= 1) return "";
+    return switch (width) {
+        1 => "",
+        2 => if (self == 1) "2" else "1",
+        3 => switch (self) {
+            1 => "2;3",
+            2 => "1;3",
+            3 => "1;2",
+            else => "",
+        },
+        else => "",
     };
 }
 
@@ -804,23 +1074,71 @@ fn ledgerValueOccurred(value: std.json.Value) bool {
 }
 
 test "computeBudgetDecision enforces thresholds" {
-    const full = computeBudgetDecision(90, 70, 12, 33, 10, 25);
+    const full = computeBudgetDecision(90, 70, 12, 33, 10, 25, 3, false, 0, 0);
     try std.testing.expectEqual(.full_fanout, full.mode);
     try std.testing.expectEqual(@as(usize, 12), full.max_active_units);
     try std.testing.expect(full.cas_scaleout_allowed);
+    try std.testing.expectEqual(@as(usize, 3), full.triplet_width);
 
-    const linear = computeBudgetDecision(30, 28, 12, 33, 10, 25);
+    const linear = computeBudgetDecision(30, 28, 12, 33, 10, 25, 3, false, 0, 0);
     try std.testing.expectEqual(.linear_clamp, linear.mode);
     try std.testing.expect(linear.max_active_units >= 1);
+    try std.testing.expectEqual(@as(usize, 3), linear.triplet_width);
 
-    const single = computeBudgetDecision(9, 40, 12, 33, 10, 25);
+    const single = computeBudgetDecision(9, 40, 12, 33, 10, 25, 3, false, 0, 0);
     try std.testing.expectEqual(.single_agent, single.mode);
     try std.testing.expectEqual(@as(usize, 1), single.max_active_units);
     try std.testing.expect(!single.cas_scaleout_allowed);
+    try std.testing.expectEqual(@as(usize, 1), single.triplet_width);
+    try std.testing.expectEqualStrings("budget_critical", single.triplet_degrade_reason);
+}
+
+test "computeTripletDecision degrades and restores by policy" {
+    const instability = computeTripletDecision(3, 60, true, 0, 0, 15, 10, 20);
+    try std.testing.expectEqual(@as(usize, 2), instability.width);
+    try std.testing.expectEqualStrings("prior_wave_instability", instability.degrade_reason);
+    try std.testing.expect(!instability.restored);
+
+    const critical = computeTripletDecision(3, 8, false, 0, 0, 15, 10, 20);
+    try std.testing.expectEqual(@as(usize, 1), critical.width);
+    try std.testing.expectEqualStrings("budget_critical", critical.degrade_reason);
+    try std.testing.expect(!critical.restored);
+
+    const restored = computeTripletDecision(1, 45, false, 0, 2, 15, 10, 20);
+    try std.testing.expectEqual(@as(usize, 2), restored.width);
+    try std.testing.expectEqualStrings("restored_after_clean_waves", restored.degrade_reason);
+    try std.testing.expect(restored.restored);
+}
+
+test "lane helper metadata follows triplet contract" {
+    try std.testing.expectEqualStrings("coder", laneString(.coder));
+    try std.testing.expectEqualStrings("writer", roleInLane(.integrator, 1));
+    try std.testing.expectEqualStrings("shadow", roleInLane(.integrator, 2));
+    try std.testing.expectEqualStrings("", roleInLane(.coder, 1));
+    try std.testing.expectEqualStrings("1;2", challengeTargets(.coder, 3, 3));
+    try std.testing.expectEqualStrings("", challengeTargets(.integrator, 3, 1));
+    try std.testing.expectEqualStrings("writer_pass,shadow_accepts=2", quorumRule(.integrator));
 }
 
 test "hasRequiredHeaders validates required set" {
-    const good = [_][]const u8{ "id", "objective", "unit_scope", "constraints", "invariants", "proof_command", "delivery_mode", "attempt", "variant", "budget_tier" };
+    const good = [_][]const u8{
+        "id",
+        "objective",
+        "unit_scope",
+        "constraints",
+        "invariants",
+        "proof_command",
+        "delivery_mode",
+        "attempt",
+        "variant",
+        "budget_tier",
+        "cohort_id",
+        "triplet_index",
+        "candidate_id",
+        "role_in_lane",
+        "challenge_targets",
+        "quorum_rule",
+    };
     try std.testing.expect(hasRequiredHeaders(&good, &RequiredCsvHeaders));
 
     const bad = [_][]const u8{ "id", "objective", "unit_scope" };
@@ -833,15 +1151,18 @@ test "pathsAreDistinct rejects identical path" {
 }
 
 fn fuzzBudgetDecisionTarget(_: void, input: []const u8) !void {
-    if (input.len < 3) return;
+    if (input.len < 4) return;
 
     const remaining_five_hour = @as(f64, @floatFromInt(input[0]));
     const remaining_weekly = @as(f64, @floatFromInt(input[1]));
     const max_threads = @max(@as(usize, 1), @as(usize, input[2] % 32));
+    const previous_triplet_width = @as(usize, (input[3] % 3) + 1);
 
-    const decision = computeBudgetDecision(remaining_five_hour, remaining_weekly, max_threads, 33, 10, 25);
+    const decision = computeBudgetDecision(remaining_five_hour, remaining_weekly, max_threads, 33, 10, 25, previous_triplet_width, false, 0, 0);
     try std.testing.expect(decision.max_active_units >= 1);
     try std.testing.expect(decision.max_active_units <= max_threads);
+    try std.testing.expect(decision.triplet_width >= 1);
+    try std.testing.expect(decision.triplet_width <= 3);
 }
 
 test "fuzz budget decision" {
