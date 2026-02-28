@@ -102,6 +102,8 @@ const Options = struct {
     format_set: bool = false,
     help: bool = false,
     root: ?[]const u8 = null,
+    path: ?[]const u8 = null,
+    session_id: ?[]const u8 = null,
     out_path: ?[]const u8 = null,
     dataset: ?[]const u8 = null,
     spec_text: ?[]const u8 = null,
@@ -135,6 +137,7 @@ pub fn run(
         .skill_report => try cmdSkillReport(allocator, sessions_root, opts),
         .role_breakdown => try cmdRoleBreakdown(allocator, sessions_root, opts),
         .occurrence_export => try cmdOccurrenceExport(allocator, sessions_root, opts),
+        .orchestration_concurrency => try cmdOrchestrationConcurrency(allocator, sessions_root, opts),
         .find_session => try cmdFindSession(allocator, sessions_root, opts),
         .session_prompts => try cmdSessionPrompts(allocator, sessions_root, opts),
         .report_bundle => try cmdReportBundle(allocator, sessions_root, opts),
@@ -177,6 +180,9 @@ fn printCommandHelp(cmd: lib.Command) !void {
         ,
         .occurrence_export =>
         \\usage: seq occurrence-export [--skill <name>] [--format jsonl|json|csv] [--max N]
+        ,
+        .orchestration_concurrency =>
+        \\usage: seq orchestration-concurrency [--session-id <id>|--path <jsonl>] [--format table|json|csv|jsonl]
         ,
         .find_session =>
         \\usage: seq find-session --prompt <text> [--limit N] [--format table|json|csv|jsonl]
@@ -224,7 +230,7 @@ fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
         .occurrence_export => {
             if (fmt == .table) return error.InvalidFormatForCommand;
         },
-        .find_session, .session_prompts, .query, .token_usage, .routing_gap => {},
+        .orchestration_concurrency, .find_session, .session_prompts, .query, .token_usage, .routing_gap => {},
         .unknown => return error.InvalidCommand,
     }
 }
@@ -476,6 +482,329 @@ fn cmdOccurrenceExport(allocator: std.mem.Allocator, sessions_root: []const u8, 
     };
     const fmt = if (opts.format_set) opts.format else output.Format.jsonl;
     try runDatasetQuery(allocator, "skill_mentions", sessions_root, query_spec, fmt, opts.out_path, select[0..]);
+}
+
+const ConcurrencySummary = struct {
+    session_id: []const u8,
+    session_path: []const u8,
+    spawn_calls: i64 = 0,
+    max_configured_concurrency: ?i64 = null,
+    max_configured_occurrences: i64 = 0,
+    max_effective_concurrency: ?i64 = null,
+    max_effective_occurrences: i64 = 0,
+    csv_rows_known: i64 = 0,
+    csv_rows_missing: i64 = 0,
+
+    fn observe(self: *ConcurrencySummary, configured_concurrency: i64, csv_rows: ?i64) void {
+        self.spawn_calls += 1;
+        updateMaxCounter(
+            &self.max_configured_concurrency,
+            &self.max_configured_occurrences,
+            configured_concurrency,
+        );
+
+        if (csv_rows) |row_count| {
+            self.csv_rows_known += 1;
+            const effective = if (configured_concurrency < row_count) configured_concurrency else row_count;
+            updateMaxCounter(
+                &self.max_effective_concurrency,
+                &self.max_effective_occurrences,
+                effective,
+            );
+        } else {
+            self.csv_rows_missing += 1;
+        }
+    }
+
+    fn mergeFrom(self: *ConcurrencySummary, other: ConcurrencySummary) void {
+        self.spawn_calls += other.spawn_calls;
+        self.csv_rows_known += other.csv_rows_known;
+        self.csv_rows_missing += other.csv_rows_missing;
+        mergeMaxCounter(
+            &self.max_configured_concurrency,
+            &self.max_configured_occurrences,
+            other.max_configured_concurrency,
+            other.max_configured_occurrences,
+        );
+        mergeMaxCounter(
+            &self.max_effective_concurrency,
+            &self.max_effective_occurrences,
+            other.max_effective_concurrency,
+            other.max_effective_occurrences,
+        );
+    }
+};
+
+const SpawnAgentsInvocation = struct {
+    max_concurrency: i64,
+    csv_path: ?[]u8,
+
+    fn deinit(self: SpawnAgentsInvocation, allocator: std.mem.Allocator) void {
+        if (self.csv_path) |path| allocator.free(path);
+    }
+};
+
+fn cmdOrchestrationConcurrency(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    opts: Options,
+) !void {
+    var input_paths = try resolveOrchestrationInputPaths(allocator, sessions_root, opts);
+    defer freePathList(allocator, &input_paths);
+
+    var out_rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &out_rows);
+
+    var total = ConcurrencySummary{
+        .session_id = "__all__",
+        .session_path = "-",
+    };
+    var included_sessions: usize = 0;
+
+    for (input_paths.items) |session_path| {
+        const summary = try summarizeSessionConcurrency(allocator, session_path);
+        if (summary.spawn_calls == 0) continue;
+
+        included_sessions += 1;
+        total.mergeFrom(summary);
+
+        var row = query.Row.init(allocator);
+        try row.putOwnedKey("session_id", .{ .string = summary.session_id });
+        try row.putOwnedKey("path", .{ .string = summary.session_path });
+        try row.putOwnedKey("spawn_calls", .{ .int = summary.spawn_calls });
+        try putOptionalInt(&row, "max_configured_concurrency", summary.max_configured_concurrency);
+        try row.putOwnedKey("max_configured_occurrences", .{ .int = summary.max_configured_occurrences });
+        try putOptionalInt(&row, "max_effective_concurrency", summary.max_effective_concurrency);
+        try row.putOwnedKey("max_effective_occurrences", .{ .int = summary.max_effective_occurrences });
+        try row.putOwnedKey("csv_rows_known", .{ .int = summary.csv_rows_known });
+        try row.putOwnedKey("csv_rows_missing", .{ .int = summary.csv_rows_missing });
+        try out_rows.append(allocator, row);
+    }
+
+    if (included_sessions == 0) return error.NoSpawnAgentsCalls;
+    if (included_sessions > 1) {
+        var row = query.Row.init(allocator);
+        try row.putOwnedKey("session_id", .{ .string = total.session_id });
+        try row.putOwnedKey("path", .{ .string = total.session_path });
+        try row.putOwnedKey("spawn_calls", .{ .int = total.spawn_calls });
+        try putOptionalInt(&row, "max_configured_concurrency", total.max_configured_concurrency);
+        try row.putOwnedKey("max_configured_occurrences", .{ .int = total.max_configured_occurrences });
+        try putOptionalInt(&row, "max_effective_concurrency", total.max_effective_concurrency);
+        try row.putOwnedKey("max_effective_occurrences", .{ .int = total.max_effective_occurrences });
+        try row.putOwnedKey("csv_rows_known", .{ .int = total.csv_rows_known });
+        try row.putOwnedKey("csv_rows_missing", .{ .int = total.csv_rows_missing });
+        try out_rows.append(allocator, row);
+    }
+
+    const cols = [_][]const u8{
+        "session_id",
+        "path",
+        "spawn_calls",
+        "max_configured_concurrency",
+        "max_configured_occurrences",
+        "max_effective_concurrency",
+        "max_effective_occurrences",
+        "csv_rows_known",
+        "csv_rows_missing",
+    };
+    try output.writeOutput(allocator, opts.format, out_rows.items, cols[0..], opts.out_path);
+}
+
+fn summarizeSessionConcurrency(
+    allocator: std.mem.Allocator,
+    session_path: []const u8,
+) !ConcurrencySummary {
+    var summary = ConcurrencySummary{
+        .session_id = inferSessionIdFromPath(session_path),
+        .session_path = session_path,
+    };
+
+    const content_opt = try readFileAllocOrSkip(allocator, session_path);
+    if (content_opt == null) return summary;
+    defer allocator.free(content_opt.?);
+
+    var lines = std.mem.splitScalar(u8, content_opt.?, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        if (!std.mem.containsAtLeast(u8, trimmed, 1, "spawn_agents_on_csv")) continue;
+
+        const invocation_opt = try parseSpawnAgentsInvocation(allocator, trimmed);
+        if (invocation_opt == null) continue;
+        const invocation = invocation_opt.?;
+        defer invocation.deinit(allocator);
+
+        const csv_rows = if (invocation.csv_path) |csv_path|
+            try countCsvDataRows(allocator, csv_path)
+        else
+            null;
+
+        summary.observe(invocation.max_concurrency, csv_rows);
+    }
+
+    return summary;
+}
+
+fn parseSpawnAgentsInvocation(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+) !?SpawnAgentsInvocation {
+    if (line.len == 0 or line[0] != '{') return null;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), line, .{}) catch return null;
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return null,
+    };
+    if (!stdJsonFieldEq(root, "type", "response_item")) return null;
+
+    const payload = stdJsonObjectField(root, "payload") orelse return null;
+    if (!stdJsonFieldEq(payload, "type", "function_call")) return null;
+    if (!stdJsonFieldEq(payload, "name", "spawn_agents_on_csv")) return null;
+
+    const arguments_text = stdJsonStringField(payload, "arguments") orelse return null;
+    const arguments_parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), arguments_text, .{}) catch return null;
+    defer arguments_parsed.deinit();
+
+    const arguments_obj = switch (arguments_parsed.value) {
+        .object => |obj| obj,
+        else => return null,
+    };
+
+    const configured =
+        stdJsonIntField(arguments_obj, "max_concurrency") orelse
+        stdJsonIntField(arguments_obj, "max_workers") orelse
+        16;
+
+    return .{
+        .max_concurrency = if (configured < 1) 1 else configured,
+        .csv_path = if (stdJsonStringField(arguments_obj, "csv_path")) |path|
+            try allocator.dupe(u8, path)
+        else
+            null,
+    };
+}
+
+fn countCsvDataRows(allocator: std.mem.Allocator, csv_path: []const u8) !?i64 {
+    const absolute = try toAbsolutePath(allocator, csv_path);
+    defer allocator.free(absolute);
+
+    const file = std.fs.openFileAbsolute(absolute, .{}) catch return null;
+    defer file.close();
+
+    const content = file.readToEndAlloc(allocator, 64 * 1024 * 1024) catch return null;
+    defer allocator.free(content);
+
+    var rows: i64 = 0;
+    var seen_header = false;
+    var line_it = std.mem.splitScalar(u8, content, '\n');
+    while (line_it.next()) |raw_line| {
+        const line = std.mem.trimRight(u8, raw_line, "\r");
+        if (line.len == 0) continue;
+        if (!seen_header) {
+            seen_header = true;
+            continue;
+        }
+        rows += 1;
+    }
+    return if (seen_header) rows else 0;
+}
+
+fn resolveOrchestrationInputPaths(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    opts: Options,
+) !std.ArrayList([]u8) {
+    if (opts.path) |single_path| {
+        var out: std.ArrayList([]u8) = .empty;
+        errdefer freePathList(allocator, &out);
+
+        const absolute = try toAbsolutePath(allocator, single_path);
+        try out.append(allocator, absolute);
+
+        if (opts.session_id) |wanted| {
+            if (!std.mem.containsAtLeast(u8, absolute, 1, wanted)) {
+                return error.SessionNotFound;
+            }
+        }
+        return out;
+    }
+
+    var paths = try collectJsonlPaths(allocator, sessions_root);
+    errdefer freePathList(allocator, &paths);
+
+    if (opts.session_id) |wanted| {
+        var write_idx: usize = 0;
+        for (paths.items) |path| {
+            if (std.mem.containsAtLeast(u8, path, 1, wanted)) {
+                paths.items[write_idx] = path;
+                write_idx += 1;
+            } else {
+                allocator.free(path);
+            }
+        }
+        paths.items.len = write_idx;
+        if (paths.items.len == 0) return error.SessionNotFound;
+    }
+
+    return paths;
+}
+
+fn inferSessionIdFromPath(path: []const u8) []const u8 {
+    const base = std.fs.path.basename(path);
+    const stem = if (std.mem.endsWith(u8, base, ".jsonl")) base[0 .. base.len - ".jsonl".len] else base;
+    if (stem.len >= 36) {
+        const candidate = stem[stem.len - 36 ..];
+        if (isUuidLike(candidate)) return candidate;
+    }
+    if (std.mem.lastIndexOfScalar(u8, stem, '-')) |idx| {
+        if (idx + 1 < stem.len) return stem[idx + 1 ..];
+    }
+    return stem;
+}
+
+fn isUuidLike(text: []const u8) bool {
+    if (text.len != 36) return false;
+    for (text, 0..) |ch, idx| {
+        const is_dash = idx == 8 or idx == 13 or idx == 18 or idx == 23;
+        if (is_dash) {
+            if (ch != '-') return false;
+            continue;
+        }
+        if (!std.ascii.isHex(ch)) return false;
+    }
+    return true;
+}
+
+fn updateMaxCounter(max_value: *?i64, occurrences: *i64, candidate: i64) void {
+    if (max_value.* == null or candidate > max_value.*.?) {
+        max_value.* = candidate;
+        occurrences.* = 1;
+        return;
+    }
+    if (candidate == max_value.*.?) occurrences.* += 1;
+}
+
+fn mergeMaxCounter(
+    max_value: *?i64,
+    occurrences: *i64,
+    incoming_value: ?i64,
+    incoming_occurrences: i64,
+) void {
+    if (incoming_value == null or incoming_occurrences == 0) return;
+    if (max_value.* == null or incoming_value.? > max_value.*.?) {
+        max_value.* = incoming_value;
+        occurrences.* = incoming_occurrences;
+        return;
+    }
+    if (incoming_value.? == max_value.*.?) {
+        occurrences.* += incoming_occurrences;
+    }
 }
 
 fn cmdFindSession(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
@@ -1113,6 +1442,48 @@ fn scalarAsInt(value: spec.Scalar) ?i64 {
     };
 }
 
+fn stdJsonFieldEq(obj: std.json.ObjectMap, key: []const u8, expected: []const u8) bool {
+    const value = stdJsonStringField(obj, key) orelse return false;
+    return std.mem.eql(u8, value, expected);
+}
+
+fn stdJsonObjectField(obj: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .object => |inner| inner,
+        else => null,
+    };
+}
+
+fn stdJsonStringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn stdJsonIntField(obj: std.json.ObjectMap, key: []const u8) ?i64 {
+    const value = obj.get(key) orelse return null;
+    return stdJsonValueToI64(value);
+}
+
+fn stdJsonValueToI64(value: std.json.Value) ?i64 {
+    return switch (value) {
+        .integer => |number| number,
+        .float => |number| blk: {
+            const min = @as(f64, @floatFromInt(std.math.minInt(i64)));
+            const max = @as(f64, @floatFromInt(std.math.maxInt(i64)));
+            if (!std.math.isFinite(number)) break :blk null;
+            if (number < min or number > max) break :blk null;
+            break :blk @intFromFloat(number);
+        },
+        .number_string => |text| std.fmt.parseInt(i64, text, 10) catch null,
+        .string => |text| std.fmt.parseInt(i64, text, 10) catch null,
+        else => null,
+    };
+}
+
 fn loadKnownSkillNames(allocator: std.mem.Allocator) !std.StringHashMap(void) {
     var out: std.StringHashMap(void) = .init(allocator);
     errdefer deinitStringSet(allocator, &out);
@@ -1182,6 +1553,14 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.root = args[i];
+        } else if (std.mem.eql(u8, arg, "--path")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.path = args[i];
+        } else if (std.mem.eql(u8, arg, "--session-id")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.session_id = args[i];
         } else if (std.mem.eql(u8, arg, "--output")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -1314,12 +1693,82 @@ fn deinitQueryRows(allocator: std.mem.Allocator, rows: *std.ArrayList(query.Row)
     rows.deinit(allocator);
 }
 
+test "summarizeSessionConcurrency computes configured and effective maxima" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "wave-a.csv",
+        .data =
+        \\id,objective
+        \\U01,a
+        \\U02,b
+        \\U03,c
+        ,
+    });
+    try tmp.dir.writeFile(.{
+        .sub_path = "wave-b.csv",
+        .data =
+        \\id,objective
+        \\U11,x
+        ,
+    });
+
+    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_abs);
+
+    const csv_a = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "wave-a.csv" });
+    defer std.testing.allocator.free(csv_a);
+    const csv_b = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "wave-b.csv" });
+    defer std.testing.allocator.free(csv_b);
+
+    const line_a = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"function_call\",\"name\":\"spawn_agents_on_csv\",\"arguments\":\"{{\\\"csv_path\\\":\\\"{s}\\\",\\\"max_concurrency\\\":5}}\"}}}}\n",
+        .{csv_a},
+    );
+    defer std.testing.allocator.free(line_a);
+    const line_b = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"function_call\",\"name\":\"spawn_agents_on_csv\",\"arguments\":\"{{\\\"csv_path\\\":\\\"{s}\\\",\\\"max_workers\\\":5}}\"}}}}\n",
+        .{csv_b},
+    );
+    defer std.testing.allocator.free(line_b);
+    const line_c =
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"spawn_agents_on_csv\",\"arguments\":\"{\\\"max_concurrency\\\":2}\"}}\n";
+
+    const session_content = try std.mem.concat(std.testing.allocator, u8, &.{ line_a, line_b, line_c });
+    defer std.testing.allocator.free(session_content);
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "rollout-2026-02-28T00-00-00-019ca0e5-0beb-7740-a9bc-81664d994266.jsonl",
+        .data = session_content,
+    });
+
+    const session_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "rollout-2026-02-28T00-00-00-019ca0e5-0beb-7740-a9bc-81664d994266.jsonl" });
+    defer std.testing.allocator.free(session_path);
+
+    const summary = try summarizeSessionConcurrency(std.testing.allocator, session_path);
+    try std.testing.expectEqualStrings("019ca0e5-0beb-7740-a9bc-81664d994266", summary.session_id);
+    try std.testing.expectEqual(@as(i64, 3), summary.spawn_calls);
+    try std.testing.expectEqual(@as(?i64, 5), summary.max_configured_concurrency);
+    try std.testing.expectEqual(@as(i64, 2), summary.max_configured_occurrences);
+    try std.testing.expectEqual(@as(?i64, 3), summary.max_effective_concurrency);
+    try std.testing.expectEqual(@as(i64, 1), summary.max_effective_occurrences);
+    try std.testing.expectEqual(@as(i64, 2), summary.csv_rows_known);
+    try std.testing.expectEqual(@as(i64, 1), summary.csv_rows_missing);
+}
+
 test "parse options supports common flags" {
     const args = [_][]const u8{
         "--format",
         "jsonl",
         "--root",
         "~/sessions",
+        "--path",
+        "/tmp/session.jsonl",
+        "--session-id",
+        "019ca0e5-0beb-7740-a9bc-81664d994266",
         "--max",
         "7",
         "--cue-spec",
@@ -1332,6 +1781,8 @@ test "parse options supports common flags" {
     try std.testing.expectEqual(output.Format.jsonl, opts.format);
     try std.testing.expect(opts.format_set);
     try std.testing.expectEqualStrings("~/sessions", opts.root.?);
+    try std.testing.expectEqualStrings("/tmp/session.jsonl", opts.path.?);
+    try std.testing.expectEqualStrings("019ca0e5-0beb-7740-a9bc-81664d994266", opts.session_id.?);
     try std.testing.expectEqual(@as(usize, 7), opts.limit);
     try std.testing.expectEqualStrings("@cues.json", opts.cue_spec_text.?);
     try std.testing.expectEqualStrings("grill-me,prove-it", opts.discovery_skills.?);

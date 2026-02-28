@@ -29,10 +29,17 @@ Binary output:
 ./zig-out/bin/seq role-breakdown --root ~/.codex/sessions --format table
 ./zig-out/bin/seq query --spec '{"dataset":"tool_calls","group_by":["tool"],"metrics":[{"op":"count","as":"count"}],"sort":["-count"],"limit":10,"format":"json"}'
 ./zig-out/bin/seq routing-gap --cue-spec @cue-spec.json --discovery-skills grill-me,prove-it,complexity-mitigator,invariant-ace,tk
+./zig-out/bin/seq orchestration-concurrency --session-id 019ca0e5-0beb-7740-a9bc-81664d994266 --format table
 ```
 
 `query.where.op` supports `contains_any` and `regex_any` in addition to `contains` and `regex`.
 `regex` uses a fast regex-like subset (`^`, `$`, `|`) and fails fast on unsupported constructs.
+
+`orchestration-concurrency` summarizes `spawn_agents_on_csv` fanout from session JSONL:
+- `spawn_calls`
+- `max_configured_concurrency` and `max_configured_occurrences`
+- `max_effective_concurrency` and `max_effective_occurrences` (effective = `min(max_concurrency, csv_rows)`)
+- CSV row observability (`csv_rows_known`, `csv_rows_missing`)
 
 ## Validation
 
