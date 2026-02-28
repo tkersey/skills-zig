@@ -224,6 +224,8 @@ pub fn build(b: *std.Build) void {
     const cas_budget_perf = addExecutable(b, "cas-perf-budget-governor", cas_budget_perf_root);
     const cas = addExecutable(b, "cas", cas_root);
     const cron = addExecutable(b, "cron", cron_root);
+    cron.linkLibC();
+    cron.root_module.linkSystemLibrary("sqlite3", .{});
     const puff = addExecutable(b, "puff", puff_root);
     const learnings = addExecutable(b, "learnings", learnings_root);
     const append_learning = addExecutable(b, "append_learning", append_learning_root);
@@ -323,6 +325,14 @@ pub fn build(b: *std.Build) void {
 
     const build_cron = b.step("build-cron", "Build cron binaries");
     build_cron.dependOn(&cron_install.step);
+
+    const cron_tests = b.addTest(.{ .root_module = cron_root });
+    cron_tests.linkLibC();
+    cron_tests.root_module.linkSystemLibrary("sqlite3", .{});
+    const run_cron_tests = b.addRunArtifact(cron_tests);
+    if (b.args) |args| run_cron_tests.addArgs(args);
+    const test_cron = b.step("test-cron", "Run cron tests");
+    test_cron.dependOn(&run_cron_tests.step);
 
     const build_puff = b.step("build-puff", "Build puff binaries");
     build_puff.dependOn(&puff_install.step);

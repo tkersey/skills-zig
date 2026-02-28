@@ -37,6 +37,8 @@ jobs:
           version: 0.15.2
       - name: Build cron binaries
         run: zig build build-cron -Doptimize=ReleaseFast
+      - name: Test cron
+        run: zig build test-cron
       - name: Package cron artifact
         run: |
           TAR_NAME="${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
