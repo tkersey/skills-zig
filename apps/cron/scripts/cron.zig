@@ -411,6 +411,11 @@ fn run(allocator: std.mem.Allocator, raw_args: []const []const u8) !void {
 
     const command = global.args[0];
 
+    if (global.args.len >= 2 and isHelpArg(global.args[1])) {
+        try printUsage();
+        return;
+    }
+
     if (std.mem.eql(u8, command, "list")) {
         const args = try parseListArgs(global.args[1..]);
         try cmdList(allocator, global.db_path, args);
@@ -471,6 +476,10 @@ fn printUsage() !void {
     var stdout_writer = stdout_file.writer(&.{});
     const stdout = &stdout_writer.interface;
     try core_cli.printHelpWithVersion(stdout, UsageText, Version);
+}
+
+fn isHelpArg(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help");
 }
 
 const GlobalArgs = struct {
@@ -818,17 +827,27 @@ fn parseRunDueArgs(args: []const []const u8) !RunDueArgs {
         return userErrorFmt("unknown run-due arg: {s}", .{arg});
     }
 
+    const validated_lock_label = try validateSchedulerLabel(lock_label);
+
     return .{
         .automation_id = id_value,
         .limit = if (limit == 0) 1 else limit,
         .dry_run = dry_run,
         .codex_bin = codex_bin,
-        .lock_label = lock_label,
+        .lock_label = validated_lock_label,
     };
 }
 
 fn cmdScheduler(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len == 0) return userErrorFmt("scheduler requires one of: install, uninstall, status", .{});
+    if (isHelpArg(args[0])) {
+        try printUsage();
+        return;
+    }
+    if (args.len >= 2 and isHelpArg(args[1])) {
+        try printUsage();
+        return;
+    }
 
     const action = args[0];
     if (std.mem.eql(u8, action, "install")) {
@@ -891,8 +910,9 @@ fn parseSchedulerInstallArgs(args: []const []const u8) !SchedulerInstallArgs {
         return userErrorFmt("unknown scheduler install arg: {s}", .{arg});
     }
 
+    const validated_label = try validateSchedulerLabel(label);
     return .{
-        .label = label,
+        .label = validated_label,
         .interval_seconds = interval_seconds,
         .path_value = path_value,
         .codex_bin = codex_bin,
@@ -914,7 +934,7 @@ fn parseSchedulerLabelArgs(args: []const []const u8) !SchedulerLabelArgs {
         return userErrorFmt("unknown scheduler arg: {s}", .{arg});
     }
 
-    return .{ .label = label };
+    return .{ .label = try validateSchedulerLabel(label) };
 }
 
 fn validateResolveArgs(resolve: ResolveArgs) !void {
@@ -924,6 +944,17 @@ fn validateResolveArgs(resolve: ResolveArgs) !void {
     if (resolve.automation_id != null and resolve.name != null) {
         return userErrorFmt("use either --id or --name", .{});
     }
+}
+
+fn validateSchedulerLabel(raw: []const u8) ![]const u8 {
+    const label = std.mem.trim(u8, raw, " \t\r\n");
+    if (label.len == 0) return userErrorFmt("label must not be empty", .{});
+
+    for (label) |ch| {
+        if (std.ascii.isAlphanumeric(ch) or ch == '.' or ch == '-' or ch == '_') continue;
+        return userErrorFmt("invalid label: {s} (allowed: [A-Za-z0-9._-])", .{label});
+    }
+    return label;
 }
 
 fn parsePositiveI64(raw: []const u8, field: []const u8) !i64 {
@@ -1731,6 +1762,8 @@ fn cmdRunDue(allocator: std.mem.Allocator, db_path: []const u8, args: RunDueArgs
     var results = std.ArrayList(RunResult).empty;
     defer {
         for (results.items) |item| {
+            allocator.free(item.thread_id);
+            allocator.free(item.cwd);
             if (item.err) |err_text| allocator.free(err_text);
         }
         results.deinit(allocator);
@@ -1739,11 +1772,15 @@ fn cmdRunDue(allocator: std.mem.Allocator, db_path: []const u8, args: RunDueArgs
     for (due.items) |*row| {
         const result = runDueAutomation(allocator, &db, row, codex_exe.?, args.dry_run) catch |err| {
             const err_text = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
+            const empty_thread = try allocator.dupe(u8, "");
+            errdefer allocator.free(empty_thread);
+            const empty_cwd = try allocator.dupe(u8, "");
+            errdefer allocator.free(empty_cwd);
             try results.append(allocator, .{
                 .id = row.id,
                 .status = "error",
-                .thread_id = "",
-                .cwd = "",
+                .thread_id = empty_thread,
+                .cwd = empty_cwd,
                 .next_run_at = null,
                 .exit_code = null,
                 .err = err_text,
@@ -1810,7 +1847,9 @@ fn runDueAutomation(
     const started = nowMs();
     const next_run = try computeNextRunAt(allocator, row, started);
 
-    try closeStaleRunningRows(allocator, db, row.id, started);
+    if (!dry_run) {
+        try closeStaleRunningRows(allocator, db, row.id, started);
+    }
 
     var cwds = try parseCwdsJson(allocator, row.cwds_json);
     defer freeOwnedStrings(allocator, cwds);
@@ -1827,29 +1866,23 @@ fn runDueAutomation(
     }
 
     var final_thread_id: []u8 = try allocator.dupe(u8, "");
-    defer allocator.free(final_thread_id);
+    errdefer allocator.free(final_thread_id);
     var final_cwd: []u8 = try allocator.dupe(u8, "");
-    defer allocator.free(final_cwd);
+    errdefer allocator.free(final_cwd);
 
     for (cwds.items) |cwd| {
         const thread_id = try generateUuidV4(allocator);
         defer allocator.free(thread_id);
 
-        try insertRunRow(allocator, db, row, thread_id, cwd, started);
-
         if (dry_run) {
-            const summary = try std.fmt.allocPrint(allocator, "[dry-run] would execute in {s}", .{cwd});
-            defer allocator.free(summary);
-
-            const finished = nowMs();
-            try updateRunRow(allocator, db, thread_id, row, "PENDING_REVIEW", summary, summary, finished);
-
             allocator.free(final_thread_id);
             allocator.free(final_cwd);
             final_thread_id = try allocator.dupe(u8, thread_id);
             final_cwd = try allocator.dupe(u8, cwd);
             continue;
         }
+
+        try insertRunRow(allocator, db, row, thread_id, cwd, started);
 
         const exec_result = try runCodexExec(allocator, codex_bin, cwd, row.prompt, thread_id);
         defer {
@@ -1900,17 +1933,6 @@ fn runDueAutomation(
         }
     }
 
-    try updateAutomationTimes(allocator, db, row.id, started, next_run);
-    try writeAutomationFiles(allocator, db, row.id);
-
-    const summary_text = if (failures.items.len == 0)
-        try std.fmt.allocPrint(allocator, "Completed {d} run(s)", .{cwds.items.len})
-    else
-        try std.fmt.allocPrint(allocator, "Completed with failures in {d}/{d} cwd(s)", .{ failures.items.len, cwds.items.len });
-    defer allocator.free(summary_text);
-
-    try writeMemorySummary(allocator, row.id, summary_text, started);
-
     if (dry_run) {
         return .{
             .id = row.id,
@@ -1922,6 +1944,17 @@ fn runDueAutomation(
             .err = null,
         };
     }
+
+    try updateAutomationTimes(allocator, db, row.id, started, next_run);
+    try writeAutomationFiles(allocator, db, row.id);
+
+    const summary_text = if (failures.items.len == 0)
+        try std.fmt.allocPrint(allocator, "Completed {d} run(s)", .{cwds.items.len})
+    else
+        try std.fmt.allocPrint(allocator, "Completed with failures in {d}/{d} cwd(s)", .{ failures.items.len, cwds.items.len });
+    defer allocator.free(summary_text);
+
+    try writeMemorySummary(allocator, row.id, summary_text, started);
 
     if (failures.items.len > 0) {
         const err_text = try std.fmt.allocPrint(allocator, "failed cwds: {d}", .{failures.items.len});
@@ -1948,11 +1981,16 @@ fn runDueAutomation(
 }
 
 fn computeNextRunAt(allocator: std.mem.Allocator, row: *const AutomationRow, run_started_ms: i64) !i64 {
-    if (!std.ascii.startsWithIgnoreCase(row.rrule, "RRULE:")) {
-        return userErrorFmt("automation {s} has non-canonical rrule; expected RRULE: prefix", .{row.id});
-    }
+    const raw = std.mem.trim(u8, row.rrule, " \t\r\n");
+    if (raw.len == 0) return userErrorFmt("automation {s} has empty rrule", .{row.id});
 
-    var rule = try parseRrule(allocator, std.mem.trim(u8, row.rrule[6..], " \t\r\n"));
+    const rule_text = if (std.ascii.startsWithIgnoreCase(raw, "RRULE:"))
+        std.mem.trim(u8, raw[6..], " \t\r\n")
+    else
+        raw;
+    if (rule_text.len == 0) return userErrorFmt("automation {s} has malformed rrule", .{row.id});
+
+    var rule = try parseRrule(allocator, rule_text);
     defer rule.deinit(allocator);
 
     const dtstart_ms: i64 = if (row.next_run_at) |next_ms|
@@ -2304,10 +2342,9 @@ fn acquireRunLock(allocator: std.mem.Allocator, label: []const u8) !?RunLock {
         _ = userErrorFmt("HOME is not set", .{}) catch {};
         return error.UserInput;
     };
-    const safe_label = try sanitizeLabel(allocator, label);
-    defer allocator.free(safe_label);
+    const validated_label = try validateSchedulerLabel(label);
 
-    const lock_dir = try std.fmt.allocPrint(allocator, "{s}/Library/Caches/{s}", .{ home, safe_label });
+    const lock_dir = try std.fmt.allocPrint(allocator, "{s}/Library/Caches/{s}", .{ home, validated_label });
     defer allocator.free(lock_dir);
     try std.fs.cwd().makePath(lock_dir);
 
@@ -2317,36 +2354,12 @@ fn acquireRunLock(allocator: std.mem.Allocator, label: []const u8) !?RunLock {
 }
 
 fn acquireExclusiveLockWithStaleRetry(allocator: std.mem.Allocator, lock_path: []const u8) !?RunLock {
-    return acquireExclusiveLockWithAttempt(allocator, lock_path, true);
+    return acquireExclusiveLockWithAttempt(allocator, lock_path, false);
 }
 
-fn acquireExclusiveLockWithAttempt(allocator: std.mem.Allocator, lock_path: []const u8, allow_stale_cleanup: bool) !?RunLock {
+fn acquireExclusiveLockWithAttempt(allocator: std.mem.Allocator, lock_path: []const u8, _: bool) !?RunLock {
     var file = std.fs.cwd().createFile(lock_path, .{ .exclusive = true, .read = true, .truncate = false, .mode = 0o644 }) catch |err| switch (err) {
-        error.PathAlreadyExists => {
-            if (!allow_stale_cleanup) return null;
-
-            var stale = false;
-            var existing = std.fs.cwd().openFile(lock_path, .{}) catch |open_err| switch (open_err) {
-                error.FileNotFound => return acquireExclusiveLockWithAttempt(allocator, lock_path, false),
-                else => return userErrorFmt("unable to inspect lock file ({s}): {s}", .{ lock_path, @errorName(open_err) }),
-            };
-            defer existing.close();
-
-            const stat = existing.stat() catch |stat_err| {
-                return userErrorFmt("unable to stat lock file ({s}): {s}", .{ lock_path, @errorName(stat_err) });
-            };
-            const age_ms = nowMs() - @as(i64, @intCast(@divFloor(stat.mtime, std.time.ns_per_ms)));
-            if (age_ms > 24 * 60 * 60 * 1000) stale = true;
-
-            if (stale) {
-                std.fs.cwd().deleteFile(lock_path) catch |delete_err| switch (delete_err) {
-                    error.FileNotFound => {},
-                    else => return userErrorFmt("unable to remove stale lock ({s}): {s}", .{ lock_path, @errorName(delete_err) }),
-                };
-                return acquireExclusiveLockWithAttempt(allocator, lock_path, false);
-            }
-            return null;
-        },
+        error.PathAlreadyExists => return null,
         else => return userErrorFmt("unable to create lock ({s}): {s}", .{ lock_path, @errorName(err) }),
     };
 
@@ -2363,23 +2376,6 @@ fn releaseRunLock(allocator: std.mem.Allocator, lock: ?RunLock) void {
         std.fs.cwd().deleteFile(state.path) catch {};
         allocator.free(state.path);
     }
-}
-
-fn sanitizeLabel(allocator: std.mem.Allocator, label: []const u8) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(allocator);
-
-    const w = out.writer(allocator);
-    for (label) |ch| {
-        if (std.ascii.isAlphanumeric(ch) or ch == '.' or ch == '-' or ch == '_') {
-            try w.writeByte(ch);
-        } else {
-            try w.writeByte('_');
-        }
-    }
-
-    if (out.items.len == 0) try w.writeAll(DefaultLaunchdLabel);
-    return out.toOwnedSlice(allocator);
 }
 
 fn resolveExecutable(allocator: std.mem.Allocator, raw: []const u8) !?[]u8 {
@@ -2837,4 +2833,154 @@ test "generateUuidV4 emits expected shape" {
     try std.testing.expectEqual('-', value[13]);
     try std.testing.expectEqual('-', value[18]);
     try std.testing.expectEqual('-', value[23]);
+}
+
+test "parseSchedulerLabelArgs rejects invalid labels" {
+    try std.testing.expectError(error.UserInput, parseSchedulerLabelArgs(&.{ "--label", "../bad" }));
+    try std.testing.expectError(error.UserInput, parseSchedulerLabelArgs(&.{ "--label", "bad label" }));
+}
+
+test "parseRunDueArgs rejects invalid lock label" {
+    try std.testing.expectError(error.UserInput, parseRunDueArgs(&.{ "--lock-label", "../bad" }));
+    try std.testing.expectError(error.UserInput, parseRunDueArgs(&.{ "--lock-label", "bad label" }));
+}
+
+test "computeNextRunAt accepts legacy non-prefixed rrule" {
+    const alloc = std.testing.allocator;
+    var row = AutomationRow{
+        .id = try alloc.dupe(u8, "legacy-id"),
+        .name = try alloc.dupe(u8, "Legacy"),
+        .prompt = try alloc.dupe(u8, "prompt"),
+        .status = try alloc.dupe(u8, "ACTIVE"),
+        .next_run_at = null,
+        .last_run_at = null,
+        .cwds_json = try alloc.dupe(u8, "[\"/tmp\"]"),
+        .rrule = try alloc.dupe(u8, "FREQ=DAILY;BYHOUR=9;BYMINUTE=0"),
+        .created_at = 1_772_469_600_000,
+        .updated_at = 1_772_469_600_000,
+    };
+    defer row.deinit(alloc);
+
+    const anchor: i64 = 1_772_470_000_000;
+    const next = try computeNextRunAt(alloc, &row, anchor);
+    try std.testing.expect(next > anchor);
+}
+
+test "runDueAutomation dry-run is read-only" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "codex-dev.db", .data = "" });
+    const root_abs = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root_abs);
+    const db_path = try std.fs.path.join(alloc, &.{ root_abs, "codex-dev.db" });
+    defer alloc.free(db_path);
+
+    var db = try Db.open(alloc, db_path);
+    defer db.close();
+
+    try db.exec(alloc,
+        \\create table automations (
+        \\  id text primary key,
+        \\  name text not null,
+        \\  prompt text not null,
+        \\  status text not null,
+        \\  next_run_at integer,
+        \\  last_run_at integer,
+        \\  cwds text not null,
+        \\  rrule text not null,
+        \\  created_at integer not null,
+        \\  updated_at integer not null
+        \\)
+    , &.{});
+    try db.exec(alloc,
+        \\create table automation_runs (
+        \\  thread_id text primary key,
+        \\  automation_id text not null,
+        \\  status text not null,
+        \\  read_at integer,
+        \\  thread_title text,
+        \\  source_cwd text,
+        \\  inbox_title text,
+        \\  inbox_summary text,
+        \\  created_at integer not null,
+        \\  updated_at integer not null,
+        \\  archived_user_message text,
+        \\  archived_assistant_message text,
+        \\  archived_reason text
+        \\)
+    , &.{});
+
+    const created_at: i64 = 1_772_469_600_000;
+    try db.exec(
+        alloc,
+        "insert into automations (id, name, prompt, status, next_run_at, last_run_at, cwds, rrule, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &.{
+            .{ .text = "dry-run-id" },
+            .{ .text = "Dry Run" },
+            .{ .text = "noop prompt" },
+            .{ .text = "ACTIVE" },
+            .null,
+            .null,
+            .{ .text = "[\"/tmp\"]" },
+            .{ .text = "RRULE:FREQ=DAILY;BYHOUR=9;BYMINUTE=0" },
+            .{ .int = created_at },
+            .{ .int = created_at },
+        },
+    );
+
+    var row = try getAutomationById(alloc, &db, "dry-run-id");
+    defer row.deinit(alloc);
+    const before_last = row.last_run_at;
+    const before_next = row.next_run_at;
+
+    const result = try runDueAutomation(alloc, &db, &row, "codex", true);
+    defer alloc.free(result.thread_id);
+    defer alloc.free(result.cwd);
+    if (result.err) |err_text| alloc.free(err_text);
+
+    try std.testing.expectEqualStrings("dry_run", result.status);
+    try std.testing.expect(result.thread_id.len > 0);
+    try std.testing.expectEqualStrings("/tmp", result.cwd);
+
+    var runs_stmt = try db.prepare(alloc, "select count(*) from automation_runs where automation_id = ?");
+    defer runs_stmt.deinit();
+    try runs_stmt.bindAll(&.{.{ .text = "dry-run-id" }});
+    switch (try runs_stmt.step()) {
+        .row => try std.testing.expectEqual(@as(i64, 0), runs_stmt.intColumn(0)),
+        .done => unreachable,
+    }
+
+    var after = try getAutomationById(alloc, &db, "dry-run-id");
+    defer after.deinit(alloc);
+    try std.testing.expectEqual(before_last, after.last_run_at);
+    try std.testing.expectEqual(before_next, after.next_run_at);
+}
+
+test "lock acquisition is fail-closed while lock exists" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_abs = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root_abs);
+    const lock_dir = try std.fs.path.join(alloc, &.{ root_abs, "locks" });
+    defer alloc.free(lock_dir);
+    try std.fs.cwd().makePath(lock_dir);
+    const lock_path = try std.fs.path.join(alloc, &.{ lock_dir, "run.lock" });
+    defer alloc.free(lock_path);
+
+    var first = try acquireExclusiveLockWithStaleRetry(alloc, lock_path);
+    try std.testing.expect(first != null);
+
+    const second = try acquireExclusiveLockWithStaleRetry(alloc, lock_path);
+    try std.testing.expect(second == null);
+
+    releaseRunLock(alloc, first);
+    first = null;
+
+    const third = try acquireExclusiveLockWithStaleRetry(alloc, lock_path);
+    try std.testing.expect(third != null);
+    releaseRunLock(alloc, third);
 }
