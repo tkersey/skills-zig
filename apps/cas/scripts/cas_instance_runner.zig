@@ -1,7 +1,7 @@
-const std = @import("std");
+const app_meta = @import("app_meta");
 const cas = @import("cas_proxy_client.zig");
 const core_cli = @import("core_cli");
-const app_meta = @import("app_meta");
+const std = @import("std");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
 
@@ -507,4 +507,58 @@ fn stringifyAnyAlloc(allocator: std.mem.Allocator, value: anytype) ![]u8 {
     defer out.deinit();
     try std.json.Stringify.value(value, .{}, &out.writer);
     return out.toOwnedSlice();
+}
+
+test "parseArgs accepts core options and collects opt-out methods" {
+    const argv = [_][]const u8{
+        "cas_instance_runner",
+        "--cwd",
+        "/tmp/repo",
+        "--instances",
+        "4",
+        "--method",
+        "thread/read",
+        "--opt-out-notification-method",
+        "thread/item/stream",
+        "--json",
+    };
+
+    const parsed = try parseArgs(std.testing.allocator, &argv);
+    defer std.testing.allocator.free(parsed.opt_out_methods);
+
+    try std.testing.expectEqual(@as(?[]const u8, "/tmp/repo"), parsed.cwd);
+    try std.testing.expectEqual(@as(usize, 4), parsed.instances);
+    try std.testing.expectEqualStrings("thread/read", parsed.method);
+    try std.testing.expect(parsed.json);
+    try std.testing.expectEqual(@as(usize, 1), parsed.opt_out_methods.len);
+    try std.testing.expectEqualStrings("thread/item/stream", parsed.opt_out_methods[0]);
+}
+
+test "parseArgs rejects duplicate parameter sources" {
+    const argv = [_][]const u8{
+        "cas_instance_runner",
+        "--cwd",
+        "/tmp/repo",
+        "--params-json",
+        "{}",
+        "--params-file",
+        "params.json",
+    };
+
+    try std.testing.expectError(error.DuplicateParamsSource, parseArgs(std.testing.allocator, &argv));
+}
+
+test "summarizeResult returns thread/list compact summary" {
+    const summary = try summarizeResult(
+        std.testing.allocator,
+        "thread/list",
+        "{\"data\":[{\"id\":\"thr_1\"},{\"id\":\"thr_2\"}]}",
+    );
+    defer std.testing.allocator.free(summary);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, summary, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expectEqual(@as(?i64, 2), cas.intField(parsed.value.object, "rows"));
+    try std.testing.expectEqualStrings("thr_1", cas.stringField(parsed.value.object, "firstThreadId").?);
 }

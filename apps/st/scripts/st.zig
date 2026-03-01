@@ -1,10 +1,9 @@
-const std = @import("std");
+const app_meta = @import("app_meta");
 const builtin = @import("builtin");
 const core_cli = @import("core_cli");
-const app_meta = @import("app_meta");
+const std = @import("std");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
-const ProgramName = "st";
 const SchemaVersion: i64 = 3;
 
 const UsageText =
@@ -41,12 +40,12 @@ const UsageText =
 ;
 
 const Status = enum {
-    pending,
-    in_progress,
-    completed,
     blocked,
-    deferred,
     canceled,
+    completed,
+    deferred,
+    in_progress,
+    pending,
 
     fn asString(self: Status) []const u8 {
         return switch (self) {
@@ -61,10 +60,10 @@ const Status = enum {
 };
 
 const DepState = enum {
-    ready,
-    waiting_on_deps,
     blocked_manual,
     na,
+    ready,
+    waiting_on_deps,
 
     fn asString(self: DepState) []const u8 {
         return switch (self) {
@@ -170,26 +169,26 @@ const ItemState = struct {
 };
 
 const Command = enum {
-    init,
+    @"export",
     add,
-    set_status,
-    set_deps,
-    set_notes,
     add_comment,
-    remove,
-    show,
-    ready,
     blocked,
     doctor,
     emit_update_plan,
-    @"export",
     import_plan,
+    init,
+    ready,
+    remove,
+    set_deps,
+    set_notes,
+    set_status,
+    show,
 };
 
 const OutputFormat = enum {
+    json,
     markdown,
     table,
-    json,
 };
 
 const Args = struct {
@@ -2214,4 +2213,75 @@ fn formatDepsLimited(buf: []u8, deps: []const Dep) ![]const u8 {
         }
     }
     return fbs.getWritten();
+}
+
+fn makeSeqRecord(
+    allocator: std.mem.Allocator,
+    lane: []const u8,
+    seq: i64,
+    op: []const u8,
+) !std.json.Value {
+    var obj = std.json.ObjectMap.init(allocator);
+    try obj.put("v", .{ .integer = SchemaVersion });
+    try obj.put("lane", .{ .string = lane });
+    try obj.put("seq", .{ .integer = seq });
+    try obj.put("op", .{ .string = op });
+    return .{ .object = obj };
+}
+
+test "parseCommand and parseOutputFormat recognize known values" {
+    try std.testing.expect(parseCommand("set-status") != null);
+    try std.testing.expectEqual(Command.emit_update_plan, parseCommand("emit-update-plan").?);
+    try std.testing.expect(parseCommand("unknown-cmd") == null);
+
+    try std.testing.expectEqual(OutputFormat.markdown, parseOutputFormat("markdown").?);
+    try std.testing.expectEqual(OutputFormat.table, parseOutputFormat("table").?);
+    try std.testing.expectEqual(OutputFormat.json, parseOutputFormat("json").?);
+    try std.testing.expect(parseOutputFormat("csv") == null);
+}
+
+test "dependencyState maps blocked and waiting statuses" {
+    const base = Item{
+        .id = "st-001",
+        .step = "sample",
+        .status = .pending,
+        .deps = &.{},
+        .notes = "",
+        .comments = &.{},
+    };
+
+    try std.testing.expectEqual(DepState.ready, dependencyState(base, &.{}));
+
+    const waiting_on = [_][]const u8{"st-009"};
+    try std.testing.expectEqual(DepState.waiting_on_deps, dependencyState(base, &waiting_on));
+
+    var blocked_item = base;
+    blocked_item.status = .blocked;
+    try std.testing.expectEqual(DepState.blocked_manual, dependencyState(blocked_item, &.{}));
+
+    var done_item = base;
+    done_item.status = .completed;
+    try std.testing.expectEqual(DepState.na, dependencyState(done_item, &.{}));
+}
+
+test "collectSeqContractIssues detects non-monotonic trailing seq" {
+    var records = [_]std.json.Value{
+        try makeSeqRecord(std.testing.allocator, "event", 1, "init"),
+        try makeSeqRecord(std.testing.allocator, "checkpoint", 1, "replace"),
+        try makeSeqRecord(std.testing.allocator, "event", 2, "replace"),
+        try makeSeqRecord(std.testing.allocator, "event", 2, "replace"),
+    };
+    defer for (&records) |*record| {
+        if (record.* == .object) {
+            record.object.deinit();
+        }
+    };
+
+    const issues = try collectSeqContractIssues(std.testing.allocator, &records);
+    defer {
+        for (issues) |issue| std.testing.allocator.free(issue);
+        std.testing.allocator.free(issues);
+    }
+
+    try std.testing.expect(issues.len >= 1);
 }

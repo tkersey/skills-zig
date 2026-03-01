@@ -1,7 +1,7 @@
-const builtin = @import("builtin");
-const std = @import("std");
-const core_cli = @import("core_cli");
 const app_meta = @import("app_meta");
+const builtin = @import("builtin");
+const core_cli = @import("core_cli");
+const std = @import("std");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
 
@@ -72,9 +72,9 @@ const c = struct {
 };
 
 const SqlParam = union(enum) {
-    text: []const u8,
     int: i64,
     null,
+    text: []const u8,
 };
 
 const Db = struct {
@@ -184,7 +184,7 @@ const Stmt = struct {
     }
 };
 
-const StepResult = enum { row, done };
+const StepResult = enum { done, row };
 
 const AutomationStatus = enum {
     ACTIVE,
@@ -205,13 +205,13 @@ const AutomationStatus = enum {
 };
 
 const Day = enum {
-    MO,
-    TU,
-    WE,
-    TH,
     FR,
+    MO,
     SA,
     SU,
+    TH,
+    TU,
+    WE,
 
     fn parse(raw: []const u8) !Day {
         if (std.ascii.eqlIgnoreCase(raw, "MO")) return .MO;
@@ -242,8 +242,8 @@ const Day = enum {
 };
 
 const Freq = enum {
-    HOURLY,
     DAILY,
+    HOURLY,
     WEEKLY,
 
     fn parse(raw: []const u8) !Freq {
@@ -301,7 +301,7 @@ const ResolveArgs = struct {
     name: ?[]const u8 = null,
 };
 
-const CwdsMode = enum { inherit_default, unchanged, clear, list, json };
+const CwdsMode = enum { clear, inherit_default, json, list, unchanged };
 
 const CwdsInput = struct {
     mode: CwdsMode,
@@ -982,16 +982,6 @@ fn civilFromDays(days_since_unix_epoch: i64) CivilDate {
     };
 }
 
-fn daysFromCivil(year: i64, month: u8, day: u8) i64 {
-    const y = year - (if (month <= 2) 1 else 0);
-    const era = @divFloor(y, 400);
-    const yoe = y - era * 400;
-    const m = @as(i64, @intCast(month));
-    const mp = m + (if (m > 2) -3 else 9);
-    const doy = @divFloor(153 * mp + 2, 5) + @as(i64, @intCast(day)) - 1;
-    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    return era * 146_097 + doe - 719_468;
-}
 
 fn weekdayMon(days_since_unix_epoch: i64) u8 {
     const idx = @mod(days_since_unix_epoch + 3, 7);
@@ -1166,12 +1156,18 @@ fn validateAutomationId(raw: []const u8) ![]const u8 {
 }
 
 fn defaultDbPath(allocator: std.mem.Allocator) ![]u8 {
-    const home = std.posix.getenv("HOME") orelse "/Users/tk";
+    const home = std.posix.getenv("HOME") orelse {
+        _ = userErrorFmt("HOME is not set", .{}) catch {};
+        return error.UserInput;
+    };
     return std.fmt.allocPrint(allocator, "{s}/.codex/sqlite/codex-dev.db", .{home});
 }
 
 fn defaultAutomationsDir(allocator: std.mem.Allocator) ![]u8 {
-    const home = std.posix.getenv("HOME") orelse "/Users/tk";
+    const home = std.posix.getenv("HOME") orelse {
+        _ = userErrorFmt("HOME is not set", .{}) catch {};
+        return error.UserInput;
+    };
     return std.fmt.allocPrint(allocator, "{s}/.codex/automations", .{home});
 }
 
@@ -2260,7 +2256,10 @@ fn runCodexExec(allocator: std.mem.Allocator, codex_bin: []const u8, cwd: []cons
 }
 
 fn tmpAutomationRunnerDir(allocator: std.mem.Allocator) ![]u8 {
-    const home = std.posix.getenv("HOME") orelse "/Users/tk";
+    const home = std.posix.getenv("HOME") orelse {
+        _ = userErrorFmt("HOME is not set", .{}) catch {};
+        return error.UserInput;
+    };
     return std.fmt.allocPrint(allocator, "{s}/.codex/tmp/automation-runner", .{home});
 }
 
@@ -2301,7 +2300,10 @@ const RunLock = struct {
 };
 
 fn acquireRunLock(allocator: std.mem.Allocator, label: []const u8) !?RunLock {
-    const home = std.posix.getenv("HOME") orelse "/Users/tk";
+    const home = std.posix.getenv("HOME") orelse {
+        _ = userErrorFmt("HOME is not set", .{}) catch {};
+        return error.UserInput;
+    };
     const safe_label = try sanitizeLabel(allocator, label);
     defer allocator.free(safe_label);
 

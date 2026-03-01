@@ -91,7 +91,12 @@ Required tag forms:
 - `mesh-v<version>` where `<version>` equals `apps/mesh/VERSION`
 - `st-v<version>` where `<version>` equals `apps/st/VERSION`
 
-Artifacts are published as `<tag>-linux-x86_64.tar.gz` (no `*-cli` prefix).
+Artifacts are published as:
+
+- `<tag>-linux-x86_64.tar.gz`
+- `<tag>-darwin-arm64.tar.gz`
+
+Each release workflow verifies that both archives are present.
 
 ## Homebrew
 

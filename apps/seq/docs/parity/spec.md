@@ -1,7 +1,7 @@
 # Zig/Python Parity Contract
 
 This repository treats the Python implementation at
-`/Users/tk/.dotfiles/codex/skills/seq/scripts/seq.py` as the compatibility oracle.
+`~/.dotfiles/codex/skills/seq/scripts/seq.py` as the compatibility oracle.
 
 ## Scope
 

@@ -1,5 +1,5 @@
-const std = @import("std");
 const core_json = @import("core_json");
+const std = @import("std");
 
 pub const ClientOptions = struct {
     cwd: []const u8,
@@ -457,4 +457,89 @@ pub fn stringField(obj: ObjectMap, key: []const u8) ?[]const u8 {
 
 pub fn intField(obj: ObjectMap, key: []const u8) ?i64 {
     return core_json.intField(obj, key);
+}
+
+test "resolveExecDecision honors read_only and explicit approvals" {
+    var client = Client{
+        .allocator = std.testing.allocator,
+        .child = undefined,
+        .stdin_file = undefined,
+        .stdout_file = undefined,
+        .line_buf = .empty,
+        .next_request_id = 1,
+        .last_error = null,
+        .exec_approval = "auto",
+        .file_approval = "auto",
+        .read_only = false,
+    };
+    defer client.line_buf.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("acceptForSession", client.resolveExecDecision());
+    try std.testing.expectEqualStrings("acceptForSession", client.resolveFileDecision());
+
+    client.exec_approval = "decline";
+    client.file_approval = "accept";
+    try std.testing.expectEqualStrings("decline", client.resolveExecDecision());
+    try std.testing.expectEqualStrings("accept", client.resolveFileDecision());
+
+    client.read_only = true;
+    try std.testing.expectEqualStrings("decline", client.resolveExecDecision());
+    try std.testing.expectEqualStrings("decline", client.resolveFileDecision());
+}
+
+test "resolveAutoExecDecision prefers acceptForSession when available" {
+    var client = Client{
+        .allocator = std.testing.allocator,
+        .child = undefined,
+        .stdin_file = undefined,
+        .stdout_file = undefined,
+        .line_buf = .empty,
+        .next_request_id = 1,
+        .last_error = null,
+        .exec_approval = "auto",
+        .file_approval = "auto",
+        .read_only = false,
+    };
+    defer client.line_buf.deinit(std.testing.allocator);
+
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"availableDecisions\":[\"decline\",\"accept\",\"acceptForSession\"]}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    const choice = client.resolveAutoExecDecision(parsed.value.object) orelse return error.TestExpectedEqual;
+    switch (choice) {
+        .string => |value| try std.testing.expectEqualStrings("acceptForSession", value),
+        else => return error.TestExpectedEqual,
+    }
+}
+
+test "resolveAutoExecDecision falls back to amendment object before decline" {
+    var client = Client{
+        .allocator = std.testing.allocator,
+        .child = undefined,
+        .stdin_file = undefined,
+        .stdout_file = undefined,
+        .line_buf = .empty,
+        .next_request_id = 1,
+        .last_error = null,
+        .exec_approval = "auto",
+        .file_approval = "auto",
+        .read_only = false,
+    };
+    defer client.line_buf.deinit(std.testing.allocator);
+
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"availableDecisions\":[\"decline\",{\"acceptWithExecpolicyAmendment\":{\"profile\":\"safe\"}}]}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    const choice = client.resolveAutoExecDecision(parsed.value.object) orelse return error.TestExpectedEqual;
+    try std.testing.expect(choice == .object);
 }

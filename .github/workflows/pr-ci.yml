@@ -3,6 +3,9 @@ name: PR CI
 on:
   pull_request:
     paths:
+      - "build.zig"
+      - "build.zig.zon"
+      - "README.md"
       - "apps/seq/**"
       - "apps/lift/**"
       - "apps/cas/**"
@@ -13,7 +16,9 @@ on:
       - "apps/st/**"
       - "libs/core/**"
       - ".github/scripts/**"
+      - ".github/workflows/release-*.yml"
       - "scripts/perf/**"
+      - "docs/release/**"
       - ".github/workflows/pr-ci.yml"
 
 permissions:
@@ -55,9 +60,14 @@ jobs:
             st:
               - "apps/st/**"
             core:
+              - "build.zig"
+              - "build.zig.zon"
+              - "README.md"
               - "libs/core/**"
               - ".github/scripts/**"
+              - ".github/workflows/release-*.yml"
               - "scripts/perf/**"
+              - "docs/release/**"
 
   seq:
     needs: changes
@@ -135,7 +145,7 @@ jobs:
       - name: Build cas binaries
         run: zig build build-cas -Doptimize=ReleaseFast
       - name: Test CAS budget governor
-        run: zig build test-cas-budget-governor
+        run: zig build test-cas
       - name: CAS budget governor perf gate
         run: bash apps/cas/scripts/perf/budget_governor_gate.sh
 
@@ -189,6 +199,10 @@ jobs:
           version: 0.15.2
       - name: Build learnings binaries
         run: zig build build-learnings -Doptimize=ReleaseFast
+      - name: Test learnings
+        run: zig build test-learnings
+      - name: Test append_learning
+        run: zig build test-append-learning
 
   st:
     needs: changes

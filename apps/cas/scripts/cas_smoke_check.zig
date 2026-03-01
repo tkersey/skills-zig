@@ -1,7 +1,7 @@
-const std = @import("std");
+const app_meta = @import("app_meta");
 const cas = @import("cas_proxy_client.zig");
 const core_cli = @import("core_cli");
-const app_meta = @import("app_meta");
+const std = @import("std");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
 
@@ -393,4 +393,57 @@ fn containsCaseInsensitive(haystack: []const u8, needle: []const u8) bool {
         if (matched) return true;
     }
     return false;
+}
+
+test "parseArgs accepts core options and collects opt-out methods" {
+    const argv = [_][]const u8{
+        "cas_smoke_check",
+        "--cwd",
+        "/tmp/repo",
+        "--thread-id",
+        "thr_123",
+        "--request-timeout-ms",
+        "45000",
+        "--opt-out-notification-method",
+        "thread/item/stream",
+        "--json",
+    };
+
+    const parsed = try parseArgs(std.testing.allocator, &argv);
+    defer std.testing.allocator.free(parsed.opt_out_methods);
+
+    try std.testing.expectEqual(@as(?[]const u8, "/tmp/repo"), parsed.cwd);
+    try std.testing.expectEqual(@as(?[]const u8, "thr_123"), parsed.thread_id);
+    try std.testing.expectEqual(@as(u32, 45_000), parsed.request_timeout_ms);
+    try std.testing.expect(parsed.json);
+    try std.testing.expectEqual(@as(usize, 1), parsed.opt_out_methods.len);
+    try std.testing.expectEqualStrings("thread/item/stream", parsed.opt_out_methods[0]);
+}
+
+test "parseArgs rejects non-positive request timeout" {
+    const argv = [_][]const u8{
+        "cas_smoke_check",
+        "--cwd",
+        "/tmp/repo",
+        "--request-timeout-ms",
+        "0",
+    };
+
+    try std.testing.expectError(error.InvalidTimeout, parseArgs(std.testing.allocator, &argv));
+}
+
+test "countDataRows and extractThreadId parse expected fields" {
+    const rows = try countDataRows(std.testing.allocator, "{\"data\":[{\"id\":\"a\"},{\"id\":\"b\"}]}");
+    try std.testing.expectEqual(@as(?usize, 2), rows);
+
+    const thread_id = try extractThreadId(std.testing.allocator, "{\"thread\":{\"id\":\"thr_abc\"}}");
+    defer if (thread_id) |owned| std.testing.allocator.free(owned);
+    try std.testing.expect(thread_id != null);
+    try std.testing.expectEqualStrings("thr_abc", thread_id.?);
+}
+
+test "isMethodUnavailableError handles structured and text errors" {
+    try std.testing.expect(isMethodUnavailableError("{\"code\":-32601,\"message\":\"Method not found\"}"));
+    try std.testing.expect(isMethodUnavailableError("UNKNOWN METHOD thread/resume"));
+    try std.testing.expect(!isMethodUnavailableError("{\"code\":-32000,\"message\":\"server error\"}"));
 }

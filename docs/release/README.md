@@ -33,20 +33,29 @@ Release tags must match file versions:
 - `mesh-v<version>` where `<version>` equals `apps/mesh/VERSION`
 - `st-v<version>` where `<version>` equals `apps/st/VERSION`
 
-Each workflow builds only binaries from its own CLI path and publishes a release archive named:
+Each workflow builds only binaries from its own CLI path and publishes two release archives:
 
 - `<tag>-linux-x86_64.tar.gz`
+- `<tag>-darwin-arm64.tar.gz`
 
 Examples:
 
 - `seq-v1.2.3-linux-x86_64.tar.gz`
+- `seq-v1.2.3-darwin-arm64.tar.gz`
 - `lift-v1.2.3-linux-x86_64.tar.gz`
+- `lift-v1.2.3-darwin-arm64.tar.gz`
 - `cas-v1.2.3-linux-x86_64.tar.gz`
+- `cas-v1.2.3-darwin-arm64.tar.gz`
 - `cron-v1.2.3-linux-x86_64.tar.gz`
+- `cron-v1.2.3-darwin-arm64.tar.gz`
 - `puff-v1.2.3-linux-x86_64.tar.gz`
+- `puff-v1.2.3-darwin-arm64.tar.gz`
 - `learnings-v1.2.3-linux-x86_64.tar.gz`
+- `learnings-v1.2.3-darwin-arm64.tar.gz`
 - `mesh-v1.2.3-linux-x86_64.tar.gz`
+- `mesh-v1.2.3-darwin-arm64.tar.gz`
 - `st-v1.2.3-linux-x86_64.tar.gz`
+- `st-v1.2.3-darwin-arm64.tar.gz`
 
 ## Homebrew Tap Handoff
 

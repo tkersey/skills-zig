@@ -1,4 +1,5 @@
 const std = @import("std");
+const zlinter = @import("zlinter");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -119,6 +120,14 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_json", .module = core_json },
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "app_meta", .module = cas_meta },
+        },
+    });
+    const cas_proxy_client_root = b.createModule(.{
+        .root_source_file = b.path("apps/cas/scripts/cas_proxy_client.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_json", .module = core_json },
         },
     });
     const cas_budget_governor_root = b.createModule(.{
@@ -316,12 +325,35 @@ pub fn build(b: *std.Build) void {
         "Run budget_governor performance harness",
     );
 
-    _ = addTestStep(
+    const run_cas_budget_governor_tests = addTestStep(
         b,
         cas_budget_governor_root,
         "test-cas-budget-governor",
         "Run budget_governor tests",
     );
+    const run_cas_smoke_tests = addTestStep(
+        b,
+        cas_smoke_root,
+        "test-cas-smoke-check",
+        "Run cas_smoke_check tests",
+    );
+    const run_cas_runner_tests = addTestStep(
+        b,
+        cas_runner_root,
+        "test-cas-instance-runner",
+        "Run cas_instance_runner tests",
+    );
+    const run_cas_proxy_client_tests = addTestStep(
+        b,
+        cas_proxy_client_root,
+        "test-cas-proxy-client",
+        "Run cas_proxy_client tests",
+    );
+    const test_cas = b.step("test-cas", "Run all cas tests");
+    test_cas.dependOn(&run_cas_budget_governor_tests.step);
+    test_cas.dependOn(&run_cas_smoke_tests.step);
+    test_cas.dependOn(&run_cas_runner_tests.step);
+    test_cas.dependOn(&run_cas_proxy_client_tests.step);
 
     const build_cron = b.step("build-cron", "Build cron binaries");
     build_cron.dependOn(&cron_install.step);
@@ -371,6 +403,26 @@ pub fn build(b: *std.Build) void {
         "test-st",
         "Run st tests",
     );
+
+    const lint_cmd = b.step("lint", "Lint source code");
+    lint_cmd.dependOn(step: {
+        var builder = zlinter.builder(b, .{});
+        builder.addRule(.{ .builtin = .no_unused }, .{});
+        builder.addPaths(.{
+            .include = &.{
+                b.path("build.zig"),
+                b.path("apps/cas/scripts/cas_instance_runner.zig"),
+                b.path("apps/cas/scripts/cas_proxy_client.zig"),
+                b.path("apps/cas/scripts/cas_smoke_check.zig"),
+                b.path("apps/cron/scripts/cron.zig"),
+                b.path("apps/learnings/scripts/append_learning.zig"),
+                b.path("apps/puff/scripts/puff.zig"),
+                b.path("apps/st/scripts/st.zig"),
+                b.path("libs/core/src/delegate_helpers.zig"),
+            },
+        });
+        break :step builder.build();
+    });
 
     addRunStep(b, seq, "run-seq", "Run seq", &.{});
     addRunStep(b, st, "run-st", "Run st", &.{"--help"});

@@ -31,7 +31,7 @@ cas instance_runner \
 ```bash
 zig build build-cas -Doptimize=ReleaseFast
 bash apps/cas/scripts/perf/budget_governor_gate.sh
-zig build test-cas-budget-governor
+zig build test-cas
 
 # Linux-only bounded fuzz smoke (matches CI behavior).
 timeout 180 zig test --dep core_json --dep core_io -Mroot=apps/cas/scripts/budget_governor.zig -Mcore_json=libs/core/src/json_helpers.zig -Mcore_io=libs/core/src/io_helpers.zig -ffuzz --test-filter "fuzz governor"

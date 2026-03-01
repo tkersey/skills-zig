@@ -1,5 +1,5 @@
-const std = @import("std");
 const core_cli = @import("core_cli");
+const std = @import("std");
 
 pub fn isHelpRequested(argv: []const []const u8) bool {
     if (argv.len <= 1) return false;
@@ -14,8 +14,8 @@ pub fn isVersionRequested(argv: []const []const u8) bool {
 }
 
 pub const DelegateRuntime = enum {
-    uv_python,
     bash,
+    uv_python,
 };
 
 pub fn runDelegatedCli(
@@ -129,10 +129,11 @@ pub fn resolveScriptPath(
     defer allocator.free(claude_home);
     if (try buildCandidateIfExists(allocator, claude_home, skill_name, script_name)) |path| return path;
 
+    const home = std.posix.getenv("HOME") orelse return error.MissingHome;
     const absolute_fallback = try std.fmt.allocPrint(
         allocator,
-        "/Users/tk/.dotfiles/codex/skills/{s}/scripts/{s}",
-        .{ skill_name, script_name },
+        "{s}/.dotfiles/codex/skills/{s}/scripts/{s}",
+        .{ home, skill_name, script_name },
     );
     if (pathExists(absolute_fallback)) return absolute_fallback;
     allocator.free(absolute_fallback);
@@ -148,7 +149,7 @@ fn resolveHomePath(
     if (std.posix.getenv(env_key)) |value| {
         return allocator.dupe(u8, value);
     }
-    const home = std.posix.getenv("HOME") orelse "/Users/tk";
+    const home = std.posix.getenv("HOME") orelse return error.MissingHome;
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, default_dir });
 }
 

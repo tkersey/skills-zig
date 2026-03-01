@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "python_oracle": "/Users/tk/.dotfiles/codex/skills/seq/scripts/seq.py",
+  "python_oracle": "~/.dotfiles/codex/skills/seq/scripts/seq.py",
   "required": [
     {
       "id": "query_tool_calls_day_tool",

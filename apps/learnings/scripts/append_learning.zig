@@ -1,6 +1,6 @@
-const std = @import("std");
-const core_cli = @import("core_cli");
 const app_meta = @import("app_meta");
+const core_cli = @import("core_cli");
+const std = @import("std");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
 const ProgramName = "append_learning";
@@ -39,8 +39,8 @@ const HelpText =
 ;
 
 const QualityMode = enum {
-    strict,
     best_effort,
+    strict,
 };
 
 const TEMP_PATH_PREFIXES = [_][]const u8{
@@ -1098,4 +1098,31 @@ fn containsString(items: []const []u8, value: []const u8) bool {
 fn freeOwnedStrings(allocator: std.mem.Allocator, list: *std.ArrayList([]u8)) void {
     for (list.items) |item| allocator.free(item);
     list.deinit(allocator);
+}
+
+test "normalizeStatusAlloc canonicalizes mixed separators" {
+    const status = try normalizeStatusAlloc(std.testing.allocator, "  Do More / ASAP  ");
+    defer std.testing.allocator.free(status);
+    try std.testing.expectEqualStrings("do_more_asap", status);
+}
+
+test "condition-action and counterfactual detectors" {
+    try std.testing.expect(hasConditionAction("when ci fails prefer rerun with logs"));
+    try std.testing.expect(!hasConditionAction("this is an observation only"));
+
+    try std.testing.expect(hasCounterfactual("prefer strict checks to avoid silent regressions"));
+    try std.testing.expect(!hasCounterfactual("prefer strict checks for quality"));
+}
+
+test "evidence anchors detect run ids, paths, and status language" {
+    try std.testing.expect(hasEvidenceAnchor("release run 22525295017 passed"));
+    try std.testing.expect(hasEvidenceAnchor("see apps/mesh/scripts/mesh.zig"));
+    try std.testing.expect(hasEvidenceAnchor("commit a1b2c3d4e5f6"));
+    try std.testing.expect(!hasEvidenceAnchor("follow up later maybe"));
+}
+
+test "isEphemeralPath recognizes temporary roots" {
+    try std.testing.expect(isEphemeralPath("/tmp/work/repo"));
+    try std.testing.expect(isEphemeralPath("/private/var/folders/abc/repo"));
+    try std.testing.expect(!isEphemeralPath("/Users/example/work/repo"));
 }

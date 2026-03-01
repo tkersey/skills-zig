@@ -1,7 +1,7 @@
-const std = @import("std");
-const core_delegate = @import("core_delegate");
-const core_cli = @import("core_cli");
 const app_meta = @import("app_meta");
+const core_cli = @import("core_cli");
+const core_delegate = @import("core_delegate");
+const std = @import("std");
 
 const SourceFile = "puff.zig";
 const SkillName = "puff";
@@ -18,7 +18,7 @@ const UsageText =
     \\Resolution order:
     \\  1. ${CODEX_HOME:-$HOME/.codex}/skills/puff/scripts/puff.sh
     \\  2. ${CLAUDE_HOME:-$HOME/.claude}/skills/puff/scripts/puff.sh
-    \\  3. /Users/tk/.dotfiles/codex/skills/puff/scripts/puff.sh
+    \\  3. $HOME/.dotfiles/codex/skills/puff/scripts/puff.sh
     \\
     \\Options:
     \\  -h, --help                        Show help.

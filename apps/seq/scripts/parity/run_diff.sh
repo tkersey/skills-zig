@@ -23,9 +23,19 @@ fi
 
 mkdir -p "$WORK_DIR"
 
-PY_ORACLE="$(jq -r '.python_oracle' "$MATRIX")"
+PY_ORACLE="${SEQ_PY_ORACLE:-$(jq -r '.python_oracle' "$MATRIX")}"
 if [[ -z "$PY_ORACLE" || "$PY_ORACLE" == "null" ]]; then
   echo "matrix missing python_oracle" >&2
+  exit 65
+fi
+if [[ "$PY_ORACLE" == "~/"* ]]; then
+  PY_ORACLE="${HOME}/${PY_ORACLE#~/}"
+fi
+if [[ "$PY_ORACLE" != /* ]]; then
+  PY_ORACLE="${HOME}/${PY_ORACLE}"
+fi
+if [[ ! -f "$PY_ORACLE" ]]; then
+  echo "python oracle not found: $PY_ORACLE" >&2
   exit 65
 fi
 
