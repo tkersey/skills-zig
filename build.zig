@@ -1,5 +1,4 @@
 const std = @import("std");
-const zlinter = @import("zlinter");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -403,26 +402,6 @@ pub fn build(b: *std.Build) void {
         "test-st",
         "Run st tests",
     );
-
-    const lint_cmd = b.step("lint", "Lint source code");
-    lint_cmd.dependOn(step: {
-        var builder = zlinter.builder(b, .{});
-        builder.addRule(.{ .builtin = .no_unused }, .{});
-        builder.addPaths(.{
-            .include = &.{
-                b.path("build.zig"),
-                b.path("apps/cas/scripts/cas_instance_runner.zig"),
-                b.path("apps/cas/scripts/cas_proxy_client.zig"),
-                b.path("apps/cas/scripts/cas_smoke_check.zig"),
-                b.path("apps/cron/scripts/cron.zig"),
-                b.path("apps/learnings/scripts/append_learning.zig"),
-                b.path("apps/puff/scripts/puff.zig"),
-                b.path("apps/st/scripts/st.zig"),
-                b.path("libs/core/src/delegate_helpers.zig"),
-            },
-        });
-        break :step builder.build();
-    });
 
     addRunStep(b, seq, "run-seq", "Run seq", &.{});
     addRunStep(b, st, "run-st", "Run st", &.{"--help"});
