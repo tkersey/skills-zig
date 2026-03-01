@@ -9,7 +9,7 @@ const UsageText =
     \\
     \\Marker: mesh.zig
     \\
-    \\Plan-driven orchestration helpers for budget clamps, CSV-wave contracts, and event-only ledgers.
+    \\Plan-driven orchestration helpers for streaming batch contracts, budget clamps, and event-only ledgers.
     \\
     \\usage: mesh {budget,plan_sync,slice,wave,run_csv,ledger,replay} [options]
     \\
@@ -17,8 +17,8 @@ const UsageText =
     \\  budget      Compute active-unit clamp from 5-hour + weekly remaining percentages
     \\  plan_sync   Summarize update_plan payload shape
     \\  slice       Derive atomic units from plan steps
-    \\  wave        Emit a wave-template CSV from sliced units
-    \\  run_csv     Validate a wave CSV and prepare output CSV path safely
+    \\  wave        Emit a streaming batch CSV from sliced units
+    \\  run_csv     Validate a streaming batch CSV and prepare output CSV path safely
     \\  ledger      Filter a ledger object down to occurred events only
     \\  replay      Simulate budget + wave sizing without execution
     \\
@@ -31,19 +31,19 @@ const RequiredCsvHeaders = [_][]const u8{
     "id",
     "objective",
     "unit_scope",
+    "write_scope",
     "constraints",
     "invariants",
     "proof_command",
+    "risk_tier",
+    "candidate_id",
+    "triplet_index",
+    "lane",
+    "base_sha",
     "delivery_mode",
     "attempt",
     "variant",
     "budget_tier",
-    "cohort_id",
-    "triplet_index",
-    "candidate_id",
-    "role_in_lane",
-    "challenge_targets",
-    "quorum_rule",
 };
 
 const Command = enum {
@@ -80,6 +80,10 @@ const BudgetDecision = struct {
 
 const Lane = enum {
     coder,
+    reducer,
+    locksmith,
+    applier,
+    prover,
     fixer,
     integrator,
 };
@@ -99,9 +103,12 @@ const SliceUnit = struct {
     id: []const u8,
     objective: []const u8,
     unit_scope: []const u8,
+    write_scope: []const u8,
     constraints: []const u8,
     invariants: []const u8,
     proof_command: []const u8,
+    risk_tier: []const u8,
+    base_sha: []const u8,
     delivery_mode: []const u8,
     attempt: []const u8,
     variant: []const u8,
@@ -484,7 +491,7 @@ fn cmdSlice(allocator: std.mem.Allocator, args: []const []const u8) !void {
             .{id},
         );
         try writeJsonString(writer, step.step);
-        try writer.writeAll(",\"unit_scope\":\"unknown\",\"constraints\":\"\",\"invariants\":\"\",\"proof_command\":\"\",\"delivery_mode\":\"commit_first\",\"attempt\":\"1\",\"variant\":\"baseline\",\"budget_tier\":\"unknown\"}");
+        try writer.writeAll(",\"unit_scope\":\"unknown\",\"write_scope\":\"unknown\",\"constraints\":\"\",\"invariants\":\"\",\"proof_command\":\"\",\"risk_tier\":\"med\",\"base_sha\":\"HEAD\",\"delivery_mode\":\"patch_first\",\"attempt\":\"1\",\"variant\":\"baseline\",\"budget_tier\":\"unknown\"}");
 
         emitted += 1;
     }
@@ -506,7 +513,6 @@ fn cmdWave(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const max_active = parseOptionalUsize(args, "--max-active") orelse 1;
     const lane = parseOptionalLane(args, "--lane") orelse .coder;
     const triplet_width = parseOptionalUsize(args, "--triplet-width") orelse 3;
-    const degrade_reason = parseOptionalPath(args, "--degrade-reason") orelse "";
 
     if (triplet_width == 0 or triplet_width > 3) return error.InvalidTripletWidth;
 
@@ -516,7 +522,7 @@ fn cmdWave(allocator: std.mem.Allocator, args: []const []const u8) !void {
     defer csv.deinit(allocator);
     var writer = csv.writer(allocator);
 
-    try writer.writeAll("id,objective,unit_scope,constraints,invariants,proof_command,delivery_mode,attempt,variant,budget_tier,cohort_id,triplet_index,candidate_id,role_in_lane,challenge_targets,quorum_rule,lane,degrade_reason\n");
+    try writer.writeAll("id,objective,unit_scope,write_scope,constraints,invariants,proof_command,risk_tier,candidate_id,triplet_index,lane,base_sha,delivery_mode,attempt,variant,budget_tier\n");
 
     var selected_units: usize = 0;
     var emitted_rows: usize = 0;
@@ -541,11 +547,23 @@ fn cmdWave(allocator: std.mem.Allocator, args: []const []const u8) !void {
             try writer.writeByte(',');
             try writeCsvField(writer, unit.unit_scope);
             try writer.writeByte(',');
+            try writeCsvField(writer, unit.write_scope);
+            try writer.writeByte(',');
             try writeCsvField(writer, unit.constraints);
             try writer.writeByte(',');
             try writeCsvField(writer, unit.invariants);
             try writer.writeByte(',');
             try writeCsvField(writer, unit.proof_command);
+            try writer.writeByte(',');
+            try writeCsvField(writer, unit.risk_tier);
+            try writer.writeByte(',');
+            try writeCsvField(writer, row_id);
+            try writer.writeByte(',');
+            try writeCsvField(writer, index_text);
+            try writer.writeByte(',');
+            try writeCsvField(writer, laneString(lane));
+            try writer.writeByte(',');
+            try writeCsvField(writer, unit.base_sha);
             try writer.writeByte(',');
             try writeCsvField(writer, unit.delivery_mode);
             try writer.writeByte(',');
@@ -554,22 +572,6 @@ fn cmdWave(allocator: std.mem.Allocator, args: []const []const u8) !void {
             try writeCsvField(writer, unit.variant);
             try writer.writeByte(',');
             try writeCsvField(writer, unit.budget_tier);
-            try writer.writeByte(',');
-            try writeCsvField(writer, unit.id);
-            try writer.writeByte(',');
-            try writeCsvField(writer, index_text);
-            try writer.writeByte(',');
-            try writeCsvField(writer, row_id);
-            try writer.writeByte(',');
-            try writeCsvField(writer, roleInLane(lane, idx));
-            try writer.writeByte(',');
-            try writeCsvField(writer, challengeTargets(lane, triplet_width, idx));
-            try writer.writeByte(',');
-            try writeCsvField(writer, quorumRule(lane));
-            try writer.writeByte(',');
-            try writeCsvField(writer, laneString(lane));
-            try writer.writeByte(',');
-            try writeCsvField(writer, degrade_reason);
             try writer.writeByte('\n');
 
             emitted_rows += 1;
@@ -610,12 +612,16 @@ fn cmdRunCsv(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const id_index = findHeaderIndex(headers, "id") orelse return error.MissingIdHeader;
     const candidate_id_index = findHeaderIndex(headers, "candidate_id") orelse return error.MissingCandidateIdHeader;
     const triplet_index_index = findHeaderIndex(headers, "triplet_index") orelse return error.MissingTripletIndexHeader;
+    const lane_index = findHeaderIndex(headers, "lane") orelse return error.MissingRequiredHeaders;
+    const write_scope_index = findHeaderIndex(headers, "write_scope") orelse return error.MissingRequiredHeaders;
+    const risk_tier_index = findHeaderIndex(headers, "risk_tier") orelse return error.MissingRequiredHeaders;
+    const base_sha_index = findHeaderIndex(headers, "base_sha") orelse return error.MissingRequiredHeaders;
 
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
     var outw = output.writer(allocator);
 
-    try outw.writeAll("id,candidate_id,triplet_index,decision,proof_status,failure_code,notes\n");
+    try outw.writeAll("id,candidate_id,triplet_index,lane,decision,proof_status,write_scope,risk_tier,base_sha,proof_attempts,proof_evidence\n");
 
     var row_count: usize = 0;
     while (lines.next()) |line| {
@@ -626,13 +632,28 @@ fn cmdRunCsv(allocator: std.mem.Allocator, args: []const []const u8) !void {
         if (id.len == 0) continue;
         const candidate_id = nthCsvField(trimmed, candidate_id_index) orelse id;
         const triplet_index = nthCsvField(trimmed, triplet_index_index) orelse "1";
+        const lane_raw = nthCsvField(trimmed, lane_index) orelse "coder";
+        const lane = parseLane(lane_raw) catch return error.InvalidLane;
+        const write_scope = nthCsvField(trimmed, write_scope_index) orelse "unknown";
+        const risk_tier = nthCsvField(trimmed, risk_tier_index) orelse "med";
+        const base_sha = nthCsvField(trimmed, base_sha_index) orelse "HEAD";
 
         try writeCsvField(outw, id);
         try outw.writeByte(',');
         try writeCsvField(outw, candidate_id);
         try outw.writeByte(',');
         try writeCsvField(outw, triplet_index);
-        try outw.writeAll(",queued,pending,,\n");
+        try outw.writeByte(',');
+        try writeCsvField(outw, laneString(lane));
+        try outw.writeAll(",queued,pending,");
+        try writeCsvField(outw, write_scope);
+        try outw.writeByte(',');
+        try writeCsvField(outw, risk_tier);
+        try outw.writeByte(',');
+        try writeCsvField(outw, base_sha);
+        try outw.writeAll(",0,");
+        try writeCsvField(outw, "{\"command\":\"\",\"key_line\":\"\",\"exit_code\":0}");
+        try outw.writeByte('\n');
         row_count += 1;
     }
 
@@ -721,6 +742,10 @@ fn parseBool(raw: []const u8) !bool {
 
 fn parseLane(raw: []const u8) !Lane {
     if (std.mem.eql(u8, raw, "coder")) return .coder;
+    if (std.mem.eql(u8, raw, "reducer")) return .reducer;
+    if (std.mem.eql(u8, raw, "locksmith")) return .locksmith;
+    if (std.mem.eql(u8, raw, "applier")) return .applier;
+    if (std.mem.eql(u8, raw, "prover")) return .prover;
     if (std.mem.eql(u8, raw, "fixer")) return .fixer;
     if (std.mem.eql(u8, raw, "integrator")) return .integrator;
     return error.InvalidLane;
@@ -775,10 +800,13 @@ fn parseSliceUnits(allocator: std.mem.Allocator, path: []const u8) ![]SliceUnit 
             .id = id,
             .objective = jsonStringField(entry.object, "objective") orelse "",
             .unit_scope = jsonStringField(entry.object, "unit_scope") orelse "unknown",
+            .write_scope = jsonStringField(entry.object, "write_scope") orelse "unknown",
             .constraints = jsonStringField(entry.object, "constraints") orelse "",
             .invariants = jsonStringField(entry.object, "invariants") orelse "",
             .proof_command = jsonStringField(entry.object, "proof_command") orelse "",
-            .delivery_mode = jsonStringField(entry.object, "delivery_mode") orelse "commit_first",
+            .risk_tier = jsonStringField(entry.object, "risk_tier") orelse "med",
+            .base_sha = jsonStringField(entry.object, "base_sha") orelse "HEAD",
+            .delivery_mode = jsonStringField(entry.object, "delivery_mode") orelse "patch_first",
             .attempt = jsonStringField(entry.object, "attempt") orelse "1",
             .variant = jsonStringField(entry.object, "variant") orelse "baseline",
             .budget_tier = jsonStringField(entry.object, "budget_tier") orelse "unknown",
@@ -904,6 +932,10 @@ fn budgetModeString(mode: BudgetMode) []const u8 {
 fn laneString(lane: Lane) []const u8 {
     return switch (lane) {
         .coder => "coder",
+        .reducer => "reducer",
+        .locksmith => "locksmith",
+        .applier => "applier",
+        .prover => "prover",
         .fixer => "fixer",
         .integrator => "integrator",
     };
@@ -918,13 +950,17 @@ fn roleInLane(lane: Lane, triplet_index: usize) []const u8 {
 fn quorumRule(lane: Lane) []const u8 {
     return switch (lane) {
         .coder => "adjudicate_one",
+        .reducer => "adjudicate_one",
+        .locksmith => "lease_single",
+        .applier => "single_apply",
+        .prover => "max_attempts=2",
         .fixer => "min_accept=2,no_blocker_reject",
         .integrator => "writer_pass,shadow_accepts=2",
     };
 }
 
 fn challengeTargets(lane: Lane, width: usize, self: usize) []const u8 {
-    if (lane == .integrator or width <= 1) return "";
+    if (lane == .integrator or lane == .locksmith or lane == .applier or lane == .prover or width <= 1) return "";
     return switch (width) {
         1 => "",
         2 => if (self == 1) "2" else "1",
@@ -1112,12 +1148,20 @@ test "computeTripletDecision degrades and restores by policy" {
 
 test "lane helper metadata follows triplet contract" {
     try std.testing.expectEqualStrings("coder", laneString(.coder));
+    try std.testing.expectEqualStrings("reducer", laneString(.reducer));
+    try std.testing.expectEqualStrings("locksmith", laneString(.locksmith));
+    try std.testing.expectEqualStrings("applier", laneString(.applier));
+    try std.testing.expectEqualStrings("prover", laneString(.prover));
     try std.testing.expectEqualStrings("writer", roleInLane(.integrator, 1));
     try std.testing.expectEqualStrings("shadow", roleInLane(.integrator, 2));
     try std.testing.expectEqualStrings("", roleInLane(.coder, 1));
+    try std.testing.expectEqualStrings("", challengeTargets(.prover, 3, 1));
     try std.testing.expectEqualStrings("1;2", challengeTargets(.coder, 3, 3));
     try std.testing.expectEqualStrings("", challengeTargets(.integrator, 3, 1));
+    try std.testing.expectEqualStrings("max_attempts=2", quorumRule(.prover));
     try std.testing.expectEqualStrings("writer_pass,shadow_accepts=2", quorumRule(.integrator));
+    try std.testing.expectEqual(Lane.reducer, try parseLane("reducer"));
+    try std.testing.expectEqual(Lane.locksmith, try parseLane("locksmith"));
 }
 
 test "hasRequiredHeaders validates required set" {
@@ -1125,19 +1169,19 @@ test "hasRequiredHeaders validates required set" {
         "id",
         "objective",
         "unit_scope",
+        "write_scope",
         "constraints",
         "invariants",
         "proof_command",
+        "risk_tier",
+        "candidate_id",
+        "triplet_index",
+        "lane",
+        "base_sha",
         "delivery_mode",
         "attempt",
         "variant",
         "budget_tier",
-        "cohort_id",
-        "triplet_index",
-        "candidate_id",
-        "role_in_lane",
-        "challenge_targets",
-        "quorum_rule",
     };
     try std.testing.expect(hasRequiredHeaders(&good, &RequiredCsvHeaders));
 
