@@ -102,6 +102,7 @@ const Options = struct {
     format_set: bool = false,
     help: bool = false,
     fail_on_floor: bool = false,
+    fail_on_mesh_truth: bool = false,
     root: ?[]const u8 = null,
     path: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
@@ -184,7 +185,7 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\usage: seq occurrence-export [--skill <name>] [--format jsonl|json|csv] [--max N]
         ,
         .orchestration_concurrency =>
-        \\usage: seq orchestration-concurrency [--session-id <id>|--path <jsonl>] [--format table|json|csv|jsonl] [--floor-threshold N] [--fail-on-floor]
+        \\usage: seq orchestration-concurrency [--session-id <id>|--path <jsonl>] [--format table|json|csv|jsonl] [--floor-threshold N] [--fail-on-floor] [--fail-on-mesh-truth]
         ,
         .find_session =>
         \\usage: seq find-session --prompt <text> [--limit N] [--format table|json|csv|jsonl]
@@ -490,7 +491,10 @@ const ConcurrencySummary = struct {
     session_id: []const u8,
     session_path: []const u8,
     spawn_calls: i64 = 0,
-    spawn_substrate: []const u8 = "spawn_agents_on_csv",
+    spawn_substrate: []const u8 = "none",
+    spawn_agent_calls: i64 = 0,
+    wait_calls: i64 = 0,
+    close_agent_calls: i64 = 0,
     max_configured_concurrency: ?i64 = null,
     max_configured_occurrences: i64 = 0,
     max_effective_concurrency: ?i64 = null,
@@ -502,6 +506,7 @@ const ConcurrencySummary = struct {
 
     fn observe(self: *ConcurrencySummary, configured_concurrency: i64, csv_rows: ?i64) void {
         self.spawn_calls += 1;
+        self.refreshSubstrate();
         updateMaxCounter(
             &self.max_configured_concurrency,
             &self.max_configured_occurrences,
@@ -529,6 +534,9 @@ const ConcurrencySummary = struct {
 
     fn mergeFrom(self: *ConcurrencySummary, other: ConcurrencySummary) void {
         self.spawn_calls += other.spawn_calls;
+        self.spawn_agent_calls += other.spawn_agent_calls;
+        self.wait_calls += other.wait_calls;
+        self.close_agent_calls += other.close_agent_calls;
         self.csv_rows_known += other.csv_rows_known;
         self.csv_rows_missing += other.csv_rows_missing;
         self.serialized_wait_calls += other.serialized_wait_calls;
@@ -549,6 +557,31 @@ const ConcurrencySummary = struct {
             other.max_effective_concurrency,
             other.max_effective_occurrences,
         );
+        self.refreshSubstrate();
+    }
+
+    fn hasSignals(self: ConcurrencySummary) bool {
+        return self.spawn_calls > 0 or self.spawn_agent_calls > 0 or self.wait_calls > 0 or self.close_agent_calls > 0;
+    }
+
+    fn meshTruthVerdict(self: ConcurrencySummary) bool {
+        return self.spawn_calls > 0;
+    }
+
+    fn refreshSubstrate(self: *ConcurrencySummary) void {
+        if (self.spawn_calls > 0 and self.spawn_agent_calls > 0) {
+            self.spawn_substrate = "mixed";
+            return;
+        }
+        if (self.spawn_calls > 0) {
+            self.spawn_substrate = "spawn_agents_on_csv";
+            return;
+        }
+        if (self.spawn_agent_calls > 0) {
+            self.spawn_substrate = "spawn_agent";
+            return;
+        }
+        self.spawn_substrate = "none";
     }
 };
 
@@ -583,10 +616,12 @@ fn cmdOrchestrationConcurrency(
     };
     var included_sessions: usize = 0;
     var floor_failed = false;
+    var mesh_truth_failed = false;
 
     for (input_paths.items) |session_path| {
         const summary = try summarizeSessionConcurrency(allocator, session_path);
-        if (summary.spawn_calls == 0) continue;
+        const explicit_target = opts.path != null or opts.session_id != null;
+        if (!summary.hasSignals() and !explicit_target) continue;
 
         included_sessions += 1;
         total.mergeFrom(summary);
@@ -594,13 +629,19 @@ fn cmdOrchestrationConcurrency(
         if (floor_eval.applicable and std.mem.eql(u8, floor_eval.result, "fail")) {
             floor_failed = true;
         }
+        if (!summary.meshTruthVerdict()) {
+            mesh_truth_failed = true;
+        }
 
         var row = query.Row.init(allocator);
         try row.putOwnedKey("session_id", .{ .string = summary.session_id });
         try row.putOwnedKey("path", .{ .string = summary.session_path });
         try row.putOwnedKey("spawn_substrate", .{ .string = summary.spawn_substrate });
-        try row.putOwnedKey("mesh_truth_verdict", .{ .bool = true });
+        try row.putOwnedKey("mesh_truth_verdict", .{ .bool = summary.meshTruthVerdict() });
         try row.putOwnedKey("spawn_calls", .{ .int = summary.spawn_calls });
+        try row.putOwnedKey("spawn_agent_calls", .{ .int = summary.spawn_agent_calls });
+        try row.putOwnedKey("wait_calls", .{ .int = summary.wait_calls });
+        try row.putOwnedKey("close_agent_calls", .{ .int = summary.close_agent_calls });
         try putOptionalInt(&row, "max_configured_concurrency", summary.max_configured_concurrency);
         try row.putOwnedKey("max_configured_occurrences", .{ .int = summary.max_configured_occurrences });
         try putOptionalInt(&row, "max_effective_concurrency", summary.max_effective_concurrency);
@@ -621,18 +662,24 @@ fn cmdOrchestrationConcurrency(
         try out_rows.append(allocator, row);
     }
 
-    if (included_sessions == 0) return error.NoSpawnAgentsCalls;
+    if (included_sessions == 0) return error.NoOrchestrationSignals;
     if (included_sessions > 1) {
         const floor_eval = evaluateFloor(total, opts.floor_threshold);
         if (floor_eval.applicable and std.mem.eql(u8, floor_eval.result, "fail")) {
             floor_failed = true;
         }
+        if (!total.meshTruthVerdict()) {
+            mesh_truth_failed = true;
+        }
         var row = query.Row.init(allocator);
         try row.putOwnedKey("session_id", .{ .string = total.session_id });
         try row.putOwnedKey("path", .{ .string = total.session_path });
         try row.putOwnedKey("spawn_substrate", .{ .string = total.spawn_substrate });
-        try row.putOwnedKey("mesh_truth_verdict", .{ .bool = true });
+        try row.putOwnedKey("mesh_truth_verdict", .{ .bool = total.meshTruthVerdict() });
         try row.putOwnedKey("spawn_calls", .{ .int = total.spawn_calls });
+        try row.putOwnedKey("spawn_agent_calls", .{ .int = total.spawn_agent_calls });
+        try row.putOwnedKey("wait_calls", .{ .int = total.wait_calls });
+        try row.putOwnedKey("close_agent_calls", .{ .int = total.close_agent_calls });
         try putOptionalInt(&row, "max_configured_concurrency", total.max_configured_concurrency);
         try row.putOwnedKey("max_configured_occurrences", .{ .int = total.max_configured_occurrences });
         try putOptionalInt(&row, "max_effective_concurrency", total.max_effective_concurrency);
@@ -659,6 +706,9 @@ fn cmdOrchestrationConcurrency(
         "spawn_substrate",
         "mesh_truth_verdict",
         "spawn_calls",
+        "spawn_agent_calls",
+        "wait_calls",
+        "close_agent_calls",
         "max_configured_concurrency",
         "max_configured_occurrences",
         "max_effective_concurrency",
@@ -674,6 +724,7 @@ fn cmdOrchestrationConcurrency(
     };
     try output.writeOutput(allocator, opts.format, out_rows.items, cols[0..], opts.out_path);
     if (opts.fail_on_floor and floor_failed) return error.ConcurrencyFloorFailed;
+    if (opts.fail_on_mesh_truth and mesh_truth_failed) return error.MeshTruthFailed;
 }
 
 fn evaluateFloor(summary: ConcurrencySummary, threshold: i64) FloorEvaluation {
@@ -702,6 +753,17 @@ fn summarizeSessionConcurrency(
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r\n");
         if (trimmed.len == 0) continue;
+
+        if (std.mem.containsAtLeast(u8, trimmed, 1, "\"type\":\"function_call\"")) {
+            if (std.mem.containsAtLeast(u8, trimmed, 1, "\"name\":\"spawn_agent\"")) {
+                summary.spawn_agent_calls += 1;
+            } else if (std.mem.containsAtLeast(u8, trimmed, 1, "\"name\":\"wait\"")) {
+                summary.wait_calls += 1;
+            } else if (std.mem.containsAtLeast(u8, trimmed, 1, "\"name\":\"close_agent\"")) {
+                summary.close_agent_calls += 1;
+            }
+        }
+
         if (!std.mem.containsAtLeast(u8, trimmed, 1, "spawn_agents_on_csv")) continue;
 
         const invocation_opt = try parseSpawnAgentsInvocation(allocator, trimmed);
@@ -717,6 +779,7 @@ fn summarizeSessionConcurrency(
         summary.observe(invocation.max_concurrency, csv_rows);
     }
 
+    summary.refreshSubstrate();
     return summary;
 }
 
@@ -1680,6 +1743,8 @@ fn parseOptions(args: []const []const u8) !Options {
             opts.floor_threshold = n;
         } else if (std.mem.eql(u8, arg, "--fail-on-floor")) {
             opts.fail_on_floor = true;
+        } else if (std.mem.eql(u8, arg, "--fail-on-mesh-truth")) {
+            opts.fail_on_mesh_truth = true;
         } else if (std.mem.eql(u8, arg, "--limit") or std.mem.eql(u8, arg, "--max") or std.mem.eql(u8, arg, "--top")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -1834,6 +1899,10 @@ test "summarizeSessionConcurrency computes configured and effective maxima" {
     const summary = try summarizeSessionConcurrency(std.testing.allocator, session_path);
     try std.testing.expectEqualStrings("019ca0e5-0beb-7740-a9bc-81664d994266", summary.session_id);
     try std.testing.expectEqual(@as(i64, 3), summary.spawn_calls);
+    try std.testing.expectEqualStrings("spawn_agents_on_csv", summary.spawn_substrate);
+    try std.testing.expectEqual(@as(i64, 0), summary.spawn_agent_calls);
+    try std.testing.expectEqual(@as(i64, 0), summary.wait_calls);
+    try std.testing.expectEqual(@as(i64, 0), summary.close_agent_calls);
     try std.testing.expectEqual(@as(?i64, 5), summary.max_configured_concurrency);
     try std.testing.expectEqual(@as(i64, 2), summary.max_configured_occurrences);
     try std.testing.expectEqual(@as(?i64, 3), summary.max_effective_concurrency);
@@ -1846,6 +1915,38 @@ test "summarizeSessionConcurrency computes configured and effective maxima" {
     const floor_eval = evaluateFloor(summary, 3);
     try std.testing.expect(floor_eval.applicable);
     try std.testing.expectEqualStrings("pass", floor_eval.result);
+}
+
+test "summarizeSessionConcurrency reports mesh truth false for spawn_agent-only sessions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const session_content =
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"spawn_agent\",\"arguments\":\"{\\\"agent_type\\\":\\\"awaiter\\\"}\"}}\n" ++
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"wait\",\"arguments\":\"{\\\"ids\\\":[\\\"A\\\"]}\"}}\n" ++
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"close_agent\",\"arguments\":\"{\\\"id\\\":\\\"A\\\"}\"}}\n";
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "rollout-2026-03-02T00-00-00-019caeb9-23af-7de2-985b-3d954b4df213.jsonl",
+        .data = session_content,
+    });
+
+    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_abs);
+    const session_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "rollout-2026-03-02T00-00-00-019caeb9-23af-7de2-985b-3d954b4df213.jsonl" });
+    defer std.testing.allocator.free(session_path);
+
+    const summary = try summarizeSessionConcurrency(std.testing.allocator, session_path);
+    try std.testing.expectEqual(@as(i64, 0), summary.spawn_calls);
+    try std.testing.expectEqual(@as(i64, 1), summary.spawn_agent_calls);
+    try std.testing.expectEqual(@as(i64, 1), summary.wait_calls);
+    try std.testing.expectEqual(@as(i64, 1), summary.close_agent_calls);
+    try std.testing.expectEqualStrings("spawn_agent", summary.spawn_substrate);
+    try std.testing.expect(!summary.meshTruthVerdict());
+
+    const floor_eval = evaluateFloor(summary, 3);
+    try std.testing.expect(!floor_eval.applicable);
+    try std.testing.expectEqualStrings("not_applicable", floor_eval.result);
 }
 
 test "evaluateFloor reports not_applicable when runnable floor is not met" {
@@ -1874,6 +1975,7 @@ test "parse options supports common flags" {
         "--floor-threshold",
         "4",
         "--fail-on-floor",
+        "--fail-on-mesh-truth",
         "--max",
         "7",
         "--cue-spec",
@@ -1890,6 +1992,7 @@ test "parse options supports common flags" {
     try std.testing.expectEqualStrings("019ca0e5-0beb-7740-a9bc-81664d994266", opts.session_id.?);
     try std.testing.expectEqual(@as(i64, 4), opts.floor_threshold);
     try std.testing.expect(opts.fail_on_floor);
+    try std.testing.expect(opts.fail_on_mesh_truth);
     try std.testing.expectEqual(@as(usize, 7), opts.limit);
     try std.testing.expectEqualStrings("@cues.json", opts.cue_spec_text.?);
     try std.testing.expectEqualStrings("grill-me,prove-it", opts.discovery_skills.?);

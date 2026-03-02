@@ -31,13 +31,15 @@ Binary output:
 ./zig-out/bin/seq routing-gap --cue-spec @cue-spec.json --discovery-skills grill-me,prove-it,complexity-mitigator,invariant-ace,tk
 ./zig-out/bin/seq orchestration-concurrency --session-id 019ca0e5-0beb-7740-a9bc-81664d994266 --format table
 ./zig-out/bin/seq orchestration-concurrency --path /absolute/path/to/rollout.jsonl --floor-threshold 3 --fail-on-floor --format json
+./zig-out/bin/seq orchestration-concurrency --path /absolute/path/to/rollout.jsonl --fail-on-mesh-truth --format table
 ```
 
 `query.where.op` supports `contains_any` and `regex_any` in addition to `contains` and `regex`.
 `regex` uses a fast regex-like subset (`^`, `$`, `|`) and fails fast on unsupported constructs.
 
-`orchestration-concurrency` summarizes `spawn_agents_on_csv` fanout from session JSONL:
+`orchestration-concurrency` summarizes orchestration substrate and `spawn_agents_on_csv` fanout from session JSONL:
 - `spawn_calls`
+- direct-lane counters (`spawn_agent_calls`, `wait_calls`, `close_agent_calls`)
 - `max_configured_concurrency` and `max_configured_occurrences`
 - `max_effective_concurrency` and `max_effective_occurrences` (effective = `min(max_concurrency, csv_rows)`)
 - `effective_peak` (alias for `max_effective_concurrency`)
@@ -46,9 +48,12 @@ Binary output:
 - serialization signal (`serialized_wait_calls`, `serialized_wait_ratio`)
 - floor gating fields (`floor_threshold`, `floor_applicable`, `floor_result`)
 
+If a session has no `spawn_agents_on_csv` calls, the command now emits a row with `mesh_truth_verdict=false` and `spawn_substrate` set to `spawn_agent` or `none` instead of hard-failing.
+
 Floor flags:
 - `--floor-threshold N` sets the minimum effective peak target (default `3`).
 - `--fail-on-floor` exits non-zero when any applicable row has `floor_result=fail`.
+- `--fail-on-mesh-truth` exits non-zero when any row has `mesh_truth_verdict=false`.
 
 ## Validation
 
