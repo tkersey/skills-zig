@@ -101,6 +101,7 @@ const Options = struct {
     format: output.Format = .table,
     format_set: bool = false,
     help: bool = false,
+    fail_on_floor: bool = false,
     root: ?[]const u8 = null,
     path: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
@@ -114,6 +115,7 @@ const Options = struct {
     cue_spec_text: ?[]const u8 = null,
     discovery_skills: ?[]const u8 = null,
     limit: usize = 0,
+    floor_threshold: i64 = 3,
 };
 
 pub fn run(
@@ -182,7 +184,7 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\usage: seq occurrence-export [--skill <name>] [--format jsonl|json|csv] [--max N]
         ,
         .orchestration_concurrency =>
-        \\usage: seq orchestration-concurrency [--session-id <id>|--path <jsonl>] [--format table|json|csv|jsonl]
+        \\usage: seq orchestration-concurrency [--session-id <id>|--path <jsonl>] [--format table|json|csv|jsonl] [--floor-threshold N] [--fail-on-floor]
         ,
         .find_session =>
         \\usage: seq find-session --prompt <text> [--limit N] [--format table|json|csv|jsonl]
@@ -488,12 +490,15 @@ const ConcurrencySummary = struct {
     session_id: []const u8,
     session_path: []const u8,
     spawn_calls: i64 = 0,
+    spawn_substrate: []const u8 = "spawn_agents_on_csv",
     max_configured_concurrency: ?i64 = null,
     max_configured_occurrences: i64 = 0,
     max_effective_concurrency: ?i64 = null,
     max_effective_occurrences: i64 = 0,
     csv_rows_known: i64 = 0,
     csv_rows_missing: i64 = 0,
+    max_observed_csv_rows: ?i64 = null,
+    serialized_wait_calls: i64 = 0,
 
     fn observe(self: *ConcurrencySummary, configured_concurrency: i64, csv_rows: ?i64) void {
         self.spawn_calls += 1;
@@ -505,7 +510,13 @@ const ConcurrencySummary = struct {
 
         if (csv_rows) |row_count| {
             self.csv_rows_known += 1;
+            if (self.max_observed_csv_rows == null or row_count > self.max_observed_csv_rows.?) {
+                self.max_observed_csv_rows = row_count;
+            }
             const effective = if (configured_concurrency < row_count) configured_concurrency else row_count;
+            if (effective < configured_concurrency) {
+                self.serialized_wait_calls += 1;
+            }
             updateMaxCounter(
                 &self.max_effective_concurrency,
                 &self.max_effective_occurrences,
@@ -520,6 +531,12 @@ const ConcurrencySummary = struct {
         self.spawn_calls += other.spawn_calls;
         self.csv_rows_known += other.csv_rows_known;
         self.csv_rows_missing += other.csv_rows_missing;
+        self.serialized_wait_calls += other.serialized_wait_calls;
+        if (other.max_observed_csv_rows) |other_max| {
+            if (self.max_observed_csv_rows == null or other_max > self.max_observed_csv_rows.?) {
+                self.max_observed_csv_rows = other_max;
+            }
+        }
         mergeMaxCounter(
             &self.max_configured_concurrency,
             &self.max_configured_occurrences,
@@ -544,6 +561,11 @@ const SpawnAgentsInvocation = struct {
     }
 };
 
+const FloorEvaluation = struct {
+    applicable: bool,
+    result: []const u8,
+};
+
 fn cmdOrchestrationConcurrency(
     allocator: std.mem.Allocator,
     sessions_root: []const u8,
@@ -560,6 +582,7 @@ fn cmdOrchestrationConcurrency(
         .session_path = "-",
     };
     var included_sessions: usize = 0;
+    var floor_failed = false;
 
     for (input_paths.items) |session_path| {
         const summary = try summarizeSessionConcurrency(allocator, session_path);
@@ -567,47 +590,99 @@ fn cmdOrchestrationConcurrency(
 
         included_sessions += 1;
         total.mergeFrom(summary);
+        const floor_eval = evaluateFloor(summary, opts.floor_threshold);
+        if (floor_eval.applicable and std.mem.eql(u8, floor_eval.result, "fail")) {
+            floor_failed = true;
+        }
 
         var row = query.Row.init(allocator);
         try row.putOwnedKey("session_id", .{ .string = summary.session_id });
         try row.putOwnedKey("path", .{ .string = summary.session_path });
+        try row.putOwnedKey("spawn_substrate", .{ .string = summary.spawn_substrate });
+        try row.putOwnedKey("mesh_truth_verdict", .{ .bool = true });
         try row.putOwnedKey("spawn_calls", .{ .int = summary.spawn_calls });
         try putOptionalInt(&row, "max_configured_concurrency", summary.max_configured_concurrency);
         try row.putOwnedKey("max_configured_occurrences", .{ .int = summary.max_configured_occurrences });
         try putOptionalInt(&row, "max_effective_concurrency", summary.max_effective_concurrency);
+        try putOptionalInt(&row, "effective_peak", summary.max_effective_concurrency);
         try row.putOwnedKey("max_effective_occurrences", .{ .int = summary.max_effective_occurrences });
         try row.putOwnedKey("csv_rows_known", .{ .int = summary.csv_rows_known });
         try row.putOwnedKey("csv_rows_missing", .{ .int = summary.csv_rows_missing });
+        try row.putOwnedKey("serialized_wait_calls", .{ .int = summary.serialized_wait_calls });
+        if (summary.csv_rows_known > 0) {
+            const ratio = @as(f64, @floatFromInt(summary.serialized_wait_calls)) / @as(f64, @floatFromInt(summary.csv_rows_known));
+            try row.putOwnedKey("serialized_wait_ratio", .{ .float = ratio });
+        } else {
+            try row.putOwnedKey("serialized_wait_ratio", .null);
+        }
+        try row.putOwnedKey("floor_threshold", .{ .int = opts.floor_threshold });
+        try row.putOwnedKey("floor_applicable", .{ .bool = floor_eval.applicable });
+        try row.putOwnedKey("floor_result", .{ .string = floor_eval.result });
         try out_rows.append(allocator, row);
     }
 
     if (included_sessions == 0) return error.NoSpawnAgentsCalls;
     if (included_sessions > 1) {
+        const floor_eval = evaluateFloor(total, opts.floor_threshold);
+        if (floor_eval.applicable and std.mem.eql(u8, floor_eval.result, "fail")) {
+            floor_failed = true;
+        }
         var row = query.Row.init(allocator);
         try row.putOwnedKey("session_id", .{ .string = total.session_id });
         try row.putOwnedKey("path", .{ .string = total.session_path });
+        try row.putOwnedKey("spawn_substrate", .{ .string = total.spawn_substrate });
+        try row.putOwnedKey("mesh_truth_verdict", .{ .bool = true });
         try row.putOwnedKey("spawn_calls", .{ .int = total.spawn_calls });
         try putOptionalInt(&row, "max_configured_concurrency", total.max_configured_concurrency);
         try row.putOwnedKey("max_configured_occurrences", .{ .int = total.max_configured_occurrences });
         try putOptionalInt(&row, "max_effective_concurrency", total.max_effective_concurrency);
+        try putOptionalInt(&row, "effective_peak", total.max_effective_concurrency);
         try row.putOwnedKey("max_effective_occurrences", .{ .int = total.max_effective_occurrences });
         try row.putOwnedKey("csv_rows_known", .{ .int = total.csv_rows_known });
         try row.putOwnedKey("csv_rows_missing", .{ .int = total.csv_rows_missing });
+        try row.putOwnedKey("serialized_wait_calls", .{ .int = total.serialized_wait_calls });
+        if (total.csv_rows_known > 0) {
+            const ratio = @as(f64, @floatFromInt(total.serialized_wait_calls)) / @as(f64, @floatFromInt(total.csv_rows_known));
+            try row.putOwnedKey("serialized_wait_ratio", .{ .float = ratio });
+        } else {
+            try row.putOwnedKey("serialized_wait_ratio", .null);
+        }
+        try row.putOwnedKey("floor_threshold", .{ .int = opts.floor_threshold });
+        try row.putOwnedKey("floor_applicable", .{ .bool = floor_eval.applicable });
+        try row.putOwnedKey("floor_result", .{ .string = floor_eval.result });
         try out_rows.append(allocator, row);
     }
 
     const cols = [_][]const u8{
         "session_id",
         "path",
+        "spawn_substrate",
+        "mesh_truth_verdict",
         "spawn_calls",
         "max_configured_concurrency",
         "max_configured_occurrences",
         "max_effective_concurrency",
+        "effective_peak",
         "max_effective_occurrences",
         "csv_rows_known",
         "csv_rows_missing",
+        "serialized_wait_calls",
+        "serialized_wait_ratio",
+        "floor_threshold",
+        "floor_applicable",
+        "floor_result",
     };
     try output.writeOutput(allocator, opts.format, out_rows.items, cols[0..], opts.out_path);
+    if (opts.fail_on_floor and floor_failed) return error.ConcurrencyFloorFailed;
+}
+
+fn evaluateFloor(summary: ConcurrencySummary, threshold: i64) FloorEvaluation {
+    if (summary.max_observed_csv_rows == null or summary.max_observed_csv_rows.? < threshold) {
+        return .{ .applicable = false, .result = "not_applicable" };
+    }
+    const peak = summary.max_effective_concurrency orelse return .{ .applicable = true, .result = "fail" };
+    if (peak >= threshold) return .{ .applicable = true, .result = "pass" };
+    return .{ .applicable = true, .result = "fail" };
 }
 
 fn summarizeSessionConcurrency(
@@ -1597,6 +1672,14 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.discovery_skills = args[i];
+        } else if (std.mem.eql(u8, arg, "--floor-threshold")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            const n = try std.fmt.parseInt(i64, args[i], 10);
+            if (n < 1) return error.InvalidLimit;
+            opts.floor_threshold = n;
+        } else if (std.mem.eql(u8, arg, "--fail-on-floor")) {
+            opts.fail_on_floor = true;
         } else if (std.mem.eql(u8, arg, "--limit") or std.mem.eql(u8, arg, "--max") or std.mem.eql(u8, arg, "--top")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -1757,6 +1840,25 @@ test "summarizeSessionConcurrency computes configured and effective maxima" {
     try std.testing.expectEqual(@as(i64, 1), summary.max_effective_occurrences);
     try std.testing.expectEqual(@as(i64, 2), summary.csv_rows_known);
     try std.testing.expectEqual(@as(i64, 1), summary.csv_rows_missing);
+    try std.testing.expectEqual(@as(?i64, 3), summary.max_observed_csv_rows);
+    try std.testing.expectEqual(@as(i64, 2), summary.serialized_wait_calls);
+
+    const floor_eval = evaluateFloor(summary, 3);
+    try std.testing.expect(floor_eval.applicable);
+    try std.testing.expectEqualStrings("pass", floor_eval.result);
+}
+
+test "evaluateFloor reports not_applicable when runnable floor is not met" {
+    const summary = ConcurrencySummary{
+        .session_id = "s",
+        .session_path = "p",
+        .spawn_calls = 1,
+        .max_observed_csv_rows = 2,
+        .max_effective_concurrency = 2,
+    };
+    const floor_eval = evaluateFloor(summary, 3);
+    try std.testing.expect(!floor_eval.applicable);
+    try std.testing.expectEqualStrings("not_applicable", floor_eval.result);
 }
 
 test "parse options supports common flags" {
@@ -1769,6 +1871,9 @@ test "parse options supports common flags" {
         "/tmp/session.jsonl",
         "--session-id",
         "019ca0e5-0beb-7740-a9bc-81664d994266",
+        "--floor-threshold",
+        "4",
+        "--fail-on-floor",
         "--max",
         "7",
         "--cue-spec",
@@ -1783,6 +1888,8 @@ test "parse options supports common flags" {
     try std.testing.expectEqualStrings("~/sessions", opts.root.?);
     try std.testing.expectEqualStrings("/tmp/session.jsonl", opts.path.?);
     try std.testing.expectEqualStrings("019ca0e5-0beb-7740-a9bc-81664d994266", opts.session_id.?);
+    try std.testing.expectEqual(@as(i64, 4), opts.floor_threshold);
+    try std.testing.expect(opts.fail_on_floor);
     try std.testing.expectEqual(@as(usize, 7), opts.limit);
     try std.testing.expectEqualStrings("@cues.json", opts.cue_spec_text.?);
     try std.testing.expectEqualStrings("grill-me,prove-it", opts.discovery_skills.?);

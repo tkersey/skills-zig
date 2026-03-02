@@ -30,6 +30,7 @@ Binary output:
 ./zig-out/bin/seq query --spec '{"dataset":"tool_calls","group_by":["tool"],"metrics":[{"op":"count","as":"count"}],"sort":["-count"],"limit":10,"format":"json"}'
 ./zig-out/bin/seq routing-gap --cue-spec @cue-spec.json --discovery-skills grill-me,prove-it,complexity-mitigator,invariant-ace,tk
 ./zig-out/bin/seq orchestration-concurrency --session-id 019ca0e5-0beb-7740-a9bc-81664d994266 --format table
+./zig-out/bin/seq orchestration-concurrency --path /absolute/path/to/rollout.jsonl --floor-threshold 3 --fail-on-floor --format json
 ```
 
 `query.where.op` supports `contains_any` and `regex_any` in addition to `contains` and `regex`.
@@ -39,7 +40,15 @@ Binary output:
 - `spawn_calls`
 - `max_configured_concurrency` and `max_configured_occurrences`
 - `max_effective_concurrency` and `max_effective_occurrences` (effective = `min(max_concurrency, csv_rows)`)
+- `effective_peak` (alias for `max_effective_concurrency`)
 - CSV row observability (`csv_rows_known`, `csv_rows_missing`)
+- `spawn_substrate` and `mesh_truth_verdict`
+- serialization signal (`serialized_wait_calls`, `serialized_wait_ratio`)
+- floor gating fields (`floor_threshold`, `floor_applicable`, `floor_result`)
+
+Floor flags:
+- `--floor-threshold N` sets the minimum effective peak target (default `3`).
+- `--fail-on-floor` exits non-zero when any applicable row has `floor_result=fail`.
 
 ## Validation
 

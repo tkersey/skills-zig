@@ -18,7 +18,7 @@ const UsageText =
     \\  plan_sync   Summarize update_plan payload shape
     \\  slice       Derive atomic units from plan steps
     \\  wave        Emit a streaming batch CSV from sliced units
-    \\  run_csv     Validate a streaming batch CSV and prepare output CSV path safely
+    \\  run_csv     Validate a streaming batch CSV, enforce optional floor/deadlock gates, and prepare output CSV path safely
     \\  ledger      Filter a ledger object down to occurred events only
     \\  replay      Simulate budget + wave sizing without execution
     \\
@@ -113,6 +113,18 @@ const SliceUnit = struct {
     attempt: []const u8,
     variant: []const u8,
     budget_tier: []const u8,
+};
+
+const RunCsvFloorDecision = struct {
+    effective_peak: usize,
+    applicable: bool,
+    result: []const u8,
+};
+
+const DepRow = struct {
+    id: []const u8,
+    deps_raw: []const u8,
+    interactive_lead: bool,
 };
 
 pub fn main() !void {
@@ -595,6 +607,18 @@ fn cmdWave(allocator: std.mem.Allocator, args: []const []const u8) !void {
 fn cmdRunCsv(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const csv_path = try parseRequiredPath(args, "--csv-path");
     const output_csv_path = try parseRequiredPath(args, "--output-csv-path");
+    const deps_csv_path = parseOptionalPath(args, "--deps-csv");
+    const fail_on_floor = hasFlag(args, "--fail-on-floor");
+    const floor_threshold = parseOptionalUsize(args, "--floor-threshold") orelse 3;
+    const runnable_units_override = parseOptionalUsize(args, "--runnable-units");
+    const max_concurrency = parseOptionalUsize(args, "--max-concurrency") orelse parseOptionalUsize(args, "--max-workers") orelse 0;
+
+    if (floor_threshold == 0) return error.InvalidFloorThreshold;
+    if (fail_on_floor and max_concurrency == 0) return error.MissingMaxConcurrencyForFloorGate;
+
+    if (deps_csv_path) |path| {
+        try validateDepsCsvPath(allocator, path);
+    }
 
     if (!pathsAreDistinct(allocator, csv_path, output_csv_path)) {
         return error.CsvPathCollision;
@@ -657,6 +681,15 @@ fn cmdRunCsv(allocator: std.mem.Allocator, args: []const []const u8) !void {
         row_count += 1;
     }
 
+    const runnable_units = runnable_units_override orelse row_count;
+    const configured_concurrency = if (max_concurrency > 0) max_concurrency else row_count;
+    const floor_decision = evaluateRunCsvFloor(configured_concurrency, runnable_units, floor_threshold);
+    const deps_check_status = if (deps_csv_path != null) "pass" else "skipped";
+
+    if (fail_on_floor and std.mem.eql(u8, floor_decision.result, "fail")) {
+        return error.ConcurrencyFloorFailed;
+    }
+
     try writeTextFile(output_csv_path, output.items);
 
     var stdout_writer = std.fs.File.stdout().writer(&.{});
@@ -665,7 +698,20 @@ fn cmdRunCsv(allocator: std.mem.Allocator, args: []const []const u8) !void {
     try std.json.Stringify.value(csv_path, .{}, stdout);
     try stdout.print(",\"output_csv_path\":", .{});
     try std.json.Stringify.value(output_csv_path, .{}, stdout);
-    try stdout.writeAll(",\"status\":\"prepared\"}\n");
+    try stdout.print(
+        ",\"status\":\"prepared\",\"spawn_substrate\":\"spawn_agents_on_csv\",\"mesh_truth_verdict\":true,\"max_concurrency\":{d},\"runnable_units\":{d},\"effective_peak\":{d},\"floor_threshold\":{d},\"floor_applicable\":{s},\"floor_result\":",
+        .{
+            configured_concurrency,
+            runnable_units,
+            floor_decision.effective_peak,
+            floor_threshold,
+            if (floor_decision.applicable) "true" else "false",
+        },
+    );
+    try std.json.Stringify.value(floor_decision.result, .{}, stdout);
+    try stdout.print(",\"deps_check_status\":", .{});
+    try std.json.Stringify.value(deps_check_status, .{}, stdout);
+    try stdout.writeAll("}\n");
 }
 
 fn cmdLedger(allocator: std.mem.Allocator, args: []const []const u8) !void {
@@ -734,6 +780,13 @@ fn parseOptionalLane(args: []const []const u8, flag: []const u8) ?Lane {
     return null;
 }
 
+fn hasFlag(args: []const []const u8, flag: []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, flag)) return true;
+    }
+    return false;
+}
+
 fn parseBool(raw: []const u8) !bool {
     if (std.mem.eql(u8, raw, "true") or std.mem.eql(u8, raw, "1")) return true;
     if (std.mem.eql(u8, raw, "false") or std.mem.eql(u8, raw, "0")) return false;
@@ -749,6 +802,159 @@ fn parseLane(raw: []const u8) !Lane {
     if (std.mem.eql(u8, raw, "fixer")) return .fixer;
     if (std.mem.eql(u8, raw, "integrator")) return .integrator;
     return error.InvalidLane;
+}
+
+fn parseTruthy(raw: []const u8) bool {
+    return std.mem.eql(u8, raw, "true") or
+        std.mem.eql(u8, raw, "1") or
+        std.mem.eql(u8, raw, "yes") or
+        std.mem.eql(u8, raw, "y") or
+        std.mem.eql(u8, raw, "on");
+}
+
+fn evaluateRunCsvFloor(
+    configured_concurrency: usize,
+    runnable_units: usize,
+    floor_threshold: usize,
+) RunCsvFloorDecision {
+    const effective_peak = @min(configured_concurrency, runnable_units);
+    const applicable = runnable_units >= floor_threshold;
+    const result = if (!applicable)
+        "not_applicable"
+    else if (effective_peak >= floor_threshold)
+        "pass"
+    else
+        "fail";
+    return .{
+        .effective_peak = effective_peak,
+        .applicable = applicable,
+        .result = result,
+    };
+}
+
+fn hasAnyDepToken(raw: []const u8) bool {
+    var i: usize = 0;
+    while (i < raw.len) {
+        while (i < raw.len and (raw[i] == ',' or raw[i] == ';' or raw[i] == ' ' or raw[i] == '\t' or raw[i] == '\r')) : (i += 1) {}
+        if (i >= raw.len) break;
+        var j = i;
+        while (j < raw.len and raw[j] != ',' and raw[j] != ';') : (j += 1) {}
+        const token = std.mem.trim(u8, raw[i..j], " \t\r");
+        if (token.len > 0) return true;
+        i = if (j < raw.len) j + 1 else j;
+    }
+    return false;
+}
+
+fn forEachDepToken(raw: []const u8, context: anytype, comptime cb: fn (@TypeOf(context), []const u8) anyerror!void) !void {
+    var i: usize = 0;
+    while (i < raw.len) {
+        while (i < raw.len and (raw[i] == ',' or raw[i] == ';' or raw[i] == ' ' or raw[i] == '\t' or raw[i] == '\r')) : (i += 1) {}
+        if (i >= raw.len) break;
+        var j = i;
+        while (j < raw.len and raw[j] != ',' and raw[j] != ';') : (j += 1) {}
+        const token = std.mem.trim(u8, raw[i..j], " \t\r");
+        if (token.len > 0) try cb(context, token);
+        i = if (j < raw.len) j + 1 else j;
+    }
+}
+
+fn validateDepsCsvPath(allocator: std.mem.Allocator, deps_csv_path: []const u8) !void {
+    const bytes = try std.fs.cwd().readFileAlloc(allocator, deps_csv_path, 16 * 1024 * 1024);
+    defer allocator.free(bytes);
+    try validateDepsCsvBytes(allocator, bytes);
+}
+
+fn validateDepsCsvBytes(allocator: std.mem.Allocator, bytes: []const u8) !void {
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    const header_line = lines.next() orelse return error.EmptyDepsCsv;
+    const headers = try parseHeaderColumns(allocator, header_line);
+    defer allocator.free(headers);
+
+    const id_index = findHeaderIndex(headers, "id") orelse return error.MissingDepsIdHeader;
+    const depends_on_index = findHeaderIndex(headers, "depends_on");
+    const interactive_lead_index = findHeaderIndex(headers, "interactive_lead");
+
+    var rows: std.ArrayList(DepRow) = .empty;
+    defer rows.deinit(allocator);
+
+    var id_to_index = std.StringHashMap(usize).init(allocator);
+    defer id_to_index.deinit();
+
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+
+        const id = nthCsvField(trimmed, id_index) orelse "";
+        if (id.len == 0) return error.MissingDepsIdValue;
+        if (id_to_index.contains(id)) return error.DuplicateDepsId;
+
+        const deps_raw = if (depends_on_index) |idx| (nthCsvField(trimmed, idx) orelse "") else "";
+        const interactive_raw = if (interactive_lead_index) |idx| (nthCsvField(trimmed, idx) orelse "") else "";
+        const interactive = parseTruthy(interactive_raw);
+
+        if (interactive and hasAnyDepToken(deps_raw)) {
+            return error.InteractiveLeadBlockedByDeps;
+        }
+
+        try rows.append(allocator, .{
+            .id = id,
+            .deps_raw = deps_raw,
+            .interactive_lead = interactive,
+        });
+        try id_to_index.put(id, rows.items.len - 1);
+    }
+
+    for (rows.items) |row| {
+        const Ctx = struct {
+            map: *std.StringHashMap(usize),
+            pub fn check(self: @This(), token: []const u8) !void {
+                if (!self.map.contains(token)) return error.UnknownDependencyId;
+            }
+        };
+        const ctx = Ctx{ .map = &id_to_index };
+        try forEachDepToken(row.deps_raw, ctx, Ctx.check);
+    }
+
+    const visit_state = try allocator.alloc(u8, rows.items.len);
+    defer allocator.free(visit_state);
+    @memset(visit_state, 0);
+
+    const Dfs = struct {
+        rows: []const DepRow,
+        map: *std.StringHashMap(usize),
+        state: []u8,
+        fn visit(self: *@This(), idx: usize) !void {
+            if (self.state[idx] == 2) return;
+            if (self.state[idx] == 1) return error.DependencyCycleDetected;
+            self.state[idx] = 1;
+
+            var i: usize = 0;
+            const deps_raw = self.rows[idx].deps_raw;
+            while (i < deps_raw.len) {
+                while (i < deps_raw.len and (deps_raw[i] == ',' or deps_raw[i] == ';' or deps_raw[i] == ' ' or deps_raw[i] == '\t' or deps_raw[i] == '\r')) : (i += 1) {}
+                if (i >= deps_raw.len) break;
+                var j = i;
+                while (j < deps_raw.len and deps_raw[j] != ',' and deps_raw[j] != ';') : (j += 1) {}
+                const token = std.mem.trim(u8, deps_raw[i..j], " \t\r");
+                if (token.len > 0) {
+                    const next_idx = self.map.get(token) orelse return error.UnknownDependencyId;
+                    try self.visit(next_idx);
+                }
+                i = if (j < deps_raw.len) j + 1 else j;
+            }
+            self.state[idx] = 2;
+        }
+    };
+
+    var dfs = Dfs{
+        .rows = rows.items,
+        .map = &id_to_index,
+        .state = visit_state,
+    };
+    for (rows.items, 0..) |_, idx| {
+        try dfs.visit(idx);
+    }
 }
 
 fn parsePlanSteps(allocator: std.mem.Allocator, json_bytes: []const u8) ![]PlanStep {
@@ -1192,6 +1398,61 @@ test "hasRequiredHeaders validates required set" {
 test "pathsAreDistinct rejects identical path" {
     try std.testing.expect(!pathsAreDistinct(std.testing.allocator, "./tmp/a.csv", "./tmp/a.csv"));
     try std.testing.expect(pathsAreDistinct(std.testing.allocator, "./tmp/a.csv", "./tmp/b.csv"));
+}
+
+test "evaluateRunCsvFloor returns pass fail and not_applicable" {
+    const pass = evaluateRunCsvFloor(5, 5, 3);
+    try std.testing.expect(pass.applicable);
+    try std.testing.expectEqual(@as(usize, 5), pass.effective_peak);
+    try std.testing.expectEqualStrings("pass", pass.result);
+
+    const fail = evaluateRunCsvFloor(2, 4, 3);
+    try std.testing.expect(fail.applicable);
+    try std.testing.expectEqual(@as(usize, 2), fail.effective_peak);
+    try std.testing.expectEqualStrings("fail", fail.result);
+
+    const na = evaluateRunCsvFloor(8, 2, 3);
+    try std.testing.expect(!na.applicable);
+    try std.testing.expectEqual(@as(usize, 2), na.effective_peak);
+    try std.testing.expectEqualStrings("not_applicable", na.result);
+}
+
+test "validateDepsCsvBytes enforces deadlock guards" {
+    const valid =
+        \\id,depends_on,interactive_lead
+        \\u1,,true
+        \\u2,u1,false
+    ;
+    try validateDepsCsvBytes(std.testing.allocator, valid);
+
+    const interactive_blocked =
+        \\id,depends_on,interactive_lead
+        \\u1,u2,true
+        \\u2,,false
+    ;
+    try std.testing.expectError(
+        error.InteractiveLeadBlockedByDeps,
+        validateDepsCsvBytes(std.testing.allocator, interactive_blocked),
+    );
+
+    const unknown_dep =
+        \\id,depends_on,interactive_lead
+        \\u1,u_missing,false
+    ;
+    try std.testing.expectError(
+        error.UnknownDependencyId,
+        validateDepsCsvBytes(std.testing.allocator, unknown_dep),
+    );
+
+    const cycle =
+        \\id,depends_on,interactive_lead
+        \\u1,u2,false
+        \\u2,u1,false
+    ;
+    try std.testing.expectError(
+        error.DependencyCycleDetected,
+        validateDepsCsvBytes(std.testing.allocator, cycle),
+    );
 }
 
 fn fuzzBudgetDecisionTarget(_: void, input: []const u8) !void {

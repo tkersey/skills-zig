@@ -4,6 +4,7 @@ Zig CLI for plan-driven streaming orchestration helpers (`budget`, `plan_sync`, 
 
 Lane support includes `coder`, `reducer`, `locksmith`, `applier`, `prover`, `fixer`, and `integrator`.
 `run_csv` now validates streaming contract headers (`write_scope`, `risk_tier`, `lane`, `base_sha`) and prepares a v2 output skeleton.
+It also supports hard preflight gates for concurrency floor and dependency deadlock checks.
 
 ## Build
 
@@ -43,4 +44,25 @@ zig build run-mesh -- wave \
 zig build run-mesh -- run_csv \
   --csv-path .mesh/batch-reducer.csv \
   --output-csv-path .mesh/batch-reducer-out.csv
+
+# Enforce floor gate (fails non-zero when applicable and peak < threshold)
+zig build run-mesh -- run_csv \
+  --csv-path .mesh/batch-reducer.csv \
+  --output-csv-path .mesh/batch-reducer-out.csv \
+  --max-concurrency 6 \
+  --runnable-units 6 \
+  --floor-threshold 3 \
+  --fail-on-floor
+
+# Optional deadlock preflight over dependency CSV
+zig build run-mesh -- run_csv \
+  --csv-path .mesh/batch-reducer.csv \
+  --output-csv-path .mesh/batch-reducer-out.csv \
+  --deps-csv .mesh/wave-deps.csv
 ```
+
+`run_csv` response now includes:
+- `spawn_substrate`, `mesh_truth_verdict`
+- `max_concurrency`, `runnable_units`, `effective_peak`
+- `floor_threshold`, `floor_applicable`, `floor_result`
+- `deps_check_status` (`pass` or `skipped`)
