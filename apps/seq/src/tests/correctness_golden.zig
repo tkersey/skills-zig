@@ -115,3 +115,75 @@ test "golden routing-gap json" {
 
     try std.testing.expectEqualStrings(expected, got);
 }
+
+test "golden opencode-prompts jsonl" {
+    const args = [_][]const u8{
+        "--source",
+        "jsonl",
+        "--opencode-path",
+        "testdata/golden/opencode/prompt-history.jsonl",
+        "--select",
+        "source_kind,source_record_index,prompt_text,mode,parts_count,text_parts_count,file_parts_count,part_types,file_paths",
+        "--format",
+        "jsonl",
+    };
+
+    const got = try runAndReadOutput(std.testing.allocator, .opencode_prompts, args[0..], ".zig-cache/golden-opencode-prompts.jsonl");
+    defer std.testing.allocator.free(got);
+
+    const expected = try readExpected(std.testing.allocator, "testdata/golden/expected/opencode-prompts.jsonl");
+    defer std.testing.allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, got);
+}
+
+test "golden query opencode-prompts jsonl" {
+    const args = [_][]const u8{
+        "--spec",
+        "@testdata/golden/query-opencode-prompts.json",
+    };
+
+    const got = try runAndReadOutput(std.testing.allocator, .query, args[0..], ".zig-cache/golden-query-opencode-prompts.jsonl");
+    defer std.testing.allocator.free(got);
+
+    const expected = try readExpected(std.testing.allocator, "testdata/golden/expected/query-opencode-prompts.jsonl");
+    defer std.testing.allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, got);
+}
+
+test "golden opencode-events jsonl" {
+    const args = [_][]const u8{
+        "--source",
+        "jsonl",
+        "--opencode-path",
+        "testdata/golden/opencode/prompt-history.jsonl",
+        "--select",
+        "source_kind,source_record_index,event_index,role,mode,part_type,text,text_len,filename",
+        "--format",
+        "jsonl",
+    };
+
+    const got = try runAndReadOutput(std.testing.allocator, .opencode_events, args[0..], ".zig-cache/golden-opencode-events.jsonl");
+    defer std.testing.allocator.free(got);
+
+    const expected = try readExpected(std.testing.allocator, "testdata/golden/expected/opencode-events.jsonl");
+    defer std.testing.allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, got);
+}
+
+test "golden query opencode-events jsonl" {
+    const args = [_][]const u8{
+        "--spec",
+        "@testdata/golden/query-opencode-events.json",
+    };
+
+    const got = try runAndReadOutput(std.testing.allocator, .query, args[0..], ".zig-cache/golden-query-opencode-events.jsonl");
+    defer std.testing.allocator.free(got);
+
+    const expected = try readExpected(std.testing.allocator, "testdata/golden/expected/query-opencode-events.jsonl");
+    defer std.testing.allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, got);
+}

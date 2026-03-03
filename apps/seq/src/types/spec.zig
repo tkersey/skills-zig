@@ -92,14 +92,27 @@ pub const SortSpec = struct {
     descending: bool = false,
 };
 
+pub const ParamSpec = struct {
+    key: []const u8,
+    value: Scalar,
+};
+
 pub const QuerySpec = struct {
     where: []const WhereClause = &.{},
     group_by: []const []const u8 = &.{},
     metrics: []const MetricSpec = &.{},
     select: []const []const u8 = &.{},
     sort: []const SortSpec = &.{},
+    params: []const ParamSpec = &.{},
     limit: usize = 0,
 };
+
+pub fn paramValue(params: []const ParamSpec, key: []const u8) ?Scalar {
+    for (params) |entry| {
+        if (std.mem.eql(u8, entry.key, key)) return entry.value;
+    }
+    return null;
+}
 
 pub fn metricAlias(allocator: std.mem.Allocator, metric: MetricSpec) ![]const u8 {
     if (metric.alias) |name| return name;
@@ -127,6 +140,7 @@ pub fn parseQuerySpecValue(allocator: std.mem.Allocator, value: std.json.Value) 
     const metrics = try parseMetrics(allocator, root.get("metrics"));
     const select = try parseStringList(allocator, root.get("select"));
     const sort = try parseSort(allocator, root.get("sort"));
+    const params = try parseParams(allocator, root.get("params"));
     const limit = try parseLimit(root.get("limit"));
 
     return .{
@@ -135,6 +149,7 @@ pub fn parseQuerySpecValue(allocator: std.mem.Allocator, value: std.json.Value) 
         .metrics = metrics,
         .select = select,
         .sort = sort,
+        .params = params,
         .limit = limit,
     };
 }
@@ -277,6 +292,27 @@ fn parseSortEntry(allocator: std.mem.Allocator, entry: []const u8) !SortSpec {
     };
 }
 
+fn parseParams(allocator: std.mem.Allocator, value_opt: ?std.json.Value) ![]const ParamSpec {
+    const value = value_opt orelse return &.{};
+    const obj = switch (value) {
+        .object => |entries| entries,
+        else => return error.InvalidParams,
+    };
+
+    var out: std.ArrayList(ParamSpec) = .empty;
+    defer out.deinit(allocator);
+
+    var it = obj.iterator();
+    while (it.next()) |entry| {
+        try out.append(allocator, .{
+            .key = try dupString(allocator, entry.key_ptr.*),
+            .value = try parseScalar(allocator, entry.value_ptr.*),
+        });
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
 fn parseLimit(value_opt: ?std.json.Value) !usize {
     const value = value_opt orelse return 0;
     return switch (value) {
@@ -400,4 +436,27 @@ test "parse where supports contains_any and regex_any operators" {
     try std.testing.expectEqual(WhereOp.contains_any, query.where[0].op);
     try std.testing.expectEqual(WhereOp.regex_any, query.where[1].op);
     try std.testing.expect(query.where[1].case_insensitive);
+}
+
+test "parse query spec json supports params" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const query = try parseQuerySpecJson(arena.allocator(),
+        \\{
+        \\  "dataset": "memory_files",
+        \\  "params": {
+        \\    "memory_root": "~/tmp/mem",
+        \\    "include_preview": true
+        \\  }
+        \\}
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), query.params.len);
+    const memory_root = paramValue(query.params, "memory_root") orelse return error.TestExpectedEqual;
+    const include_preview = paramValue(query.params, "include_preview") orelse return error.TestExpectedEqual;
+    try std.testing.expect(memory_root == .string);
+    try std.testing.expectEqualStrings("~/tmp/mem", memory_root.string);
+    try std.testing.expect(include_preview == .bool);
+    try std.testing.expect(include_preview.bool);
 }

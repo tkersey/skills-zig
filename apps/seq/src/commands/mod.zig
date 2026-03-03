@@ -95,6 +95,73 @@ pub const dataset_meta = [_]DatasetMeta{
         .description = "File-based memories under ~/.codex/memories",
         .fields = &.{ "path", "relative_path", "name", "category", "extension", "size_bytes", "modified_at", "preview" },
     },
+    .{
+        .name = "opencode_prompts",
+        .description = "Prompt rows mined from Opencode DB (with JSONL fallback)",
+        .fields = &.{
+            "source_kind",
+            "source_path",
+            "source_record_index",
+            "session_id",
+            "session_slug",
+            "session_directory",
+            "message_id",
+            "message_parent_id",
+            "role",
+            "mode",
+            "prompt_text",
+            "prompt_len",
+            "prompt_from_summary",
+            "prompt_truncated",
+            "parts_count",
+            "text_parts_count",
+            "file_parts_count",
+            "part_types",
+            "file_paths",
+            "time_created_epoch_ms",
+            "time_created_iso",
+            "time_updated_epoch_ms",
+            "time_updated_iso",
+            "raw_message_json",
+            "raw_parts_json",
+        },
+    },
+    .{
+        .name = "opencode_events",
+        .description = "Message/part event rows mined from Opencode DB (with JSONL fallback)",
+        .fields = &.{
+            "source_kind",
+            "source_path",
+            "source_record_index",
+            "session_id",
+            "session_slug",
+            "session_directory",
+            "message_id",
+            "message_parent_id",
+            "part_id",
+            "event_index",
+            "role",
+            "mode",
+            "agent",
+            "model_id",
+            "provider_id",
+            "part_type",
+            "tool_name",
+            "tool_status",
+            "call_id",
+            "text",
+            "text_len",
+            "filename",
+            "file_path",
+            "mime",
+            "time_created_epoch_ms",
+            "time_created_iso",
+            "time_updated_epoch_ms",
+            "time_updated_iso",
+            "raw_message_json",
+            "raw_part_json",
+        },
+    },
 };
 
 const Options = struct {
@@ -112,6 +179,21 @@ const Options = struct {
     skill: ?[]const u8 = null,
     bucket: ?[]const u8 = null,
     prompt: ?[]const u8 = null,
+    contains: ?[]const u8 = null,
+    regex: ?[]const u8 = null,
+    role: ?[]const u8 = null,
+    tool: ?[]const u8 = null,
+    status: ?[]const u8 = null,
+    mode: ?[]const u8 = null,
+    part_type: ?[]const u8 = null,
+    select_text: ?[]const u8 = null,
+    sort_text: ?[]const u8 = null,
+    group_by_text: ?[]const u8 = null,
+    metric_text: ?[]const u8 = null,
+    opencode_db_path: ?[]const u8 = null,
+    opencode_path: ?[]const u8 = null,
+    opencode_source_text: ?[]const u8 = null,
+    include_raw: bool = false,
     sections: ?[]const u8 = null,
     cue_spec_text: ?[]const u8 = null,
     discovery_skills: ?[]const u8 = null,
@@ -150,6 +232,8 @@ pub fn run(
         .datasets => try cmdDatasets(allocator, opts),
         .dataset_schema => try cmdDatasetSchema(allocator, opts),
         .query => try cmdQuery(allocator, sessions_root, opts),
+        .opencode_prompts => try cmdOpencodePrompts(allocator, sessions_root, opts),
+        .opencode_events => try cmdOpencodeEvents(allocator, sessions_root, opts),
         .unknown => return error.InvalidCommand,
     }
 }
@@ -160,12 +244,11 @@ fn printCommandHelp(cmd: lib.Command) !void {
 
     const common =
         \\shared options:
-        \\  --root <path>
-        \\  --roles <csv>
-        \\  --since <iso-ts>
-        \\  --until <iso-ts>
+        \\  --format <table|json|csv|jsonl>
+        \\  --root <path> (session datasets)
+        \\  --path <path> (single-session/rollout modes)
         \\  --output <path>
-        \\  --skills-dir <path> (repeatable)
+        \\  --limit|--max|--top <N>
     ;
 
     const body = switch (cmd) {
@@ -214,6 +297,12 @@ fn printCommandHelp(cmd: lib.Command) !void {
         .query =>
         \\usage: seq query --spec <json|@path>
         ,
+        .opencode_prompts =>
+        \\usage: seq opencode-prompts [--spec <json|@path>] [--contains <text>] [--regex <expr>] [--mode <name>] [--part-type <name>] [--group-by <csv>] [--metric <csv>] [--select <csv>] [--sort <csv>] [--source auto|db|jsonl] [--opencode-db-path <path>] [--opencode-path <path>] [--include-raw] [--limit N] [--format table|json|csv|jsonl]
+        ,
+        .opencode_events =>
+        \\usage: seq opencode-events [--spec <json|@path>] [--contains <text>] [--regex <expr>] [--role <name>] [--mode <name>] [--part-type <name>] [--tool <name>] [--status <name>] [--group-by <csv>] [--metric <csv>] [--select <csv>] [--sort <csv>] [--source auto|db|jsonl] [--opencode-db-path <path>] [--opencode-path <path>] [--include-raw] [--limit N] [--format table|json|csv|jsonl]
+        ,
         .unknown =>
         \\usage: seq <command> --help
         ,
@@ -233,7 +322,7 @@ fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
         .occurrence_export => {
             if (fmt == .table) return error.InvalidFormatForCommand;
         },
-        .orchestration_concurrency, .find_session, .session_prompts, .query, .token_usage, .routing_gap => {},
+        .orchestration_concurrency, .find_session, .session_prompts, .query, .token_usage, .routing_gap, .opencode_prompts, .opencode_events => {},
         .unknown => return error.InvalidCommand,
     }
 }
@@ -309,7 +398,107 @@ fn cmdQuery(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Optio
         break :blk if (query_spec.group_by.len > 0) output.Format.table else output.Format.jsonl;
     };
 
-    var rows = try collectDatasetRows(allocator, dataset_name, sessions_root);
+    var rows = try collectDatasetRows(allocator, dataset_name, sessions_root, query_spec.params);
+    defer deinitQueryRows(allocator, &rows);
+
+    var result = try query.execute(allocator, rows.items, query_spec);
+    defer result.deinit(allocator);
+
+    const cols_opt: ?[]const []const u8 = if (query_spec.select.len > 0) query_spec.select else null;
+    try output.writeOutput(allocator, fmt, result.rows.items, cols_opt, opts.out_path);
+}
+
+fn cmdOpencodePrompts(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var query_spec = spec.QuerySpec{};
+    var fmt: output.Format = if (opts.format_set) opts.format else output.Format.jsonl;
+
+    if (opts.spec_text) |raw_spec| {
+        const spec_text = try loadSpecText(allocator, raw_spec);
+        defer allocator.free(spec_text);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), spec_text, .{});
+        defer parsed.deinit();
+
+        query_spec = try spec.parseQuerySpecValue(arena.allocator(), parsed.value);
+        const root_obj = switch (parsed.value) {
+            .object => |obj| obj,
+            else => return error.InvalidSpec,
+        };
+        if (root_obj.get("dataset")) |dataset_value| switch (dataset_value) {
+            .string => |dataset_name| {
+                if (!std.mem.eql(u8, dataset_name, "opencode_prompts")) return error.InvalidDatasetArg;
+            },
+            else => return error.InvalidSpec,
+        };
+        if (!opts.format_set) {
+            if (root_obj.get("format")) |fmt_value| switch (fmt_value) {
+                .string => |text| fmt = try output.Format.parse(text),
+                else => return error.InvalidSpec,
+            } else {
+                fmt = if (query_spec.group_by.len > 0) output.Format.table else output.Format.jsonl;
+            }
+        }
+    } else if (!opts.format_set) {
+        fmt = output.Format.jsonl;
+    }
+
+    query_spec = try applyOpencodePromptConvenienceFilters(arena.allocator(), query_spec, opts);
+    query_spec.params = try mergeOpencodeParams(arena.allocator(), query_spec.params, opts);
+
+    var rows = try collectDatasetRows(allocator, "opencode_prompts", sessions_root, query_spec.params);
+    defer deinitQueryRows(allocator, &rows);
+
+    var result = try query.execute(allocator, rows.items, query_spec);
+    defer result.deinit(allocator);
+
+    const cols_opt: ?[]const []const u8 = if (query_spec.select.len > 0) query_spec.select else null;
+    try output.writeOutput(allocator, fmt, result.rows.items, cols_opt, opts.out_path);
+}
+
+fn cmdOpencodeEvents(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var query_spec = spec.QuerySpec{};
+    var fmt: output.Format = if (opts.format_set) opts.format else output.Format.jsonl;
+
+    if (opts.spec_text) |raw_spec| {
+        const spec_text = try loadSpecText(allocator, raw_spec);
+        defer allocator.free(spec_text);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), spec_text, .{});
+        defer parsed.deinit();
+
+        query_spec = try spec.parseQuerySpecValue(arena.allocator(), parsed.value);
+        const root_obj = switch (parsed.value) {
+            .object => |obj| obj,
+            else => return error.InvalidSpec,
+        };
+        if (root_obj.get("dataset")) |dataset_value| switch (dataset_value) {
+            .string => |dataset_name| {
+                if (!std.mem.eql(u8, dataset_name, "opencode_events")) return error.InvalidDatasetArg;
+            },
+            else => return error.InvalidSpec,
+        };
+        if (!opts.format_set) {
+            if (root_obj.get("format")) |fmt_value| switch (fmt_value) {
+                .string => |text| fmt = try output.Format.parse(text),
+                else => return error.InvalidSpec,
+            } else {
+                fmt = if (query_spec.group_by.len > 0) output.Format.table else output.Format.jsonl;
+            }
+        }
+    } else if (!opts.format_set) {
+        fmt = output.Format.jsonl;
+    }
+
+    query_spec = try applyOpencodeEventConvenienceFilters(arena.allocator(), query_spec, opts);
+    query_spec.params = try mergeOpencodeParams(arena.allocator(), query_spec.params, opts);
+
+    var rows = try collectDatasetRows(allocator, "opencode_events", sessions_root, query_spec.params);
     defer deinitQueryRows(allocator, &rows);
 
     var result = try query.execute(allocator, rows.items, query_spec);
@@ -343,7 +532,7 @@ fn cmdSkillTrend(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
         .sort = &.{.{ .field = bucket, .descending = false }},
     };
 
-    var rows = try collectDatasetRows(allocator, "skill_mentions", sessions_root);
+    var rows = try collectDatasetRows(allocator, "skill_mentions", sessions_root, &.{});
     defer deinitQueryRows(allocator, &rows);
 
     var result = try query.execute(allocator, rows.items, query_spec);
@@ -393,7 +582,7 @@ fn cmdRoleBreakdown(allocator: std.mem.Allocator, sessions_root: []const u8, opt
         .metrics = &.{.{ .op = .count, .alias = "count" }},
     };
 
-    var occ_rows = try collectDatasetRows(allocator, "skill_mentions", sessions_root);
+    var occ_rows = try collectDatasetRows(allocator, "skill_mentions", sessions_root, &.{});
     defer deinitQueryRows(allocator, &occ_rows);
 
     var grouped = try query.execute(allocator, occ_rows.items, query_spec);
@@ -996,7 +1185,7 @@ fn cmdReportBundle(allocator: std.mem.Allocator, sessions_root: []const u8, opts
 }
 
 fn cmdSectionAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
-    var rows = try collectDatasetRows(allocator, "messages", sessions_root);
+    var rows = try collectDatasetRows(allocator, "messages", sessions_root, &.{});
     defer deinitQueryRows(allocator, &rows);
 
     const select = [_][]const u8{ "role", "text" };
@@ -1059,7 +1248,7 @@ fn cmdRoutingGap(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
     var discovery_skills = try parseDiscoverySkills(allocator, opts.discovery_skills);
     defer deinitStringSet(allocator, &discovery_skills);
 
-    var skill_rows = try collectDatasetRows(allocator, "skill_mentions", sessions_root);
+    var skill_rows = try collectDatasetRows(allocator, "skill_mentions", sessions_root, &.{});
     defer deinitQueryRows(allocator, &skill_rows);
 
     var invoked_sessions: std.StringHashMap(void) = .init(allocator);
@@ -1073,7 +1262,7 @@ fn cmdRoutingGap(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
         try addToStringSet(allocator, &invoked_sessions, path.string);
     }
 
-    var message_rows = try collectDatasetRows(allocator, "messages", sessions_root);
+    var message_rows = try collectDatasetRows(allocator, "messages", sessions_root, &.{});
     defer deinitQueryRows(allocator, &message_rows);
 
     var out_rows: std.ArrayList(query.Row) = .empty;
@@ -1298,7 +1487,7 @@ fn runDatasetQuery(
     out_path: ?[]const u8,
     columns_opt: ?[]const []const u8,
 ) !void {
-    var rows = try collectDatasetRows(allocator, dataset_name, sessions_root);
+    var rows = try collectDatasetRows(allocator, dataset_name, sessions_root, query_spec.params);
     defer deinitQueryRows(allocator, &rows);
 
     var result = try query.execute(allocator, rows.items, query_spec);
@@ -1312,6 +1501,7 @@ fn collectDatasetRows(
     allocator: std.mem.Allocator,
     dataset_name: []const u8,
     sessions_root: []const u8,
+    query_params: []const spec.ParamSpec,
 ) !std.ArrayList(query.Row) {
     var rows: std.ArrayList(query.Row) = .empty;
     errdefer deinitQueryRows(allocator, &rows);
@@ -1329,7 +1519,11 @@ fn collectDatasetRows(
     } else if (std.mem.eql(u8, dataset_name, "tool_calls")) {
         try collectToolCallsRows(allocator, sessions_root, &rows);
     } else if (std.mem.eql(u8, dataset_name, "memory_files")) {
-        try collectMemoryFilesRows(allocator, &rows);
+        try collectMemoryFilesRows(allocator, query_params, &rows);
+    } else if (std.mem.eql(u8, dataset_name, "opencode_prompts")) {
+        try collectOpencodePromptRows(allocator, query_params, &rows);
+    } else if (std.mem.eql(u8, dataset_name, "opencode_events")) {
+        try collectOpencodeEventRows(allocator, query_params, &rows);
     } else {
         return error.UnknownDataset;
     }
@@ -1537,9 +1731,18 @@ fn collectToolCallsRows(
 
 fn collectMemoryFilesRows(
     allocator: std.mem.Allocator,
+    query_params: []const spec.ParamSpec,
     out_rows: *std.ArrayList(query.Row),
 ) !void {
-    var parsed = try datasets.memory_files.collect(allocator, .{});
+    var options = datasets.memory_files.Options{};
+    if (paramString(query_params, "memory_root")) |memory_root| {
+        options.memory_root = memory_root;
+    }
+    if (paramBool(query_params, "include_preview")) |include_preview| {
+        options.include_preview = include_preview;
+    }
+
+    var parsed = try datasets.memory_files.collect(allocator, options);
     defer datasets.memory_files.deinitRows(allocator, &parsed);
 
     for (parsed.items) |row| {
@@ -1552,6 +1755,124 @@ fn collectMemoryFilesRows(
         try qrow.putOwnedKey("size_bytes", .{ .int = @intCast(row.size_bytes) });
         try qrow.putOwnedKey("modified_at", .{ .string = row.modified_at });
         try putOptionalString(&qrow, "preview", row.preview);
+        try out_rows.append(allocator, qrow);
+    }
+}
+
+fn collectOpencodePromptRows(
+    allocator: std.mem.Allocator,
+    query_params: []const spec.ParamSpec,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    var options = datasets.opencode_prompts.Options{};
+    if (paramString(query_params, "opencode_db_path")) |opencode_db_path| {
+        options.opencode_db_path = opencode_db_path;
+    }
+    if (paramString(query_params, "opencode_path")) |opencode_path| {
+        options.opencode_path = opencode_path;
+    }
+    if (paramString(query_params, "source")) |source_text| {
+        options.source = try datasets.opencode_sqlite.Source.parse(source_text);
+    }
+    if (paramBool(query_params, "include_raw")) |include_raw| {
+        options.include_raw = include_raw;
+    }
+    if (paramBool(query_params, "include_summary_fallback")) |include_summary_fallback| {
+        options.include_summary_fallback = include_summary_fallback;
+    }
+
+    var parsed = try datasets.opencode_prompts.collect(allocator, options);
+    defer datasets.opencode_prompts.deinitRows(allocator, &parsed);
+
+    for (parsed.items) |row| {
+        var qrow = query.Row.init(allocator);
+        try qrow.putOwnedKey("source_kind", .{ .string = row.source_kind });
+        try qrow.putOwnedKey("source_path", .{ .string = row.source_path });
+        try qrow.putOwnedKey("source_record_index", .{ .int = row.source_record_index });
+        try putOptionalString(&qrow, "session_id", row.session_id);
+        try putOptionalString(&qrow, "session_slug", row.session_slug);
+        try putOptionalString(&qrow, "session_directory", row.session_directory);
+        try putOptionalString(&qrow, "message_id", row.message_id);
+        try putOptionalString(&qrow, "message_parent_id", row.message_parent_id);
+        try qrow.putOwnedKey("role", .{ .string = row.role });
+        try putOptionalString(&qrow, "mode", row.mode);
+        try qrow.putOwnedKey("prompt_text", .{ .string = row.prompt_text });
+        try qrow.putOwnedKey("prompt_len", .{ .int = @intCast(row.prompt_len) });
+        try qrow.putOwnedKey("prompt_from_summary", .{ .bool = row.prompt_from_summary });
+        try qrow.putOwnedKey("prompt_truncated", .{ .bool = row.prompt_truncated });
+        try qrow.putOwnedKey("parts_count", .{ .int = @intCast(row.parts_count) });
+        try qrow.putOwnedKey("text_parts_count", .{ .int = @intCast(row.text_parts_count) });
+        try qrow.putOwnedKey("file_parts_count", .{ .int = @intCast(row.file_parts_count) });
+        try qrow.putOwnedKey("part_types", .{ .string = row.part_types });
+        try qrow.putOwnedKey("file_paths", .{ .string = row.file_paths });
+        try putOptionalInt(&qrow, "time_created_epoch_ms", row.time_created_epoch_ms);
+        try putOptionalString(&qrow, "time_created_iso", row.time_created_iso);
+        try putOptionalInt(&qrow, "time_updated_epoch_ms", row.time_updated_epoch_ms);
+        try putOptionalString(&qrow, "time_updated_iso", row.time_updated_iso);
+        try putOptionalString(&qrow, "raw_message_json", row.raw_message_json);
+        try putOptionalString(&qrow, "raw_parts_json", row.raw_parts_json);
+        try out_rows.append(allocator, qrow);
+    }
+}
+
+fn collectOpencodeEventRows(
+    allocator: std.mem.Allocator,
+    query_params: []const spec.ParamSpec,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    var options = datasets.opencode_events.Options{};
+    if (paramString(query_params, "opencode_db_path")) |opencode_db_path| {
+        options.opencode_db_path = opencode_db_path;
+    }
+    if (paramString(query_params, "opencode_path")) |opencode_path| {
+        options.opencode_path = opencode_path;
+    }
+    if (paramString(query_params, "source")) |source_text| {
+        options.source = try datasets.opencode_sqlite.Source.parse(source_text);
+    }
+    if (paramBool(query_params, "include_raw")) |include_raw| {
+        options.include_raw = include_raw;
+    }
+
+    var parsed = try datasets.opencode_events.collect(allocator, options);
+    defer datasets.opencode_events.deinitRows(allocator, &parsed);
+
+    for (parsed.items) |row| {
+        var qrow = query.Row.init(allocator);
+        try qrow.putOwnedKey("source_kind", .{ .string = row.source_kind });
+        try qrow.putOwnedKey("source_path", .{ .string = row.source_path });
+        try qrow.putOwnedKey("source_record_index", .{ .int = row.source_record_index });
+        try putOptionalString(&qrow, "session_id", row.session_id);
+        try putOptionalString(&qrow, "session_slug", row.session_slug);
+        try putOptionalString(&qrow, "session_directory", row.session_directory);
+        try putOptionalString(&qrow, "message_id", row.message_id);
+        try putOptionalString(&qrow, "message_parent_id", row.message_parent_id);
+        try putOptionalString(&qrow, "part_id", row.part_id);
+        try qrow.putOwnedKey("event_index", .{ .int = row.event_index });
+        try qrow.putOwnedKey("role", .{ .string = row.role });
+        try putOptionalString(&qrow, "mode", row.mode);
+        try putOptionalString(&qrow, "agent", row.agent);
+        try putOptionalString(&qrow, "model_id", row.model_id);
+        try putOptionalString(&qrow, "provider_id", row.provider_id);
+        try putOptionalString(&qrow, "part_type", row.part_type);
+        try putOptionalString(&qrow, "tool_name", row.tool_name);
+        try putOptionalString(&qrow, "tool_status", row.tool_status);
+        try putOptionalString(&qrow, "call_id", row.call_id);
+        try putOptionalString(&qrow, "text", row.text);
+        if (row.text_len) |value| {
+            try qrow.putOwnedKey("text_len", .{ .int = @intCast(value) });
+        } else {
+            try qrow.putOwnedKey("text_len", .null);
+        }
+        try putOptionalString(&qrow, "filename", row.filename);
+        try putOptionalString(&qrow, "file_path", row.file_path);
+        try putOptionalString(&qrow, "mime", row.mime);
+        try putOptionalInt(&qrow, "time_created_epoch_ms", row.time_created_epoch_ms);
+        try putOptionalString(&qrow, "time_created_iso", row.time_created_iso);
+        try putOptionalInt(&qrow, "time_updated_epoch_ms", row.time_updated_epoch_ms);
+        try putOptionalString(&qrow, "time_updated_iso", row.time_updated_iso);
+        try putOptionalString(&qrow, "raw_message_json", row.raw_message_json);
+        try putOptionalString(&qrow, "raw_part_json", row.raw_part_json);
         try out_rows.append(allocator, qrow);
     }
 }
@@ -1578,6 +1899,289 @@ fn scalarAsInt(value: spec.Scalar) ?i64 {
         .float => |v| @intFromFloat(v),
         else => null,
     };
+}
+
+fn paramString(params: []const spec.ParamSpec, key: []const u8) ?[]const u8 {
+    const value = spec.paramValue(params, key) orelse return null;
+    return switch (value) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn paramBool(params: []const spec.ParamSpec, key: []const u8) ?bool {
+    const value = spec.paramValue(params, key) orelse return null;
+    return switch (value) {
+        .bool => |flag| flag,
+        .int => |number| number != 0,
+        .string => |text| blk: {
+            if (std.ascii.eqlIgnoreCase(text, "true") or std.mem.eql(u8, text, "1")) break :blk true;
+            if (std.ascii.eqlIgnoreCase(text, "false") or std.mem.eql(u8, text, "0")) break :blk false;
+            break :blk null;
+        },
+        else => null,
+    };
+}
+
+fn mergeOpencodeParams(
+    allocator: std.mem.Allocator,
+    base_params: []const spec.ParamSpec,
+    opts: Options,
+) ![]const spec.ParamSpec {
+    var out: std.ArrayList(spec.ParamSpec) = .empty;
+    defer out.deinit(allocator);
+
+    for (base_params) |entry| {
+        if (opts.opencode_db_path != null and std.mem.eql(u8, entry.key, "opencode_db_path")) continue;
+        if (opts.opencode_path != null and std.mem.eql(u8, entry.key, "opencode_path")) continue;
+        if (opts.opencode_source_text != null and std.mem.eql(u8, entry.key, "source")) continue;
+        if (opts.include_raw and std.mem.eql(u8, entry.key, "include_raw")) continue;
+        try out.append(allocator, entry);
+    }
+
+    if (opts.opencode_db_path) |path| {
+        try out.append(allocator, .{
+            .key = "opencode_db_path",
+            .value = .{ .string = try allocator.dupe(u8, path) },
+        });
+    }
+    if (opts.opencode_path) |path| {
+        try out.append(allocator, .{
+            .key = "opencode_path",
+            .value = .{ .string = try allocator.dupe(u8, path) },
+        });
+    }
+    if (opts.opencode_source_text) |source| {
+        try out.append(allocator, .{
+            .key = "source",
+            .value = .{ .string = try allocator.dupe(u8, source) },
+        });
+    }
+    if (opts.include_raw) {
+        try out.append(allocator, .{
+            .key = "include_raw",
+            .value = .{ .bool = true },
+        });
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn applyOpencodePromptConvenienceFilters(
+    allocator: std.mem.Allocator,
+    base: spec.QuerySpec,
+    opts: Options,
+) !spec.QuerySpec {
+    var where_out: std.ArrayList(spec.WhereClause) = .empty;
+    defer where_out.deinit(allocator);
+    try where_out.appendSlice(allocator, base.where);
+
+    if (opts.contains) |value| {
+        try where_out.append(allocator, .{
+            .field = "prompt_text",
+            .op = .contains,
+            .value = .{ .scalar = .{ .string = try allocator.dupe(u8, value) } },
+        });
+    }
+    if (opts.regex) |value| {
+        try where_out.append(allocator, .{
+            .field = "prompt_text",
+            .op = .regex,
+            .value = .{ .scalar = .{ .string = try allocator.dupe(u8, value) } },
+        });
+    }
+    if (opts.mode) |value| {
+        try where_out.append(allocator, .{
+            .field = "mode",
+            .op = .eq,
+            .value = .{ .scalar = .{ .string = try allocator.dupe(u8, value) } },
+        });
+    }
+    if (opts.part_type) |value| {
+        try where_out.append(allocator, .{
+            .field = "part_types",
+            .op = .contains,
+            .value = .{ .scalar = .{ .string = try allocator.dupe(u8, value) } },
+        });
+    }
+
+    const group_by_out = if (opts.group_by_text) |csv|
+        try parseCsvStringList(allocator, csv)
+    else
+        base.group_by;
+    const select_out = if (opts.select_text) |csv|
+        try parseCsvStringList(allocator, csv)
+    else
+        base.select;
+    const sort_out = if (opts.sort_text) |csv|
+        try parseCsvSortList(allocator, csv)
+    else
+        base.sort;
+    const metrics_out = if (opts.metric_text) |csv|
+        try parseCsvMetricList(allocator, csv)
+    else
+        base.metrics;
+
+    return .{
+        .where = try where_out.toOwnedSlice(allocator),
+        .group_by = group_by_out,
+        .metrics = metrics_out,
+        .select = select_out,
+        .sort = sort_out,
+        .params = base.params,
+        .limit = if (opts.limit > 0) opts.limit else base.limit,
+    };
+}
+
+fn applyOpencodeEventConvenienceFilters(
+    allocator: std.mem.Allocator,
+    base: spec.QuerySpec,
+    opts: Options,
+) !spec.QuerySpec {
+    var where_out: std.ArrayList(spec.WhereClause) = .empty;
+    defer where_out.deinit(allocator);
+    try where_out.appendSlice(allocator, base.where);
+
+    if (opts.contains) |value| {
+        try where_out.append(allocator, .{
+            .field = "text",
+            .op = .contains,
+            .value = .{ .scalar = .{ .string = try allocator.dupe(u8, value) } },
+        });
+    }
+    if (opts.regex) |value| {
+        try where_out.append(allocator, .{
+            .field = "text",
+            .op = .regex,
+            .value = .{ .scalar = .{ .string = try allocator.dupe(u8, value) } },
+        });
+    }
+    if (opts.role) |value| {
+        try where_out.append(allocator, .{
+            .field = "role",
+            .op = .eq,
+            .value = .{ .scalar = .{ .string = try allocator.dupe(u8, value) } },
+        });
+    }
+    if (opts.mode) |value| {
+        try where_out.append(allocator, .{
+            .field = "mode",
+            .op = .eq,
+            .value = .{ .scalar = .{ .string = try allocator.dupe(u8, value) } },
+        });
+    }
+    if (opts.part_type) |value| {
+        try where_out.append(allocator, .{
+            .field = "part_type",
+            .op = .eq,
+            .value = .{ .scalar = .{ .string = try allocator.dupe(u8, value) } },
+        });
+    }
+    if (opts.tool) |value| {
+        try where_out.append(allocator, .{
+            .field = "tool_name",
+            .op = .eq,
+            .value = .{ .scalar = .{ .string = try allocator.dupe(u8, value) } },
+        });
+    }
+    if (opts.status) |value| {
+        try where_out.append(allocator, .{
+            .field = "tool_status",
+            .op = .eq,
+            .value = .{ .scalar = .{ .string = try allocator.dupe(u8, value) } },
+        });
+    }
+
+    const group_by_out = if (opts.group_by_text) |csv|
+        try parseCsvStringList(allocator, csv)
+    else
+        base.group_by;
+    const select_out = if (opts.select_text) |csv|
+        try parseCsvStringList(allocator, csv)
+    else
+        base.select;
+    const sort_out = if (opts.sort_text) |csv|
+        try parseCsvSortList(allocator, csv)
+    else
+        base.sort;
+    const metrics_out = if (opts.metric_text) |csv|
+        try parseCsvMetricList(allocator, csv)
+    else
+        base.metrics;
+
+    return .{
+        .where = try where_out.toOwnedSlice(allocator),
+        .group_by = group_by_out,
+        .metrics = metrics_out,
+        .select = select_out,
+        .sort = sort_out,
+        .params = base.params,
+        .limit = if (opts.limit > 0) opts.limit else base.limit,
+    };
+}
+
+fn parseCsvStringList(allocator: std.mem.Allocator, raw: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    defer out.deinit(allocator);
+
+    var split = std.mem.splitScalar(u8, raw, ',');
+    while (split.next()) |entry| {
+        const trimmed = std.mem.trim(u8, entry, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        try out.append(allocator, try allocator.dupe(u8, trimmed));
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn parseCsvSortList(allocator: std.mem.Allocator, raw: []const u8) ![]const spec.SortSpec {
+    var out: std.ArrayList(spec.SortSpec) = .empty;
+    defer out.deinit(allocator);
+
+    var split = std.mem.splitScalar(u8, raw, ',');
+    while (split.next()) |entry| {
+        const trimmed = std.mem.trim(u8, entry, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const descending = trimmed[0] == '-';
+        const field = if (descending) trimmed[1..] else trimmed;
+        if (field.len == 0) return error.InvalidSort;
+        try out.append(allocator, .{
+            .field = try allocator.dupe(u8, field),
+            .descending = descending,
+        });
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn parseCsvMetricList(allocator: std.mem.Allocator, raw: []const u8) ![]const spec.MetricSpec {
+    var out: std.ArrayList(spec.MetricSpec) = .empty;
+    defer out.deinit(allocator);
+
+    var split = std.mem.splitScalar(u8, raw, ',');
+    while (split.next()) |entry| {
+        const trimmed = std.mem.trim(u8, entry, " \t\r\n");
+        if (trimmed.len == 0) continue;
+
+        var parts = std.mem.splitScalar(u8, trimmed, ':');
+        const op_text = parts.next() orelse return error.InvalidMetricOp;
+        const field_text = parts.next();
+        const alias_text = parts.next();
+
+        try out.append(allocator, .{
+            .op = try spec.MetricOp.parse(op_text),
+            .field = if (field_text) |field|
+                if (field.len == 0) null else try allocator.dupe(u8, field)
+            else
+                null,
+            .alias = if (alias_text) |alias|
+                if (alias.len == 0) null else try allocator.dupe(u8, alias)
+            else
+                null,
+        });
+    }
+
+    return out.toOwnedSlice(allocator);
 }
 
 fn stdJsonFieldEq(obj: std.json.ObjectMap, key: []const u8, expected: []const u8) bool {
@@ -1723,6 +2327,66 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.prompt = args[i];
+        } else if (std.mem.eql(u8, arg, "--contains")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.contains = args[i];
+        } else if (std.mem.eql(u8, arg, "--regex")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.regex = args[i];
+        } else if (std.mem.eql(u8, arg, "--role")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.role = args[i];
+        } else if (std.mem.eql(u8, arg, "--tool")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.tool = args[i];
+        } else if (std.mem.eql(u8, arg, "--status")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.status = args[i];
+        } else if (std.mem.eql(u8, arg, "--mode")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.mode = args[i];
+        } else if (std.mem.eql(u8, arg, "--part-type")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.part_type = args[i];
+        } else if (std.mem.eql(u8, arg, "--group-by")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.group_by_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--metric")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.metric_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--select")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.select_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--sort")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.sort_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--opencode-db-path")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.opencode_db_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--opencode-path")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.opencode_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--source")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.opencode_source_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--include-raw")) {
+            opts.include_raw = true;
+        } else if (std.mem.eql(u8, arg, "--include-parts")) {
+            opts.include_raw = true;
         } else if (std.mem.eql(u8, arg, "--sections")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -1982,6 +2646,35 @@ test "parse options supports common flags" {
         "@cues.json",
         "--discovery-skills",
         "grill-me,prove-it",
+        "--contains",
+        "needle",
+        "--regex",
+        "^foo",
+        "--role",
+        "assistant",
+        "--tool",
+        "bash",
+        "--status",
+        "completed",
+        "--mode",
+        "normal",
+        "--part-type",
+        "file",
+        "--group-by",
+        "mode",
+        "--metric",
+        "count::count",
+        "--select",
+        "mode,input_len",
+        "--sort",
+        "-count,mode",
+        "--opencode-db-path",
+        "/tmp/opencode.db",
+        "--opencode-path",
+        "/tmp/prompt-history.jsonl",
+        "--source",
+        "db",
+        "--include-raw",
         "--help",
     };
     const opts = try parseOptions(args[0..]);
@@ -1996,5 +2689,20 @@ test "parse options supports common flags" {
     try std.testing.expectEqual(@as(usize, 7), opts.limit);
     try std.testing.expectEqualStrings("@cues.json", opts.cue_spec_text.?);
     try std.testing.expectEqualStrings("grill-me,prove-it", opts.discovery_skills.?);
+    try std.testing.expectEqualStrings("needle", opts.contains.?);
+    try std.testing.expectEqualStrings("^foo", opts.regex.?);
+    try std.testing.expectEqualStrings("assistant", opts.role.?);
+    try std.testing.expectEqualStrings("bash", opts.tool.?);
+    try std.testing.expectEqualStrings("completed", opts.status.?);
+    try std.testing.expectEqualStrings("normal", opts.mode.?);
+    try std.testing.expectEqualStrings("file", opts.part_type.?);
+    try std.testing.expectEqualStrings("mode", opts.group_by_text.?);
+    try std.testing.expectEqualStrings("count::count", opts.metric_text.?);
+    try std.testing.expectEqualStrings("mode,input_len", opts.select_text.?);
+    try std.testing.expectEqualStrings("-count,mode", opts.sort_text.?);
+    try std.testing.expectEqualStrings("/tmp/opencode.db", opts.opencode_db_path.?);
+    try std.testing.expectEqualStrings("/tmp/prompt-history.jsonl", opts.opencode_path.?);
+    try std.testing.expectEqualStrings("db", opts.opencode_source_text.?);
+    try std.testing.expect(opts.include_raw);
     try std.testing.expect(opts.help);
 }

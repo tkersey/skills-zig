@@ -16,6 +16,8 @@ pub const Command = enum {
     datasets,
     dataset_schema,
     query,
+    opencode_prompts,
+    opencode_events,
     unknown,
 };
 
@@ -40,6 +42,8 @@ const command_defs = [_]CommandDef{
     .{ .name = "datasets", .cmd = .datasets },
     .{ .name = "dataset-schema", .cmd = .dataset_schema },
     .{ .name = "query", .cmd = .query },
+    .{ .name = "opencode-prompts", .cmd = .opencode_prompts },
+    .{ .name = "opencode-events", .cmd = .opencode_events },
 };
 
 pub fn parseCommand(arg: []const u8) Command {

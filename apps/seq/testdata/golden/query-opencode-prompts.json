@@ -1,0 +1,17 @@
+{
+  "dataset": "opencode_prompts",
+  "params": {
+    "source": "jsonl",
+    "opencode_path": "testdata/golden/opencode/prompt-history.jsonl"
+  },
+  "where": [
+    { "field": "mode", "op": "eq", "value": "normal" }
+  ],
+  "group_by": ["part_types"],
+  "metrics": [
+    { "op": "count", "as": "count" }
+  ],
+  "sort": ["part_types"],
+  "select": ["part_types", "count"],
+  "format": "jsonl"
+}

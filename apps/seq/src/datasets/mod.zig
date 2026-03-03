@@ -5,3 +5,6 @@ pub const token_deltas = @import("token_deltas.zig");
 pub const token_sessions = @import("token_sessions.zig");
 pub const tool_calls = @import("tool_calls.zig");
 pub const memory_files = @import("memory_files.zig");
+pub const opencode_prompts = @import("opencode_prompts.zig");
+pub const opencode_events = @import("opencode_events.zig");
+pub const opencode_sqlite = @import("opencode_sqlite.zig");

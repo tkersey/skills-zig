@@ -3,6 +3,8 @@ skill-trend
 query
 dataset-schema
 token-usage
+opencode-prompts
+opencode-events
 unknown-command
 --help
 $tk

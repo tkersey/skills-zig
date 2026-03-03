@@ -1,0 +1,4 @@
+{"source_kind":"jsonl","source_record_index":1,"event_index":1,"role":"user","mode":"normal","part_type":"text","text":"one","text_len":3,"filename":null}
+{"source_kind":"jsonl","source_record_index":2,"event_index":1,"role":"user","mode":"normal","part_type":"file","text":null,"text_len":null,"filename":"a.txt"}
+{"source_kind":"jsonl","source_record_index":2,"event_index":2,"role":"user","mode":"normal","part_type":"text","text":"hi","text_len":2,"filename":null}
+{"source_kind":"jsonl","source_record_index":3,"event_index":1,"role":"user","mode":"review","part_type":"text","text":"query","text_len":5,"filename":null}

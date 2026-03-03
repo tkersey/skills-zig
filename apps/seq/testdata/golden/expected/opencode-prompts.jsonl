@@ -1,0 +1,3 @@
+{"source_kind":"jsonl","source_record_index":1,"prompt_text":"one","mode":"normal","parts_count":0,"text_parts_count":0,"file_parts_count":0,"part_types":"","file_paths":""}
+{"source_kind":"jsonl","source_record_index":2,"prompt_text":"second with file","mode":"normal","parts_count":2,"text_parts_count":1,"file_parts_count":1,"part_types":"file,text","file_paths":"a.txt"}
+{"source_kind":"jsonl","source_record_index":3,"prompt_text":"third search","mode":"review","parts_count":1,"text_parts_count":1,"file_parts_count":0,"part_types":"text","file_paths":""}

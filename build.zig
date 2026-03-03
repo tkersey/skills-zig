@@ -223,6 +223,8 @@ pub fn build(b: *std.Build) void {
     });
 
     const seq = addExecutable(b, "seq", seq_root);
+    seq.linkLibC();
+    seq.root_module.linkSystemLibrary("sqlite3", .{});
     const seq_perf = addExecutable(b, "seq-perf", seq_perf_root);
     const bench_stats = addExecutable(b, "bench_stats", lift_bench_root);
     const perf_report = addExecutable(b, "perf_report", lift_report_root);
