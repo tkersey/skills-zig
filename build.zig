@@ -381,8 +381,22 @@ pub fn build(b: *std.Build) void {
     const build_st = b.step("build-st", "Build st binary");
     build_st.dependOn(&st_install.step);
 
+    const enable_zlinter = b.option(
+        bool,
+        "enable_zlinter",
+        "Internal flag to run zlinter-backed lint directly",
+    ) orelse false;
     const lint_step = b.step("lint", "Run zlinter checks");
-    lint_step.dependOn(buildLintStep(b, target, optimize, mesh));
+    if (enable_zlinter) {
+        lint_step.dependOn(buildLintStep(b, target, optimize, mesh));
+    } else {
+        const lint_cmd = b.addSystemCommand(&.{ "zig", "build", "lint", "-Denable_zlinter=true" });
+        if (b.args) |args| {
+            lint_cmd.addArg("--");
+            lint_cmd.addArgs(args);
+        }
+        lint_step.dependOn(&lint_cmd.step);
+    }
 
     _ = addTestStep(
         b,
