@@ -1,4 +1,5 @@
 const std = @import("std");
+const zlinter = @import("zlinter");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -380,6 +381,9 @@ pub fn build(b: *std.Build) void {
     const build_st = b.step("build-st", "Build st binary");
     build_st.dependOn(&st_install.step);
 
+    const lint_step = b.step("lint", "Run zlinter checks");
+    lint_step.dependOn(buildLintStep(b, target, optimize, mesh));
+
     _ = addTestStep(
         b,
         learnings_root,
@@ -480,4 +484,26 @@ fn addVersionModule(b: *std.Build, raw_version: []const u8) *std.Build.Module {
     const options = b.addOptions();
     options.addOption([]const u8, "version", std.mem.trim(u8, raw_version, " \t\r\n"));
     return options.createModule();
+}
+
+fn buildLintStep(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    mesh: *std.Build.Step.Compile,
+) *std.Build.Step {
+    var lint_builder = zlinter.builder(b, .{
+        .target = target,
+        .optimize = optimize,
+    });
+    lint_builder.addSource(.compiled(mesh));
+    lint_builder.addPaths(.{
+        .include = &.{
+            b.path("apps/mesh"),
+            b.path("libs/core"),
+            b.path("build.zig"),
+        },
+    });
+    lint_builder.addRule(.{ .builtin = .no_unused }, .{});
+    return lint_builder.build();
 }

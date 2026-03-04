@@ -11,7 +11,7 @@ const UsageText =
     \\
     \\Plan-driven orchestration helpers for streaming batch contracts, budget clamps, and event-only ledgers.
     \\
-    \\usage: mesh {budget,plan_sync,slice,wave,run_csv,ledger,replay} [options]
+    \\usage: mesh {budget,plan_sync,slice,wave,run_csv,ledger,replay,orchplan_to_units,prepare_crfip_batch,doctor,lane_completeness_lint,contract_drift_lint,migration_gate} [options]
     \\
     \\commands:
     \\  budget      Compute active-unit clamp from 5-hour + weekly remaining percentages
@@ -21,6 +21,12 @@ const UsageText =
     \\  run_csv     Validate a streaming batch CSV, enforce optional floor/deadlock gates, and prepare output CSV path safely
     \\  ledger      Filter a ledger object down to occurred events only
     \\  replay      Simulate budget + wave sizing without execution
+    \\  orchplan_to_units      Convert OrchPlan (json/yaml) into units.json payloads
+    \\  prepare_crfip_batch    Emit durable CRFIP candidate CSV + output CSV skeleton
+    \\  doctor                 Run mesh postmortem gates (mesh-truth, artifacts, lane checks)
+    \\  lane_completeness_lint Lint candidate/full/crfip lane completeness fail-closed
+    \\  contract_drift_lint    Assert required mesh contract snippets across docs/config
+    \\  migration_gate         Composite fail-closed migration closeout gate
     \\
     \\global options:
     \\  -h, --help                 Show help
@@ -54,6 +60,12 @@ const Command = enum {
     run_csv,
     ledger,
     replay,
+    orchplan_to_units,
+    prepare_crfip_batch,
+    doctor,
+    lane_completeness_lint,
+    contract_drift_lint,
+    migration_gate,
 };
 
 const BudgetMode = enum {
@@ -171,6 +183,12 @@ pub fn main() !void {
         .run_csv => try cmdRunCsv(allocator, argv[2..]),
         .ledger => try cmdLedger(allocator, argv[2..]),
         .replay => try cmdReplay(argv[2..]),
+        .orchplan_to_units => try cmdOrchplanToUnits(allocator, argv[2..]),
+        .prepare_crfip_batch => try cmdPrepareCrfipBatch(allocator, argv[2..]),
+        .doctor => try cmdDoctor(allocator, argv[2..]),
+        .lane_completeness_lint => try cmdLaneCompletenessLint(allocator, argv[2..]),
+        .contract_drift_lint => try cmdContractDriftLint(allocator, argv[2..]),
+        .migration_gate => try cmdMigrationGate(allocator, argv[2..]),
     }
 }
 
@@ -182,6 +200,12 @@ fn resolveCommand(raw: []const u8) ?Command {
     if (std.mem.eql(u8, raw, "run_csv") or std.mem.eql(u8, raw, "run-csv")) return .run_csv;
     if (std.mem.eql(u8, raw, "ledger")) return .ledger;
     if (std.mem.eql(u8, raw, "replay")) return .replay;
+    if (std.mem.eql(u8, raw, "orchplan_to_units") or std.mem.eql(u8, raw, "orchplan-to-units")) return .orchplan_to_units;
+    if (std.mem.eql(u8, raw, "prepare_crfip_batch") or std.mem.eql(u8, raw, "prepare-crfip-batch")) return .prepare_crfip_batch;
+    if (std.mem.eql(u8, raw, "doctor")) return .doctor;
+    if (std.mem.eql(u8, raw, "lane_completeness_lint") or std.mem.eql(u8, raw, "lane-completeness-lint") or std.mem.eql(u8, raw, "lane_lint")) return .lane_completeness_lint;
+    if (std.mem.eql(u8, raw, "contract_drift_lint") or std.mem.eql(u8, raw, "contract-drift-lint")) return .contract_drift_lint;
+    if (std.mem.eql(u8, raw, "migration_gate") or std.mem.eql(u8, raw, "migration-gate")) return .migration_gate;
     return null;
 }
 
@@ -743,6 +767,695 @@ fn cmdLedger(allocator: std.mem.Allocator, args: []const []const u8) !void {
     try stdout.writeAll("}}}\n");
 }
 
+fn cmdOrchplanToUnits(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    const orchplan_path = try parseRequiredPath(args, "--orchplan");
+    const output_json_path = try parseRequiredPath(args, "--output-json");
+    const format = parseOptionalPath(args, "--format") orelse "json";
+    if (!std.mem.eql(u8, format, "json") and !std.mem.eql(u8, format, "quiet")) {
+        return error.InvalidFormat;
+    }
+
+    const bytes = try std.fs.cwd().readFileAlloc(allocator, orchplan_path, 32 * 1024 * 1024);
+    const tasks = try parseOrchplanTasks(allocator, bytes);
+
+    var warnings: std.ArrayList([]const u8) = .empty;
+    defer warnings.deinit(allocator);
+    var units: std.ArrayList(SliceUnit) = .empty;
+    defer units.deinit(allocator);
+
+    for (tasks) |task| {
+        if (task.id.len == 0) continue;
+        const title = if (task.title.len > 0) task.title else task.id;
+        const risk_tier = normalizeRiskTier(task.risk_tier);
+
+        const write_scope = if (task.scopes.len == 0) blk: {
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "task {s}: missing scope; write_scope will be 'unknown' and parallelism will collapse",
+                .{task.id},
+            );
+            try warnings.append(allocator, msg);
+            break :blk "unknown";
+        } else try std.mem.join(allocator, ";", task.scopes);
+
+        const proof_command = if (task.validations.len > 0) task.validations[0] else blk: {
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "task {s}: missing validation; proof_command is empty",
+                .{task.id},
+            );
+            try warnings.append(allocator, msg);
+            break :blk "";
+        };
+
+        try units.append(allocator, .{
+            .id = task.id,
+            .objective = title,
+            .unit_scope = task.id,
+            .write_scope = write_scope,
+            .constraints = "",
+            .invariants = "",
+            .proof_command = proof_command,
+            .risk_tier = risk_tier,
+            .base_sha = "HEAD",
+            .delivery_mode = "patch_first",
+            .attempt = "1",
+            .variant = "baseline",
+            .budget_tier = "unknown",
+        });
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    const out_writer = out.writer(allocator);
+    try writeUnitsPayloadJson(out_writer, units.items);
+    try writeTextFile(output_json_path, out.items);
+
+    if (std.mem.eql(u8, format, "quiet")) return;
+
+    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.print(
+        "{{\"command\":\"orchplan_to_units\",\"orchplan\":",
+        .{},
+    );
+    try std.json.Stringify.value(orchplan_path, .{}, stdout);
+    try stdout.print(",\"output_json\":", .{});
+    try std.json.Stringify.value(output_json_path, .{}, stdout);
+    try stdout.print(",\"unit_count\":{d},\"warnings\":[", .{units.items.len});
+    for (warnings.items, 0..) |warning, idx| {
+        if (idx > 0) try stdout.writeAll(",");
+        try std.json.Stringify.value(warning, .{}, stdout);
+    }
+    try stdout.writeAll("]}\n");
+}
+
+fn cmdPrepareCrfipBatch(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    const units_json_path = try parseRequiredPath(args, "--units-json");
+    const max_active = parseOptionalUsize(args, "--max-active") orelse 6;
+    const artifact_root = parseOptionalPath(args, "--artifact-root");
+    const run_id = parseOptionalPath(args, "--run-id");
+    const batch_name = parseOptionalPath(args, "--name") orelse "candidate";
+    const max_concurrency = parseOptionalUsize(args, "--max-concurrency");
+    const floor_threshold = parseOptionalUsize(args, "--floor-threshold") orelse 3;
+    const fail_on_floor = hasFlag(args, "--fail-on-floor");
+    const format = parseOptionalPath(args, "--format") orelse "json";
+    if (!std.mem.eql(u8, format, "json") and !std.mem.eql(u8, format, "paths")) {
+        return error.InvalidFormat;
+    }
+
+    const units = try parseSliceUnits(allocator, units_json_path);
+
+    const resolved_root = if (artifact_root) |root| try expandPathWithHome(allocator, root) else try defaultArtifactRoot(allocator);
+    const resolved_run_id = if (run_id) |rid| rid else try defaultRunId(allocator);
+    const run_dir = try meshArtifactRunDir(allocator, resolved_root, resolved_run_id);
+    const csv_path = try std.fmt.allocPrint(allocator, "{s}/{s}.csv", .{ run_dir, batch_name });
+    const out_path = try std.fmt.allocPrint(allocator, "{s}/{s}.out.csv", .{ run_dir, batch_name });
+
+    var warnings: std.ArrayList([]const u8) = .empty;
+    defer warnings.deinit(allocator);
+    const selected = try selectCrfipUnits(allocator, units, @max(@as(usize, 1), max_active), &warnings);
+    try writeCrfipCandidateCsv(allocator, csv_path, selected);
+
+    var run_csv_args: std.ArrayList([]const u8) = .empty;
+    defer run_csv_args.deinit(allocator);
+    try run_csv_args.appendSlice(allocator, &.{ "run_csv", "--csv-path", csv_path, "--output-csv-path", out_path });
+    if (max_concurrency) |mc| {
+        const mc_text = try std.fmt.allocPrint(allocator, "{d}", .{mc});
+        try run_csv_args.appendSlice(allocator, &.{ "--max-concurrency", mc_text });
+    }
+    const floor_text = try std.fmt.allocPrint(allocator, "{d}", .{@max(@as(usize, 1), floor_threshold)});
+    try run_csv_args.appendSlice(allocator, &.{ "--floor-threshold", floor_text });
+    if (fail_on_floor) try run_csv_args.append(allocator, "--fail-on-floor");
+
+    const run_csv_json = try runSelfJsonCommand(allocator, run_csv_args.items);
+
+    if (std.mem.eql(u8, format, "paths")) {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try stdout.print("{s}\n{s}\n", .{ csv_path, out_path });
+        return;
+    }
+
+    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.print("{{\"command\":\"prepare_crfip_batch\",\"run_dir\":", .{});
+    try std.json.Stringify.value(run_dir, .{}, stdout);
+    try stdout.print(",\"csv_path\":", .{});
+    try std.json.Stringify.value(csv_path, .{}, stdout);
+    try stdout.print(",\"output_csv_path\":", .{});
+    try std.json.Stringify.value(out_path, .{}, stdout);
+    try stdout.print(
+        ",\"units_in\":{d},\"units_selected\":{d},\"rows_emitted\":{d},\"warnings\":[",
+        .{ units.len, selected.len, selected.len * 2 },
+    );
+    for (warnings.items, 0..) |warning, idx| {
+        if (idx > 0) try stdout.writeAll(",");
+        try std.json.Stringify.value(warning, .{}, stdout);
+    }
+    try stdout.writeAll("],\"run_csv\":");
+    try std.json.Stringify.value(run_csv_json, .{}, stdout);
+    try stdout.writeAll("}\n");
+}
+
+fn cmdDoctor(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var rollout_jsonl: ?[]const u8 = null;
+    var session_id: ?[]const u8 = null;
+    var root = try defaultSessionsRoot(allocator);
+    var expect_mesh_truth = false;
+    var require_artifacts = false;
+    var require_archived_paths = false;
+    var artifact_root: ?[]const u8 = null;
+    var lane_check: []const u8 = "crfip";
+    var require_spawn_substrate = false;
+    var format: []const u8 = "text";
+    var exec_out_paths: std.ArrayList([]const u8) = .empty;
+    defer exec_out_paths.deinit(allocator);
+    var exec_out_globs: std.ArrayList([]const u8) = .empty;
+    defer exec_out_globs.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--rollout-jsonl")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            rollout_jsonl = args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--session-id")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            session_id = args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--root")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            root = args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--expect-mesh-truth")) {
+            expect_mesh_truth = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--require-artifacts")) {
+            require_artifacts = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--require-archived-paths")) {
+            require_archived_paths = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--artifact-root")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            artifact_root = args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--lane-check")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            lane_check = args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--require-spawn-substrate")) {
+            require_spawn_substrate = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--exec-out")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            try exec_out_paths.append(allocator, args[i]);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--exec-out-glob")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            try exec_out_globs.append(allocator, args[i]);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--format")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            format = args[i];
+            continue;
+        }
+        return error.UnknownFlag;
+    }
+
+    if ((rollout_jsonl == null and session_id == null) or (rollout_jsonl != null and session_id != null)) {
+        return error.ExpectedRolloutOrSession;
+    }
+    if (!std.mem.eql(u8, lane_check, "skip") and !std.mem.eql(u8, lane_check, "crfip") and !std.mem.eql(u8, lane_check, "full")) {
+        return error.InvalidLaneCheck;
+    }
+    if (!std.mem.eql(u8, format, "json") and !std.mem.eql(u8, format, "text")) return error.InvalidFormat;
+
+    var seq_args: std.ArrayList([]const u8) = .empty;
+    defer seq_args.deinit(allocator);
+    try seq_args.appendSlice(allocator, &.{ "seq", "orchestration-concurrency" });
+    if (rollout_jsonl) |path| {
+        try seq_args.appendSlice(allocator, &.{ "--path", path });
+    } else {
+        try seq_args.appendSlice(allocator, &.{ "--root", root, "--session-id", session_id.? });
+    }
+    try seq_args.appendSlice(allocator, &.{ "--format", "json" });
+
+    const seq_result = try runCommandCapture(allocator, seq_args.items, null);
+    if (seq_result.exit_code != 0) return error.SeqCommandFailed;
+    const seq_row = try parseFirstSeqRow(allocator, seq_result.stdout);
+
+    const missing = jsonObjectGetInt(seq_row.object, "csv_rows_missing");
+    const known = jsonObjectGetInt(seq_row.object, "csv_rows_known");
+    const mesh_truth = jsonObjectGetBool(seq_row.object, "mesh_truth_verdict");
+    const substrate = jsonObjectGetString(seq_row.object, "spawn_substrate");
+
+    var errors: std.ArrayList([]const u8) = .empty;
+    defer errors.deinit(allocator);
+    if (expect_mesh_truth and !mesh_truth) {
+        try appendLintError(allocator, &errors, "mesh_truth_verdict=false (spawn_substrate={s})", .{substrate});
+    }
+    if (require_artifacts and missing != 0) {
+        try appendLintError(allocator, &errors, "csv_rows_missing={d} (known={d})", .{ missing, known });
+    }
+
+    var archived_paths_ok: ?bool = null;
+    var spawn_pairs: []SpawnCsvPair = &.{};
+    var archived_misses: std.ArrayList([]const u8) = .empty;
+    defer archived_misses.deinit(allocator);
+    var archived_missing_files: std.ArrayList([]const u8) = .empty;
+    defer archived_missing_files.deinit(allocator);
+
+    if (require_archived_paths) {
+        const seq_rollout = jsonObjectGetString(seq_row.object, "path");
+        if (seq_rollout.len == 0) {
+            try appendLintError(allocator, &errors, "seq row missing rollout path; cannot validate archived paths", .{});
+        } else {
+            const root_path = if (artifact_root) |r| try expandPathWithHome(allocator, r) else try defaultArtifactRoot(allocator);
+            spawn_pairs = try extractSpawnCsvPairs(allocator, seq_rollout);
+            for (spawn_pairs) |pair| {
+                const paths = [_][]const u8{ pair.csv_path, pair.output_csv_path };
+                for (paths) |p| {
+                    if (!isPathUnderRoot(allocator, root_path, p)) {
+                        try archived_misses.append(allocator, p);
+                    }
+                    const expanded = try expandPathWithHome(allocator, p);
+                    std.fs.cwd().access(expanded, .{}) catch {
+                        try archived_missing_files.append(allocator, p);
+                    };
+                }
+            }
+            archived_paths_ok = archived_misses.items.len == 0;
+            if (!(archived_paths_ok orelse false)) {
+                try appendLintError(allocator, &errors, "spawn_agents_on_csv paths not under artifact root", .{});
+            }
+            if (archived_missing_files.items.len > 0) {
+                try appendLintError(allocator, &errors, "spawn_agents_on_csv referenced csv files are missing", .{});
+            }
+        }
+    }
+
+    var lane_rc: u8 = 0;
+    var lane_out: []const u8 = "";
+    var lane_err: []const u8 = "";
+    var expanded_exec_paths: std.ArrayList([]const u8) = .empty;
+    defer expanded_exec_paths.deinit(allocator);
+
+    if (!std.mem.eql(u8, lane_check, "skip")) {
+        try expanded_exec_paths.appendSlice(allocator, exec_out_paths.items);
+        if (exec_out_globs.items.len == 0) {
+            const defaults = try expandSimpleGlob(allocator, ".mesh/*.exec.out.csv");
+            try expanded_exec_paths.appendSlice(allocator, defaults);
+        } else {
+            for (exec_out_globs.items) |pattern| {
+                const matches = try expandSimpleGlob(allocator, pattern);
+                try expanded_exec_paths.appendSlice(allocator, matches);
+            }
+        }
+
+        if (expanded_exec_paths.items.len > 0) {
+            var lint_args: std.ArrayList([]const u8) = .empty;
+            defer lint_args.deinit(allocator);
+            try lint_args.appendSlice(allocator, &.{ "lane_completeness_lint", "--check", lane_check });
+            if (require_spawn_substrate) try lint_args.append(allocator, "--require-spawn-substrate");
+            try lint_args.appendSlice(allocator, expanded_exec_paths.items);
+            const lint_result = try runSelfCommandCapture(allocator, lint_args.items);
+            lane_rc = lint_result.exit_code;
+            lane_out = std.mem.trim(u8, lint_result.stdout, " \t\r\n");
+            lane_err = std.mem.trim(u8, lint_result.stderr, " \t\r\n");
+            if (lane_rc != 0) try appendLintError(allocator, &errors, "lane_completeness_lint failed", .{});
+        }
+    }
+
+    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    const stdout = &stdout_writer.interface;
+    if (std.mem.eql(u8, format, "json")) {
+        try stdout.writeAll("{\"command\":\"mesh_doctor\",\"seq\":");
+        try std.json.Stringify.value(seq_row, .{}, stdout);
+        try stdout.print(",\"archived_paths\":{{\"requested\":{s},\"ok\":", .{
+            if (require_archived_paths) "true" else "false",
+        });
+        if (archived_paths_ok) |ok| {
+            try stdout.writeAll(if (ok) "true" else "false");
+        } else {
+            try stdout.writeAll("null");
+        }
+        try stdout.print(",\"spawn_call_pairs\":{d},\"misses\":[", .{spawn_pairs.len});
+        for (archived_misses.items, 0..) |miss, idx| {
+            if (idx > 0) try stdout.writeAll(",");
+            try std.json.Stringify.value(miss, .{}, stdout);
+        }
+        try stdout.writeAll("],\"missing_files\":[");
+        for (archived_missing_files.items, 0..) |miss, idx| {
+            if (idx > 0) try stdout.writeAll(",");
+            try std.json.Stringify.value(miss, .{}, stdout);
+        }
+        try stdout.writeAll("]},\"lane_check\":{");
+        try stdout.print("\"requested\":", .{});
+        try std.json.Stringify.value(lane_check, .{}, stdout);
+        try stdout.print(",\"exec_out_paths\":[", .{});
+        for (expanded_exec_paths.items, 0..) |p, idx| {
+            if (idx > 0) try stdout.writeAll(",");
+            try std.json.Stringify.value(p, .{}, stdout);
+        }
+        try stdout.print("],\"returncode\":{d},\"stdout\":", .{lane_rc});
+        try std.json.Stringify.value(lane_out, .{}, stdout);
+        try stdout.print(",\"stderr\":", .{});
+        try std.json.Stringify.value(lane_err, .{}, stdout);
+        try stdout.writeAll("},\"errors\":[");
+        for (errors.items, 0..) |msg, idx| {
+            if (idx > 0) try stdout.writeAll(",");
+            try std.json.Stringify.value(msg, .{}, stdout);
+        }
+        try stdout.writeAll("]}\n");
+    } else {
+        try stdout.writeAll("mesh doctor\n");
+        try stdout.print(
+            "- mesh_truth_verdict: {s} (spawn_substrate={s})\n",
+            .{ if (mesh_truth) "true" else "false", if (substrate.len > 0) substrate else "-" },
+        );
+        try stdout.print("- artifacts: csv_rows_known={d} csv_rows_missing={d}\n", .{ known, missing });
+        if (require_archived_paths) {
+            const ok_text = if (archived_paths_ok == null) "unknown" else if (archived_paths_ok.?) "pass" else "fail";
+            try stdout.print(
+                "- archived_paths: {s} (spawn_pairs={d} misses={d})\n",
+                .{ ok_text, spawn_pairs.len, archived_misses.items.len },
+            );
+            if (archived_missing_files.items.len > 0) {
+                try stdout.print("- archived_paths: missing_files={d}\n", .{archived_missing_files.items.len});
+            }
+        }
+        if (!std.mem.eql(u8, lane_check, "skip")) {
+            try stdout.print("- lane_check: {s} (exec_out_paths={d})\n", .{ lane_check, expanded_exec_paths.items.len });
+        }
+        if (errors.items.len == 0) {
+            try stdout.writeAll("- PASS\n");
+        } else {
+            for (errors.items) |msg| {
+                try stdout.print("- FAIL: {s}\n", .{msg});
+            }
+        }
+    }
+
+    if (errors.items.len > 0) return error.MeshDoctorFailed;
+}
+
+fn cmdLaneCompletenessLint(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var check_raw: ?[]const u8 = null;
+    var collapsed_ok = false;
+    var require_spawn_substrate = false;
+    var expected_spawn_substrate: []const u8 = "spawn_agents_on_csv";
+    var deps_csv_paths: std.ArrayList([]const u8) = .empty;
+    defer deps_csv_paths.deinit(allocator);
+    var csv_paths: std.ArrayList([]const u8) = .empty;
+    defer csv_paths.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--check")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            check_raw = args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--collapsed-ok")) {
+            collapsed_ok = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--require-spawn-substrate")) {
+            require_spawn_substrate = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--expected-spawn-substrate")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            expected_spawn_substrate = args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--deps-csv")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            try deps_csv_paths.append(allocator, args[i]);
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "-")) return error.UnknownFlag;
+        try csv_paths.append(allocator, arg);
+    }
+
+    if (check_raw == null) return error.MissingRequiredOption;
+    if (csv_paths.items.len == 0) return error.MissingRequiredOption;
+    const check = try parseLaneLintCheck(check_raw.?);
+
+    var errors = try evaluateLaneLint(
+        allocator,
+        check,
+        csv_paths.items,
+        require_spawn_substrate,
+        expected_spawn_substrate,
+        deps_csv_paths.items,
+    );
+    defer errors.deinit(allocator);
+
+    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    const stdout = &stdout_writer.interface;
+
+    if (errors.items.len == 0) {
+        try stdout.writeAll("lane_completeness_lint: PASS\n");
+        return;
+    }
+
+    if (collapsed_ok) {
+        try stdout.writeAll("lane_completeness_lint: WAIVED (collapsed path override)\n");
+        for (errors.items) |msg| {
+            try stdout.print("- {s}\n", .{msg});
+        }
+        return;
+    }
+
+    try stdout.writeAll("lane_completeness_lint: FAIL\n");
+    for (errors.items) |msg| {
+        try stdout.print("- {s}\n", .{msg});
+    }
+    return error.LaneCompletenessLintFailed;
+}
+
+fn cmdContractDriftLint(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    const repo_root = parseOptionalPath(args, "--repo-root") orelse blk: {
+        break :blk try std.process.getCwdAlloc(allocator);
+    };
+
+    const DriftRule = struct {
+        rel_path: []const u8,
+        snippets: []const []const u8,
+    };
+    const rules = [_]DriftRule{
+        .{
+            .rel_path = "codex/AGENTS.md",
+            .snippets = &.{
+                "mesh lane_completeness_lint",
+                "mesh prepare_crfip_batch",
+                "mesh doctor",
+            },
+        },
+        .{
+            .rel_path = "codex/skills/mesh/SKILL.md",
+            .snippets = &.{
+                "mesh orchplan_to_units",
+                "mesh prepare_crfip_batch",
+                "mesh lane_completeness_lint",
+                "mesh doctor",
+            },
+        },
+        .{
+            .rel_path = "codex/skills/mesh/agents/openai.yaml",
+            .snippets = &.{
+                "mesh orchplan_to_units",
+                "mesh prepare_crfip_batch",
+                "mesh lane_completeness_lint",
+                "mesh doctor",
+            },
+        },
+        .{
+            .rel_path = "codex/skills/mesh/references/output-contract.md",
+            .snippets = &.{
+                "Mesh Output Contract v2",
+                "write_scope",
+                "proof_evidence",
+            },
+        },
+    };
+
+    var missing: std.ArrayList([]const u8) = .empty;
+    defer missing.deinit(allocator);
+
+    for (rules) |rule| {
+        const file_path = try std.fs.path.resolve(allocator, &.{ repo_root, rule.rel_path });
+        defer allocator.free(file_path);
+
+        const bytes = std.fs.cwd().readFileAlloc(allocator, file_path, 16 * 1024 * 1024) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "{s}: file missing ({s})", .{ rule.rel_path, @errorName(err) });
+            try missing.append(allocator, msg);
+            continue;
+        };
+
+        for (rule.snippets) |snippet| {
+            if (std.mem.indexOf(u8, bytes, snippet) == null) {
+                const msg = try std.fmt.allocPrint(allocator, "{s}: missing snippet -> {s}", .{ rule.rel_path, snippet });
+                try missing.append(allocator, msg);
+            }
+        }
+    }
+
+    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    const stdout = &stdout_writer.interface;
+    if (missing.items.len == 0) {
+        try stdout.writeAll("contract_drift_lint: PASS\n");
+        return;
+    }
+
+    try stdout.writeAll("contract_drift_lint: FAIL\n");
+    for (missing.items) |msg| {
+        try stdout.print("- {s}\n", .{msg});
+    }
+    return error.ContractDriftLintFailed;
+}
+
+fn cmdMigrationGate(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var rollout_jsonl: ?[]const u8 = null;
+    var format: []const u8 = "text";
+    var exec_out_globs: std.ArrayList([]const u8) = .empty;
+    defer exec_out_globs.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--rollout-jsonl")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            rollout_jsonl = args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--exec-out-glob")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            try exec_out_globs.append(allocator, args[i]);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--format")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            format = args[i];
+            continue;
+        }
+        return error.UnknownFlag;
+    }
+    if (rollout_jsonl == null) return error.MissingRequiredOption;
+    if (!std.mem.eql(u8, format, "json") and !std.mem.eql(u8, format, "text")) return error.InvalidFormat;
+
+    const drift_result = try runSelfCommandCapture(allocator, &.{"contract_drift_lint"});
+    var doctor_args: std.ArrayList([]const u8) = .empty;
+    defer doctor_args.deinit(allocator);
+    try doctor_args.appendSlice(
+        allocator,
+        &.{
+            "doctor",
+            "--rollout-jsonl",
+            rollout_jsonl.?,
+            "--expect-mesh-truth",
+            "--require-artifacts",
+            "--require-archived-paths",
+            "--lane-check",
+            "crfip",
+            "--require-spawn-substrate",
+            "--format",
+            "json",
+        },
+    );
+    if (exec_out_globs.items.len == 0) {
+        try doctor_args.appendSlice(allocator, &.{ "--exec-out-glob", ".mesh/*.exec.out.csv" });
+    } else {
+        for (exec_out_globs.items) |glob| {
+            try doctor_args.appendSlice(allocator, &.{ "--exec-out-glob", glob });
+        }
+    }
+    const doctor_result = try runSelfCommandCapture(allocator, doctor_args.items);
+    const python_files = try findPythonFilesUnder(allocator, "codex/skills/mesh");
+
+    var errors: std.ArrayList([]const u8) = .empty;
+    defer errors.deinit(allocator);
+    if (drift_result.exit_code != 0) {
+        try appendLintError(allocator, &errors, "contract_drift_lint failed", .{});
+    }
+    if (doctor_result.exit_code != 0) {
+        try appendLintError(allocator, &errors, "doctor failed", .{});
+    }
+    if (python_files.len > 0) {
+        try appendLintError(allocator, &errors, "python files still present under codex/skills/mesh", .{});
+    }
+
+    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    const stdout = &stdout_writer.interface;
+    if (std.mem.eql(u8, format, "json")) {
+        try stdout.writeAll("{\"command\":\"migration_gate\",\"contract_drift\":{");
+        try stdout.print("\"returncode\":{d},\"stdout\":", .{drift_result.exit_code});
+        try std.json.Stringify.value(std.mem.trim(u8, drift_result.stdout, " \t\r\n"), .{}, stdout);
+        try stdout.print(",\"stderr\":", .{});
+        try std.json.Stringify.value(std.mem.trim(u8, drift_result.stderr, " \t\r\n"), .{}, stdout);
+        try stdout.writeAll("},\"doctor\":{");
+        try stdout.print("\"returncode\":{d},\"stdout\":", .{doctor_result.exit_code});
+        try std.json.Stringify.value(std.mem.trim(u8, doctor_result.stdout, " \t\r\n"), .{}, stdout);
+        try stdout.print(",\"stderr\":", .{});
+        try std.json.Stringify.value(std.mem.trim(u8, doctor_result.stderr, " \t\r\n"), .{}, stdout);
+        try stdout.writeAll("},\"python_files\":[");
+        for (python_files, 0..) |p, idx| {
+            if (idx > 0) try stdout.writeAll(",");
+            try std.json.Stringify.value(p, .{}, stdout);
+        }
+        try stdout.writeAll("],\"errors\":[");
+        for (errors.items, 0..) |msg, idx| {
+            if (idx > 0) try stdout.writeAll(",");
+            try std.json.Stringify.value(msg, .{}, stdout);
+        }
+        try stdout.writeAll("]}\n");
+    } else {
+        try stdout.writeAll("migration_gate\n");
+        try stdout.print("- contract_drift_lint: rc={d}\n", .{drift_result.exit_code});
+        try stdout.print("- doctor: rc={d}\n", .{doctor_result.exit_code});
+        try stdout.print("- python_files: {d}\n", .{python_files.len});
+        if (errors.items.len == 0) {
+            try stdout.writeAll("- PASS\n");
+        } else {
+            for (errors.items) |msg| {
+                try stdout.print("- FAIL: {s}\n", .{msg});
+            }
+        }
+    }
+
+    if (errors.items.len > 0) return error.MigrationGateFailed;
+}
+
 fn parseRequiredPath(args: []const []const u8, flag: []const u8) ![]const u8 {
     return parseOptionalPath(args, flag) orelse error.MissingRequiredOption;
 }
@@ -802,6 +1515,319 @@ fn parseLane(raw: []const u8) !Lane {
     if (std.mem.eql(u8, raw, "fixer")) return .fixer;
     if (std.mem.eql(u8, raw, "integrator")) return .integrator;
     return error.InvalidLane;
+}
+
+const LaneLintCheck = enum {
+    candidate,
+    candidate_crfip,
+    full,
+    crfip,
+};
+
+const UnitLaneCounts = struct {
+    coder: usize = 0,
+    reducer: usize = 0,
+    locksmith: usize = 0,
+    applier: usize = 0,
+    prover: usize = 0,
+    fixer: usize = 0,
+    integrator: usize = 0,
+};
+
+const FixerState = struct {
+    decision: []const u8 = "",
+    selected_candidate: []const u8 = "",
+};
+
+fn parseLaneLintCheck(raw: []const u8) !LaneLintCheck {
+    if (std.mem.eql(u8, raw, "candidate")) return .candidate;
+    if (std.mem.eql(u8, raw, "candidate_crfip")) return .candidate_crfip;
+    if (std.mem.eql(u8, raw, "full")) return .full;
+    if (std.mem.eql(u8, raw, "crfip")) return .crfip;
+    return error.InvalidCheck;
+}
+
+fn appendLintError(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList([]const u8),
+    comptime fmt: []const u8,
+    args: anytype,
+) !void {
+    const msg = try std.fmt.allocPrint(allocator, fmt, args);
+    try errors.append(allocator, msg);
+}
+
+fn csvFieldByName(headers: []const []const u8, line: []const u8, name: []const u8) []const u8 {
+    const idx = findHeaderIndex(headers, name) orelse return "";
+    return nthCsvField(line, idx) orelse "";
+}
+
+fn isKnownLaneName(raw: []const u8) bool {
+    return std.mem.eql(u8, raw, "coder") or
+        std.mem.eql(u8, raw, "reducer") or
+        std.mem.eql(u8, raw, "locksmith") or
+        std.mem.eql(u8, raw, "applier") or
+        std.mem.eql(u8, raw, "prover") or
+        std.mem.eql(u8, raw, "fixer") or
+        std.mem.eql(u8, raw, "integrator");
+}
+
+fn incrementLaneCount(unit: *UnitLaneCounts, lane: []const u8) void {
+    if (std.mem.eql(u8, lane, "coder")) unit.coder += 1 else if (std.mem.eql(u8, lane, "reducer")) unit.reducer += 1 else if (std.mem.eql(u8, lane, "locksmith")) unit.locksmith += 1 else if (std.mem.eql(u8, lane, "applier")) unit.applier += 1 else if (std.mem.eql(u8, lane, "prover")) unit.prover += 1 else if (std.mem.eql(u8, lane, "fixer")) unit.fixer += 1 else if (std.mem.eql(u8, lane, "integrator")) unit.integrator += 1;
+}
+
+fn extractStringFromResultJson(
+    allocator: std.mem.Allocator,
+    raw_json: []const u8,
+    key: []const u8,
+) []const u8 {
+    if (raw_json.len == 0) return "";
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch return "";
+    if (parsed.value != .object) return "";
+    const v = parsed.value.object.get(key) orelse return "";
+    return switch (v) {
+        .string => |s| s,
+        else => "",
+    };
+}
+
+fn extractFieldOrResultJson(
+    allocator: std.mem.Allocator,
+    headers: []const []const u8,
+    line: []const u8,
+    key: []const u8,
+) []const u8 {
+    const direct = csvFieldByName(headers, line, key);
+    if (direct.len > 0) return std.mem.trim(u8, direct, " \t\r");
+    const raw_json = csvFieldByName(headers, line, "result_json");
+    const json_val = extractStringFromResultJson(allocator, raw_json, key);
+    return std.mem.trim(u8, json_val, " \t\r");
+}
+
+fn keySetCoderOnly(lane_counts: *std.StringHashMap(usize)) bool {
+    var it = lane_counts.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (key.len == 0) continue;
+        if (!std.mem.eql(u8, key, "coder")) return false;
+    }
+    return lane_counts.count() > 0;
+}
+
+fn evaluateLaneLint(
+    allocator: std.mem.Allocator,
+    check: LaneLintCheck,
+    csv_paths: []const []const u8,
+    require_spawn_substrate: bool,
+    expected_spawn_substrate: []const u8,
+    deps_csv_paths: []const []const u8,
+) !std.ArrayList([]const u8) {
+    var errors: std.ArrayList([]const u8) = .empty;
+
+    var lane_counts: std.StringHashMap(usize) = .init(allocator);
+    defer lane_counts.deinit();
+    var units: std.StringHashMap(UnitLaneCounts) = .init(allocator);
+    defer units.deinit();
+    var fixer_states: std.StringHashMap(FixerState) = .init(allocator);
+    defer fixer_states.deinit();
+
+    for (csv_paths) |path| {
+        const bytes = std.fs.cwd().readFileAlloc(allocator, path, 32 * 1024 * 1024) catch |err| {
+            try appendLintError(allocator, &errors, "{s}: read failed ({s})", .{ path, @errorName(err) });
+            continue;
+        };
+
+        var lines_it = std.mem.splitScalar(u8, bytes, '\n');
+        const header_line = lines_it.next() orelse {
+            try appendLintError(allocator, &errors, "{s}: missing CSV header", .{path});
+            continue;
+        };
+        const headers = try parseHeaderColumns(allocator, header_line);
+
+        const needs_candidate = check == .candidate or check == .candidate_crfip;
+        const missing_id = findHeaderIndex(headers, "id") == null;
+        const missing_lane = findHeaderIndex(headers, "lane") == null;
+        if (missing_id or missing_lane) {
+            try appendLintError(allocator, &errors, "{s}: missing headers: id,lane", .{path});
+            continue;
+        }
+        if (needs_candidate and findHeaderIndex(headers, "candidate_id") == null) {
+            try appendLintError(allocator, &errors, "{s}: missing headers: candidate_id", .{path});
+            continue;
+        }
+        if (needs_candidate and findHeaderIndex(headers, "triplet_index") == null) {
+            try appendLintError(allocator, &errors, "{s}: missing headers: triplet_index", .{path});
+            continue;
+        }
+        if (require_spawn_substrate and (check == .full or check == .crfip) and findHeaderIndex(headers, "spawn_substrate") == null) {
+            try appendLintError(allocator, &errors, "{s}: missing headers: spawn_substrate", .{path});
+            continue;
+        }
+
+        var row_count: usize = 0;
+        var bad_spawn_ids: std.StringHashMap(void) = .init(allocator);
+        defer bad_spawn_ids.deinit();
+
+        while (lines_it.next()) |line_raw| {
+            const line = std.mem.trim(u8, line_raw, " \t\r");
+            if (line.len == 0) continue;
+            row_count += 1;
+
+            const id = std.mem.trim(u8, csvFieldByName(headers, line, "id"), " \t\r");
+            const lane = std.mem.trim(u8, csvFieldByName(headers, line, "lane"), " \t\r");
+            if (lane_counts.getPtr(lane)) |ptr| {
+                ptr.* += 1;
+            } else {
+                try lane_counts.put(lane, 1);
+            }
+
+            if (id.len > 0) {
+                const gop = try units.getOrPut(id);
+                if (!gop.found_existing) gop.value_ptr.* = .{};
+                incrementLaneCount(gop.value_ptr, lane);
+            }
+
+            if (check == .crfip and id.len > 0 and std.mem.eql(u8, lane, "fixer")) {
+                const decision = extractFieldOrResultJson(allocator, headers, line, "decision");
+                const selected = extractFieldOrResultJson(allocator, headers, line, "selected_candidate");
+                try fixer_states.put(id, .{
+                    .decision = decision,
+                    .selected_candidate = selected,
+                });
+            }
+
+            if (require_spawn_substrate and (check == .full or check == .crfip)) {
+                const substrate = std.mem.trim(u8, csvFieldByName(headers, line, "spawn_substrate"), " \t\r");
+                if (!std.mem.eql(u8, substrate, expected_spawn_substrate)) {
+                    const key = if (id.len > 0) id else "<unknown>";
+                    _ = try bad_spawn_ids.getOrPut(key);
+                }
+            }
+        }
+
+        if (row_count == 0) {
+            try appendLintError(allocator, &errors, "{s}: no rows", .{path});
+        }
+        if (bad_spawn_ids.count() > 0) {
+            var it_bad = bad_spawn_ids.keyIterator();
+            var joined: std.ArrayList(u8) = .empty;
+            defer joined.deinit(allocator);
+            var first = true;
+            while (it_bad.next()) |id_ptr| {
+                if (!first) try joined.appendSlice(allocator, ", ");
+                first = false;
+                try joined.appendSlice(allocator, id_ptr.*);
+            }
+            try appendLintError(allocator, &errors, "{s}: spawn_substrate mismatch for ids: {s}", .{ path, joined.items });
+        }
+    }
+
+    var it_lanes = lane_counts.iterator();
+    while (it_lanes.next()) |entry| {
+        const lane = entry.key_ptr.*;
+        if (lane.len == 0) continue;
+        if (!isKnownLaneName(lane)) {
+            try appendLintError(allocator, &errors, "unknown lane values: {s}", .{lane});
+        }
+        if ((check == .candidate or check == .candidate_crfip) and !std.mem.eql(u8, lane, "coder") and !std.mem.eql(u8, lane, "reducer")) {
+            try appendLintError(allocator, &errors, "{s}: candidate check expects only coder/reducer lanes", .{lane});
+        }
+    }
+
+    if ((check == .full or check == .crfip) and keySetCoderOnly(&lane_counts)) {
+        const msg = if (check == .full)
+            "coder-only run detected (this is not lane-complete mesh orchestration)"
+        else
+            "coder-only run detected (this is not lane-complete CRFIP mesh orchestration)";
+        try appendLintError(allocator, &errors, "{s}", .{msg});
+    }
+
+    var it_units = units.iterator();
+    while (it_units.next()) |entry| {
+        const unit_id = entry.key_ptr.*;
+        const counts = entry.value_ptr.*;
+
+        if (check == .candidate) {
+            if (counts.coder < 2 or counts.reducer < 1) {
+                try appendLintError(
+                    allocator,
+                    &errors,
+                    "{s}: candidate cohort incomplete (need coder>=2 and reducer>=1; got coder={d}, reducer={d})",
+                    .{ unit_id, counts.coder, counts.reducer },
+                );
+            }
+            continue;
+        }
+        if (check == .candidate_crfip) {
+            if (counts.coder < 1 or counts.reducer < 1) {
+                try appendLintError(
+                    allocator,
+                    &errors,
+                    "{s}: candidate cohort incomplete (need coder>=1 and reducer>=1; got coder={d}, reducer={d})",
+                    .{ unit_id, counts.coder, counts.reducer },
+                );
+            }
+            continue;
+        }
+        if (check == .full) {
+            if (counts.coder < 2 or counts.reducer < 1) {
+                try appendLintError(
+                    allocator,
+                    &errors,
+                    "{s}: candidate cohort incomplete (need coder>=2 and reducer>=1; got coder={d}, reducer={d})",
+                    .{ unit_id, counts.coder, counts.reducer },
+                );
+            }
+            if (counts.locksmith == 0) try appendLintError(allocator, &errors, "{s}: missing lanes: locksmith", .{unit_id});
+            if (counts.applier == 0) try appendLintError(allocator, &errors, "{s}: missing lanes: applier", .{unit_id});
+            if (counts.prover == 0) try appendLintError(allocator, &errors, "{s}: missing lanes: prover", .{unit_id});
+            if (counts.fixer == 0) try appendLintError(allocator, &errors, "{s}: missing lanes: fixer", .{unit_id});
+            if (counts.integrator == 0) try appendLintError(allocator, &errors, "{s}: missing lanes: integrator", .{unit_id});
+            continue;
+        }
+
+        if (counts.coder < 1 or counts.reducer < 1) {
+            try appendLintError(
+                allocator,
+                &errors,
+                "{s}: missing candidate lanes (need coder>=1 and reducer>=1; got coder={d}, reducer={d})",
+                .{ unit_id, counts.coder, counts.reducer },
+            );
+        }
+        if (counts.fixer < 1) {
+            try appendLintError(allocator, &errors, "{s}: missing fixer lane", .{unit_id});
+            continue;
+        }
+
+        const fs = fixer_states.get(unit_id) orelse FixerState{};
+        if (fs.decision.len == 0) {
+            try appendLintError(allocator, &errors, "{s}: fixer missing decision (expected decision=accepted|rework_required|blocked_safety)", .{unit_id});
+            continue;
+        }
+        if (fs.selected_candidate.len == 0) {
+            try appendLintError(allocator, &errors, "{s}: fixer missing selected_candidate (must be explicit; use selected_candidate=none for no-op)", .{unit_id});
+            continue;
+        }
+        if (!std.mem.eql(u8, fs.decision, "accepted")) {
+            try appendLintError(allocator, &errors, "{s}: fixer decision not accepted (got {s}); unit is not completion-eligible", .{ unit_id, fs.decision });
+            continue;
+        }
+        if (std.mem.eql(u8, fs.selected_candidate, "none")) continue;
+        if (counts.prover < 1) {
+            try appendLintError(allocator, &errors, "{s}: missing prover lane for selected_candidate={s}", .{ unit_id, fs.selected_candidate });
+        }
+        if (counts.integrator < 1) {
+            try appendLintError(allocator, &errors, "{s}: missing integrator lane for selected_candidate={s}", .{ unit_id, fs.selected_candidate });
+        }
+    }
+
+    for (deps_csv_paths) |deps_path| {
+        validateDepsCsvPath(allocator, deps_path) catch |err| {
+            try appendLintError(allocator, &errors, "{s}: deps lint failed ({s})", .{ deps_path, @errorName(err) });
+        };
+    }
+
+    return errors;
 }
 
 fn parseTruthy(raw: []const u8) bool {
@@ -1020,6 +2046,671 @@ fn parseSliceUnits(allocator: std.mem.Allocator, path: []const u8) ![]SliceUnit 
     }
 
     return try units.toOwnedSlice(allocator);
+}
+
+const OrchTask = struct {
+    id: []const u8,
+    title: []const u8,
+    risk_tier: []const u8,
+    scopes: []const []const u8,
+    validations: []const []const u8,
+};
+
+fn normalizeRiskTier(raw: []const u8) []const u8 {
+    if (std.mem.eql(u8, raw, "low") or std.mem.eql(u8, raw, "med") or std.mem.eql(u8, raw, "high")) {
+        return raw;
+    }
+    return "med";
+}
+
+fn writeUnitsPayloadJson(writer: anytype, units: []const SliceUnit) !void {
+    try writer.writeAll("{\"command\":\"orchplan_to_units\",\"units\":[");
+    for (units, 0..) |unit, idx| {
+        if (idx > 0) try writer.writeAll(",");
+        try writer.writeAll("{\"id\":");
+        try writeJsonString(writer, unit.id);
+        try writer.writeAll(",\"objective\":");
+        try writeJsonString(writer, unit.objective);
+        try writer.writeAll(",\"unit_scope\":");
+        try writeJsonString(writer, unit.unit_scope);
+        try writer.writeAll(",\"write_scope\":");
+        try writeJsonString(writer, unit.write_scope);
+        try writer.writeAll(",\"constraints\":");
+        try writeJsonString(writer, unit.constraints);
+        try writer.writeAll(",\"invariants\":");
+        try writeJsonString(writer, unit.invariants);
+        try writer.writeAll(",\"proof_command\":");
+        try writeJsonString(writer, unit.proof_command);
+        try writer.writeAll(",\"risk_tier\":");
+        try writeJsonString(writer, unit.risk_tier);
+        try writer.writeAll(",\"base_sha\":");
+        try writeJsonString(writer, unit.base_sha);
+        try writer.writeAll(",\"delivery_mode\":");
+        try writeJsonString(writer, unit.delivery_mode);
+        try writer.writeAll(",\"attempt\":");
+        try writeJsonString(writer, unit.attempt);
+        try writer.writeAll(",\"variant\":");
+        try writeJsonString(writer, unit.variant);
+        try writer.writeAll(",\"budget_tier\":");
+        try writeJsonString(writer, unit.budget_tier);
+        try writer.writeAll("}");
+    }
+    try writer.print("],\"unit_count\":{d}}}\n", .{units.len});
+}
+
+fn parseOrchplanTasks(allocator: std.mem.Allocator, bytes: []const u8) ![]OrchTask {
+    if (parseOrchplanTasksFromJson(allocator, bytes)) |tasks| return tasks else |_| {}
+    return parseOrchplanTasksFromYaml(allocator, bytes);
+}
+
+fn parseOrchplanTasksFromJson(allocator: std.mem.Allocator, bytes: []const u8) ![]OrchTask {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    if (parsed.value != .object) return error.InvalidOrchPlan;
+    const tasks_value = parsed.value.object.get("tasks") orelse return error.InvalidOrchPlan;
+    if (tasks_value != .array) return error.InvalidOrchPlan;
+
+    var tasks: std.ArrayList(OrchTask) = .empty;
+    for (tasks_value.array.items) |entry| {
+        if (entry != .object) continue;
+        const id = jsonStringField(entry.object, "id") orelse continue;
+        const title = jsonStringField(entry.object, "title") orelse "";
+        const risk_tier = jsonStringField(entry.object, "risk_tier") orelse "med";
+        const scopes = try jsonStringListValue(allocator, entry.object.get("scope"));
+        const validations = try jsonStringListValue(allocator, entry.object.get("validation"));
+        try tasks.append(allocator, .{
+            .id = id,
+            .title = title,
+            .risk_tier = risk_tier,
+            .scopes = scopes,
+            .validations = validations,
+        });
+    }
+    if (tasks.items.len == 0) return error.InvalidOrchPlan;
+    return try tasks.toOwnedSlice(allocator);
+}
+
+fn jsonStringListValue(
+    allocator: std.mem.Allocator,
+    value_opt: ?std.json.Value,
+) ![]const []const u8 {
+    const value = value_opt orelse return &.{};
+    var out: std.ArrayList([]const u8) = .empty;
+    switch (value) {
+        .string => |s| {
+            const trimmed = std.mem.trim(u8, s, " \t\r");
+            if (trimmed.len > 0) try out.append(allocator, trimmed);
+        },
+        .array => |arr| {
+            for (arr.items) |item| {
+                if (item != .string) continue;
+                const trimmed = std.mem.trim(u8, item.string, " \t\r");
+                if (trimmed.len > 0) try out.append(allocator, trimmed);
+            }
+        },
+        else => {},
+    }
+    if (out.items.len == 0) return &.{};
+    return try out.toOwnedSlice(allocator);
+}
+
+fn parseOrchplanTasksFromYaml(allocator: std.mem.Allocator, bytes: []const u8) ![]OrchTask {
+    const ActiveList = enum { none, scope, validation };
+    const TaskBuilder = struct {
+        id: []const u8 = "",
+        title: []const u8 = "",
+        risk_tier: []const u8 = "med",
+        scopes: std.ArrayList([]const u8) = .empty,
+        validations: std.ArrayList([]const u8) = .empty,
+    };
+
+    var tasks: std.ArrayList(OrchTask) = .empty;
+    var current: ?TaskBuilder = null;
+    var active: ActiveList = .none;
+
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line_raw| {
+        const no_comment = stripYamlComment(line_raw);
+        const trimmed_line = std.mem.trim(u8, no_comment, " \t\r");
+        if (trimmed_line.len == 0) continue;
+        if (std.mem.eql(u8, trimmed_line, "tasks:")) continue;
+        if (std.mem.startsWith(u8, trimmed_line, "kind:")) continue;
+
+        if (std.mem.startsWith(u8, trimmed_line, "- id:")) {
+            if (current) |*curr| {
+                if (curr.id.len > 0) {
+                    const scopes = if (curr.scopes.items.len == 0) &.{} else try curr.scopes.toOwnedSlice(allocator);
+                    const validations = if (curr.validations.items.len == 0) &.{} else try curr.validations.toOwnedSlice(allocator);
+                    try tasks.append(allocator, .{
+                        .id = curr.id,
+                        .title = curr.title,
+                        .risk_tier = curr.risk_tier,
+                        .scopes = scopes,
+                        .validations = validations,
+                    });
+                }
+            }
+            current = TaskBuilder{};
+            active = .none;
+            if (current) |*curr| {
+                curr.id = parseYamlScalar(trimmed_line["- id:".len..]);
+            }
+            continue;
+        }
+
+        if (current == null) continue;
+        if (std.mem.startsWith(u8, trimmed_line, "- ") and active != .none) {
+            const item = parseYamlScalar(trimmed_line[2..]);
+            if (item.len > 0) {
+                if (active == .scope) {
+                    try current.?.scopes.append(allocator, item);
+                } else {
+                    try current.?.validations.append(allocator, item);
+                }
+            }
+            continue;
+        }
+
+        const colon_idx = std.mem.indexOfScalar(u8, trimmed_line, ':') orelse continue;
+        const key = std.mem.trim(u8, trimmed_line[0..colon_idx], " \t\r");
+        const raw_val = trimmed_line[colon_idx + 1 ..];
+
+        if (std.mem.eql(u8, key, "id")) {
+            current.?.id = parseYamlScalar(raw_val);
+            active = .none;
+            continue;
+        }
+        if (std.mem.eql(u8, key, "title")) {
+            current.?.title = parseYamlScalar(raw_val);
+            active = .none;
+            continue;
+        }
+        if (std.mem.eql(u8, key, "risk_tier")) {
+            current.?.risk_tier = parseYamlScalar(raw_val);
+            active = .none;
+            continue;
+        }
+        if (std.mem.eql(u8, key, "scope")) {
+            active = .scope;
+            const maybe_inline = std.mem.trim(u8, raw_val, " \t\r");
+            if (maybe_inline.len > 0) {
+                const inline_items = try parseYamlInlineList(allocator, maybe_inline);
+                for (inline_items) |item| {
+                    try current.?.scopes.append(allocator, item);
+                }
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, key, "validation")) {
+            active = .validation;
+            const maybe_inline = std.mem.trim(u8, raw_val, " \t\r");
+            if (maybe_inline.len > 0) {
+                const inline_items = try parseYamlInlineList(allocator, maybe_inline);
+                for (inline_items) |item| {
+                    try current.?.validations.append(allocator, item);
+                }
+            }
+            continue;
+        }
+    }
+
+    if (current) |*curr| {
+        if (curr.id.len > 0) {
+            const scopes = if (curr.scopes.items.len == 0) &.{} else try curr.scopes.toOwnedSlice(allocator);
+            const validations = if (curr.validations.items.len == 0) &.{} else try curr.validations.toOwnedSlice(allocator);
+            try tasks.append(allocator, .{
+                .id = curr.id,
+                .title = curr.title,
+                .risk_tier = curr.risk_tier,
+                .scopes = scopes,
+                .validations = validations,
+            });
+        }
+    }
+
+    if (tasks.items.len == 0) return error.InvalidOrchPlan;
+    return try tasks.toOwnedSlice(allocator);
+}
+
+fn stripYamlComment(line: []const u8) []const u8 {
+    var in_single = false;
+    var in_double = false;
+    for (line, 0..) |ch, idx| {
+        if (ch == '\'' and !in_double) in_single = !in_single;
+        if (ch == '"' and !in_single) in_double = !in_double;
+        if (ch == '#' and !in_single and !in_double) {
+            return line[0..idx];
+        }
+    }
+    return line;
+}
+
+fn parseYamlScalar(raw: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r");
+    if (trimmed.len >= 2 and ((trimmed[0] == '"' and trimmed[trimmed.len - 1] == '"') or (trimmed[0] == '\'' and trimmed[trimmed.len - 1] == '\''))) {
+        return trimmed[1 .. trimmed.len - 1];
+    }
+    return trimmed;
+}
+
+fn parseYamlInlineList(allocator: std.mem.Allocator, raw: []const u8) ![]const []const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r");
+    var out: std.ArrayList([]const u8) = .empty;
+
+    if (trimmed.len >= 2 and trimmed[0] == '[' and trimmed[trimmed.len - 1] == ']') {
+        const body = trimmed[1 .. trimmed.len - 1];
+        var it = std.mem.splitScalar(u8, body, ',');
+        while (it.next()) |part| {
+            const item = parseYamlScalar(part);
+            if (item.len > 0) try out.append(allocator, item);
+        }
+    } else {
+        const item = parseYamlScalar(trimmed);
+        if (item.len > 0) try out.append(allocator, item);
+    }
+
+    if (out.items.len == 0) return &.{};
+    return try out.toOwnedSlice(allocator);
+}
+
+fn expandPathWithHome(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    if (raw.len == 0) return raw;
+    if (raw[0] != '~') return raw;
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return raw;
+    if (raw.len == 1) return home;
+    if (raw[1] == '/') return try std.fmt.allocPrint(allocator, "{s}{s}", .{ home, raw[1..] });
+    return raw;
+}
+
+fn defaultArtifactRoot(allocator: std.mem.Allocator) ![]const u8 {
+    const env = std.process.getEnvVarOwned(allocator, "CODEX_MESH_ARTIFACT_ROOT") catch "";
+    if (env.len > 0) return try expandPathWithHome(allocator, env);
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return ".codex/mesh-artifacts";
+    return try std.fmt.allocPrint(allocator, "{s}/.codex/mesh-artifacts", .{home});
+}
+
+fn defaultRunId(allocator: std.mem.Allocator) ![]const u8 {
+    const now = std.time.timestamp();
+    return try std.fmt.allocPrint(allocator, "{d}", .{now});
+}
+
+fn meshArtifactRunDir(allocator: std.mem.Allocator, root: []const u8, run_id: []const u8) ![]const u8 {
+    if (run_id.len >= 15 and run_id[8] == 'T') {
+        return try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}/{s}/{s}/run-{s}",
+            .{ root, run_id[0..4], run_id[4..6], run_id[6..8], run_id },
+        );
+    }
+    return try std.fmt.allocPrint(allocator, "{s}/run-{s}", .{ root, run_id });
+}
+
+fn normalizeScopeToken(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r");
+    if (trimmed.len == 0) return "";
+    var out: std.ArrayList(u8) = .empty;
+    for (trimmed) |ch| {
+        if (ch == '\\') {
+            try out.append(allocator, '/');
+        } else {
+            try out.append(allocator, ch);
+        }
+    }
+    var token = out.items;
+    if (std.mem.startsWith(u8, token, "./")) token = token[2..];
+    while (token.len > 1 and token[token.len - 1] == '/') {
+        token = token[0 .. token.len - 1];
+    }
+    return token;
+}
+
+fn isBroadScopeToken(token: []const u8) bool {
+    return token.len == 0 or
+        std.mem.eql(u8, token, ".") or
+        std.mem.eql(u8, token, "*") or
+        std.mem.eql(u8, token, "**") or
+        std.mem.eql(u8, token, "**/*") or
+        std.mem.eql(u8, token, "/");
+}
+
+fn scopeRootsFromWriteScope(allocator: std.mem.Allocator, write_scope: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.tokenizeAny(u8, write_scope, ",;");
+    while (it.next()) |part| {
+        const token = try normalizeScopeToken(allocator, part);
+        if (token.len > 0) try out.append(allocator, token);
+    }
+    if (out.items.len == 0) return &.{};
+    return try out.toOwnedSlice(allocator);
+}
+
+fn rootsOverlap(a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    if (a.len > b.len and std.mem.startsWith(u8, a, b) and a[b.len] == '/') return true;
+    if (b.len > a.len and std.mem.startsWith(u8, b, a) and b[a.len] == '/') return true;
+    return false;
+}
+
+fn scopesOverlap(a: []const []const u8, b: []const []const u8) bool {
+    for (a) |a_root| {
+        for (b) |b_root| {
+            if (rootsOverlap(a_root, b_root)) return true;
+        }
+    }
+    return false;
+}
+
+fn selectCrfipUnits(
+    allocator: std.mem.Allocator,
+    units: []const SliceUnit,
+    max_active: usize,
+    warnings: *std.ArrayList([]const u8),
+) ![]SliceUnit {
+    var selected: std.ArrayList(SliceUnit) = .empty;
+    var selected_roots: std.ArrayList([]const []const u8) = .empty;
+
+    for (units) |unit| {
+        if (selected.items.len >= max_active) break;
+        if (unit.id.len == 0) continue;
+
+        const roots = try scopeRootsFromWriteScope(allocator, unit.write_scope);
+        var broad = roots.len == 0;
+        for (roots) |root| {
+            if (isBroadScopeToken(root)) {
+                broad = true;
+                break;
+            }
+        }
+        if (broad) {
+            if (selected.items.len > 0) continue;
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "unit {s}: write_scope is missing/broad; selected alone",
+                .{unit.id},
+            );
+            try warnings.append(allocator, msg);
+            try selected.append(allocator, unit);
+            try selected_roots.append(allocator, roots);
+            continue;
+        }
+
+        var overlaps = false;
+        for (selected_roots.items) |prior_roots| {
+            if (scopesOverlap(roots, prior_roots)) {
+                overlaps = true;
+                break;
+            }
+        }
+        if (overlaps) continue;
+        try selected.append(allocator, unit);
+        try selected_roots.append(allocator, roots);
+    }
+
+    return try selected.toOwnedSlice(allocator);
+}
+
+fn writeCrfipCandidateCsv(
+    allocator: std.mem.Allocator,
+    csv_path: []const u8,
+    selected: []const SliceUnit,
+) !void {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    const writer = out.writer(allocator);
+    try writer.writeAll("id,objective,unit_scope,write_scope,constraints,invariants,proof_command,risk_tier,candidate_id,triplet_index,lane,base_sha,delivery_mode,attempt,variant,budget_tier\n");
+
+    for (selected) |unit| {
+        var coder_id_buf: [256]u8 = undefined;
+        const coder_id = try std.fmt.bufPrint(&coder_id_buf, "{s}-coder-1", .{unit.id});
+        var reducer_id_buf: [256]u8 = undefined;
+        const reducer_id = try std.fmt.bufPrint(&reducer_id_buf, "{s}-reducer-2", .{unit.id});
+
+        const rows = [_]struct { candidate_id: []const u8, triplet_index: []const u8, lane: []const u8 }{
+            .{ .candidate_id = coder_id, .triplet_index = "1", .lane = "coder" },
+            .{ .candidate_id = reducer_id, .triplet_index = "2", .lane = "reducer" },
+        };
+        for (rows) |row| {
+            try writeCsvField(writer, unit.id);
+            try writer.writeByte(',');
+            try writeCsvField(writer, unit.objective);
+            try writer.writeByte(',');
+            try writeCsvField(writer, unit.unit_scope);
+            try writer.writeByte(',');
+            try writeCsvField(writer, unit.write_scope);
+            try writer.writeByte(',');
+            try writeCsvField(writer, unit.constraints);
+            try writer.writeByte(',');
+            try writeCsvField(writer, unit.invariants);
+            try writer.writeByte(',');
+            try writeCsvField(writer, unit.proof_command);
+            try writer.writeByte(',');
+            try writeCsvField(writer, unit.risk_tier);
+            try writer.writeByte(',');
+            try writeCsvField(writer, row.candidate_id);
+            try writer.writeByte(',');
+            try writeCsvField(writer, row.triplet_index);
+            try writer.writeByte(',');
+            try writeCsvField(writer, row.lane);
+            try writer.writeByte(',');
+            try writeCsvField(writer, unit.base_sha);
+            try writer.writeByte(',');
+            try writeCsvField(writer, unit.delivery_mode);
+            try writer.writeByte(',');
+            try writeCsvField(writer, unit.attempt);
+            try writer.writeByte(',');
+            try writeCsvField(writer, unit.variant);
+            try writer.writeByte(',');
+            try writeCsvField(writer, unit.budget_tier);
+            try writer.writeByte('\n');
+        }
+    }
+
+    try writeTextFile(csv_path, out.items);
+}
+
+const CommandRunResult = struct {
+    exit_code: u8,
+    stdout: []const u8,
+    stderr: []const u8,
+};
+
+fn runCommandCapture(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    cwd: ?[]const u8,
+) !CommandRunResult {
+    var child = std.process.Child.init(argv, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    if (cwd) |cwd_path| child.cwd = cwd_path;
+    try child.spawn();
+
+    const out = try child.stdout.?.readToEndAlloc(allocator, 32 * 1024 * 1024);
+    const err = try child.stderr.?.readToEndAlloc(allocator, 32 * 1024 * 1024);
+    const term = try child.wait();
+    const code: u8 = switch (term) {
+        .Exited => |c| @intCast(c),
+        else => 1,
+    };
+    return .{ .exit_code = code, .stdout = out, .stderr = err };
+}
+
+fn runSelfJsonCommand(
+    allocator: std.mem.Allocator,
+    cmd_args: []const []const u8,
+) !std.json.Value {
+    const exe_path = try std.fs.selfExePathAlloc(allocator);
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, exe_path);
+    try argv.appendSlice(allocator, cmd_args);
+
+    const result = try runCommandCapture(allocator, argv.items, null);
+    if (result.exit_code != 0) {
+        return error.ChildCommandFailed;
+    }
+    const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
+    return parsed.value;
+}
+
+fn runSelfCommandCapture(
+    allocator: std.mem.Allocator,
+    cmd_args: []const []const u8,
+) !CommandRunResult {
+    const exe_path = try std.fs.selfExePathAlloc(allocator);
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, exe_path);
+    try argv.appendSlice(allocator, cmd_args);
+    return runCommandCapture(allocator, argv.items, null);
+}
+
+fn defaultSessionsRoot(allocator: std.mem.Allocator) ![]const u8 {
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return "~/.codex/sessions";
+    return try std.fmt.allocPrint(allocator, "{s}/.codex/sessions", .{home});
+}
+
+fn parseFirstSeqRow(allocator: std.mem.Allocator, raw: []const u8) !std.json.Value {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
+    if (parsed.value != .array or parsed.value.array.items.len == 0) return error.InvalidSeqJson;
+    const first = parsed.value.array.items[0];
+    if (first != .object) return error.InvalidSeqJson;
+    return first;
+}
+
+fn jsonObjectGetString(obj: std.json.ObjectMap, key: []const u8) []const u8 {
+    const v = obj.get(key) orelse return "";
+    return switch (v) {
+        .string => |s| s,
+        .number_string => |s| s,
+        else => "",
+    };
+}
+
+fn jsonObjectGetBool(obj: std.json.ObjectMap, key: []const u8) bool {
+    const v = obj.get(key) orelse return false;
+    return switch (v) {
+        .bool => |b| b,
+        .integer => |n| n != 0,
+        .float => |f| f != 0,
+        .number_string => |s| !std.mem.eql(u8, s, "0") and !std.mem.eql(u8, s, "false"),
+        .string => |s| std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "1"),
+        else => false,
+    };
+}
+
+fn jsonObjectGetInt(obj: std.json.ObjectMap, key: []const u8) i64 {
+    const v = obj.get(key) orelse return 0;
+    return switch (v) {
+        .integer => |n| n,
+        .float => |f| @intFromFloat(f),
+        .number_string => |s| std.fmt.parseInt(i64, s, 10) catch 0,
+        .string => |s| std.fmt.parseInt(i64, s, 10) catch 0,
+        .bool => |b| if (b) 1 else 0,
+        else => 0,
+    };
+}
+
+const SpawnCsvPair = struct {
+    csv_path: []const u8,
+    output_csv_path: []const u8,
+};
+
+fn extractSpawnCsvPairs(
+    allocator: std.mem.Allocator,
+    rollout_jsonl: []const u8,
+) ![]SpawnCsvPair {
+    const bytes = try std.fs.cwd().readFileAlloc(allocator, rollout_jsonl, 64 * 1024 * 1024);
+    var out: std.ArrayList(SpawnCsvPair) = .empty;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0) continue;
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+        if (parsed.value != .object) continue;
+        const payload_v = parsed.value.object.get("payload") orelse continue;
+        if (payload_v != .object) continue;
+        const payload = payload_v.object;
+        if (!std.mem.eql(u8, jsonObjectGetString(payload, "type"), "function_call")) continue;
+        if (!std.mem.eql(u8, jsonObjectGetString(payload, "name"), "spawn_agents_on_csv")) continue;
+
+        var args_obj: ?std.json.ObjectMap = null;
+        if (payload.get("arguments")) |args_v| {
+            switch (args_v) {
+                .object => args_obj = args_v.object,
+                .string => |raw_args| {
+                    const args_parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_args, .{}) catch continue;
+                    if (args_parsed.value == .object) args_obj = args_parsed.value.object;
+                },
+                else => {},
+            }
+        }
+        const obj = args_obj orelse continue;
+        const csv_path = jsonObjectGetString(obj, "csv_path");
+        const out_path = jsonObjectGetString(obj, "output_csv_path");
+        if (csv_path.len == 0 or out_path.len == 0) continue;
+        try out.append(allocator, .{ .csv_path = csv_path, .output_csv_path = out_path });
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn isPathUnderRoot(
+    allocator: std.mem.Allocator,
+    root_path_raw: []const u8,
+    candidate_raw: []const u8,
+) bool {
+    const root_path = expandPathWithHome(allocator, root_path_raw) catch return false;
+    const candidate = expandPathWithHome(allocator, candidate_raw) catch return false;
+    const cwd = std.process.getCwdAlloc(allocator) catch return false;
+    const abs_root = std.fs.path.resolve(allocator, &.{ cwd, root_path }) catch return false;
+    const abs_candidate = std.fs.path.resolve(allocator, &.{ cwd, candidate }) catch return false;
+    if (!std.mem.startsWith(u8, abs_candidate, abs_root)) return false;
+    if (abs_candidate.len == abs_root.len) return true;
+    return abs_candidate[abs_root.len] == '/';
+}
+
+fn expandSimpleGlob(allocator: std.mem.Allocator, pattern: []const u8) ![]const []const u8 {
+    if (std.mem.indexOfScalar(u8, pattern, '*') == null) {
+        return &.{pattern};
+    }
+
+    const slash_idx = std.mem.lastIndexOfScalar(u8, pattern, '/') orelse return &.{};
+    const dir_path = if (slash_idx == 0) "." else pattern[0..slash_idx];
+    const file_pat = pattern[slash_idx + 1 ..];
+    const star_idx = std.mem.indexOfScalar(u8, file_pat, '*') orelse return &.{};
+    const prefix = file_pat[0..star_idx];
+    const suffix = file_pat[star_idx + 1 ..];
+
+    var out: std.ArrayList([]const u8) = .empty;
+    var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
+        if (!std.mem.endsWith(u8, entry.name, suffix)) continue;
+        const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
+        try out.append(allocator, full);
+    }
+    if (out.items.len == 0) return &.{};
+    return try out.toOwnedSlice(allocator);
+}
+
+fn findPythonFilesUnder(allocator: std.mem.Allocator, root_rel: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var dir = std.fs.cwd().openDir(root_rel, .{ .iterate = true }) catch return &.{};
+    defer dir.close();
+    var walker = try dir.walk(allocator);
+    defer walker.deinit();
+    while (try walker.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.path, ".py")) continue;
+        const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root_rel, entry.path });
+        try out.append(allocator, full);
+    }
+    if (out.items.len == 0) return &.{};
+    return try out.toOwnedSlice(allocator);
 }
 
 fn computeBudgetDecision(
@@ -1393,6 +3084,93 @@ test "hasRequiredHeaders validates required set" {
 
     const bad = [_][]const u8{ "id", "objective", "unit_scope" };
     try std.testing.expect(!hasRequiredHeaders(&bad, &RequiredCsvHeaders));
+}
+
+test "parseOrchplanTasks supports json and yaml" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const json_input =
+        \\{
+        \\  "kind": "OrchPlan",
+        \\  "tasks": [
+        \\    {"id":"u1","title":"Unit 1","scope":["a/b"],"validation":["echo ok"],"risk_tier":"low"},
+        \\    {"id":"u2","scope":"x/y"}
+        \\  ]
+        \\}
+    ;
+    const json_tasks = try parseOrchplanTasks(a, json_input);
+    try std.testing.expectEqual(@as(usize, 2), json_tasks.len);
+    try std.testing.expectEqualStrings("u1", json_tasks[0].id);
+    try std.testing.expectEqualStrings("Unit 1", json_tasks[0].title);
+    try std.testing.expectEqualStrings("low", json_tasks[0].risk_tier);
+    try std.testing.expectEqualStrings("a/b", json_tasks[0].scopes[0]);
+
+    const yaml_input =
+        \\kind: OrchPlan
+        \\tasks:
+        \\  - id: u3
+        \\    title: Unit 3
+        \\    scope:
+        \\      - m/n
+        \\    validation:
+        \\      - echo run
+    ;
+    const yaml_tasks = try parseOrchplanTasks(a, yaml_input);
+    try std.testing.expectEqual(@as(usize, 1), yaml_tasks.len);
+    try std.testing.expectEqualStrings("u3", yaml_tasks[0].id);
+    try std.testing.expectEqualStrings("Unit 3", yaml_tasks[0].title);
+    try std.testing.expectEqualStrings("m/n", yaml_tasks[0].scopes[0]);
+    try std.testing.expectEqualStrings("echo run", yaml_tasks[0].validations[0]);
+}
+
+test "evaluateLaneLint enforces candidate_crfip lanes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const pass_csv =
+        \\id,objective,unit_scope,write_scope,constraints,invariants,proof_command,risk_tier,candidate_id,triplet_index,lane,base_sha,delivery_mode,attempt,variant,budget_tier
+        \\u1,obj,u1,s1,,,,med,u1-coder-1,1,coder,HEAD,patch_first,1,baseline,unknown
+        \\u1,obj,u1,s1,,,,med,u1-reducer-2,2,reducer,HEAD,patch_first,1,baseline,unknown
+    ;
+    try tmp.dir.writeFile(.{ .sub_path = "pass.csv", .data = pass_csv });
+    const pass_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "pass.csv");
+    defer std.testing.allocator.free(pass_abs);
+    const pass_paths = [_][]const u8{pass_abs};
+    var pass_errors = try evaluateLaneLint(
+        a,
+        .candidate_crfip,
+        &pass_paths,
+        false,
+        "spawn_agents_on_csv",
+        &.{},
+    );
+    defer pass_errors.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), pass_errors.items.len);
+
+    const fail_csv =
+        \\id,objective,unit_scope,write_scope,constraints,invariants,proof_command,risk_tier,candidate_id,triplet_index,lane,base_sha,delivery_mode,attempt,variant,budget_tier
+        \\u1,obj,u1,s1,,,,med,u1-coder-1,1,coder,HEAD,patch_first,1,baseline,unknown
+    ;
+    try tmp.dir.writeFile(.{ .sub_path = "fail.csv", .data = fail_csv });
+    const fail_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "fail.csv");
+    defer std.testing.allocator.free(fail_abs);
+    const fail_paths = [_][]const u8{fail_abs};
+    var fail_errors = try evaluateLaneLint(
+        a,
+        .candidate_crfip,
+        &fail_paths,
+        false,
+        "spawn_agents_on_csv",
+        &.{},
+    );
+    defer fail_errors.deinit(a);
+    try std.testing.expect(fail_errors.items.len > 0);
 }
 
 test "pathsAreDistinct rejects identical path" {
