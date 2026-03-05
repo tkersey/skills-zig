@@ -7,6 +7,14 @@ pub const Options = struct {
     source: sqlite.Source = .auto,
     include_raw: bool = false,
     include_summary_fallback: bool = true,
+    session_id: ?[]const u8 = null,
+    session_slug: ?[]const u8 = null,
+    message_id: ?[]const u8 = null,
+    mode: ?[]const u8 = null,
+    time_created_min_ms: ?i64 = null,
+    time_created_max_ms: ?i64 = null,
+    order_desc: bool = false,
+    limit: usize = 0,
 };
 
 pub const Row = struct {
@@ -112,7 +120,10 @@ fn collectFromDb(allocator: std.mem.Allocator, options: Options) !RowList {
     var db = try sqlite.Db.open(allocator, db_path);
     defer db.close();
 
-    var messages_stmt = try db.prepare(allocator,
+    const order_keyword = if (options.order_desc) "DESC" else "ASC";
+    const limit_clause = if (options.limit > 0) "LIMIT ?7" else "";
+    const messages_sql = try std.fmt.allocPrint(
+        allocator,
         \\SELECT
         \\  m.rowid,
         \\  m.id,
@@ -125,21 +136,48 @@ fn collectFromDb(allocator: std.mem.Allocator, options: Options) !RowList {
         \\FROM message m
         \\LEFT JOIN session s ON s.id = m.session_id
         \\WHERE json_extract(m.data, '$.role') = 'user'
-        \\ORDER BY m.time_created ASC, m.rowid ASC
+        \\  AND (?1 IS NULL OR m.session_id = ?1)
+        \\  AND (?2 IS NULL OR s.slug = ?2)
+        \\  AND (?3 IS NULL OR m.id = ?3)
+        \\  AND (?4 IS NULL OR json_extract(m.data, '$.mode') = ?4)
+        \\  AND (?5 IS NULL OR m.time_created >= ?5)
+        \\  AND (?6 IS NULL OR m.time_created <= ?6)
+        \\ORDER BY m.time_created {s}, m.rowid {s}
+        \\{s}
+    ,
+        .{ order_keyword, order_keyword, limit_clause },
     );
+    defer allocator.free(messages_sql);
+
+    var messages_stmt = try db.prepare(allocator, messages_sql);
     defer messages_stmt.deinit();
 
-    var parts_stmt = try db.prepare(allocator,
+    const parts_sql = try std.fmt.allocPrint(
+        allocator,
         \\SELECT
         \\  p.data
         \\FROM part p
         \\WHERE p.message_id = ?1
-        \\ORDER BY p.time_created ASC, p.rowid ASC
+        \\ORDER BY p.time_created {s}, p.rowid {s}
+    ,
+        .{ order_keyword, order_keyword },
     );
+    defer allocator.free(parts_sql);
+
+    var parts_stmt = try db.prepare(allocator, parts_sql);
     defer parts_stmt.deinit();
 
     var rows = RowList.empty;
     errdefer deinitRows(allocator, &rows);
+
+    try messages_stmt.reset();
+    try bindOptionalText(&messages_stmt, 1, options.session_id);
+    try bindOptionalText(&messages_stmt, 2, options.session_slug);
+    try bindOptionalText(&messages_stmt, 3, options.message_id);
+    try bindOptionalText(&messages_stmt, 4, options.mode);
+    try bindOptionalInt64(&messages_stmt, 5, options.time_created_min_ms);
+    try bindOptionalInt64(&messages_stmt, 6, options.time_created_max_ms);
+    if (options.limit > 0) try messages_stmt.bindInt64(7, @intCast(options.limit));
 
     while (try messages_stmt.step() == .row) {
         const source_record_index = messages_stmt.intColumn(0);
@@ -311,23 +349,59 @@ fn collectFromJsonl(allocator: std.mem.Allocator, options: Options) !RowList {
     };
     defer file.close();
 
-    const content = file.readToEndAlloc(allocator, 64 * 1024 * 1024) catch return error.MissingOpencodeHistory;
-    defer allocator.free(content);
-
     var rows = RowList.empty;
     errdefer deinitRows(allocator, &rows);
 
     var line_number: i64 = 0;
-    var line_it = std.mem.splitScalar(u8, content, '\n');
-    while (line_it.next()) |raw_line| {
-        line_number += 1;
-        const line = std.mem.trimRight(u8, raw_line, "\r");
-        if (line.len == 0) continue;
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(allocator);
+    var buf: [64 * 1024]u8 = undefined;
 
-        const maybe_row = try parseJsonlLine(allocator, source_path, line, line_number, options.include_raw);
-        if (maybe_row) |row| {
-            try rows.append(allocator, row);
+    read_loop: while (true) {
+        const read_n = try file.read(&buf);
+        if (read_n == 0) break;
+
+        var start: usize = 0;
+        for (buf[0..read_n], 0..) |byte, idx| {
+            if (byte != '\n') continue;
+
+            if (idx > start) {
+                try pending.appendSlice(allocator, buf[start..idx]);
+                if (pending.items.len > 8 * 1024 * 1024) return error.StreamTooLong;
+            }
+            line_number += 1;
+            const line = std.mem.trimRight(u8, pending.items, "\r");
+            if (line.len > 0) {
+                const maybe_row = try parseJsonlLine(allocator, source_path, line, line_number, options);
+                if (maybe_row) |row| {
+                    try rows.append(allocator, row);
+                    if (!options.order_desc and options.limit > 0 and rows.items.len >= options.limit) break :read_loop;
+                }
+            }
+            pending.clearRetainingCapacity();
+            start = idx + 1;
         }
+
+        if (start < read_n) {
+            try pending.appendSlice(allocator, buf[start..read_n]);
+            if (pending.items.len > 8 * 1024 * 1024) return error.StreamTooLong;
+        }
+    }
+
+    if (pending.items.len > 0) {
+        line_number += 1;
+        const line = std.mem.trimRight(u8, pending.items, "\r");
+        if (line.len > 0) {
+            const maybe_row = try parseJsonlLine(allocator, source_path, line, line_number, options);
+            if (maybe_row) |row| {
+                try rows.append(allocator, row);
+            }
+        }
+    }
+
+    if (options.order_desc) reverseRows(&rows);
+    if (options.limit > 0 and rows.items.len > options.limit) {
+        trimRows(allocator, &rows, options.limit);
     }
 
     return rows;
@@ -343,7 +417,7 @@ fn parseJsonlLine(
     source_path: []const u8,
     line: []const u8,
     line_number: i64,
-    include_raw: bool,
+    options: Options,
 ) !?Row {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -356,8 +430,14 @@ fn parseJsonlLine(
         else => return null,
     };
 
+    if (options.session_id != null or options.session_slug != null or options.message_id != null) return null;
+    if (options.time_created_min_ms != null or options.time_created_max_ms != null) return null;
+
     const prompt_text = stringField(obj, "input") orelse return null;
     const mode = stringField(obj, "mode");
+    if (options.mode) |expected_mode| {
+        if (mode == null or !std.mem.eql(u8, mode.?, expected_mode)) return null;
+    }
     const parts_value = valueField(obj, "parts");
 
     var part_types: std.ArrayList([]u8) = .empty;
@@ -399,7 +479,7 @@ fn parseJsonlLine(
     const file_paths_csv = try joinSortedCsv(allocator, &file_paths);
     errdefer allocator.free(file_paths_csv);
 
-    const raw_parts_json = if (include_raw)
+    const raw_parts_json = if (options.include_raw)
         try stringifyParts(allocator, parts_value)
     else
         null;
@@ -420,7 +500,7 @@ fn parseJsonlLine(
         .file_parts_count = file_parts_count,
         .part_types = part_types_csv,
         .file_paths = file_paths_csv,
-        .raw_message_json = if (include_raw) try allocator.dupe(u8, line) else null,
+        .raw_message_json = if (options.include_raw) try allocator.dupe(u8, line) else null,
         .raw_parts_json = raw_parts_json,
     };
     errdefer row.deinit(allocator);
@@ -542,6 +622,44 @@ fn objectField(obj: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
 fn nestedStringField(obj: std.json.ObjectMap, parent_key: []const u8, child_key: []const u8) ?[]const u8 {
     const parent_obj = objectField(obj, parent_key) orelse return null;
     return stringField(parent_obj, child_key);
+}
+
+fn bindOptionalText(stmt: *sqlite.Stmt, idx: c_int, value: ?[]const u8) !void {
+    if (value) |text| {
+        try stmt.bindText(idx, text);
+    } else {
+        try stmt.bindNull(idx);
+    }
+}
+
+fn bindOptionalInt64(stmt: *sqlite.Stmt, idx: c_int, value: ?i64) !void {
+    if (value) |number| {
+        try stmt.bindInt64(idx, number);
+    } else {
+        try stmt.bindNull(idx);
+    }
+}
+
+fn reverseRows(rows: *RowList) void {
+    if (rows.items.len <= 1) return;
+    var left: usize = 0;
+    var right: usize = rows.items.len - 1;
+    while (left < right) {
+        const tmp = rows.items[left];
+        rows.items[left] = rows.items[right];
+        rows.items[right] = tmp;
+        left += 1;
+        right -= 1;
+    }
+}
+
+fn trimRows(allocator: std.mem.Allocator, rows: *RowList, keep: usize) void {
+    if (keep >= rows.items.len) return;
+    var idx = keep;
+    while (idx < rows.items.len) : (idx += 1) {
+        rows.items[idx].deinit(allocator);
+    }
+    rows.items.len = keep;
 }
 
 test "collect jsonl fallback returns db-native shape" {

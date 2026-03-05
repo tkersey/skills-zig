@@ -34,6 +34,8 @@ const c = struct {
     extern fn sqlite3_reset(stmt: *sqlite3_stmt) c_int;
     extern fn sqlite3_clear_bindings(stmt: *sqlite3_stmt) c_int;
     extern fn sqlite3_bind_text(stmt: *sqlite3_stmt, idx: c_int, value: [*]const u8, n: c_int, dtor: ?*const anyopaque) c_int;
+    extern fn sqlite3_bind_int64(stmt: *sqlite3_stmt, idx: c_int, value: i64) c_int;
+    extern fn sqlite3_bind_null(stmt: *sqlite3_stmt, idx: c_int) c_int;
     extern fn sqlite3_column_type(stmt: *sqlite3_stmt, iCol: c_int) c_int;
     extern fn sqlite3_column_text(stmt: *sqlite3_stmt, iCol: c_int) ?[*:0]const u8;
     extern fn sqlite3_column_int64(stmt: *sqlite3_stmt, iCol: c_int) i64;
@@ -96,6 +98,16 @@ pub const Stmt = struct {
 
     pub fn bindText(self: *Stmt, idx: c_int, value: []const u8) !void {
         const rc = c.sqlite3_bind_text(self.handle, idx, value.ptr, @intCast(value.len), null);
+        if (rc != c.SQLITE_OK) return error.OpencodeDbBindFailed;
+    }
+
+    pub fn bindInt64(self: *Stmt, idx: c_int, value: i64) !void {
+        const rc = c.sqlite3_bind_int64(self.handle, idx, value);
+        if (rc != c.SQLITE_OK) return error.OpencodeDbBindFailed;
+    }
+
+    pub fn bindNull(self: *Stmt, idx: c_int) !void {
+        const rc = c.sqlite3_bind_null(self.handle, idx);
         if (rc != c.SQLITE_OK) return error.OpencodeDbBindFailed;
     }
 
