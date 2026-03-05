@@ -28,11 +28,19 @@ Binary output:
 ./zig-out/bin/seq dataset-schema --dataset messages
 ./zig-out/bin/seq dataset-schema --dataset opencode_prompts
 ./zig-out/bin/seq dataset-schema --dataset opencode_events
+./zig-out/bin/seq dataset-schema --dataset opencode_tool_calls
+./zig-out/bin/seq dataset-schema --dataset opencode_sessions
 ./zig-out/bin/seq role-breakdown --root ~/.codex/sessions --format table
 ./zig-out/bin/seq query --spec '{"dataset":"tool_calls","group_by":["tool"],"metrics":[{"op":"count","as":"count"}],"sort":["-count"],"limit":10,"format":"json"}'
+./zig-out/bin/seq session-tooling --path /absolute/path/to/rollout.jsonl --summary --group-by executable --format table
+./zig-out/bin/seq query-diagnose --path /absolute/path/to/rollout.jsonl --threshold-ms 10000 --next-actions --format json
 ./zig-out/bin/seq opencode-prompts --limit 20 --format jsonl
+./zig-out/bin/seq opencode-prompts --session ses_abc --since 1772700000000 --latest --format table
 ./zig-out/bin/seq opencode-prompts --source db --contains "grill me" --mode normal --select session_slug,message_id,prompt_text,part_types --sort -time_created_epoch_ms --format table
 ./zig-out/bin/seq opencode-events --source db --role assistant --tool shell --status completed --select session_slug,message_id,event_index,part_type,tool_name,tool_status,text --sort -time_created_epoch_ms --limit 50 --format table
+./zig-out/bin/seq opencode-events --session ses_abc --since 2026-03-01T00:00:00Z --until 2026-03-05T00:00:00Z --latest --format jsonl
+./zig-out/bin/seq query --spec '{"dataset":"opencode_tool_calls","params":{"source":"db"},"select":["session_id","tool_name","tool_status","tool_duration_ms"],"sort":["-time_created_epoch_ms"],"limit":10,"format":"table"}'
+./zig-out/bin/seq query --spec '{"dataset":"opencode_sessions","params":{"source":"db"},"select":["session_id","event_count","tool_event_count","reasoning_event_count","duration_ms"],"sort":["-last_event_epoch_ms"],"limit":10,"format":"table"}'
 ./zig-out/bin/seq query --spec '{"dataset":"opencode_prompts","params":{"source":"db","opencode_db_path":"~/.local/share/opencode/opencode.db"},"where":[{"field":"part_types","op":"contains","value":"file"}],"select":["session_slug","prompt_text","part_types"],"sort":["-time_created_epoch_ms"],"format":"jsonl"}'
 ./zig-out/bin/seq routing-gap --cue-spec @cue-spec.json --discovery-skills grill-me,prove-it,complexity-mitigator,invariant-ace,tk
 ./zig-out/bin/seq orchestration-concurrency --session-id 019ca0e5-0beb-7740-a9bc-81664d994266 --format table
@@ -51,6 +59,7 @@ Binary output:
 - accepts `--spec <json|@path>` for full query controls
 - supports convenience flags (`--contains`, `--regex`, `--mode`, `--part-type`, `--group-by`, `--metric`, `--select`, `--sort`)
 - `opencode-events` also supports `--role`, `--tool`, and `--status`
+- both opencode commands support `--session <id|slug>`, `--since`, `--until`, and `--latest`
 - convenience flags override conflicting values from `--spec`
 - source controls:
   - `--source auto|db|jsonl` (default: `auto`)
@@ -81,6 +90,16 @@ Floor flags:
 - `--fail-on-floor` exits non-zero when any applicable row has `floor_result=fail`.
 - `--fail-on-mesh-truth` exits non-zero when any row has `mesh_truth_verdict=false`.
 
+`session-tooling` summarizes shell/tool invocation behavior from rollout JSONL:
+- raw mode (default) emits per-invocation rows with `command_text`, `primary_executable`, call lifecycle, and runtime markers
+- `--summary` aggregates by `--group-by executable|command|tool` (default `executable`)
+
+`query-diagnose` inspects `seq query` lifecycle health inside rollout JSONL:
+- raw mode (default) emits per-query diagnostics (`resolution_state`, `duration_ms`, `hang_flag`)
+- strict hang mode is enabled by default and requires unresolved lifecycle plus threshold breach
+- `--fail-on-hang` exits non-zero when any query row is flagged as hanging
+- `--next-actions` emits deterministic follow-up `seq` command suggestions
+
 ## Validation
 
 ```bash
@@ -88,6 +107,7 @@ zig build test
 # Note: `zig build test --fuzz` may fail on macOS due Zig InvalidElfMagic runtime issue.
 zig build bench -Doptimize=ReleaseFast -- --config perf/frozen/workload_config.json
 bash scripts/perf/parser_gate.sh
+bash scripts/release/command_surface_gate.sh
 
 # Linux-only bounded fuzz smoke (matches CI behavior).
 timeout 180 zig test --dep core_path -Mroot=src/tests.zig -Mcore_path=../../libs/core/src/path_helpers.zig -ffuzz --test-filter "fuzz "
