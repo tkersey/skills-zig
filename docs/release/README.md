@@ -67,3 +67,39 @@ After a tagged release in this repo:
 3. Ship the formula change from the tap repo as a separate PR/release step.
 
 This keeps binary publishing (this repo) decoupled from tap formula maintenance (tap repo).
+
+## Queue Triage (Tag Pushes)
+
+When a release tag is pushed and no new run appears in a default `gh run list` view,
+do not assume the workflow failed to trigger.
+
+Use explicit queue checks first:
+
+```bash
+gh run list --workflow release-seq.yml --status queued --limit 20
+gh run list --workflow release-learnings.yml --status queued --limit 20
+gh run view <run-id> --json status,jobs,headBranch,createdAt
+```
+
+If runs are queued for several minutes with no steps started, check GitHub service health:
+
+```bash
+curl -fsSL https://www.githubstatus.com/api/v2/status.json
+curl -fsSL https://www.githubstatus.com/api/v2/components.json \
+  | jq -r '.components[] | select(.name=="Actions") | [.name,.status,.updated_at] | @tsv'
+```
+
+## Outage Fallback (Manual Publish)
+
+If GitHub Actions is degraded/outage and tag runs remain queued, publish manually so tap
+propagation is not blocked:
+
+1. Build and package the two release archives per CLI (`<tag>-darwin-arm64.tar.gz`, `<tag>-linux-x86_64.tar.gz`).
+2. Create the release directly on the existing tag:
+   - `gh release create <tag> <asset1> <asset2> --verify-tag`
+3. Update `homebrew-tap` formula version + SHA256 from the published assets.
+4. Prove end-to-end with:
+   - `brew audit --strict tkersey/tap/<cli>`
+   - `brew upgrade --formula tkersey/tap/<cli>`
+   - `brew test tkersey/tap/<cli>`
+   - `<cli> --version`
