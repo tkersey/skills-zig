@@ -149,6 +149,15 @@ pub const dataset_meta = [_]DatasetMeta{
             "tool_name",
             "tool_status",
             "call_id",
+            "tool_start_epoch_ms",
+            "tool_end_epoch_ms",
+            "tool_duration_ms",
+            "tool_exit_code",
+            "tool_command",
+            "tool_output_len",
+            "part_time_start_epoch_ms",
+            "part_time_end_epoch_ms",
+            "has_reasoning_encrypted_content",
             "text",
             "text_len",
             "filename",
@@ -162,14 +171,75 @@ pub const dataset_meta = [_]DatasetMeta{
             "raw_part_json",
         },
     },
+    .{
+        .name = "opencode_tool_calls",
+        .description = "Tool-call rows derived from opencode_events",
+        .fields = &.{
+            "source_kind",
+            "source_path",
+            "source_record_index",
+            "session_id",
+            "session_slug",
+            "session_directory",
+            "message_id",
+            "message_parent_id",
+            "part_id",
+            "event_index",
+            "role",
+            "mode",
+            "agent",
+            "model_id",
+            "provider_id",
+            "tool_name",
+            "tool_status",
+            "call_id",
+            "tool_start_epoch_ms",
+            "tool_end_epoch_ms",
+            "tool_duration_ms",
+            "tool_exit_code",
+            "tool_command",
+            "tool_output_len",
+            "time_created_epoch_ms",
+            "time_created_iso",
+            "time_updated_epoch_ms",
+            "time_updated_iso",
+        },
+    },
+    .{
+        .name = "opencode_sessions",
+        .description = "Session rollups derived from opencode_events",
+        .fields = &.{
+            "source_kind",
+            "source_path",
+            "session_id",
+            "session_slug",
+            "session_directory",
+            "message_count",
+            "event_count",
+            "tool_event_count",
+            "reasoning_event_count",
+            "text_event_count",
+            "file_event_count",
+            "patch_event_count",
+            "first_event_epoch_ms",
+            "last_event_epoch_ms",
+            "duration_ms",
+            "last_update_epoch_ms",
+        },
+    },
 };
 
 const Options = struct {
     format: output.Format = .table,
     format_set: bool = false,
     help: bool = false,
+    summary: bool = false,
+    next_actions: bool = false,
+    latest: bool = false,
     fail_on_floor: bool = false,
     fail_on_mesh_truth: bool = false,
+    fail_on_hang: bool = false,
+    strict_hang: bool = true,
     root: ?[]const u8 = null,
     path: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
@@ -186,6 +256,9 @@ const Options = struct {
     status: ?[]const u8 = null,
     mode: ?[]const u8 = null,
     part_type: ?[]const u8 = null,
+    since: ?[]const u8 = null,
+    until: ?[]const u8 = null,
+    session: ?[]const u8 = null,
     select_text: ?[]const u8 = null,
     sort_text: ?[]const u8 = null,
     group_by_text: ?[]const u8 = null,
@@ -199,6 +272,7 @@ const Options = struct {
     discovery_skills: ?[]const u8 = null,
     limit: usize = 0,
     floor_threshold: i64 = 3,
+    threshold_ms: i64 = 10_000,
 };
 
 pub fn run(
@@ -232,6 +306,8 @@ pub fn run(
         .datasets => try cmdDatasets(allocator, opts),
         .dataset_schema => try cmdDatasetSchema(allocator, opts),
         .query => try cmdQuery(allocator, sessions_root, opts),
+        .session_tooling => try cmdSessionTooling(allocator, sessions_root, opts),
+        .query_diagnose => try cmdQueryDiagnose(allocator, sessions_root, opts),
         .opencode_prompts => try cmdOpencodePrompts(allocator, sessions_root, opts),
         .opencode_events => try cmdOpencodeEvents(allocator, sessions_root, opts),
         .unknown => return error.InvalidCommand,
@@ -297,11 +373,17 @@ fn printCommandHelp(cmd: lib.Command) !void {
         .query =>
         \\usage: seq query --spec <json|@path>
         ,
+        .session_tooling =>
+        \\usage: seq session-tooling [--session-id <id>|--path <jsonl>] [--group-by executable|command|tool] [--summary] [--limit N] [--format table|json|csv|jsonl]
+        ,
+        .query_diagnose =>
+        \\usage: seq query-diagnose [--session-id <id>|--path <jsonl>] [--threshold-ms N] [--strict-hang] [--fail-on-hang] [--next-actions] [--summary] [--format table|json|csv|jsonl]
+        ,
         .opencode_prompts =>
-        \\usage: seq opencode-prompts [--spec <json|@path>] [--contains <text>] [--regex <expr>] [--mode <name>] [--part-type <name>] [--group-by <csv>] [--metric <csv>] [--select <csv>] [--sort <csv>] [--source auto|db|jsonl] [--opencode-db-path <path>] [--opencode-path <path>] [--include-raw] [--limit N] [--format table|json|csv|jsonl]
+        \\usage: seq opencode-prompts [--spec <json|@path>] [--contains <text>] [--regex <expr>] [--session <id|slug>] [--since <epoch-ms|iso>] [--until <epoch-ms|iso>] [--latest] [--mode <name>] [--part-type <name>] [--group-by <csv>] [--metric <csv>] [--select <csv>] [--sort <csv>] [--source auto|db|jsonl] [--opencode-db-path <path>] [--opencode-path <path>] [--include-raw] [--limit N] [--format table|json|csv|jsonl]
         ,
         .opencode_events =>
-        \\usage: seq opencode-events [--spec <json|@path>] [--contains <text>] [--regex <expr>] [--role <name>] [--mode <name>] [--part-type <name>] [--tool <name>] [--status <name>] [--group-by <csv>] [--metric <csv>] [--select <csv>] [--sort <csv>] [--source auto|db|jsonl] [--opencode-db-path <path>] [--opencode-path <path>] [--include-raw] [--limit N] [--format table|json|csv|jsonl]
+        \\usage: seq opencode-events [--spec <json|@path>] [--contains <text>] [--regex <expr>] [--session <id|slug>] [--since <epoch-ms|iso>] [--until <epoch-ms|iso>] [--latest] [--role <name>] [--mode <name>] [--part-type <name>] [--tool <name>] [--status <name>] [--group-by <csv>] [--metric <csv>] [--select <csv>] [--sort <csv>] [--source auto|db|jsonl] [--opencode-db-path <path>] [--opencode-path <path>] [--include-raw] [--limit N] [--format table|json|csv|jsonl]
         ,
         .unknown =>
         \\usage: seq <command> --help
@@ -322,7 +404,7 @@ fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
         .occurrence_export => {
             if (fmt == .table) return error.InvalidFormatForCommand;
         },
-        .orchestration_concurrency, .find_session, .session_prompts, .query, .token_usage, .routing_gap, .opencode_prompts, .opencode_events => {},
+        .orchestration_concurrency, .find_session, .session_prompts, .query, .token_usage, .routing_gap, .session_tooling, .query_diagnose, .opencode_prompts, .opencode_events => {},
         .unknown => return error.InvalidCommand,
     }
 }
@@ -398,7 +480,7 @@ fn cmdQuery(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Optio
         break :blk if (query_spec.group_by.len > 0) output.Format.table else output.Format.jsonl;
     };
 
-    var rows = try collectDatasetRows(allocator, dataset_name, sessions_root, query_spec.params, query_spec.where);
+    var rows = try collectDatasetRowsForSpec(allocator, dataset_name, sessions_root, query_spec);
     defer deinitQueryRows(allocator, &rows);
 
     var result = try query.execute(allocator, rows.items, query_spec);
@@ -448,7 +530,7 @@ fn cmdOpencodePrompts(allocator: std.mem.Allocator, sessions_root: []const u8, o
     query_spec = try applyOpencodePromptConvenienceFilters(arena.allocator(), query_spec, opts);
     query_spec.params = try mergeOpencodeParams(arena.allocator(), query_spec.params, opts);
 
-    var rows = try collectDatasetRows(allocator, "opencode_prompts", sessions_root, query_spec.params, query_spec.where);
+    var rows = try collectDatasetRowsForSpec(allocator, "opencode_prompts", sessions_root, query_spec);
     defer deinitQueryRows(allocator, &rows);
 
     var result = try query.execute(allocator, rows.items, query_spec);
@@ -498,7 +580,7 @@ fn cmdOpencodeEvents(allocator: std.mem.Allocator, sessions_root: []const u8, op
     query_spec = try applyOpencodeEventConvenienceFilters(arena.allocator(), query_spec, opts);
     query_spec.params = try mergeOpencodeParams(arena.allocator(), query_spec.params, opts);
 
-    var rows = try collectDatasetRows(allocator, "opencode_events", sessions_root, query_spec.params, query_spec.where);
+    var rows = try collectDatasetRowsForSpec(allocator, "opencode_events", sessions_root, query_spec);
     defer deinitQueryRows(allocator, &rows);
 
     var result = try query.execute(allocator, rows.items, query_spec);
@@ -1080,6 +1162,696 @@ fn resolveOrchestrationInputPaths(
     }
 
     return paths;
+}
+
+const InvocationKind = enum {
+    function_call,
+    custom_tool_call,
+};
+
+const InvocationRecord = struct {
+    path: []u8,
+    session_id: []u8,
+    start_ts: ?[]u8 = null,
+    end_ts: ?[]u8 = null,
+    call_id: ?[]u8 = null,
+    tool_name: ?[]u8 = null,
+    invocation_kind: InvocationKind,
+    command_text: ?[]u8 = null,
+    primary_executable: ?[]u8 = null,
+    pty_session_id: ?i64 = null,
+    output_seen: bool = false,
+    output_running: bool = false,
+    output_exited: bool = false,
+    exit_code: ?i64 = null,
+    wall_time_ms: ?i64 = null,
+    parse_error: bool = false,
+
+    fn deinit(self: *InvocationRecord, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.session_id);
+        if (self.start_ts) |value| allocator.free(value);
+        if (self.end_ts) |value| allocator.free(value);
+        if (self.call_id) |value| allocator.free(value);
+        if (self.tool_name) |value| allocator.free(value);
+        if (self.command_text) |value| allocator.free(value);
+        if (self.primary_executable) |value| allocator.free(value);
+    }
+
+    fn unresolved(self: InvocationRecord) bool {
+        return std.mem.eql(u8, self.runningState(), "running_unresolved") or
+            std.mem.eql(u8, self.runningState(), "unresolved_no_output");
+    }
+
+    fn runningState(self: InvocationRecord) []const u8 {
+        if (self.invocation_kind == .custom_tool_call) return "not_applicable";
+        if (!self.output_seen) return "unresolved_no_output";
+        if (self.output_running and !self.output_exited) return "running_unresolved";
+        if (self.output_running and self.output_exited) return "running_then_resolved";
+        if (self.output_exited) return "completed";
+        return "output_without_state";
+    }
+
+    fn invocationKindText(self: InvocationRecord) []const u8 {
+        return switch (self.invocation_kind) {
+            .function_call => "function_call",
+            .custom_tool_call => "custom_tool_call",
+        };
+    }
+};
+
+const OutputMarkers = struct {
+    saw_running: bool = false,
+    saw_exited: bool = false,
+    pty_session_id: ?i64 = null,
+    exit_code: ?i64 = null,
+    wall_time_ms: ?i64 = null,
+};
+
+const ToolingGroupMode = enum {
+    executable,
+    command,
+    tool,
+};
+
+const ToolingSummaryBucket = struct {
+    key: []u8,
+    count: i64 = 0,
+    error_count: i64 = 0,
+    running_count: i64 = 0,
+    durations_ms: std.ArrayList(i64) = .empty,
+
+    fn deinit(self: *ToolingSummaryBucket, allocator: std.mem.Allocator) void {
+        allocator.free(self.key);
+        self.durations_ms.deinit(allocator);
+    }
+};
+
+fn cmdSessionTooling(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    opts: Options,
+) !void {
+    var records = try collectInvocationRecords(allocator, sessions_root, opts);
+    defer deinitInvocationRecords(allocator, &records);
+
+    if (opts.summary) {
+        const mode = try parseToolingGroupMode(opts.group_by_text);
+        var rows = try buildSessionToolingSummaryRows(allocator, records.items, mode);
+        defer deinitQueryRows(allocator, &rows);
+        if (opts.limit > 0 and rows.items.len > opts.limit) {
+            rows.items.len = opts.limit;
+        }
+        const cols = [_][]const u8{
+            "group_key",
+            "count",
+            "error_count",
+            "running_count",
+            "p95_wall_time_ms",
+        };
+        try output.writeOutput(allocator, opts.format, rows.items, cols[0..], opts.out_path);
+        return;
+    }
+
+    var out_rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &out_rows);
+
+    const max_rows = if (opts.limit > 0 and opts.limit < records.items.len) opts.limit else records.items.len;
+    for (records.items[0..max_rows]) |record| {
+        var row = query.Row.init(allocator);
+        try row.putOwnedKey("session_id", .{ .string = record.session_id });
+        try row.putOwnedKey("path", .{ .string = record.path });
+        try putOptionalString(&row, "timestamp", record.start_ts);
+        try putOptionalString(&row, "end_timestamp", record.end_ts);
+        try putOptionalString(&row, "call_id", record.call_id);
+        try putOptionalString(&row, "tool_name", record.tool_name);
+        try row.putOwnedKey("invocation_kind", .{ .string = record.invocationKindText() });
+        try putOptionalString(&row, "command_text", record.command_text);
+        try putOptionalString(&row, "primary_executable", record.primary_executable);
+        try putOptionalInt(&row, "pty_session_id", record.pty_session_id);
+        try putOptionalInt(&row, "wall_time_ms", record.wall_time_ms);
+        try putOptionalInt(&row, "exit_code", record.exit_code);
+        try row.putOwnedKey("running_state", .{ .string = record.runningState() });
+        try row.putOwnedKey("unresolved", .{ .bool = record.unresolved() });
+        try out_rows.append(allocator, row);
+    }
+
+    const cols = [_][]const u8{
+        "session_id",
+        "path",
+        "timestamp",
+        "end_timestamp",
+        "call_id",
+        "tool_name",
+        "invocation_kind",
+        "command_text",
+        "primary_executable",
+        "pty_session_id",
+        "wall_time_ms",
+        "exit_code",
+        "running_state",
+        "unresolved",
+    };
+    try output.writeOutput(allocator, opts.format, out_rows.items, cols[0..], opts.out_path);
+}
+
+fn cmdQueryDiagnose(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    opts: Options,
+) !void {
+    var records = try collectInvocationRecords(allocator, sessions_root, opts);
+    defer deinitInvocationRecords(allocator, &records);
+
+    var query_total: i64 = 0;
+    var hang_count: i64 = 0;
+    var unresolved_count: i64 = 0;
+    var duration_values: std.ArrayList(i64) = .empty;
+    defer duration_values.deinit(allocator);
+
+    var out_rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &out_rows);
+
+    for (records.items) |record| {
+        if (!isSeqQueryInvocation(record)) continue;
+        query_total += 1;
+
+        const unresolved = record.unresolved();
+        const threshold_exceeded = if (record.wall_time_ms) |wall_time|
+            wall_time >= opts.threshold_ms
+        else
+            false;
+        const hang_flag = if (opts.strict_hang)
+            unresolved and threshold_exceeded
+        else
+            unresolved or threshold_exceeded;
+        if (hang_flag) hang_count += 1;
+        if (unresolved) unresolved_count += 1;
+        if (record.wall_time_ms) |wall_time| {
+            try duration_values.append(allocator, wall_time);
+        }
+
+        if (opts.summary) continue;
+
+        var row = query.Row.init(allocator);
+        try row.putOwnedKey("query_call_id", .{ .string = record.call_id orelse "-" });
+        try row.putOwnedKey("session_id", .{ .string = record.session_id });
+        try row.putOwnedKey("path", .{ .string = record.path });
+        try putOptionalString(&row, "started_at", record.start_ts);
+        try putOptionalString(&row, "ended_at", record.end_ts);
+        try putOptionalInt(&row, "duration_ms", record.wall_time_ms);
+        const dataset_hint = try extractDatasetHint(allocator, record.command_text);
+        defer if (dataset_hint) |hint| allocator.free(hint);
+        try putOptionalString(&row, "dataset_hint", dataset_hint);
+        try row.putOwnedKey("unresolved", .{ .bool = unresolved });
+        try row.putOwnedKey("threshold_exceeded", .{ .bool = threshold_exceeded });
+        try row.putOwnedKey("hang_flag", .{ .bool = hang_flag });
+        try putOptionalInt(&row, "pty_session_id", record.pty_session_id);
+        try row.putOwnedKey("resolution_state", .{ .string = queryResolutionState(record) });
+        try putOptionalString(&row, "query_invocation", record.command_text);
+        if (opts.next_actions) {
+            const next_action = try buildNextAction(allocator, record, hang_flag);
+            defer if (next_action) |value| allocator.free(value);
+            try putOptionalString(&row, "next_action", next_action);
+        }
+        try out_rows.append(allocator, row);
+    }
+
+    if (opts.summary) {
+        var row = query.Row.init(allocator);
+        try row.putOwnedKey("queries_total", .{ .int = query_total });
+        try row.putOwnedKey("hangs_total", .{ .int = hang_count });
+        try row.putOwnedKey("unresolved_total", .{ .int = unresolved_count });
+        try putOptionalInt(&row, "p50_duration_ms", try percentileDuration(allocator, duration_values.items, 50));
+        try putOptionalInt(&row, "p95_duration_ms", try percentileDuration(allocator, duration_values.items, 95));
+        try row.putOwnedKey("threshold_ms", .{ .int = opts.threshold_ms });
+        try row.putOwnedKey("strict_hang", .{ .bool = opts.strict_hang });
+        if (opts.next_actions and hang_count > 0) {
+            const next_action = try std.fmt.allocPrint(
+                allocator,
+                "seq session-tooling --root {s} --summary --group-by executable --format table",
+                .{sessions_root},
+            );
+            defer allocator.free(next_action);
+            try row.putOwnedKey("next_action", .{ .string = next_action });
+        } else if (opts.next_actions) {
+            try row.putOwnedKey("next_action", .{ .string = "none" });
+        }
+        try out_rows.append(allocator, row);
+
+        if (opts.next_actions) {
+            const cols = [_][]const u8{ "queries_total", "hangs_total", "unresolved_total", "p50_duration_ms", "p95_duration_ms", "threshold_ms", "strict_hang", "next_action" };
+            try output.writeOutput(allocator, opts.format, out_rows.items, cols[0..], opts.out_path);
+        } else {
+            const cols = [_][]const u8{ "queries_total", "hangs_total", "unresolved_total", "p50_duration_ms", "p95_duration_ms", "threshold_ms", "strict_hang" };
+            try output.writeOutput(allocator, opts.format, out_rows.items, cols[0..], opts.out_path);
+        }
+    } else {
+        if (opts.limit > 0 and out_rows.items.len > opts.limit) {
+            out_rows.items.len = opts.limit;
+        }
+        if (opts.next_actions) {
+            const cols = [_][]const u8{ "query_call_id", "session_id", "path", "started_at", "ended_at", "duration_ms", "dataset_hint", "unresolved", "threshold_exceeded", "hang_flag", "pty_session_id", "resolution_state", "query_invocation", "next_action" };
+            try output.writeOutput(allocator, opts.format, out_rows.items, cols[0..], opts.out_path);
+        } else {
+            const cols = [_][]const u8{ "query_call_id", "session_id", "path", "started_at", "ended_at", "duration_ms", "dataset_hint", "unresolved", "threshold_exceeded", "hang_flag", "pty_session_id", "resolution_state", "query_invocation" };
+            try output.writeOutput(allocator, opts.format, out_rows.items, cols[0..], opts.out_path);
+        }
+    }
+
+    if (opts.fail_on_hang and hang_count > 0) return error.QueryHangDetected;
+}
+
+fn parseToolingGroupMode(raw_text: ?[]const u8) !ToolingGroupMode {
+    const raw = raw_text orelse return .executable;
+    const first = if (std.mem.indexOfScalar(u8, raw, ',')) |idx|
+        raw[0..idx]
+    else
+        raw;
+    const trimmed = std.mem.trim(u8, first, " \t\r\n");
+    if (std.mem.eql(u8, trimmed, "executable")) return .executable;
+    if (std.mem.eql(u8, trimmed, "command")) return .command;
+    if (std.mem.eql(u8, trimmed, "tool")) return .tool;
+    return error.InvalidGroupBy;
+}
+
+fn buildSessionToolingSummaryRows(
+    allocator: std.mem.Allocator,
+    records: []const InvocationRecord,
+    mode: ToolingGroupMode,
+) !std.ArrayList(query.Row) {
+    var bucket_index = std.StringHashMap(usize).init(allocator);
+    defer bucket_index.deinit();
+
+    var buckets: std.ArrayList(ToolingSummaryBucket) = .empty;
+    defer {
+        for (buckets.items) |*bucket| bucket.deinit(allocator);
+        buckets.deinit(allocator);
+    }
+
+    for (records) |record| {
+        if (mode != .tool and record.command_text == null) continue;
+        const key_text = switch (mode) {
+            .executable => record.primary_executable orelse "unknown",
+            .command => record.command_text orelse "unknown",
+            .tool => record.tool_name orelse "unknown",
+        };
+
+        const index = if (bucket_index.get(key_text)) |existing|
+            existing
+        else blk: {
+            const key_copy = try allocator.dupe(u8, key_text);
+            errdefer allocator.free(key_copy);
+            const idx = buckets.items.len;
+            try buckets.append(allocator, .{ .key = key_copy });
+            try bucket_index.put(key_copy, idx);
+            break :blk idx;
+        };
+
+        var bucket = &buckets.items[index];
+        bucket.count += 1;
+        if (record.exit_code != null and record.exit_code.? != 0) {
+            bucket.error_count += 1;
+        }
+        if (record.unresolved()) {
+            bucket.running_count += 1;
+        }
+        if (record.wall_time_ms) |wall_time| {
+            try bucket.durations_ms.append(allocator, wall_time);
+        }
+    }
+
+    std.mem.sort(ToolingSummaryBucket, buckets.items, {}, lessToolingSummaryBucket);
+
+    var out_rows: std.ArrayList(query.Row) = .empty;
+    errdefer deinitQueryRows(allocator, &out_rows);
+
+    for (buckets.items) |*bucket| {
+        var row = query.Row.init(allocator);
+        try row.putOwnedKey("group_key", .{ .string = bucket.key });
+        try row.putOwnedKey("count", .{ .int = bucket.count });
+        try row.putOwnedKey("error_count", .{ .int = bucket.error_count });
+        try row.putOwnedKey("running_count", .{ .int = bucket.running_count });
+        try putOptionalInt(&row, "p95_wall_time_ms", try percentileDuration(allocator, bucket.durations_ms.items, 95));
+        try out_rows.append(allocator, row);
+    }
+
+    return out_rows;
+}
+
+fn lessToolingSummaryBucket(_: void, a: ToolingSummaryBucket, b: ToolingSummaryBucket) bool {
+    if (a.count != b.count) return a.count > b.count;
+    return std.mem.order(u8, a.key, b.key) == .lt;
+}
+
+fn percentileDuration(
+    allocator: std.mem.Allocator,
+    values: []const i64,
+    percentile: usize,
+) !?i64 {
+    if (values.len == 0) return null;
+    const copy = try allocator.alloc(i64, values.len);
+    defer allocator.free(copy);
+    @memcpy(copy, values);
+    std.mem.sort(i64, copy, {}, lessI64);
+    const n = copy.len;
+    const rank = (n * percentile + 99) / 100;
+    const index = if (rank == 0) 0 else rank - 1;
+    return copy[index];
+}
+
+fn lessI64(_: void, a: i64, b: i64) bool {
+    return a < b;
+}
+
+fn collectInvocationRecords(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    opts: Options,
+) !std.ArrayList(InvocationRecord) {
+    var input_paths = try resolveOrchestrationInputPaths(allocator, sessions_root, opts);
+    defer freePathList(allocator, &input_paths);
+
+    var records: std.ArrayList(InvocationRecord) = .empty;
+    errdefer deinitInvocationRecords(allocator, &records);
+
+    for (input_paths.items) |session_path| {
+        try collectInvocationRecordsFromSession(allocator, session_path, &records);
+    }
+
+    return records;
+}
+
+fn collectInvocationRecordsFromSession(
+    allocator: std.mem.Allocator,
+    session_path: []const u8,
+    out: *std.ArrayList(InvocationRecord),
+) !void {
+    const content_opt = try readFileAllocOrSkip(allocator, session_path);
+    if (content_opt == null) return;
+    defer allocator.free(content_opt.?);
+
+    var call_indices = std.StringHashMap(usize).init(allocator);
+    defer call_indices.deinit();
+
+    var lines = std.mem.splitScalar(u8, content_opt.?, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len == 0 or trimmed[0] != '{') continue;
+        if (!std.mem.containsAtLeast(u8, trimmed, 1, "\"type\":\"response_item\"")) continue;
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), trimmed, .{}) catch continue;
+        defer parsed.deinit();
+        const root = switch (parsed.value) {
+            .object => |obj| obj,
+            else => continue,
+        };
+        if (!stdJsonFieldEq(root, "type", "response_item")) continue;
+
+        const payload = stdJsonObjectField(root, "payload") orelse continue;
+        const payload_type = stdJsonStringField(payload, "type") orelse continue;
+        const timestamp = stdJsonStringField(root, "timestamp");
+
+        if (std.mem.eql(u8, payload_type, "function_call") or std.mem.eql(u8, payload_type, "custom_tool_call")) {
+            const invocation_kind: InvocationKind = if (std.mem.eql(u8, payload_type, "function_call")) .function_call else .custom_tool_call;
+            const tool_name = stdJsonStringField(payload, "name") orelse continue;
+
+            var record = InvocationRecord{
+                .path = try allocator.dupe(u8, session_path),
+                .session_id = try allocator.dupe(u8, inferSessionIdFromPath(session_path)),
+                .invocation_kind = invocation_kind,
+            };
+            errdefer record.deinit(allocator);
+
+            if (timestamp) |value| {
+                record.start_ts = try allocator.dupe(u8, value);
+            }
+            record.tool_name = try allocator.dupe(u8, tool_name);
+
+            if (stdJsonStringField(payload, "call_id")) |call_id| {
+                record.call_id = try allocator.dupe(u8, call_id);
+            }
+
+            if (invocation_kind == .function_call) {
+                if (stdJsonStringField(payload, "arguments")) |arguments_text| {
+                    try applyFunctionCallArguments(allocator, &record, arguments_text);
+                }
+            } else {
+                if (std.mem.eql(u8, tool_name, "shell")) {
+                    if (stdJsonStringField(payload, "input")) |input_text| {
+                        record.command_text = try allocator.dupe(u8, input_text);
+                        record.primary_executable = try extractPrimaryExecutable(allocator, input_text);
+                    }
+                }
+            }
+
+            const index = out.items.len;
+            try out.append(allocator, record);
+            if (record.call_id) |call_id| {
+                try call_indices.put(call_id, index);
+            }
+            continue;
+        }
+
+        if (!std.mem.eql(u8, payload_type, "function_call_output")) continue;
+        const call_id = stdJsonStringField(payload, "call_id") orelse continue;
+        const index = call_indices.get(call_id) orelse continue;
+        var record = &out.items[index];
+        record.output_seen = true;
+        if (timestamp) |value| {
+            if (record.end_ts) |current| allocator.free(current);
+            record.end_ts = try allocator.dupe(u8, value);
+        }
+
+        const output_text = stdJsonStringField(payload, "output") orelse continue;
+        const markers = parseOutputMarkers(output_text);
+        if (markers.saw_running) record.output_running = true;
+        if (markers.saw_exited) record.output_exited = true;
+        if (markers.pty_session_id) |session_id| record.pty_session_id = session_id;
+        if (markers.exit_code) |exit_code| record.exit_code = exit_code;
+        if (markers.wall_time_ms) |wall_time| record.wall_time_ms = wall_time;
+    }
+}
+
+fn applyFunctionCallArguments(
+    allocator: std.mem.Allocator,
+    record: *InvocationRecord,
+    arguments_text: []const u8,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), arguments_text, .{}) catch {
+        record.parse_error = true;
+        return;
+    };
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |value| value,
+        else => {
+            record.parse_error = true;
+            return;
+        },
+    };
+
+    if (stdJsonStringField(obj, "cmd")) |cmd_text| {
+        record.command_text = try allocator.dupe(u8, cmd_text);
+        record.primary_executable = try extractPrimaryExecutable(allocator, cmd_text);
+    }
+    if (stdJsonIntField(obj, "session_id")) |session_id| {
+        record.pty_session_id = session_id;
+    } else if (stdJsonStringField(obj, "session_id")) |session_text| {
+        if (std.fmt.parseInt(i64, session_text, 10) catch null) |session_id| {
+            record.pty_session_id = session_id;
+        }
+    }
+}
+
+fn extractPrimaryExecutable(allocator: std.mem.Allocator, command_text: []const u8) !?[]u8 {
+    var it = std.mem.tokenizeAny(u8, command_text, " \t\r\n;|&(){}");
+    while (it.next()) |token_raw| {
+        const token = std.mem.trim(u8, token_raw, " \t\r\n\"'");
+        if (token.len == 0) continue;
+        if (isShellNoiseToken(token)) continue;
+        if (looksLikeEnvAssignment(token)) continue;
+        if (token[0] == '-') continue;
+        if (token.len == 1 and std.ascii.isAlphabetic(token[0])) continue;
+        if (!std.ascii.isAlphanumeric(token[0]) and token[0] != '/' and token[0] != '.') continue;
+        if (isAllDigits(token)) continue;
+
+        const basename = if (std.mem.lastIndexOfScalar(u8, token, '/')) |idx|
+            if (idx + 1 < token.len) token[idx + 1 ..] else token
+        else
+            token;
+        if (basename.len == 0) continue;
+        const executable = try allocator.dupe(u8, basename);
+        return executable;
+    }
+    return null;
+}
+
+fn isShellNoiseToken(token: []const u8) bool {
+    const keywords = [_][]const u8{
+        "if",
+        "then",
+        "else",
+        "elif",
+        "fi",
+        "for",
+        "while",
+        "do",
+        "done",
+        "case",
+        "esac",
+        "in",
+        "function",
+        "time",
+        "set",
+        "export",
+        "local",
+        "readonly",
+        "declare",
+        "typeset",
+        "env",
+        "[",
+        "]",
+    };
+    for (keywords) |keyword| {
+        if (std.mem.eql(u8, token, keyword)) return true;
+    }
+    return false;
+}
+
+fn isAllDigits(token: []const u8) bool {
+    if (token.len == 0) return false;
+    for (token) |ch| {
+        if (!std.ascii.isDigit(ch)) return false;
+    }
+    return true;
+}
+
+fn looksLikeEnvAssignment(token: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, token, '=')) |idx| {
+        if (idx == 0) return false;
+        if (token[0] == '-' or token[0] == '/') return false;
+        return true;
+    }
+    return false;
+}
+
+fn parseOutputMarkers(output_text: []const u8) OutputMarkers {
+    var out = OutputMarkers{};
+    out.wall_time_ms = parseWallTimeMs(output_text);
+    out.pty_session_id = parseSignedIntAfterPrefix(output_text, "Process running with session ID ");
+    out.exit_code = parseSignedIntAfterPrefix(output_text, "Process exited with code ");
+    out.saw_running = out.pty_session_id != null or std.mem.indexOf(u8, output_text, "Process running with session ID ") != null;
+    out.saw_exited = out.exit_code != null or std.mem.indexOf(u8, output_text, "Process exited with code ") != null;
+    return out;
+}
+
+fn parseWallTimeMs(output_text: []const u8) ?i64 {
+    const prefix = "Wall time:";
+    const prefix_index = std.mem.indexOf(u8, output_text, prefix) orelse return null;
+    var cursor = prefix_index + prefix.len;
+    while (cursor < output_text.len and std.ascii.isWhitespace(output_text[cursor])) : (cursor += 1) {}
+    const suffix_rel = std.mem.indexOf(u8, output_text[cursor..], "seconds") orelse return null;
+    const seconds_text = std.mem.trim(u8, output_text[cursor .. cursor + suffix_rel], " \t");
+    if (seconds_text.len == 0) return null;
+    const seconds = std.fmt.parseFloat(f64, seconds_text) catch return null;
+    if (!std.math.isFinite(seconds) or seconds < 0) return null;
+    return @intFromFloat(seconds * 1000.0);
+}
+
+fn parseSignedIntAfterPrefix(text: []const u8, prefix: []const u8) ?i64 {
+    const index = std.mem.indexOf(u8, text, prefix) orelse return null;
+    var cursor = index + prefix.len;
+    while (cursor < text.len and std.ascii.isWhitespace(text[cursor])) : (cursor += 1) {}
+    if (cursor >= text.len) return null;
+
+    var end = cursor;
+    if (text[end] == '-' or text[end] == '+') end += 1;
+    const digits_start = end;
+    while (end < text.len and std.ascii.isDigit(text[end])) : (end += 1) {}
+    if (digits_start == end) return null;
+    return std.fmt.parseInt(i64, text[cursor..end], 10) catch null;
+}
+
+fn isSeqQueryInvocation(record: InvocationRecord) bool {
+    if (record.invocation_kind != .function_call) return false;
+    if (record.tool_name == null or !std.mem.eql(u8, record.tool_name.?, "exec_command")) return false;
+    if (record.command_text == null) return false;
+    return std.mem.indexOf(u8, record.command_text.?, "seq query") != null;
+}
+
+fn extractDatasetHint(allocator: std.mem.Allocator, command_text_opt: ?[]const u8) !?[]u8 {
+    const command_text = command_text_opt orelse return null;
+    const patterns = [_][]const u8{
+        "\"dataset\":\"",
+        "\"dataset\": \"",
+        "\\\"dataset\\\":\\\"",
+        "\\\"dataset\\\": \\\"",
+    };
+    for (patterns) |pattern| {
+        const index = std.mem.indexOf(u8, command_text, pattern) orelse continue;
+        const start = index + pattern.len;
+        var end = start;
+        while (end < command_text.len) : (end += 1) {
+            const ch = command_text[end];
+            if (ch == '"' or ch == '\\' or ch == '\'' or std.ascii.isWhitespace(ch) or ch == ',') break;
+        }
+        if (end > start) {
+            const dataset = try allocator.dupe(u8, command_text[start..end]);
+            return dataset;
+        }
+    }
+    return null;
+}
+
+fn queryResolutionState(record: InvocationRecord) []const u8 {
+    if (record.parse_error) return "parse_error";
+    return record.runningState();
+}
+
+fn buildNextAction(
+    allocator: std.mem.Allocator,
+    record: InvocationRecord,
+    hang_flag: bool,
+) !?[]u8 {
+    if (!hang_flag) return null;
+    const state = queryResolutionState(record);
+    if (std.mem.eql(u8, state, "running_unresolved")) {
+        const action = try std.fmt.allocPrint(
+            allocator,
+            "seq session-tooling --path {s} --summary --group-by executable --format table",
+            .{record.path},
+        );
+        return action;
+    }
+    if (std.mem.eql(u8, state, "unresolved_no_output")) {
+        const action = try std.fmt.allocPrint(
+            allocator,
+            "seq session-tooling --path {s} --summary --group-by tool --format table",
+            .{record.path},
+        );
+        return action;
+    }
+    const action = try std.fmt.allocPrint(
+        allocator,
+        "seq query-diagnose --path {s} --format table",
+        .{record.path},
+    );
+    return action;
+}
+
+fn deinitInvocationRecords(
+    allocator: std.mem.Allocator,
+    records: *std.ArrayList(InvocationRecord),
+) void {
+    for (records.items) |*record| record.deinit(allocator);
+    records.deinit(allocator);
 }
 
 fn inferSessionIdFromPath(path: []const u8) []const u8 {
@@ -1679,7 +2451,7 @@ fn runDatasetQuery(
     out_path: ?[]const u8,
     columns_opt: ?[]const []const u8,
 ) !void {
-    var rows = try collectDatasetRows(allocator, dataset_name, sessions_root, query_spec.params, query_spec.where);
+    var rows = try collectDatasetRowsForSpec(allocator, dataset_name, sessions_root, query_spec);
     defer deinitQueryRows(allocator, &rows);
 
     var result = try query.execute(allocator, rows.items, query_spec);
@@ -1687,6 +2459,27 @@ fn runDatasetQuery(
 
     const cols = if (columns_opt) |c| c else if (query_spec.select.len > 0) query_spec.select else null;
     try output.writeOutput(allocator, fmt, result.rows.items, cols, out_path);
+}
+
+fn collectDatasetRowsForSpec(
+    allocator: std.mem.Allocator,
+    dataset_name: []const u8,
+    sessions_root: []const u8,
+    query_spec: spec.QuerySpec,
+) !std.ArrayList(query.Row) {
+    if (std.mem.eql(u8, dataset_name, "opencode_prompts")) {
+        return collectOpencodePromptRowsFromSpec(allocator, query_spec);
+    }
+    if (std.mem.eql(u8, dataset_name, "opencode_events")) {
+        return collectOpencodeEventRowsFromSpec(allocator, query_spec);
+    }
+    if (std.mem.eql(u8, dataset_name, "opencode_tool_calls")) {
+        return collectOpencodeToolCallRowsFromSpec(allocator, query_spec);
+    }
+    if (std.mem.eql(u8, dataset_name, "opencode_sessions")) {
+        return collectOpencodeSessionRowsFromSpec(allocator, query_spec);
+    }
+    return collectDatasetRows(allocator, dataset_name, sessions_root, query_spec.params, query_spec.where);
 }
 
 fn collectDatasetRows(
@@ -1719,6 +2512,14 @@ fn collectDatasetRows(
         try collectOpencodePromptRows(allocator, query_params, &rows);
     } else if (std.mem.eql(u8, dataset_name, "opencode_events")) {
         try collectOpencodeEventRows(allocator, query_params, &rows);
+    } else if (std.mem.eql(u8, dataset_name, "opencode_tool_calls")) {
+        const empty_query = spec.QuerySpec{ .params = query_params };
+        const derived = try collectOpencodeToolCallRowsFromSpec(allocator, empty_query);
+        rows = derived;
+    } else if (std.mem.eql(u8, dataset_name, "opencode_sessions")) {
+        const empty_query = spec.QuerySpec{ .params = query_params };
+        const derived = try collectOpencodeSessionRowsFromSpec(allocator, empty_query);
+        rows = derived;
     } else {
         return error.UnknownDataset;
     }
@@ -1970,22 +2771,35 @@ fn collectOpencodePromptRows(
     query_params: []const spec.ParamSpec,
     out_rows: *std.ArrayList(query.Row),
 ) !void {
+    const spec_view = spec.QuerySpec{ .params = query_params };
+    const rows = try collectOpencodePromptRowsFromSpec(allocator, spec_view);
+    out_rows.* = rows;
+}
+
+fn collectOpencodePromptRowsFromSpec(
+    allocator: std.mem.Allocator,
+    query_spec: spec.QuerySpec,
+) !std.ArrayList(query.Row) {
+    var out_rows: std.ArrayList(query.Row) = .empty;
+    errdefer deinitQueryRows(allocator, &out_rows);
+
     var options = datasets.opencode_prompts.Options{};
-    if (paramString(query_params, "opencode_db_path")) |opencode_db_path| {
+    if (paramString(query_spec.params, "opencode_db_path")) |opencode_db_path| {
         options.opencode_db_path = opencode_db_path;
     }
-    if (paramString(query_params, "opencode_path")) |opencode_path| {
+    if (paramString(query_spec.params, "opencode_path")) |opencode_path| {
         options.opencode_path = opencode_path;
     }
-    if (paramString(query_params, "source")) |source_text| {
+    if (paramString(query_spec.params, "source")) |source_text| {
         options.source = try datasets.opencode_sqlite.Source.parse(source_text);
     }
-    if (paramBool(query_params, "include_raw")) |include_raw| {
+    if (paramBool(query_spec.params, "include_raw")) |include_raw| {
         options.include_raw = include_raw;
     }
-    if (paramBool(query_params, "include_summary_fallback")) |include_summary_fallback| {
+    if (paramBool(query_spec.params, "include_summary_fallback")) |include_summary_fallback| {
         options.include_summary_fallback = include_summary_fallback;
     }
+    applyOpencodePromptPushdown(&options, query_spec);
 
     var parsed = try datasets.opencode_prompts.collect(allocator, options);
     defer datasets.opencode_prompts.deinitRows(allocator, &parsed);
@@ -2019,6 +2833,8 @@ fn collectOpencodePromptRows(
         try putOptionalString(&qrow, "raw_parts_json", row.raw_parts_json);
         try out_rows.append(allocator, qrow);
     }
+
+    return out_rows;
 }
 
 fn collectOpencodeEventRows(
@@ -2026,19 +2842,32 @@ fn collectOpencodeEventRows(
     query_params: []const spec.ParamSpec,
     out_rows: *std.ArrayList(query.Row),
 ) !void {
+    const spec_view = spec.QuerySpec{ .params = query_params };
+    const rows = try collectOpencodeEventRowsFromSpec(allocator, spec_view);
+    out_rows.* = rows;
+}
+
+fn collectOpencodeEventRowsFromSpec(
+    allocator: std.mem.Allocator,
+    query_spec: spec.QuerySpec,
+) !std.ArrayList(query.Row) {
+    var out_rows: std.ArrayList(query.Row) = .empty;
+    errdefer deinitQueryRows(allocator, &out_rows);
+
     var options = datasets.opencode_events.Options{};
-    if (paramString(query_params, "opencode_db_path")) |opencode_db_path| {
+    if (paramString(query_spec.params, "opencode_db_path")) |opencode_db_path| {
         options.opencode_db_path = opencode_db_path;
     }
-    if (paramString(query_params, "opencode_path")) |opencode_path| {
+    if (paramString(query_spec.params, "opencode_path")) |opencode_path| {
         options.opencode_path = opencode_path;
     }
-    if (paramString(query_params, "source")) |source_text| {
+    if (paramString(query_spec.params, "source")) |source_text| {
         options.source = try datasets.opencode_sqlite.Source.parse(source_text);
     }
-    if (paramBool(query_params, "include_raw")) |include_raw| {
+    if (paramBool(query_spec.params, "include_raw")) |include_raw| {
         options.include_raw = include_raw;
     }
+    applyOpencodeEventPushdown(&options, query_spec);
 
     var parsed = try datasets.opencode_events.collect(allocator, options);
     defer datasets.opencode_events.deinitRows(allocator, &parsed);
@@ -2064,6 +2893,19 @@ fn collectOpencodeEventRows(
         try putOptionalString(&qrow, "tool_name", row.tool_name);
         try putOptionalString(&qrow, "tool_status", row.tool_status);
         try putOptionalString(&qrow, "call_id", row.call_id);
+        try putOptionalInt(&qrow, "tool_start_epoch_ms", row.tool_start_epoch_ms);
+        try putOptionalInt(&qrow, "tool_end_epoch_ms", row.tool_end_epoch_ms);
+        try putOptionalInt(&qrow, "tool_duration_ms", row.tool_duration_ms);
+        try putOptionalInt(&qrow, "tool_exit_code", row.tool_exit_code);
+        try putOptionalString(&qrow, "tool_command", row.tool_command);
+        if (row.tool_output_len) |value| {
+            try qrow.putOwnedKey("tool_output_len", .{ .int = @intCast(value) });
+        } else {
+            try qrow.putOwnedKey("tool_output_len", .null);
+        }
+        try putOptionalInt(&qrow, "part_time_start_epoch_ms", row.part_time_start_epoch_ms);
+        try putOptionalInt(&qrow, "part_time_end_epoch_ms", row.part_time_end_epoch_ms);
+        try qrow.putOwnedKey("has_reasoning_encrypted_content", .{ .bool = row.has_reasoning_encrypted_content });
         try putOptionalString(&qrow, "text", row.text);
         if (row.text_len) |value| {
             try qrow.putOwnedKey("text_len", .{ .int = @intCast(value) });
@@ -2080,6 +2922,175 @@ fn collectOpencodeEventRows(
         try putOptionalString(&qrow, "raw_message_json", row.raw_message_json);
         try putOptionalString(&qrow, "raw_part_json", row.raw_part_json);
         try out_rows.append(allocator, qrow);
+    }
+
+    return out_rows;
+}
+
+fn collectOpencodeToolCallRowsFromSpec(
+    allocator: std.mem.Allocator,
+    query_spec: spec.QuerySpec,
+) !std.ArrayList(query.Row) {
+    var events = try collectOpencodeEventRowsFromSpec(allocator, query_spec);
+    defer deinitQueryRows(allocator, &events);
+
+    var out_rows: std.ArrayList(query.Row) = .empty;
+    errdefer deinitQueryRows(allocator, &out_rows);
+
+    const fields = [_][]const u8{
+        "source_kind",
+        "source_path",
+        "source_record_index",
+        "session_id",
+        "session_slug",
+        "session_directory",
+        "message_id",
+        "message_parent_id",
+        "part_id",
+        "event_index",
+        "role",
+        "mode",
+        "agent",
+        "model_id",
+        "provider_id",
+        "tool_name",
+        "tool_status",
+        "call_id",
+        "tool_start_epoch_ms",
+        "tool_end_epoch_ms",
+        "tool_duration_ms",
+        "tool_exit_code",
+        "tool_command",
+        "tool_output_len",
+        "time_created_epoch_ms",
+        "time_created_iso",
+        "time_updated_epoch_ms",
+        "time_updated_iso",
+    };
+
+    for (events.items) |row| {
+        if (!scalarStringEq(row.valueOrNull("part_type"), "tool")) continue;
+        const out = try row.cloneSelected(allocator, fields[0..]);
+        try out_rows.append(allocator, out);
+    }
+
+    return out_rows;
+}
+
+fn collectOpencodeSessionRowsFromSpec(
+    allocator: std.mem.Allocator,
+    query_spec: spec.QuerySpec,
+) !std.ArrayList(query.Row) {
+    var events = try collectOpencodeEventRowsFromSpec(allocator, query_spec);
+    defer deinitQueryRows(allocator, &events);
+
+    for (events.items) |*row| {
+        const part_type = row.valueOrNull("part_type");
+        try row.putOwnedKey("is_tool", .{ .int = if (scalarStringEq(part_type, "tool")) 1 else 0 });
+        try row.putOwnedKey("is_reasoning", .{ .int = if (scalarStringEq(part_type, "reasoning")) 1 else 0 });
+        try row.putOwnedKey("is_text", .{ .int = if (scalarStringEq(part_type, "text")) 1 else 0 });
+        try row.putOwnedKey("is_file", .{ .int = if (scalarStringEq(part_type, "file")) 1 else 0 });
+        try row.putOwnedKey("is_patch", .{ .int = if (scalarStringEq(part_type, "patch")) 1 else 0 });
+    }
+
+    const group_by = [_][]const u8{
+        "source_kind",
+        "source_path",
+        "session_id",
+        "session_slug",
+        "session_directory",
+    };
+    const metrics = [_]spec.MetricSpec{
+        .{ .op = .count_distinct, .field = "message_id", .alias = "message_count" },
+        .{ .op = .count, .alias = "event_count" },
+        .{ .op = .sum, .field = "is_tool", .alias = "tool_event_count" },
+        .{ .op = .sum, .field = "is_reasoning", .alias = "reasoning_event_count" },
+        .{ .op = .sum, .field = "is_text", .alias = "text_event_count" },
+        .{ .op = .sum, .field = "is_file", .alias = "file_event_count" },
+        .{ .op = .sum, .field = "is_patch", .alias = "patch_event_count" },
+        .{ .op = .min, .field = "time_created_epoch_ms", .alias = "first_event_epoch_ms" },
+        .{ .op = .max, .field = "time_created_epoch_ms", .alias = "last_event_epoch_ms" },
+        .{ .op = .max, .field = "time_updated_epoch_ms", .alias = "last_update_epoch_ms" },
+    };
+    const session_query = spec.QuerySpec{
+        .group_by = group_by[0..],
+        .metrics = metrics[0..],
+    };
+
+    var grouped = try query.execute(allocator, events.items, session_query);
+    defer grouped.deinit(allocator);
+
+    var out_rows: std.ArrayList(query.Row) = .empty;
+    errdefer deinitQueryRows(allocator, &out_rows);
+
+    for (grouped.rows.items) |row| {
+        var out = query.Row.init(allocator);
+        try out.putOwnedKey("source_kind", row.valueOrNull("source_kind"));
+        try out.putOwnedKey("source_path", row.valueOrNull("source_path"));
+        try out.putOwnedKey("session_id", row.valueOrNull("session_id"));
+        try out.putOwnedKey("session_slug", row.valueOrNull("session_slug"));
+        try out.putOwnedKey("session_directory", row.valueOrNull("session_directory"));
+        try out.putOwnedKey("message_count", row.valueOrNull("message_count"));
+        try out.putOwnedKey("event_count", row.valueOrNull("event_count"));
+        try out.putOwnedKey("tool_event_count", row.valueOrNull("tool_event_count"));
+        try out.putOwnedKey("reasoning_event_count", row.valueOrNull("reasoning_event_count"));
+        try out.putOwnedKey("text_event_count", row.valueOrNull("text_event_count"));
+        try out.putOwnedKey("file_event_count", row.valueOrNull("file_event_count"));
+        try out.putOwnedKey("patch_event_count", row.valueOrNull("patch_event_count"));
+        try out.putOwnedKey("first_event_epoch_ms", row.valueOrNull("first_event_epoch_ms"));
+        try out.putOwnedKey("last_event_epoch_ms", row.valueOrNull("last_event_epoch_ms"));
+        try out.putOwnedKey("last_update_epoch_ms", row.valueOrNull("last_update_epoch_ms"));
+
+        const first_ms = scalarAsInt(row.valueOrNull("first_event_epoch_ms"));
+        const last_ms = scalarAsInt(row.valueOrNull("last_event_epoch_ms"));
+        if (first_ms != null and last_ms != null and last_ms.? >= first_ms.?) {
+            try out.putOwnedKey("duration_ms", .{ .int = last_ms.? - first_ms.? });
+        } else {
+            try out.putOwnedKey("duration_ms", .null);
+        }
+        try out_rows.append(allocator, out);
+    }
+
+    return out_rows;
+}
+
+fn applyOpencodePromptPushdown(options: *datasets.opencode_prompts.Options, query_spec: spec.QuerySpec) void {
+    if (whereStringEq(query_spec.where, "session_id")) |value| options.session_id = value;
+    if (whereStringEq(query_spec.where, "session_slug")) |value| options.session_slug = value;
+    if (whereStringEq(query_spec.where, "message_id")) |value| options.message_id = value;
+    if (whereStringEq(query_spec.where, "mode")) |value| options.mode = value;
+
+    const range = whereEpochMsRange(query_spec.where, "time_created_epoch_ms");
+    if (range.min_ms) |min_ms| options.time_created_min_ms = min_ms;
+    if (range.max_ms) |max_ms| options.time_created_max_ms = max_ms;
+
+    if (query_spec.group_by.len == 0 and query_spec.limit > 0) {
+        if (isTimeSort(query_spec.sort)) |descending| {
+            options.order_desc = descending;
+            options.limit = query_spec.limit;
+        }
+    }
+}
+
+fn applyOpencodeEventPushdown(options: *datasets.opencode_events.Options, query_spec: spec.QuerySpec) void {
+    if (whereStringEq(query_spec.where, "session_id")) |value| options.session_id = value;
+    if (whereStringEq(query_spec.where, "session_slug")) |value| options.session_slug = value;
+    if (whereStringEq(query_spec.where, "message_id")) |value| options.message_id = value;
+    if (whereStringEq(query_spec.where, "role")) |value| options.role = value;
+    if (whereStringEq(query_spec.where, "mode")) |value| options.mode = value;
+    if (whereStringEq(query_spec.where, "part_type")) |value| options.part_type = value;
+    if (whereStringEq(query_spec.where, "tool_name")) |value| options.tool_name = value;
+    if (whereStringEq(query_spec.where, "tool_status")) |value| options.tool_status = value;
+
+    const range = whereEpochMsRange(query_spec.where, "time_created_epoch_ms");
+    if (range.min_ms) |min_ms| options.time_created_min_ms = min_ms;
+    if (range.max_ms) |max_ms| options.time_created_max_ms = max_ms;
+
+    if (query_spec.group_by.len == 0 and query_spec.limit > 0) {
+        if (isTimeSort(query_spec.sort)) |descending| {
+            options.order_desc = descending;
+            options.limit = query_spec.limit;
+        }
     }
 }
 
@@ -2105,6 +3116,80 @@ fn scalarAsInt(value: spec.Scalar) ?i64 {
         .float => |v| @intFromFloat(v),
         else => null,
     };
+}
+
+fn scalarStringEq(value: spec.Scalar, expected: []const u8) bool {
+    return switch (value) {
+        .string => |text| std.mem.eql(u8, text, expected),
+        else => false,
+    };
+}
+
+fn whereStringEq(where: []const spec.WhereClause, field: []const u8) ?[]const u8 {
+    var out: ?[]const u8 = null;
+    for (where) |clause| {
+        if (!std.mem.eql(u8, clause.field, field)) continue;
+        if (clause.op != .eq) continue;
+        const where_value = clause.value orelse continue;
+        switch (where_value) {
+            .scalar => |scalar| switch (scalar) {
+                .string => |text| out = text,
+                else => {},
+            },
+            else => {},
+        }
+    }
+    return out;
+}
+
+const EpochMsRange = struct {
+    min_ms: ?i64 = null,
+    max_ms: ?i64 = null,
+};
+
+fn whereEpochMsRange(where: []const spec.WhereClause, field: []const u8) EpochMsRange {
+    var out = EpochMsRange{};
+    for (where) |clause| {
+        if (!std.mem.eql(u8, clause.field, field)) continue;
+        const where_value = clause.value orelse continue;
+        const scalar = switch (where_value) {
+            .scalar => |v| v,
+            else => continue,
+        };
+        const value = scalarAsInt(scalar) orelse continue;
+        switch (clause.op) {
+            .gte => {
+                if (out.min_ms == null or value > out.min_ms.?) out.min_ms = value;
+            },
+            .gt => {
+                if (value < std.math.maxInt(i64)) {
+                    const adjusted = value + 1;
+                    if (out.min_ms == null or adjusted > out.min_ms.?) out.min_ms = adjusted;
+                }
+            },
+            .lte => {
+                if (out.max_ms == null or value < out.max_ms.?) out.max_ms = value;
+            },
+            .lt => {
+                if (value > std.math.minInt(i64)) {
+                    const adjusted = value - 1;
+                    if (out.max_ms == null or adjusted < out.max_ms.?) out.max_ms = adjusted;
+                }
+            },
+            .eq => {
+                out.min_ms = value;
+                out.max_ms = value;
+            },
+            else => {},
+        }
+    }
+    return out;
+}
+
+fn isTimeSort(sort: []const spec.SortSpec) ?bool {
+    if (sort.len == 0) return null;
+    if (!std.mem.eql(u8, sort[0].field, "time_created_epoch_ms")) return null;
+    return sort[0].descending;
 }
 
 fn paramString(params: []const spec.ParamSpec, key: []const u8) ?[]const u8 {
@@ -2210,6 +3295,20 @@ fn applyOpencodePromptConvenienceFilters(
             .value = .{ .scalar = .{ .string = try allocator.dupe(u8, value) } },
         });
     }
+    if (opts.session) |value| {
+        const field_name = if (std.mem.startsWith(u8, value, "ses_")) "session_id" else "session_slug";
+        try where_out.append(allocator, .{
+            .field = field_name,
+            .op = .eq,
+            .value = .{ .scalar = .{ .string = try allocator.dupe(u8, value) } },
+        });
+    }
+    if (opts.since) |value| {
+        try appendTimeWhere(allocator, &where_out, "time_created_epoch_ms", "time_created_iso", .gte, value);
+    }
+    if (opts.until) |value| {
+        try appendTimeWhere(allocator, &where_out, "time_created_epoch_ms", "time_created_iso", .lte, value);
+    }
 
     const group_by_out = if (opts.group_by_text) |csv|
         try parseCsvStringList(allocator, csv)
@@ -2219,7 +3318,7 @@ fn applyOpencodePromptConvenienceFilters(
         try parseCsvStringList(allocator, csv)
     else
         base.select;
-    const sort_out = if (opts.sort_text) |csv|
+    var sort_out = if (opts.sort_text) |csv|
         try parseCsvSortList(allocator, csv)
     else
         base.sort;
@@ -2228,6 +3327,17 @@ fn applyOpencodePromptConvenienceFilters(
     else
         base.metrics;
 
+    if (opts.latest or (group_by_out.len == 0 and sort_out.len == 0)) {
+        sort_out = try defaultRecentSort(allocator);
+    }
+
+    const limit_out = if (opts.latest and opts.limit == 0 and base.limit == 0)
+        @as(usize, 1)
+    else if (opts.limit > 0)
+        opts.limit
+    else
+        base.limit;
+
     return .{
         .where = try where_out.toOwnedSlice(allocator),
         .group_by = group_by_out,
@@ -2235,7 +3345,7 @@ fn applyOpencodePromptConvenienceFilters(
         .select = select_out,
         .sort = sort_out,
         .params = base.params,
-        .limit = if (opts.limit > 0) opts.limit else base.limit,
+        .limit = limit_out,
     };
 }
 
@@ -2297,6 +3407,20 @@ fn applyOpencodeEventConvenienceFilters(
             .value = .{ .scalar = .{ .string = try allocator.dupe(u8, value) } },
         });
     }
+    if (opts.session) |value| {
+        const field_name = if (std.mem.startsWith(u8, value, "ses_")) "session_id" else "session_slug";
+        try where_out.append(allocator, .{
+            .field = field_name,
+            .op = .eq,
+            .value = .{ .scalar = .{ .string = try allocator.dupe(u8, value) } },
+        });
+    }
+    if (opts.since) |value| {
+        try appendTimeWhere(allocator, &where_out, "time_created_epoch_ms", "time_created_iso", .gte, value);
+    }
+    if (opts.until) |value| {
+        try appendTimeWhere(allocator, &where_out, "time_created_epoch_ms", "time_created_iso", .lte, value);
+    }
 
     const group_by_out = if (opts.group_by_text) |csv|
         try parseCsvStringList(allocator, csv)
@@ -2306,7 +3430,7 @@ fn applyOpencodeEventConvenienceFilters(
         try parseCsvStringList(allocator, csv)
     else
         base.select;
-    const sort_out = if (opts.sort_text) |csv|
+    var sort_out = if (opts.sort_text) |csv|
         try parseCsvSortList(allocator, csv)
     else
         base.sort;
@@ -2315,6 +3439,17 @@ fn applyOpencodeEventConvenienceFilters(
     else
         base.metrics;
 
+    if (opts.latest or (group_by_out.len == 0 and sort_out.len == 0)) {
+        sort_out = try defaultRecentSort(allocator);
+    }
+
+    const limit_out = if (opts.latest and opts.limit == 0 and base.limit == 0)
+        @as(usize, 1)
+    else if (opts.limit > 0)
+        opts.limit
+    else
+        base.limit;
+
     return .{
         .where = try where_out.toOwnedSlice(allocator),
         .group_by = group_by_out,
@@ -2322,8 +3457,44 @@ fn applyOpencodeEventConvenienceFilters(
         .select = select_out,
         .sort = sort_out,
         .params = base.params,
-        .limit = if (opts.limit > 0) opts.limit else base.limit,
+        .limit = limit_out,
     };
+}
+
+fn appendTimeWhere(
+    allocator: std.mem.Allocator,
+    where_out: *std.ArrayList(spec.WhereClause),
+    epoch_field: []const u8,
+    iso_field: []const u8,
+    op: spec.WhereOp,
+    raw_value: []const u8,
+) !void {
+    if (parseEpochMs(raw_value)) |epoch_ms| {
+        try where_out.append(allocator, .{
+            .field = epoch_field,
+            .op = op,
+            .value = .{ .scalar = .{ .int = epoch_ms } },
+        });
+        return;
+    }
+    try where_out.append(allocator, .{
+        .field = iso_field,
+        .op = op,
+        .value = .{ .scalar = .{ .string = try allocator.dupe(u8, raw_value) } },
+    });
+}
+
+fn parseEpochMs(raw: []const u8) ?i64 {
+    return std.fmt.parseInt(i64, raw, 10) catch null;
+}
+
+fn defaultRecentSort(allocator: std.mem.Allocator) ![]const spec.SortSpec {
+    const out = try allocator.alloc(spec.SortSpec, 1);
+    out[0] = .{
+        .field = try allocator.dupe(u8, "time_created_epoch_ms"),
+        .descending = true,
+    };
+    return out;
 }
 
 fn parseCsvStringList(allocator: std.mem.Allocator, raw: []const u8) ![]const []const u8 {
@@ -2561,6 +3732,18 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.part_type = args[i];
+        } else if (std.mem.eql(u8, arg, "--since")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.since = args[i];
+        } else if (std.mem.eql(u8, arg, "--until")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.until = args[i];
+        } else if (std.mem.eql(u8, arg, "--session")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.session = args[i];
         } else if (std.mem.eql(u8, arg, "--group-by")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -2593,6 +3776,16 @@ fn parseOptions(args: []const []const u8) !Options {
             opts.include_raw = true;
         } else if (std.mem.eql(u8, arg, "--include-parts")) {
             opts.include_raw = true;
+        } else if (std.mem.eql(u8, arg, "--summary")) {
+            opts.summary = true;
+        } else if (std.mem.eql(u8, arg, "--next-actions")) {
+            opts.next_actions = true;
+        } else if (std.mem.eql(u8, arg, "--latest")) {
+            opts.latest = true;
+        } else if (std.mem.eql(u8, arg, "--strict-hang")) {
+            opts.strict_hang = true;
+        } else if (std.mem.eql(u8, arg, "--no-strict-hang")) {
+            opts.strict_hang = false;
         } else if (std.mem.eql(u8, arg, "--sections")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -2615,6 +3808,14 @@ fn parseOptions(args: []const []const u8) !Options {
             opts.fail_on_floor = true;
         } else if (std.mem.eql(u8, arg, "--fail-on-mesh-truth")) {
             opts.fail_on_mesh_truth = true;
+        } else if (std.mem.eql(u8, arg, "--fail-on-hang")) {
+            opts.fail_on_hang = true;
+        } else if (std.mem.eql(u8, arg, "--threshold-ms")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            const n = try std.fmt.parseInt(i64, args[i], 10);
+            if (n < 1) return error.InvalidLimit;
+            opts.threshold_ms = n;
         } else if (std.mem.eql(u8, arg, "--limit") or std.mem.eql(u8, arg, "--max") or std.mem.eql(u8, arg, "--top")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -2928,6 +4129,12 @@ test "parse options supports common flags" {
         "normal",
         "--part-type",
         "file",
+        "--session",
+        "ses_abc",
+        "--since",
+        "1772700000000",
+        "--until",
+        "2026-03-05T00:00:00Z",
         "--group-by",
         "mode",
         "--metric",
@@ -2943,6 +4150,13 @@ test "parse options supports common flags" {
         "--source",
         "db",
         "--include-raw",
+        "--summary",
+        "--next-actions",
+        "--latest",
+        "--strict-hang",
+        "--threshold-ms",
+        "12000",
+        "--fail-on-hang",
         "--help",
     };
     const opts = try parseOptions(args[0..]);
@@ -2964,6 +4178,9 @@ test "parse options supports common flags" {
     try std.testing.expectEqualStrings("completed", opts.status.?);
     try std.testing.expectEqualStrings("normal", opts.mode.?);
     try std.testing.expectEqualStrings("file", opts.part_type.?);
+    try std.testing.expectEqualStrings("ses_abc", opts.session.?);
+    try std.testing.expectEqualStrings("1772700000000", opts.since.?);
+    try std.testing.expectEqualStrings("2026-03-05T00:00:00Z", opts.until.?);
     try std.testing.expectEqualStrings("mode", opts.group_by_text.?);
     try std.testing.expectEqualStrings("count::count", opts.metric_text.?);
     try std.testing.expectEqualStrings("mode,input_len", opts.select_text.?);
@@ -2972,5 +4189,119 @@ test "parse options supports common flags" {
     try std.testing.expectEqualStrings("/tmp/prompt-history.jsonl", opts.opencode_path.?);
     try std.testing.expectEqualStrings("db", opts.opencode_source_text.?);
     try std.testing.expect(opts.include_raw);
+    try std.testing.expect(opts.summary);
+    try std.testing.expect(opts.next_actions);
+    try std.testing.expect(opts.latest);
+    try std.testing.expect(opts.strict_hang);
+    try std.testing.expectEqual(@as(i64, 12000), opts.threshold_ms);
+    try std.testing.expect(opts.fail_on_hang);
     try std.testing.expect(opts.help);
+}
+
+fn runCommandWithOutput(
+    allocator: std.mem.Allocator,
+    cmd: lib.Command,
+    args: []const []const u8,
+    output_path: []const u8,
+) ![]u8 {
+    var all_args: std.ArrayList([]const u8) = .empty;
+    defer all_args.deinit(allocator);
+    try all_args.appendSlice(allocator, args);
+    try all_args.append(allocator, "--output");
+    try all_args.append(allocator, output_path);
+
+    try run(allocator, cmd, all_args.items);
+
+    const file = try std.fs.openFileAbsolute(output_path, .{});
+    defer file.close();
+    return file.readToEndAlloc(allocator, 1 * 1024 * 1024);
+}
+
+test "session-tooling summary groups by primary executable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("2026/03/05");
+    const session_content =
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:00:00Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"q1\",\"arguments\":\"{\\\"cmd\\\":\\\"seq query --spec @spec.json\\\"}\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:00:12Z\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"q1\",\"output\":\"Chunk ID: aa\\nWall time: 12.250 seconds\\nProcess running with session ID 77\\nOutput:\\n\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:01:00Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"e1\",\"arguments\":\"{\\\"cmd\\\":\\\"rg -n foo\\\"}\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:01:01Z\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"e1\",\"output\":\"Chunk ID: bb\\nWall time: 0.050 seconds\\nProcess exited with code 0\\nOutput:\\n\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:02:00Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"e2\",\"arguments\":\"{\\\"cmd\\\":\\\"jq .\\\"}\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:02:01Z\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"e2\",\"output\":\"Chunk ID: cc\\nWall time: 0.090 seconds\\nProcess exited with code 2\\nOutput:\\n\"}}\n";
+    try tmp.dir.writeFile(.{
+        .sub_path = "2026/03/05/rollout-2026-03-05T00-00-00-019c0000-0000-7000-8000-000000000001.jsonl",
+        .data = session_content,
+    });
+
+    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "session-tooling-summary.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const args = [_][]const u8{
+        "--root",
+        root_abs,
+        "--summary",
+        "--group-by",
+        "executable",
+        "--format",
+        "json",
+    };
+    const got = try runCommandWithOutput(std.testing.allocator, .session_tooling, args[0..], output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"group_key\": \"seq\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"group_key\": \"rg\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"group_key\": \"jq\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"error_count\": 1") != null);
+}
+
+test "query-diagnose flags strict hangs and supports fail-on-hang" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("2026/03/05");
+    const session_content =
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:00:00Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"q1\",\"arguments\":\"{\\\"cmd\\\":\\\"seq query --spec @spec.json\\\"}\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:00:12Z\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"q1\",\"output\":\"Chunk ID: aa\\nWall time: 12.250 seconds\\nProcess running with session ID 77\\nOutput:\\n\"}}\n";
+    try tmp.dir.writeFile(.{
+        .sub_path = "2026/03/05/rollout-2026-03-05T00-00-00-019c0000-0000-7000-8000-000000000002.jsonl",
+        .data = session_content,
+    });
+
+    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "query-diagnose.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const args = [_][]const u8{
+        "--root",
+        root_abs,
+        "--threshold-ms",
+        "10000",
+        "--next-actions",
+        "--format",
+        "json",
+    };
+    const got = try runCommandWithOutput(std.testing.allocator, .query_diagnose, args[0..], output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"query_call_id\": \"q1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"hang_flag\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"resolution_state\": \"running_unresolved\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"next_action\": \"seq session-tooling --path ") != null);
+
+    const fail_args = [_][]const u8{
+        "--root",
+        root_abs,
+        "--threshold-ms",
+        "10000",
+        "--fail-on-hang",
+        "--format",
+        "json",
+        "--output",
+        output_path,
+    };
+    try std.testing.expectError(error.QueryHangDetected, run(std.testing.allocator, .query_diagnose, fail_args[0..]));
 }

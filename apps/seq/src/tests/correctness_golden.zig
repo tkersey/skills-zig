@@ -187,3 +187,33 @@ test "golden query opencode-events jsonl" {
 
     try std.testing.expectEqualStrings(expected, got);
 }
+
+test "golden query opencode-tool-calls jsonl" {
+    const args = [_][]const u8{
+        "--spec",
+        "@testdata/golden/query-opencode-tool-calls.json",
+    };
+
+    const got = try runAndReadOutput(std.testing.allocator, .query, args[0..], ".zig-cache/golden-query-opencode-tool-calls.jsonl");
+    defer std.testing.allocator.free(got);
+
+    const expected = try readExpected(std.testing.allocator, "testdata/golden/expected/query-opencode-tool-calls.jsonl");
+    defer std.testing.allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, got);
+}
+
+test "golden query opencode-sessions jsonl" {
+    const args = [_][]const u8{
+        "--spec",
+        "@testdata/golden/query-opencode-sessions.json",
+    };
+
+    const got = try runAndReadOutput(std.testing.allocator, .query, args[0..], ".zig-cache/golden-query-opencode-sessions.jsonl");
+    defer std.testing.allocator.free(got);
+
+    const expected = try readExpected(std.testing.allocator, "testdata/golden/expected/query-opencode-sessions.jsonl");
+    defer std.testing.allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, got);
+}

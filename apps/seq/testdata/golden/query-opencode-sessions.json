@@ -1,0 +1,21 @@
+{
+  "dataset": "opencode_sessions",
+  "params": {
+    "source": "jsonl",
+    "opencode_path": "testdata/golden/opencode/prompt-history-tooling.jsonl"
+  },
+  "select": [
+    "source_kind",
+    "event_count",
+    "message_count",
+    "tool_event_count",
+    "reasoning_event_count",
+    "text_event_count",
+    "file_event_count",
+    "patch_event_count",
+    "first_event_epoch_ms",
+    "last_event_epoch_ms",
+    "duration_ms"
+  ],
+  "format": "jsonl"
+}

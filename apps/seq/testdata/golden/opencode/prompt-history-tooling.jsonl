@@ -1,0 +1,2 @@
+{"input":"run list","parts":[{"type":"tool","callID":"c1","tool":"bash","state":{"status":"completed","input":{"command":"ls -F"},"output":"a\nb\n","metadata":{"exit":0},"time":{"start":1000,"end":1015}}},{"type":"reasoning","text":"","metadata":{"openai":{"reasoningEncryptedContent":"enc"}},"time":{"start":990,"end":1020}}],"mode":"build"}
+{"input":"simple","parts":[{"type":"text","text":"hi"},{"type":"file","filename":"note.txt"}],"mode":"normal"}
