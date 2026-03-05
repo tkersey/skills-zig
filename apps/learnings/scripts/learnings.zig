@@ -14,18 +14,20 @@ const UsageText =
     \\
     \\Marker: learnings.zig
     \\
-    \\usage: learnings [-h] [--path PATH] {datasets,dataset-schema,query,recent,recall,codify-candidates} ...
+    \\usage: learnings [-h] [--path PATH] {datasets,dataset-schema,query,recent,recall,codify-candidates,quality-audit,value-report} ...
     \\
     \\Mine, recall, and promote records from repo-root .learnings.jsonl.
     \\
     \\positional arguments:
-    \\  {datasets,dataset-schema,query,recent,recall,codify-candidates}
+    \\  {datasets,dataset-schema,query,recent,recall,codify-candidates,quality-audit,value-report}
     \\    datasets            List datasets
     \\    dataset-schema      Show dataset schema
     \\    query               Run a JSON spec query
     \\    recent              Show most recent learnings
     \\    recall              Rank relevant learnings for a task
     \\    codify-candidates   Suggest repeated/high-impact learnings to promote into durable docs
+    \\    quality-audit       Summarize learning capture quality and contract health
+    \\    value-report        Compare recall-loaded sessions against a non-recall comparator
     \\
     \\options:
     \\  -h, --help            show this help message and exit
@@ -147,6 +149,51 @@ const TOOL_KEYWORDS = [_][]const u8{
     "precommit",
 };
 
+const RecallTextMarkers = [_][]const u8{
+    "learnings recall",
+    "run_learnings_tool recall",
+};
+
+const LearningsTextMarkers = [_][]const u8{
+    "$learnings",
+    "append_learning",
+    "run_learnings_tool",
+    "learnings recall",
+    ".learnings.jsonl",
+    "skill:learnings",
+};
+
+const ImplementationTextMarkers = [_][]const u8{
+    "$tk",
+    "$fix",
+    "$mesh",
+    "$commit",
+    "$patch",
+    "$ship",
+    "$join",
+    "$fin",
+    "$zig",
+    "<name>tk</name>",
+    "<name>fix</name>",
+    "<name>mesh</name>",
+};
+
+const ProofTextMarkers = [_][]const u8{
+    "proof",
+    "validated",
+    "validation",
+    "passed",
+    "fail->pass",
+};
+
+const FrictionTextMarkers = [_][]const u8{
+    "error",
+    "failed",
+    "timeout",
+    "retry",
+    "invalid",
+};
+
 const StatusBoost = struct {
     status: []const u8,
     value: f64,
@@ -168,10 +215,17 @@ const Command = enum {
     recent,
     recall,
     codify_candidates,
+    quality_audit,
+    value_report,
 };
 
 const Args = struct {
     path: []const u8 = ".learnings.jsonl",
+    sessions_root: []const u8 = "",
+    since: []const u8 = "",
+    until: []const u8 = "",
+    comparator: []const u8 = "learnings_nonrecall",
+    output: []const u8 = "",
     command: ?Command = null,
     dataset: ?[]const u8 = null,
     spec: ?[]const u8 = null,
@@ -212,6 +266,48 @@ const DateParts = struct {
     year: i32,
     month: i32,
     day: i32,
+};
+
+const Comparator = enum {
+    learnings_nonrecall,
+    impl_nonrecall,
+    all_nonrecall,
+};
+
+const QualityCounts = struct {
+    total_records: usize = 0,
+    required_key_missing_count: usize = 0,
+    missing_application_count: usize = 0,
+    missing_or_empty_evidence_count: usize = 0,
+    condition_action_count: usize = 0,
+    evidence_anchor_count: usize = 0,
+    fingerprint_duplicate_groups: usize = 0,
+};
+
+const SessionSummary = struct {
+    path: []u8,
+    day: []u8,
+    duration_min: f64,
+    has_recall: bool,
+    has_learnings: bool,
+    has_impl: bool,
+    has_proof: bool,
+    has_friction: bool,
+    recall_delta_min: ?f64,
+
+    fn deinit(self: SessionSummary, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.day);
+    }
+};
+
+const CohortStats = struct {
+    n: usize = 0,
+    duration_median_min: ?f64 = null,
+    duration_p90_min: ?f64 = null,
+    proof_rate: ?f64 = null,
+    friction_rate: ?f64 = null,
+    recall_delta_median_min: ?f64 = null,
 };
 
 pub fn main() !void {
@@ -277,6 +373,25 @@ pub fn main() !void {
             parsed.format,
             parsed.drop_superseded,
         ),
+        .quality_audit => try cmdQualityAudit(
+            allocator,
+            jsonl_path,
+            parsed.since,
+            parsed.until,
+            parsed.format,
+            parsed.output,
+        ),
+        .value_report => try cmdValueReport(
+            allocator,
+            repo_root,
+            jsonl_path,
+            parsed.sessions_root,
+            parsed.since,
+            parsed.until,
+            parsed.comparator,
+            parsed.format,
+            parsed.output,
+        ),
     }
 }
 
@@ -315,6 +430,14 @@ fn parseArgs(argv: []const []const u8) !Args {
         }
         if (std.mem.eql(u8, arg, "codify-candidates")) {
             args.command = .codify_candidates;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "quality-audit")) {
+            args.command = .quality_audit;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "value-report")) {
+            args.command = .value_report;
             continue;
         }
 
@@ -404,6 +527,72 @@ fn parseArgs(argv: []const []const u8) !Args {
                 }
                 return error.InvalidCodifyArg;
             },
+            .quality_audit => {
+                if (std.mem.eql(u8, arg, "--since")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingSinceValue;
+                    args.since = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--until")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingUntilValue;
+                    args.until = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--format")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingFormatValue;
+                    args.format = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--output")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingOutputValue;
+                    args.output = argv[i];
+                    continue;
+                }
+                return error.InvalidQualityAuditArg;
+            },
+            .value_report => {
+                if (std.mem.eql(u8, arg, "--sessions-root")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingSessionsRootValue;
+                    args.sessions_root = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--since")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingSinceValue;
+                    args.since = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--until")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingUntilValue;
+                    args.until = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--comparator")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingComparatorValue;
+                    args.comparator = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--format")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingFormatValue;
+                    args.format = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--output")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingOutputValue;
+                    args.output = argv[i];
+                    continue;
+                }
+                return error.InvalidValueReportArg;
+            },
             .datasets => return error.InvalidDatasetsArg,
         }
     }
@@ -452,6 +641,21 @@ fn printParseError(err: anyerror, argv: []const []const u8) noreturn {
         error.MissingFormatValue => {
             stderr.print("error: argument --format: expected one argument\n", .{}) catch {};
         },
+        error.MissingSinceValue => {
+            stderr.print("error: argument --since: expected one argument\n", .{}) catch {};
+        },
+        error.MissingUntilValue => {
+            stderr.print("error: argument --until: expected one argument\n", .{}) catch {};
+        },
+        error.MissingSessionsRootValue => {
+            stderr.print("error: argument --sessions-root: expected one argument\n", .{}) catch {};
+        },
+        error.MissingComparatorValue => {
+            stderr.print("error: argument --comparator: expected one argument\n", .{}) catch {};
+        },
+        error.MissingOutputValue => {
+            stderr.print("error: argument --output: expected one argument\n", .{}) catch {};
+        },
         error.InvalidPositiveInt => {
             stderr.print("error: expected non-negative integer\n", .{}) catch {};
         },
@@ -461,6 +665,8 @@ fn printParseError(err: anyerror, argv: []const []const u8) noreturn {
         error.InvalidRecentArg,
         error.InvalidRecallArg,
         error.InvalidCodifyArg,
+        error.InvalidQualityAuditArg,
+        error.InvalidValueReportArg,
         => {
             stderr.print("error: invalid arguments\n", .{}) catch {};
         },
@@ -1061,6 +1267,819 @@ fn cmdCodifyCandidates(
     }
 
     try renderCodifyTable(allocator, capped);
+}
+
+fn cmdQualityAudit(
+    allocator: std.mem.Allocator,
+    jsonl_path: []const u8,
+    since: []const u8,
+    until: []const u8,
+    format_text: []const u8,
+    output_path: []const u8,
+) !void {
+    const format = query_output.Format.parse(format_text) catch {
+        try renderErrorLine("error: --format must be one of: table, json, csv, jsonl\n", .{});
+        return;
+    };
+
+    var rows = try collectDatasetRows(allocator, jsonl_path, "learnings");
+    defer {
+        for (rows.items) |*row| row.deinit();
+        rows.deinit(allocator);
+    }
+
+    var counts = QualityCounts{};
+
+    var status_counts = std.StringHashMap(usize).init(allocator);
+    defer deinitOwnedStringMapValues(allocator, &status_counts);
+
+    var day_counts = std.StringHashMap(usize).init(allocator);
+    defer deinitOwnedStringMapValues(allocator, &day_counts);
+
+    var fingerprint_counts = std.StringHashMap(usize).init(allocator);
+    defer deinitOwnedStringMapValues(allocator, &fingerprint_counts);
+
+    for (rows.items) |row| {
+        const day = rowString(row, "day");
+        if (!inDateWindow(day, since, until)) continue;
+
+        counts.total_records += 1;
+        if (hasMissingRequiredKey(row)) counts.required_key_missing_count += 1;
+        if (std.mem.trim(u8, rowString(row, "application"), " \t\r\n").len == 0) {
+            counts.missing_application_count += 1;
+        }
+
+        const evidence_count = scalarAsInt(row.valueOrNull("evidence_count"));
+        const evidence_text = rowString(row, "evidence_text");
+        if (evidence_count == 0 or std.mem.trim(u8, evidence_text, " \t\r\n").len == 0) {
+            counts.missing_or_empty_evidence_count += 1;
+        }
+
+        if (isConditionActionLearning(rowString(row, "learning"))) {
+            counts.condition_action_count += 1;
+        }
+        if (evidenceHasAnchor(evidence_text)) {
+            counts.evidence_anchor_count += 1;
+        }
+
+        const status = rowString(row, "status");
+        if (status.len > 0) {
+            try incrementCount(&status_counts, allocator, status);
+        }
+        if (day.len > 0) {
+            try incrementCount(&day_counts, allocator, day);
+        }
+
+        const fingerprint = rowString(row, "fingerprint");
+        if (fingerprint.len > 0) {
+            try incrementCount(&fingerprint_counts, allocator, fingerprint);
+        }
+    }
+
+    var fp_it = fingerprint_counts.iterator();
+    while (fp_it.next()) |entry| {
+        if (entry.value_ptr.* > 1) counts.fingerprint_duplicate_groups += 1;
+    }
+
+    const condition_rate = ratioAsPercent(counts.condition_action_count, counts.total_records);
+    const anchor_rate = ratioAsPercent(counts.evidence_anchor_count, counts.total_records);
+
+    var out_rows: std.ArrayList(query_engine.Row) = .empty;
+    defer {
+        for (out_rows.items) |*row| row.deinit();
+        out_rows.deinit(allocator);
+    }
+
+    try appendMetricValueRow(allocator, &out_rows, "total_records", counts.total_records);
+    try appendMetricValueRow(allocator, &out_rows, "required_key_missing_count", counts.required_key_missing_count);
+    try appendMetricValueRow(allocator, &out_rows, "missing_application_count", counts.missing_application_count);
+    try appendMetricValueRow(allocator, &out_rows, "missing_or_empty_evidence_count", counts.missing_or_empty_evidence_count);
+    try appendMetricFloatRow(allocator, &out_rows, "condition_action_rate_pct", condition_rate);
+    try appendMetricFloatRow(allocator, &out_rows, "evidence_anchor_rate_pct", anchor_rate);
+    try appendMetricValueRow(allocator, &out_rows, "fingerprint_duplicate_groups", counts.fingerprint_duplicate_groups);
+
+    try appendGroupedCountsRows(allocator, &out_rows, &status_counts, "status_count");
+    try appendGroupedCountsRows(allocator, &out_rows, &day_counts, "daily_count");
+
+    if (counts.total_records == 0) {
+        try appendMetricTextRow(allocator, &out_rows, "confidence_note", "no_records_in_window");
+    } else {
+        if (counts.total_records < 10) {
+            try appendMetricTextRow(allocator, &out_rows, "confidence_note", "small_sample");
+        }
+        if (counts.required_key_missing_count > 0) {
+            try appendMetricTextRow(allocator, &out_rows, "confidence_note", "required_key_gaps_present");
+        }
+        if (counts.missing_or_empty_evidence_count > 0) {
+            try appendMetricTextRow(allocator, &out_rows, "confidence_note", "evidence_gaps_present");
+        }
+    }
+
+    const cols = [_][]const u8{ "metric", "value" };
+    const rendered = try query_output.render(allocator, format, out_rows.items, cols[0..]);
+    defer allocator.free(rendered);
+    try emitOutput(output_path, rendered);
+}
+
+fn cmdValueReport(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    jsonl_path: []const u8,
+    sessions_root_raw: []const u8,
+    since: []const u8,
+    until: []const u8,
+    comparator_text: []const u8,
+    format_text: []const u8,
+    output_path: []const u8,
+) !void {
+    _ = jsonl_path;
+
+    const format = query_output.Format.parse(format_text) catch {
+        try renderErrorLine("error: --format must be one of: table, json, csv, jsonl\n", .{});
+        return;
+    };
+
+    const comparator = parseComparator(comparator_text) catch {
+        try renderErrorLine("error: --comparator must be one of: learnings_nonrecall, impl_nonrecall, all_nonrecall\n", .{});
+        return;
+    };
+
+    const sessions_root = try resolveSessionsRootAlloc(allocator, repo_root, sessions_root_raw);
+    defer allocator.free(sessions_root);
+
+    var sessions = try collectSessionSummaries(allocator, sessions_root, since, until, comparator);
+    defer {
+        for (sessions.items) |entry| entry.deinit(allocator);
+        sessions.deinit(allocator);
+    }
+
+    var primary_idxs: std.ArrayList(usize) = .empty;
+    defer primary_idxs.deinit(allocator);
+
+    var comparator_idxs: std.ArrayList(usize) = .empty;
+    defer comparator_idxs.deinit(allocator);
+
+    for (sessions.items, 0..) |entry, idx| {
+        if (entry.has_recall) try primary_idxs.append(allocator, idx);
+
+        if (entry.has_recall) continue;
+        switch (comparator) {
+            .learnings_nonrecall => if (entry.has_learnings) try comparator_idxs.append(allocator, idx),
+            .impl_nonrecall => if (entry.has_impl) try comparator_idxs.append(allocator, idx),
+            .all_nonrecall => try comparator_idxs.append(allocator, idx),
+        }
+    }
+
+    const primary = computeCohortStats(allocator, sessions.items, primary_idxs.items);
+    const comparator_stats = computeCohortStats(allocator, sessions.items, comparator_idxs.items);
+
+    const rel_duration = relativeDelta(primary.duration_median_min, comparator_stats.duration_median_min);
+    const rel_proof = relativeDelta(primary.proof_rate, comparator_stats.proof_rate);
+    const rel_friction = relativeDelta(primary.friction_rate, comparator_stats.friction_rate);
+
+    var recommendation: []const u8 = "keep_policy";
+    if (primary.n == 0 or comparator_stats.n == 0) {
+        recommendation = "insufficient_data";
+    } else if (exceedsRecommendationThreshold(rel_duration, rel_proof, rel_friction)) {
+        recommendation = "review_policy";
+    }
+
+    var out_rows: std.ArrayList(query_engine.Row) = .empty;
+    defer {
+        for (out_rows.items) |*row| row.deinit();
+        out_rows.deinit(allocator);
+    }
+
+    try appendValueReportRow(allocator, &out_rows, "window_since", since, "", "");
+    try appendValueReportRow(allocator, &out_rows, "window_until", until, "", "");
+    try appendValueReportRow(allocator, &out_rows, "cohort_primary", "recall_loaded", "", "");
+    try appendValueReportRow(allocator, &out_rows, "cohort_comparator", comparatorLabel(comparator), "", "");
+
+    try appendValueReportIntRow(allocator, &out_rows, "n_primary", primary.n, comparator_stats.n);
+    try appendValueReportOptionalFloatRow(allocator, &out_rows, "duration_median_primary_min", primary.duration_median_min, comparator_stats.duration_median_min);
+    try appendValueReportOptionalFloatRow(allocator, &out_rows, "duration_p90_primary_min", primary.duration_p90_min, comparator_stats.duration_p90_min);
+    try appendValueReportOptionalFloatRow(allocator, &out_rows, "proof_rate_primary", primary.proof_rate, comparator_stats.proof_rate);
+    try appendValueReportOptionalFloatRow(allocator, &out_rows, "friction_rate_primary", primary.friction_rate, comparator_stats.friction_rate);
+    try appendValueReportOptionalFloatRow(allocator, &out_rows, "recall_load_delta_median_min", primary.recall_delta_median_min, null);
+
+    try appendValueReportDeltaRow(allocator, &out_rows, "relative_delta_duration", rel_duration);
+    try appendValueReportDeltaRow(allocator, &out_rows, "relative_delta_proof", rel_proof);
+    try appendValueReportDeltaRow(allocator, &out_rows, "relative_delta_friction", rel_friction);
+    try appendValueReportRow(allocator, &out_rows, "comparator_fallback_used", "false", "", "");
+    try appendValueReportRow(allocator, &out_rows, "policy_recommendation", recommendation, "", "");
+
+    if (comparator_stats.n < 10) {
+        try appendValueReportRow(allocator, &out_rows, "confidence_note", "small_comparator_sample", "", "");
+    }
+    if (primary.n == 0) {
+        try appendValueReportRow(allocator, &out_rows, "confidence_note", "no_recall_sessions_in_window", "", "");
+    }
+
+    const cols = [_][]const u8{ "metric", "primary", "comparator", "delta" };
+    const rendered = try query_output.render(allocator, format, out_rows.items, cols[0..]);
+    defer allocator.free(rendered);
+    try emitOutput(output_path, rendered);
+}
+
+fn parseComparator(text: []const u8) !Comparator {
+    if (std.ascii.eqlIgnoreCase(text, "learnings_nonrecall")) return .learnings_nonrecall;
+    if (std.ascii.eqlIgnoreCase(text, "impl_nonrecall")) return .impl_nonrecall;
+    if (std.ascii.eqlIgnoreCase(text, "all_nonrecall")) return .all_nonrecall;
+    return error.InvalidComparator;
+}
+
+fn comparatorLabel(comparator: Comparator) []const u8 {
+    return switch (comparator) {
+        .learnings_nonrecall => "learnings_nonrecall",
+        .impl_nonrecall => "impl_nonrecall",
+        .all_nonrecall => "all_nonrecall",
+    };
+}
+
+fn hasMissingRequiredKey(row: query_engine.Row) bool {
+    if (std.mem.trim(u8, rowString(row, "id"), " \t\r\n").len == 0) return true;
+    if (std.mem.trim(u8, rowString(row, "captured_at"), " \t\r\n").len == 0) return true;
+    if (std.mem.trim(u8, rowString(row, "status"), " \t\r\n").len == 0) return true;
+    if (std.mem.trim(u8, rowString(row, "learning"), " \t\r\n").len == 0) return true;
+    if (std.mem.trim(u8, rowString(row, "application"), " \t\r\n").len == 0) return true;
+    if (std.mem.trim(u8, rowString(row, "source"), " \t\r\n").len == 0) return true;
+    if (std.mem.trim(u8, rowString(row, "fingerprint"), " \t\r\n").len == 0) return true;
+    if (scalarAsInt(row.valueOrNull("evidence_count")) == 0) return true;
+    return false;
+}
+
+fn scalarAsInt(value: query_spec.Scalar) usize {
+    return switch (value) {
+        .int => |v| if (v < 0) 0 else @intCast(v),
+        .float => |v| if (v < 0) 0 else @intFromFloat(v),
+        else => 0,
+    };
+}
+
+fn isConditionActionLearning(text: []const u8) bool {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    return containsCaseInsensitive(trimmed, "when ") or
+        containsCaseInsensitive(trimmed, "if ") or
+        containsCaseInsensitive(trimmed, "for ") or
+        containsCaseInsensitive(trimmed, "on ") or
+        containsCaseInsensitive(trimmed, "during ");
+}
+
+fn evidenceHasAnchor(text: []const u8) bool {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    const anchors = [_][]const u8{
+        "gh run",
+        "run ",
+        ".md",
+        ".zig",
+        ".py",
+        ".rb",
+        " -- ",
+        "::",
+        "error",
+        "passed",
+        "failed",
+        "http://",
+        "https://",
+        "/",
+    };
+    for (anchors) |needle| {
+        if (containsCaseInsensitive(trimmed, needle)) return true;
+    }
+    return hasHexSpan(trimmed, 7);
+}
+
+fn hasHexSpan(text: []const u8, min_len: usize) bool {
+    var run: usize = 0;
+    for (text) |char| {
+        if (std.ascii.isHex(char)) {
+            run += 1;
+            if (run >= min_len) return true;
+        } else {
+            run = 0;
+        }
+    }
+    return false;
+}
+
+fn containsCaseInsensitive(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) : (start += 1) {
+        var matched = true;
+        var i: usize = 0;
+        while (i < needle.len) : (i += 1) {
+            if (toLowerAscii(haystack[start + i]) != toLowerAscii(needle[i])) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) return true;
+    }
+    return false;
+}
+
+fn inDateWindow(day: []const u8, since: []const u8, until: []const u8) bool {
+    if (since.len == 0 and until.len == 0) return true;
+    if (day.len == 0) return false;
+    if (since.len > 0 and std.mem.order(u8, day, since) == .lt) return false;
+    if (until.len > 0 and std.mem.order(u8, day, until) == .gt) return false;
+    return true;
+}
+
+fn incrementCount(
+    map: *std.StringHashMap(usize),
+    allocator: std.mem.Allocator,
+    raw_key: []const u8,
+) !void {
+    const key = std.mem.trim(u8, raw_key, " \t\r\n");
+    if (key.len == 0) return;
+    if (map.getEntry(key)) |entry| {
+        entry.value_ptr.* += 1;
+        return;
+    }
+    const owned = try allocator.dupe(u8, key);
+    errdefer allocator.free(owned);
+    try map.put(owned, 1);
+}
+
+fn appendMetricValueRow(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayList(query_engine.Row),
+    metric: []const u8,
+    value: usize,
+) !void {
+    const value_text = try std.fmt.allocPrint(allocator, "{d}", .{value});
+    defer allocator.free(value_text);
+    try appendMetricTextRow(allocator, rows, metric, value_text);
+}
+
+fn appendMetricFloatRow(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayList(query_engine.Row),
+    metric: []const u8,
+    value: f64,
+) !void {
+    const value_text = try std.fmt.allocPrint(allocator, "{d:.2}", .{value});
+    defer allocator.free(value_text);
+    try appendMetricTextRow(allocator, rows, metric, value_text);
+}
+
+fn appendMetricTextRow(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayList(query_engine.Row),
+    metric: []const u8,
+    value: []const u8,
+) !void {
+    var row = query_engine.Row.init(allocator);
+    errdefer row.deinit();
+    try row.putOwnedKey("metric", .{ .string = metric });
+    try row.putOwnedKey("value", .{ .string = value });
+    try rows.append(allocator, row);
+}
+
+fn appendGroupedCountsRows(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayList(query_engine.Row),
+    map: *std.StringHashMap(usize),
+    prefix: []const u8,
+) !void {
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer keys.deinit(allocator);
+
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        try keys.append(allocator, entry.key_ptr.*);
+    }
+
+    std.mem.sort([]const u8, keys.items, {}, lessStringAsc);
+
+    for (keys.items) |key| {
+        const metric = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ prefix, key });
+        defer allocator.free(metric);
+        try appendMetricValueRow(allocator, rows, metric, map.get(key).?);
+    }
+}
+
+fn ratioAsPercent(numerator: usize, denominator: usize) f64 {
+    if (denominator == 0) return 0.0;
+    return (@as(f64, @floatFromInt(numerator)) / @as(f64, @floatFromInt(denominator))) * 100.0;
+}
+
+fn resolveSessionsRootAlloc(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    raw_root: []const u8,
+) ![]u8 {
+    if (raw_root.len > 0) {
+        if (std.fs.path.isAbsolute(raw_root)) return allocator.dupe(u8, raw_root);
+        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ repo_root, raw_root });
+    }
+
+    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return error.MissingHomeEnv;
+    defer allocator.free(home);
+    return std.fmt.allocPrint(allocator, "{s}/.codex/sessions", .{home});
+}
+
+fn collectSessionSummaries(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    since: []const u8,
+    until: []const u8,
+    comparator: Comparator,
+) !std.ArrayList(SessionSummary) {
+    var out: std.ArrayList(SessionSummary) = .empty;
+
+    var root_dir = std.fs.openDirAbsolute(sessions_root, .{ .iterate = true }) catch return out;
+    defer root_dir.close();
+
+    var walker = try root_dir.walk(allocator);
+    defer walker.deinit();
+
+    while (try walker.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.path, ".jsonl")) continue;
+
+        const base = std.fs.path.basename(entry.path);
+        if (!std.mem.startsWith(u8, base, "rollout-")) continue;
+        const path_day = sessionDayFromEntryPath(entry.path);
+        if (path_day) |day_buf| {
+            // Push down date filtering before file reads when day folders are present.
+            if (!inDateWindow(day_buf[0..], since, until)) continue;
+        }
+
+        const abs_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sessions_root, entry.path });
+        defer allocator.free(abs_path);
+
+        const data = std.fs.cwd().readFileAlloc(allocator, abs_path, 128 * 1024 * 1024) catch continue;
+        defer allocator.free(data);
+        if (data.len == 0) continue;
+
+        // Skip files that cannot contribute to either cohort for the selected comparator.
+        if (shouldSkipValueReportFile(data, comparator)) continue;
+
+        var first_day_buf: [10]u8 = undefined;
+        var first_day: []const u8 = "";
+        const first_ts_text = firstTimestampField(data) orelse continue;
+        const last_ts_text = lastTimestampField(data) orelse continue;
+        const first_ts = parseIsoTimestampSeconds(first_ts_text) orelse continue;
+        const last_ts = parseIsoTimestampSeconds(last_ts_text) orelse continue;
+
+        const has_recall = containsAnyNeedle(data, &RecallTextMarkers);
+        const has_learnings = containsAnyNeedle(data, &LearningsTextMarkers);
+        const has_impl = containsAnyNeedle(data, &ImplementationTextMarkers);
+        const has_proof = containsAnyNeedle(data, &ProofTextMarkers);
+        const has_friction = containsAnyNeedle(data, &FrictionTextMarkers);
+
+        const ts_day = dayLabel(first_ts_text);
+        if (ts_day.len == 10) {
+            std.mem.copyForwards(u8, first_day_buf[0..], ts_day[0..10]);
+            first_day = first_day_buf[0..];
+        }
+        if (first_day.len == 0) {
+            if (path_day) |day_buf| {
+                std.mem.copyForwards(u8, first_day_buf[0..], day_buf[0..]);
+                first_day = first_day_buf[0..];
+            }
+        }
+        if (!inDateWindow(first_day, since, until)) continue;
+
+        var first_assistant_ts: ?i64 = null;
+        var first_recall_ts: ?i64 = null;
+        if (has_recall) {
+            var lines = std.mem.splitScalar(u8, data, '\n');
+            while (lines.next()) |raw_line| {
+                const line = std.mem.trim(u8, raw_line, " \t\r\n");
+                if (line.len == 0) continue;
+                const role = extractJsonStringField(line, "role") orelse continue;
+                if (!std.ascii.eqlIgnoreCase(role, "assistant")) continue;
+                const ts = extractJsonStringField(line, "timestamp") orelse continue;
+                const ts_sec = parseIsoTimestampSeconds(ts) orelse continue;
+                if (first_assistant_ts == null) first_assistant_ts = ts_sec;
+                if (containsAnyNeedle(line, &RecallTextMarkers)) {
+                    first_recall_ts = ts_sec;
+                    break;
+                }
+            }
+        }
+
+        const duration_min = @as(f64, @floatFromInt(last_ts - first_ts)) / 60.0;
+        const recall_delta_min: ?f64 = blk: {
+            if (first_assistant_ts == null or first_recall_ts == null) break :blk null;
+            if (first_recall_ts.? < first_assistant_ts.?) break :blk null;
+            break :blk @as(f64, @floatFromInt(first_recall_ts.? - first_assistant_ts.?)) / 60.0;
+        };
+
+        try out.append(allocator, .{
+            .path = try allocator.dupe(u8, abs_path),
+            .day = try allocator.dupe(u8, first_day),
+            .duration_min = duration_min,
+            .has_recall = has_recall,
+            .has_learnings = has_learnings,
+            .has_impl = has_impl,
+            .has_proof = has_proof,
+            .has_friction = has_friction,
+            .recall_delta_min = recall_delta_min,
+        });
+    }
+
+    return out;
+}
+
+fn containsAnyNeedle(haystack: []const u8, needles: []const []const u8) bool {
+    for (needles) |needle| {
+        if (needle.len == 0) continue;
+        if (std.mem.indexOf(u8, haystack, needle) != null) return true;
+    }
+    return false;
+}
+
+fn shouldSkipValueReportFile(data: []const u8, comparator: Comparator) bool {
+    if (comparator == .all_nonrecall) return false;
+    const has_recall = containsAnyNeedle(data, &RecallTextMarkers);
+    const has_candidate = switch (comparator) {
+        .learnings_nonrecall => containsAnyNeedle(data, &LearningsTextMarkers),
+        .impl_nonrecall => containsAnyNeedle(data, &ImplementationTextMarkers),
+        .all_nonrecall => true,
+    };
+    return !has_recall and !has_candidate;
+}
+
+fn sessionDayFromEntryPath(entry_path: []const u8) ?[10]u8 {
+    var parts = std.mem.splitScalar(u8, entry_path, '/');
+    var year: ?[]const u8 = null;
+    var month: ?[]const u8 = null;
+    var day: ?[]const u8 = null;
+
+    while (parts.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
+        if (year == null) {
+            year = part;
+            continue;
+        }
+        if (month == null) {
+            month = part;
+            continue;
+        }
+        day = part;
+        break;
+    }
+
+    if (year == null or month == null or day == null) return null;
+
+    if (!isFixedDigits(year.?, 4)) return null;
+    if (!isFixedDigits(month.?, 2)) return null;
+    if (!isFixedDigits(day.?, 2)) return null;
+
+    var out: [10]u8 = undefined;
+    std.mem.copyForwards(u8, out[0..4], year.?);
+    out[4] = '-';
+    std.mem.copyForwards(u8, out[5..7], month.?);
+    out[7] = '-';
+    std.mem.copyForwards(u8, out[8..10], day.?);
+    return out;
+}
+
+fn isFixedDigits(text: []const u8, expected_len: usize) bool {
+    if (text.len != expected_len) return false;
+    for (text) |char| {
+        if (!std.ascii.isDigit(char)) return false;
+    }
+    return true;
+}
+
+fn extractJsonStringField(line: []const u8, field: []const u8) ?[]const u8 {
+    if (line.len == 0 or field.len == 0) return null;
+
+    var search_from: usize = 0;
+    while (search_from < line.len) {
+        const hit = std.mem.indexOfPos(u8, line, search_from, field) orelse return null;
+        search_from = hit + field.len;
+
+        if (hit == 0) continue;
+        if (hit + field.len >= line.len) continue;
+        if (line[hit - 1] != '"' or line[hit + field.len] != '"') continue;
+
+        var cursor = hit + field.len + 1;
+        while (cursor < line.len and std.ascii.isWhitespace(line[cursor])) : (cursor += 1) {}
+        if (cursor >= line.len or line[cursor] != ':') continue;
+        cursor += 1;
+        while (cursor < line.len and std.ascii.isWhitespace(line[cursor])) : (cursor += 1) {}
+        if (cursor >= line.len or line[cursor] != '"') continue;
+
+        const start = cursor + 1;
+        cursor = start;
+        while (cursor < line.len) : (cursor += 1) {
+            if (line[cursor] == '"' and !isEscapedQuote(line, cursor)) {
+                return line[start..cursor];
+            }
+        }
+        return null;
+    }
+
+    return null;
+}
+
+fn isEscapedQuote(text: []const u8, quote_index: usize) bool {
+    if (quote_index == 0) return false;
+    var backslash_count: usize = 0;
+    var idx = quote_index;
+    while (idx > 0) {
+        if (text[idx - 1] != '\\') break;
+        backslash_count += 1;
+        idx -= 1;
+    }
+    return @mod(backslash_count, 2) == 1;
+}
+
+const TimestampPattern = "\"timestamp\":\"";
+
+fn firstTimestampField(data: []const u8) ?[]const u8 {
+    const hit = std.mem.indexOf(u8, data, TimestampPattern) orelse return null;
+    return quotedValueAt(data, hit + TimestampPattern.len);
+}
+
+fn lastTimestampField(data: []const u8) ?[]const u8 {
+    const hit = std.mem.lastIndexOf(u8, data, TimestampPattern) orelse return null;
+    return quotedValueAt(data, hit + TimestampPattern.len);
+}
+
+fn quotedValueAt(text: []const u8, start: usize) ?[]const u8 {
+    if (start >= text.len) return null;
+    var idx = start;
+    while (idx < text.len) : (idx += 1) {
+        if (text[idx] == '"' and !isEscapedQuote(text, idx)) {
+            return text[start..idx];
+        }
+    }
+    return null;
+}
+
+fn computeCohortStats(
+    allocator: std.mem.Allocator,
+    sessions: []const SessionSummary,
+    idxs: []const usize,
+) CohortStats {
+    var stats = CohortStats{ .n = idxs.len };
+    if (idxs.len == 0) return stats;
+
+    var durations: std.ArrayList(f64) = .empty;
+    defer durations.deinit(allocator);
+    var recall_deltas: std.ArrayList(f64) = .empty;
+    defer recall_deltas.deinit(allocator);
+
+    var proof_count: usize = 0;
+    var friction_count: usize = 0;
+
+    for (idxs) |idx| {
+        const session = sessions[idx];
+        durations.append(allocator, session.duration_min) catch {};
+        if (session.has_proof) proof_count += 1;
+        if (session.has_friction) friction_count += 1;
+        if (session.recall_delta_min) |delta| recall_deltas.append(allocator, delta) catch {};
+    }
+
+    std.mem.sort(f64, durations.items, {}, lessF64Asc);
+    std.mem.sort(f64, recall_deltas.items, {}, lessF64Asc);
+
+    stats.duration_median_min = medianSorted(durations.items);
+    stats.duration_p90_min = p90Sorted(durations.items);
+    stats.proof_rate = ratio(proof_count, idxs.len);
+    stats.friction_rate = ratio(friction_count, idxs.len);
+    stats.recall_delta_median_min = medianSorted(recall_deltas.items);
+    return stats;
+}
+
+fn lessF64Asc(_: void, a: f64, b: f64) bool {
+    return a < b;
+}
+
+fn medianSorted(values: []const f64) ?f64 {
+    if (values.len == 0) return null;
+    if (@mod(values.len, 2) == 1) return values[values.len / 2];
+    const right = values.len / 2;
+    const left = right - 1;
+    return (values[left] + values[right]) / 2.0;
+}
+
+fn p90Sorted(values: []const f64) ?f64 {
+    if (values.len == 0) return null;
+    const raw = (@as(f64, @floatFromInt(values.len)) * 0.9);
+    var idx: usize = @intFromFloat(@floor(raw));
+    if (idx >= values.len) idx = values.len - 1;
+    return values[idx];
+}
+
+fn ratio(numerator: usize, denominator: usize) ?f64 {
+    if (denominator == 0) return null;
+    return @as(f64, @floatFromInt(numerator)) / @as(f64, @floatFromInt(denominator));
+}
+
+fn relativeDelta(primary: ?f64, comparator: ?f64) ?f64 {
+    if (primary == null or comparator == null) return null;
+    if (comparator.? == 0.0) return null;
+    return (primary.? - comparator.?) / comparator.?;
+}
+
+fn exceedsRecommendationThreshold(duration_delta: ?f64, proof_delta: ?f64, friction_delta: ?f64) bool {
+    return absOptional(duration_delta) >= 0.05 or absOptional(proof_delta) >= 0.05 or absOptional(friction_delta) >= 0.05;
+}
+
+fn absOptional(value: ?f64) f64 {
+    if (value == null) return 0.0;
+    return @abs(value.?);
+}
+
+fn appendValueReportIntRow(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayList(query_engine.Row),
+    metric: []const u8,
+    primary: usize,
+    comparator: usize,
+) !void {
+    const primary_text = try std.fmt.allocPrint(allocator, "{d}", .{primary});
+    defer allocator.free(primary_text);
+    const comparator_text = try std.fmt.allocPrint(allocator, "{d}", .{comparator});
+    defer allocator.free(comparator_text);
+    try appendValueReportRow(allocator, rows, metric, primary_text, comparator_text, "");
+}
+
+fn appendValueReportOptionalFloatRow(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayList(query_engine.Row),
+    metric: []const u8,
+    primary: ?f64,
+    comparator: ?f64,
+) !void {
+    const primary_text = try optionalFloatText(allocator, primary);
+    defer allocator.free(primary_text);
+    const comparator_text = try optionalFloatText(allocator, comparator);
+    defer allocator.free(comparator_text);
+
+    const delta = blk: {
+        if (primary == null or comparator == null) break :blk try allocator.dupe(u8, "");
+        const delta_text = try std.fmt.allocPrint(allocator, "{d:.4}", .{primary.? - comparator.?});
+        break :blk delta_text;
+    };
+    defer allocator.free(delta);
+
+    try appendValueReportRow(allocator, rows, metric, primary_text, comparator_text, delta);
+}
+
+fn appendValueReportDeltaRow(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayList(query_engine.Row),
+    metric: []const u8,
+    delta: ?f64,
+) !void {
+    const delta_text = try optionalFloatText(allocator, delta);
+    defer allocator.free(delta_text);
+    try appendValueReportRow(allocator, rows, metric, "", "", delta_text);
+}
+
+fn optionalFloatText(allocator: std.mem.Allocator, value: ?f64) ![]u8 {
+    if (value == null) return allocator.dupe(u8, "");
+    return std.fmt.allocPrint(allocator, "{d:.4}", .{value.?});
+}
+
+fn appendValueReportRow(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayList(query_engine.Row),
+    metric: []const u8,
+    primary: []const u8,
+    comparator: []const u8,
+    delta: []const u8,
+) !void {
+    var row = query_engine.Row.init(allocator);
+    errdefer row.deinit();
+    try row.putOwnedKey("metric", .{ .string = metric });
+    try row.putOwnedKey("primary", .{ .string = primary });
+    try row.putOwnedKey("comparator", .{ .string = comparator });
+    try row.putOwnedKey("delta", .{ .string = delta });
+    try rows.append(allocator, row);
+}
+
+fn emitOutput(output_path: []const u8, rendered: []const u8) !void {
+    if (output_path.len == 0) {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        try stdout_writer.interface.writeAll(rendered);
+        return;
+    }
+
+    if (std.fs.path.isAbsolute(output_path)) {
+        var file = try std.fs.createFileAbsolute(output_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(rendered);
+        return;
+    }
+
+    var file = try std.fs.cwd().createFile(output_path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(rendered);
 }
 
 fn collectDatasetRows(
@@ -2043,6 +3062,108 @@ test "parse args recall" {
     try std.testing.expect(parsed.command.? == .recall);
     try std.testing.expectEqualStrings(".learnings.jsonl", parsed.path);
     try std.testing.expectEqualStrings("zig", parsed.query.?);
+}
+
+test "parse args quality-audit" {
+    const argv = [_][]const u8{
+        ProgramName,
+        "--path",
+        ".learnings.jsonl",
+        "quality-audit",
+        "--since",
+        "2026-02-14",
+        "--until",
+        "2026-03-05",
+        "--format",
+        "json",
+    };
+    const parsed = try parseArgs(&argv);
+    try std.testing.expect(parsed.command.? == .quality_audit);
+    try std.testing.expectEqualStrings("2026-02-14", parsed.since);
+    try std.testing.expectEqualStrings("2026-03-05", parsed.until);
+    try std.testing.expectEqualStrings("json", parsed.format);
+}
+
+test "parse args value-report" {
+    const argv = [_][]const u8{
+        ProgramName,
+        "value-report",
+        "--sessions-root",
+        "/tmp/sessions",
+        "--comparator",
+        "impl_nonrecall",
+        "--format",
+        "csv",
+        "--output",
+        "value.csv",
+    };
+    const parsed = try parseArgs(&argv);
+    try std.testing.expect(parsed.command.? == .value_report);
+    try std.testing.expectEqualStrings("/tmp/sessions", parsed.sessions_root);
+    try std.testing.expectEqualStrings("impl_nonrecall", parsed.comparator);
+    try std.testing.expectEqualStrings("csv", parsed.format);
+    try std.testing.expectEqualStrings("value.csv", parsed.output);
+}
+
+test "session day from entry path" {
+    const day = sessionDayFromEntryPath("2026/03/05/rollout-2026-03-05T05-12-23-123.jsonl").?;
+    try std.testing.expectEqualStrings("2026-03-05", day[0..]);
+    const day_with_dot = sessionDayFromEntryPath("./2026/03/05/rollout-2026-03-05T05-12-23-123.jsonl").?;
+    try std.testing.expectEqualStrings("2026-03-05", day_with_dot[0..]);
+    try std.testing.expect(sessionDayFromEntryPath("rollout-2026-03-05.jsonl") == null);
+}
+
+test "extract json string field" {
+    const line =
+        "{\"timestamp\":\"2026-03-05T05:13:26Z\",\"role\":\"assistant\",\"text\":\"Run LEARNINGS recall \\\"now\\\"\"}";
+    try std.testing.expectEqualStrings("2026-03-05T05:13:26Z", extractJsonStringField(line, "timestamp").?);
+    try std.testing.expectEqualStrings("assistant", extractJsonStringField(line, "role").?);
+    try std.testing.expect(extractJsonStringField(line, "missing") == null);
+}
+
+test "timestamp field extraction from blob" {
+    const blob =
+        "{\"timestamp\":\"2026-03-05T05:13:26Z\",\"role\":\"user\"}\n{\"timestamp\":\"2026-03-05T06:34:21Z\",\"role\":\"assistant\"}";
+    try std.testing.expectEqualStrings("2026-03-05T05:13:26Z", firstTimestampField(blob).?);
+    try std.testing.expectEqualStrings("2026-03-05T06:34:21Z", lastTimestampField(blob).?);
+}
+
+test "containsAnyNeedle basic matching" {
+    try std.testing.expect(containsAnyNeedle("run learnings recall now", &RecallTextMarkers));
+    try std.testing.expect(containsAnyNeedle("token failed with error", &FrictionTextMarkers));
+}
+
+test "value report file prefilter" {
+    const recall_blob = "{\"role\":\"assistant\",\"text\":\"Run learnings recall before implementation\"}";
+    try std.testing.expect(!shouldSkipValueReportFile(recall_blob, .learnings_nonrecall));
+    try std.testing.expect(!shouldSkipValueReportFile(recall_blob, .impl_nonrecall));
+
+    const learnings_blob = "{\"role\":\"user\",\"text\":\"append_learning wrote .learnings.jsonl\"}";
+    try std.testing.expect(!shouldSkipValueReportFile(learnings_blob, .learnings_nonrecall));
+    try std.testing.expect(shouldSkipValueReportFile(learnings_blob, .impl_nonrecall));
+
+    const unrelated_blob = "{\"role\":\"user\",\"text\":\"plain status update\"}";
+    try std.testing.expect(shouldSkipValueReportFile(unrelated_blob, .learnings_nonrecall));
+    try std.testing.expect(!shouldSkipValueReportFile(unrelated_blob, .all_nonrecall));
+}
+
+test "condition action learning detection" {
+    try std.testing.expect(isConditionActionLearning("When a run fails, prefer rerun with proof."));
+    try std.testing.expect(isConditionActionLearning("If evidence is weak, skip capture."));
+    try std.testing.expect(!isConditionActionLearning("Boundary parsing eliminated duplication."));
+}
+
+test "evidence anchor detection" {
+    try std.testing.expect(evidenceHasAnchor("gh run 12345678 succeeded"));
+    try std.testing.expect(evidenceHasAnchor("Updated codex/skills/learnings/SKILL.md and tests passed"));
+    try std.testing.expect(!evidenceHasAnchor("General observation without anchors"));
+}
+
+test "relative delta helper" {
+    const delta = relativeDelta(2.0, 1.0).?;
+    try std.testing.expectApproxEqRel(@as(f64, 1.0), delta, 1e-6);
+    try std.testing.expect(relativeDelta(null, 1.0) == null);
+    try std.testing.expect(relativeDelta(1.0, 0.0) == null);
 }
 
 test "iso week basic" {
