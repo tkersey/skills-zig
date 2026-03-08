@@ -85,6 +85,16 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = seq_meta },
         },
     });
+    const seq_tests_root = b.createModule(.{
+        .root_source_file = b.path("apps/seq/src/tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_path", .module = core_path },
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = seq_meta },
+        },
+    });
     const lift_bench_root = b.createModule(.{
         .root_source_file = b.path("apps/lift/scripts/bench_stats.zig"),
         .target = target,
@@ -304,14 +314,17 @@ pub fn build(b: *std.Build) void {
     install_all.dependOn(&st_install.step);
     install_all.dependOn(&parse_arch_install.step);
 
-    const build_seq = b.step("build-seq", "Build seq binaries");
-    build_seq.dependOn(&seq_install.step);
-    build_seq.dependOn(&seq_perf_install.step);
-
-    const build_lift = b.step("build-lift", "Build lift binaries");
-    build_lift.dependOn(&bench_stats_install.step);
-    build_lift.dependOn(&perf_report_install.step);
-    build_lift.dependOn(&lift_bench_perf_install.step);
+    const run_seq_tests = addTestStepWithOptions(
+        b,
+        seq_tests_root,
+        "test-seq",
+        "Run seq tests",
+        .{
+            .link_libc = true,
+            .sqlite = true,
+            .cwd = b.path("apps/seq"),
+        },
+    );
 
     addBenchStep(
         b,
@@ -342,11 +355,6 @@ pub fn build(b: *std.Build) void {
     test_lift.dependOn(&run_lift_bench_tests.step);
     test_lift.dependOn(&run_lift_report_tests.step);
     test_lift.dependOn(&run_lift_bench_perf_tests.step);
-
-    const build_cas = b.step("build-cas", "Build cas binaries");
-    build_cas.dependOn(&cas_smoke_check_install.step);
-    build_cas.dependOn(&cas_instance_runner_install.step);
-    build_cas.dependOn(&cas_install.step);
 
     addBenchStep(
         b,
@@ -385,32 +393,122 @@ pub fn build(b: *std.Build) void {
     test_cas.dependOn(&run_cas_runner_tests.step);
     test_cas.dependOn(&run_cas_proxy_client_tests.step);
 
-    const build_cron = b.step("build-cron", "Build cron binaries");
-    build_cron.dependOn(&cron_install.step);
+    const run_cron_tests = addTestStepWithOptions(
+        b,
+        cron_root,
+        "test-cron",
+        "Run cron tests",
+        .{
+            .link_libc = true,
+            .sqlite = true,
+        },
+    );
 
-    const cron_tests = b.addTest(.{ .root_module = cron_root });
-    cron_tests.linkLibC();
-    cron_tests.root_module.linkSystemLibrary("sqlite3", .{});
-    const run_cron_tests = b.addRunArtifact(cron_tests);
-    if (b.args) |args| run_cron_tests.addArgs(args);
-    const test_cron = b.step("test-cron", "Run cron tests");
-    test_cron.dependOn(&run_cron_tests.step);
+    const run_learnings_tests = addTestStep(
+        b,
+        learnings_root,
+        "test-learnings",
+        "Run learnings tests",
+    );
+    const run_append_learning_tests = addTestStep(
+        b,
+        append_learning_root,
+        "test-append-learning",
+        "Run append_learning tests",
+    );
+    const run_mesh_tests = addTestStep(
+        b,
+        mesh_root,
+        "test-mesh",
+        "Run mesh tests",
+    );
+    const run_st_tests = addTestStep(
+        b,
+        st_root,
+        "test-st",
+        "Run st tests",
+    );
+    const run_parse_arch_tests = addTestStep(
+        b,
+        parse_arch_root,
+        "test-parse-arch",
+        "Run parse-arch tests",
+    );
 
-    const build_puff = b.step("build-puff", "Build puff binaries");
-    build_puff.dependOn(&puff_install.step);
+    const app_surfaces = [_]AppSurface{
+        .{
+            .path = b.path("apps/seq"),
+            .build_step_name = "build-seq",
+            .build_description = "Build seq binaries",
+            .build_deps = &.{ &seq_install.step, &seq_perf_install.step },
+            .test_deps = &.{ &run_seq_tests.step },
+        },
+        .{
+            .path = b.path("apps/lift"),
+            .build_step_name = "build-lift",
+            .build_description = "Build lift binaries",
+            .build_deps = &.{ &bench_stats_install.step, &perf_report_install.step, &lift_bench_perf_install.step },
+            .test_deps = &.{ test_lift },
+        },
+        .{
+            .path = b.path("apps/cas"),
+            .build_step_name = "build-cas",
+            .build_description = "Build cas binaries",
+            .build_deps = &.{ &cas_smoke_check_install.step, &cas_instance_runner_install.step, &cas_install.step },
+            .test_deps = &.{ test_cas },
+        },
+        .{
+            .path = b.path("apps/cron"),
+            .build_step_name = "build-cron",
+            .build_description = "Build cron binaries",
+            .build_deps = &.{&cron_install.step},
+            .test_deps = &.{ &run_cron_tests.step },
+        },
+        .{
+            .path = b.path("apps/puff"),
+            .build_step_name = "build-puff",
+            .build_description = "Build puff binaries",
+            .build_deps = &.{&puff_install.step},
+            .test_deps = &.{},
+        },
+        .{
+            .path = b.path("apps/learnings"),
+            .build_step_name = "build-learnings",
+            .build_description = "Build learnings binaries",
+            .build_deps = &.{ &learnings_install.step, &append_learning_install.step },
+            .test_deps = &.{ &run_learnings_tests.step, &run_append_learning_tests.step },
+        },
+        .{
+            .path = b.path("apps/mesh"),
+            .build_step_name = "build-mesh",
+            .build_description = "Build mesh binary",
+            .build_deps = &.{&mesh_install.step},
+            .test_deps = &.{&run_mesh_tests.step},
+        },
+        .{
+            .path = b.path("apps/st"),
+            .build_step_name = "build-st",
+            .build_description = "Build st binary",
+            .build_deps = &.{&st_install.step},
+            .test_deps = &.{&run_st_tests.step},
+        },
+        .{
+            .path = b.path("apps/parse-arch"),
+            .build_step_name = "build-parse-arch",
+            .build_description = "Build parse-arch binary",
+            .build_deps = &.{&parse_arch_install.step},
+            .test_deps = &.{&run_parse_arch_tests.step},
+        },
+    };
 
-    const build_learnings = b.step("build-learnings", "Build learnings binaries");
-    build_learnings.dependOn(&learnings_install.step);
-    build_learnings.dependOn(&append_learning_install.step);
+    for (app_surfaces) |surface| {
+        _ = addGroupedStep(b, surface.build_step_name, surface.build_description, surface.build_deps);
+    }
 
-    const build_mesh = b.step("build-mesh", "Build mesh binary");
-    build_mesh.dependOn(&mesh_install.step);
-
-    const build_st = b.step("build-st", "Build st binary");
-    build_st.dependOn(&st_install.step);
-
-    const build_parse_arch = b.step("build-parse-arch", "Build parse-arch binary");
-    build_parse_arch.dependOn(&parse_arch_install.step);
+    const test_all = b.step("test", "Run all tests");
+    for (app_surfaces) |surface| {
+        for (surface.test_deps) |dep| test_all.dependOn(dep);
+    }
 
     const enable_zlinter = b.option(
         bool,
@@ -419,7 +517,7 @@ pub fn build(b: *std.Build) void {
     ) orelse false;
     const lint_step = b.step("lint", "Run zlinter checks");
     if (enable_zlinter) {
-        lint_step.dependOn(buildLintStep(b, target, optimize, mesh));
+        lint_step.dependOn(buildLintStep(b, target, optimize, mesh, &app_surfaces));
     } else {
         const lint_cmd = b.addSystemCommand(&.{ "zig", "build", "lint", "-Denable_zlinter=true" });
         if (b.args) |args| {
@@ -428,37 +526,6 @@ pub fn build(b: *std.Build) void {
         }
         lint_step.dependOn(&lint_cmd.step);
     }
-
-    _ = addTestStep(
-        b,
-        learnings_root,
-        "test-learnings",
-        "Run learnings tests",
-    );
-    _ = addTestStep(
-        b,
-        append_learning_root,
-        "test-append-learning",
-        "Run append_learning tests",
-    );
-    _ = addTestStep(
-        b,
-        mesh_root,
-        "test-mesh",
-        "Run mesh tests",
-    );
-    _ = addTestStep(
-        b,
-        st_root,
-        "test-st",
-        "Run st tests",
-    );
-    _ = addTestStep(
-        b,
-        parse_arch_root,
-        "test-parse-arch",
-        "Run parse-arch tests",
-    );
 
     addRunStep(b, seq, "run-seq", "Run seq", &.{});
     addRunStep(b, st, "run-st", "Run st", &.{"--help"});
@@ -518,14 +585,54 @@ fn addBenchStep(
     step.dependOn(&run_cmd.step);
 }
 
+const AppSurface = struct {
+    path: std.Build.LazyPath,
+    build_step_name: []const u8,
+    build_description: []const u8,
+    build_deps: []const *std.Build.Step,
+    test_deps: []const *std.Build.Step,
+};
+
+fn addGroupedStep(
+    b: *std.Build,
+    step_name: []const u8,
+    description: []const u8,
+    deps: []const *std.Build.Step,
+) *std.Build.Step {
+    const step = b.step(step_name, description);
+    for (deps) |dep| step.dependOn(dep);
+    return step;
+}
+
 fn addTestStep(
     b: *std.Build,
     root_module: *std.Build.Module,
     step_name: []const u8,
     description: []const u8,
 ) *std.Build.Step.Run {
+    return addTestStepWithOptions(b, root_module, step_name, description, .{});
+}
+
+const TestStepOptions = struct {
+    link_libc: bool = false,
+    sqlite: bool = false,
+    cwd: ?std.Build.LazyPath = null,
+};
+
+fn addTestStepWithOptions(
+    b: *std.Build,
+    root_module: *std.Build.Module,
+    step_name: []const u8,
+    description: []const u8,
+    options: TestStepOptions,
+) *std.Build.Step.Run {
     const tests = b.addTest(.{ .root_module = root_module });
+    if (options.link_libc) {
+        tests.linkLibC();
+        if (options.sqlite) tests.root_module.linkSystemLibrary("sqlite3", .{});
+    }
     const run_tests = b.addRunArtifact(tests);
+    if (options.cwd) |cwd| run_tests.setCwd(cwd);
     if (b.args) |args| run_tests.addArgs(args);
     const step = b.step(step_name, description);
     step.dependOn(&run_tests.step);
@@ -543,16 +650,18 @@ fn buildLintStep(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     mesh: *std.Build.Step.Compile,
+    app_surfaces: []const AppSurface,
 ) *std.Build.Step {
     var lint_builder = zlinter.builder(b, .{
         .target = target,
         .optimize = optimize,
     });
     lint_builder.addSource(.compiled(mesh));
-        lint_builder.addPaths(.{
+    for (app_surfaces) |surface| {
+        lint_builder.addPaths(.{ .include = &.{surface.path} });
+    }
+    lint_builder.addPaths(.{
         .include = &.{
-            b.path("apps/mesh"),
-            b.path("apps/parse-arch"),
             b.path("libs/core"),
             b.path("build.zig"),
         },

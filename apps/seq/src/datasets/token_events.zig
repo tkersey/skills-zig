@@ -678,25 +678,9 @@ fn jsonStringContentEquals(raw: []const u8, expected: []const u8) bool {
     return matched == expected.len;
 }
 
-fn fieldEqString(object_text: []const u8, key: []const u8, expected: []const u8) bool {
-    const value = objectFieldValueSlice(object_text, key) orelse return false;
-    const str = jsonStringSlice(value) orelse return false;
-    return jsonStringContentEquals(str, expected);
-}
-
-fn objectObjectField(object_text: []const u8, key: []const u8) ?[]const u8 {
-    const value = objectFieldValueSlice(object_text, key) orelse return null;
-    return jsonObjectSlice(value);
-}
-
 fn objectIntField(object_text: []const u8, key: []const u8) ?i64 {
     const value = objectFieldValueSlice(object_text, key) orelse return null;
     return jsonInt(value);
-}
-
-fn intFieldMaybe(object_text: ?[]const u8, key: []const u8) ?i64 {
-    if (object_text == null) return null;
-    return objectIntField(object_text.?, key);
 }
 
 fn parseTokenCountLineStdJson(line: []const u8, path: []const u8) !?Row {

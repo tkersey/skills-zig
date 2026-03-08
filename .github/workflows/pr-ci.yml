@@ -14,6 +14,7 @@ on:
       - "apps/learnings/**"
       - "apps/mesh/**"
       - "apps/st/**"
+      - "apps/parse-arch/**"
       - "libs/core/**"
       - ".github/scripts/**"
       - ".github/workflows/release-*.yml"
@@ -36,6 +37,7 @@ jobs:
       learnings: ${{ steps.filter.outputs.learnings }}
       mesh: ${{ steps.filter.outputs.mesh }}
       st: ${{ steps.filter.outputs.st }}
+      parse_arch: ${{ steps.filter.outputs.parse_arch }}
       core: ${{ steps.filter.outputs.core }}
     steps:
       - uses: actions/checkout@v4
@@ -59,6 +61,8 @@ jobs:
               - "apps/mesh/**"
             st:
               - "apps/st/**"
+            parse_arch:
+              - "apps/parse-arch/**"
             core:
               - "build.zig"
               - "build.zig.zon"
@@ -231,3 +235,17 @@ jobs:
         run: zig build build-mesh -Doptimize=ReleaseFast
       - name: Test mesh
         run: zig build test-mesh
+
+  parse-arch:
+    needs: changes
+    if: needs.changes.outputs.parse_arch == 'true' || needs.changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Build parse-arch
+        run: zig build build-parse-arch -Doptimize=ReleaseFast
+      - name: Test parse-arch
+        run: zig build test-parse-arch

@@ -3603,39 +3603,6 @@ fn stdJsonValueToI64(value: std.json.Value) ?i64 {
     };
 }
 
-fn loadKnownSkillNames(allocator: std.mem.Allocator) !std.StringHashMap(void) {
-    var out: std.StringHashMap(void) = .init(allocator);
-    errdefer deinitStringSet(allocator, &out);
-
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch null;
-    defer if (home) |h| allocator.free(h);
-    if (home == null) return out;
-
-    const roots = [_][]const u8{
-        ".dotfiles/codex/skills",
-        ".codex/skills",
-    };
-
-    for (roots) |suffix| {
-        const dir_path = try std.fs.path.join(allocator, &.{ home.?, suffix });
-        defer allocator.free(dir_path);
-
-        var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch continue;
-        defer dir.close();
-
-        var it = dir.iterate();
-        while (try it.next()) |entry| {
-            if (entry.kind != .directory) continue;
-            if (out.contains(entry.name)) continue;
-            const dup = try allocator.dupe(u8, entry.name);
-            errdefer allocator.free(dup);
-            try out.put(dup, {});
-        }
-    }
-
-    return out;
-}
-
 fn deinitStringSet(allocator: std.mem.Allocator, set: *std.StringHashMap(void)) void {
     var it = set.iterator();
     while (it.next()) |entry| allocator.free(entry.key_ptr.*);
