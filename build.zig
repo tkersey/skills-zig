@@ -51,6 +51,20 @@ pub fn build(b: *std.Build) void {
     const learnings_meta = addVersionModule(b, @embedFile("apps/learnings/VERSION"));
     const mesh_meta = addVersionModule(b, @embedFile("apps/mesh/VERSION"));
     const st_meta = addVersionModule(b, @embedFile("apps/st/VERSION"));
+    const parse_arch_meta = addVersionModule(b, @embedFile("apps/parse-arch/VERSION"));
+    const parse_arch_collector = b.createModule(.{
+        .root_source_file = b.path("apps/parse-arch/src/collector.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const parse_arch_eval_suite = b.createModule(.{
+        .root_source_file = b.path("apps/parse-arch/src/eval_suite.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "parse_arch_collector", .module = parse_arch_collector },
+        },
+    });
 
     const seq_root = b.createModule(.{
         .root_source_file = b.path("apps/seq/src/main.zig"),
@@ -222,6 +236,17 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = st_meta },
         },
     });
+    const parse_arch_root = b.createModule(.{
+        .root_source_file = b.path("apps/parse-arch/scripts/parse_arch.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = parse_arch_meta },
+            .{ .name = "parse_arch_collector", .module = parse_arch_collector },
+            .{ .name = "parse_arch_eval_suite", .module = parse_arch_eval_suite },
+        },
+    });
 
     const seq = addExecutable(b, "seq", seq_root);
     seq.linkLibC();
@@ -242,6 +267,7 @@ pub fn build(b: *std.Build) void {
     const append_learning = addExecutable(b, "append_learning", append_learning_root);
     const mesh = addExecutable(b, "mesh", mesh_root);
     const st = addExecutable(b, "st", st_root);
+    const parse_arch = addExecutable(b, "parse-arch", parse_arch_root);
 
     const seq_install = addInstallStep(b, seq);
     const seq_perf_install = addInstallStep(b, seq_perf);
@@ -258,6 +284,7 @@ pub fn build(b: *std.Build) void {
     const append_learning_install = addInstallStep(b, append_learning);
     const mesh_install = addInstallStep(b, mesh);
     const st_install = addInstallStep(b, st);
+    const parse_arch_install = addInstallStep(b, parse_arch);
 
     const install_all = b.getInstallStep();
     install_all.dependOn(&seq_install.step);
@@ -275,6 +302,7 @@ pub fn build(b: *std.Build) void {
     install_all.dependOn(&append_learning_install.step);
     install_all.dependOn(&mesh_install.step);
     install_all.dependOn(&st_install.step);
+    install_all.dependOn(&parse_arch_install.step);
 
     const build_seq = b.step("build-seq", "Build seq binaries");
     build_seq.dependOn(&seq_install.step);
@@ -381,6 +409,9 @@ pub fn build(b: *std.Build) void {
     const build_st = b.step("build-st", "Build st binary");
     build_st.dependOn(&st_install.step);
 
+    const build_parse_arch = b.step("build-parse-arch", "Build parse-arch binary");
+    build_parse_arch.dependOn(&parse_arch_install.step);
+
     const enable_zlinter = b.option(
         bool,
         "enable_zlinter",
@@ -422,10 +453,17 @@ pub fn build(b: *std.Build) void {
         "test-st",
         "Run st tests",
     );
+    _ = addTestStep(
+        b,
+        parse_arch_root,
+        "test-parse-arch",
+        "Run parse-arch tests",
+    );
 
     addRunStep(b, seq, "run-seq", "Run seq", &.{});
     addRunStep(b, st, "run-st", "Run st", &.{"--help"});
     addRunStep(b, mesh, "run-mesh", "Run mesh", &.{"--help"});
+    addRunStep(b, parse_arch, "run-parse-arch", "Run parse-arch", &.{"--help"});
     addRunStep(b, bench_stats, "run-bench-stats", "Run bench_stats", &.{"--help"});
     addRunStep(b, cas_smoke_check, "run-cas-smoke-check", "Run cas_smoke_check", &.{"--help"});
 }
@@ -511,9 +549,10 @@ fn buildLintStep(
         .optimize = optimize,
     });
     lint_builder.addSource(.compiled(mesh));
-    lint_builder.addPaths(.{
+        lint_builder.addPaths(.{
         .include = &.{
             b.path("apps/mesh"),
+            b.path("apps/parse-arch"),
             b.path("libs/core"),
             b.path("build.zig"),
         },

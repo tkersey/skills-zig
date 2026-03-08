@@ -10,6 +10,7 @@ This monorepo uses independent GitHub Actions release workflows per CLI:
 - `learnings`: `.github/workflows/release-learnings.yml` on tag `learnings-v*`
 - `mesh`: `.github/workflows/release-mesh.yml` on tag `mesh-v*`
 - `st`: `.github/workflows/release-st.yml` on tag `st-v*`
+- `parse-arch`: `.github/workflows/release-parse-arch.yml` on tag `parse-arch-v*`
 
 Per-app VERSION files:
 
@@ -21,6 +22,7 @@ Per-app VERSION files:
 - `apps/learnings/VERSION`
 - `apps/mesh/VERSION`
 - `apps/st/VERSION`
+- `apps/parse-arch/VERSION`
 
 Release tags must match file versions:
 
@@ -32,6 +34,7 @@ Release tags must match file versions:
 - `learnings-v<version>` where `<version>` equals `apps/learnings/VERSION`
 - `mesh-v<version>` where `<version>` equals `apps/mesh/VERSION`
 - `st-v<version>` where `<version>` equals `apps/st/VERSION`
+- `parse-arch-v<version>` where `<version>` equals `apps/parse-arch/VERSION`
 
 Each workflow builds only binaries from its own CLI path and publishes two release archives:
 
@@ -56,6 +59,8 @@ Examples:
 - `mesh-v1.2.3-darwin-arm64.tar.gz`
 - `st-v1.2.3-linux-x86_64.tar.gz`
 - `st-v1.2.3-darwin-arm64.tar.gz`
+- `parse-arch-v1.2.3-linux-x86_64.tar.gz`
+- `parse-arch-v1.2.3-darwin-arm64.tar.gz`
 
 ## Homebrew Tap Handoff
 

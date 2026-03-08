@@ -19,6 +19,9 @@
         "apps/cron/scripts",
         "apps/puff/scripts",
         "apps/learnings/scripts",
+        "apps/parse-arch/scripts",
+        "apps/parse-arch/src",
+        "apps/parse-arch/references",
         "libs/core/src",
     },
 }

@@ -12,6 +12,7 @@ Monorepo for Zig CLIs with shared internal libraries and independent release str
 - `learnings` (`learnings`, `append_learning`)
 - `mesh` (`mesh`)
 - `st` (`st`)
+- `parse-arch` (`parse-arch`)
 
 No unified umbrella CLI is introduced. Binaries remain separate.
 
@@ -25,6 +26,7 @@ No unified umbrella CLI is introduced. Binaries remain separate.
 - `apps/learnings`
 - `apps/mesh`
 - `apps/st`
+- `apps/parse-arch`
 - `libs/core`
 - `.github/workflows`
 - `docs/release`
@@ -46,6 +48,7 @@ zig build build-puff -Doptimize=ReleaseFast
 zig build build-learnings -Doptimize=ReleaseFast
 zig build build-mesh -Doptimize=ReleaseFast
 zig build build-st -Doptimize=ReleaseFast
+zig build build-parse-arch -Doptimize=ReleaseFast
 ```
 
 Run helpers:
@@ -68,6 +71,7 @@ Per-app VERSION files are the source of truth:
 - `apps/learnings/VERSION`
 - `apps/mesh/VERSION`
 - `apps/st/VERSION`
+- `apps/parse-arch/VERSION`
 
 Independent tags trigger independent workflows, and each tag must match its app VERSION file:
 
@@ -79,6 +83,7 @@ Independent tags trigger independent workflows, and each tag must match its app 
 - `learnings-v*` -> `.github/workflows/release-learnings.yml`
 - `mesh-v*` -> `.github/workflows/release-mesh.yml`
 - `st-v*` -> `.github/workflows/release-st.yml`
+- `parse-arch-v*` -> `.github/workflows/release-parse-arch.yml`
 
 Required tag forms:
 
@@ -90,6 +95,7 @@ Required tag forms:
 - `learnings-v<version>` where `<version>` equals `apps/learnings/VERSION`
 - `mesh-v<version>` where `<version>` equals `apps/mesh/VERSION`
 - `st-v<version>` where `<version>` equals `apps/st/VERSION`
+- `parse-arch-v<version>` where `<version>` equals `apps/parse-arch/VERSION`
 
 Artifacts are published as:
 
