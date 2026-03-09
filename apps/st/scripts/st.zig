@@ -5,6 +5,7 @@ const std = @import("std");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
 const SchemaVersion: i64 = 3;
+const PlanSyncVersion: i64 = 1;
 
 const UsageText =
     \\st.zig
@@ -13,12 +14,13 @@ const UsageText =
     \\
     \\Manage dependency-aware JSONL v3 plan state.
     \\
-    \\usage: st {init,add,set-status,set-deps,set-notes,add-comment,remove,show,ready,blocked,doctor,emit-update-plan,export,import-plan} [options]
+    \\usage: st {init,add,set-status,set-priority,set-deps,set-notes,add-comment,remove,show,ready,blocked,doctor,emit-plan-sync,emit-update-plan,export,import-plan} [options]
     \\
     \\commands:
     \\  init              Initialize plan storage
     \\  add               Add or upsert a plan item
     \\  set-status        Set item status
+    \\  set-priority      Set item priority
     \\  set-deps          Set item dependencies
     \\  set-notes         Set item notes
     \\  add-comment       Add a comment to an item
@@ -27,7 +29,8 @@ const UsageText =
     \\  ready             Show ready pending items
     \\  blocked           Show blocked or waiting items
     \\  doctor            Inspect or repair seq contract integrity
-    \\  emit-update-plan  Emit update_plan payload JSON
+    \\  emit-plan-sync    Emit dual-runtime plan_sync payload JSON
+    \\  emit-update-plan  Emit legacy update_plan payload JSON
     \\  export            Export snapshot JSON
     \\  import-plan       Import snapshot JSON
     \\
@@ -35,6 +38,7 @@ const UsageText =
     \\  --file PATH                     Path to plan JSONL file (default: .step/st-plan.jsonl)
     \\  --allow-multiple-in-progress    Allow multiple in_progress items
     \\  --format markdown|table|json    Output format for list/read commands
+    \\  --priority high|medium|low      Priority for add/set-priority (add default: medium)
     \\  -h, --help                      Show help
     \\  -V, --version | version         Show version
 ;
@@ -55,6 +59,20 @@ const Status = enum {
             .blocked => "blocked",
             .deferred => "deferred",
             .canceled => "canceled",
+        };
+    }
+};
+
+const Priority = enum {
+    high,
+    low,
+    medium,
+
+    fn asString(self: Priority) []const u8 {
+        return switch (self) {
+            .high => "high",
+            .medium => "medium",
+            .low => "low",
         };
     }
 };
@@ -90,6 +108,7 @@ const Item = struct {
     id: []const u8,
     step: []const u8,
     status: Status,
+    priority: Priority,
     deps: []Dep,
     notes: []const u8,
     comments: []const Comment,
@@ -174,6 +193,7 @@ const Command = enum {
     add_comment,
     blocked,
     doctor,
+    emit_plan_sync,
     emit_update_plan,
     import_plan,
     init,
@@ -181,6 +201,7 @@ const Command = enum {
     remove,
     set_deps,
     set_notes,
+    set_priority,
     set_status,
     show,
 };
@@ -200,6 +221,7 @@ const Args = struct {
     id: ?[]const u8 = null,
     step: ?[]const u8 = null,
     status: []const u8 = "pending",
+    priority: ?[]const u8 = null,
     deps: []const u8 = "",
     notes: ?[]const u8 = null,
     text: ?[]const u8 = null,
@@ -337,6 +359,12 @@ fn parseArgs(argv: []const []const u8) !Args {
                     args.deps = argv[i];
                     continue;
                 }
+                if (std.mem.eql(u8, token, "--priority")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingPriorityValue;
+                    args.priority = argv[i];
+                    continue;
+                }
                 return error.InvalidAddArg;
             },
             .set_status => {
@@ -353,6 +381,21 @@ fn parseArgs(argv: []const []const u8) !Args {
                     continue;
                 }
                 return error.InvalidSetStatusArg;
+            },
+            .set_priority => {
+                if (std.mem.eql(u8, token, "--id")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingIdValue;
+                    args.id = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--priority")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingPriorityValue;
+                    args.priority = argv[i];
+                    continue;
+                }
+                return error.InvalidSetPriorityArg;
             },
             .set_deps => {
                 if (std.mem.eql(u8, token, "--id")) {
@@ -424,7 +467,7 @@ fn parseArgs(argv: []const []const u8) !Args {
                 }
                 return error.InvalidDoctorArg;
             },
-            .emit_update_plan => {
+            .emit_plan_sync, .emit_update_plan => {
                 return error.InvalidEmitArg;
             },
             .@"export" => {
@@ -457,6 +500,10 @@ fn parseArgs(argv: []const []const u8) !Args {
         .set_status => {
             if (args.id == null) return error.MissingIdValue;
         },
+        .set_priority => {
+            if (args.id == null) return error.MissingIdValue;
+            if (args.priority == null) return error.MissingPriorityValue;
+        },
         .set_deps => {
             if (args.id == null) return error.MissingIdValue;
         },
@@ -480,6 +527,7 @@ fn parseCommand(raw: []const u8) ?Command {
     if (std.mem.eql(u8, raw, "init")) return .init;
     if (std.mem.eql(u8, raw, "add")) return .add;
     if (std.mem.eql(u8, raw, "set-status")) return .set_status;
+    if (std.mem.eql(u8, raw, "set-priority")) return .set_priority;
     if (std.mem.eql(u8, raw, "set-deps")) return .set_deps;
     if (std.mem.eql(u8, raw, "set-notes")) return .set_notes;
     if (std.mem.eql(u8, raw, "add-comment")) return .add_comment;
@@ -488,6 +536,7 @@ fn parseCommand(raw: []const u8) ?Command {
     if (std.mem.eql(u8, raw, "ready")) return .ready;
     if (std.mem.eql(u8, raw, "blocked")) return .blocked;
     if (std.mem.eql(u8, raw, "doctor")) return .doctor;
+    if (std.mem.eql(u8, raw, "emit-plan-sync")) return .emit_plan_sync;
     if (std.mem.eql(u8, raw, "emit-update-plan")) return .emit_update_plan;
     if (std.mem.eql(u8, raw, "export")) return .@"export";
     if (std.mem.eql(u8, raw, "import-plan")) return .import_plan;
@@ -503,7 +552,7 @@ fn parseOutputFormat(raw: []const u8) ?OutputFormat {
 
 fn isMutatingCommand(command: Command) bool {
     return switch (command) {
-        .init, .add, .set_status, .set_deps, .set_notes, .add_comment, .remove, .import_plan => true,
+        .init, .add, .set_status, .set_priority, .set_deps, .set_notes, .add_comment, .remove, .import_plan => true,
         else => false,
     };
 }
@@ -513,6 +562,7 @@ fn runCommand(allocator: std.mem.Allocator, args: Args) !u8 {
         .init => try cmdInit(allocator, args),
         .add => try cmdAdd(allocator, args),
         .set_status => try cmdSetStatus(allocator, args),
+        .set_priority => try cmdSetPriority(allocator, args),
         .set_deps => try cmdSetDeps(allocator, args),
         .set_notes => try cmdSetNotes(allocator, args),
         .add_comment => try cmdAddComment(allocator, args),
@@ -521,6 +571,7 @@ fn runCommand(allocator: std.mem.Allocator, args: Args) !u8 {
         .ready => try cmdReady(allocator, args),
         .blocked => try cmdBlocked(allocator, args),
         .doctor => try cmdDoctor(allocator, args),
+        .emit_plan_sync => try cmdEmitPlanSync(allocator, args),
         .emit_update_plan => try cmdEmitUpdatePlan(allocator, args),
         .@"export" => try cmdExport(allocator, args),
         .import_plan => try cmdImportPlan(allocator, args),
@@ -570,12 +621,14 @@ fn cmdAdd(allocator: std.mem.Allocator, args: Args) !u8 {
 
     const step = try requireNonEmptyString(allocator, args.step.?, "--step");
     const status = try normalizeStatus(args.status);
+    const priority = try normalizePriority(args.priority orelse "medium");
     const deps = try parseCliDeps(allocator, args.deps);
 
     const item = Item{
         .id = item_id,
         .step = step,
         .status = status,
+        .priority = priority,
         .deps = deps,
         .notes = "",
         .comments = &.{},
@@ -591,7 +644,7 @@ fn cmdAdd(allocator: std.mem.Allocator, args: Args) !u8 {
     var stdout_writer = std.fs.File.stdout().writer(&.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("upserted {s}\n", .{item_id});
-    try emitUpdatePlan(allocator, stdout, &state, args.allow_multiple_in_progress, true);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
     return 0;
 }
 
@@ -614,7 +667,30 @@ fn cmdSetStatus(allocator: std.mem.Allocator, args: Args) !u8 {
     var stdout_writer = std.fs.File.stdout().writer(&.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("updated {s} -> {s}\n", .{ item_id, status.asString() });
-    try emitUpdatePlan(allocator, stdout, &state, args.allow_multiple_in_progress, true);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
+    return 0;
+}
+
+fn cmdSetPriority(allocator: std.mem.Allocator, args: Args) !u8 {
+    const loaded = try loadValidatedState(allocator, args.file, args.allow_multiple_in_progress);
+    var state = loaded.state;
+    defer state.deinit();
+
+    const item_id = try requireNonEmptyString(allocator, args.id.?, "--id");
+    const priority = try normalizePriority(args.priority.?);
+    const item = state.get(item_id) orelse return error.UnknownItemId;
+    item.priority = priority;
+
+    try validateState(&state, args.allow_multiple_in_progress);
+
+    const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
+    const ts = try nowUtcAlloc(allocator);
+    try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, ts, meta, null);
+
+    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.print("updated {s} priority -> {s}\n", .{ item_id, priority.asString() });
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
     return 0;
 }
 
@@ -650,7 +726,7 @@ fn cmdSetDeps(allocator: std.mem.Allocator, args: Args) !u8 {
         }
         try stdout.writeByte('\n');
     }
-    try emitUpdatePlan(allocator, stdout, &state, args.allow_multiple_in_progress, true);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
     return 0;
 }
 
@@ -673,7 +749,7 @@ fn cmdSetNotes(allocator: std.mem.Allocator, args: Args) !u8 {
     var stdout_writer = std.fs.File.stdout().writer(&.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("updated {s} notes\n", .{item_id});
-    try emitUpdatePlan(allocator, stdout, &state, args.allow_multiple_in_progress, true);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
     return 0;
 }
 
@@ -703,7 +779,7 @@ fn cmdAddComment(allocator: std.mem.Allocator, args: Args) !u8 {
     var stdout_writer = std.fs.File.stdout().writer(&.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("added comment to {s}\n", .{item_id});
-    try emitUpdatePlan(allocator, stdout, &state, args.allow_multiple_in_progress, true);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
     return 0;
 }
 
@@ -724,7 +800,7 @@ fn cmdRemove(allocator: std.mem.Allocator, args: Args) !u8 {
     var stdout_writer = std.fs.File.stdout().writer(&.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("removed {s}\n", .{item_id});
-    try emitUpdatePlan(allocator, stdout, &state, args.allow_multiple_in_progress, true);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
     return 0;
 }
 
@@ -774,6 +850,17 @@ fn cmdBlocked(allocator: std.mem.Allocator, args: Args) !u8 {
     var stdout_writer = std.fs.File.stdout().writer(&.{});
     const stdout = &stdout_writer.interface;
     try renderItemRows(allocator, stdout, rows.items, args.format);
+    return 0;
+}
+
+fn cmdEmitPlanSync(allocator: std.mem.Allocator, args: Args) !u8 {
+    const loaded = try loadValidatedState(allocator, args.file, args.allow_multiple_in_progress);
+    var state = loaded.state;
+    defer state.deinit();
+
+    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    const stdout = &stdout_writer.interface;
+    try emitPlanSync(allocator, stdout, &state, args.allow_multiple_in_progress, false);
     return 0;
 }
 
@@ -849,8 +936,18 @@ fn cmdImportPlan(allocator: std.mem.Allocator, args: Args) !u8 {
     } else {
         try stdout.print("imported {d} item(s) from {s}\n", .{ imported_items.len, input_path });
     }
-    try emitUpdatePlan(allocator, stdout, &state, args.allow_multiple_in_progress, true);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
     return 0;
+}
+
+fn emitSyncOutputs(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    state: *const ItemState,
+    allow_multiple_in_progress: bool,
+) !void {
+    try emitPlanSync(allocator, writer, state, allow_multiple_in_progress, true);
+    try emitUpdatePlan(allocator, writer, state, allow_multiple_in_progress, true);
 }
 
 fn cmdDoctor(allocator: std.mem.Allocator, args: Args) !u8 {
@@ -1183,6 +1280,8 @@ fn writeItemObject(writer: anytype, item: Item) !void {
     try std.json.Stringify.value(item.step, .{}, writer);
     try writer.writeAll(",\"status\":");
     try std.json.Stringify.value(item.status.asString(), .{}, writer);
+    try writer.writeAll(",\"priority\":");
+    try std.json.Stringify.value(item.priority.asString(), .{}, writer);
     try writer.writeAll(",\"deps\":");
     try writeDepsArray(writer, item.deps);
     try writer.writeAll(",\"notes\":");
@@ -1439,34 +1538,73 @@ fn renderTable(writer: anytype, rows: []const EnrichedItem) !void {
     }
 }
 
+fn writeEnrichedItemObject(writer: anytype, row: EnrichedItem) !void {
+    try writer.writeByte('{');
+    try writer.writeAll("\"id\":");
+    try std.json.Stringify.value(row.item.id, .{}, writer);
+    try writer.writeAll(",\"step\":");
+    try std.json.Stringify.value(row.item.step, .{}, writer);
+    try writer.writeAll(",\"status\":");
+    try std.json.Stringify.value(row.item.status.asString(), .{}, writer);
+    try writer.writeAll(",\"priority\":");
+    try std.json.Stringify.value(row.item.priority.asString(), .{}, writer);
+    try writer.writeAll(",\"deps\":");
+    try writeDepsArray(writer, row.item.deps);
+    try writer.writeAll(",\"notes\":");
+    try std.json.Stringify.value(row.item.notes, .{}, writer);
+    try writer.writeAll(",\"comments\":");
+    try writeCommentsArray(writer, row.item.comments);
+    try writer.writeAll(",\"dep_state\":");
+    try std.json.Stringify.value(row.dep_state.asString(), .{}, writer);
+    try writer.writeAll(",\"waiting_on\":");
+    try writeWaitingOnArray(writer, row.waiting_on);
+    try writer.writeByte('}');
+}
+
+fn writeWaitingOnArray(writer: anytype, waiting_on: []const []const u8) !void {
+    try writer.writeByte('[');
+    for (waiting_on, 0..) |item_id, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try std.json.Stringify.value(item_id, .{}, writer);
+    }
+    try writer.writeByte(']');
+}
+
 fn writeEnrichedItemsJson(writer: anytype, rows: []const EnrichedItem) !void {
     try writer.writeAll("{\"items\":[");
     for (rows, 0..) |row, idx| {
         if (idx > 0) try writer.writeByte(',');
-        try writer.writeByte('{');
-        try writer.writeAll("\"id\":");
-        try std.json.Stringify.value(row.item.id, .{}, writer);
-        try writer.writeAll(",\"step\":");
-        try std.json.Stringify.value(row.item.step, .{}, writer);
-        try writer.writeAll(",\"status\":");
-        try std.json.Stringify.value(row.item.status.asString(), .{}, writer);
-        try writer.writeAll(",\"deps\":");
-        try writeDepsArray(writer, row.item.deps);
-        try writer.writeAll(",\"notes\":");
-        try std.json.Stringify.value(row.item.notes, .{}, writer);
-        try writer.writeAll(",\"comments\":");
-        try writeCommentsArray(writer, row.item.comments);
-        try writer.writeAll(",\"dep_state\":");
-        try std.json.Stringify.value(row.dep_state.asString(), .{}, writer);
-        try writer.writeAll(",\"waiting_on\":[");
-        for (row.waiting_on, 0..) |w, w_idx| {
-            if (w_idx > 0) try writer.writeByte(',');
-            try std.json.Stringify.value(w, .{}, writer);
-        }
-        try writer.writeByte(']');
-        try writer.writeByte('}');
+        try writeEnrichedItemObject(writer, row);
     }
     try writer.writeAll("]}");
+}
+
+fn emitPlanSync(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    state: *const ItemState,
+    allow_multiple_in_progress: bool,
+    prefixed: bool,
+) !void {
+    _ = allow_multiple_in_progress;
+    const enriched = try enrichItems(allocator, state);
+
+    if (prefixed) {
+        try writer.writeAll("plan_sync: ");
+    }
+
+    try writer.writeAll("{\"version\":");
+    try writer.print("{d}", .{PlanSyncVersion});
+    try writer.writeAll(",\"items\":[");
+    for (enriched, 0..) |row, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writeEnrichedItemObject(writer, row);
+    }
+    try writer.writeAll("],\"codex\":{\"plan\":[");
+    try writeCodexPlan(writer, enriched);
+    try writer.writeAll("]},\"opencode\":{\"todos\":[");
+    try writeOpencodeTodos(writer, enriched);
+    try writer.writeAll("]}}\n");
 }
 
 fn emitUpdatePlan(
@@ -1484,25 +1622,65 @@ fn emitUpdatePlan(
     }
 
     try writer.writeAll("{\"plan\":[");
-    for (enriched, 0..) |row, idx| {
-        if (idx > 0) try writer.writeByte(',');
-
-        var mapped = switch (row.item.status) {
-            .in_progress => "in_progress",
-            .completed => "completed",
-            .pending, .blocked, .deferred, .canceled => "pending",
-        };
-        if (row.dep_state == .waiting_on_deps and std.mem.eql(u8, mapped, "in_progress")) {
-            mapped = "pending";
-        }
-
-        try writer.writeAll("{\"step\":");
-        try std.json.Stringify.value(row.item.step, .{}, writer);
-        try writer.writeAll(",\"status\":");
-        try std.json.Stringify.value(mapped, .{}, writer);
-        try writer.writeByte('}');
-    }
+    try writeCodexPlan(writer, enriched);
     try writer.writeAll("]}\n");
+}
+
+fn writeCodexPlan(writer: anytype, rows: []const EnrichedItem) !void {
+    for (rows, 0..) |row, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writeCodexPlanEntry(writer, row);
+    }
+}
+
+fn writeCodexPlanEntry(writer: anytype, row: EnrichedItem) !void {
+    try writer.writeAll("{\"step\":");
+    try std.json.Stringify.value(row.item.step, .{}, writer);
+    try writer.writeAll(",\"status\":");
+    try std.json.Stringify.value(codexPlanStatusForRow(row), .{}, writer);
+    try writer.writeByte('}');
+}
+
+fn codexPlanStatusForRow(row: EnrichedItem) []const u8 {
+    var mapped = switch (row.item.status) {
+        .in_progress => "in_progress",
+        .completed => "completed",
+        .pending, .blocked, .deferred, .canceled => "pending",
+    };
+    if (row.dep_state == .waiting_on_deps and std.mem.eql(u8, mapped, "in_progress")) {
+        mapped = "pending";
+    }
+    return mapped;
+}
+
+fn writeOpencodeTodos(writer: anytype, rows: []const EnrichedItem) !void {
+    for (rows, 0..) |row, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writeOpencodeTodoEntry(writer, row);
+    }
+}
+
+fn writeOpencodeTodoEntry(writer: anytype, row: EnrichedItem) !void {
+    try writer.writeAll("{\"content\":");
+    try std.json.Stringify.value(row.item.step, .{}, writer);
+    try writer.writeAll(",\"status\":");
+    try std.json.Stringify.value(opencodeTodoStatusForRow(row), .{}, writer);
+    try writer.writeAll(",\"priority\":");
+    try std.json.Stringify.value(row.item.priority.asString(), .{}, writer);
+    try writer.writeByte('}');
+}
+
+fn opencodeTodoStatusForRow(row: EnrichedItem) []const u8 {
+    var mapped = switch (row.item.status) {
+        .in_progress => "in_progress",
+        .completed => "completed",
+        .canceled => "cancelled",
+        .pending, .blocked, .deferred => "pending",
+    };
+    if (row.dep_state == .waiting_on_deps and std.mem.eql(u8, mapped, "in_progress")) {
+        mapped = "pending";
+    }
+    return mapped;
 }
 
 fn enrichItems(allocator: std.mem.Allocator, state: *const ItemState) ![]EnrichedItem {
@@ -1666,6 +1844,9 @@ fn canonicalItem(allocator: std.mem.Allocator, value: std.json.Value) !Item {
     const status_raw = if (obj.get("status")) |v| asString(v) orelse return error.InvalidStatus else "pending";
     const status = try normalizeStatus(status_raw);
 
+    const priority_raw = if (obj.get("priority")) |v| asString(v) orelse return error.InvalidPriority else "medium";
+    const priority = try normalizePriority(priority_raw);
+
     const deps_value = obj.get("deps") orelse return error.MissingDepsValue;
     const deps = try normalizeDeps(allocator, deps_value);
 
@@ -1681,6 +1862,7 @@ fn canonicalItem(allocator: std.mem.Allocator, value: std.json.Value) !Item {
         .id = id,
         .step = step,
         .status = status,
+        .priority = priority,
         .deps = deps,
         .notes = notes,
         .comments = comments,
@@ -1818,6 +2000,21 @@ fn normalizeStatus(raw: []const u8) !Status {
     if (std.mem.eql(u8, lower, "canceled") or std.mem.eql(u8, lower, "cancelled")) return .canceled;
 
     return error.InvalidStatus;
+}
+
+fn normalizePriority(raw: []const u8) !Priority {
+    var lower_buf: [16]u8 = undefined;
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0 or trimmed.len > lower_buf.len) return error.InvalidPriority;
+
+    for (trimmed, 0..) |c, idx| lower_buf[idx] = std.ascii.toLower(c);
+    const lower = lower_buf[0..trimmed.len];
+
+    if (std.mem.eql(u8, lower, "high")) return .high;
+    if (std.mem.eql(u8, lower, "medium")) return .medium;
+    if (std.mem.eql(u8, lower, "low")) return .low;
+
+    return error.InvalidPriority;
 }
 
 fn collectSeqContractIssues(allocator: std.mem.Allocator, records: []const std.json.Value) ![]const []const u8 {
@@ -2231,6 +2428,8 @@ fn makeSeqRecord(
 
 test "parseCommand and parseOutputFormat recognize known values" {
     try std.testing.expect(parseCommand("set-status") != null);
+    try std.testing.expectEqual(Command.set_priority, parseCommand("set-priority").?);
+    try std.testing.expectEqual(Command.emit_plan_sync, parseCommand("emit-plan-sync").?);
     try std.testing.expectEqual(Command.emit_update_plan, parseCommand("emit-update-plan").?);
     try std.testing.expect(parseCommand("unknown-cmd") == null);
 
@@ -2245,6 +2444,7 @@ test "dependencyState maps blocked and waiting statuses" {
         .id = "st-001",
         .step = "sample",
         .status = .pending,
+        .priority = .medium,
         .deps = &.{},
         .notes = "",
         .comments = &.{},
@@ -2262,6 +2462,87 @@ test "dependencyState maps blocked and waiting statuses" {
     var done_item = base;
     done_item.status = .completed;
     try std.testing.expectEqual(DepState.na, dependencyState(done_item, &.{}));
+}
+
+test "canonicalItem defaults missing priority to medium" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"id\":\"st-001\",\"step\":\"Sample\",\"status\":\"pending\",\"deps\":[],\"notes\":\"\",\"comments\":[]}",
+        .{},
+    );
+
+    const item = try canonicalItem(allocator, parsed.value);
+    try std.testing.expectEqual(Priority.medium, item.priority);
+}
+
+test "emitPlanSync includes items plus codex and opencode projections" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var state = ItemState.init(allocator);
+    defer state.deinit();
+    try state.upsert(.{
+        .id = "st-001",
+        .step = "First step",
+        .status = .pending,
+        .priority = .high,
+        .deps = &.{},
+        .notes = "",
+        .comments = &.{},
+    });
+    try state.upsert(.{
+        .id = "st-002",
+        .step = "Canceled step",
+        .status = .canceled,
+        .priority = .low,
+        .deps = &.{},
+        .notes = "",
+        .comments = &.{},
+    });
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try emitPlanSync(allocator, &out.writer, &state, false, false);
+    const actual = try out.toOwnedSlice();
+
+    try std.testing.expectEqualStrings(
+        "{\"version\":1,\"items\":[{\"id\":\"st-001\",\"step\":\"First step\",\"status\":\"pending\",\"priority\":\"high\",\"deps\":[],\"notes\":\"\",\"comments\":[],\"dep_state\":\"ready\",\"waiting_on\":[]},{\"id\":\"st-002\",\"step\":\"Canceled step\",\"status\":\"canceled\",\"priority\":\"low\",\"deps\":[],\"notes\":\"\",\"comments\":[],\"dep_state\":\"n/a\",\"waiting_on\":[]}],\"codex\":{\"plan\":[{\"step\":\"First step\",\"status\":\"pending\"},{\"step\":\"Canceled step\",\"status\":\"pending\"}]},\"opencode\":{\"todos\":[{\"content\":\"First step\",\"status\":\"pending\",\"priority\":\"high\"},{\"content\":\"Canceled step\",\"status\":\"cancelled\",\"priority\":\"low\"}]}}\n",
+        actual,
+    );
+}
+
+test "emitUpdatePlan preserves legacy payload shape" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var state = ItemState.init(allocator);
+    defer state.deinit();
+    try state.upsert(.{
+        .id = "st-001",
+        .step = "High priority step",
+        .status = .in_progress,
+        .priority = .high,
+        .deps = &.{},
+        .notes = "",
+        .comments = &.{},
+    });
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try emitUpdatePlan(allocator, &out.writer, &state, false, false);
+    const actual = try out.toOwnedSlice();
+
+    try std.testing.expectEqualStrings(
+        "{\"plan\":[{\"step\":\"High priority step\",\"status\":\"in_progress\"}]}\n",
+        actual,
+    );
 }
 
 test "collectSeqContractIssues detects non-monotonic trailing seq" {
