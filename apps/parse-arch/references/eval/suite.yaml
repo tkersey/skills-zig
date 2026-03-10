@@ -24,6 +24,11 @@ cases:
     expected_top_signal: modular-monolith
     min_entrypoint_hint_count: 1
 
+  - id: library-contract-surfaces
+    repo: fixtures/library-contract-surfaces
+    expected_repo_kind: library-sdk
+    expected_top_signal: modular-monolith
+
   - id: microservice-platform
     repo: fixtures/microservice-platform
     expected_repo_kind: monorepo-platform

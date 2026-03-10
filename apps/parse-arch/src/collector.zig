@@ -259,6 +259,18 @@ const library_like_markers = std.StaticStringMap(void).initComptime(.{
     .{ "pkg", {} },
 });
 
+const library_contract_surface_markers = std.StaticStringMap(void).initComptime(.{
+    .{ "docs", {} },
+    .{ "examples", {} },
+    .{ "example", {} },
+    .{ "test", {} },
+    .{ "tests", {} },
+    .{ "bench", {} },
+    .{ "benches", {} },
+    .{ "benchmark", {} },
+    .{ "benchmarks", {} },
+});
+
 const interesting_subsystem_markers = std.StaticStringMap(void).initComptime(.{
     .{ "apps", {} },
     .{ "services", {} },
@@ -336,7 +348,7 @@ const zone_marker_sets = [_]MarkerSet{
 const keyword_patterns = [_]KeywordPattern{
     .{ .name = "component-ui", .tokens = &.{ "component", "viewmodel", "screen", "page", "react", "vue", "svelte", "solid" } },
     .{ .name = "event-driven", .tokens = &.{ "kafka", "rabbitmq", "nats", "sns", "sqs", "pubsub", "topic", "consumer", "publisher", "subscribe", "eventbridge" } },
-    .{ .name = "pipeline", .tokens = &.{ "airflow", "dagster", "prefect", "etl", "workflow", "pipeline", "cron job", "batch job", "dag" } },
+    .{ .name = "pipeline", .tokens = &.{ "airflow", "dagster", "prefect", "etl", "pipeline", "cron job", "batch job", "dag" } },
     .{ .name = "plugin", .tokens = &.{ "plugin", "hook registry", "provider interface", "extension point", "dynamic load" } },
     .{ .name = "microservice", .tokens = &.{ "service boundary", "grpc", "service-to-service", "microservice" } },
     .{ .name = "clean-hexagonal", .tokens = &.{ "ports and adapters", "use case", "usecase", "application service", "domain layer", "infrastructure layer" } },
@@ -1062,6 +1074,24 @@ fn collectSignals(
 ) ![]const SignalEntry {
     var signal_builders = std.StringHashMap(SignalBuilder).init(allocator);
     defer signal_builders.deinit();
+
+    const library_root_count = countTopLevelMatches(top_level_dirs, library_like_markers);
+    const contract_surface_count = countTopLevelMatches(top_level_dirs, library_contract_surface_markers);
+    const app_like_count = countTopLevelMatches(top_level_dirs, service_like_markers) +
+        countTopLevelMatches(top_level_dirs, frontend_like_markers) +
+        countTopLevelMatches(top_level_dirs, apps_dir_markers);
+
+    if (library_root_count >= 1 and contract_surface_count >= 3 and app_like_count == 0) {
+        if (try intersectTopLevelMarkers(allocator, top_level_dirs, library_contract_surface_markers)) |names| {
+            const signal = try getSignalBuilder(allocator, &signal_builders, "modular-monolith");
+            signal.score += 4;
+            try signal.appendEvidence(allocator, try std.fmt.allocPrint(
+                allocator,
+                "library contract surfaces: src plus {s}",
+                .{names},
+            ));
+        }
+    }
 
     for (architecture_marker_sets) |marker_set| {
         var overlaps = std.ArrayList([]const u8).empty;
