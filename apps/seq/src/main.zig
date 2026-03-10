@@ -10,6 +10,31 @@ fn shouldIgnoreWriteError(err: anyerror) bool {
     return err == error.WriteFailed or err == error.BrokenPipe;
 }
 
+fn shouldSuppressCliError(err: anyerror) bool {
+    return switch (err) {
+        error.InvalidCommand,
+        error.UnknownArgument,
+        error.UnsupportedOption,
+        error.InvalidFormatForCommand,
+        error.InvalidLimit,
+        error.MissingArgValue,
+        error.MissingDatasetArg,
+        error.MissingSpecArg,
+        error.MissingSkillArg,
+        error.MissingPromptArg,
+        error.MissingSectionsArg,
+        error.MissingCueSpecArg,
+        error.SessionNotFound,
+        error.InvalidSessionTarget,
+        error.AmbiguousSessionTarget,
+        error.CurrentSessionUnavailable,
+        error.InvalidRoleArg,
+        error.QueryHangDetected,
+        => true,
+        else => false,
+    };
+}
+
 fn printCommandList(stdout: anytype) !void {
     try stdout.print("seq\n", .{});
     try stdout.print("Version: {s}\n", .{Version});
@@ -55,6 +80,7 @@ fn runLegacyNumericSeqCompat(stdout: anytype, argv: []const []const u8) !bool {
 pub fn main() !void {
     runMain() catch |err| {
         if (shouldIgnoreWriteError(err)) return;
+        if (shouldSuppressCliError(err)) return;
         return err;
     };
 }

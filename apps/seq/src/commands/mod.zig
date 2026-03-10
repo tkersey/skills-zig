@@ -233,6 +233,7 @@ const Options = struct {
     format: output.Format = .table,
     format_set: bool = false,
     help: bool = false,
+    current: bool = false,
     summary: bool = false,
     next_actions: bool = false,
     latest: bool = false,
@@ -249,6 +250,7 @@ const Options = struct {
     skill: ?[]const u8 = null,
     bucket: ?[]const u8 = null,
     prompt: ?[]const u8 = null,
+    roles_csv: ?[]const u8 = null,
     contains: ?[]const u8 = null,
     regex: ?[]const u8 = null,
     role: ?[]const u8 = null,
@@ -267,6 +269,8 @@ const Options = struct {
     opencode_path: ?[]const u8 = null,
     opencode_source_text: ?[]const u8 = null,
     include_raw: bool = false,
+    strip_skill_blocks: bool = false,
+    no_dedupe_exact: bool = false,
     sections: ?[]const u8 = null,
     cue_spec_text: ?[]const u8 = null,
     discovery_skills: ?[]const u8 = null,
@@ -286,6 +290,7 @@ pub fn run(
         return;
     }
     if (opts.format_set) try validateFormatForCommand(cmd, opts.format);
+    try validateCommandOptions(cmd, opts);
 
     const sessions_root = try resolveSessionsRoot(allocator, opts.root);
     defer allocator.free(sessions_root);
@@ -322,7 +327,6 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\shared options:
         \\  --format <table|json|csv|jsonl>
         \\  --root <path> (session datasets)
-        \\  --path <path> (single-session/rollout modes)
         \\  --output <path>
         \\  --limit|--max|--top <N>
     ;
@@ -350,10 +354,17 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\usage: seq find-session --prompt <text> [--limit N] [--format table|json|csv|jsonl]
         ,
         .session_prompts =>
-        \\usage: seq session-prompts [--session-id <id>|--path <jsonl>|--current] [--limit N] [--format table|json|csv|jsonl]
+        \\usage: seq session-prompts [--session-id <id>|--path <jsonl>|--current] [--roles <csv>] [--strip-skill-blocks] [--no-dedupe-exact] [--limit N] [--format table|json|csv|jsonl]
+        \\extra options:
+        \\  --path <path>              Inspect exactly one rollout/session JSONL file
+        \\  --session-id <id>          Resolve exactly one session file by session id substring
+        \\  --current                  Resolve current session via CODEX_THREAD_ID
+        \\  --roles <csv>              user | assistant | user,assistant
+        \\  --strip-skill-blocks       Remove <skill>...</skill> envelopes before output
+        \\  --no-dedupe-exact          Keep duplicated role+text rows
         ,
         .report_bundle =>
-        \\usage: seq report-bundle [--top N] [--skills <csv>] [--sections <csv>]
+        \\usage: seq report-bundle [--top N]
         ,
         .section_audit =>
         \\usage: seq section-audit --sections <csv>
@@ -396,6 +407,23 @@ fn printCommandHelp(cmd: lib.Command) !void {
     try stdout.writeByte('\n');
 }
 
+fn printCliError(comptime fmt: []const u8, args: anytype) void {
+    var stderr_writer = std.fs.File.stderr().writer(&.{});
+    const stderr = &stderr_writer.interface;
+    stderr.print(fmt, args) catch {};
+}
+
+fn unsupportedOption(option: []const u8, cmd: lib.Command) !void {
+    printCliError("error: option {s} is not supported for {s}\n", .{ option, @tagName(cmd) });
+    return error.UnsupportedOption;
+}
+
+fn ensureOptionAllowed(flag_set: bool, allowed: bool, option: []const u8, cmd: lib.Command) !void {
+    if (flag_set and !allowed) {
+        try unsupportedOption(option, cmd);
+    }
+}
+
 fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
     switch (cmd) {
         .skills_rank, .skill_trend, .skill_report, .role_breakdown, .report_bundle, .section_audit, .datasets, .dataset_schema => {
@@ -407,6 +435,155 @@ fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
         .orchestration_concurrency, .find_session, .session_prompts, .query, .token_usage, .routing_gap, .session_tooling, .query_diagnose, .opencode_prompts, .opencode_events => {},
         .unknown => return error.InvalidCommand,
     }
+}
+
+fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
+    const supports_path = switch (cmd) {
+        .orchestration_concurrency, .session_prompts, .session_tooling, .query_diagnose => true,
+        else => false,
+    };
+    const supports_session_id = switch (cmd) {
+        .orchestration_concurrency, .session_prompts, .session_tooling => true,
+        else => false,
+    };
+    const supports_current = cmd == .session_prompts;
+    const supports_roles_csv = cmd == .session_prompts;
+    const supports_strip_skill_blocks = cmd == .session_prompts;
+    const supports_no_dedupe_exact = cmd == .session_prompts;
+    const supports_summary = switch (cmd) {
+        .session_tooling, .query_diagnose => true,
+        else => false,
+    };
+    const supports_next_actions = cmd == .query_diagnose;
+    const supports_latest = switch (cmd) {
+        .opencode_prompts, .opencode_events => true,
+        else => false,
+    };
+    const supports_floor_threshold = cmd == .orchestration_concurrency;
+    const supports_fail_on_floor = cmd == .orchestration_concurrency;
+    const supports_fail_on_mesh_truth = cmd == .orchestration_concurrency;
+    const supports_fail_on_hang = cmd == .query_diagnose;
+    const supports_threshold_ms = cmd == .query_diagnose;
+    const supports_strict_hang = cmd == .query_diagnose;
+    const supports_skill = switch (cmd) {
+        .skill_trend, .skill_report, .occurrence_export => true,
+        else => false,
+    };
+    const supports_bucket = cmd == .skill_trend;
+    const supports_prompt = cmd == .find_session;
+    const supports_sections = cmd == .section_audit;
+    const supports_cue_spec = cmd == .routing_gap;
+    const supports_discovery_skills = cmd == .routing_gap;
+    const supports_dataset = cmd == .dataset_schema;
+    const supports_spec_text = switch (cmd) {
+        .query, .opencode_prompts, .opencode_events => true,
+        else => false,
+    };
+    const supports_contains = switch (cmd) {
+        .opencode_prompts, .opencode_events => true,
+        else => false,
+    };
+    const supports_regex = switch (cmd) {
+        .opencode_prompts, .opencode_events => true,
+        else => false,
+    };
+    const supports_role = cmd == .opencode_events;
+    const supports_tool = cmd == .opencode_events;
+    const supports_status = cmd == .opencode_events;
+    const supports_mode = switch (cmd) {
+        .opencode_prompts, .opencode_events => true,
+        else => false,
+    };
+    const supports_part_type = switch (cmd) {
+        .opencode_prompts, .opencode_events => true,
+        else => false,
+    };
+    const supports_since = switch (cmd) {
+        .opencode_prompts, .opencode_events => true,
+        else => false,
+    };
+    const supports_until = switch (cmd) {
+        .opencode_prompts, .opencode_events => true,
+        else => false,
+    };
+    const supports_session = switch (cmd) {
+        .opencode_prompts, .opencode_events => true,
+        else => false,
+    };
+    const supports_group_by = switch (cmd) {
+        .session_tooling, .opencode_prompts, .opencode_events => true,
+        else => false,
+    };
+    const supports_metric = switch (cmd) {
+        .opencode_prompts, .opencode_events => true,
+        else => false,
+    };
+    const supports_select = switch (cmd) {
+        .opencode_prompts, .opencode_events => true,
+        else => false,
+    };
+    const supports_sort = switch (cmd) {
+        .opencode_prompts, .opencode_events => true,
+        else => false,
+    };
+    const supports_opencode_db_path = switch (cmd) {
+        .opencode_prompts, .opencode_events => true,
+        else => false,
+    };
+    const supports_opencode_path = switch (cmd) {
+        .opencode_prompts, .opencode_events => true,
+        else => false,
+    };
+    const supports_opencode_source = switch (cmd) {
+        .opencode_prompts, .opencode_events => true,
+        else => false,
+    };
+    const supports_include_raw = switch (cmd) {
+        .opencode_prompts, .opencode_events => true,
+        else => false,
+    };
+
+    try ensureOptionAllowed(opts.path != null, supports_path, "--path", cmd);
+    try ensureOptionAllowed(opts.session_id != null, supports_session_id, "--session-id", cmd);
+    try ensureOptionAllowed(opts.current, supports_current, "--current", cmd);
+    try ensureOptionAllowed(opts.roles_csv != null, supports_roles_csv, "--roles", cmd);
+    try ensureOptionAllowed(opts.strip_skill_blocks, supports_strip_skill_blocks, "--strip-skill-blocks", cmd);
+    try ensureOptionAllowed(opts.no_dedupe_exact, supports_no_dedupe_exact, "--no-dedupe-exact", cmd);
+    try ensureOptionAllowed(opts.summary, supports_summary, "--summary", cmd);
+    try ensureOptionAllowed(opts.next_actions, supports_next_actions, "--next-actions", cmd);
+    try ensureOptionAllowed(opts.latest, supports_latest, "--latest", cmd);
+    try ensureOptionAllowed(opts.floor_threshold != 3, supports_floor_threshold, "--floor-threshold", cmd);
+    try ensureOptionAllowed(opts.fail_on_floor, supports_fail_on_floor, "--fail-on-floor", cmd);
+    try ensureOptionAllowed(opts.fail_on_mesh_truth, supports_fail_on_mesh_truth, "--fail-on-mesh-truth", cmd);
+    try ensureOptionAllowed(opts.fail_on_hang, supports_fail_on_hang, "--fail-on-hang", cmd);
+    try ensureOptionAllowed(opts.threshold_ms != 10_000, supports_threshold_ms, "--threshold-ms", cmd);
+    try ensureOptionAllowed(!opts.strict_hang, supports_strict_hang, "--no-strict-hang", cmd);
+    try ensureOptionAllowed(opts.skill != null, supports_skill, "--skill", cmd);
+    try ensureOptionAllowed(opts.bucket != null, supports_bucket, "--bucket", cmd);
+    try ensureOptionAllowed(opts.prompt != null, supports_prompt, "--prompt", cmd);
+    try ensureOptionAllowed(opts.sections != null, supports_sections, "--sections", cmd);
+    try ensureOptionAllowed(opts.cue_spec_text != null, supports_cue_spec, "--cue-spec", cmd);
+    try ensureOptionAllowed(opts.discovery_skills != null, supports_discovery_skills, "--discovery-skills", cmd);
+    try ensureOptionAllowed(opts.dataset != null, supports_dataset, "--dataset", cmd);
+    try ensureOptionAllowed(opts.spec_text != null, supports_spec_text, "--spec", cmd);
+    try ensureOptionAllowed(opts.contains != null, supports_contains, "--contains", cmd);
+    try ensureOptionAllowed(opts.regex != null, supports_regex, "--regex", cmd);
+    try ensureOptionAllowed(opts.role != null, supports_role, "--role", cmd);
+    try ensureOptionAllowed(opts.tool != null, supports_tool, "--tool", cmd);
+    try ensureOptionAllowed(opts.status != null, supports_status, "--status", cmd);
+    try ensureOptionAllowed(opts.mode != null, supports_mode, "--mode", cmd);
+    try ensureOptionAllowed(opts.part_type != null, supports_part_type, "--part-type", cmd);
+    try ensureOptionAllowed(opts.since != null, supports_since, "--since", cmd);
+    try ensureOptionAllowed(opts.until != null, supports_until, "--until", cmd);
+    try ensureOptionAllowed(opts.session != null, supports_session, "--session", cmd);
+    try ensureOptionAllowed(opts.group_by_text != null, supports_group_by, "--group-by", cmd);
+    try ensureOptionAllowed(opts.metric_text != null, supports_metric, "--metric", cmd);
+    try ensureOptionAllowed(opts.select_text != null, supports_select, "--select", cmd);
+    try ensureOptionAllowed(opts.sort_text != null, supports_sort, "--sort", cmd);
+    try ensureOptionAllowed(opts.opencode_db_path != null, supports_opencode_db_path, "--opencode-db-path", cmd);
+    try ensureOptionAllowed(opts.opencode_path != null, supports_opencode_path, "--opencode-path", cmd);
+    try ensureOptionAllowed(opts.opencode_source_text != null, supports_opencode_source, "--source", cmd);
+    try ensureOptionAllowed(opts.include_raw, supports_include_raw, "--include-raw", cmd);
 }
 
 fn cmdDatasets(allocator: std.mem.Allocator, opts: Options) !void {
@@ -1925,22 +2102,153 @@ fn cmdFindSession(allocator: std.mem.Allocator, sessions_root: []const u8, opts:
     try runDatasetQuery(allocator, "messages", sessions_root, query_spec, opts.format, opts.out_path, select[0..]);
 }
 
-fn cmdSessionPrompts(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
-    const where = [_]spec.WhereClause{
-        .{
-            .field = "role",
-            .op = .eq,
-            .value = .{ .scalar = .{ .string = "user" } },
-        },
+fn currentSessionIdFromEnv(allocator: std.mem.Allocator) ![]u8 {
+    return std.process.getEnvVarOwned(allocator, "CODEX_THREAD_ID") catch {
+        printCliError("error: --current requires CODEX_THREAD_ID in the environment\n", .{});
+        return error.CurrentSessionUnavailable;
     };
-    const select = [_][]const u8{ "timestamp", "path", "text" };
+}
+
+fn resolveSessionPromptInputPaths(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    opts: Options,
+) !std.ArrayList([]u8) {
+    const selector_count: usize =
+        @intFromBool(opts.path != null) +
+        @intFromBool(opts.session_id != null) +
+        @intFromBool(opts.current);
+    if (selector_count > 1) {
+        printCliError("error: use at most one of --path, --session-id, or --current\n", .{});
+        return error.InvalidSessionTarget;
+    }
+
+    if (opts.path) |single_path| {
+        var out: std.ArrayList([]u8) = .empty;
+        errdefer freePathList(allocator, &out);
+
+        const absolute = try toAbsolutePath(allocator, single_path);
+        const file = std.fs.openFileAbsolute(absolute, .{}) catch {
+            allocator.free(absolute);
+            return error.SessionNotFound;
+        };
+        file.close();
+        try out.append(allocator, absolute);
+        return out;
+    }
+
+    const wanted_id = if (opts.current)
+        try currentSessionIdFromEnv(allocator)
+    else if (opts.session_id) |explicit|
+        try allocator.dupe(u8, explicit)
+    else
+        null;
+    defer if (wanted_id) |value| allocator.free(value);
+
+    var paths = try collectJsonlPaths(allocator, sessions_root, null);
+    errdefer freePathList(allocator, &paths);
+
+    if (wanted_id) |wanted| {
+        var write_idx: usize = 0;
+        for (paths.items) |path| {
+            if (std.mem.containsAtLeast(u8, path, 1, wanted)) {
+                paths.items[write_idx] = path;
+                write_idx += 1;
+            } else {
+                allocator.free(path);
+            }
+        }
+        paths.items.len = write_idx;
+        if (paths.items.len == 0) return error.SessionNotFound;
+        if (paths.items.len > 1) {
+            printCliError("error: session selector matched more than one file\n", .{});
+            return error.AmbiguousSessionTarget;
+        }
+    }
+
+    return paths;
+}
+
+fn parseSessionPromptMessageOptions(opts: Options) !datasets.messages.ParseOptions {
+    var include_user = false;
+    var include_assistant = false;
+    const roles_text = opts.roles_csv orelse "user";
+    var split = std.mem.splitScalar(u8, roles_text, ',');
+    while (split.next()) |raw_role| {
+        const role = std.mem.trim(u8, raw_role, " \t\r\n");
+        if (role.len == 0) continue;
+        if (std.mem.eql(u8, role, "user")) {
+            include_user = true;
+        } else if (std.mem.eql(u8, role, "assistant")) {
+            include_assistant = true;
+        } else {
+            printCliError("error: invalid --roles value {s}\n", .{role});
+            return error.InvalidRoleArg;
+        }
+    }
+
+    if (!include_user and !include_assistant) {
+        printCliError("error: --roles must include user, assistant, or both\n", .{});
+        return error.InvalidRoleArg;
+    }
+
+    return .{
+        .include_user = include_user,
+        .include_assistant = include_assistant,
+        .strip_echo_assistant = true,
+        .skip_meta_user_messages = true,
+        .dedupe_by_role_and_text = !opts.no_dedupe_exact,
+        .strip_skill_blocks = opts.strip_skill_blocks,
+    };
+}
+
+fn collectSessionPromptRows(
+    allocator: std.mem.Allocator,
+    input_paths: []const []u8,
+    parse_options: datasets.messages.ParseOptions,
+) !std.ArrayList(query.Row) {
+    var rows: std.ArrayList(query.Row) = .empty;
+    errdefer deinitQueryRows(allocator, &rows);
+
+    for (input_paths) |path| {
+        const content = try readFileAllocOrSkip(allocator, path);
+        if (content == null) continue;
+        defer allocator.free(content.?);
+
+        const parsed = try datasets.messages.parseJsonl(allocator, path, content.?, parse_options);
+        defer datasets.messages.freeRows(allocator, parsed);
+
+        for (parsed) |row| {
+            var qrow = query.Row.init(allocator);
+            try putOptionalString(&qrow, "timestamp", row.timestamp);
+            try qrow.putOwnedKey("path", .{ .string = row.path });
+            try qrow.putOwnedKey("role", .{ .string = row.role });
+            try qrow.putOwnedKey("text", .{ .string = row.text });
+            try rows.append(allocator, qrow);
+        }
+    }
+
+    return rows;
+}
+
+fn cmdSessionPrompts(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    const parse_options = try parseSessionPromptMessageOptions(opts);
+    var input_paths = try resolveSessionPromptInputPaths(allocator, sessions_root, opts);
+    defer freePathList(allocator, &input_paths);
+
+    var rows = try collectSessionPromptRows(allocator, input_paths.items, parse_options);
+    defer deinitQueryRows(allocator, &rows);
+
+    const select = [_][]const u8{ "timestamp", "path", "role", "text" };
     const query_spec = spec.QuerySpec{
-        .where = where[0..],
         .select = select[0..],
         .sort = &.{.{ .field = "timestamp", .descending = false }},
         .limit = opts.limit,
     };
-    try runDatasetQuery(allocator, "messages", sessions_root, query_spec, opts.format, opts.out_path, select[0..]);
+    var result = try query.execute(allocator, rows.items, query_spec);
+    defer result.deinit(allocator);
+
+    try output.writeOutput(allocator, opts.format, result.rows.items, select[0..], opts.out_path);
 }
 
 fn cmdReportBundle(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
@@ -3630,6 +3938,10 @@ fn parseOptions(args: []const []const u8) !Options {
             opts.help = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--current")) {
+            opts.current = true;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--format")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -3671,6 +3983,10 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.prompt = args[i];
+        } else if (std.mem.eql(u8, arg, "--roles")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.roles_csv = args[i];
         } else if (std.mem.eql(u8, arg, "--contains")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -3743,6 +4059,10 @@ fn parseOptions(args: []const []const u8) !Options {
             opts.include_raw = true;
         } else if (std.mem.eql(u8, arg, "--include-parts")) {
             opts.include_raw = true;
+        } else if (std.mem.eql(u8, arg, "--strip-skill-blocks")) {
+            opts.strip_skill_blocks = true;
+        } else if (std.mem.eql(u8, arg, "--no-dedupe-exact")) {
+            opts.no_dedupe_exact = true;
         } else if (std.mem.eql(u8, arg, "--summary")) {
             opts.summary = true;
         } else if (std.mem.eql(u8, arg, "--next-actions")) {
@@ -3789,6 +4109,9 @@ fn parseOptions(args: []const []const u8) !Options {
             const n = try std.fmt.parseInt(i64, args[i], 10);
             if (n < 0) return error.InvalidLimit;
             opts.limit = @intCast(n);
+        } else {
+            printCliError("error: unknown option {s}\n", .{arg});
+            return error.UnknownArgument;
         }
     }
     return opts;
@@ -4082,6 +4405,8 @@ test "parse options supports common flags" {
         "@cues.json",
         "--discovery-skills",
         "grill-me,prove-it",
+        "--roles",
+        "user,assistant",
         "--contains",
         "needle",
         "--regex",
@@ -4117,8 +4442,11 @@ test "parse options supports common flags" {
         "--source",
         "db",
         "--include-raw",
+        "--strip-skill-blocks",
+        "--no-dedupe-exact",
         "--summary",
         "--next-actions",
+        "--current",
         "--latest",
         "--strict-hang",
         "--threshold-ms",
@@ -4138,6 +4466,7 @@ test "parse options supports common flags" {
     try std.testing.expectEqual(@as(usize, 7), opts.limit);
     try std.testing.expectEqualStrings("@cues.json", opts.cue_spec_text.?);
     try std.testing.expectEqualStrings("grill-me,prove-it", opts.discovery_skills.?);
+    try std.testing.expectEqualStrings("user,assistant", opts.roles_csv.?);
     try std.testing.expectEqualStrings("needle", opts.contains.?);
     try std.testing.expectEqualStrings("^foo", opts.regex.?);
     try std.testing.expectEqualStrings("assistant", opts.role.?);
@@ -4156,13 +4485,26 @@ test "parse options supports common flags" {
     try std.testing.expectEqualStrings("/tmp/prompt-history.jsonl", opts.opencode_path.?);
     try std.testing.expectEqualStrings("db", opts.opencode_source_text.?);
     try std.testing.expect(opts.include_raw);
+    try std.testing.expect(opts.strip_skill_blocks);
+    try std.testing.expect(opts.no_dedupe_exact);
     try std.testing.expect(opts.summary);
     try std.testing.expect(opts.next_actions);
+    try std.testing.expect(opts.current);
     try std.testing.expect(opts.latest);
     try std.testing.expect(opts.strict_hang);
     try std.testing.expectEqual(@as(i64, 12000), opts.threshold_ms);
     try std.testing.expect(opts.fail_on_hang);
     try std.testing.expect(opts.help);
+}
+
+test "parseOptions rejects unknown option" {
+    const args = [_][]const u8{"--bogus"};
+    try std.testing.expectError(error.UnknownArgument, parseOptions(args[0..]));
+}
+
+test "validateCommandOptions rejects unsupported path on skill-report" {
+    const opts = Options{ .path = "/tmp/session.jsonl" };
+    try std.testing.expectError(error.UnsupportedOption, validateCommandOptions(.skill_report, opts));
 }
 
 fn runCommandWithOutput(
@@ -4182,6 +4524,83 @@ fn runCommandWithOutput(
     const file = try std.fs.openFileAbsolute(output_path, .{});
     defer file.close();
     return file.readToEndAlloc(allocator, 1 * 1024 * 1024);
+}
+
+test "session-prompts resolves a single targeted file and supports role filters" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("2026/03/10");
+    const target_content =
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Before\\n<skill>\\n<name>seq</name>\\n</skill>\\nAfter\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Echo: prompt\\n\\nAnswer\"}]}}\n";
+    const other_content =
+        "{\"type\":\"response_item\",\"timestamp\":\"2025-10-20T10:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Older session\"}]}}\n";
+
+    const target_rel = "2026/03/10/rollout-2026-03-10T10-00-00-019c0000-0000-7000-8000-000000000010.jsonl";
+    const other_rel = "2026/03/10/rollout-2025-10-20T10-00-00-019a0000-0000-7000-8000-000000000011.jsonl";
+    try tmp.dir.writeFile(.{ .sub_path = target_rel, .data = target_content });
+    try tmp.dir.writeFile(.{ .sub_path = other_rel, .data = other_content });
+
+    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_abs);
+    const target_abs = try std.fs.path.join(std.testing.allocator, &.{ root_abs, target_rel });
+    defer std.testing.allocator.free(target_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "session-prompts.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const args = [_][]const u8{
+        "--root",
+        root_abs,
+        "--path",
+        target_abs,
+        "--roles",
+        "user,assistant",
+        "--strip-skill-blocks",
+        "--format",
+        "json",
+    };
+    const got = try runCommandWithOutput(std.testing.allocator, .session_prompts, args[0..], output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, target_abs) != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "Older session") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"role\": \"assistant\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "Before\\n\\nAfter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "Echo:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"text\": \"Answer\"") != null);
+}
+
+test "session-prompts preserves duplicates when no-dedupe-exact is set" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("2026/03/10");
+    const session_content =
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"repeat\"}]}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-10T10:00:01Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"repeat\"}}\n";
+    const session_rel = "2026/03/10/rollout-2026-03-10T10-00-00-019c0000-0000-7000-8000-000000000012.jsonl";
+    try tmp.dir.writeFile(.{ .sub_path = session_rel, .data = session_content });
+
+    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "session-prompts-dupes.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const args = [_][]const u8{
+        "--root",
+        root_abs,
+        "--session-id",
+        "019c0000-0000-7000-8000-000000000012",
+        "--no-dedupe-exact",
+        "--format",
+        "json",
+    };
+    const got = try runCommandWithOutput(std.testing.allocator, .session_prompts, args[0..], output_path);
+    defer std.testing.allocator.free(got);
+
+    const first = std.mem.indexOf(u8, got, "\"text\": \"repeat\"") orelse unreachable;
+    try std.testing.expect(std.mem.indexOfPos(u8, got, first + 1, "\"text\": \"repeat\"") != null);
 }
 
 test "session-tooling summary groups by primary executable" {

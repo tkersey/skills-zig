@@ -27,6 +27,7 @@ pub const ParseOptions = struct {
     strip_echo_assistant: bool = true,
     skip_meta_user_messages: bool = true,
     dedupe_by_role_and_text: bool = true,
+    strip_skill_blocks: bool = false,
 };
 
 const DateParts = struct {
@@ -128,6 +129,25 @@ fn normalizeText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
 
     const trimmed = std.mem.trim(u8, out.items, " \t\n");
     return allocator.dupe(u8, trimmed);
+}
+
+fn stripSkillBlocks(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    var remaining = text;
+    while (std.mem.indexOf(u8, remaining, "<skill>")) |start| {
+        try out.appendSlice(allocator, remaining[0..start]);
+        const after_start = remaining[start + "<skill>".len ..];
+        const end_rel = std.mem.indexOf(u8, after_start, "</skill>") orelse {
+            try out.appendSlice(allocator, remaining[start..]);
+            return out.toOwnedSlice(allocator);
+        };
+        remaining = after_start[end_rel + "</skill>".len ..];
+    }
+
+    try out.appendSlice(allocator, remaining);
+    return out.toOwnedSlice(allocator);
 }
 
 fn extractResponseItemText(allocator: std.mem.Allocator, payload: std.json.Value) ![]u8 {
@@ -306,6 +326,12 @@ pub fn parseJsonlLine(
         return null;
     }
 
+    if (options.strip_skill_blocks) {
+        const stripped = try stripSkillBlocks(allocator, raw_text);
+        allocator.free(raw_text);
+        raw_text = stripped;
+    }
+
     const normalized_text = try normalizeText(allocator, raw_text);
     allocator.free(raw_text);
     raw_text = normalized_text;
@@ -402,4 +428,29 @@ test "parse messages from response_item and event_msg with echo stripping" {
 
     try std.testing.expectEqualStrings("assistant", rows[1].role);
     try std.testing.expectEqualStrings("Answer", rows[1].text);
+}
+
+test "parse messages strips skill blocks before normalization" {
+    const allocator = std.testing.allocator;
+    const jsonl =
+        \\{"type":"response_item","timestamp":"2026-03-10T10:11:12Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Before\n<skill>\n<name>seq</name>\n</skill>\nAfter"}]}}
+    ;
+
+    const rows = try parseJsonl(allocator, "/tmp/s2.jsonl", jsonl, .{ .strip_skill_blocks = true });
+    defer freeRows(allocator, rows);
+
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("Before\n\nAfter", rows[0].text);
+}
+
+test "parse messages drops rows emptied by skill-block stripping" {
+    const allocator = std.testing.allocator;
+    const jsonl =
+        \\{"type":"response_item","timestamp":"2026-03-10T10:11:12Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<skill>\n<name>seq</name>\n</skill>"}]}}
+    ;
+
+    const rows = try parseJsonl(allocator, "/tmp/s3.jsonl", jsonl, .{ .strip_skill_blocks = true });
+    defer freeRows(allocator, rows);
+
+    try std.testing.expectEqual(@as(usize, 0), rows.len);
 }
