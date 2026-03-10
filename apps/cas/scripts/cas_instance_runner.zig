@@ -26,6 +26,12 @@ const UsageText =
     \\  --server-request-timeout-ms N       Forwarded server-request timeout.
     \\  --exec-approval VALUE               auto|accept|acceptForSession|decline|cancel.
     \\  --file-approval VALUE               auto|accept|acceptForSession|decline|cancel.
+    \\  --permissions-approval VALUE        deny|grant-turn|grant-session.
+    \\  --request-user-input-response-json JSON
+    \\                                      Exact result payload for item/tool/requestUserInput.
+    \\  --elicitation-action VALUE          decline|cancel|accept.
+    \\  --elicitation-content-json JSON     Content payload when elicitation action is accept.
+    \\  --dynamic-tool-response-json JSON   Exact result payload for item/tool/call.
     \\  --read-only                         Decline exec + file approvals.
     \\  --opt-out-notification-method M     Suppress notification method (repeatable).
     \\  --client-prefix NAME                Instance client prefix (default: cas-instance).
@@ -52,6 +58,11 @@ const ParsedArgs = struct {
     server_request_timeout_ms: ?u32 = null,
     exec_approval: ?[]const u8 = null,
     file_approval: ?[]const u8 = null,
+    permissions_approval: ?[]const u8 = null,
+    request_user_input_response_json: ?[]const u8 = null,
+    elicitation_action: ?[]const u8 = null,
+    elicitation_content_json: ?[]const u8 = null,
+    dynamic_tool_response_json: ?[]const u8 = null,
     read_only: bool = false,
     opt_out_methods: []const []const u8 = &.{},
     client_prefix: []const u8 = "cas-instance",
@@ -152,6 +163,11 @@ pub fn main() !void {
             .server_request_timeout_ms = opts.server_request_timeout_ms,
             .exec_approval = opts.exec_approval,
             .file_approval = opts.file_approval,
+            .permissions_approval = opts.permissions_approval,
+            .request_user_input_response_json = opts.request_user_input_response_json,
+            .elicitation_action = opts.elicitation_action,
+            .elicitation_content_json = opts.elicitation_content_json,
+            .dynamic_tool_response_json = opts.dynamic_tool_response_json,
             .read_only = opts.read_only,
             .opt_out_notification_methods = opts.opt_out_methods,
         }) catch |err| {
@@ -366,6 +382,32 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             out.file_approval = value;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--permissions-approval")) {
+            out.permissions_approval = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--request-user-input-response-json")) {
+            var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, value, .{});
+            defer parsed_json.deinit();
+            out.request_user_input_response_json = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--elicitation-action")) {
+            out.elicitation_action = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--elicitation-content-json")) {
+            var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, value, .{});
+            defer parsed_json.deinit();
+            out.elicitation_content_json = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--dynamic-tool-response-json")) {
+            var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, value, .{});
+            defer parsed_json.deinit();
+            out.dynamic_tool_response_json = value;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--opt-out-notification-method")) {
             try methods.append(allocator, value);
             continue;
@@ -390,12 +432,14 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
 
 fn buildParamsJson(allocator: std.mem.Allocator, method: []const u8, params_json: ?[]const u8, params_file: ?[]const u8) ![]u8 {
     if (params_json) |raw| {
-        _ = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer parsed_json.deinit();
         return allocator.dupe(u8, raw);
     }
     if (params_file) |path| {
         const raw = try std.fs.cwd().readFileAlloc(allocator, path, 4 * 1024 * 1024);
-        _ = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+        defer parsed_json.deinit();
         return raw;
     }
     if (std.mem.eql(u8, method, "thread/list")) {
@@ -478,6 +522,32 @@ fn summarizeResult(allocator: std.mem.Allocator, method: []const u8, result_json
         });
     }
 
+    if (std.mem.eql(u8, method, "turn/start")) {
+        const turn_val = root_obj.get("turn") orelse return allocator.dupe(u8, "{\"turnId\":null,\"status\":null}");
+        const turn_obj = switch (turn_val) {
+            .object => |o| o,
+            else => return allocator.dupe(u8, "{\"turnId\":null,\"status\":null}"),
+        };
+        const turn_id = if (turn_obj.get("id")) |id_val|
+            switch (id_val) {
+                .string => |s| s,
+                else => null,
+            }
+        else
+            null;
+        const status = if (turn_obj.get("status")) |status_val|
+            switch (status_val) {
+                .string => |s| s,
+                else => null,
+            }
+        else
+            null;
+        return stringifyAnyAlloc(allocator, .{
+            .turnId = turn_id,
+            .status = status,
+        });
+    }
+
     // Generic object summary: first 8 keys.
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -534,6 +604,33 @@ test "parseArgs accepts core options and collects opt-out methods" {
     try std.testing.expectEqualStrings("thread/item/stream", parsed.opt_out_methods[0]);
 }
 
+test "parseArgs accepts extended server request controls" {
+    const argv = [_][]const u8{
+        "cas_instance_runner",
+        "--cwd",
+        "/tmp/repo",
+        "--permissions-approval",
+        "grant-session",
+        "--request-user-input-response-json",
+        "{\"answers\":{\"mode\":{\"answers\":[\"fast\"]}}}",
+        "--elicitation-action",
+        "accept",
+        "--elicitation-content-json",
+        "{\"confirmed\":true}",
+        "--dynamic-tool-response-json",
+        "{\"contentItems\":[{\"type\":\"inputText\",\"text\":\"ok\"}],\"success\":true}",
+    };
+
+    const parsed = try parseArgs(std.testing.allocator, &argv);
+    defer std.testing.allocator.free(parsed.opt_out_methods);
+
+    try std.testing.expectEqual(@as(?[]const u8, "grant-session"), parsed.permissions_approval);
+    try std.testing.expectEqual(@as(?[]const u8, "{\"answers\":{\"mode\":{\"answers\":[\"fast\"]}}}"), parsed.request_user_input_response_json);
+    try std.testing.expectEqual(@as(?[]const u8, "accept"), parsed.elicitation_action);
+    try std.testing.expectEqual(@as(?[]const u8, "{\"confirmed\":true}"), parsed.elicitation_content_json);
+    try std.testing.expectEqual(@as(?[]const u8, "{\"contentItems\":[{\"type\":\"inputText\",\"text\":\"ok\"}],\"success\":true}"), parsed.dynamic_tool_response_json);
+}
+
 test "parseArgs rejects duplicate parameter sources" {
     const argv = [_][]const u8{
         "cas_instance_runner",
@@ -561,4 +658,19 @@ test "summarizeResult returns thread/list compact summary" {
     try std.testing.expect(parsed.value == .object);
     try std.testing.expectEqual(@as(?i64, 2), cas.intField(parsed.value.object, "rows"));
     try std.testing.expectEqualStrings("thr_1", cas.stringField(parsed.value.object, "firstThreadId").?);
+}
+
+test "summarizeResult returns turn/start compact summary" {
+    const summary = try summarizeResult(
+        std.testing.allocator,
+        "turn/start",
+        "{\"turn\":{\"id\":\"turn_1\",\"status\":\"inProgress\"}}",
+    );
+    defer std.testing.allocator.free(summary);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, summary, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expectEqualStrings("turn_1", cas.stringField(parsed.value.object, "turnId").?);
+    try std.testing.expectEqualStrings("inProgress", cas.stringField(parsed.value.object, "status").?);
 }

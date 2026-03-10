@@ -13,6 +13,11 @@ pub const ClientOptions = struct {
     server_request_timeout_ms: ?u32 = null,
     exec_approval: ?[]const u8 = null,
     file_approval: ?[]const u8 = null,
+    permissions_approval: ?[]const u8 = null,
+    request_user_input_response_json: ?[]const u8 = null,
+    elicitation_action: ?[]const u8 = null,
+    elicitation_content_json: ?[]const u8 = null,
+    dynamic_tool_response_json: ?[]const u8 = null,
     read_only: bool = false,
     opt_out_notification_methods: []const []const u8 = &.{},
 };
@@ -27,6 +32,11 @@ pub const Client = struct {
     last_error: ?[]u8 = null,
     exec_approval: ?[]const u8,
     file_approval: ?[]const u8,
+    permissions_approval: ?[]const u8,
+    request_user_input_response_json: ?[]const u8,
+    elicitation_action: ?[]const u8,
+    elicitation_content_json: ?[]const u8,
+    dynamic_tool_response_json: ?[]const u8,
     read_only: bool,
 
     pub fn start(allocator: std.mem.Allocator, opts: ClientOptions) !Client {
@@ -56,6 +66,11 @@ pub const Client = struct {
             .last_error = null,
             .exec_approval = opts.exec_approval,
             .file_approval = opts.file_approval,
+            .permissions_approval = opts.permissions_approval,
+            .request_user_input_response_json = opts.request_user_input_response_json,
+            .elicitation_action = opts.elicitation_action,
+            .elicitation_content_json = opts.elicitation_content_json,
+            .dynamic_tool_response_json = opts.dynamic_tool_response_json,
             .read_only = opts.read_only,
         };
         try client.handshake(opts);
@@ -289,6 +304,26 @@ pub const Client = struct {
             return;
         }
 
+        if (std.mem.eql(u8, method, "item/permissions/requestApproval")) {
+            try self.handlePermissionsRequest(id, msg_obj);
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "item/tool/requestUserInput")) {
+            try self.handleRequestUserInput(id, msg_obj);
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "mcpServer/elicitation/request")) {
+            try self.handleMcpElicitation(id);
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "item/tool/call")) {
+            try self.handleDynamicToolCall(id);
+            return;
+        }
+
         if (std.mem.eql(u8, method, "execCommandApproval") or std.mem.eql(u8, method, "applyPatchApproval")) {
             try self.sendServerError(id, -32602, "Unsupported deprecated server request");
             return;
@@ -322,6 +357,21 @@ pub const Client = struct {
             .id = id,
             .result = .{ .decision = decision },
         });
+    }
+
+    fn sendResultRawJson(self: *Client, id: i64, result_json: []const u8) !void {
+        var payload_writer: std.Io.Writer.Allocating = .init(self.allocator);
+        defer payload_writer.deinit();
+
+        try payload_writer.writer.writeAll("{\"id\":");
+        try std.json.Stringify.value(id, .{}, &payload_writer.writer);
+        try payload_writer.writer.writeAll(",\"result\":");
+        try payload_writer.writer.writeAll(result_json);
+        try payload_writer.writer.writeAll("}");
+
+        const payload = payload_writer.written();
+        try self.stdin_file.writeAll(payload);
+        try self.stdin_file.writeAll("\n");
     }
 
     fn sendServerError(self: *Client, id: i64, code: i64, message: []const u8) !void {
@@ -405,6 +455,147 @@ pub const Client = struct {
         return "acceptForSession";
     }
 
+    fn handlePermissionsRequest(self: *Client, id: i64, msg_obj: core_json.ObjectMap) !void {
+        const params_obj = core_json.objectField(msg_obj, "params");
+        const mode = self.resolvePermissionsApproval();
+        if (mode == .deny or params_obj == null) {
+            try self.sendResultRawJson(id, "{\"permissions\":{},\"scope\":\"turn\"}");
+            return;
+        }
+
+        const permissions_val = params_obj.?.get("permissions") orelse {
+            try self.sendResultRawJson(id, "{\"permissions\":{},\"scope\":\"turn\"}");
+            return;
+        };
+        const permissions_json = try core_json.stringifyAlloc(self.allocator, permissions_val);
+        defer self.allocator.free(permissions_json);
+        const response_json = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"permissions\":{s},\"scope\":\"{s}\"}}",
+            .{ permissions_json, switch (mode) {
+                .grant_turn => "turn",
+                .grant_session => "session",
+                .deny => "turn",
+            } },
+        );
+        defer self.allocator.free(response_json);
+        try self.sendResultRawJson(id, response_json);
+    }
+
+    fn handleRequestUserInput(self: *Client, id: i64, msg_obj: core_json.ObjectMap) !void {
+        if (self.request_user_input_response_json) |raw| {
+            try self.sendResultRawJson(id, raw);
+            return;
+        }
+
+        const params_obj = core_json.objectField(msg_obj, "params") orelse {
+            try self.sendResultRawJson(id, "{\"answers\":{}}");
+            return;
+        };
+        const questions_val = params_obj.get("questions") orelse {
+            try self.sendResultRawJson(id, "{\"answers\":{}}");
+            return;
+        };
+        const questions = switch (questions_val) {
+            .array => |arr| arr.items,
+            else => {
+                try self.sendResultRawJson(id, "{\"answers\":{}}");
+                return;
+            },
+        };
+
+        var result_writer: std.Io.Writer.Allocating = .init(self.allocator);
+        defer result_writer.deinit();
+
+        try result_writer.writer.writeAll("{\"answers\":{");
+        var first_question = true;
+        for (questions) |question| {
+            const question_obj = switch (question) {
+                .object => |obj| obj,
+                else => continue,
+            };
+            const question_id = core_json.stringField(question_obj, "id") orelse continue;
+            const answer = defaultRequestUserInputAnswer(question_obj);
+            if (!first_question) try result_writer.writer.writeAll(",");
+            first_question = false;
+            try std.json.Stringify.value(question_id, .{}, &result_writer.writer);
+            try result_writer.writer.writeAll(":{\"answers\":[");
+            try std.json.Stringify.value(answer, .{}, &result_writer.writer);
+            try result_writer.writer.writeAll("]}");
+        }
+        try result_writer.writer.writeAll("}}");
+
+        const result_json = result_writer.written();
+        try self.sendResultRawJson(id, result_json);
+    }
+
+    fn handleMcpElicitation(self: *Client, id: i64) !void {
+        const action = self.resolveElicitationAction();
+        const content_json = self.elicitation_content_json orelse "null";
+        const response_json = switch (action) {
+            .accept => try std.fmt.allocPrint(
+                self.allocator,
+                "{{\"action\":\"accept\",\"content\":{s},\"_meta\":null}}",
+                .{content_json},
+            ),
+            .decline => try self.allocator.dupe(u8, "{\"action\":\"decline\",\"content\":null,\"_meta\":null}"),
+            .cancel => try self.allocator.dupe(u8, "{\"action\":\"cancel\",\"content\":null,\"_meta\":null}"),
+        };
+        defer self.allocator.free(response_json);
+        try self.sendResultRawJson(id, response_json);
+    }
+
+    fn handleDynamicToolCall(self: *Client, id: i64) !void {
+        const response_json = self.dynamic_tool_response_json orelse
+            "{\"contentItems\":[{\"type\":\"inputText\",\"text\":\"Unsupported dynamic tool call in native CAS client\"}],\"success\":false}";
+        try self.sendResultRawJson(id, response_json);
+    }
+
+    const PermissionsApproval = enum {
+        deny,
+        grant_turn,
+        grant_session,
+    };
+
+    fn resolvePermissionsApproval(self: *const Client) PermissionsApproval {
+        if (self.read_only) return .deny;
+        if (self.permissions_approval) |decision| {
+            if (std.mem.eql(u8, decision, "grant-session")) return .grant_session;
+            if (std.mem.eql(u8, decision, "grant-turn")) return .grant_turn;
+        }
+        return .deny;
+    }
+
+    const McpElicitationResponseAction = enum {
+        accept,
+        decline,
+        cancel,
+    };
+
+    fn resolveElicitationAction(self: *const Client) McpElicitationResponseAction {
+        if (self.elicitation_action) |action| {
+            if (std.mem.eql(u8, action, "accept")) return .accept;
+            if (std.mem.eql(u8, action, "cancel")) return .cancel;
+        }
+        return .decline;
+    }
+
+    fn defaultRequestUserInputAnswer(question_obj: core_json.ObjectMap) []const u8 {
+        const options_val = question_obj.get("options") orelse return "";
+        const options = switch (options_val) {
+            .array => |arr| arr.items,
+            else => return "",
+        };
+        for (options) |option| {
+            const option_obj = switch (option) {
+                .object => |obj| obj,
+                else => continue,
+            };
+            if (core_json.stringField(option_obj, "label")) |label| return label;
+        }
+        return "";
+    }
+
     fn setLastErrorOwned(self: *Client, owned: []u8) void {
         if (self.last_error) |existing| self.allocator.free(existing);
         self.last_error = owned;
@@ -470,6 +661,11 @@ test "resolveExecDecision honors read_only and explicit approvals" {
         .last_error = null,
         .exec_approval = "auto",
         .file_approval = "auto",
+        .permissions_approval = null,
+        .request_user_input_response_json = null,
+        .elicitation_action = null,
+        .elicitation_content_json = null,
+        .dynamic_tool_response_json = null,
         .read_only = false,
     };
     defer client.line_buf.deinit(std.testing.allocator);
@@ -498,6 +694,11 @@ test "resolveAutoExecDecision prefers acceptForSession when available" {
         .last_error = null,
         .exec_approval = "auto",
         .file_approval = "auto",
+        .permissions_approval = null,
+        .request_user_input_response_json = null,
+        .elicitation_action = null,
+        .elicitation_content_json = null,
+        .dynamic_tool_response_json = null,
         .read_only = false,
     };
     defer client.line_buf.deinit(std.testing.allocator);
@@ -528,6 +729,11 @@ test "resolveAutoExecDecision falls back to amendment object before decline" {
         .last_error = null,
         .exec_approval = "auto",
         .file_approval = "auto",
+        .permissions_approval = null,
+        .request_user_input_response_json = null,
+        .elicitation_action = null,
+        .elicitation_content_json = null,
+        .dynamic_tool_response_json = null,
         .read_only = false,
     };
     defer client.line_buf.deinit(std.testing.allocator);
@@ -542,4 +748,71 @@ test "resolveAutoExecDecision falls back to amendment object before decline" {
 
     const choice = client.resolveAutoExecDecision(parsed.value.object) orelse return error.TestExpectedEqual;
     try std.testing.expect(choice == .object);
+}
+
+test "resolvePermissionsApproval honors explicit grants and read_only" {
+    var client = Client{
+        .allocator = std.testing.allocator,
+        .child = undefined,
+        .stdin_file = undefined,
+        .stdout_file = undefined,
+        .line_buf = .empty,
+        .next_request_id = 1,
+        .last_error = null,
+        .exec_approval = "auto",
+        .file_approval = "auto",
+        .permissions_approval = "grant-session",
+        .request_user_input_response_json = null,
+        .elicitation_action = null,
+        .elicitation_content_json = null,
+        .dynamic_tool_response_json = null,
+        .read_only = false,
+    };
+    defer client.line_buf.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Client.PermissionsApproval.grant_session, client.resolvePermissionsApproval());
+    client.permissions_approval = "grant-turn";
+    try std.testing.expectEqual(Client.PermissionsApproval.grant_turn, client.resolvePermissionsApproval());
+    client.read_only = true;
+    try std.testing.expectEqual(Client.PermissionsApproval.deny, client.resolvePermissionsApproval());
+}
+
+test "defaultRequestUserInputAnswer prefers first option label" {
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"id\":\"choice\",\"options\":[{\"label\":\"Alpha\",\"description\":\"first\"},{\"label\":\"Beta\",\"description\":\"second\"}]}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    const answer = Client.defaultRequestUserInputAnswer(parsed.value.object);
+    try std.testing.expectEqualStrings("Alpha", answer);
+}
+
+test "resolveElicitationAction defaults to decline" {
+    var client = Client{
+        .allocator = std.testing.allocator,
+        .child = undefined,
+        .stdin_file = undefined,
+        .stdout_file = undefined,
+        .line_buf = .empty,
+        .next_request_id = 1,
+        .last_error = null,
+        .exec_approval = "auto",
+        .file_approval = "auto",
+        .permissions_approval = null,
+        .request_user_input_response_json = null,
+        .elicitation_action = null,
+        .elicitation_content_json = null,
+        .dynamic_tool_response_json = null,
+        .read_only = false,
+    };
+    defer client.line_buf.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Client.McpElicitationResponseAction.decline, client.resolveElicitationAction());
+    client.elicitation_action = "accept";
+    try std.testing.expectEqual(Client.McpElicitationResponseAction.accept, client.resolveElicitationAction());
+    client.elicitation_action = "cancel";
+    try std.testing.expectEqual(Client.McpElicitationResponseAction.cancel, client.resolveElicitationAction());
 }

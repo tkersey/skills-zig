@@ -183,7 +183,92 @@ pub fn main() !void {
         });
     }
 
-    // Check 3: turn/steer method is wired; precondition failures are acceptable.
+    // Check 3: turn/start returns a turn id for a resumed thread.
+    {
+        var turn_start_ok = true;
+        var turn_start_detail: []const u8 = "ok";
+        var started_turn_id: ?[]const u8 = null;
+
+        if (thread_id == null) {
+            turn_start_ok = false;
+            turn_start_detail = "no threadId available for turn/start check";
+        } else {
+            const turn_start_params = try stringifyAnyAlloc(allocator, .{
+                .threadId = thread_id.?,
+                .input = [_]struct {
+                    type: []const u8,
+                    text: []const u8,
+                }{
+                    .{
+                        .type = "text",
+                        .text = "cas smoke-check turn start",
+                    },
+                },
+            });
+            defer allocator.free(turn_start_params);
+
+            const turn_start_json = client.requestJson("turn/start", turn_start_params) catch |err| blk: {
+                const summary = try errorSummary(allocator, &client, err);
+                if (isMethodUnavailableError(summary)) {
+                    turn_start_ok = false;
+                    turn_start_detail = try std.fmt.allocPrint(allocator, "method unavailable: {s}", .{summary});
+                } else {
+                    turn_start_detail = try std.fmt.allocPrint(allocator, "method reached server: {s}", .{summary});
+                }
+                break :blk null;
+            };
+
+            if (turn_start_json) |json| {
+                defer allocator.free(json);
+                started_turn_id = try extractTurnId(allocator, json);
+                if (started_turn_id == null) {
+                    turn_start_ok = false;
+                    turn_start_detail = "turn/start did not return turn.id";
+                }
+            }
+        }
+
+        try checks.append(allocator, .{
+            .name = "turn/start",
+            .ok = turn_start_ok,
+            .detail = turn_start_detail,
+        });
+
+        // Check 4: turn/interrupt method is wired; race/precondition failures are acceptable.
+        var interrupt_ok = true;
+        var interrupt_detail: []const u8 = "ok";
+
+        if (thread_id == null or started_turn_id == null) {
+            interrupt_ok = false;
+            interrupt_detail = "no active turnId available for turn/interrupt check";
+        } else {
+            const interrupt_params = try stringifyAnyAlloc(allocator, .{
+                .threadId = thread_id.?,
+                .turnId = started_turn_id.?,
+            });
+            defer allocator.free(interrupt_params);
+
+            const maybe_interrupt_json = client.requestJson("turn/interrupt", interrupt_params) catch |err| blk: {
+                const summary = try errorSummary(allocator, &client, err);
+                if (isMethodUnavailableError(summary)) {
+                    interrupt_ok = false;
+                    interrupt_detail = try std.fmt.allocPrint(allocator, "method unavailable: {s}", .{summary});
+                } else {
+                    interrupt_detail = try std.fmt.allocPrint(allocator, "method reached server (expected race/precondition rejection): {s}", .{summary});
+                }
+                break :blk null;
+            };
+            if (maybe_interrupt_json) |interrupt_json| allocator.free(interrupt_json);
+        }
+
+        try checks.append(allocator, .{
+            .name = "turn/interrupt",
+            .ok = interrupt_ok,
+            .detail = interrupt_detail,
+        });
+    }
+
+    // Check 5: turn/steer method is wired; precondition failures are acceptable.
     {
         var steer_ok = true;
         var steer_detail: []const u8 = "ok";
@@ -358,6 +443,26 @@ fn extractThreadId(allocator: std.mem.Allocator, result_json: []const u8) !?[]co
     return try allocator.dupe(u8, id);
 }
 
+fn extractTurnId(allocator: std.mem.Allocator, result_json: []const u8) !?[]const u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result_json, .{});
+    defer parsed.deinit();
+    const root_obj = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return null,
+    };
+    const turn_val = root_obj.get("turn") orelse return null;
+    const turn_obj = switch (turn_val) {
+        .object => |obj| obj,
+        else => return null,
+    };
+    const id_val = turn_obj.get("id") orelse return null;
+    const id = switch (id_val) {
+        .string => |s| s,
+        else => return null,
+    };
+    return try allocator.dupe(u8, id);
+}
+
 fn errorSummary(allocator: std.mem.Allocator, client: *cas.Client, err: anyerror) ![]const u8 {
     if (client.lastError()) |detail| return detail;
     return std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
@@ -418,6 +523,17 @@ test "parseArgs accepts core options and collects opt-out methods" {
     try std.testing.expect(parsed.json);
     try std.testing.expectEqual(@as(usize, 1), parsed.opt_out_methods.len);
     try std.testing.expectEqualStrings("thread/item/stream", parsed.opt_out_methods[0]);
+}
+
+test "extractTurnId reads nested turn id" {
+    const turn_id = try extractTurnId(
+        std.testing.allocator,
+        "{\"turn\":{\"id\":\"turn_123\",\"status\":\"inProgress\"}}",
+    );
+    defer if (turn_id) |id| std.testing.allocator.free(id);
+
+    try std.testing.expect(turn_id != null);
+    try std.testing.expectEqualStrings("turn_123", turn_id.?);
 }
 
 test "parseArgs rejects non-positive request timeout" {
