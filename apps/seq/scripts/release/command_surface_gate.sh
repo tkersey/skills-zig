@@ -36,5 +36,9 @@ if ! "$BIN_PATH" --help | rg -q '^- query-diagnose$'; then
   echo "required command missing: query-diagnose" >&2
   exit 1
 fi
+if ! "$BIN_PATH" --help | rg -q '^- artifact-search$'; then
+  echo "required command missing: artifact-search" >&2
+  exit 1
+fi
 
 echo "command-surface gate passed for $BIN_PATH"

@@ -26,6 +26,7 @@ Binary output:
 ```bash
 ./zig-out/bin/seq datasets
 ./zig-out/bin/seq dataset-schema --dataset messages
+./zig-out/bin/seq dataset-schema --dataset memory_blocks
 ./zig-out/bin/seq dataset-schema --dataset opencode_prompts
 ./zig-out/bin/seq dataset-schema --dataset opencode_events
 ./zig-out/bin/seq dataset-schema --dataset opencode_tool_calls
@@ -39,6 +40,8 @@ Binary output:
 ./zig-out/bin/seq find-session --root ~/.codex/sessions --prompt "learnings recall" --since 2026-03-08T00:00:00Z --until 2026-03-10T23:59:59Z --limit 5 --format table
 ./zig-out/bin/seq session-tooling --root ~/.codex/sessions --since 2026-03-08T00:00:00Z --until 2026-03-10T23:59:59Z --summary --group-by executable --format table
 ./zig-out/bin/seq query-diagnose --path /absolute/path/to/rollout.jsonl --threshold-ms 10000 --next-actions --format json
+./zig-out/bin/seq artifact-search --contains "spawn_agent" --kind orchestration --since 2026-03-01T00:00:00Z --limit 10 --format table
+./zig-out/bin/seq artifact-search --contains "MEMORY.md" --kind memory --stats --format table
 ./zig-out/bin/seq opencode-prompts --limit 20 --format jsonl
 ./zig-out/bin/seq opencode-prompts --session ses_abc --since 1772700000000 --latest --format table
 ./zig-out/bin/seq opencode-prompts --source db --contains "grill me" --mode normal --select session_slug,message_id,prompt_text,part_types --sort -time_created_epoch_ms --format table
@@ -55,6 +58,17 @@ Binary output:
 
 `query.where.op` supports `contains_any` and `regex_any` in addition to `contains` and `regex`.
 `regex` uses a fast regex-like subset (`^`, `$`, `|`) and fails fast on unsupported constructs.
+`artifact-search` is the seq-first forensic entrypoint:
+- searches `messages`, `tool_calls`, and `memory_blocks` with one normalized result shape
+- accepts `--kind auto|session|memory|orchestration|tooling|prompt`
+- accepts `--surface auto|messages|tool_calls|memory_blocks` when you need to pin the substrate
+- emits `next_action_kind` / `next_action` suggestions for follow-up commands
+- `--stats` adds scan counters (`surfaces_scanned`, `candidate_files`, `files_opened`, `rows_examined`, `rows_emitted`, `duration_ms`)
+
+`memory_blocks` is a markdown-block dataset over `~/.codex/memories`:
+- one row per heading-delimited block
+- exposes `doc_kind`, `heading_path`, `title`, `body`, `preview`, and optional `thread_id` / `rollout_path`
+- use it when memory inventory is not enough and you need searchable body content
 `query.params` is now functional for dataset-specific source overrides:
 - `memory_files`: `params.memory_root`, `params.include_preview`
 - `opencode_prompts`: `params.source`, `params.opencode_db_path`, `params.opencode_path`, `params.include_raw`, `params.include_summary_fallback`
@@ -114,6 +128,7 @@ Floor flags:
 
 `query-diagnose` inspects `seq query` lifecycle health inside rollout JSONL:
 - raw mode (default) emits per-query diagnostics (`resolution_state`, `duration_ms`, `hang_flag`)
+- also classifies each row with `command_class` and `diagnosis` (`polling_unresolved`, `actual_slow_query`, `unresolved_no_output`, `slow_but_completed`, `completed`)
 - strict hang mode is enabled by default and requires unresolved lifecycle plus threshold breach
 - `--fail-on-hang` exits non-zero when any query row is flagged as hanging
 - `--next-actions` emits deterministic follow-up `seq` command suggestions

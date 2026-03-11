@@ -165,6 +165,11 @@ pub const dataset_meta = [_]DatasetMeta{
         .fields = &.{ "path", "relative_path", "name", "category", "extension", "size_bytes", "modified_at", "preview" },
     },
     .{
+        .name = "memory_blocks",
+        .description = "Heading-delimited memory markdown blocks under ~/.codex/memories",
+        .fields = &.{ "path", "relative_path", "doc_kind", "heading_path", "title", "body", "preview", "updated_at", "thread_id", "rollout_path", "keywords" },
+    },
+    .{
         .name = "opencode_prompts",
         .description = "Prompt rows mined from Opencode DB (with JSONL fallback)",
         .fields = &.{
@@ -319,11 +324,15 @@ const Options = struct {
     skill: ?[]const u8 = null,
     bucket: ?[]const u8 = null,
     prompt: ?[]const u8 = null,
+    kind_text: ?[]const u8 = null,
+    surface_text: ?[]const u8 = null,
+    follow_text: ?[]const u8 = null,
     roles_csv: ?[]const u8 = null,
     contains: ?[]const u8 = null,
     regex: ?[]const u8 = null,
     role: ?[]const u8 = null,
     tool: ?[]const u8 = null,
+    workdir_text: ?[]const u8 = null,
     status: ?[]const u8 = null,
     mode: ?[]const u8 = null,
     part_type: ?[]const u8 = null,
@@ -338,6 +347,7 @@ const Options = struct {
     opencode_path: ?[]const u8 = null,
     opencode_source_text: ?[]const u8 = null,
     include_raw: bool = false,
+    stats: bool = false,
     strip_skill_blocks: bool = false,
     no_dedupe_exact: bool = false,
     sections: ?[]const u8 = null,
@@ -368,6 +378,7 @@ pub fn run(
         .skills_rank => try cmdSkillsRank(allocator, sessions_root, opts),
         .skill_trend => try cmdSkillTrend(allocator, sessions_root, opts),
         .skill_report => try cmdSkillReport(allocator, sessions_root, opts),
+        .artifact_search => try cmdArtifactSearch(allocator, sessions_root, opts),
         .role_breakdown => try cmdRoleBreakdown(allocator, sessions_root, opts),
         .occurrence_export => try cmdOccurrenceExport(allocator, sessions_root, opts),
         .orchestration_concurrency => try cmdOrchestrationConcurrency(allocator, sessions_root, opts),
@@ -409,6 +420,9 @@ fn printCommandHelp(cmd: lib.Command) !void {
         ,
         .skill_report =>
         \\usage: seq skill-report --skill <name> [--since <iso>] [--until <iso>]
+        ,
+        .artifact_search =>
+        \\usage: seq artifact-search [--contains <text>|--regex <expr>] [--kind <auto|session|memory|orchestration|tooling|prompt>] [--surface <auto|messages|tool_calls|memory_blocks>] [--roles <csv>] [--tool <name>] [--workdir <path>] [--session-id <id>|--path <jsonl>] [--since <iso>] [--until <iso>] [--follow <none|auto>] [--strip-skill-blocks] [--no-dedupe-exact] [--stats] [--limit N] [--format table|json|csv|jsonl]
         ,
         .role_breakdown =>
         \\usage: seq role-breakdown [--since <iso>] [--until <iso>] [--format table|json|csv] [--max N]
@@ -501,24 +515,24 @@ fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
         .occurrence_export => {
             if (fmt == .table) return error.InvalidFormatForCommand;
         },
-        .orchestration_concurrency, .find_session, .session_prompts, .query, .token_usage, .routing_gap, .session_tooling, .query_diagnose, .opencode_prompts, .opencode_events => {},
+        .artifact_search, .orchestration_concurrency, .find_session, .session_prompts, .query, .token_usage, .routing_gap, .session_tooling, .query_diagnose, .opencode_prompts, .opencode_events => {},
         .unknown => return error.InvalidCommand,
     }
 }
 
 fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_path = switch (cmd) {
-        .orchestration_concurrency, .session_prompts, .session_tooling, .query_diagnose => true,
+        .artifact_search, .orchestration_concurrency, .session_prompts, .session_tooling, .query_diagnose => true,
         else => false,
     };
     const supports_session_id = switch (cmd) {
-        .orchestration_concurrency, .session_prompts, .session_tooling => true,
+        .artifact_search, .orchestration_concurrency, .session_prompts, .session_tooling => true,
         else => false,
     };
     const supports_current = cmd == .session_prompts;
-    const supports_roles_csv = cmd == .session_prompts;
-    const supports_strip_skill_blocks = cmd == .session_prompts;
-    const supports_no_dedupe_exact = cmd == .session_prompts;
+    const supports_roles_csv = cmd == .session_prompts or cmd == .artifact_search;
+    const supports_strip_skill_blocks = cmd == .session_prompts or cmd == .artifact_search;
+    const supports_no_dedupe_exact = cmd == .session_prompts or cmd == .artifact_search;
     const supports_summary = switch (cmd) {
         .session_tooling, .query_diagnose => true,
         else => false,
@@ -549,20 +563,25 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         else => false,
     };
     const supports_contains = switch (cmd) {
-        .opencode_prompts, .opencode_events => true,
+        .artifact_search, .opencode_prompts, .opencode_events => true,
         else => false,
     };
     const supports_regex = switch (cmd) {
-        .opencode_prompts, .opencode_events => true,
+        .artifact_search, .opencode_prompts, .opencode_events => true,
         else => false,
     };
     const supports_role = cmd == .opencode_events;
-    const supports_tool = cmd == .opencode_events;
+    const supports_tool = cmd == .opencode_events or cmd == .artifact_search;
+    const supports_workdir = cmd == .artifact_search;
     const supports_status = cmd == .opencode_events;
     const supports_mode = switch (cmd) {
         .opencode_prompts, .opencode_events => true,
         else => false,
     };
+    const supports_kind = cmd == .artifact_search;
+    const supports_surface = cmd == .artifact_search;
+    const supports_follow = cmd == .artifact_search;
+    const supports_stats = cmd == .artifact_search;
     const supports_part_type = switch (cmd) {
         .opencode_prompts, .opencode_events => true,
         else => false,
@@ -574,6 +593,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .role_breakdown,
         .occurrence_export,
         .find_session,
+        .artifact_search,
         .session_prompts,
         .report_bundle,
         .section_audit,
@@ -592,6 +612,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .role_breakdown,
         .occurrence_export,
         .find_session,
+        .artifact_search,
         .session_prompts,
         .report_bundle,
         .section_audit,
@@ -667,8 +688,13 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.regex != null, supports_regex, "--regex", cmd);
     try ensureOptionAllowed(opts.role != null, supports_role, "--role", cmd);
     try ensureOptionAllowed(opts.tool != null, supports_tool, "--tool", cmd);
+    try ensureOptionAllowed(opts.workdir_text != null, supports_workdir, "--workdir", cmd);
     try ensureOptionAllowed(opts.status != null, supports_status, "--status", cmd);
     try ensureOptionAllowed(opts.mode != null, supports_mode, "--mode", cmd);
+    try ensureOptionAllowed(opts.kind_text != null, supports_kind, "--kind", cmd);
+    try ensureOptionAllowed(opts.surface_text != null, supports_surface, "--surface", cmd);
+    try ensureOptionAllowed(opts.follow_text != null, supports_follow, "--follow", cmd);
+    try ensureOptionAllowed(opts.stats, supports_stats, "--stats", cmd);
     try ensureOptionAllowed(opts.part_type != null, supports_part_type, "--part-type", cmd);
     try ensureOptionAllowed(opts.since != null, supports_since, "--since", cmd);
     try ensureOptionAllowed(opts.until != null, supports_until, "--until", cmd);
@@ -762,6 +788,489 @@ fn cmdQuery(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Optio
 
     const cols_opt: ?[]const []const u8 = if (query_spec.select.len > 0) query_spec.select else null;
     try output.writeOutput(allocator, fmt, result.rows.items, cols_opt, opts.out_path);
+}
+
+const ArtifactKind = enum {
+    auto,
+    session,
+    memory,
+    orchestration,
+    tooling,
+    prompt,
+};
+
+const ArtifactSurface = enum {
+    auto,
+    messages,
+    tool_calls,
+    memory_blocks,
+};
+
+const ArtifactFollow = enum {
+    none,
+    auto,
+};
+
+const ArtifactStats = struct {
+    surfaces_scanned: i64 = 0,
+    candidate_files: i64 = 0,
+    files_opened: i64 = 0,
+    rows_examined: i64 = 0,
+    rows_emitted: i64 = 0,
+    duration_ms: i64 = 0,
+    used_time_bounds: bool = false,
+    used_targeted_session: bool = false,
+};
+
+fn cmdArtifactSearch(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    const query_text = opts.contains orelse opts.regex orelse return error.MissingContainsArg;
+    const use_regex = opts.regex != null;
+    const kind = try parseArtifactKind(opts.kind_text);
+    const surface = try parseArtifactSurface(opts.surface_text);
+    const follow = try parseArtifactFollow(opts.follow_text);
+    _ = follow;
+
+    const start_ms = std.time.milliTimestamp();
+    var stats = ArtifactStats{
+        .used_time_bounds = opts.since != null or opts.until != null,
+        .used_targeted_session = opts.path != null or opts.session_id != null,
+    };
+
+    var hit_rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &hit_rows);
+
+    if (shouldSearchSurface(kind, surface, .memory_blocks)) {
+        stats.surfaces_scanned += 1;
+        try searchMemoryBlockHits(allocator, query_text, use_regex, &stats, &hit_rows);
+    }
+    if (shouldSearchSurface(kind, surface, .messages)) {
+        stats.surfaces_scanned += 1;
+        try searchMessageHits(allocator, sessions_root, opts, query_text, use_regex, &stats, &hit_rows);
+    }
+    if (shouldSearchSurface(kind, surface, .tool_calls)) {
+        stats.surfaces_scanned += 1;
+        try searchToolCallHits(allocator, sessions_root, opts, query_text, use_regex, &stats, &hit_rows);
+    }
+
+    const duration_delta = std.time.milliTimestamp() - start_ms;
+    stats.duration_ms = @intCast(@max(duration_delta, 0));
+
+    const limit = if (opts.limit == 0) 20 else opts.limit;
+    const sort = [_]spec.SortSpec{
+        .{ .field = "score", .descending = true },
+        .{ .field = "timestamp", .descending = true },
+    };
+    const select_base = [_][]const u8{
+        "surface",
+        "path",
+        "session_id",
+        "timestamp",
+        "label",
+        "snippet",
+        "match_kind",
+        "score",
+        "next_action_kind",
+        "next_action",
+    };
+    const select_with_stats = [_][]const u8{
+        "surface",
+        "path",
+        "session_id",
+        "timestamp",
+        "label",
+        "snippet",
+        "match_kind",
+        "score",
+        "next_action_kind",
+        "next_action",
+        "surfaces_scanned",
+        "candidate_files",
+        "files_opened",
+        "rows_examined",
+        "rows_emitted",
+        "duration_ms",
+        "used_time_bounds",
+        "used_targeted_session",
+    };
+    const query_spec = spec.QuerySpec{
+        .sort = sort[0..],
+        .limit = limit,
+        .select = if (opts.stats) select_with_stats[0..] else select_base[0..],
+    };
+    var result = try query.execute(allocator, hit_rows.items, query_spec);
+    defer result.deinit(allocator);
+
+    stats.rows_emitted = @intCast(result.rows.items.len);
+    if (opts.stats) {
+        for (result.rows.items) |*row| try attachArtifactStats(row, stats);
+    }
+
+    const cols = if (opts.stats) select_with_stats[0..] else select_base[0..];
+    try output.writeOutput(allocator, opts.format, result.rows.items, cols, opts.out_path);
+}
+
+fn parseArtifactKind(raw_opt: ?[]const u8) !ArtifactKind {
+    const raw = raw_opt orelse return .auto;
+    if (std.mem.eql(u8, raw, "auto")) return .auto;
+    if (std.mem.eql(u8, raw, "session")) return .session;
+    if (std.mem.eql(u8, raw, "memory")) return .memory;
+    if (std.mem.eql(u8, raw, "orchestration")) return .orchestration;
+    if (std.mem.eql(u8, raw, "tooling")) return .tooling;
+    if (std.mem.eql(u8, raw, "prompt")) return .prompt;
+    return error.InvalidModeArg;
+}
+
+fn parseArtifactSurface(raw_opt: ?[]const u8) !ArtifactSurface {
+    const raw = raw_opt orelse return .auto;
+    if (std.mem.eql(u8, raw, "auto")) return .auto;
+    if (std.mem.eql(u8, raw, "messages")) return .messages;
+    if (std.mem.eql(u8, raw, "tool_calls")) return .tool_calls;
+    if (std.mem.eql(u8, raw, "memory_blocks")) return .memory_blocks;
+    return error.InvalidDatasetArg;
+}
+
+fn parseArtifactFollow(raw_opt: ?[]const u8) !ArtifactFollow {
+    const raw = raw_opt orelse return .auto;
+    if (std.mem.eql(u8, raw, "auto")) return .auto;
+    if (std.mem.eql(u8, raw, "none")) return .none;
+    return error.InvalidModeArg;
+}
+
+fn shouldSearchSurface(kind: ArtifactKind, chosen: ArtifactSurface, candidate: ArtifactSurface) bool {
+    if (chosen != .auto) return chosen == candidate;
+    return switch (kind) {
+        .memory => candidate == .memory_blocks,
+        .orchestration, .tooling => candidate == .tool_calls,
+        .prompt, .session => candidate == .messages or candidate == .tool_calls,
+        .auto => true,
+    };
+}
+
+fn parseArtifactMessageOptions(opts: Options) !datasets.messages.ParseOptions {
+    var next = opts;
+    if (next.roles_csv == null) next.roles_csv = "user,assistant";
+    return parseSessionPromptMessageOptions(next);
+}
+
+fn searchMessageHits(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    opts: Options,
+    query_text: []const u8,
+    use_regex: bool,
+    stats: *ArtifactStats,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    const parse_options = try parseArtifactMessageOptions(opts);
+    const day_filter = deriveSessionDayPathFilterFromOptions(opts);
+    var input_paths = try resolveSessionPromptInputPaths(allocator, sessions_root, opts, day_filter);
+    defer freePathList(allocator, &input_paths);
+    stats.candidate_files += @intCast(input_paths.items.len);
+
+    for (input_paths.items) |path| {
+        const content = try readFileAllocOrSkip(allocator, path);
+        if (content == null) continue;
+        defer allocator.free(content.?);
+        stats.files_opened += 1;
+
+        const parsed = try datasets.messages.parseJsonl(allocator, path, content.?, parse_options);
+        defer datasets.messages.freeRows(allocator, parsed);
+        stats.rows_examined += @intCast(parsed.len);
+
+        for (parsed) |row| {
+            const score = try matchScoreForText(allocator, query_text, use_regex, &.{ row.text });
+            if (score == null) continue;
+            const session_id = inferSessionIdFromPath(row.path);
+            const next_action = try std.fmt.allocPrint(
+                allocator,
+                "seq session-prompts --session-id {s} --roles user,assistant --strip-skill-blocks --limit 40 --format jsonl",
+                .{session_id},
+            );
+            defer allocator.free(next_action);
+            try appendArtifactHit(
+                allocator,
+                out_rows,
+                "messages",
+                row.path,
+                session_id,
+                row.timestamp,
+                row.role,
+                row.text,
+                if (use_regex) "regex" else "contains",
+                score.?,
+                "session-prompts",
+                next_action,
+            );
+        }
+    }
+}
+
+fn searchToolCallHits(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    opts: Options,
+    query_text: []const u8,
+    use_regex: bool,
+    stats: *ArtifactStats,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    const day_filter = deriveSessionDayPathFilterFromOptions(opts);
+    var input_paths = try resolveOrchestrationInputPaths(allocator, sessions_root, opts, day_filter);
+    defer freePathList(allocator, &input_paths);
+    stats.candidate_files += @intCast(input_paths.items.len);
+
+    for (input_paths.items) |session_path| {
+        stats.files_opened += 1;
+        var records: std.ArrayList(InvocationRecord) = .empty;
+        defer deinitInvocationRecords(allocator, &records);
+        try collectInvocationRecordsFromSession(allocator, session_path, &records);
+        stats.rows_examined += @intCast(records.items.len);
+
+        for (records.items) |record| {
+            if (opts.tool) |required_tool| {
+                if (record.tool_name == null or !std.mem.eql(u8, record.tool_name.?, required_tool)) continue;
+            }
+            if (opts.workdir_text) |required_workdir| {
+                if (record.workdir == null or !std.mem.eql(u8, record.workdir.?, required_workdir)) continue;
+            }
+            const tool_name = record.tool_name orelse "";
+            const command_text = record.command_text orelse "";
+            const workdir = record.workdir orelse "";
+            const arguments_text = record.arguments_text orelse "";
+            const input_text = record.input_text orelse "";
+            const score = try matchScoreForText(allocator, query_text, use_regex, &.{ tool_name, command_text, workdir, arguments_text, input_text });
+            if (score == null) continue;
+
+            const is_orchestration = std.mem.eql(u8, tool_name, "spawn_agent") or
+                std.mem.eql(u8, tool_name, "spawn_agents_on_csv") or
+                std.mem.eql(u8, tool_name, "wait") or
+                std.mem.eql(u8, tool_name, "close_agent") or
+                std.mem.eql(u8, tool_name, "update_plan");
+            const next_action_kind = if (is_orchestration) "orchestration-concurrency" else "session-tooling";
+            const next_action = if (is_orchestration)
+                try std.fmt.allocPrint(allocator, "seq orchestration-concurrency --path {s} --format table", .{session_path})
+            else
+                try std.fmt.allocPrint(allocator, "seq session-tooling --path {s} --summary --group-by command --format table", .{session_path});
+            defer allocator.free(next_action);
+            const label = if (tool_name.len > 0) tool_name else "tool_call";
+            const snippet = if (command_text.len > 0) command_text else if (arguments_text.len > 0) arguments_text else input_text;
+            try appendArtifactHit(
+                allocator,
+                out_rows,
+                "tool_calls",
+                record.path,
+                record.session_id,
+                record.start_ts,
+                label,
+                snippet,
+                if (use_regex) "regex" else "contains",
+                score.?,
+                next_action_kind,
+                next_action,
+            );
+        }
+    }
+}
+
+fn searchMemoryBlockHits(
+    allocator: std.mem.Allocator,
+    query_text: []const u8,
+    use_regex: bool,
+    stats: *ArtifactStats,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    var parsed = try datasets.memory_blocks.collect(allocator, .{});
+    defer datasets.memory_blocks.deinitRows(allocator, &parsed);
+    stats.candidate_files += @intCast(parsed.items.len);
+    stats.files_opened += @intCast(parsed.items.len);
+    stats.rows_examined += @intCast(parsed.items.len);
+
+    for (parsed.items) |row| {
+        const keywords = row.keywords orelse "";
+        const score = try matchScoreForText(allocator, query_text, use_regex, &.{ row.title, row.heading_path, row.body, keywords, row.relative_path });
+        if (score == null) continue;
+        const session_id = if (row.rollout_path) |rollout_path| inferSessionIdFromPath(rollout_path) else "";
+        const next_action_kind = if (row.rollout_path != null) "session-prompts" else "none";
+        const next_action = if (row.rollout_path) |rollout_path|
+            try std.fmt.allocPrint(allocator, "seq session-prompts --path {s} --roles user,assistant --strip-skill-blocks --limit 40 --format jsonl", .{rollout_path})
+        else
+            try allocator.dupe(u8, "");
+        defer allocator.free(next_action);
+        try appendArtifactHit(
+            allocator,
+            out_rows,
+            "memory_blocks",
+            row.path,
+            session_id,
+            row.updated_at,
+            row.title,
+            row.preview,
+            if (use_regex) "regex" else "contains",
+            score.?,
+            next_action_kind,
+            next_action,
+        );
+    }
+}
+
+fn matchScoreForText(
+    allocator: std.mem.Allocator,
+    query_text: []const u8,
+    use_regex: bool,
+    haystacks: []const []const u8,
+) !?i64 {
+    for (haystacks) |haystack| {
+        if (haystack.len == 0) continue;
+        if (use_regex) {
+            const score = try regexScore(allocator, haystack, query_text);
+            if (score != null) return score;
+        } else if (containsIgnoreCaseAscii(haystack, query_text)) {
+            if (eqlIgnoreCaseAscii(haystack, query_text)) return 140;
+            if (startsWithIgnoreCaseAscii(haystack, query_text)) return 120;
+            return 100;
+        }
+    }
+    return null;
+}
+
+const ArtifactRegexMode = enum { exact, prefix, suffix, contains };
+const ArtifactRegexAtom = struct {
+    mode: ArtifactRegexMode,
+    text: []const u8,
+};
+
+fn regexScore(allocator: std.mem.Allocator, haystack: []const u8, pattern: []const u8) !?i64 {
+    const atoms = try compileArtifactRegexAtoms(allocator, pattern);
+    defer allocator.free(atoms);
+    for (atoms) |atom| {
+        if (artifactRegexAtomMatch(haystack, atom)) {
+            return switch (atom.mode) {
+                .exact => 140,
+                .prefix, .suffix => 120,
+                .contains => 100,
+            };
+        }
+    }
+    return null;
+}
+
+fn compileArtifactRegexAtoms(allocator: std.mem.Allocator, pattern: []const u8) ![]const ArtifactRegexAtom {
+    var atoms: std.ArrayList(ArtifactRegexAtom) = .empty;
+    defer atoms.deinit(allocator);
+
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i <= pattern.len) : (i += 1) {
+        if (i < pattern.len and pattern[i] != '|') continue;
+        const part = pattern[start..i];
+        try atoms.append(allocator, try compileArtifactRegexAtom(part));
+        start = i + 1;
+    }
+    return atoms.toOwnedSlice(allocator);
+}
+
+fn compileArtifactRegexAtom(part: []const u8) !ArtifactRegexAtom {
+    if (std.mem.indexOfScalar(u8, part, '\\') != null) return error.UnsupportedRegexConstruct;
+    var inner = part;
+    const anchored_start = inner.len > 0 and inner[0] == '^';
+    if (anchored_start) inner = inner[1..];
+    const anchored_end = inner.len > 0 and inner[inner.len - 1] == '$';
+    if (anchored_end) inner = inner[0 .. inner.len - 1];
+    for (inner) |c| switch (c) {
+        '.', '*', '+', '?', '[', ']', '(', ')', '{', '}' => return error.UnsupportedRegexConstruct,
+        else => {},
+    };
+    return .{
+        .mode = if (anchored_start and anchored_end)
+            .exact
+        else if (anchored_start)
+            .prefix
+        else if (anchored_end)
+            .suffix
+        else
+            .contains,
+        .text = inner,
+    };
+}
+
+fn artifactRegexAtomMatch(haystack: []const u8, atom: ArtifactRegexAtom) bool {
+    return switch (atom.mode) {
+        .exact => eqlIgnoreCaseAscii(haystack, atom.text),
+        .prefix => startsWithIgnoreCaseAscii(haystack, atom.text),
+        .suffix => endsWithIgnoreCaseAscii(haystack, atom.text),
+        .contains => containsIgnoreCaseAscii(haystack, atom.text),
+    };
+}
+
+fn appendArtifactHit(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    surface: []const u8,
+    path: []const u8,
+    session_id: []const u8,
+    timestamp: ?[]const u8,
+    label: []const u8,
+    snippet: []const u8,
+    match_kind: []const u8,
+    score: i64,
+    next_action_kind: []const u8,
+    next_action: []const u8,
+) !void {
+    var row = query.Row.init(allocator);
+    try row.putOwnedKey("surface", .{ .string = surface });
+    try row.putOwnedKey("path", .{ .string = path });
+    if (session_id.len > 0) {
+        try row.putOwnedKey("session_id", .{ .string = session_id });
+    } else {
+        try row.putOwnedKey("session_id", .null);
+    }
+    try putOptionalString(&row, "timestamp", timestamp);
+    try row.putOwnedKey("label", .{ .string = label });
+    try row.putOwnedKey("snippet", .{ .string = snippet[0..@min(snippet.len, 240)] });
+    try row.putOwnedKey("match_kind", .{ .string = match_kind });
+    try row.putOwnedKey("score", .{ .int = score });
+    try row.putOwnedKey("next_action_kind", .{ .string = next_action_kind });
+    if (next_action.len > 0) {
+        try row.putOwnedKey("next_action", .{ .string = next_action });
+    } else {
+        try row.putOwnedKey("next_action", .null);
+    }
+    try out_rows.append(allocator, row);
+}
+
+fn attachArtifactStats(row: *query.Row, stats: ArtifactStats) !void {
+    try row.putOwnedKey("surfaces_scanned", .{ .int = stats.surfaces_scanned });
+    try row.putOwnedKey("candidate_files", .{ .int = stats.candidate_files });
+    try row.putOwnedKey("files_opened", .{ .int = stats.files_opened });
+    try row.putOwnedKey("rows_examined", .{ .int = stats.rows_examined });
+    try row.putOwnedKey("rows_emitted", .{ .int = stats.rows_emitted });
+    try row.putOwnedKey("duration_ms", .{ .int = stats.duration_ms });
+    try row.putOwnedKey("used_time_bounds", .{ .bool = stats.used_time_bounds });
+    try row.putOwnedKey("used_targeted_session", .{ .bool = stats.used_targeted_session });
+}
+
+fn containsIgnoreCaseAscii(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) : (start += 1) {
+        if (eqlIgnoreCaseAscii(haystack[start .. start + needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn startsWithIgnoreCaseAscii(haystack: []const u8, prefix: []const u8) bool {
+    if (prefix.len > haystack.len) return false;
+    return eqlIgnoreCaseAscii(haystack[0..prefix.len], prefix);
+}
+
+fn endsWithIgnoreCaseAscii(haystack: []const u8, suffix: []const u8) bool {
+    if (suffix.len > haystack.len) return false;
+    return eqlIgnoreCaseAscii(haystack[haystack.len - suffix.len ..], suffix);
+}
+
+fn eqlIgnoreCaseAscii(lhs: []const u8, rhs: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(lhs, rhs);
 }
 
 fn cmdOpencodePrompts(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
@@ -1558,9 +2067,7 @@ fn cmdSessionTooling(
         }
         var rows = try buildSessionToolingSummaryRows(allocator, filtered.items, mode);
         defer deinitQueryRows(allocator, &rows);
-        if (opts.limit > 0 and rows.items.len > opts.limit) {
-            rows.items.len = opts.limit;
-        }
+        trimQueryRows(&rows, opts.limit);
         const cols = [_][]const u8{
             "group_key",
             "count",
@@ -1648,6 +2155,16 @@ fn cmdQueryDiagnose(
             unresolved and threshold_exceeded
         else
             unresolved or threshold_exceeded;
+        const diagnosis = if (unresolved and threshold_exceeded)
+            "actual_slow_query"
+        else if (unresolved and std.mem.eql(u8, record.runningState(), "running_unresolved"))
+            "polling_unresolved"
+        else if (unresolved)
+            "unresolved_no_output"
+        else if (threshold_exceeded)
+            "slow_but_completed"
+        else
+            "completed";
         if (hang_flag) hang_count += 1;
         if (unresolved) unresolved_count += 1;
         if (record.wall_time_ms) |wall_time| {
@@ -1663,6 +2180,7 @@ fn cmdQueryDiagnose(
         try putOptionalString(&row, "started_at", record.start_ts);
         try putOptionalString(&row, "ended_at", record.end_ts);
         try putOptionalInt(&row, "duration_ms", record.wall_time_ms);
+        try row.putOwnedKey("command_class", .{ .string = queryCommandClass(record.command_text) });
         const dataset_hint = try extractDatasetHint(allocator, record.command_text);
         defer if (dataset_hint) |hint| allocator.free(hint);
         try putOptionalString(&row, "dataset_hint", dataset_hint);
@@ -1671,6 +2189,7 @@ fn cmdQueryDiagnose(
         try row.putOwnedKey("hang_flag", .{ .bool = hang_flag });
         try putOptionalInt(&row, "pty_session_id", record.pty_session_id);
         try row.putOwnedKey("resolution_state", .{ .string = queryResolutionState(record) });
+        try row.putOwnedKey("diagnosis", .{ .string = diagnosis });
         try putOptionalString(&row, "query_invocation", record.command_text);
         if (opts.next_actions) {
             const next_action = try buildNextAction(allocator, record, hang_flag);
@@ -1710,14 +2229,12 @@ fn cmdQueryDiagnose(
             try output.writeOutput(allocator, opts.format, out_rows.items, cols[0..], opts.out_path);
         }
     } else {
-        if (opts.limit > 0 and out_rows.items.len > opts.limit) {
-            out_rows.items.len = opts.limit;
-        }
+        trimQueryRows(&out_rows, opts.limit);
         if (opts.next_actions) {
-            const cols = [_][]const u8{ "query_call_id", "session_id", "path", "started_at", "ended_at", "duration_ms", "dataset_hint", "unresolved", "threshold_exceeded", "hang_flag", "pty_session_id", "resolution_state", "query_invocation", "next_action" };
+            const cols = [_][]const u8{ "query_call_id", "session_id", "path", "started_at", "ended_at", "duration_ms", "command_class", "dataset_hint", "unresolved", "threshold_exceeded", "hang_flag", "pty_session_id", "resolution_state", "diagnosis", "query_invocation", "next_action" };
             try output.writeOutput(allocator, opts.format, out_rows.items, cols[0..], opts.out_path);
         } else {
-            const cols = [_][]const u8{ "query_call_id", "session_id", "path", "started_at", "ended_at", "duration_ms", "dataset_hint", "unresolved", "threshold_exceeded", "hang_flag", "pty_session_id", "resolution_state", "query_invocation" };
+            const cols = [_][]const u8{ "query_call_id", "session_id", "path", "started_at", "ended_at", "duration_ms", "command_class", "dataset_hint", "unresolved", "threshold_exceeded", "hang_flag", "pty_session_id", "resolution_state", "diagnosis", "query_invocation" };
             try output.writeOutput(allocator, opts.format, out_rows.items, cols[0..], opts.out_path);
         }
     }
@@ -2114,7 +2631,14 @@ fn isSeqQueryInvocation(record: InvocationRecord) bool {
     if (record.invocation_kind != .function_call) return false;
     if (record.tool_name == null or !std.mem.eql(u8, record.tool_name.?, "exec_command")) return false;
     if (record.command_text == null) return false;
-    return std.mem.indexOf(u8, record.command_text.?, "seq query") != null;
+    return std.mem.indexOf(u8, record.command_text.?, "seq query") != null or
+        std.mem.indexOf(u8, record.command_text.?, "seq artifact-search") != null;
+}
+
+fn queryCommandClass(command_text_opt: ?[]const u8) []const u8 {
+    const command_text = command_text_opt orelse return "query";
+    if (std.mem.indexOf(u8, command_text, "seq artifact-search") != null) return "artifact_search";
+    return "query";
 }
 
 fn extractDatasetHint(allocator: std.mem.Allocator, command_text_opt: ?[]const u8) !?[]u8 {
@@ -2166,6 +2690,14 @@ fn buildNextAction(
             allocator,
             "seq session-tooling --path {s} --summary --group-by tool --format table",
             .{record.path},
+        );
+        return action;
+    }
+    if (std.mem.eql(u8, queryCommandClass(record.command_text), "query")) {
+        const action = try std.fmt.allocPrint(
+            allocator,
+            "seq artifact-search --contains <text> --since <iso> --limit 20 --format table",
+            .{},
         );
         return action;
     }
@@ -3118,6 +3650,8 @@ fn collectDatasetRows(
         try collectToolCallArgRows(allocator, sessions_root, day_filter, &rows);
     } else if (std.mem.eql(u8, dataset_name, "memory_files")) {
         try collectMemoryFilesRows(allocator, query_params, &rows);
+    } else if (std.mem.eql(u8, dataset_name, "memory_blocks")) {
+        try collectMemoryBlocksRows(allocator, query_params, &rows);
     } else if (std.mem.eql(u8, dataset_name, "opencode_prompts")) {
         try collectOpencodePromptRows(allocator, query_params, &rows);
     } else if (std.mem.eql(u8, dataset_name, "opencode_events")) {
@@ -3589,6 +4123,36 @@ fn collectMemoryFilesRows(
         try qrow.putOwnedKey("size_bytes", .{ .int = @intCast(row.size_bytes) });
         try qrow.putOwnedKey("modified_at", .{ .string = row.modified_at });
         try putOptionalString(&qrow, "preview", row.preview);
+        try out_rows.append(allocator, qrow);
+    }
+}
+
+fn collectMemoryBlocksRows(
+    allocator: std.mem.Allocator,
+    query_params: []const spec.ParamSpec,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    var options = datasets.memory_blocks.Options{};
+    if (paramString(query_params, "memory_root")) |memory_root| {
+        options.memory_root = memory_root;
+    }
+
+    var parsed = try datasets.memory_blocks.collect(allocator, options);
+    defer datasets.memory_blocks.deinitRows(allocator, &parsed);
+
+    for (parsed.items) |row| {
+        var qrow = query.Row.init(allocator);
+        try qrow.putOwnedKey("path", .{ .string = row.path });
+        try qrow.putOwnedKey("relative_path", .{ .string = row.relative_path });
+        try qrow.putOwnedKey("doc_kind", .{ .string = row.doc_kind });
+        try qrow.putOwnedKey("heading_path", .{ .string = row.heading_path });
+        try qrow.putOwnedKey("title", .{ .string = row.title });
+        try qrow.putOwnedKey("body", .{ .string = row.body });
+        try qrow.putOwnedKey("preview", .{ .string = row.preview });
+        try putOptionalString(&qrow, "updated_at", row.updated_at);
+        try putOptionalString(&qrow, "thread_id", row.thread_id);
+        try putOptionalString(&qrow, "rollout_path", row.rollout_path);
+        try putOptionalString(&qrow, "keywords", row.keywords);
         try out_rows.append(allocator, qrow);
     }
 }
@@ -4502,6 +5066,18 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.prompt = args[i];
+        } else if (std.mem.eql(u8, arg, "--kind")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.kind_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--surface")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.surface_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--follow")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.follow_text = args[i];
         } else if (std.mem.eql(u8, arg, "--roles")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -4522,6 +5098,10 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.tool = args[i];
+        } else if (std.mem.eql(u8, arg, "--workdir")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.workdir_text = args[i];
         } else if (std.mem.eql(u8, arg, "--status")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -4578,6 +5158,8 @@ fn parseOptions(args: []const []const u8) !Options {
             opts.include_raw = true;
         } else if (std.mem.eql(u8, arg, "--include-parts")) {
             opts.include_raw = true;
+        } else if (std.mem.eql(u8, arg, "--stats")) {
+            opts.stats = true;
         } else if (std.mem.eql(u8, arg, "--strip-skill-blocks")) {
             opts.strip_skill_blocks = true;
         } else if (std.mem.eql(u8, arg, "--no-dedupe-exact")) {
@@ -4826,6 +5408,16 @@ fn timestampWeekAlloc(allocator: std.mem.Allocator, ts_opt: ?[]const u8) !?[]u8 
 fn deinitQueryRows(allocator: std.mem.Allocator, rows: *std.ArrayList(query.Row)) void {
     for (rows.items) |*row| row.deinit();
     rows.deinit(allocator);
+}
+
+fn trimQueryRows(rows: *std.ArrayList(query.Row), limit: usize) void {
+    if (limit == 0 or rows.items.len <= limit) return;
+    var idx = rows.items.len;
+    while (idx > limit) {
+        idx -= 1;
+        rows.items[idx].deinit();
+    }
+    rows.items.len = limit;
 }
 
 test "deriveSessionDayPathFilter honors day bounds for session datasets" {

@@ -16,6 +16,7 @@ comptime {
     _ = @import("datasets/token_sessions.zig");
     _ = @import("datasets/tool_calls.zig");
     _ = @import("datasets/memory_files.zig");
+    _ = @import("datasets/memory_blocks.zig");
     _ = @import("datasets/opencode_prompts.zig");
     _ = @import("datasets/opencode_events.zig");
     _ = @import("datasets/opencode_sqlite.zig");
@@ -30,6 +31,7 @@ test "bootstrap parse coverage" {
     try std.testing.expectEqual(lib.Command.skills_rank, lib.parseCommand("skills-rank"));
     try std.testing.expectEqual(lib.Command.skill_trend, lib.parseCommand("skill-trend"));
     try std.testing.expectEqual(lib.Command.skill_report, lib.parseCommand("skill-report"));
+    try std.testing.expectEqual(lib.Command.artifact_search, lib.parseCommand("artifact-search"));
     try std.testing.expectEqual(lib.Command.role_breakdown, lib.parseCommand("role-breakdown"));
     try std.testing.expectEqual(lib.Command.occurrence_export, lib.parseCommand("occurrence-export"));
     try std.testing.expectEqual(lib.Command.orchestration_concurrency, lib.parseCommand("orchestration-concurrency"));
