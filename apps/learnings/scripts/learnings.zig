@@ -1,4 +1,5 @@
 const std = @import("std");
+const append_learning_cli = @import("append_learning_cli");
 const core_cli = @import("core_cli");
 const app_meta = @import("app_meta");
 const seq_bundle = @import("seq_bundle");
@@ -14,12 +15,13 @@ const UsageText =
     \\
     \\Marker: learnings.zig
     \\
-    \\usage: learnings [-h] [--path PATH] {datasets,dataset-schema,query,recent,recall,codify-candidates,quality-audit,value-report} ...
+    \\usage: learnings [-h] [--path PATH] {append,datasets,dataset-schema,query,recent,recall,codify-candidates,quality-audit,value-report} ...
     \\
     \\Mine, recall, and promote records from repo-root .learnings.jsonl.
     \\
     \\positional arguments:
-    \\  {datasets,dataset-schema,query,recent,recall,codify-candidates,quality-audit,value-report}
+    \\  {append,datasets,dataset-schema,query,recent,recall,codify-candidates,quality-audit,value-report}
+    \\    append              Append a structured learning record
     \\    datasets            List datasets
     \\    dataset-schema      Show dataset schema
     \\    query               Run a JSON spec query
@@ -209,6 +211,7 @@ const STATUS_BOOSTS = [_]StatusBoost{
 };
 
 const Command = enum {
+    append,
     datasets,
     dataset_schema,
     query,
@@ -221,6 +224,7 @@ const Command = enum {
 
 const Args = struct {
     path: []const u8 = ".learnings.jsonl",
+    path_explicit: bool = false,
     sessions_root: []const u8 = "",
     since: []const u8 = "",
     until: []const u8 = "",
@@ -235,6 +239,7 @@ const Args = struct {
     format: []const u8 = "table",
     drop_superseded: bool = false,
     min_count: usize = 3,
+    append_args_start: usize = 0,
 };
 
 const RecallCandidate = struct {
@@ -350,6 +355,7 @@ pub fn main() !void {
     defer allocator.free(jsonl_path);
 
     switch (parsed.command orelse unreachable) {
+        .append => try cmdAppend(allocator, argv, parsed),
         .datasets => try cmdDatasets(allocator),
         .dataset_schema => try cmdDatasetSchema(allocator, parsed.dataset.?),
         .query => try cmdQuery(allocator, repo_root, jsonl_path, parsed.spec.?),
@@ -405,9 +411,15 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i >= argv.len) return error.MissingPathValue;
             args.path = argv[i];
+            args.path_explicit = true;
             continue;
         }
 
+        if (std.mem.eql(u8, arg, "append")) {
+            args.command = .append;
+            args.append_args_start = i + 1;
+            break;
+        }
         if (std.mem.eql(u8, arg, "datasets")) {
             args.command = .datasets;
             continue;
@@ -444,6 +456,7 @@ fn parseArgs(argv: []const []const u8) !Args {
         if (args.command == null) return error.MissingCommand;
 
         switch (args.command.?) {
+            .append => unreachable,
             .dataset_schema => {
                 if (std.mem.eql(u8, arg, "--dataset")) {
                     i += 1;
@@ -667,6 +680,7 @@ fn printParseError(err: anyerror, argv: []const []const u8) noreturn {
         error.InvalidCodifyArg,
         error.InvalidQualityAuditArg,
         error.InvalidValueReportArg,
+        error.ConflictingPathValue,
         => {
             stderr.print("error: invalid arguments\n", .{}) catch {};
         },
@@ -676,6 +690,57 @@ fn printParseError(err: anyerror, argv: []const []const u8) noreturn {
     }
 
     stderr.print("{s}\n", .{UsageText}) catch {};
+    std.process.exit(2);
+}
+
+fn cmdAppend(allocator: std.mem.Allocator, argv: []const []const u8, args: Args) !void {
+    const append_args = mergeAppendArgsAlloc(allocator, args.path_explicit, args.path, argv[args.append_args_start..]) catch |err| switch (err) {
+        error.MissingPathValue => exitAppendParseError("argument --path: expected one argument", .{}),
+        error.ConflictingPathValue => exitAppendParseError("conflicting --path values before and after append", .{}),
+        else => return err,
+    };
+    defer allocator.free(append_args);
+    try append_learning_cli.runWithAllocator(allocator, append_args, append_learning_cli.subcommandSurface());
+}
+
+fn mergeAppendArgsAlloc(
+    allocator: std.mem.Allocator,
+    path_explicit: bool,
+    prefixed_path: []const u8,
+    tail_args: []const []const u8,
+) ![]const []const u8 {
+    const tail_path = try lastPathValue(tail_args);
+    if (!path_explicit) return allocator.dupe([]const u8, tail_args);
+    if (tail_path) |value| {
+        if (!std.mem.eql(u8, value, prefixed_path)) return error.ConflictingPathValue;
+        return allocator.dupe([]const u8, tail_args);
+    }
+
+    var out: std.ArrayList([]const u8) = .empty;
+    defer out.deinit(allocator);
+
+    try out.appendSlice(allocator, &.{ "--path", prefixed_path });
+    try out.appendSlice(allocator, tail_args);
+    return out.toOwnedSlice(allocator);
+}
+
+fn lastPathValue(args: []const []const u8) !?[]const u8 {
+    var value: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (!std.mem.eql(u8, args[i], "--path")) continue;
+        i += 1;
+        if (i >= args.len) return error.MissingPathValue;
+        value = args[i];
+    }
+    return value;
+}
+
+fn exitAppendParseError(comptime fmt: []const u8, args: anytype) noreturn {
+    const surface = append_learning_cli.subcommandSurface();
+    std.debug.print("{s}\n", .{surface.usage_line});
+    std.debug.print("{s}: error: ", .{surface.program_name});
+    std.debug.print(fmt ++ "\n", args);
     std.process.exit(2);
 }
 
@@ -3054,6 +3119,30 @@ test "parse args datasets" {
     const argv = [_][]const u8{ ProgramName, "datasets" };
     const parsed = try parseArgs(&argv);
     try std.testing.expect(parsed.command.? == .datasets);
+}
+
+test "parse args append captures tail start" {
+    const argv = [_][]const u8{ ProgramName, "--path", "nested.jsonl", "append", "--learning", "rule" };
+    const parsed = try parseArgs(&argv);
+    try std.testing.expect(parsed.command.? == .append);
+    try std.testing.expect(parsed.path_explicit);
+    try std.testing.expectEqualStrings("nested.jsonl", parsed.path);
+    try std.testing.expectEqual(@as(usize, 4), parsed.append_args_start);
+}
+
+test "merge append args injects explicit prefixed path" {
+    const merged = try mergeAppendArgsAlloc(std.testing.allocator, true, "nested.jsonl", &.{ "--learning", "rule" });
+    defer std.testing.allocator.free(merged);
+    try std.testing.expectEqual(@as(usize, 4), merged.len);
+    try std.testing.expectEqualStrings("--path", merged[0]);
+    try std.testing.expectEqualStrings("nested.jsonl", merged[1]);
+}
+
+test "merge append args rejects conflicting path values" {
+    try std.testing.expectError(
+        error.ConflictingPathValue,
+        mergeAppendArgsAlloc(std.testing.allocator, true, "a.jsonl", &.{ "--path", "b.jsonl", "--learning", "rule" }),
+    );
 }
 
 test "parse args recall" {

@@ -207,17 +207,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = puff_meta },
         },
     });
-    const learnings_root = b.createModule(.{
-        .root_source_file = b.path("apps/learnings/scripts/learnings.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "core_delegate", .module = core_delegate },
-            .{ .name = "core_cli", .module = core_cli },
-            .{ .name = "app_meta", .module = learnings_meta },
-            .{ .name = "seq_bundle", .module = seq_bundle },
-        },
-    });
     const append_learning_root = b.createModule(.{
         .root_source_file = b.path("apps/learnings/scripts/append_learning.zig"),
         .target = target,
@@ -226,6 +215,18 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_delegate", .module = core_delegate },
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "app_meta", .module = learnings_meta },
+        },
+    });
+    const learnings_root = b.createModule(.{
+        .root_source_file = b.path("apps/learnings/scripts/learnings.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "append_learning_cli", .module = append_learning_root },
+            .{ .name = "core_delegate", .module = core_delegate },
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = learnings_meta },
+            .{ .name = "seq_bundle", .module = seq_bundle },
         },
     });
     const mesh_root = b.createModule(.{

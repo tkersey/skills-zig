@@ -3,10 +3,16 @@ const core_cli = @import("core_cli");
 const std = @import("std");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
-const ProgramName = "append_learning";
-const UsageLine =
-    "usage: append_learning [-h] [--status STATUS] --learning LEARNING [--evidence EVIDENCE] [--application APPLICATION] [--tag TAG] [--related-id RELATED_ID] [--supersedes-id SUPERSEDES_ID] [--repo REPO] [--path PATH] [--source SOURCE] [--allow-duplicate] [--quality-mode {strict,best_effort}] [--allow-temp-path]";
-const HelpText =
+pub const Surface = struct {
+    program_name: []const u8,
+    usage_line: []const u8,
+    help_text: []const u8,
+};
+
+const StandaloneSurface = Surface{
+    .program_name = "append_learning",
+    .usage_line = "usage: append_learning [-h] [--status STATUS] --learning LEARNING [--evidence EVIDENCE] [--application APPLICATION] [--tag TAG] [--related-id RELATED_ID] [--supersedes-id SUPERSEDES_ID] [--repo REPO] [--path PATH] [--source SOURCE] [--allow-duplicate] [--quality-mode {strict,best_effort}] [--allow-temp-path]",
+    .help_text =
     \\append_learning.zig
     \\
     \\Marker: append_learning.zig
@@ -36,7 +42,44 @@ const HelpText =
     \\  --allow-temp-path     Allow capture when repo root is under temporary paths (/tmp or /var/folders).
     \\  -V, --version         Show version
     \\  version               Show version
-;
+    ,
+};
+
+const SubcommandSurface = Surface{
+    .program_name = "learnings append",
+    .usage_line = "usage: learnings append [-h] [--status STATUS] --learning LEARNING [--evidence EVIDENCE] [--application APPLICATION] [--tag TAG] [--related-id RELATED_ID] [--supersedes-id SUPERSEDES_ID] [--repo REPO] [--path PATH] [--source SOURCE] [--allow-duplicate] [--quality-mode {strict,best_effort}] [--allow-temp-path]",
+    .help_text =
+    \\learnings append
+    \\
+    \\Marker: append_learning.zig
+    \\
+    \\usage: learnings append [-h] [--status STATUS] --learning LEARNING [--evidence EVIDENCE] [--application APPLICATION] [--tag TAG] [--related-id RELATED_ID] [--supersedes-id SUPERSEDES_ID] [--repo REPO] [--path PATH] [--source SOURCE] [--allow-duplicate] [--quality-mode {strict,best_effort}] [--allow-temp-path]
+    \\
+    \\Append a structured learning record to repo-root .learnings.jsonl.
+    \\
+    \\options:
+    \\  -h, --help            show this help message and exit
+    \\  --status STATUS       Action status (for example: do_more, do_less); defaults to review_later
+    \\  --learning LEARNING   Learning statement
+    \\  --evidence EVIDENCE   Evidence item (repeat for multiple lines); optional in best-effort mode
+    \\  --application APPLICATION
+    \\                        How to apply this learning; optional in best-effort mode
+    \\  --tag TAG             Tag (repeatable; comma-separated ok), for example: tooling, git, ci
+    \\  --related-id RELATED_ID
+    \\                        Related learning id (repeatable; comma-separated ok)
+    \\  --supersedes-id SUPERSEDES_ID
+    \\                        If this learning supersedes an older record id
+    \\  --repo REPO           Repo identifier override (defaults to remote origin slug or repo dir name)
+    \\  --path PATH           Path to JSONL file, relative to repo root by default
+    \\  --source SOURCE       Source marker for the record
+    \\  --allow-duplicate     Append even if an existing record has the same fingerprint
+    \\  --quality-mode {strict,best_effort}
+    \\                        Record quality gate mode; strict rejects weak records, best_effort keeps legacy placeholder behavior.
+    \\  --allow-temp-path     Allow capture when repo root is under temporary paths (/tmp or /var/folders).
+    \\  -V, --version         Show version
+    \\  version               Show version
+    ,
+};
 
 const QualityMode = enum {
     best_effort,
@@ -137,16 +180,33 @@ pub fn main() !void {
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
 
+    try runWithAllocator(allocator, if (argv.len > 1) argv[1..] else &.{}, StandaloneSurface);
+}
+
+pub fn standaloneSurface() Surface {
+    return StandaloneSurface;
+}
+
+pub fn subcommandSurface() Surface {
+    return SubcommandSurface;
+}
+
+pub fn runWithAllocator(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    surface: Surface,
+) !void {
+
     var opts = Options{};
     defer opts.deinit(allocator);
 
-    var i: usize = 1;
-    while (i < argv.len) : (i += 1) {
-        const arg = argv[i];
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
         if (core_cli.isHelpArg(arg)) {
             var stdout_writer = std.fs.File.stdout().writer(&.{});
             const stdout = &stdout_writer.interface;
-            try stdout.print("{s}\n", .{HelpText});
+            try stdout.print("{s}\n", .{surface.help_text});
             return;
         }
         if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
@@ -165,84 +225,84 @@ pub fn main() !void {
         }
         if (std.mem.eql(u8, arg, "--quality-mode")) {
             i += 1;
-            if (i >= argv.len) exitParseError("argument --quality-mode: expected one argument", .{});
-            const mode = argv[i];
+            if (i >= args.len) exitParseError(surface, "argument --quality-mode: expected one argument", .{});
+            const mode = args[i];
             if (std.mem.eql(u8, mode, "strict")) {
                 opts.quality_mode = .strict;
             } else if (std.mem.eql(u8, mode, "best_effort")) {
                 opts.quality_mode = .best_effort;
             } else {
-                exitParseError("argument --quality-mode: expected one of strict,best_effort", .{});
+                exitParseError(surface, "argument --quality-mode: expected one of strict,best_effort", .{});
             }
             continue;
         }
 
         if (std.mem.eql(u8, arg, "--status")) {
             i += 1;
-            if (i >= argv.len) exitParseError("argument --status: expected one argument", .{});
-            opts.status = argv[i];
+            if (i >= args.len) exitParseError(surface, "argument --status: expected one argument", .{});
+            opts.status = args[i];
             continue;
         }
         if (std.mem.eql(u8, arg, "--learning")) {
             i += 1;
-            if (i >= argv.len) exitParseError("argument --learning: expected one argument", .{});
-            opts.learning = argv[i];
+            if (i >= args.len) exitParseError(surface, "argument --learning: expected one argument", .{});
+            opts.learning = args[i];
             continue;
         }
         if (std.mem.eql(u8, arg, "--evidence")) {
             i += 1;
-            if (i >= argv.len) exitParseError("argument --evidence: expected one argument", .{});
-            opts.evidence.append(allocator, argv[i]) catch |err| return err;
+            if (i >= args.len) exitParseError(surface, "argument --evidence: expected one argument", .{});
+            opts.evidence.append(allocator, args[i]) catch |err| return err;
             continue;
         }
         if (std.mem.eql(u8, arg, "--application")) {
             i += 1;
-            if (i >= argv.len) exitParseError("argument --application: expected one argument", .{});
-            opts.application = argv[i];
+            if (i >= args.len) exitParseError(surface, "argument --application: expected one argument", .{});
+            opts.application = args[i];
             continue;
         }
         if (std.mem.eql(u8, arg, "--tag")) {
             i += 1;
-            if (i >= argv.len) exitParseError("argument --tag: expected one argument", .{});
-            opts.tags.append(allocator, argv[i]) catch |err| return err;
+            if (i >= args.len) exitParseError(surface, "argument --tag: expected one argument", .{});
+            opts.tags.append(allocator, args[i]) catch |err| return err;
             continue;
         }
         if (std.mem.eql(u8, arg, "--related-id")) {
             i += 1;
-            if (i >= argv.len) exitParseError("argument --related-id: expected one argument", .{});
-            opts.related_ids.append(allocator, argv[i]) catch |err| return err;
+            if (i >= args.len) exitParseError(surface, "argument --related-id: expected one argument", .{});
+            opts.related_ids.append(allocator, args[i]) catch |err| return err;
             continue;
         }
         if (std.mem.eql(u8, arg, "--supersedes-id")) {
             i += 1;
-            if (i >= argv.len) exitParseError("argument --supersedes-id: expected one argument", .{});
-            opts.supersedes_id = argv[i];
+            if (i >= args.len) exitParseError(surface, "argument --supersedes-id: expected one argument", .{});
+            opts.supersedes_id = args[i];
             continue;
         }
         if (std.mem.eql(u8, arg, "--repo")) {
             i += 1;
-            if (i >= argv.len) exitParseError("argument --repo: expected one argument", .{});
-            opts.repo = argv[i];
+            if (i >= args.len) exitParseError(surface, "argument --repo: expected one argument", .{});
+            opts.repo = args[i];
             continue;
         }
         if (std.mem.eql(u8, arg, "--path")) {
             i += 1;
-            if (i >= argv.len) exitParseError("argument --path: expected one argument", .{});
-            opts.path = argv[i];
+            if (i >= args.len) exitParseError(surface, "argument --path: expected one argument", .{});
+            opts.path = args[i];
             continue;
         }
         if (std.mem.eql(u8, arg, "--source")) {
             i += 1;
-            if (i >= argv.len) exitParseError("argument --source: expected one argument", .{});
-            opts.source = argv[i];
+            if (i >= args.len) exitParseError(surface, "argument --source: expected one argument", .{});
+            opts.source = args[i];
             continue;
         }
 
-        exitParseError("unrecognized arguments: {s}", .{arg});
+        exitParseError(surface, "unrecognized arguments: {s}", .{arg});
     }
 
     const learning_raw = opts.learning orelse {
-        exitParseError("the following arguments are required: --learning", .{});
+        exitParseError(surface, "the following arguments are required: --learning", .{});
     };
 
     const cwd = try std.process.getCwdAlloc(allocator);
@@ -401,9 +461,10 @@ pub fn main() !void {
     try stdout.print("appended: id={s} status={s} path={s}\n", .{ record_id, status, output_path });
 }
 
-fn exitParseError(comptime fmt: []const u8, args: anytype) noreturn {
-    std.debug.print("{s}\n", .{UsageLine});
-    std.debug.print(ProgramName ++ ": error: " ++ fmt ++ "\n", args);
+fn exitParseError(surface: Surface, comptime fmt: []const u8, args: anytype) noreturn {
+    std.debug.print("{s}\n", .{surface.usage_line});
+    std.debug.print("{s}: error: ", .{surface.program_name});
+    std.debug.print(fmt ++ "\n", args);
     std.process.exit(2);
 }
 
