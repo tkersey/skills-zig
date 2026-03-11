@@ -88,7 +88,76 @@ pub const dataset_meta = [_]DatasetMeta{
     .{
         .name = "tool_calls",
         .description = "Tool calls (function_call/custom_tool_call)",
-        .fields = &.{ "path", "timestamp", "day", "week", "month", "kind", "tool", "call_id", "arguments_len", "input_len", "status" },
+        .fields = &.{
+            "path",
+            "timestamp",
+            "day",
+            "week",
+            "month",
+            "kind",
+            "tool",
+            "call_id",
+            "arguments_len",
+            "input_len",
+            "status",
+            "arguments_text",
+            "input_text",
+            "command_text",
+            "primary_executable",
+            "workdir",
+            "parse_error",
+        },
+    },
+    .{
+        .name = "tool_invocations",
+        .description = "Lifecycle-enriched tool invocations parsed from rollout JSONL",
+        .fields = &.{
+            "path",
+            "session_id",
+            "timestamp",
+            "end_timestamp",
+            "day",
+            "week",
+            "month",
+            "call_id",
+            "tool_name",
+            "invocation_kind",
+            "arguments_text",
+            "input_text",
+            "command_text",
+            "primary_executable",
+            "workdir",
+            "pty_session_id",
+            "wall_time_ms",
+            "exit_code",
+            "running_state",
+            "unresolved",
+            "parse_error",
+        },
+    },
+    .{
+        .name = "tool_call_args",
+        .description = "Flattened tool-call argument leaves parsed from JSON arguments/input payloads",
+        .fields = &.{
+            "path",
+            "session_id",
+            "timestamp",
+            "day",
+            "week",
+            "month",
+            "call_id",
+            "tool_name",
+            "invocation_kind",
+            "payload_source",
+            "arg_path",
+            "value_kind",
+            "value_text",
+            "value_number",
+            "value_bool",
+            "is_null",
+            "array_index",
+            "parse_error",
+        },
     },
     .{
         .name = "memory_files",
@@ -333,28 +402,28 @@ fn printCommandHelp(cmd: lib.Command) !void {
 
     const body = switch (cmd) {
         .skills_rank =>
-        \\usage: seq skills-rank [--format table|json|csv] [--max N]
+        \\usage: seq skills-rank [--since <iso>] [--until <iso>] [--format table|json|csv] [--max N]
         ,
         .skill_trend =>
-        \\usage: seq skill-trend --skill <name> [--bucket day|week|month] [--format table|json|csv] [--max N]
+        \\usage: seq skill-trend --skill <name> [--bucket day|week|month] [--since <iso>] [--until <iso>] [--format table|json|csv] [--max N]
         ,
         .skill_report =>
-        \\usage: seq skill-report --skill <name>
+        \\usage: seq skill-report --skill <name> [--since <iso>] [--until <iso>]
         ,
         .role_breakdown =>
-        \\usage: seq role-breakdown [--format table|json|csv] [--max N]
+        \\usage: seq role-breakdown [--since <iso>] [--until <iso>] [--format table|json|csv] [--max N]
         ,
         .occurrence_export =>
-        \\usage: seq occurrence-export [--skill <name>] [--format jsonl|json|csv] [--max N]
+        \\usage: seq occurrence-export [--skill <name>] [--since <iso>] [--until <iso>] [--format jsonl|json|csv] [--max N]
         ,
         .orchestration_concurrency =>
         \\usage: seq orchestration-concurrency [--session-id <id>|--path <jsonl>] [--format table|json|csv|jsonl] [--floor-threshold N] [--fail-on-floor] [--fail-on-mesh-truth]
         ,
         .find_session =>
-        \\usage: seq find-session --prompt <text> [--limit N] [--format table|json|csv|jsonl]
+        \\usage: seq find-session --prompt <text> [--since <iso>] [--until <iso>] [--limit N] [--format table|json|csv|jsonl]
         ,
         .session_prompts =>
-        \\usage: seq session-prompts [--session-id <id>|--path <jsonl>|--current] [--roles <csv>] [--strip-skill-blocks] [--no-dedupe-exact] [--limit N] [--format table|json|csv|jsonl]
+        \\usage: seq session-prompts [--session-id <id>|--path <jsonl>|--current] [--roles <csv>] [--since <iso>] [--until <iso>] [--strip-skill-blocks] [--no-dedupe-exact] [--limit N] [--format table|json|csv|jsonl]
         \\extra options:
         \\  --path <path>              Inspect exactly one rollout/session JSONL file
         \\  --session-id <id>          Resolve exactly one session file by session id substring
@@ -364,13 +433,13 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\  --no-dedupe-exact          Keep duplicated role+text rows
         ,
         .report_bundle =>
-        \\usage: seq report-bundle [--top N]
+        \\usage: seq report-bundle [--since <iso>] [--until <iso>] [--top N]
         ,
         .section_audit =>
-        \\usage: seq section-audit --sections <csv>
+        \\usage: seq section-audit --sections <csv> [--since <iso>] [--until <iso>]
         ,
         .token_usage =>
-        \\usage: seq token-usage [--top N]
+        \\usage: seq token-usage [--since <iso>] [--until <iso>] [--top N]
         ,
         .routing_gap =>
         \\usage: seq routing-gap --cue-spec <json|@path> [--discovery-skills <csv>] [--format table|json|csv|jsonl]
@@ -385,10 +454,10 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\usage: seq query --spec <json|@path>
         ,
         .session_tooling =>
-        \\usage: seq session-tooling [--session-id <id>|--path <jsonl>] [--group-by executable|command|tool] [--summary] [--limit N] [--format table|json|csv|jsonl]
+        \\usage: seq session-tooling [--session-id <id>|--path <jsonl>] [--since <iso>] [--until <iso>] [--group-by executable|command|tool] [--summary] [--limit N] [--format table|json|csv|jsonl]
         ,
         .query_diagnose =>
-        \\usage: seq query-diagnose [--session-id <id>|--path <jsonl>] [--threshold-ms N] [--strict-hang] [--fail-on-hang] [--next-actions] [--summary] [--format table|json|csv|jsonl]
+        \\usage: seq query-diagnose [--session-id <id>|--path <jsonl>] [--since <iso>] [--until <iso>] [--threshold-ms N] [--strict-hang] [--fail-on-hang] [--next-actions] [--summary] [--format table|json|csv|jsonl]
         ,
         .opencode_prompts =>
         \\usage: seq opencode-prompts [--spec <json|@path>] [--contains <text>] [--regex <expr>] [--session <id|slug>] [--since <epoch-ms|iso>] [--until <epoch-ms|iso>] [--latest] [--mode <name>] [--part-type <name>] [--group-by <csv>] [--metric <csv>] [--select <csv>] [--sort <csv>] [--source auto|db|jsonl] [--opencode-db-path <path>] [--opencode-path <path>] [--include-raw] [--limit N] [--format table|json|csv|jsonl]
@@ -499,11 +568,39 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         else => false,
     };
     const supports_since = switch (cmd) {
-        .opencode_prompts, .opencode_events => true,
+        .skills_rank,
+        .skill_trend,
+        .skill_report,
+        .role_breakdown,
+        .occurrence_export,
+        .find_session,
+        .session_prompts,
+        .report_bundle,
+        .section_audit,
+        .token_usage,
+        .session_tooling,
+        .query_diagnose,
+        .opencode_prompts,
+        .opencode_events,
+        => true,
         else => false,
     };
     const supports_until = switch (cmd) {
-        .opencode_prompts, .opencode_events => true,
+        .skills_rank,
+        .skill_trend,
+        .skill_report,
+        .role_breakdown,
+        .occurrence_export,
+        .find_session,
+        .session_prompts,
+        .report_bundle,
+        .section_audit,
+        .token_usage,
+        .session_tooling,
+        .query_diagnose,
+        .opencode_prompts,
+        .opencode_events,
+        => true,
         else => false,
     };
     const supports_session = switch (cmd) {
@@ -768,7 +865,11 @@ fn cmdOpencodeEvents(allocator: std.mem.Allocator, sessions_root: []const u8, op
 }
 
 fn cmdSkillsRank(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    var where: std.ArrayList(spec.WhereClause) = .empty;
+    defer where.deinit(allocator);
+    try appendSessionTimeBounds(allocator, &where, opts);
     const query_spec = spec.QuerySpec{
+        .where = where.items,
         .group_by = &.{"skill"},
         .metrics = &.{.{ .op = .count, .alias = "count" }},
         .sort = &.{.{ .field = "count", .descending = true }},
@@ -781,17 +882,18 @@ fn cmdSkillTrend(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
     const skill_name = opts.skill orelse return error.MissingSkillArg;
     const bucket = opts.bucket orelse "day";
     const group_by = [_][]const u8{bucket};
-    const where = [_]spec.WhereClause{
-        .{ .field = "skill", .op = .eq, .value = .{ .scalar = .{ .string = skill_name } } },
-    };
+    var where: std.ArrayList(spec.WhereClause) = .empty;
+    defer where.deinit(allocator);
+    try where.append(allocator, .{ .field = "skill", .op = .eq, .value = .{ .scalar = .{ .string = skill_name } } });
+    try appendSessionTimeBounds(allocator, &where, opts);
     const query_spec = spec.QuerySpec{
-        .where = where[0..],
+        .where = where.items,
         .group_by = group_by[0..],
         .metrics = &.{.{ .op = .count, .alias = "count" }},
         .sort = &.{.{ .field = bucket, .descending = false }},
     };
 
-    var rows = try collectDatasetRows(allocator, "skill_mentions", sessions_root, &.{}, &.{});
+    var rows = try collectDatasetRows(allocator, "skill_mentions", sessions_root, &.{}, where.items);
     defer deinitQueryRows(allocator, &rows);
 
     var result = try query.execute(allocator, rows.items, query_spec);
@@ -818,16 +920,17 @@ fn cmdSkillTrend(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
 
 fn cmdSkillReport(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
     const skill_name = opts.skill orelse return error.MissingSkillArg;
-    var where_buf: [1]spec.WhereClause = undefined;
-    where_buf[0] = .{
+    var where: std.ArrayList(spec.WhereClause) = .empty;
+    defer where.deinit(allocator);
+    try where.append(allocator, .{
         .field = "skill",
         .op = .eq,
         .value = .{ .scalar = .{ .string = skill_name } },
-    };
-    const where_slice = where_buf[0..1];
+    });
+    try appendSessionTimeBounds(allocator, &where, opts);
     const select = [_][]const u8{ "path", "timestamp", "role", "skill", "types", "snippet" };
     const query_spec = spec.QuerySpec{
-        .where = where_slice,
+        .where = where.items,
         .select = select[0..],
         .sort = &.{.{ .field = "timestamp", .descending = false }},
         .limit = opts.limit,
@@ -836,12 +939,16 @@ fn cmdSkillReport(allocator: std.mem.Allocator, sessions_root: []const u8, opts:
 }
 
 fn cmdRoleBreakdown(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    var where: std.ArrayList(spec.WhereClause) = .empty;
+    defer where.deinit(allocator);
+    try appendSessionTimeBounds(allocator, &where, opts);
     const query_spec = spec.QuerySpec{
+        .where = where.items,
         .group_by = &.{ "skill", "role" },
         .metrics = &.{.{ .op = .count, .alias = "count" }},
     };
 
-    var occ_rows = try collectDatasetRows(allocator, "skill_mentions", sessions_root, &.{}, &.{});
+    var occ_rows = try collectDatasetRows(allocator, "skill_mentions", sessions_root, &.{}, where.items);
     defer deinitQueryRows(allocator, &occ_rows);
 
     var grouped = try query.execute(allocator, occ_rows.items, query_spec);
@@ -914,19 +1021,19 @@ fn cmdRoleBreakdown(allocator: std.mem.Allocator, sessions_root: []const u8, opt
 }
 
 fn cmdOccurrenceExport(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
-    var where_buf: [1]spec.WhereClause = undefined;
-    var where_slice: []const spec.WhereClause = &.{};
+    var where: std.ArrayList(spec.WhereClause) = .empty;
+    defer where.deinit(allocator);
     if (opts.skill) |skill_name| {
-        where_buf[0] = .{
+        try where.append(allocator, .{
             .field = "skill",
             .op = .eq,
             .value = .{ .scalar = .{ .string = skill_name } },
-        };
-        where_slice = where_buf[0..1];
+        });
     }
+    try appendSessionTimeBounds(allocator, &where, opts);
     const select = [_][]const u8{ "path", "timestamp", "role", "skill", "types", "snippet" };
     const query_spec = spec.QuerySpec{
-        .where = where_slice,
+        .where = where.items,
         .select = select[0..],
         .sort = &.{.{ .field = "timestamp", .descending = false }},
         .limit = opts.limit,
@@ -1052,7 +1159,7 @@ fn cmdOrchestrationConcurrency(
     sessions_root: []const u8,
     opts: Options,
 ) !void {
-    var input_paths = try resolveOrchestrationInputPaths(allocator, sessions_root, opts);
+    var input_paths = try resolveOrchestrationInputPaths(allocator, sessions_root, opts, null);
     defer freePathList(allocator, &input_paths);
 
     var out_rows: std.ArrayList(query.Row) = .empty;
@@ -1305,6 +1412,7 @@ fn resolveOrchestrationInputPaths(
     allocator: std.mem.Allocator,
     sessions_root: []const u8,
     opts: Options,
+    day_filter: ?SessionDayPathFilter,
 ) !std.ArrayList([]u8) {
     if (opts.path) |single_path| {
         var out: std.ArrayList([]u8) = .empty;
@@ -1321,7 +1429,7 @@ fn resolveOrchestrationInputPaths(
         return out;
     }
 
-    var paths = try collectJsonlPaths(allocator, sessions_root, null);
+    var paths = try collectJsonlPaths(allocator, sessions_root, day_filter);
     errdefer freePathList(allocator, &paths);
 
     if (opts.session_id) |wanted| {
@@ -1354,8 +1462,12 @@ const InvocationRecord = struct {
     call_id: ?[]u8 = null,
     tool_name: ?[]u8 = null,
     invocation_kind: InvocationKind,
+    arguments_text: ?[]u8 = null,
+    input_text: ?[]u8 = null,
     command_text: ?[]u8 = null,
     primary_executable: ?[]u8 = null,
+    workdir: ?[]u8 = null,
+    status_text: ?[]u8 = null,
     pty_session_id: ?i64 = null,
     output_seen: bool = false,
     output_running: bool = false,
@@ -1371,8 +1483,12 @@ const InvocationRecord = struct {
         if (self.end_ts) |value| allocator.free(value);
         if (self.call_id) |value| allocator.free(value);
         if (self.tool_name) |value| allocator.free(value);
+        if (self.arguments_text) |value| allocator.free(value);
+        if (self.input_text) |value| allocator.free(value);
         if (self.command_text) |value| allocator.free(value);
         if (self.primary_executable) |value| allocator.free(value);
+        if (self.workdir) |value| allocator.free(value);
+        if (self.status_text) |value| allocator.free(value);
     }
 
     fn unresolved(self: InvocationRecord) bool {
@@ -1434,7 +1550,13 @@ fn cmdSessionTooling(
 
     if (opts.summary) {
         const mode = try parseToolingGroupMode(opts.group_by_text);
-        var rows = try buildSessionToolingSummaryRows(allocator, records.items, mode);
+        var filtered: std.ArrayList(InvocationRecord) = .empty;
+        defer filtered.deinit(allocator);
+        for (records.items) |record| {
+            if (!timestampSatisfiesBounds(record.start_ts, opts)) continue;
+            try filtered.append(allocator, record);
+        }
+        var rows = try buildSessionToolingSummaryRows(allocator, filtered.items, mode);
         defer deinitQueryRows(allocator, &rows);
         if (opts.limit > 0 and rows.items.len > opts.limit) {
             rows.items.len = opts.limit;
@@ -1453,8 +1575,10 @@ fn cmdSessionTooling(
     var out_rows: std.ArrayList(query.Row) = .empty;
     defer deinitQueryRows(allocator, &out_rows);
 
-    const max_rows = if (opts.limit > 0 and opts.limit < records.items.len) opts.limit else records.items.len;
-    for (records.items[0..max_rows]) |record| {
+    var emitted: usize = 0;
+    for (records.items) |record| {
+        if (!timestampSatisfiesBounds(record.start_ts, opts)) continue;
+        if (opts.limit > 0 and emitted >= opts.limit) break;
         var row = query.Row.init(allocator);
         try row.putOwnedKey("session_id", .{ .string = record.session_id });
         try row.putOwnedKey("path", .{ .string = record.path });
@@ -1471,6 +1595,7 @@ fn cmdSessionTooling(
         try row.putOwnedKey("running_state", .{ .string = record.runningState() });
         try row.putOwnedKey("unresolved", .{ .bool = record.unresolved() });
         try out_rows.append(allocator, row);
+        emitted += 1;
     }
 
     const cols = [_][]const u8{
@@ -1510,6 +1635,7 @@ fn cmdQueryDiagnose(
     defer deinitQueryRows(allocator, &out_rows);
 
     for (records.items) |record| {
+        if (!timestampSatisfiesBounds(record.start_ts, opts)) continue;
         if (!isSeqQueryInvocation(record)) continue;
         query_total += 1;
 
@@ -1706,7 +1832,26 @@ fn collectInvocationRecords(
     sessions_root: []const u8,
     opts: Options,
 ) !std.ArrayList(InvocationRecord) {
-    var input_paths = try resolveOrchestrationInputPaths(allocator, sessions_root, opts);
+    const day_filter = deriveSessionDayPathFilterFromOptions(opts);
+    var input_paths = try resolveOrchestrationInputPaths(allocator, sessions_root, opts, day_filter);
+    defer freePathList(allocator, &input_paths);
+
+    var records: std.ArrayList(InvocationRecord) = .empty;
+    errdefer deinitInvocationRecords(allocator, &records);
+
+    for (input_paths.items) |session_path| {
+        try collectInvocationRecordsFromSession(allocator, session_path, &records);
+    }
+
+    return records;
+}
+
+fn collectInvocationRecordsForRoot(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    day_filter: ?SessionDayPathFilter,
+) !std.ArrayList(InvocationRecord) {
+    var input_paths = try collectJsonlPaths(allocator, sessions_root, day_filter);
     defer freePathList(allocator, &input_paths);
 
     var records: std.ArrayList(InvocationRecord) = .empty;
@@ -1777,8 +1922,12 @@ fn collectInvocationRecordsFromSession(
                     try applyFunctionCallArguments(allocator, &record, arguments_text);
                 }
             } else {
-                if (std.mem.eql(u8, tool_name, "shell")) {
-                    if (stdJsonStringField(payload, "input")) |input_text| {
+                if (stdJsonStringField(payload, "status")) |status_text| {
+                    record.status_text = try allocator.dupe(u8, status_text);
+                }
+                if (stdJsonStringField(payload, "input")) |input_text| {
+                    record.input_text = try allocator.dupe(u8, input_text);
+                    if (std.mem.eql(u8, tool_name, "shell")) {
                         record.command_text = try allocator.dupe(u8, input_text);
                         record.primary_executable = try extractPrimaryExecutable(allocator, input_text);
                     }
@@ -1818,6 +1967,8 @@ fn applyFunctionCallArguments(
     record: *InvocationRecord,
     arguments_text: []const u8,
 ) !void {
+    record.arguments_text = try allocator.dupe(u8, arguments_text);
+
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
@@ -1837,6 +1988,9 @@ fn applyFunctionCallArguments(
     if (stdJsonStringField(obj, "cmd")) |cmd_text| {
         record.command_text = try allocator.dupe(u8, cmd_text);
         record.primary_executable = try extractPrimaryExecutable(allocator, cmd_text);
+    }
+    if (stdJsonStringField(obj, "workdir")) |workdir| {
+        record.workdir = try allocator.dupe(u8, workdir);
     }
     if (stdJsonIntField(obj, "session_id")) |session_id| {
         record.pty_session_id = session_id;
@@ -2085,16 +2239,17 @@ fn mergeMaxCounter(
 
 fn cmdFindSession(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
     const prompt = opts.prompt orelse return error.MissingPromptArg;
-    const where = [_]spec.WhereClause{
-        .{
-            .field = "text",
-            .op = .contains,
-            .value = .{ .scalar = .{ .string = prompt } },
-        },
-    };
+    var where: std.ArrayList(spec.WhereClause) = .empty;
+    defer where.deinit(allocator);
+    try where.append(allocator, .{
+        .field = "text",
+        .op = .contains,
+        .value = .{ .scalar = .{ .string = prompt } },
+    });
+    try appendSessionTimeBounds(allocator, &where, opts);
     const select = [_][]const u8{ "path", "timestamp", "role", "text" };
     const query_spec = spec.QuerySpec{
-        .where = where[0..],
+        .where = where.items,
         .select = select[0..],
         .sort = &.{.{ .field = "timestamp", .descending = true }},
         .limit = opts.limit,
@@ -2113,6 +2268,7 @@ fn resolveSessionPromptInputPaths(
     allocator: std.mem.Allocator,
     sessions_root: []const u8,
     opts: Options,
+    day_filter: ?SessionDayPathFilter,
 ) !std.ArrayList([]u8) {
     const selector_count: usize =
         @intFromBool(opts.path != null) +
@@ -2145,7 +2301,7 @@ fn resolveSessionPromptInputPaths(
         null;
     defer if (wanted_id) |value| allocator.free(value);
 
-    var paths = try collectJsonlPaths(allocator, sessions_root, null);
+    var paths = try collectJsonlPaths(allocator, sessions_root, day_filter);
     errdefer freePathList(allocator, &paths);
 
     if (wanted_id) |wanted| {
@@ -2233,14 +2389,19 @@ fn collectSessionPromptRows(
 
 fn cmdSessionPrompts(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
     const parse_options = try parseSessionPromptMessageOptions(opts);
-    var input_paths = try resolveSessionPromptInputPaths(allocator, sessions_root, opts);
+    const day_filter = deriveSessionDayPathFilterFromOptions(opts);
+    var input_paths = try resolveSessionPromptInputPaths(allocator, sessions_root, opts, day_filter);
     defer freePathList(allocator, &input_paths);
 
     var rows = try collectSessionPromptRows(allocator, input_paths.items, parse_options);
     defer deinitQueryRows(allocator, &rows);
 
     const select = [_][]const u8{ "timestamp", "path", "role", "text" };
+    var where: std.ArrayList(spec.WhereClause) = .empty;
+    defer where.deinit(allocator);
+    try appendSessionTimeBounds(allocator, &where, opts);
     const query_spec = spec.QuerySpec{
+        .where = where.items,
         .select = select[0..],
         .sort = &.{.{ .field = "timestamp", .descending = false }},
         .limit = opts.limit,
@@ -2252,7 +2413,11 @@ fn cmdSessionPrompts(allocator: std.mem.Allocator, sessions_root: []const u8, op
 }
 
 fn cmdReportBundle(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    var where: std.ArrayList(spec.WhereClause) = .empty;
+    defer where.deinit(allocator);
+    try appendSessionTimeBounds(allocator, &where, opts);
     const query_spec = spec.QuerySpec{
+        .where = where.items,
         .group_by = &.{"skill"},
         .metrics = &.{
             .{ .op = .count, .alias = "mentions" },
@@ -2265,11 +2430,14 @@ fn cmdReportBundle(allocator: std.mem.Allocator, sessions_root: []const u8, opts
 }
 
 fn cmdSectionAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
-    var rows = try collectDatasetRows(allocator, "messages", sessions_root, &.{}, &.{});
+    var where: std.ArrayList(spec.WhereClause) = .empty;
+    defer where.deinit(allocator);
+    try appendSessionTimeBounds(allocator, &where, opts);
+    var rows = try collectDatasetRows(allocator, "messages", sessions_root, &.{}, where.items);
     defer deinitQueryRows(allocator, &rows);
 
     const select = [_][]const u8{ "role", "text" };
-    const identity_spec = spec.QuerySpec{ .select = select[0..] };
+    const identity_spec = spec.QuerySpec{ .where = where.items, .select = select[0..] };
     var result = try query.execute(allocator, rows.items, identity_spec);
     defer result.deinit(allocator);
 
@@ -2302,7 +2470,11 @@ fn cmdSectionAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts
 }
 
 fn cmdTokenUsage(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    var where: std.ArrayList(spec.WhereClause) = .empty;
+    defer where.deinit(allocator);
+    try appendSessionTimeBounds(allocator, &where, opts);
     const query_spec = spec.QuerySpec{
+        .where = where.items,
         .group_by = &.{"day"},
         .metrics = &.{
             .{ .op = .sum, .field = "delta_total_tokens", .alias = "total_tokens" },
@@ -2328,7 +2500,11 @@ fn cmdRoutingGap(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
     var discovery_skills = try parseDiscoverySkills(allocator, opts.discovery_skills);
     defer deinitStringSet(allocator, &discovery_skills);
 
-    var skill_rows = try collectDatasetRows(allocator, "skill_mentions", sessions_root, &.{}, &.{});
+    var where: std.ArrayList(spec.WhereClause) = .empty;
+    defer where.deinit(allocator);
+    try appendSessionTimeBounds(allocator, &where, opts);
+
+    var skill_rows = try collectDatasetRows(allocator, "skill_mentions", sessions_root, &.{}, where.items);
     defer deinitQueryRows(allocator, &skill_rows);
 
     var invoked_sessions: std.StringHashMap(void) = .init(allocator);
@@ -2342,7 +2518,7 @@ fn cmdRoutingGap(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
         try addToStringSet(allocator, &invoked_sessions, path.string);
     }
 
-    var message_rows = try collectDatasetRows(allocator, "messages", sessions_root, &.{}, &.{});
+    var message_rows = try collectDatasetRows(allocator, "messages", sessions_root, &.{}, where.items);
     defer deinitQueryRows(allocator, &message_rows);
 
     var out_rows: std.ArrayList(query.Row) = .empty;
@@ -2355,7 +2531,7 @@ fn cmdRoutingGap(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
     var total_cue_messages: i64 = 0;
 
     for (cue_specs) |cue| {
-        const where = [_]spec.WhereClause{
+        const cue_where = [_]spec.WhereClause{
             .{
                 .field = "role",
                 .op = .eq,
@@ -2370,7 +2546,7 @@ fn cmdRoutingGap(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
         };
 
         const query_spec = spec.QuerySpec{
-            .where = where[0..],
+            .where = cue_where[0..],
             .select = &.{"path"},
         };
         var matched = try query.execute(allocator, message_rows.items, query_spec);
@@ -2559,14 +2735,46 @@ fn countIntersectionAndFill(
 }
 
 const SessionDayPathFilter = struct {
-    eq_day: ?[]const u8 = null,
-    min_day: ?[]const u8 = null,
+    eq_buf: [10]u8 = undefined,
+    min_buf: [10]u8 = undefined,
+    max_buf: [10]u8 = undefined,
+    has_eq_day: bool = false,
+    has_min_day: bool = false,
     min_inclusive: bool = true,
-    max_day: ?[]const u8 = null,
+    has_max_day: bool = false,
     max_inclusive: bool = true,
 
     fn hasAny(self: SessionDayPathFilter) bool {
-        return self.eq_day != null or self.min_day != null or self.max_day != null;
+        return self.has_eq_day or self.has_min_day or self.has_max_day;
+    }
+
+    fn eqDay(self: *const SessionDayPathFilter) ?[]const u8 {
+        return if (self.has_eq_day) self.eq_buf[0..] else null;
+    }
+
+    fn minDay(self: *const SessionDayPathFilter) ?[]const u8 {
+        return if (self.has_min_day) self.min_buf[0..] else null;
+    }
+
+    fn maxDay(self: *const SessionDayPathFilter) ?[]const u8 {
+        return if (self.has_max_day) self.max_buf[0..] else null;
+    }
+
+    fn setEqDay(self: *SessionDayPathFilter, day: []const u8) void {
+        std.mem.copyForwards(u8, self.eq_buf[0..], day[0..10]);
+        self.has_eq_day = true;
+    }
+
+    fn setMinDay(self: *SessionDayPathFilter, day: []const u8, inclusive: bool) void {
+        std.mem.copyForwards(u8, self.min_buf[0..], day[0..10]);
+        self.has_min_day = true;
+        self.min_inclusive = inclusive;
+    }
+
+    fn setMaxDay(self: *SessionDayPathFilter, day: []const u8, inclusive: bool) void {
+        std.mem.copyForwards(u8, self.max_buf[0..], day[0..10]);
+        self.has_max_day = true;
+        self.max_inclusive = inclusive;
     }
 };
 
@@ -2576,7 +2784,9 @@ fn isSessionFileDataset(dataset_name: []const u8) bool {
         std.mem.eql(u8, dataset_name, "token_events") or
         std.mem.eql(u8, dataset_name, "token_deltas") or
         std.mem.eql(u8, dataset_name, "token_sessions") or
-        std.mem.eql(u8, dataset_name, "tool_calls");
+        std.mem.eql(u8, dataset_name, "tool_calls") or
+        std.mem.eql(u8, dataset_name, "tool_invocations") or
+        std.mem.eql(u8, dataset_name, "tool_call_args");
 }
 
 fn isValidDayLiteral(text: []const u8) bool {
@@ -2600,31 +2810,70 @@ fn scalarDayLiteral(value: spec.Scalar) ?[]const u8 {
     };
 }
 
+fn scalarTimestampDayLiteral(value: spec.Scalar) ?[]const u8 {
+    return switch (value) {
+        .string => |text| if (text.len >= 10 and isValidDayLiteral(text[0..10])) text[0..10] else null,
+        else => null,
+    };
+}
+
+fn shiftDayLiteral(allocator: std.mem.Allocator, day: []const u8, delta: i32) !?[]u8 {
+    var date = parseTimestampDate(day) orelse return null;
+    var remaining = delta;
+    if (remaining > 0) {
+        while (remaining > 0) : (remaining -= 1) {
+            if (date.day < daysInMonthForCommands(date.year, date.month)) {
+                date.day += 1;
+            } else if (date.month < 12) {
+                date.month += 1;
+                date.day = 1;
+            } else {
+                date.year += 1;
+                date.month = 1;
+                date.day = 1;
+            }
+        }
+    } else if (remaining < 0) {
+        while (remaining < 0) : (remaining += 1) {
+            if (date.day > 1) {
+                date.day -= 1;
+            } else if (date.month > 1) {
+                date.month -= 1;
+                date.day = daysInMonthForCommands(date.year, date.month);
+            } else {
+                date.year -= 1;
+                date.month = 12;
+                date.day = 31;
+            }
+        }
+    }
+
+    const year_u: u32 = @intCast(@max(date.year, 0));
+    const shifted = try std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}", .{ year_u, date.month, date.day });
+    return shifted;
+}
+
 fn updateMinDay(filter: *SessionDayPathFilter, day: []const u8, inclusive: bool) void {
-    const current = filter.min_day orelse {
-        filter.min_day = day;
-        filter.min_inclusive = inclusive;
+    const current = filter.minDay() orelse {
+        filter.setMinDay(day, inclusive);
         return;
     };
     const order = std.mem.order(u8, day, current);
     if (order == .gt) {
-        filter.min_day = day;
-        filter.min_inclusive = inclusive;
+        filter.setMinDay(day, inclusive);
     } else if (order == .eq and !inclusive and filter.min_inclusive) {
         filter.min_inclusive = false;
     }
 }
 
 fn updateMaxDay(filter: *SessionDayPathFilter, day: []const u8, inclusive: bool) void {
-    const current = filter.max_day orelse {
-        filter.max_day = day;
-        filter.max_inclusive = inclusive;
+    const current = filter.maxDay() orelse {
+        filter.setMaxDay(day, inclusive);
         return;
     };
     const order = std.mem.order(u8, day, current);
     if (order == .lt) {
-        filter.max_day = day;
-        filter.max_inclusive = inclusive;
+        filter.setMaxDay(day, inclusive);
     } else if (order == .eq and !inclusive and filter.max_inclusive) {
         filter.max_inclusive = false;
     }
@@ -2635,58 +2884,42 @@ fn deriveSessionDayPathFilter(dataset_name: []const u8, query_where: []const spe
 
     var filter = SessionDayPathFilter{};
     for (query_where) |clause| {
-        if (!std.mem.eql(u8, clause.field, "day")) continue;
+        const where_value = clause.value orelse continue;
+        const scalar = switch (where_value) {
+            .scalar => |value| value,
+            else => continue,
+        };
+
+        if (std.mem.eql(u8, clause.field, "day")) {
+            const day = scalarDayLiteral(scalar) orelse continue;
+            switch (clause.op) {
+                .eq => filter.setEqDay(day),
+                .gte => updateMinDay(&filter, day, true),
+                .gt => updateMinDay(&filter, day, false),
+                .lte => updateMaxDay(&filter, day, true),
+                .lt => updateMaxDay(&filter, day, false),
+                else => {},
+            }
+            continue;
+        }
+
+        if (!std.mem.eql(u8, clause.field, "timestamp")) continue;
+        const day = scalarTimestampDayLiteral(scalar) orelse continue;
+        const coarse_min = shiftDayLiteral(std.heap.page_allocator, day, -1) catch null;
+        const coarse_max = shiftDayLiteral(std.heap.page_allocator, day, 1) catch null;
+        defer if (coarse_min) |value| std.heap.page_allocator.free(value);
+        defer if (coarse_max) |value| std.heap.page_allocator.free(value);
 
         switch (clause.op) {
             .eq => {
-                const where_value = clause.value orelse continue;
-                switch (where_value) {
-                    .scalar => |scalar| {
-                        const day = scalarDayLiteral(scalar) orelse continue;
-                        filter.eq_day = day;
-                    },
-                    else => {},
-                }
+                if (coarse_min) |value| updateMinDay(&filter, value, true);
+                if (coarse_max) |value| updateMaxDay(&filter, value, true);
             },
-            .gte => {
-                const where_value = clause.value orelse continue;
-                switch (where_value) {
-                    .scalar => |scalar| {
-                        const day = scalarDayLiteral(scalar) orelse continue;
-                        updateMinDay(&filter, day, true);
-                    },
-                    else => {},
-                }
+            .gte, .gt => {
+                if (coarse_min) |value| updateMinDay(&filter, value, true);
             },
-            .gt => {
-                const where_value = clause.value orelse continue;
-                switch (where_value) {
-                    .scalar => |scalar| {
-                        const day = scalarDayLiteral(scalar) orelse continue;
-                        updateMinDay(&filter, day, false);
-                    },
-                    else => {},
-                }
-            },
-            .lte => {
-                const where_value = clause.value orelse continue;
-                switch (where_value) {
-                    .scalar => |scalar| {
-                        const day = scalarDayLiteral(scalar) orelse continue;
-                        updateMaxDay(&filter, day, true);
-                    },
-                    else => {},
-                }
-            },
-            .lt => {
-                const where_value = clause.value orelse continue;
-                switch (where_value) {
-                    .scalar => |scalar| {
-                        const day = scalarDayLiteral(scalar) orelse continue;
-                        updateMaxDay(&filter, day, false);
-                    },
-                    else => {},
-                }
+            .lte, .lt => {
+                if (coarse_max) |value| updateMaxDay(&filter, value, true);
             },
             else => {},
         }
@@ -2696,17 +2929,82 @@ fn deriveSessionDayPathFilter(dataset_name: []const u8, query_where: []const spe
     return filter;
 }
 
+fn appendSessionTimeWhere(
+    allocator: std.mem.Allocator,
+    where_out: *std.ArrayList(spec.WhereClause),
+    op: spec.WhereOp,
+    raw_value: []const u8,
+) !void {
+    try where_out.append(allocator, .{
+        .field = "timestamp",
+        .op = op,
+        .value = .{ .scalar = .{ .string = raw_value } },
+    });
+}
+
+fn appendSessionTimeBounds(
+    allocator: std.mem.Allocator,
+    where_out: *std.ArrayList(spec.WhereClause),
+    opts: Options,
+) !void {
+    if (opts.since) |value| try appendSessionTimeWhere(allocator, where_out, .gte, value);
+    if (opts.until) |value| try appendSessionTimeWhere(allocator, where_out, .lte, value);
+}
+
+fn timestampSatisfiesBounds(ts_opt: ?[]const u8, opts: Options) bool {
+    const ts = ts_opt orelse return false;
+    if (opts.since) |raw_since| {
+        if (compareNormalizedTimestamp(ts, raw_since) == .lt) return false;
+    }
+    if (opts.until) |raw_until| {
+        if (compareNormalizedTimestamp(ts, raw_until) == .gt) return false;
+    }
+    return true;
+}
+
+fn compareNormalizedTimestamp(lhs: []const u8, raw_rhs: []const u8) std.math.Order {
+    var buffer: [64]u8 = undefined;
+    const rhs = if (raw_rhs.len > 0 and raw_rhs[raw_rhs.len - 1] == 'Z' and raw_rhs.len + 5 <= buffer.len) blk: {
+        @memcpy(buffer[0 .. raw_rhs.len - 1], raw_rhs[0 .. raw_rhs.len - 1]);
+        @memcpy(buffer[raw_rhs.len - 1 .. raw_rhs.len + 5], "+00:00");
+        break :blk buffer[0 .. raw_rhs.len + 5];
+    } else raw_rhs;
+    return std.mem.order(u8, lhs, rhs);
+}
+
+fn deriveSessionDayPathFilterFromOptions(opts: Options) ?SessionDayPathFilter {
+    var where: [2]spec.WhereClause = undefined;
+    var len: usize = 0;
+    if (opts.since) |value| {
+        where[len] = .{
+            .field = "timestamp",
+            .op = .gte,
+            .value = .{ .scalar = .{ .string = value } },
+        };
+        len += 1;
+    }
+    if (opts.until) |value| {
+        where[len] = .{
+            .field = "timestamp",
+            .op = .lte,
+            .value = .{ .scalar = .{ .string = value } },
+        };
+        len += 1;
+    }
+    return deriveSessionDayPathFilter("messages", where[0..len]);
+}
+
 fn dayMatchesFilter(filter: SessionDayPathFilter, day: []const u8) bool {
     if (!isValidDayLiteral(day)) return true;
-    if (filter.eq_day) |eq_day| {
+    if (filter.eqDay()) |eq_day| {
         if (!std.mem.eql(u8, day, eq_day)) return false;
     }
-    if (filter.min_day) |min_day| {
+    if (filter.minDay()) |min_day| {
         const order = std.mem.order(u8, day, min_day);
         if (order == .lt) return false;
         if (order == .eq and !filter.min_inclusive) return false;
     }
-    if (filter.max_day) |max_day| {
+    if (filter.maxDay()) |max_day| {
         const order = std.mem.order(u8, day, max_day);
         if (order == .gt) return false;
         if (order == .eq and !filter.max_inclusive) return false;
@@ -2814,6 +3112,10 @@ fn collectDatasetRows(
         try collectTokenSessionsRows(allocator, sessions_root, day_filter, &rows);
     } else if (std.mem.eql(u8, dataset_name, "tool_calls")) {
         try collectToolCallsRows(allocator, sessions_root, day_filter, &rows);
+    } else if (std.mem.eql(u8, dataset_name, "tool_invocations")) {
+        try collectToolInvocationRows(allocator, sessions_root, day_filter, &rows);
+    } else if (std.mem.eql(u8, dataset_name, "tool_call_args")) {
+        try collectToolCallArgRows(allocator, sessions_root, day_filter, &rows);
     } else if (std.mem.eql(u8, dataset_name, "memory_files")) {
         try collectMemoryFilesRows(allocator, query_params, &rows);
     } else if (std.mem.eql(u8, dataset_name, "opencode_prompts")) {
@@ -3011,37 +3313,254 @@ fn collectToolCallsRows(
     day_filter: ?SessionDayPathFilter,
     out_rows: *std.ArrayList(query.Row),
 ) !void {
-    var parsed = try datasets.tool_calls.collect(allocator, sessions_root);
-    defer datasets.tool_calls.deinitRows(allocator, &parsed);
+    var records = try collectInvocationRecordsForRoot(allocator, sessions_root, day_filter);
+    defer deinitInvocationRecords(allocator, &records);
 
-    for (parsed.items) |row| {
-        if (day_filter) |filter| {
-            if (row.day) |day| {
-                if (!dayMatchesFilter(filter, day)) continue;
-            }
-        }
+    for (records.items) |record| {
         var qrow = query.Row.init(allocator);
-        try qrow.putOwnedKey("path", .{ .string = row.path });
-        try putOptionalString(&qrow, "timestamp", row.timestamp);
-        try putOptionalString(&qrow, "day", row.day);
-        try putOptionalString(&qrow, "week", row.week);
-        try putOptionalString(&qrow, "month", row.month);
-        try qrow.putOwnedKey("kind", .{ .string = row.kind });
-        try putOptionalString(&qrow, "tool", row.tool);
-        try putOptionalString(&qrow, "call_id", row.call_id);
-        if (row.arguments_len) |v| {
-            try qrow.putOwnedKey("arguments_len", .{ .int = @intCast(v) });
+        const week = try timestampWeekAlloc(allocator, record.start_ts);
+        defer if (week) |value| allocator.free(value);
+        try qrow.putOwnedKey("path", .{ .string = record.path });
+        try putOptionalString(&qrow, "timestamp", record.start_ts);
+        try putOptionalString(&qrow, "day", timestampDaySlice(record.start_ts));
+        try putOptionalString(&qrow, "week", week);
+        try putOptionalString(&qrow, "month", timestampMonthSlice(record.start_ts));
+        try qrow.putOwnedKey("kind", .{ .string = record.invocationKindText() });
+        try putOptionalString(&qrow, "tool", record.tool_name);
+        try putOptionalString(&qrow, "call_id", record.call_id);
+        if (record.arguments_text) |v| {
+            try qrow.putOwnedKey("arguments_len", .{ .int = @intCast(v.len) });
+            try qrow.putOwnedKey("arguments_text", .{ .string = v });
         } else {
             try qrow.putOwnedKey("arguments_len", .null);
+            try qrow.putOwnedKey("arguments_text", .null);
         }
-        if (row.input_len) |v| {
-            try qrow.putOwnedKey("input_len", .{ .int = @intCast(v) });
+        if (record.input_text) |v| {
+            try qrow.putOwnedKey("input_len", .{ .int = @intCast(v.len) });
+            try qrow.putOwnedKey("input_text", .{ .string = v });
         } else {
             try qrow.putOwnedKey("input_len", .null);
+            try qrow.putOwnedKey("input_text", .null);
         }
-        try putOptionalString(&qrow, "status", row.status);
+        try putOptionalString(&qrow, "status", record.status_text);
+        try putOptionalString(&qrow, "command_text", record.command_text);
+        try putOptionalString(&qrow, "primary_executable", record.primary_executable);
+        try putOptionalString(&qrow, "workdir", record.workdir);
+        try qrow.putOwnedKey("parse_error", .{ .bool = record.parse_error });
         try out_rows.append(allocator, qrow);
     }
+}
+
+fn collectToolInvocationRows(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    day_filter: ?SessionDayPathFilter,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    var records = try collectInvocationRecordsForRoot(allocator, sessions_root, day_filter);
+    defer deinitInvocationRecords(allocator, &records);
+
+    for (records.items) |record| {
+        var qrow = query.Row.init(allocator);
+        const week = try timestampWeekAlloc(allocator, record.start_ts);
+        defer if (week) |value| allocator.free(value);
+        try qrow.putOwnedKey("path", .{ .string = record.path });
+        try qrow.putOwnedKey("session_id", .{ .string = record.session_id });
+        try putOptionalString(&qrow, "timestamp", record.start_ts);
+        try putOptionalString(&qrow, "end_timestamp", record.end_ts);
+        try putOptionalString(&qrow, "day", timestampDaySlice(record.start_ts));
+        try putOptionalString(&qrow, "week", week);
+        try putOptionalString(&qrow, "month", timestampMonthSlice(record.start_ts));
+        try putOptionalString(&qrow, "call_id", record.call_id);
+        try putOptionalString(&qrow, "tool_name", record.tool_name);
+        try qrow.putOwnedKey("invocation_kind", .{ .string = record.invocationKindText() });
+        try putOptionalString(&qrow, "arguments_text", record.arguments_text);
+        try putOptionalString(&qrow, "input_text", record.input_text);
+        try putOptionalString(&qrow, "command_text", record.command_text);
+        try putOptionalString(&qrow, "primary_executable", record.primary_executable);
+        try putOptionalString(&qrow, "workdir", record.workdir);
+        try putOptionalInt(&qrow, "pty_session_id", record.pty_session_id);
+        try putOptionalInt(&qrow, "wall_time_ms", record.wall_time_ms);
+        try putOptionalInt(&qrow, "exit_code", record.exit_code);
+        try qrow.putOwnedKey("running_state", .{ .string = record.runningState() });
+        try qrow.putOwnedKey("unresolved", .{ .bool = record.unresolved() });
+        try qrow.putOwnedKey("parse_error", .{ .bool = record.parse_error });
+        try out_rows.append(allocator, qrow);
+    }
+}
+
+fn collectToolCallArgRows(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    day_filter: ?SessionDayPathFilter,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    var records = try collectInvocationRecordsForRoot(allocator, sessions_root, day_filter);
+    defer deinitInvocationRecords(allocator, &records);
+
+    for (records.items) |record| {
+        const payload_text = if (record.arguments_text != null)
+            record.arguments_text.?
+        else if (record.input_text != null)
+            record.input_text.?
+        else
+            continue;
+        const payload_source = if (record.arguments_text != null) "arguments" else "input";
+        try appendFlattenedArgRows(allocator, record, payload_text, payload_source, out_rows);
+    }
+}
+
+fn appendFlattenedArgRows(
+    allocator: std.mem.Allocator,
+    record: InvocationRecord,
+    payload_text: []const u8,
+    payload_source: []const u8,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), payload_text, .{}) catch {
+        try appendParseErrorArgRow(allocator, record, payload_source, out_rows);
+        return;
+    };
+    defer parsed.deinit();
+
+    try appendJsonValueArgRows(allocator, record, payload_source, "", parsed.value, null, out_rows);
+}
+
+fn appendParseErrorArgRow(
+    allocator: std.mem.Allocator,
+    record: InvocationRecord,
+    payload_source: []const u8,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    var qrow = query.Row.init(allocator);
+    const week = try timestampWeekAlloc(allocator, record.start_ts);
+    defer if (week) |value| allocator.free(value);
+    try qrow.putOwnedKey("path", .{ .string = record.path });
+    try qrow.putOwnedKey("session_id", .{ .string = record.session_id });
+    try putOptionalString(&qrow, "timestamp", record.start_ts);
+    try putOptionalString(&qrow, "day", timestampDaySlice(record.start_ts));
+    try putOptionalString(&qrow, "week", week);
+    try putOptionalString(&qrow, "month", timestampMonthSlice(record.start_ts));
+    try putOptionalString(&qrow, "call_id", record.call_id);
+    try putOptionalString(&qrow, "tool_name", record.tool_name);
+    try qrow.putOwnedKey("invocation_kind", .{ .string = record.invocationKindText() });
+    try qrow.putOwnedKey("payload_source", .{ .string = payload_source });
+    try qrow.putOwnedKey("arg_path", .{ .string = "_parse_error" });
+    try qrow.putOwnedKey("value_kind", .{ .string = "parse_error" });
+    try qrow.putOwnedKey("value_text", .null);
+    try qrow.putOwnedKey("value_number", .null);
+    try qrow.putOwnedKey("value_bool", .null);
+    try qrow.putOwnedKey("is_null", .{ .bool = false });
+    try qrow.putOwnedKey("array_index", .null);
+    try qrow.putOwnedKey("parse_error", .{ .bool = true });
+    try out_rows.append(allocator, qrow);
+}
+
+fn appendJsonValueArgRows(
+    allocator: std.mem.Allocator,
+    record: InvocationRecord,
+    payload_source: []const u8,
+    prefix: []const u8,
+    value: std.json.Value,
+    array_index: ?i64,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    switch (value) {
+        .object => |obj| {
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                const next_prefix = if (prefix.len == 0)
+                    entry.key_ptr.*
+                else
+                    try std.fmt.allocPrint(allocator, "{s}.{s}", .{ prefix, entry.key_ptr.* });
+                defer if (prefix.len != 0) allocator.free(next_prefix);
+                try appendJsonValueArgRows(allocator, record, payload_source, next_prefix, entry.value_ptr.*, null, out_rows);
+            }
+        },
+        .array => |arr| {
+            for (arr.items, 0..) |item, idx| {
+                const next_prefix = try std.fmt.allocPrint(allocator, "{s}[{d}]", .{ prefix, idx });
+                defer allocator.free(next_prefix);
+                try appendJsonValueArgRows(allocator, record, payload_source, next_prefix, item, @intCast(idx), out_rows);
+            }
+        },
+        else => try appendScalarArgRow(allocator, record, payload_source, prefix, value, array_index, out_rows),
+    }
+}
+
+fn appendScalarArgRow(
+    allocator: std.mem.Allocator,
+    record: InvocationRecord,
+    payload_source: []const u8,
+    arg_path: []const u8,
+    value: std.json.Value,
+    array_index: ?i64,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    var qrow = query.Row.init(allocator);
+    const week = try timestampWeekAlloc(allocator, record.start_ts);
+    defer if (week) |v| allocator.free(v);
+    try qrow.putOwnedKey("path", .{ .string = record.path });
+    try qrow.putOwnedKey("session_id", .{ .string = record.session_id });
+    try putOptionalString(&qrow, "timestamp", record.start_ts);
+    try putOptionalString(&qrow, "day", timestampDaySlice(record.start_ts));
+    try putOptionalString(&qrow, "week", week);
+    try putOptionalString(&qrow, "month", timestampMonthSlice(record.start_ts));
+    try putOptionalString(&qrow, "call_id", record.call_id);
+    try putOptionalString(&qrow, "tool_name", record.tool_name);
+    try qrow.putOwnedKey("invocation_kind", .{ .string = record.invocationKindText() });
+    try qrow.putOwnedKey("payload_source", .{ .string = payload_source });
+    try qrow.putOwnedKey("arg_path", .{ .string = if (arg_path.len == 0) "_" else arg_path });
+    try putOptionalInt(&qrow, "array_index", array_index);
+    try qrow.putOwnedKey("parse_error", .{ .bool = false });
+
+    switch (value) {
+        .string => |text| {
+            try qrow.putOwnedKey("value_kind", .{ .string = "string" });
+            try qrow.putOwnedKey("value_text", .{ .string = text });
+            try qrow.putOwnedKey("value_number", .null);
+            try qrow.putOwnedKey("value_bool", .null);
+            try qrow.putOwnedKey("is_null", .{ .bool = false });
+        },
+        .integer => |num| {
+            const rendered = try std.fmt.allocPrint(allocator, "{d}", .{num});
+            defer allocator.free(rendered);
+            try qrow.putOwnedKey("value_kind", .{ .string = "integer" });
+            try qrow.putOwnedKey("value_text", .{ .string = rendered });
+            try qrow.putOwnedKey("value_number", .{ .int = num });
+            try qrow.putOwnedKey("value_bool", .null);
+            try qrow.putOwnedKey("is_null", .{ .bool = false });
+        },
+        .float => |num| {
+            const rendered = try std.fmt.allocPrint(allocator, "{d}", .{num});
+            defer allocator.free(rendered);
+            try qrow.putOwnedKey("value_kind", .{ .string = "float" });
+            try qrow.putOwnedKey("value_text", .{ .string = rendered });
+            try qrow.putOwnedKey("value_number", .{ .float = num });
+            try qrow.putOwnedKey("value_bool", .null);
+            try qrow.putOwnedKey("is_null", .{ .bool = false });
+        },
+        .bool => |flag| {
+            try qrow.putOwnedKey("value_kind", .{ .string = "bool" });
+            try qrow.putOwnedKey("value_text", .{ .string = if (flag) "true" else "false" });
+            try qrow.putOwnedKey("value_number", .null);
+            try qrow.putOwnedKey("value_bool", .{ .bool = flag });
+            try qrow.putOwnedKey("is_null", .{ .bool = false });
+        },
+        .null => {
+            try qrow.putOwnedKey("value_kind", .{ .string = "null" });
+            try qrow.putOwnedKey("value_text", .null);
+            try qrow.putOwnedKey("value_number", .null);
+            try qrow.putOwnedKey("value_bool", .null);
+            try qrow.putOwnedKey("is_null", .{ .bool = true });
+        },
+        else => unreachable,
+    }
+
+    try out_rows.append(allocator, qrow);
 }
 
 fn collectMemoryFilesRows(
@@ -4210,6 +4729,100 @@ fn lessThanString(_: void, a: []u8, b: []u8) bool {
     return std.mem.order(u8, a, b) == .lt;
 }
 
+const TimestampDate = struct {
+    year: i32,
+    month: u8,
+    day: u8,
+};
+
+fn timestampDaySlice(ts_opt: ?[]const u8) ?[]const u8 {
+    const ts = ts_opt orelse return null;
+    if (ts.len < 10) return null;
+    return ts[0..10];
+}
+
+fn timestampMonthSlice(ts_opt: ?[]const u8) ?[]const u8 {
+    const ts = ts_opt orelse return null;
+    if (ts.len < 7) return null;
+    return ts[0..7];
+}
+
+fn parseTimestampDate(ts: []const u8) ?TimestampDate {
+    if (ts.len < 10) return null;
+    if (ts[4] != '-' or ts[7] != '-') return null;
+    const year = std.fmt.parseInt(i32, ts[0..4], 10) catch return null;
+    const month = std.fmt.parseInt(u8, ts[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(u8, ts[8..10], 10) catch return null;
+    if (month < 1 or month > 12) return null;
+    if (day < 1 or day > daysInMonthForCommands(year, month)) return null;
+    return .{ .year = year, .month = month, .day = day };
+}
+
+fn isLeapYearForCommands(year: i32) bool {
+    return (@mod(year, 4) == 0 and @mod(year, 100) != 0) or (@mod(year, 400) == 0);
+}
+
+fn daysInMonthForCommands(year: i32, month: u8) u8 {
+    return switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (isLeapYearForCommands(year)) 29 else 28,
+        else => 0,
+    };
+}
+
+fn dayOfYearForCommands(date: TimestampDate) u16 {
+    var total: u16 = 0;
+    var m: u8 = 1;
+    while (m < date.month) : (m += 1) total += daysInMonthForCommands(date.year, m);
+    return total + date.day;
+}
+
+fn weekdayMondayOneForCommands(date: TimestampDate) u8 {
+    var y = date.year;
+    if (date.month < 3) y -= 1;
+    const t = [_]i32{ 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+    const month_idx: usize = @intCast(date.month - 1);
+    const weekday_sun_zero = @mod(y + @divFloor(y, 4) - @divFloor(y, 100) + @divFloor(y, 400) + t[month_idx] + date.day, 7);
+    if (weekday_sun_zero == 0) return 7;
+    return @intCast(weekday_sun_zero);
+}
+
+fn isoWeeksInYearForCommands(year: i32) u8 {
+    const jan1 = TimestampDate{ .year = year, .month = 1, .day = 1 };
+    const jan1_weekday = weekdayMondayOneForCommands(jan1);
+    if (jan1_weekday == 4 or (jan1_weekday == 3 and isLeapYearForCommands(year))) return 53;
+    return 52;
+}
+
+fn isoWeekAndYearForCommands(date: TimestampDate) struct { year: i32, week: u8 } {
+    const doy: i32 = dayOfYearForCommands(date);
+    const dow: i32 = weekdayMondayOneForCommands(date);
+
+    var week = @divFloor(doy - dow + 10, 7);
+    var iso_year = date.year;
+    if (week < 1) {
+        iso_year -= 1;
+        week = isoWeeksInYearForCommands(iso_year);
+    } else {
+        const weeks_in_year = isoWeeksInYearForCommands(iso_year);
+        if (week > weeks_in_year) {
+            iso_year += 1;
+            week = 1;
+        }
+    }
+    return .{ .year = iso_year, .week = @intCast(week) };
+}
+
+fn timestampWeekAlloc(allocator: std.mem.Allocator, ts_opt: ?[]const u8) !?[]u8 {
+    const ts = ts_opt orelse return null;
+    const date = parseTimestampDate(ts) orelse return null;
+    const iso = isoWeekAndYearForCommands(date);
+    const iso_year_u: u32 = @intCast(@max(iso.year, 0));
+    const week = try std.fmt.allocPrint(allocator, "{d:0>4}-W{d:0>2}", .{ iso_year_u, iso.week });
+    return week;
+}
+
 fn deinitQueryRows(allocator: std.mem.Allocator, rows: *std.ArrayList(query.Row)) void {
     for (rows.items) |*row| row.deinit();
     rows.deinit(allocator);
@@ -4252,16 +4865,69 @@ test "collectJsonlPaths applies day filter pushdown on path dates" {
     const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(root_abs);
 
-    const filter = SessionDayPathFilter{
-        .min_day = "2026-02-27",
-        .min_inclusive = true,
-    };
+    var filter = SessionDayPathFilter{};
+    filter.setMinDay("2026-02-27", true);
     var paths = try collectJsonlPaths(std.testing.allocator, root_abs, filter);
     defer freePathList(std.testing.allocator, &paths);
 
     try std.testing.expectEqual(@as(usize, 2), paths.items.len);
     try std.testing.expect(std.mem.containsAtLeast(u8, paths.items[0], 1, "/2026/02/27/") or std.mem.containsAtLeast(u8, paths.items[1], 1, "/2026/02/27/"));
     try std.testing.expect(std.mem.containsAtLeast(u8, paths.items[0], 1, "/2026/03/01/") or std.mem.containsAtLeast(u8, paths.items[1], 1, "/2026/03/01/"));
+}
+
+test "deriveSessionDayPathFilter widens timestamp bounds for safe path pushdown" {
+    const where = [_]spec.WhereClause{
+        .{
+            .field = "timestamp",
+            .op = .gte,
+            .value = .{ .scalar = .{ .string = "2026-03-09T00:00:00Z" } },
+        },
+        .{
+            .field = "timestamp",
+            .op = .lte,
+            .value = .{ .scalar = .{ .string = "2026-03-10T23:59:59Z" } },
+        },
+    };
+
+    const filter = deriveSessionDayPathFilter("messages", where[0..]) orelse return error.TestExpectedEqual;
+    try std.testing.expect(dayMatchesFilter(filter, "2026-03-08"));
+    try std.testing.expect(dayMatchesFilter(filter, "2026-03-09"));
+    try std.testing.expect(dayMatchesFilter(filter, "2026-03-10"));
+    try std.testing.expect(dayMatchesFilter(filter, "2026-03-11"));
+    try std.testing.expect(!dayMatchesFilter(filter, "2026-03-07"));
+    try std.testing.expect(!dayMatchesFilter(filter, "2026-03-12"));
+}
+
+test "tool invocation datasets expose command text and flattened args" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("2026/03/09");
+    try tmp.dir.writeFile(.{
+        .sub_path = "2026/03/09/sample.jsonl",
+        .data =
+        \\{"type":"response_item","timestamp":"2026-03-09T04:01:05Z","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"learnings recall --query \\\"Commit and push the changes for $st\\\" --limit 5 --drop-superseded\",\"workdir\":\"/Users/tk/.dotfiles\",\"yield_time_ms\":1000}"}}
+        \\{"type":"response_item","timestamp":"2026-03-09T04:01:06Z","payload":{"type":"function_call_output","call_id":"call-1","output":"Chunk ID: aa\nWall time: 0.050 seconds\nProcess exited with code 0\nOutput:\n"}}
+        \\
+        ,
+    });
+
+    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_abs);
+
+    var invocation_rows = try collectDatasetRows(std.testing.allocator, "tool_invocations", root_abs, &.{}, &.{});
+    defer deinitQueryRows(std.testing.allocator, &invocation_rows);
+    try std.testing.expectEqual(@as(usize, 1), invocation_rows.items.len);
+    const tool_name = invocation_rows.items[0].valueOrNull("tool_name");
+    try std.testing.expect(tool_name == .string and std.mem.eql(u8, tool_name.string, "exec_command"));
+    const workdir = invocation_rows.items[0].valueOrNull("workdir");
+    try std.testing.expect(workdir == .string and std.mem.eql(u8, workdir.string, "/Users/tk/.dotfiles"));
+    const command_text = invocation_rows.items[0].valueOrNull("command_text");
+    try std.testing.expect(command_text == .string and std.mem.indexOf(u8, command_text.string, "learnings recall") != null);
+
+    var arg_rows = try collectDatasetRows(std.testing.allocator, "tool_call_args", root_abs, &.{}, &.{});
+    defer deinitQueryRows(std.testing.allocator, &arg_rows);
+    try std.testing.expect(arg_rows.items.len >= 2);
 }
 
 test "summarizeSessionConcurrency computes configured and effective maxima" {

@@ -30,9 +30,14 @@ Binary output:
 ./zig-out/bin/seq dataset-schema --dataset opencode_events
 ./zig-out/bin/seq dataset-schema --dataset opencode_tool_calls
 ./zig-out/bin/seq dataset-schema --dataset opencode_sessions
-./zig-out/bin/seq role-breakdown --root ~/.codex/sessions --format table
+./zig-out/bin/seq dataset-schema --dataset tool_invocations
+./zig-out/bin/seq dataset-schema --dataset tool_call_args
+./zig-out/bin/seq role-breakdown --root ~/.codex/sessions --since 2026-03-01T00:00:00Z --format table
 ./zig-out/bin/seq query --spec '{"dataset":"tool_calls","group_by":["tool"],"metrics":[{"op":"count","as":"count"}],"sort":["-count"],"limit":10,"format":"json"}'
-./zig-out/bin/seq session-tooling --path /absolute/path/to/rollout.jsonl --summary --group-by executable --format table
+./zig-out/bin/seq query --root ~/.codex/sessions --spec '{"dataset":"tool_invocations","where":[{"field":"command_text","op":"contains","value":"learnings recall"}],"select":["path","tool_name","command_text","workdir"],"sort":["timestamp"],"limit":5,"format":"table"}'
+./zig-out/bin/seq query --root ~/.codex/sessions --spec '{"dataset":"tool_call_args","where":[{"field":"tool_name","op":"eq","value":"exec_command"},{"field":"arg_path","op":"eq","value":"workdir"}],"select":["path","arg_path","value_text"],"sort":["timestamp"],"limit":5,"format":"table"}'
+./zig-out/bin/seq find-session --root ~/.codex/sessions --prompt "learnings recall" --since 2026-03-08T00:00:00Z --until 2026-03-10T23:59:59Z --limit 5 --format table
+./zig-out/bin/seq session-tooling --root ~/.codex/sessions --since 2026-03-08T00:00:00Z --until 2026-03-10T23:59:59Z --summary --group-by executable --format table
 ./zig-out/bin/seq query-diagnose --path /absolute/path/to/rollout.jsonl --threshold-ms 10000 --next-actions --format json
 ./zig-out/bin/seq opencode-prompts --limit 20 --format jsonl
 ./zig-out/bin/seq opencode-prompts --session ses_abc --since 1772700000000 --latest --format table
@@ -90,15 +95,29 @@ Floor flags:
 - `--fail-on-floor` exits non-zero when any applicable row has `floor_result=fail`.
 - `--fail-on-mesh-truth` exits non-zero when any row has `mesh_truth_verdict=false`.
 
+`tool_invocations` is the queryable cross-session invocation dataset:
+- one row per function/custom tool call with `command_text`, `primary_executable`, `workdir`, lifecycle markers, and runtime markers
+- use it when you need `seq query` to replace raw JSONL mining of `exec_command.cmd`
+
+`tool_call_args` is the flattened argument-leaf dataset:
+- one row per parsed JSON leaf from function-call `arguments` or JSON-shaped custom-tool `input`
+- use it when you need generic argument search without column explosion in `tool_calls`
+
+`tool_calls` remains the compatibility dataset:
+- existing fields stay intact
+- additive fields now include raw argument/input text plus high-value derived fields such as `command_text`, `primary_executable`, and `workdir`
+
 `session-tooling` summarizes shell/tool invocation behavior from rollout JSONL:
-- raw mode (default) emits per-invocation rows with `command_text`, `primary_executable`, call lifecycle, and runtime markers
+- raw mode (default) emits per-invocation rows with `command_text`, `primary_executable`, `workdir`, call lifecycle, and runtime markers
 - `--summary` aggregates by `--group-by executable|command|tool` (default `executable`)
+- session-backed time windows now accept `--since` and `--until`
 
 `query-diagnose` inspects `seq query` lifecycle health inside rollout JSONL:
 - raw mode (default) emits per-query diagnostics (`resolution_state`, `duration_ms`, `hang_flag`)
 - strict hang mode is enabled by default and requires unresolved lifecycle plus threshold breach
 - `--fail-on-hang` exits non-zero when any query row is flagged as hanging
 - `--next-actions` emits deterministic follow-up `seq` command suggestions
+- session-backed time windows now accept `--since` and `--until`
 
 ## Validation
 
