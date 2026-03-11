@@ -1948,10 +1948,6 @@ fn cmdRunDue(allocator: std.mem.Allocator, db_path: []const u8, args: RunDueArgs
         return;
     }
 
-    const codex_exe = try resolveExecutable(allocator, args.codex_bin);
-    defer if (codex_exe) |p| allocator.free(p);
-    if (codex_exe == null) return userErrorFmt("codex executable not found: {s}", .{args.codex_bin});
-
     var db = try Db.open(allocator, db_path);
     defer db.close();
 
@@ -1970,6 +1966,10 @@ fn cmdRunDue(allocator: std.mem.Allocator, db_path: []const u8, args: RunDueArgs
         return;
     }
 
+    const codex_exe = if (args.dry_run) null else try resolveExecutable(allocator, args.codex_bin);
+    defer if (codex_exe) |p| allocator.free(p);
+    if (!args.dry_run and codex_exe == null) return userErrorFmt("codex executable not found: {s}", .{args.codex_bin});
+
     var results = std.ArrayList(RunResult).empty;
     defer {
         for (results.items) |item| {
@@ -1981,7 +1981,7 @@ fn cmdRunDue(allocator: std.mem.Allocator, db_path: []const u8, args: RunDueArgs
     }
 
     for (due.items) |*row| {
-        const result = runDueAutomation(allocator, &db, row, codex_exe.?, args.dry_run) catch |err| {
+        const result = runDueAutomation(allocator, &db, row, codex_exe orelse "", args.dry_run) catch |err| {
             const err_text = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
             const empty_thread = try allocator.dupe(u8, "");
             errdefer allocator.free(empty_thread);
