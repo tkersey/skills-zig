@@ -89,8 +89,6 @@ jobs:
         run: zig build -Doptimize=ReleaseFast
       - name: Test seq
         run: zig build test
-      - name: Parser perf gate
-        run: bash scripts/perf/parser_gate.sh
 
   seq-fuzz-linux:
     needs: changes
@@ -121,8 +119,6 @@ jobs:
         run: zig build build-lift -Doptimize=ReleaseFast
       - name: Test lift
         run: zig build test-lift
-      - name: Lift bench_stats perf gate
-        run: bash apps/lift/scripts/perf/bench_stats_gate.sh
 
   lift-fuzz-linux:
     needs: changes
@@ -150,8 +146,6 @@ jobs:
         run: zig build build-cas -Doptimize=ReleaseFast
       - name: Test CAS budget governor
         run: zig build test-cas
-      - name: CAS budget governor perf gate
-        run: bash apps/cas/scripts/perf/budget_governor_gate.sh
 
   cas-fuzz-linux:
     needs: changes

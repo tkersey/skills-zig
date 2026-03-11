@@ -38,12 +38,27 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const core_perf_contract = b.createModule(.{
+        .root_source_file = b.path("libs/core/src/perf_contract.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const seq_bundle = b.createModule(.{
         .root_source_file = b.path("apps/seq/src/bundle.zig"),
         .target = target,
         .optimize = optimize,
     });
     const seq_meta = addVersionModule(b, @embedFile("apps/seq/VERSION"));
+    const seq_perf_cli = b.createModule(.{
+        .root_source_file = b.path("apps/seq/src/perf_cli.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_path", .module = core_path },
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = seq_meta },
+        },
+    });
     const lift_meta = addVersionModule(b, @embedFile("apps/lift/VERSION"));
     const cas_meta = addVersionModule(b, @embedFile("apps/cas/VERSION"));
     const cron_meta = addVersionModule(b, @embedFile("apps/cron/VERSION"));
@@ -258,6 +273,19 @@ pub fn build(b: *std.Build) void {
             .{ .name = "parse_arch_eval_suite", .module = parse_arch_eval_suite },
         },
     });
+    const perf_hub_root = b.createModule(.{
+        .root_source_file = b.path("tools/perf_hub.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "core_perf", .module = core_perf },
+            .{ .name = "perf_contract", .module = core_perf_contract },
+            .{ .name = "seq_perf_cli", .module = seq_perf_cli },
+            .{ .name = "cron_cli", .module = cron_root },
+            .{ .name = "st_cli", .module = st_root },
+        },
+    });
 
     const seq = addExecutable(b, "seq", seq_root);
     seq.linkLibC();
@@ -279,6 +307,7 @@ pub fn build(b: *std.Build) void {
     const mesh = addExecutable(b, "mesh", mesh_root);
     const st = addExecutable(b, "st", st_root);
     const parse_arch = addExecutable(b, "parse-arch", parse_arch_root);
+    const perf_hub = addExecutable(b, "perf_hub", perf_hub_root);
 
     const seq_install = addInstallStep(b, seq);
     const seq_perf_install = addInstallStep(b, seq_perf);
@@ -296,6 +325,7 @@ pub fn build(b: *std.Build) void {
     const mesh_install = addInstallStep(b, mesh);
     const st_install = addInstallStep(b, st);
     const parse_arch_install = addInstallStep(b, parse_arch);
+    const perf_hub_install = addInstallStep(b, perf_hub);
 
     const install_all = b.getInstallStep();
     install_all.dependOn(&seq_install.step);
@@ -314,6 +344,7 @@ pub fn build(b: *std.Build) void {
     install_all.dependOn(&mesh_install.step);
     install_all.dependOn(&st_install.step);
     install_all.dependOn(&parse_arch_install.step);
+    install_all.dependOn(&perf_hub_install.step);
 
     const run_seq_tests = addTestStepWithOptions(
         b,
@@ -435,6 +466,12 @@ pub fn build(b: *std.Build) void {
         "test-parse-arch",
         "Run parse-arch tests",
     );
+    const run_perf_hub_tests = addTestStep(
+        b,
+        perf_hub_root,
+        "test-perf-hub",
+        "Run perf_hub tests",
+    );
 
     const app_surfaces = [_]AppSurface{
         .{
@@ -442,28 +479,28 @@ pub fn build(b: *std.Build) void {
             .build_step_name = "build-seq",
             .build_description = "Build seq binaries",
             .build_deps = &.{ &seq_install.step, &seq_perf_install.step },
-            .test_deps = &.{ &run_seq_tests.step },
+            .test_deps = &.{&run_seq_tests.step},
         },
         .{
             .path = b.path("apps/lift"),
             .build_step_name = "build-lift",
             .build_description = "Build lift binaries",
             .build_deps = &.{ &bench_stats_install.step, &perf_report_install.step, &lift_bench_perf_install.step },
-            .test_deps = &.{ test_lift },
+            .test_deps = &.{test_lift},
         },
         .{
             .path = b.path("apps/cas"),
             .build_step_name = "build-cas",
             .build_description = "Build cas binaries",
             .build_deps = &.{ &cas_smoke_check_install.step, &cas_instance_runner_install.step, &cas_install.step },
-            .test_deps = &.{ test_cas },
+            .test_deps = &.{test_cas},
         },
         .{
             .path = b.path("apps/cron"),
             .build_step_name = "build-cron",
             .build_description = "Build cron binaries",
             .build_deps = &.{&cron_install.step},
-            .test_deps = &.{ &run_cron_tests.step },
+            .test_deps = &.{&run_cron_tests.step},
         },
         .{
             .path = b.path("apps/puff"),
@@ -510,6 +547,7 @@ pub fn build(b: *std.Build) void {
     for (app_surfaces) |surface| {
         for (surface.test_deps) |dep| test_all.dependOn(dep);
     }
+    test_all.dependOn(&run_perf_hub_tests.step);
 
     const enable_zlinter = b.option(
         bool,
@@ -534,6 +572,14 @@ pub fn build(b: *std.Build) void {
     addRunStep(b, parse_arch, "run-parse-arch", "Run parse-arch", &.{"--help"});
     addRunStep(b, bench_stats, "run-bench-stats", "Run bench_stats", &.{"--help"});
     addRunStep(b, cas_smoke_check, "run-cas-smoke-check", "Run cas_smoke_check", &.{"--help"});
+    addRunStepPrefixed(b, perf_hub, "perf-list-local", "List local perf cases", &.{"list"});
+    addRunStepPrefixed(b, perf_hub, "perf-manifest-local", "Emit native perf manifest", &.{"manifest"});
+    addRunStepPrefixed(b, perf_hub, "perf-audit-local", "Audit native perf coverage", &.{"audit"});
+    addRunStepPrefixed(b, perf_hub, "perf-doctor-local", "Validate local perf coverage and setup", &.{"doctor"});
+    addRunStepPrefixed(b, perf_hub, "perf-capture-local", "Capture local perf baselines", &.{"capture"});
+    addRunStepPrefixed(b, perf_hub, "perf-compare-local", "Compare against local perf baselines", &.{"compare"});
+    addRunStepPrefixed(b, perf_hub, "perf-report-local", "Summarize latest compare artifacts", &.{"report"});
+    addRunStepPrefixed(b, perf_hub, "perf-accept-local", "Accept current baselines into the local ledger", &.{"accept"});
 }
 
 fn addExecutable(
@@ -570,6 +616,20 @@ fn addRunStep(
         run_cmd.addArgs(default_args);
     }
 
+    const run_step = b.step(step_name, description);
+    run_step.dependOn(&run_cmd.step);
+}
+
+fn addRunStepPrefixed(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    step_name: []const u8,
+    description: []const u8,
+    fixed_args: []const []const u8,
+) void {
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.addArgs(fixed_args);
+    if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step(step_name, description);
     run_step.dependOn(&run_cmd.step);
 }
@@ -665,6 +725,7 @@ fn buildLintStep(
         .include = &.{
             b.path("libs/core"),
             b.path("build.zig"),
+            b.path("tools"),
         },
     });
     lint_builder.addRule(.{ .builtin = .no_unused }, .{});

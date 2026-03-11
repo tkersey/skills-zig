@@ -1,0 +1,4 @@
+p50=1.245ms p95=3.120ms p99=4.980ms
+throughput=12450.5 req/s
+latency_us=992.4 retries=1
+alloc_bytes=4096 peak=8192

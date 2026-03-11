@@ -10,35 +10,137 @@ const DefaultCodexBin = "codex";
 const DefaultLaunchdLabel = "com.openai.codex.automation-runner";
 const DefaultIntervalSeconds: i64 = 60;
 const MaxCommandOutputBytes = 10 * 1024 * 1024;
+var perf_automation_root_override: ?[]const u8 = null;
 
-const UsageText =
-    \\cron.zig
-    \\
-    \\Marker: cron.zig
-    \\Manage Codex automations with native Zig runtime (no Python/shell delegation).
-    \\
-    \\Usage:
-    \\  cron [--db <path>] <command> [options]
-    \\
-    \\Commands:
-    \\  list                 List automations
-    \\  show                 Show one automation
-    \\  create               Create automation
-    \\  update               Update automation
-    \\  enable               Set status ACTIVE
-    \\  disable              Set status PAUSED
-    \\  run-now              Set next_run_at to now
-    \\  delete               Delete automation and synced files
-    \\  run-due              Run due automations once (headless)
-    \\  scheduler install    Install/start launchd scheduler (macOS)
-    \\  scheduler uninstall  Stop/remove launchd scheduler (macOS)
-    \\  scheduler status     Show launchd scheduler status (macOS)
-    \\
-    \\Global options:
-    \\  --db <path>          Path to codex-dev.db
-    \\  -h, --help           Show help
-    \\  -V, --version        Show version
-;
+pub const Command = enum {
+    list,
+    show,
+    create,
+    update,
+    enable,
+    disable,
+    run_now,
+    delete,
+    run_due,
+    scheduler,
+    unknown,
+};
+
+pub const SchedulerCommand = enum {
+    install,
+    uninstall,
+    status,
+    unknown,
+};
+
+pub const CommandDef = struct {
+    name: []const u8,
+    command: Command,
+    summary: []const u8,
+};
+
+pub const SchedulerCommandDef = struct {
+    name: []const u8,
+    command: SchedulerCommand,
+    summary: []const u8,
+};
+
+const command_defs = [_]CommandDef{
+    .{ .name = "list", .command = .list, .summary = "List automations" },
+    .{ .name = "show", .command = .show, .summary = "Show one automation" },
+    .{ .name = "create", .command = .create, .summary = "Create automation" },
+    .{ .name = "update", .command = .update, .summary = "Update automation" },
+    .{ .name = "enable", .command = .enable, .summary = "Set status ACTIVE" },
+    .{ .name = "disable", .command = .disable, .summary = "Set status PAUSED" },
+    .{ .name = "run-now", .command = .run_now, .summary = "Set next_run_at to now" },
+    .{ .name = "delete", .command = .delete, .summary = "Delete automation and synced files" },
+    .{ .name = "run-due", .command = .run_due, .summary = "Run due automations once (headless)" },
+    .{ .name = "scheduler", .command = .scheduler, .summary = "Manage launchd scheduler (macOS)" },
+};
+
+const scheduler_command_defs = [_]SchedulerCommandDef{
+    .{ .name = "install", .command = .install, .summary = "Install/start launchd scheduler (macOS)" },
+    .{ .name = "uninstall", .command = .uninstall, .summary = "Stop/remove launchd scheduler (macOS)" },
+    .{ .name = "status", .command = .status, .summary = "Show launchd scheduler status (macOS)" },
+};
+
+pub fn commandDefinitions() []const CommandDef {
+    return command_defs[0..];
+}
+
+pub fn schedulerCommandDefinitions() []const SchedulerCommandDef {
+    return scheduler_command_defs[0..];
+}
+
+pub fn parseCommand(raw: []const u8) Command {
+    for (command_defs) |def| {
+        if (std.mem.eql(u8, raw, def.name)) return def.command;
+    }
+    return .unknown;
+}
+
+pub fn parseSchedulerCommand(raw: []const u8) SchedulerCommand {
+    for (scheduler_command_defs) |def| {
+        if (std.mem.eql(u8, raw, def.name)) return def.command;
+    }
+    return .unknown;
+}
+
+pub const PerfCase = enum {
+    show,
+    create,
+    update,
+    enable,
+    disable,
+    run_now,
+    delete,
+    run_due,
+};
+
+pub fn runPerfCase(allocator: std.mem.Allocator, case: PerfCase, temp_root: []const u8) !void {
+    const db_path = try std.fs.path.join(allocator, &.{ temp_root, "codex-dev.db" });
+    defer allocator.free(db_path);
+    const automation_root = try std.fs.path.join(allocator, &.{ temp_root, ".codex", "automations" });
+    defer allocator.free(automation_root);
+    try std.fs.cwd().makePath(automation_root);
+
+    perf_automation_root_override = automation_root;
+    defer perf_automation_root_override = null;
+
+    try seedPerfDb(allocator, db_path);
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+
+    switch (case) {
+        .show => try run(allocator, &.{ "--db", db_path, "show", "--id", "cron-001" }),
+        .create => try run(allocator, &.{ "--db", db_path, "create", "--name", "Created Perf", "--prompt", "noop prompt", "--rrule", "RRULE:FREQ=DAILY;BYHOUR=9;BYMINUTE=15" }),
+        .update => try run(allocator, &.{ "--db", db_path, "update", "--id", "cron-001", "--new-name", "Updated Perf" }),
+        .enable => try run(allocator, &.{ "--db", db_path, "enable", "--id", "cron-001" }),
+        .disable => try run(allocator, &.{ "--db", db_path, "disable", "--id", "cron-001" }),
+        .run_now => try run(allocator, &.{ "--db", db_path, "run-now", "--id", "cron-001" }),
+        .delete => try run(allocator, &.{ "--db", db_path, "delete", "--id", "cron-001" }),
+        .run_due => try run(allocator, &.{ "--db", db_path, "run-due", "--id", "cron-001", "--dry-run" }),
+    }
+}
+
+const StdoutGuard = struct {
+    saved_fd: std.posix.fd_t,
+    devnull: std.fs.File,
+};
+
+fn silenceStdout() !StdoutGuard {
+    const saved_fd = try std.posix.dup(std.posix.STDOUT_FILENO);
+    const devnull = try std.fs.openFileAbsolute("/dev/null", .{ .mode = .write_only });
+    try std.posix.dup2(devnull.handle, std.posix.STDOUT_FILENO);
+    return .{ .saved_fd = saved_fd, .devnull = devnull };
+}
+
+fn restoreStdout(guard: StdoutGuard) void {
+    std.posix.dup2(guard.saved_fd, std.posix.STDOUT_FILENO) catch {};
+    std.posix.close(guard.saved_fd);
+    guard.devnull.close();
+}
 
 const c = struct {
     pub const sqlite3 = opaque {};
@@ -186,7 +288,7 @@ const Stmt = struct {
 
 const StepResult = enum { done, row };
 
-const AutomationStatus = enum {
+pub const AutomationStatus = enum {
     ACTIVE,
     PAUSED,
 
@@ -296,28 +398,28 @@ const AutomationRow = struct {
     }
 };
 
-const ResolveArgs = struct {
+pub const ResolveArgs = struct {
     automation_id: ?[]const u8 = null,
     name: ?[]const u8 = null,
 };
 
-const CwdsMode = enum { clear, inherit_default, json, list, unchanged };
+pub const CwdsMode = enum { clear, inherit_default, json, list, unchanged };
 
-const CwdsInput = struct {
+pub const CwdsInput = struct {
     mode: CwdsMode,
     list: std.ArrayList([]const u8),
     json_text: ?[]const u8 = null,
 
-    fn init(_: std.mem.Allocator, mode: CwdsMode) CwdsInput {
+    pub fn init(_: std.mem.Allocator, mode: CwdsMode) CwdsInput {
         return .{ .mode = mode, .list = std.ArrayList([]const u8).empty, .json_text = null };
     }
 
-    fn deinit(self: *CwdsInput, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *CwdsInput, allocator: std.mem.Allocator) void {
         self.list.deinit(allocator);
     }
 };
 
-const CreateArgs = struct {
+pub const CreateArgs = struct {
     name: []const u8,
     prompt: []const u8,
     prompt_file: ?[]const u8,
@@ -327,7 +429,7 @@ const CreateArgs = struct {
     next_run_at: ?[]const u8,
 };
 
-const UpdateArgs = struct {
+pub const UpdateArgs = struct {
     resolve: ResolveArgs,
     new_name: ?[]const u8,
     prompt: ?[]const u8,
@@ -339,17 +441,17 @@ const UpdateArgs = struct {
     clear_next_run_at: bool,
 };
 
-const ListArgs = struct {
+pub const ListArgs = struct {
     status: ?[]const u8,
     json: bool,
 };
 
-const ShowArgs = struct {
+pub const ShowArgs = struct {
     resolve: ResolveArgs,
     json: bool,
 };
 
-const RunDueArgs = struct {
+pub const RunDueArgs = struct {
     automation_id: ?[]const u8,
     limit: usize,
     dry_run: bool,
@@ -386,7 +488,21 @@ pub fn main() !void {
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
 
-    if (try core_cli.handleDefaultHelpAndVersion(argv, UsageText, Version)) return;
+    if (argv.len <= 1) {
+        try printUsage();
+        return;
+    }
+    if (isHelpArg(argv[1])) {
+        try printUsage();
+        return;
+    }
+    if (core_cli.isVersionArg(argv[1]) or core_cli.isVersionSubcommand(argv[1])) {
+        var stdout_file = std.fs.File.stdout();
+        var stdout_writer = stdout_file.writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try core_cli.printVersion(stdout, Version);
+        return;
+    }
 
     run(allocator, argv[1..]) catch |err| {
         if (err == error.UserInput) std.process.exit(1);
@@ -409,73 +525,105 @@ fn run(allocator: std.mem.Allocator, raw_args: []const []const u8) !void {
         return;
     }
 
-    const command = global.args[0];
+    const command = parseCommand(global.args[0]);
 
     if (global.args.len >= 2 and isHelpArg(global.args[1])) {
         try printUsage();
         return;
     }
 
-    if (std.mem.eql(u8, command, "list")) {
-        const args = try parseListArgs(global.args[1..]);
-        try cmdList(allocator, global.db_path, args);
-        return;
-    }
-    if (std.mem.eql(u8, command, "show")) {
-        const args = try parseShowArgs(global.args[1..]);
-        try cmdShow(allocator, global.db_path, args);
-        return;
-    }
-    if (std.mem.eql(u8, command, "create")) {
-        var args = try parseCreateArgs(allocator, global.args[1..]);
-        defer args.cwds.deinit(allocator);
-        try cmdCreate(allocator, global.db_path, args);
-        return;
-    }
-    if (std.mem.eql(u8, command, "update")) {
-        var args = try parseUpdateArgs(allocator, global.args[1..]);
-        defer args.cwds.deinit(allocator);
-        try cmdUpdate(allocator, global.db_path, args);
-        return;
-    }
-    if (std.mem.eql(u8, command, "enable")) {
-        const resolve = try parseResolveOnly(global.args[1..]);
-        try cmdEnableDisable(allocator, global.db_path, resolve, .ACTIVE);
-        return;
-    }
-    if (std.mem.eql(u8, command, "disable")) {
-        const resolve = try parseResolveOnly(global.args[1..]);
-        try cmdEnableDisable(allocator, global.db_path, resolve, .PAUSED);
-        return;
-    }
-    if (std.mem.eql(u8, command, "run-now")) {
-        const resolve = try parseResolveOnly(global.args[1..]);
-        try cmdRunNow(allocator, global.db_path, resolve);
-        return;
-    }
-    if (std.mem.eql(u8, command, "delete")) {
-        const resolve = try parseResolveOnly(global.args[1..]);
-        try cmdDelete(allocator, global.db_path, resolve);
-        return;
-    }
-    if (std.mem.eql(u8, command, "run-due")) {
-        const args = try parseRunDueArgs(global.args[1..]);
-        try cmdRunDue(allocator, global.db_path, args);
-        return;
-    }
-    if (std.mem.eql(u8, command, "scheduler")) {
-        try cmdScheduler(allocator, global.args[1..]);
-        return;
+    switch (command) {
+        .list => {
+            const args = try parseListArgs(global.args[1..]);
+            try cmdList(allocator, global.db_path, args);
+            return;
+        },
+        .show => {
+            const args = try parseShowArgs(global.args[1..]);
+            try cmdShow(allocator, global.db_path, args);
+            return;
+        },
+        .create => {
+            var args = try parseCreateArgs(allocator, global.args[1..]);
+            defer args.cwds.deinit(allocator);
+            try cmdCreate(allocator, global.db_path, args);
+            return;
+        },
+        .update => {
+            var args = try parseUpdateArgs(allocator, global.args[1..]);
+            defer args.cwds.deinit(allocator);
+            try cmdUpdate(allocator, global.db_path, args);
+            return;
+        },
+        .enable => {
+            const resolve = try parseResolveOnly(global.args[1..]);
+            try cmdEnableDisable(allocator, global.db_path, resolve, .ACTIVE);
+            return;
+        },
+        .disable => {
+            const resolve = try parseResolveOnly(global.args[1..]);
+            try cmdEnableDisable(allocator, global.db_path, resolve, .PAUSED);
+            return;
+        },
+        .run_now => {
+            const resolve = try parseResolveOnly(global.args[1..]);
+            try cmdRunNow(allocator, global.db_path, resolve);
+            return;
+        },
+        .delete => {
+            const resolve = try parseResolveOnly(global.args[1..]);
+            try cmdDelete(allocator, global.db_path, resolve);
+            return;
+        },
+        .run_due => {
+            const args = try parseRunDueArgs(global.args[1..]);
+            try cmdRunDue(allocator, global.db_path, args);
+            return;
+        },
+        .scheduler => {
+            try cmdScheduler(allocator, global.args[1..]);
+            return;
+        },
+        .unknown => {},
     }
 
-    return userErrorFmt("unknown command: {s}", .{command});
+    return userErrorFmt("unknown command: {s}", .{global.args[0]});
 }
 
 fn printUsage() !void {
     var stdout_file = std.fs.File.stdout();
     var stdout_writer = stdout_file.writer(&.{});
     const stdout = &stdout_writer.interface;
-    try core_cli.printHelpWithVersion(stdout, UsageText, Version);
+    try stdout.writeAll(
+        \\cron.zig
+        \\
+        \\Marker: cron.zig
+        \\Manage Codex automations with native Zig runtime (no Python/shell delegation).
+        \\
+        \\Usage:
+        \\  cron [--db <path>] <command> [options]
+        \\
+        \\Commands:
+        \\
+    );
+    for (command_defs) |def| {
+        if (def.command == .scheduler) {
+            for (scheduler_command_defs) |subdef| {
+                try stdout.print("  scheduler {s:<9} {s}\n", .{ subdef.name, subdef.summary });
+            }
+            continue;
+        }
+        try stdout.print("  {s:<20} {s}\n", .{ def.name, def.summary });
+    }
+    try stdout.writeAll(
+        \\
+        \\Global options:
+        \\  --db <path>          Path to codex-dev.db
+        \\  -h, --help           Show help
+        \\  -V, --version        Show version
+        \\
+    );
+    try stdout.print("Version: {s}\n", .{Version});
 }
 
 fn isHelpArg(arg: []const u8) bool {
@@ -849,24 +997,26 @@ fn cmdScheduler(allocator: std.mem.Allocator, args: []const []const u8) !void {
         return;
     }
 
-    const action = args[0];
-    if (std.mem.eql(u8, action, "install")) {
-        const parsed = try parseSchedulerInstallArgs(args[1..]);
-        try cmdSchedulerInstall(allocator, parsed);
-        return;
-    }
-    if (std.mem.eql(u8, action, "uninstall")) {
-        const parsed = try parseSchedulerLabelArgs(args[1..]);
-        try cmdSchedulerUninstall(allocator, parsed);
-        return;
-    }
-    if (std.mem.eql(u8, action, "status")) {
-        const parsed = try parseSchedulerLabelArgs(args[1..]);
-        try cmdSchedulerStatus(allocator, parsed);
-        return;
+    switch (parseSchedulerCommand(args[0])) {
+        .install => {
+            const parsed = try parseSchedulerInstallArgs(args[1..]);
+            try cmdSchedulerInstall(allocator, parsed);
+            return;
+        },
+        .uninstall => {
+            const parsed = try parseSchedulerLabelArgs(args[1..]);
+            try cmdSchedulerUninstall(allocator, parsed);
+            return;
+        },
+        .status => {
+            const parsed = try parseSchedulerLabelArgs(args[1..]);
+            try cmdSchedulerStatus(allocator, parsed);
+            return;
+        },
+        .unknown => {},
     }
 
-    return userErrorFmt("unknown scheduler action: {s}", .{action});
+    return userErrorFmt("unknown scheduler action: {s}", .{args[0]});
 }
 
 fn parseSchedulerInstallArgs(args: []const []const u8) !SchedulerInstallArgs {
@@ -1012,7 +1162,6 @@ fn civilFromDays(days_since_unix_epoch: i64) CivilDate {
         .day = @intCast(d),
     };
 }
-
 
 fn weekdayMon(days_since_unix_epoch: i64) u8 {
     const idx = @mod(days_since_unix_epoch + 3, 7);
@@ -1195,11 +1344,73 @@ fn defaultDbPath(allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn defaultAutomationsDir(allocator: std.mem.Allocator) ![]u8 {
+    if (perf_automation_root_override) |override| {
+        return allocator.dupe(u8, override);
+    }
     const home = std.posix.getenv("HOME") orelse {
         _ = userErrorFmt("HOME is not set", .{}) catch {};
         return error.UserInput;
     };
     return std.fmt.allocPrint(allocator, "{s}/.codex/automations", .{home});
+}
+
+fn seedPerfDb(allocator: std.mem.Allocator, db_path: []const u8) !void {
+    std.fs.cwd().deleteFile(db_path) catch {};
+    {
+        var file = try std.fs.cwd().createFile(db_path, .{});
+        file.close();
+    }
+
+    var db = try Db.open(allocator, db_path);
+    defer db.close();
+
+    try db.exec(allocator,
+        \\create table automations (
+        \\  id text primary key,
+        \\  name text not null,
+        \\  prompt text not null,
+        \\  status text not null,
+        \\  next_run_at integer,
+        \\  last_run_at integer,
+        \\  cwds text not null,
+        \\  rrule text not null,
+        \\  created_at integer not null,
+        \\  updated_at integer not null
+        \\)
+    , &.{});
+    try db.exec(allocator,
+        \\create table automation_runs (
+        \\  thread_id text primary key,
+        \\  automation_id text not null,
+        \\  status text not null,
+        \\  read_at integer,
+        \\  thread_title text,
+        \\  source_cwd text,
+        \\  inbox_title text,
+        \\  inbox_summary text,
+        \\  created_at integer not null,
+        \\  updated_at integer not null,
+        \\  archived_user_message text,
+        \\  archived_assistant_message text,
+        \\  archived_reason text
+        \\)
+    , &.{});
+    try db.exec(
+        allocator,
+        "insert into automations (id, name, prompt, status, next_run_at, last_run_at, cwds, rrule, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &.{
+            .{ .text = "cron-001" },
+            .{ .text = "Daily Summary" },
+            .{ .text = "noop prompt" },
+            .{ .text = "ACTIVE" },
+            .null,
+            .null,
+            .{ .text = "[]" },
+            .{ .text = "RRULE:FREQ=DAILY;BYHOUR=9;BYMINUTE=15" },
+            .{ .int = 1_772_469_600_000 },
+            .{ .int = 1_772_469_600_000 },
+        },
+    );
 }
 
 fn automationDirPath(allocator: std.mem.Allocator, automation_id: []const u8) ![]u8 {
@@ -2958,6 +3169,31 @@ test "runDueAutomation dry-run is read-only" {
     try std.testing.expectEqual(before_next, after.next_run_at);
 }
 
+test "runPerfCase covers residual cron command families" {
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_abs = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root_abs);
+    try runPerfCase(alloc, .show, root_abs);
+    try runPerfCase(alloc, .create, root_abs);
+    try runPerfCase(alloc, .update, root_abs);
+    try runPerfCase(alloc, .enable, root_abs);
+    try runPerfCase(alloc, .disable, root_abs);
+    try runPerfCase(alloc, .run_now, root_abs);
+    try runPerfCase(alloc, .run_due, root_abs);
+    try runPerfCase(alloc, .delete, root_abs);
+
+    const db_path = try std.fs.path.join(alloc, &.{ root_abs, "codex-dev.db" });
+    defer alloc.free(db_path);
+    var db = try Db.open(alloc, db_path);
+    defer db.close();
+    try std.testing.expectError(error.UserInput, getAutomationById(alloc, &db, "cron-001"));
+}
+
 test "lock acquisition is fail-closed while lock exists" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2983,4 +3219,18 @@ test "lock acquisition is fail-closed while lock exists" {
     const third = try acquireExclusiveLockWithStaleRetry(alloc, lock_path);
     try std.testing.expect(third != null);
     releaseRunLock(alloc, third);
+}
+
+test "parseCommand recognizes the exported command surface" {
+    for (command_defs) |def| {
+        try std.testing.expectEqual(def.command, parseCommand(def.name));
+    }
+    try std.testing.expectEqual(Command.unknown, parseCommand("nope"));
+}
+
+test "parseSchedulerCommand recognizes exported scheduler actions" {
+    for (scheduler_command_defs) |def| {
+        try std.testing.expectEqual(def.command, parseSchedulerCommand(def.name));
+    }
+    try std.testing.expectEqual(SchedulerCommand.unknown, parseSchedulerCommand("bogus"));
 }

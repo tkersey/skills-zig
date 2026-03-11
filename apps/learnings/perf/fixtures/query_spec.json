@@ -1,0 +1,10 @@
+{
+  "dataset": "learnings",
+  "where": [
+    { "field": "tags_text", "op": "contains", "value": "perf" }
+  ],
+  "select": ["id", "status", "learning"],
+  "sort": ["captured_at"],
+  "limit": 3,
+  "format": "json"
+}

@@ -20,6 +20,7 @@ comptime {
     _ = @import("datasets/opencode_prompts.zig");
     _ = @import("datasets/opencode_events.zig");
     _ = @import("datasets/opencode_sqlite.zig");
+    _ = @import("perf_cli.zig");
     _ = @import("perf_parser.zig");
     _ = @import("main.zig");
 }

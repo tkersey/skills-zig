@@ -1,0 +1,7 @@
+{
+  "steps": [
+    { "step": "Prepare local perf workflow", "status": "pending" },
+    { "step": "Capture baseline", "status": "in_progress" },
+    { "step": "Document compare loop", "status": "completed" }
+  ]
+}

@@ -9,7 +9,7 @@ Monorepo for Zig CLIs with shared internal libraries and independent release str
 - `cas` (`cas_smoke_check`, `cas_instance_runner`)
 - `cron` (`cron`)
 - `puff` (`puff`)
-- `learnings` (`learnings`, `append_learning`)
+- `learnings` (`learnings append` primary, `append_learning` compatibility)
 - `mesh` (`mesh`)
 - `st` (`st`)
 - `parse-arch` (`parse-arch`)
@@ -58,6 +58,30 @@ zig build run-seq -- --help
 zig build run-bench-stats
 zig build run-cas-smoke-check
 ```
+
+## Local Perf
+
+Local performance regression tracking is machine-local, intentionally not part of CI, and now fronts through the native Zig `perf_hub` control plane.
+
+```bash
+zig build perf-list-local
+zig build perf-manifest-local
+zig build perf-audit-local
+zig build perf-doctor-local
+zig build perf-capture-local
+zig build perf-compare-local
+zig build perf-report-local
+zig build perf-accept-local
+
+# Optional filter by binary or case id substring.
+zig build perf-capture-local -- --target seq
+zig build perf-compare-local -- --target parse-arch
+```
+
+Authoritative baselines live under `.perf-local/<machine-id>/baselines/` and are ignored by git.
+Accepted baseline snapshots and compare summaries are stored under the same machine-local root.
+`perf-report-local` also writes `latest-report.json` and `cutover-status.json` under the machine-local reports directory.
+Checked-in fixtures remain under app-local `perf/` directories.
 
 ## Release Model
 

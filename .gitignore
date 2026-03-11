@@ -1,5 +1,6 @@
 
 .step/st-plan.jsonl.lock
+.perf-local/
 .zig-cache/
 zig-out/
 dist/

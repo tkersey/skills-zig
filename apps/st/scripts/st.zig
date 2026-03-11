@@ -187,7 +187,7 @@ const ItemState = struct {
     }
 };
 
-const Command = enum {
+pub const Command = enum {
     @"export",
     add,
     add_comment,
@@ -206,13 +206,80 @@ const Command = enum {
     show,
 };
 
+pub const CommandDef = struct {
+    name: []const u8,
+    command: Command,
+};
+
+const command_defs = [_]CommandDef{
+    .{ .name = "init", .command = .init },
+    .{ .name = "add", .command = .add },
+    .{ .name = "set-status", .command = .set_status },
+    .{ .name = "set-priority", .command = .set_priority },
+    .{ .name = "set-deps", .command = .set_deps },
+    .{ .name = "set-notes", .command = .set_notes },
+    .{ .name = "add-comment", .command = .add_comment },
+    .{ .name = "remove", .command = .remove },
+    .{ .name = "show", .command = .show },
+    .{ .name = "ready", .command = .ready },
+    .{ .name = "blocked", .command = .blocked },
+    .{ .name = "doctor", .command = .doctor },
+    .{ .name = "emit-plan-sync", .command = .emit_plan_sync },
+    .{ .name = "emit-update-plan", .command = .emit_update_plan },
+    .{ .name = "export", .command = .@"export" },
+    .{ .name = "import-plan", .command = .import_plan },
+};
+
+pub fn commandDefs() []const CommandDef {
+    return command_defs[0..];
+}
+
+pub const PerfCase = enum {
+    init,
+    set_status,
+    set_priority,
+    set_deps,
+    set_notes,
+    add_comment,
+    remove,
+    ready,
+    blocked,
+    doctor,
+    emit_update_plan,
+    import_plan,
+};
+
+pub const PerfCaseDef = struct {
+    name: []const u8,
+    case: PerfCase,
+};
+
+const perf_case_defs = [_]PerfCaseDef{
+    .{ .name = "init", .case = .init },
+    .{ .name = "set-status", .case = .set_status },
+    .{ .name = "set-priority", .case = .set_priority },
+    .{ .name = "set-deps", .case = .set_deps },
+    .{ .name = "set-notes", .case = .set_notes },
+    .{ .name = "add-comment", .case = .add_comment },
+    .{ .name = "remove", .case = .remove },
+    .{ .name = "ready", .case = .ready },
+    .{ .name = "blocked", .case = .blocked },
+    .{ .name = "doctor", .case = .doctor },
+    .{ .name = "emit-update-plan", .case = .emit_update_plan },
+    .{ .name = "import-plan", .case = .import_plan },
+};
+
+pub fn perfCaseDefs() []const PerfCaseDef {
+    return perf_case_defs[0..];
+}
+
 const OutputFormat = enum {
     json,
     markdown,
     table,
 };
 
-const Args = struct {
+pub const Args = struct {
     command: Command,
     file: []const u8 = ".step/st-plan.jsonl",
     allow_multiple_in_progress: bool = false,
@@ -232,6 +299,130 @@ const Args = struct {
     output: ?[]const u8 = null,
     input: ?[]const u8 = null,
 };
+
+pub fn runPerfCase(allocator: std.mem.Allocator, perf_case: PerfCase, base_dir: []const u8) !u8 {
+    const plan_path = try std.fs.path.join(allocator, &.{ base_dir, "st-perf-plan.jsonl" });
+    defer allocator.free(plan_path);
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+
+    switch (perf_case) {
+        .init => return cmdInit(allocator, .{ .command = .init, .file = plan_path }),
+        .set_status => {
+            try seedBasicPlan(allocator, plan_path);
+            return cmdSetStatus(allocator, .{
+                .command = .set_status,
+                .file = plan_path,
+                .id = "st-001",
+                .status = "completed",
+            });
+        },
+        .set_priority => {
+            try seedBasicPlan(allocator, plan_path);
+            return cmdSetPriority(allocator, .{
+                .command = .set_priority,
+                .file = plan_path,
+                .id = "st-001",
+                .priority = "high",
+            });
+        },
+        .set_deps => {
+            try seedDependentPlan(allocator, plan_path);
+            return cmdSetDeps(allocator, .{
+                .command = .set_deps,
+                .file = plan_path,
+                .id = "st-002",
+                .deps = "st-001",
+            });
+        },
+        .set_notes => {
+            try seedBasicPlan(allocator, plan_path);
+            return cmdSetNotes(allocator, .{
+                .command = .set_notes,
+                .file = plan_path,
+                .id = "st-001",
+                .notes = "perf note",
+            });
+        },
+        .add_comment => {
+            try seedBasicPlan(allocator, plan_path);
+            return cmdAddComment(allocator, .{
+                .command = .add_comment,
+                .file = plan_path,
+                .id = "st-001",
+                .text = "perf comment",
+                .author = "perf",
+            });
+        },
+        .remove => {
+            try seedBasicPlan(allocator, plan_path);
+            return cmdRemove(allocator, .{
+                .command = .remove,
+                .file = plan_path,
+                .id = "st-001",
+            });
+        },
+        .ready => {
+            try seedBasicPlan(allocator, plan_path);
+            return cmdReady(allocator, .{
+                .command = .ready,
+                .file = plan_path,
+                .format = .json,
+            });
+        },
+        .blocked => {
+            try seedBlockedPlan(allocator, plan_path);
+            return cmdBlocked(allocator, .{
+                .command = .blocked,
+                .file = plan_path,
+                .format = .json,
+            });
+        },
+        .doctor => {
+            try seedBasicPlan(allocator, plan_path);
+            return cmdDoctor(allocator, .{
+                .command = .doctor,
+                .file = plan_path,
+            });
+        },
+        .emit_update_plan => {
+            try seedBasicPlan(allocator, plan_path);
+            return cmdEmitUpdatePlan(allocator, .{
+                .command = .emit_update_plan,
+                .file = plan_path,
+            });
+        },
+        .import_plan => {
+            try seedImportPlan(allocator, base_dir, plan_path);
+            const input_path = try std.fs.path.join(allocator, &.{ base_dir, "import.json" });
+            defer allocator.free(input_path);
+            return cmdImportPlan(allocator, .{
+                .command = .import_plan,
+                .file = plan_path,
+                .input = input_path,
+                .replace = true,
+            });
+        },
+    }
+}
+
+const StdoutGuard = struct {
+    saved_fd: std.posix.fd_t,
+    devnull: std.fs.File,
+};
+
+fn silenceStdout() !StdoutGuard {
+    const saved_fd = try std.posix.dup(std.posix.STDOUT_FILENO);
+    const devnull = try std.fs.openFileAbsolute("/dev/null", .{ .mode = .write_only });
+    try std.posix.dup2(devnull.handle, std.posix.STDOUT_FILENO);
+    return .{ .saved_fd = saved_fd, .devnull = devnull };
+}
+
+fn restoreStdout(guard: StdoutGuard) void {
+    std.posix.dup2(guard.saved_fd, std.posix.STDOUT_FILENO) catch {};
+    std.posix.close(guard.saved_fd);
+    guard.devnull.close();
+}
 
 const ParsedRecords = struct {
     records: []std.json.Value,
@@ -524,22 +715,9 @@ fn parseArgs(argv: []const []const u8) !Args {
 }
 
 fn parseCommand(raw: []const u8) ?Command {
-    if (std.mem.eql(u8, raw, "init")) return .init;
-    if (std.mem.eql(u8, raw, "add")) return .add;
-    if (std.mem.eql(u8, raw, "set-status")) return .set_status;
-    if (std.mem.eql(u8, raw, "set-priority")) return .set_priority;
-    if (std.mem.eql(u8, raw, "set-deps")) return .set_deps;
-    if (std.mem.eql(u8, raw, "set-notes")) return .set_notes;
-    if (std.mem.eql(u8, raw, "add-comment")) return .add_comment;
-    if (std.mem.eql(u8, raw, "remove")) return .remove;
-    if (std.mem.eql(u8, raw, "show")) return .show;
-    if (std.mem.eql(u8, raw, "ready")) return .ready;
-    if (std.mem.eql(u8, raw, "blocked")) return .blocked;
-    if (std.mem.eql(u8, raw, "doctor")) return .doctor;
-    if (std.mem.eql(u8, raw, "emit-plan-sync")) return .emit_plan_sync;
-    if (std.mem.eql(u8, raw, "emit-update-plan")) return .emit_update_plan;
-    if (std.mem.eql(u8, raw, "export")) return .@"export";
-    if (std.mem.eql(u8, raw, "import-plan")) return .import_plan;
+    for (command_defs) |def| {
+        if (std.mem.eql(u8, raw, def.name)) return def.command;
+    }
     return null;
 }
 
@@ -555,6 +733,58 @@ fn isMutatingCommand(command: Command) bool {
         .init, .add, .set_status, .set_priority, .set_deps, .set_notes, .add_comment, .remove, .import_plan => true,
         else => false,
     };
+}
+
+fn seedBasicPlan(allocator: std.mem.Allocator, plan_path: []const u8) !void {
+    _ = try cmdInit(allocator, .{ .command = .init, .file = plan_path, .replace = true });
+    _ = try cmdAdd(allocator, .{
+        .command = .add,
+        .file = plan_path,
+        .id = "st-001",
+        .step = "Seed item",
+        .priority = "medium",
+    });
+}
+
+fn seedDependentPlan(allocator: std.mem.Allocator, plan_path: []const u8) !void {
+    _ = try cmdInit(allocator, .{ .command = .init, .file = plan_path, .replace = true });
+    _ = try cmdAdd(allocator, .{
+        .command = .add,
+        .file = plan_path,
+        .id = "st-001",
+        .step = "Parent",
+        .priority = "medium",
+        .status = "pending",
+    });
+    _ = try cmdAdd(allocator, .{
+        .command = .add,
+        .file = plan_path,
+        .id = "st-002",
+        .step = "Child",
+        .priority = "medium",
+    });
+}
+
+fn seedBlockedPlan(allocator: std.mem.Allocator, plan_path: []const u8) !void {
+    try seedDependentPlan(allocator, plan_path);
+    _ = try cmdSetDeps(allocator, .{
+        .command = .set_deps,
+        .file = plan_path,
+        .id = "st-002",
+        .deps = "st-001",
+    });
+}
+
+fn seedImportPlan(allocator: std.mem.Allocator, base_dir: []const u8, plan_path: []const u8) !void {
+    const export_path = try std.fs.path.join(allocator, &.{ base_dir, "import.json" });
+    defer allocator.free(export_path);
+    try seedBasicPlan(allocator, plan_path);
+    _ = try cmdExport(allocator, .{
+        .command = .@"export",
+        .file = plan_path,
+        .output = export_path,
+    });
+    _ = try cmdInit(allocator, .{ .command = .init, .file = plan_path, .replace = true });
 }
 
 fn runCommand(allocator: std.mem.Allocator, args: Args) !u8 {
@@ -576,6 +806,10 @@ fn runCommand(allocator: std.mem.Allocator, args: Args) !u8 {
         .@"export" => try cmdExport(allocator, args),
         .import_plan => try cmdImportPlan(allocator, args),
     };
+}
+
+pub fn runPerfArgs(allocator: std.mem.Allocator, args: Args) !u8 {
+    return runCommand(allocator, args);
 }
 
 fn cmdInit(allocator: std.mem.Allocator, args: Args) !u8 {
@@ -2543,6 +2777,30 @@ test "emitUpdatePlan preserves legacy payload shape" {
         "{\"plan\":[{\"step\":\"High priority step\",\"status\":\"in_progress\"}]}\n",
         actual,
     );
+}
+
+test "runPerfCase covers representative Wave B seams" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+
+    const cases = [_]PerfCase{
+        .init,
+        .set_status,
+        .set_deps,
+        .emit_update_plan,
+        .import_plan,
+    };
+
+    for (cases) |perf_case| {
+        const exit_code = try runPerfCase(alloc, perf_case, root);
+        try std.testing.expectEqual(@as(u8, 0), exit_code);
+    }
 }
 
 test "collectSeqContractIssues detects non-monotonic trailing seq" {
