@@ -347,6 +347,11 @@ pub fn main() !void {
         printParseError(err, argv);
     };
 
+    if ((parsed.command orelse unreachable) == .append) {
+        try cmdAppend(allocator, argv, parsed);
+        return;
+    }
+
     const cwd = try std.process.getCwdAlloc(allocator);
     defer allocator.free(cwd);
     const repo_root = try discoverRepoRootAlloc(allocator, cwd);
@@ -355,7 +360,7 @@ pub fn main() !void {
     defer allocator.free(jsonl_path);
 
     switch (parsed.command orelse unreachable) {
-        .append => try cmdAppend(allocator, argv, parsed),
+        .append => unreachable,
         .datasets => try cmdDatasets(allocator),
         .dataset_schema => try cmdDatasetSchema(allocator, parsed.dataset.?),
         .query => try cmdQuery(allocator, repo_root, jsonl_path, parsed.spec.?),
