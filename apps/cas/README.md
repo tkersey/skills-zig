@@ -1,16 +1,20 @@
 # cas-zig-cli
 
-Zig CLI utilities for Codex app-server validation and request fanout.
+Zig CLI utilities for Codex app-server validation, request fanout, and swarm conformance checks.
 
 ## Files
 
+- `scripts/cas.zig`
 - `scripts/budget_governor.zig`
+- `scripts/cas_conformance_suite.zig`
 - `scripts/cas_smoke_check.zig`
 - `scripts/cas_instance_runner.zig`
 - `scripts/cas_proxy_client.zig`
 
 ## Behavior
 
+- `cas` dispatches `conformance`, `smoke_check`, and `instance_runner`.
+- `cas_conformance_suite` verifies claim-safe wave handling, stale-claim reclaim, mesh result accountability, and bounded overload retry behavior.
 - `cas_smoke_check` verifies the native v2 handshake plus `experimentalFeature/list`, `thread/start`, `thread/resume`, `turn/start`, `turn/interrupt`, and `turn/steer`.
 - `cas_instance_runner` executes one app-server method per isolated instance and now supports native responses for:
   - `item/commandExecution/requestApproval`
@@ -24,6 +28,12 @@ Zig CLI utilities for Codex app-server validation and request fanout.
 ## API Examples
 
 ```bash
+# Run the dispatcher help surface.
+cas --help
+
+# Run one conformance scenario with JSON output.
+cas conformance --cwd /path/to/workspace --scenario mesh_row_accountability --json
+
 # Filter thread/list by title substring.
 cas instance_runner \
   --cwd /path/to/workspace \
@@ -54,6 +64,7 @@ cas instance_runner \
 ```bash
 zig build test-cas
 zig build build-cas -Doptimize=ReleaseFast
+zig build run-cas-conformance-suite
 bash apps/cas/scripts/perf/budget_governor_gate.sh
 
 # Linux-only bounded fuzz smoke (matches CI behavior).

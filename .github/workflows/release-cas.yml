@@ -45,6 +45,7 @@ jobs:
           cp zig-out/bin/cas dist/cas/cas
           cp zig-out/bin/cas_smoke_check dist/cas/cas-smoke-check
           cp zig-out/bin/cas_instance_runner dist/cas/cas-instance-runner
+          cp zig-out/bin/cas_conformance_suite dist/cas/cas-conformance-suite
           tar -czf "${TAR_NAME}" -C dist/cas .
       - name: Upload cas workflow artifact
         uses: actions/upload-artifact@v4
