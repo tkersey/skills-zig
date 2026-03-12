@@ -14,11 +14,13 @@ const UsageText =
     \\
     \\Manage dependency-aware JSONL v3 plan state.
     \\
-    \\usage: st {init,add,set-status,set-priority,set-deps,set-notes,add-comment,remove,show,ready,blocked,doctor,emit-plan-sync,emit-update-plan,export,import-plan} [options]
+    \\usage: st {init,add,select,deselect,set-status,set-priority,set-deps,set-notes,add-comment,remove,show,ready,blocked,doctor,emit-plan-sync,emit-update-plan,export,import-plan} [options]
     \\
     \\commands:
     \\  init              Initialize plan storage
     \\  add               Add or upsert a plan item
+    \\  select            Add tasks into the mirrored plan projection
+    \\  deselect          Remove tasks from the mirrored plan projection
     \\  set-status        Set item status
     \\  set-priority      Set item priority
     \\  set-deps          Set item dependencies
@@ -38,6 +40,7 @@ const UsageText =
     \\  --file PATH                     Path to plan JSONL file (default: .step/st-plan.jsonl)
     \\  --allow-multiple-in-progress    Allow multiple in_progress items
     \\  --format markdown|table|json    Output format for list/read commands
+    \\  --surface plan|all|backlog      Surface for show/ready/blocked (default: plan)
     \\  --priority high|medium|low      Priority for add/set-priority (add default: medium)
     \\  -h, --help                      Show help
     \\  -V, --version | version         Show version
@@ -93,6 +96,20 @@ const DepState = enum {
     }
 };
 
+const Surface = enum {
+    all,
+    backlog,
+    plan,
+
+    fn asString(self: Surface) []const u8 {
+        return switch (self) {
+            .plan => "plan",
+            .all => "all",
+            .backlog => "backlog",
+        };
+    }
+};
+
 const Dep = struct {
     id: []const u8,
     type: []const u8,
@@ -109,6 +126,7 @@ const Item = struct {
     step: []const u8,
     status: Status,
     priority: Priority,
+    in_plan: bool,
     deps: []Dep,
     notes: []const u8,
     comments: []const Comment,
@@ -192,6 +210,7 @@ pub const Command = enum {
     add,
     add_comment,
     blocked,
+    deselect,
     doctor,
     emit_plan_sync,
     emit_update_plan,
@@ -199,6 +218,7 @@ pub const Command = enum {
     init,
     ready,
     remove,
+    select,
     set_deps,
     set_notes,
     set_priority,
@@ -214,6 +234,8 @@ pub const CommandDef = struct {
 const command_defs = [_]CommandDef{
     .{ .name = "init", .command = .init },
     .{ .name = "add", .command = .add },
+    .{ .name = "select", .command = .select },
+    .{ .name = "deselect", .command = .deselect },
     .{ .name = "set-status", .command = .set_status },
     .{ .name = "set-priority", .command = .set_priority },
     .{ .name = "set-deps", .command = .set_deps },
@@ -284,8 +306,10 @@ pub const Args = struct {
     file: []const u8 = ".step/st-plan.jsonl",
     allow_multiple_in_progress: bool = false,
     format: OutputFormat = .markdown,
+    surface: Surface = .plan,
 
     id: ?[]const u8 = null,
+    ids: []const u8 = "",
     step: ?[]const u8 = null,
     status: []const u8 = "pending",
     priority: ?[]const u8 = null,
@@ -293,11 +317,14 @@ pub const Args = struct {
     notes: ?[]const u8 = null,
     text: ?[]const u8 = null,
     author: ?[]const u8 = null,
+    selection_status: ?[]const u8 = null,
+    selection_priority: ?[]const u8 = null,
 
     replace: bool = false,
     repair_seq: bool = false,
     output: ?[]const u8 = null,
     input: ?[]const u8 = null,
+    backlog_only: bool = false,
 };
 
 pub fn runPerfCase(allocator: std.mem.Allocator, perf_case: PerfCase, base_dir: []const u8) !u8 {
@@ -516,6 +543,12 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.format = parseOutputFormat(argv[i]) orelse return error.InvalidFormat;
             continue;
         }
+        if (std.mem.eql(u8, token, "--surface")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingSurfaceValue;
+            args.surface = parseSurface(argv[i]) orelse return error.InvalidSurface;
+            continue;
+        }
 
         switch (args.command) {
             .init => {
@@ -556,7 +589,32 @@ fn parseArgs(argv: []const []const u8) !Args {
                     args.priority = argv[i];
                     continue;
                 }
+                if (std.mem.eql(u8, token, "--backlog-only")) {
+                    args.backlog_only = true;
+                    continue;
+                }
                 return error.InvalidAddArg;
+            },
+            .select, .deselect => {
+                if (std.mem.eql(u8, token, "--ids")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingIdsValue;
+                    args.ids = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--status")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingStatusValue;
+                    args.selection_status = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--priority")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingPriorityValue;
+                    args.selection_priority = argv[i];
+                    continue;
+                }
+                return if (args.command == .select) error.InvalidSelectArg else error.InvalidDeselectArg;
             },
             .set_status => {
                 if (std.mem.eql(u8, token, "--id")) {
@@ -681,6 +739,10 @@ fn parseArgs(argv: []const []const u8) !Args {
                     args.replace = true;
                     continue;
                 }
+                if (std.mem.eql(u8, token, "--backlog-only")) {
+                    args.backlog_only = true;
+                    continue;
+                }
                 return error.InvalidImportArg;
             },
         }
@@ -688,6 +750,11 @@ fn parseArgs(argv: []const []const u8) !Args {
 
     switch (args.command) {
         .add => if (args.step == null) return error.MissingStepValue,
+        .select, .deselect => {
+            if (std.mem.trim(u8, args.ids, " \t\r\n").len == 0 and args.selection_status == null and args.selection_priority == null) {
+                return error.MissingSelectionCriteria;
+            }
+        },
         .set_status => {
             if (args.id == null) return error.MissingIdValue;
         },
@@ -728,9 +795,16 @@ fn parseOutputFormat(raw: []const u8) ?OutputFormat {
     return null;
 }
 
+fn parseSurface(raw: []const u8) ?Surface {
+    if (std.mem.eql(u8, raw, "plan")) return .plan;
+    if (std.mem.eql(u8, raw, "all")) return .all;
+    if (std.mem.eql(u8, raw, "backlog")) return .backlog;
+    return null;
+}
+
 fn isMutatingCommand(command: Command) bool {
     return switch (command) {
-        .init, .add, .set_status, .set_priority, .set_deps, .set_notes, .add_comment, .remove, .import_plan => true,
+        .init, .add, .select, .deselect, .set_status, .set_priority, .set_deps, .set_notes, .add_comment, .remove, .import_plan => true,
         else => false,
     };
 }
@@ -787,10 +861,118 @@ fn seedImportPlan(allocator: std.mem.Allocator, base_dir: []const u8, plan_path:
     _ = try cmdInit(allocator, .{ .command = .init, .file = plan_path, .replace = true });
 }
 
+const SelectionMode = enum {
+    select,
+    deselect,
+};
+
+fn collectSelectionTargetIds(
+    allocator: std.mem.Allocator,
+    state: *ItemState,
+    args: Args,
+) ![][]const u8 {
+    var selected = std.ArrayList([]const u8).empty;
+    var seen = std.StringHashMap(void).init(allocator);
+
+    const explicit_ids = try parseCliIds(allocator, args.ids);
+    for (explicit_ids) |item_id| {
+        const item = state.getConst(item_id) orelse return error.UnknownItemId;
+        if (seen.get(item.id) == null) {
+            try seen.put(item.id, {});
+            try selected.append(allocator, item.id);
+        }
+    }
+
+    const status_filter = if (args.selection_status) |raw| try normalizeStatus(raw) else null;
+    const priority_filter = if (args.selection_priority) |raw| try normalizePriority(raw) else null;
+
+    if (status_filter != null or priority_filter != null) {
+        for (state.items.items) |item| {
+            if (status_filter) |filter_status| {
+                if (item.status != filter_status) continue;
+            }
+            if (priority_filter) |filter_priority| {
+                if (item.priority != filter_priority) continue;
+            }
+            if (seen.get(item.id) == null) {
+                try seen.put(item.id, {});
+                try selected.append(allocator, item.id);
+            }
+        }
+    }
+
+    if (selected.items.len == 0) return error.NoMatchingSelectionTargets;
+    return selected.toOwnedSlice(allocator);
+}
+
+fn parseCliIds(allocator: std.mem.Allocator, raw: []const u8) ![][]const u8 {
+    const text = std.mem.trim(u8, raw, " \t\r\n");
+    if (text.len == 0) return &.{};
+
+    var out = std.ArrayList([]const u8).empty;
+    var seen = std.StringHashMap(void).init(allocator);
+    var it = std.mem.splitScalar(u8, text, ',');
+    while (it.next()) |token_raw| {
+        const item_id = try requireNonEmptyString(allocator, token_raw, "selection id");
+        if (seen.get(item_id) != null) continue;
+        try seen.put(item_id, {});
+        try out.append(allocator, item_id);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn applySelectionChange(
+    allocator: std.mem.Allocator,
+    state: *ItemState,
+    target_ids: [][]const u8,
+    mode: SelectionMode,
+) !void {
+    switch (mode) {
+        .select => {
+            var to_select = std.StringHashMap(void).init(allocator);
+            for (target_ids) |item_id| {
+                try collectSelectionClosure(allocator, state, item_id, &to_select);
+            }
+            var it = to_select.iterator();
+            while (it.next()) |entry| {
+                state.get(entry.key_ptr.*).?.in_plan = true;
+            }
+        },
+        .deselect => {
+            for (target_ids) |item_id| {
+                const item = state.get(item_id) orelse return error.UnknownItemId;
+                if (item.status == .in_progress) return error.CannotDeselectInProgress;
+                item.in_plan = false;
+            }
+        },
+    }
+}
+
+fn collectSelectionClosure(
+    allocator: std.mem.Allocator,
+    state: *ItemState,
+    item_id: []const u8,
+    selected: *std.StringHashMap(void),
+) !void {
+    if (selected.get(item_id) != null) return;
+    const item = state.get(item_id) orelse return error.UnknownItemId;
+    if (isTerminalStatus(item.status)) return error.TerminalTaskCannotBeSelected;
+
+    try selected.put(item.id, {});
+    for (item.deps) |dep| {
+        const dep_item = state.get(dep.id) orelse return error.UnknownDependency;
+        if (dep_item.status == .completed) continue;
+        if (isTerminalStatus(dep_item.status)) return error.TerminalDependencyCannotBeSelected;
+        try collectSelectionClosure(allocator, state, dep.id, selected);
+    }
+}
+
 fn runCommand(allocator: std.mem.Allocator, args: Args) !u8 {
     return switch (args.command) {
         .init => try cmdInit(allocator, args),
         .add => try cmdAdd(allocator, args),
+        .select => try cmdSelect(allocator, args),
+        .deselect => try cmdDeselect(allocator, args),
         .set_status => try cmdSetStatus(allocator, args),
         .set_priority => try cmdSetPriority(allocator, args),
         .set_deps => try cmdSetDeps(allocator, args),
@@ -863,12 +1045,15 @@ fn cmdAdd(allocator: std.mem.Allocator, args: Args) !u8 {
         .step = step,
         .status = status,
         .priority = priority,
+        .in_plan = !args.backlog_only,
         .deps = deps,
         .notes = "",
         .comments = &.{},
     };
 
-    try state.upsert(item);
+    var normalized_item = item;
+    normalizeItemPlanMembership(&normalized_item);
+    try state.upsert(normalized_item);
     try validateState(&state, args.allow_multiple_in_progress);
 
     const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
@@ -882,6 +1067,46 @@ fn cmdAdd(allocator: std.mem.Allocator, args: Args) !u8 {
     return 0;
 }
 
+fn cmdSelect(allocator: std.mem.Allocator, args: Args) !u8 {
+    const loaded = try loadValidatedState(allocator, args.file, args.allow_multiple_in_progress);
+    var state = loaded.state;
+    defer state.deinit();
+
+    const target_ids = try collectSelectionTargetIds(allocator, &state, args);
+    try applySelectionChange(allocator, &state, target_ids, .select);
+    try validateState(&state, args.allow_multiple_in_progress);
+
+    const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
+    const ts = try nowUtcAlloc(allocator);
+    try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, ts, meta, null);
+
+    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.print("selected {d} item(s)\n", .{target_ids.len});
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
+    return 0;
+}
+
+fn cmdDeselect(allocator: std.mem.Allocator, args: Args) !u8 {
+    const loaded = try loadValidatedState(allocator, args.file, args.allow_multiple_in_progress);
+    var state = loaded.state;
+    defer state.deinit();
+
+    const target_ids = try collectSelectionTargetIds(allocator, &state, args);
+    try applySelectionChange(allocator, &state, target_ids, .deselect);
+    try validateState(&state, args.allow_multiple_in_progress);
+
+    const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
+    const ts = try nowUtcAlloc(allocator);
+    try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, ts, meta, null);
+
+    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.print("deselected {d} item(s)\n", .{target_ids.len});
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
+    return 0;
+}
+
 fn cmdSetStatus(allocator: std.mem.Allocator, args: Args) !u8 {
     const loaded = try loadValidatedState(allocator, args.file, args.allow_multiple_in_progress);
     var state = loaded.state;
@@ -891,6 +1116,7 @@ fn cmdSetStatus(allocator: std.mem.Allocator, args: Args) !u8 {
     const status = try normalizeStatus(args.status);
     const item = state.get(item_id) orelse return error.UnknownItemId;
     item.status = status;
+    normalizeItemPlanMembership(item);
 
     try validateState(&state, args.allow_multiple_in_progress);
 
@@ -1045,7 +1271,7 @@ fn cmdShow(allocator: std.mem.Allocator, args: Args) !u8 {
 
     var stdout_writer = std.fs.File.stdout().writer(&.{});
     const stdout = &stdout_writer.interface;
-    try renderShow(allocator, stdout, &state, args.format);
+    try renderShow(allocator, stdout, &state, args.format, args.surface);
     return 0;
 }
 
@@ -1061,10 +1287,11 @@ fn cmdReady(allocator: std.mem.Allocator, args: Args) !u8 {
             try rows.append(allocator, row);
         }
     }
+    const filtered_rows = try filterRowsBySurface(allocator, rows.items, args.surface);
 
     var stdout_writer = std.fs.File.stdout().writer(&.{});
     const stdout = &stdout_writer.interface;
-    try renderItemRows(allocator, stdout, rows.items, args.format);
+    try renderItemRows(allocator, stdout, filtered_rows, args.format);
     return 0;
 }
 
@@ -1080,10 +1307,11 @@ fn cmdBlocked(allocator: std.mem.Allocator, args: Args) !u8 {
             try rows.append(allocator, row);
         }
     }
+    const filtered_rows = try filterRowsBySurface(allocator, rows.items, args.surface);
 
     var stdout_writer = std.fs.File.stdout().writer(&.{});
     const stdout = &stdout_writer.interface;
-    try renderItemRows(allocator, stdout, rows.items, args.format);
+    try renderItemRows(allocator, stdout, filtered_rows, args.format);
     return 0;
 }
 
@@ -1140,6 +1368,12 @@ fn cmdImportPlan(allocator: std.mem.Allocator, args: Args) !u8 {
     const input_bytes = try readFileAlloc(allocator, input_path, 32 * 1024 * 1024);
     const parsed_snapshot = try std.json.parseFromSlice(std.json.Value, allocator, input_bytes, .{});
     const imported_items = try parseSnapshotItems(allocator, parsed_snapshot.value);
+    if (args.backlog_only) {
+        for (imported_items) |*item| {
+            item.in_plan = false;
+            normalizeItemPlanMembership(item);
+        }
+    }
 
     const loaded = try loadValidatedState(allocator, args.file, args.allow_multiple_in_progress);
     var state = loaded.state;
@@ -1302,6 +1536,7 @@ fn materializeStateFromRecords(allocator: std.mem.Allocator, records: []const st
         try applyEventOp(allocator, &state, record, source_index);
     }
 
+    normalizeStatePlanMembership(&state);
     try state.rebuildIndex();
     return state;
 }
@@ -1340,7 +1575,9 @@ fn applyEventOp(allocator: std.mem.Allocator, state: *ItemState, record: std.jso
     if (std.mem.eql(u8, op, "set_status")) {
         const status_raw = stringField(record, "status") orelse return error.MissingStatusValue;
         const status = try normalizeStatus(status_raw);
-        state.get(item_id).?.status = status;
+        const item = state.get(item_id).?;
+        item.status = status;
+        normalizeItemPlanMembership(item);
         return;
     }
 
@@ -1516,6 +1753,8 @@ fn writeItemObject(writer: anytype, item: Item) !void {
     try std.json.Stringify.value(item.status.asString(), .{}, writer);
     try writer.writeAll(",\"priority\":");
     try std.json.Stringify.value(item.priority.asString(), .{}, writer);
+    try writer.writeAll(",\"in_plan\":");
+    try writer.writeAll(if (item.in_plan) "true" else "false");
     try writer.writeAll(",\"deps\":");
     try writeDepsArray(writer, item.deps);
     try writer.writeAll(",\"notes\":");
@@ -1559,16 +1798,21 @@ fn writeSnapshotJson(writer: anytype, state: *const ItemState) !void {
     try writer.writeByte('}');
 }
 
-fn renderShow(allocator: std.mem.Allocator, writer: anytype, state: *const ItemState, format: OutputFormat) !void {
+fn renderShow(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    state: *const ItemState,
+    format: OutputFormat,
+    surface: Surface,
+) !void {
+    const enriched = try enrichItems(allocator, state);
+    const filtered = try filterRowsBySurface(allocator, enriched, surface);
+
     switch (format) {
-        .markdown => try renderShowMarkdown(allocator, writer, state),
-        .table => {
-            const enriched = try enrichItems(allocator, state);
-            try renderTable(writer, enriched);
-        },
+        .markdown => try renderShowMarkdown(allocator, writer, filtered, surface),
+        .table => try renderTable(writer, filtered),
         .json => {
-            const enriched = try enrichItems(allocator, state);
-            try writeEnrichedItemsJson(writer, enriched);
+            try writeEnrichedItemsJson(writer, filtered);
             try writer.writeByte('\n');
         },
     }
@@ -1629,13 +1873,21 @@ fn renderItemRows(allocator: std.mem.Allocator, writer: anytype, rows: []const E
     }
 }
 
-fn renderShowMarkdown(allocator: std.mem.Allocator, writer: anytype, state: *const ItemState) !void {
-    if (state.items.items.len == 0) {
-        try writer.writeAll("- [ ] (empty plan)\n");
+fn renderShowMarkdown(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    rows: []const EnrichedItem,
+    surface: Surface,
+) !void {
+    if (rows.len == 0) {
+        const empty_label = switch (surface) {
+            .plan => "- [ ] (empty plan)\n",
+            .all => "- (no tasks)\n",
+            .backlog => "- (no backlog tasks)\n",
+        };
+        try writer.writeAll(empty_label);
         return;
     }
-
-    const enriched = try enrichItems(allocator, state);
 
     const Section = struct {
         title: []const u8,
@@ -1654,7 +1906,7 @@ fn renderShowMarkdown(allocator: std.mem.Allocator, writer: anytype, state: *con
     var first_section = true;
     for (sections) |section| {
         var matched: usize = 0;
-        for (enriched) |row| {
+        for (rows) |row| {
             if (rowMatchesSection(section.title, row)) matched += 1;
         }
         if (matched == 0) continue;
@@ -1666,7 +1918,7 @@ fn renderShowMarkdown(allocator: std.mem.Allocator, writer: anytype, state: *con
         try writer.writeAll(section.title);
         try writer.writeByte('\n');
 
-        for (enriched) |row| {
+        for (rows) |row| {
             if (!rowMatchesSection(section.title, row)) continue;
 
             const marker = statusMarker(row.item.status);
@@ -1720,6 +1972,9 @@ fn renderShowMarkdown(allocator: std.mem.Allocator, writer: anytype, state: *con
                 try writer.writeAll(details.items);
                 try writer.writeByte(')');
             }
+            if (surface == .all) {
+                try writer.print(" [in_plan={s}]", .{if (effectiveInPlan(row.item.*)) "true" else "false"});
+            }
             try writer.writeByte('\n');
         }
     }
@@ -1748,8 +2003,8 @@ fn statusMarker(status: Status) []const u8 {
 }
 
 fn renderTable(writer: anytype, rows: []const EnrichedItem) !void {
-    try writer.writeAll("ID         STATUS       DEP_STATE          WAITING_ON            DEPS                 STEP\n");
-    try writer.writeAll("-----------------------------------------------------------------------------------------------\n");
+    try writer.writeAll("ID         STATUS       IN_PLAN  DEP_STATE          WAITING_ON            DEPS                 STEP\n");
+    try writer.writeAll("---------------------------------------------------------------------------------------------------------\n");
 
     for (rows) |row| {
         var waiting_buf: [128]u8 = undefined;
@@ -1759,10 +2014,11 @@ fn renderTable(writer: anytype, rows: []const EnrichedItem) !void {
         const deps = try formatDepsLimited(deps_buf[0..], row.item.deps);
 
         try writer.print(
-            "{s:<10} {s:<12} {s:<18} {s:<20} {s:<20} {s}\n",
+            "{s:<10} {s:<12} {s:<8} {s:<18} {s:<20} {s:<20} {s}\n",
             .{
                 row.item.id,
                 row.item.status.asString(),
+                if (effectiveInPlan(row.item.*)) "true" else "false",
                 row.dep_state.asString(),
                 waiting,
                 deps,
@@ -1782,6 +2038,8 @@ fn writeEnrichedItemObject(writer: anytype, row: EnrichedItem) !void {
     try std.json.Stringify.value(row.item.status.asString(), .{}, writer);
     try writer.writeAll(",\"priority\":");
     try std.json.Stringify.value(row.item.priority.asString(), .{}, writer);
+    try writer.writeAll(",\"in_plan\":");
+    try writer.writeAll(if (effectiveInPlan(row.item.*)) "true" else "false");
     try writer.writeAll(",\"deps\":");
     try writeDepsArray(writer, row.item.deps);
     try writer.writeAll(",\"notes\":");
@@ -1861,9 +2119,12 @@ fn emitUpdatePlan(
 }
 
 fn writeCodexPlan(writer: anytype, rows: []const EnrichedItem) !void {
-    for (rows, 0..) |row, idx| {
-        if (idx > 0) try writer.writeByte(',');
+    var wrote_any = false;
+    for (rows) |row| {
+        if (!effectiveInPlan(row.item.*)) continue;
+        if (wrote_any) try writer.writeByte(',');
         try writeCodexPlanEntry(writer, row);
+        wrote_any = true;
     }
 }
 
@@ -1888,9 +2149,12 @@ fn codexPlanStatusForRow(row: EnrichedItem) []const u8 {
 }
 
 fn writeOpencodeTodos(writer: anytype, rows: []const EnrichedItem) !void {
-    for (rows, 0..) |row, idx| {
-        if (idx > 0) try writer.writeByte(',');
+    var wrote_any = false;
+    for (rows) |row| {
+        if (!effectiveInPlan(row.item.*)) continue;
+        if (wrote_any) try writer.writeByte(',');
         try writeOpencodeTodoEntry(writer, row);
+        wrote_any = true;
     }
 }
 
@@ -1940,6 +2204,56 @@ fn dependencyState(item: Item, waiting: []const []const u8) DepState {
     return .ready;
 }
 
+fn isTerminalStatus(status: Status) bool {
+    return switch (status) {
+        .completed, .deferred, .canceled => true,
+        else => false,
+    };
+}
+
+fn effectiveInPlan(item: Item) bool {
+    if (isTerminalStatus(item.status)) return false;
+    return item.in_plan;
+}
+
+fn normalizeItemPlanMembership(item: *Item) void {
+    if (isTerminalStatus(item.status)) {
+        item.in_plan = false;
+        return;
+    }
+    if (item.status == .in_progress) {
+        item.in_plan = true;
+    }
+}
+
+fn normalizeStatePlanMembership(state: *ItemState) void {
+    for (state.items.items) |*item| {
+        normalizeItemPlanMembership(item);
+    }
+}
+
+fn rowMatchesSurface(surface: Surface, row: EnrichedItem) bool {
+    return switch (surface) {
+        .all => true,
+        .plan => effectiveInPlan(row.item.*),
+        .backlog => !effectiveInPlan(row.item.*),
+    };
+}
+
+fn filterRowsBySurface(
+    allocator: std.mem.Allocator,
+    rows: []const EnrichedItem,
+    surface: Surface,
+) ![]EnrichedItem {
+    var filtered = std.ArrayList(EnrichedItem).empty;
+    for (rows) |row| {
+        if (rowMatchesSurface(surface, row)) {
+            try filtered.append(allocator, row);
+        }
+    }
+    return filtered.toOwnedSlice(allocator);
+}
+
 fn unresolvedDependencyIds(allocator: std.mem.Allocator, item: Item, state: *const ItemState) ![]const []const u8 {
     var out = std.ArrayList([]const u8).empty;
     var seen = std.StringHashMap(void).init(allocator);
@@ -1959,6 +2273,7 @@ fn unresolvedDependencyIds(allocator: std.mem.Allocator, item: Item, state: *con
 
 fn validateState(state: *ItemState, allow_multiple_in_progress: bool) !void {
     try state.rebuildIndex();
+    normalizeStatePlanMembership(state);
 
     for (state.items.items) |item| {
         for (item.deps) |dep| {
@@ -1981,6 +2296,19 @@ fn validateState(state: *ItemState, allow_multiple_in_progress: bool) !void {
         if (item.status != .in_progress and item.status != .completed) continue;
         const waiting = try unresolvedDependencyIds(state.allocator, item, state);
         if (waiting.len > 0) return error.UnresolvedDependencies;
+    }
+
+    try validatePlanProjection(state);
+}
+
+fn validatePlanProjection(state: *ItemState) !void {
+    for (state.items.items) |item| {
+        if (!effectiveInPlan(item)) continue;
+        for (item.deps) |dep| {
+            const dep_item = state.getConst(dep.id) orelse return error.UnknownDependency;
+            if (dep_item.status == .completed) continue;
+            if (!effectiveInPlan(dep_item.*)) return error.PlanDependencyNotSelected;
+        }
     }
 }
 
@@ -2080,6 +2408,11 @@ fn canonicalItem(allocator: std.mem.Allocator, value: std.json.Value) !Item {
 
     const priority_raw = if (obj.get("priority")) |v| asString(v) orelse return error.InvalidPriority else "medium";
     const priority = try normalizePriority(priority_raw);
+    const in_plan = if (obj.get("in_plan")) |v| switch (v) {
+        .bool => |b| b,
+        .null => true,
+        else => return error.InvalidInPlan,
+    } else true;
 
     const deps_value = obj.get("deps") orelse return error.MissingDepsValue;
     const deps = try normalizeDeps(allocator, deps_value);
@@ -2092,15 +2425,18 @@ fn canonicalItem(allocator: std.mem.Allocator, value: std.json.Value) !Item {
 
     const comments = if (obj.get("comments")) |v| try normalizeComments(allocator, v) else &.{};
 
-    return .{
+    var item = Item{
         .id = id,
         .step = step,
         .status = status,
         .priority = priority,
+        .in_plan = in_plan,
         .deps = deps,
         .notes = notes,
         .comments = comments,
     };
+    normalizeItemPlanMembership(&item);
+    return item;
 }
 
 fn normalizeComments(allocator: std.mem.Allocator, value: std.json.Value) ![]Comment {
@@ -2662,6 +2998,8 @@ fn makeSeqRecord(
 
 test "parseCommand and parseOutputFormat recognize known values" {
     try std.testing.expect(parseCommand("set-status") != null);
+    try std.testing.expectEqual(Command.select, parseCommand("select").?);
+    try std.testing.expectEqual(Command.deselect, parseCommand("deselect").?);
     try std.testing.expectEqual(Command.set_priority, parseCommand("set-priority").?);
     try std.testing.expectEqual(Command.emit_plan_sync, parseCommand("emit-plan-sync").?);
     try std.testing.expectEqual(Command.emit_update_plan, parseCommand("emit-update-plan").?);
@@ -2671,6 +3009,11 @@ test "parseCommand and parseOutputFormat recognize known values" {
     try std.testing.expectEqual(OutputFormat.table, parseOutputFormat("table").?);
     try std.testing.expectEqual(OutputFormat.json, parseOutputFormat("json").?);
     try std.testing.expect(parseOutputFormat("csv") == null);
+
+    try std.testing.expectEqual(Surface.plan, parseSurface("plan").?);
+    try std.testing.expectEqual(Surface.all, parseSurface("all").?);
+    try std.testing.expectEqual(Surface.backlog, parseSurface("backlog").?);
+    try std.testing.expect(parseSurface("queue") == null);
 }
 
 test "dependencyState maps blocked and waiting statuses" {
@@ -2679,6 +3022,7 @@ test "dependencyState maps blocked and waiting statuses" {
         .step = "sample",
         .status = .pending,
         .priority = .medium,
+        .in_plan = true,
         .deps = &.{},
         .notes = "",
         .comments = &.{},
@@ -2712,9 +3056,26 @@ test "canonicalItem defaults missing priority to medium" {
 
     const item = try canonicalItem(allocator, parsed.value);
     try std.testing.expectEqual(Priority.medium, item.priority);
+    try std.testing.expect(item.in_plan);
 }
 
-test "emitPlanSync includes items plus codex and opencode projections" {
+test "canonicalItem demotes terminal items out of the plan" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        "{\"id\":\"st-002\",\"step\":\"Done\",\"status\":\"completed\",\"priority\":\"medium\",\"in_plan\":true,\"deps\":[],\"notes\":\"\",\"comments\":[]}",
+        .{},
+    );
+
+    const item = try canonicalItem(allocator, parsed.value);
+    try std.testing.expect(!item.in_plan);
+}
+
+test "emitPlanSync keeps inventory while filtering mirrored plan projections" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -2726,6 +3087,7 @@ test "emitPlanSync includes items plus codex and opencode projections" {
         .step = "First step",
         .status = .pending,
         .priority = .high,
+        .in_plan = true,
         .deps = &.{},
         .notes = "",
         .comments = &.{},
@@ -2735,6 +3097,7 @@ test "emitPlanSync includes items plus codex and opencode projections" {
         .step = "Canceled step",
         .status = .canceled,
         .priority = .low,
+        .in_plan = true,
         .deps = &.{},
         .notes = "",
         .comments = &.{},
@@ -2746,7 +3109,7 @@ test "emitPlanSync includes items plus codex and opencode projections" {
     const actual = try out.toOwnedSlice();
 
     try std.testing.expectEqualStrings(
-        "{\"version\":1,\"items\":[{\"id\":\"st-001\",\"step\":\"First step\",\"status\":\"pending\",\"priority\":\"high\",\"deps\":[],\"notes\":\"\",\"comments\":[],\"dep_state\":\"ready\",\"waiting_on\":[]},{\"id\":\"st-002\",\"step\":\"Canceled step\",\"status\":\"canceled\",\"priority\":\"low\",\"deps\":[],\"notes\":\"\",\"comments\":[],\"dep_state\":\"n/a\",\"waiting_on\":[]}],\"codex\":{\"plan\":[{\"step\":\"First step\",\"status\":\"pending\"},{\"step\":\"Canceled step\",\"status\":\"pending\"}]},\"opencode\":{\"todos\":[{\"content\":\"First step\",\"status\":\"pending\",\"priority\":\"high\"},{\"content\":\"Canceled step\",\"status\":\"cancelled\",\"priority\":\"low\"}]}}\n",
+        "{\"version\":1,\"items\":[{\"id\":\"st-001\",\"step\":\"First step\",\"status\":\"pending\",\"priority\":\"high\",\"in_plan\":true,\"deps\":[],\"notes\":\"\",\"comments\":[],\"dep_state\":\"ready\",\"waiting_on\":[]},{\"id\":\"st-002\",\"step\":\"Canceled step\",\"status\":\"canceled\",\"priority\":\"low\",\"in_plan\":false,\"deps\":[],\"notes\":\"\",\"comments\":[],\"dep_state\":\"n/a\",\"waiting_on\":[]}],\"codex\":{\"plan\":[{\"step\":\"First step\",\"status\":\"pending\"}]},\"opencode\":{\"todos\":[{\"content\":\"First step\",\"status\":\"pending\",\"priority\":\"high\"}]}}\n",
         actual,
     );
 }
@@ -2763,6 +3126,7 @@ test "emitUpdatePlan preserves legacy payload shape" {
         .step = "High priority step",
         .status = .in_progress,
         .priority = .high,
+        .in_plan = true,
         .deps = &.{},
         .notes = "",
         .comments = &.{},
@@ -2777,6 +3141,58 @@ test "emitUpdatePlan preserves legacy payload shape" {
         "{\"plan\":[{\"step\":\"High priority step\",\"status\":\"in_progress\"}]}\n",
         actual,
     );
+}
+
+test "select auto-includes dependency closure and deselect rejects stranded dependents" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
+
+    _ = try cmdInit(allocator, .{ .command = .init, .file = plan_path, .replace = true });
+    _ = try cmdAdd(allocator, .{
+        .command = .add,
+        .file = plan_path,
+        .id = "st-001",
+        .step = "Parent",
+        .priority = "medium",
+        .backlog_only = true,
+    });
+    _ = try cmdAdd(allocator, .{
+        .command = .add,
+        .file = plan_path,
+        .id = "st-002",
+        .step = "Child",
+        .priority = "medium",
+        .backlog_only = true,
+    });
+    _ = try cmdSetDeps(allocator, .{
+        .command = .set_deps,
+        .file = plan_path,
+        .id = "st-002",
+        .deps = "st-001",
+    });
+    _ = try cmdSelect(allocator, .{
+        .command = .select,
+        .file = plan_path,
+        .ids = "st-002",
+    });
+
+    var loaded = try loadValidatedState(allocator, plan_path, false);
+    defer loaded.state.deinit();
+    try std.testing.expect(loaded.state.getConst("st-001").?.in_plan);
+    try std.testing.expect(loaded.state.getConst("st-002").?.in_plan);
+
+    try std.testing.expectError(error.PlanDependencyNotSelected, cmdDeselect(allocator, .{
+        .command = .deselect,
+        .file = plan_path,
+        .ids = "st-001",
+    }));
 }
 
 test "runPerfCase covers representative Wave B seams" {
