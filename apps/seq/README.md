@@ -38,6 +38,9 @@ Binary output:
 ./zig-out/bin/seq query --root ~/.codex/sessions --spec '{"dataset":"tool_invocations","where":[{"field":"command_text","op":"contains","value":"learnings recall"}],"select":["path","tool_name","command_text","workdir"],"sort":["timestamp"],"limit":5,"format":"table"}'
 ./zig-out/bin/seq query --root ~/.codex/sessions --spec '{"dataset":"tool_call_args","where":[{"field":"tool_name","op":"eq","value":"exec_command"},{"field":"arg_path","op":"eq","value":"workdir"}],"select":["path","arg_path","value_text"],"sort":["timestamp"],"limit":5,"format":"table"}'
 ./zig-out/bin/seq find-session --root ~/.codex/sessions --prompt "learnings recall" --since 2026-03-08T00:00:00Z --until 2026-03-10T23:59:59Z --limit 5 --format table
+./zig-out/bin/seq plan-search --root ~/.codex/sessions --repo /Users/tk/workspace/tk/shift --since 2026-03-01T00:00:00Z --format table
+./zig-out/bin/seq plan-search --root ~/.codex/sessions --repo /Users/tk/workspace/tk/shift --contains "PromptMode" --stats --format jsonl
+./zig-out/bin/seq plan-search --root ~/.codex/sessions --session-id 019ce80b-9fb4-72a1-9c1e-3d626d4e4913 --include-body --format jsonl
 ./zig-out/bin/seq session-tooling --root ~/.codex/sessions --since 2026-03-08T00:00:00Z --until 2026-03-10T23:59:59Z --summary --group-by executable --format table
 ./zig-out/bin/seq query-diagnose --path /absolute/path/to/rollout.jsonl --threshold-ms 10000 --next-actions --format json
 ./zig-out/bin/seq artifact-search --contains "spawn_agent" --kind orchestration --since 2026-03-01T00:00:00Z --limit 10 --format table
@@ -58,6 +61,12 @@ Binary output:
 
 `query.where.op` supports `contains_any` and `regex_any` in addition to `contains` and `regex`.
 `regex` uses a fast regex-like subset (`^`, `$`, `|`) and fails fast on unsupported constructs.
+`plan-search` is the strict finalized-plan surface:
+- searches assistant messages for complete `<proposed_plan> ... </proposed_plan>` blocks only
+- matches by repo (`--repo`), session (`--session-id` / `--path`), time (`--since` / `--until`), and title/body text (`--contains` / `--regex`)
+- defaults to newest-first metadata rows and exposes the exact plan block only with `--include-body`
+- `--stats` adds scan counters (`candidate_files`, `files_opened`, `messages_examined`, `plan_blocks_found`, `rows_emitted`, `duration_ms`) plus filter-usage flags
+
 `artifact-search` is the seq-first forensic entrypoint:
 - searches `messages`, `tool_calls`, and `memory_blocks` with one normalized result shape
 - accepts `--kind auto|session|memory|orchestration|tooling|prompt`

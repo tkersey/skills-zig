@@ -1,6 +1,7 @@
 const std = @import("std");
 const lib = @import("../lib.zig");
 const datasets = @import("../datasets/mod.zig");
+const plan_blocks = @import("../plan_blocks.zig");
 const query = @import("../query/engine.zig");
 const spec = @import("../types/spec.zig");
 const output = @import("../output/mod.zig");
@@ -333,6 +334,7 @@ const Options = struct {
     role: ?[]const u8 = null,
     tool: ?[]const u8 = null,
     workdir_text: ?[]const u8 = null,
+    repo_text: ?[]const u8 = null,
     status: ?[]const u8 = null,
     mode: ?[]const u8 = null,
     part_type: ?[]const u8 = null,
@@ -347,6 +349,7 @@ const Options = struct {
     opencode_path: ?[]const u8 = null,
     opencode_source_text: ?[]const u8 = null,
     include_raw: bool = false,
+    include_body: bool = false,
     stats: bool = false,
     strip_skill_blocks: bool = false,
     no_dedupe_exact: bool = false,
@@ -383,6 +386,7 @@ pub fn run(
         .occurrence_export => try cmdOccurrenceExport(allocator, sessions_root, opts),
         .orchestration_concurrency => try cmdOrchestrationConcurrency(allocator, sessions_root, opts),
         .find_session => try cmdFindSession(allocator, sessions_root, opts),
+        .plan_search => try cmdPlanSearch(allocator, sessions_root, opts),
         .session_prompts => try cmdSessionPrompts(allocator, sessions_root, opts),
         .report_bundle => try cmdReportBundle(allocator, sessions_root, opts),
         .section_audit => try cmdSectionAudit(allocator, sessions_root, opts),
@@ -435,6 +439,19 @@ fn printCommandHelp(cmd: lib.Command) !void {
         ,
         .find_session =>
         \\usage: seq find-session --prompt <text> [--since <iso>] [--until <iso>] [--limit N] [--format table|json|csv|jsonl]
+        ,
+        .plan_search =>
+        \\usage: seq plan-search [--repo <path>] [--session-id <id>|--path <jsonl>] [--since <iso>] [--until <iso>] [--contains <text>|--regex <expr>] [--sort timestamp|-timestamp] [--include-body] [--stats] [--limit N] [--format table|json|csv|jsonl]
+        \\extra options:
+        \\  --repo <path>             Match session_meta cwd against this repo root or one of its descendants
+        \\  --path <path>             Inspect exactly one rollout/session JSONL file
+        \\  --session-id <id>         Resolve exactly one session file by session id substring
+        \\  --contains <text>         Filter title+plan body by case-insensitive substring
+        \\  --regex <expr>            Filter title+plan body by the artifact-search regex subset
+        \\  --sort timestamp|-timestamp
+        \\                           Order oldest-first or newest-first (default: -timestamp)
+        \\  --include-body            Include the exact <proposed_plan> block in output rows
+        \\  --stats                   Emit scan counters and filter-usage flags
         ,
         .session_prompts =>
         \\usage: seq session-prompts [--session-id <id>|--path <jsonl>|--current] [--roles <csv>] [--since <iso>] [--until <iso>] [--strip-skill-blocks] [--no-dedupe-exact] [--limit N] [--format table|json|csv|jsonl]
@@ -515,18 +532,18 @@ fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
         .occurrence_export => {
             if (fmt == .table) return error.InvalidFormatForCommand;
         },
-        .artifact_search, .orchestration_concurrency, .find_session, .session_prompts, .query, .token_usage, .routing_gap, .session_tooling, .query_diagnose, .opencode_prompts, .opencode_events => {},
+        .artifact_search, .orchestration_concurrency, .find_session, .plan_search, .session_prompts, .query, .token_usage, .routing_gap, .session_tooling, .query_diagnose, .opencode_prompts, .opencode_events => {},
         .unknown => return error.InvalidCommand,
     }
 }
 
 fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_path = switch (cmd) {
-        .artifact_search, .orchestration_concurrency, .session_prompts, .session_tooling, .query_diagnose => true,
+        .artifact_search, .orchestration_concurrency, .plan_search, .session_prompts, .session_tooling, .query_diagnose => true,
         else => false,
     };
     const supports_session_id = switch (cmd) {
-        .artifact_search, .orchestration_concurrency, .session_prompts, .session_tooling => true,
+        .artifact_search, .orchestration_concurrency, .plan_search, .session_prompts, .session_tooling => true,
         else => false,
     };
     const supports_current = cmd == .session_prompts;
@@ -563,16 +580,17 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         else => false,
     };
     const supports_contains = switch (cmd) {
-        .artifact_search, .opencode_prompts, .opencode_events => true,
+        .artifact_search, .plan_search, .opencode_prompts, .opencode_events => true,
         else => false,
     };
     const supports_regex = switch (cmd) {
-        .artifact_search, .opencode_prompts, .opencode_events => true,
+        .artifact_search, .plan_search, .opencode_prompts, .opencode_events => true,
         else => false,
     };
     const supports_role = cmd == .opencode_events;
     const supports_tool = cmd == .opencode_events or cmd == .artifact_search;
     const supports_workdir = cmd == .artifact_search;
+    const supports_repo = cmd == .plan_search;
     const supports_status = cmd == .opencode_events;
     const supports_mode = switch (cmd) {
         .opencode_prompts, .opencode_events => true,
@@ -581,7 +599,8 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_kind = cmd == .artifact_search;
     const supports_surface = cmd == .artifact_search;
     const supports_follow = cmd == .artifact_search;
-    const supports_stats = cmd == .artifact_search;
+    const supports_stats = cmd == .artifact_search or cmd == .plan_search;
+    const supports_include_body = cmd == .plan_search;
     const supports_part_type = switch (cmd) {
         .opencode_prompts, .opencode_events => true,
         else => false,
@@ -594,6 +613,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .occurrence_export,
         .find_session,
         .artifact_search,
+        .plan_search,
         .session_prompts,
         .report_bundle,
         .section_audit,
@@ -613,6 +633,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .occurrence_export,
         .find_session,
         .artifact_search,
+        .plan_search,
         .session_prompts,
         .report_bundle,
         .section_audit,
@@ -641,7 +662,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         else => false,
     };
     const supports_sort = switch (cmd) {
-        .opencode_prompts, .opencode_events => true,
+        .plan_search, .opencode_prompts, .opencode_events => true,
         else => false,
     };
     const supports_opencode_db_path = switch (cmd) {
@@ -689,12 +710,14 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.role != null, supports_role, "--role", cmd);
     try ensureOptionAllowed(opts.tool != null, supports_tool, "--tool", cmd);
     try ensureOptionAllowed(opts.workdir_text != null, supports_workdir, "--workdir", cmd);
+    try ensureOptionAllowed(opts.repo_text != null, supports_repo, "--repo", cmd);
     try ensureOptionAllowed(opts.status != null, supports_status, "--status", cmd);
     try ensureOptionAllowed(opts.mode != null, supports_mode, "--mode", cmd);
     try ensureOptionAllowed(opts.kind_text != null, supports_kind, "--kind", cmd);
     try ensureOptionAllowed(opts.surface_text != null, supports_surface, "--surface", cmd);
     try ensureOptionAllowed(opts.follow_text != null, supports_follow, "--follow", cmd);
     try ensureOptionAllowed(opts.stats, supports_stats, "--stats", cmd);
+    try ensureOptionAllowed(opts.include_body, supports_include_body, "--include-body", cmd);
     try ensureOptionAllowed(opts.part_type != null, supports_part_type, "--part-type", cmd);
     try ensureOptionAllowed(opts.since != null, supports_since, "--since", cmd);
     try ensureOptionAllowed(opts.until != null, supports_until, "--until", cmd);
@@ -978,7 +1001,7 @@ fn searchMessageHits(
         stats.rows_examined += @intCast(parsed.len);
 
         for (parsed) |row| {
-            const score = try matchScoreForText(allocator, query_text, use_regex, &.{ row.text });
+            const score = try matchScoreForText(allocator, query_text, use_regex, &.{row.text});
             if (score == null) continue;
             const session_id = inferSessionIdFromPath(row.path);
             const next_action = try std.fmt.allocPrint(
@@ -2787,6 +2810,309 @@ fn cmdFindSession(allocator: std.mem.Allocator, sessions_root: []const u8, opts:
         .limit = opts.limit,
     };
     try runDatasetQuery(allocator, "messages", sessions_root, query_spec, opts.format, opts.out_path, select[0..]);
+}
+
+const PlanSearchStats = struct {
+    candidate_files: i64 = 0,
+    files_opened: i64 = 0,
+    messages_examined: i64 = 0,
+    plan_blocks_found: i64 = 0,
+    rows_emitted: i64 = 0,
+    duration_ms: i64 = 0,
+    used_repo_filter: bool = false,
+    used_time_bounds: bool = false,
+    used_targeted_session: bool = false,
+};
+
+fn cmdPlanSearch(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    const start_ms = std.time.milliTimestamp();
+    const repo_root = try resolvePlanSearchRepoRoot(allocator, opts);
+    defer if (repo_root) |value| allocator.free(value);
+
+    if (repo_root == null and opts.path == null and opts.session_id == null) {
+        printCliError("error: plan-search requires --repo, --session-id, --path, or a current cwd inside a git repo\n", .{});
+        return error.MissingRepoArg;
+    }
+
+    var stats = PlanSearchStats{
+        .used_repo_filter = repo_root != null,
+        .used_time_bounds = opts.since != null or opts.until != null,
+        .used_targeted_session = opts.path != null or opts.session_id != null,
+    };
+
+    const day_filter = deriveSessionDayPathFilterFromOptions(opts);
+    var input_paths = try resolveSessionPromptInputPaths(allocator, sessions_root, opts, day_filter);
+    defer freePathList(allocator, &input_paths);
+    stats.candidate_files = @intCast(input_paths.items.len);
+
+    const parse_options = datasets.messages.ParseOptions{
+        .include_user = false,
+        .include_assistant = true,
+        .strip_echo_assistant = true,
+        .skip_meta_user_messages = true,
+        .dedupe_by_role_and_text = false,
+        .strip_skill_blocks = false,
+    };
+
+    var rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &rows);
+
+    for (input_paths.items) |path| {
+        const content = try readFileAllocOrSkip(allocator, path);
+        if (content == null) continue;
+        defer allocator.free(content.?);
+        stats.files_opened += 1;
+
+        const meta = try plan_blocks.parseSessionMeta(allocator, content.?);
+        defer meta.deinit(allocator);
+
+        if (repo_root) |required_repo| {
+            const cwd = meta.cwd orelse continue;
+            if (!try pathMatchesRepoScope(allocator, required_repo, cwd)) continue;
+        }
+
+        const parsed = try datasets.messages.parseJsonl(allocator, path, content.?, parse_options);
+        defer datasets.messages.freeRows(allocator, parsed);
+        stats.messages_examined += @intCast(parsed.len);
+
+        const session_id = inferSessionIdFromPath(path);
+        for (parsed) |message_row| {
+            if (!timestampSatisfiesBounds(message_row.timestamp, opts)) continue;
+
+            const blocks = try plan_blocks.extractPlanBlocks(allocator, message_row.text);
+            defer plan_blocks.deinitPlanBlocks(allocator, blocks);
+            stats.plan_blocks_found += @intCast(blocks.len);
+
+            for (blocks) |block| {
+                if (!try planSearchMatchesFilters(allocator, opts, block.title, block.block)) continue;
+
+                var qrow = query.Row.init(allocator);
+                try qrow.putOwnedKey("path", .{ .string = path });
+                try qrow.putOwnedKey("session_id", .{ .string = session_id });
+                try putOptionalString(&qrow, "timestamp", message_row.timestamp);
+                try putOptionalString(&qrow, "cwd", meta.cwd);
+                try putOptionalString(&qrow, "title", block.title);
+                try putOptionalString(&qrow, "iteration", block.iteration);
+                try qrow.putOwnedKey("plan_index", .{ .int = @intCast(block.plan_index) });
+                try qrow.putOwnedKey("plan_len", .{ .int = @intCast(block.block.len) });
+                if (opts.include_body) {
+                    try qrow.putOwnedKey("plan_block", .{ .string = block.block });
+                }
+                try rows.append(allocator, qrow);
+            }
+        }
+    }
+
+    const duration_delta = std.time.milliTimestamp() - start_ms;
+    stats.duration_ms = @intCast(@max(duration_delta, 0));
+
+    const descending = try parsePlanSearchDescending(opts.sort_text);
+    const sort = [_]spec.SortSpec{
+        .{ .field = "timestamp", .descending = descending },
+        .{ .field = "path", .descending = false },
+        .{ .field = "plan_index", .descending = false },
+    };
+    const limit = if (opts.limit == 0) 20 else opts.limit;
+    const select_base = [_][]const u8{
+        "timestamp",
+        "session_id",
+        "cwd",
+        "iteration",
+        "title",
+        "path",
+        "plan_index",
+        "plan_len",
+    };
+    const select_with_body = [_][]const u8{
+        "timestamp",
+        "session_id",
+        "cwd",
+        "iteration",
+        "title",
+        "path",
+        "plan_index",
+        "plan_len",
+        "plan_block",
+    };
+    const select_with_stats = [_][]const u8{
+        "timestamp",
+        "session_id",
+        "cwd",
+        "iteration",
+        "title",
+        "path",
+        "plan_index",
+        "plan_len",
+        "candidate_files",
+        "files_opened",
+        "messages_examined",
+        "plan_blocks_found",
+        "rows_emitted",
+        "duration_ms",
+        "used_repo_filter",
+        "used_time_bounds",
+        "used_targeted_session",
+    };
+    const select_with_body_and_stats = [_][]const u8{
+        "timestamp",
+        "session_id",
+        "cwd",
+        "iteration",
+        "title",
+        "path",
+        "plan_index",
+        "plan_len",
+        "plan_block",
+        "candidate_files",
+        "files_opened",
+        "messages_examined",
+        "plan_blocks_found",
+        "rows_emitted",
+        "duration_ms",
+        "used_repo_filter",
+        "used_time_bounds",
+        "used_targeted_session",
+    };
+
+    const select = if (opts.include_body and opts.stats)
+        select_with_body_and_stats[0..]
+    else if (opts.include_body)
+        select_with_body[0..]
+    else if (opts.stats)
+        select_with_stats[0..]
+    else
+        select_base[0..];
+
+    const query_spec = spec.QuerySpec{
+        .sort = sort[0..],
+        .limit = limit,
+        .select = select,
+    };
+    var result = try query.execute(allocator, rows.items, query_spec);
+    defer result.deinit(allocator);
+
+    stats.rows_emitted = @intCast(result.rows.items.len);
+    if (opts.stats) {
+        for (result.rows.items) |*row| try attachPlanSearchStats(row, stats);
+    }
+
+    try output.writeOutput(allocator, opts.format, result.rows.items, select, opts.out_path);
+}
+
+fn parsePlanSearchDescending(raw_opt: ?[]const u8) !bool {
+    const raw = raw_opt orelse return true;
+    if (std.mem.eql(u8, raw, "-timestamp")) return true;
+    if (std.mem.eql(u8, raw, "timestamp")) return false;
+    printCliError("error: plan-search only supports --sort timestamp or --sort -timestamp\n", .{});
+    return error.InvalidSortArg;
+}
+
+fn resolvePlanSearchRepoRoot(allocator: std.mem.Allocator, opts: Options) !?[]u8 {
+    if (opts.repo_text) |raw_repo| {
+        const repo = try resolveExplicitRepoRoot(allocator, raw_repo);
+        return repo;
+    }
+    if (opts.path != null or opts.session_id != null) return null;
+    return resolveImplicitCurrentRepoRoot(allocator);
+}
+
+fn resolveExplicitRepoRoot(allocator: std.mem.Allocator, raw_path: []const u8) ![]u8 {
+    const normalized = try normalizeRepoMatchPath(allocator, raw_path);
+    if (pathHasGitMarker(normalized)) return normalized;
+
+    var current = try allocator.dupe(u8, normalized);
+    defer allocator.free(current);
+    while (parentPathOrNull(current)) |parent| {
+        allocator.free(current);
+        current = try allocator.dupe(u8, parent);
+        if (pathHasGitMarker(current)) {
+            allocator.free(normalized);
+            return current;
+        }
+    }
+    return normalized;
+}
+
+fn resolveImplicitCurrentRepoRoot(allocator: std.mem.Allocator) !?[]u8 {
+    var current = try normalizeRepoMatchPath(allocator, ".");
+    while (true) {
+        if (pathHasGitMarker(current)) return current;
+        const parent = parentPathOrNull(current) orelse {
+            allocator.free(current);
+            return null;
+        };
+        allocator.free(current);
+        current = try allocator.dupe(u8, parent);
+    }
+}
+
+fn normalizeRepoMatchPath(allocator: std.mem.Allocator, raw_path: []const u8) ![]u8 {
+    const absolute = try toAbsolutePath(allocator, raw_path);
+    defer allocator.free(absolute);
+
+    const canonical = std.fs.cwd().realpathAlloc(allocator, absolute) catch null;
+    if (canonical) |value| {
+        defer allocator.free(value);
+        return trimTrailingPathSeparatorsAlloc(allocator, value);
+    }
+    return trimTrailingPathSeparatorsAlloc(allocator, absolute);
+}
+
+fn trimTrailingPathSeparatorsAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var end = path.len;
+    while (end > 1 and isPathSep(path[end - 1])) : (end -= 1) {}
+    return allocator.dupe(u8, path[0..end]);
+}
+
+fn parentPathOrNull(path: []const u8) ?[]const u8 {
+    const parent = std.fs.path.dirname(path) orelse return null;
+    if (parent.len == 0 or std.mem.eql(u8, parent, path)) return null;
+    return parent;
+}
+
+fn pathHasGitMarker(path: []const u8) bool {
+    if (!std.fs.path.isAbsolute(path)) return false;
+    var dir = std.fs.openDirAbsolute(path, .{}) catch return false;
+    defer dir.close();
+    dir.access(".git", .{}) catch return false;
+    return true;
+}
+
+fn pathMatchesRepoScope(allocator: std.mem.Allocator, repo_root: []const u8, candidate_path: []const u8) !bool {
+    const normalized_candidate = try normalizeRepoMatchPath(allocator, candidate_path);
+    defer allocator.free(normalized_candidate);
+    return isPathEqualOrDescendant(repo_root, normalized_candidate);
+}
+
+fn isPathEqualOrDescendant(root: []const u8, candidate: []const u8) bool {
+    if (std.mem.eql(u8, root, candidate)) return true;
+    if (root.len == 1 and isPathSep(root[0])) return std.fs.path.isAbsolute(candidate);
+    if (!std.mem.startsWith(u8, candidate, root)) return false;
+    if (candidate.len <= root.len) return false;
+    return isPathSep(candidate[root.len]);
+}
+
+fn planSearchMatchesFilters(
+    allocator: std.mem.Allocator,
+    opts: Options,
+    title: ?[]const u8,
+    block: []const u8,
+) !bool {
+    const query_text = opts.contains orelse opts.regex orelse return true;
+    const score = try matchScoreForText(allocator, query_text, opts.regex != null, &.{ title orelse "", block });
+    return score != null;
+}
+
+fn attachPlanSearchStats(row: *query.Row, stats: PlanSearchStats) !void {
+    try row.putOwnedKey("candidate_files", .{ .int = stats.candidate_files });
+    try row.putOwnedKey("files_opened", .{ .int = stats.files_opened });
+    try row.putOwnedKey("messages_examined", .{ .int = stats.messages_examined });
+    try row.putOwnedKey("plan_blocks_found", .{ .int = stats.plan_blocks_found });
+    try row.putOwnedKey("rows_emitted", .{ .int = stats.rows_emitted });
+    try row.putOwnedKey("duration_ms", .{ .int = stats.duration_ms });
+    try row.putOwnedKey("used_repo_filter", .{ .bool = stats.used_repo_filter });
+    try row.putOwnedKey("used_time_bounds", .{ .bool = stats.used_time_bounds });
+    try row.putOwnedKey("used_targeted_session", .{ .bool = stats.used_targeted_session });
 }
 
 fn currentSessionIdFromEnv(allocator: std.mem.Allocator) ![]u8 {
@@ -5102,6 +5428,10 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.workdir_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--repo")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.repo_text = args[i];
         } else if (std.mem.eql(u8, arg, "--status")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -5158,6 +5488,8 @@ fn parseOptions(args: []const []const u8) !Options {
             opts.include_raw = true;
         } else if (std.mem.eql(u8, arg, "--include-parts")) {
             opts.include_raw = true;
+        } else if (std.mem.eql(u8, arg, "--include-body")) {
+            opts.include_body = true;
         } else if (std.mem.eql(u8, arg, "--stats")) {
             opts.stats = true;
         } else if (std.mem.eql(u8, arg, "--strip-skill-blocks")) {
@@ -5673,6 +6005,8 @@ test "parse options supports common flags" {
         "assistant",
         "--tool",
         "bash",
+        "--repo",
+        "/Users/tk/workspace/tk/shift",
         "--status",
         "completed",
         "--mode",
@@ -5700,6 +6034,7 @@ test "parse options supports common flags" {
         "--source",
         "db",
         "--include-raw",
+        "--include-body",
         "--strip-skill-blocks",
         "--no-dedupe-exact",
         "--summary",
@@ -5729,6 +6064,7 @@ test "parse options supports common flags" {
     try std.testing.expectEqualStrings("^foo", opts.regex.?);
     try std.testing.expectEqualStrings("assistant", opts.role.?);
     try std.testing.expectEqualStrings("bash", opts.tool.?);
+    try std.testing.expectEqualStrings("/Users/tk/workspace/tk/shift", opts.repo_text.?);
     try std.testing.expectEqualStrings("completed", opts.status.?);
     try std.testing.expectEqualStrings("normal", opts.mode.?);
     try std.testing.expectEqualStrings("file", opts.part_type.?);
@@ -5743,6 +6079,7 @@ test "parse options supports common flags" {
     try std.testing.expectEqualStrings("/tmp/prompt-history.jsonl", opts.opencode_path.?);
     try std.testing.expectEqualStrings("db", opts.opencode_source_text.?);
     try std.testing.expect(opts.include_raw);
+    try std.testing.expect(opts.include_body);
     try std.testing.expect(opts.strip_skill_blocks);
     try std.testing.expect(opts.no_dedupe_exact);
     try std.testing.expect(opts.summary);
@@ -5859,6 +6196,128 @@ test "session-prompts preserves duplicates when no-dedupe-exact is set" {
 
     const first = std.mem.indexOf(u8, got, "\"text\": \"repeat\"") orelse unreachable;
     try std.testing.expect(std.mem.indexOfPos(u8, got, first + 1, "\"text\": \"repeat\"") != null);
+}
+
+test "plan-search extracts strict proposed_plan blocks from a targeted file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("2026/03/10");
+    const session_rel = "2026/03/10/rollout-2026-03-10T10-00-00-019c0000-0000-7000-8000-000000000013.jsonl";
+    const session_content =
+        "{\"timestamp\":\"2026-03-10T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019c0000-0000-7000-8000-000000000013\",\"cwd\":\"/Users/tk/workspace/tk/shift\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Echo: prompt\\n\\n<proposed_plan>\\nIteration: 4\\n# First\\nBody\\n</proposed_plan>\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"<proposed_plan>\\nIteration: 5\\n# Broken\"}]}}\n";
+    try tmp.dir.writeFile(.{ .sub_path = session_rel, .data = session_content });
+
+    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_abs);
+    const session_abs = try std.fs.path.join(std.testing.allocator, &.{ root_abs, session_rel });
+    defer std.testing.allocator.free(session_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "plan-search.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const args = [_][]const u8{
+        "--root",
+        root_abs,
+        "--path",
+        session_abs,
+        "--include-body",
+        "--format",
+        "json",
+    };
+    const got = try runCommandWithOutput(std.testing.allocator, .plan_search, args[0..], output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"title\": \"# First\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"iteration\": \"Iteration: 4\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"plan_index\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"plan_block\": \"<proposed_plan>\\nIteration: 4\\n# First\\nBody\\n</proposed_plan>\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "Echo:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "Broken") == null);
+}
+
+test "plan-search applies repo filter, stats, and chronological sort" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("sessions/2026/03/10");
+    try tmp.dir.makePath("sessions/2026/03/11");
+    try tmp.dir.makePath("repos/repo-a");
+    try tmp.dir.makePath("repos/repo-b");
+
+    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_abs);
+    const sessions_abs = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "sessions" });
+    defer std.testing.allocator.free(sessions_abs);
+    const repo_a = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "repos/repo-a" });
+    defer std.testing.allocator.free(repo_a);
+    const repo_a_nested = try std.fmt.allocPrint(std.testing.allocator, "{s}/nested", .{repo_a});
+    defer std.testing.allocator.free(repo_a_nested);
+    const repo_b = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "repos/repo-b" });
+    defer std.testing.allocator.free(repo_b);
+
+    const session_a_rel = "sessions/2026/03/10/rollout-2026-03-10T10-00-00-019c0000-0000-7000-8000-000000000014.jsonl";
+    const session_b_rel = "sessions/2026/03/11/rollout-2026-03-11T10-00-00-019c0000-0000-7000-8000-000000000015.jsonl";
+    const session_other_rel = "sessions/2026/03/11/rollout-2026-03-11T10-01-00-019c0000-0000-7000-8000-000000000016.jsonl";
+    const session_a_content = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"timestamp\":\"2026-03-10T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"019c0000-0000-7000-8000-000000000014\",\"cwd\":\"{s}\"}}}}\n" ++
+            "{{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:00:01Z\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"<proposed_plan>\\nIteration: 1\\n# Older\\n</proposed_plan>\"}}]}}}}\n",
+        .{repo_a},
+    );
+    defer std.testing.allocator.free(session_a_content);
+    const session_b_content = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"timestamp\":\"2026-03-11T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"019c0000-0000-7000-8000-000000000015\",\"cwd\":\"{s}\"}}}}\n" ++
+            "{{\"type\":\"response_item\",\"timestamp\":\"2026-03-11T10:00:01Z\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"<proposed_plan>\\nIteration: 2\\n# Newer\\n</proposed_plan>\"}}]}}}}\n",
+        .{repo_a_nested},
+    );
+    defer std.testing.allocator.free(session_b_content);
+    const session_other_content = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"timestamp\":\"2026-03-11T10:01:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"019c0000-0000-7000-8000-000000000016\",\"cwd\":\"{s}\"}}}}\n" ++
+            "{{\"type\":\"response_item\",\"timestamp\":\"2026-03-11T10:01:01Z\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"<proposed_plan>\\nIteration: 9\\n# OtherRepo\\n</proposed_plan>\"}}]}}}}\n",
+        .{repo_b},
+    );
+    defer std.testing.allocator.free(session_other_content);
+    try tmp.dir.writeFile(.{
+        .sub_path = session_a_rel,
+        .data = session_a_content,
+    });
+    try tmp.dir.writeFile(.{
+        .sub_path = session_b_rel,
+        .data = session_b_content,
+    });
+    try tmp.dir.writeFile(.{
+        .sub_path = session_other_rel,
+        .data = session_other_content,
+    });
+
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "plan-search-stats.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const args = [_][]const u8{
+        "--root",
+        sessions_abs,
+        "--repo",
+        repo_a,
+        "--sort",
+        "timestamp",
+        "--stats",
+        "--format",
+        "json",
+    };
+    const got = try runCommandWithOutput(std.testing.allocator, .plan_search, args[0..], output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "OtherRepo") == null);
+    const older_idx = std.mem.indexOf(u8, got, "\"title\": \"# Older\"") orelse unreachable;
+    const newer_idx = std.mem.indexOf(u8, got, "\"title\": \"# Newer\"") orelse unreachable;
+    try std.testing.expect(older_idx < newer_idx);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"used_repo_filter\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"plan_blocks_found\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"candidate_files\": 3") != null);
 }
 
 test "session-tooling summary groups by primary executable" {
