@@ -316,9 +316,9 @@ const CohortStats = struct {
 };
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
@@ -1067,7 +1067,6 @@ fn cmdRecall(
     for (rows.items, 0..) |row, row_index| {
         const row_id = rowString(row, "id");
         if (drop_superseded and row_id.len > 0 and superseded.contains(row_id)) continue;
-
         const learning = rowString(row, "learning");
         const application = rowString(row, "application");
         const tags_text = rowString(row, "tags_text");
@@ -1097,8 +1096,8 @@ fn cmdRecall(
 
         if (overlap == 0 and tool_match == 0.0 and path_match == 0.0) continue;
 
-        const captured_at = rowString(row, "captured_at");
         const recency = blk: {
+            const captured_at = rowString(row, "captured_at");
             if (captured_at.len == 0) break :blk 0.0;
             if (parseIsoTimestampSeconds(captured_at)) |captured_sec| {
                 const delta = @as(f64, @floatFromInt(@max(now_sec - captured_sec, 0)));
@@ -1138,8 +1137,11 @@ fn cmdRecall(
     defer deinitOwnedStringMapValues(allocator, &theme_counts);
 
     for (candidates.items) |candidate| {
-        const row = rows.items[candidate.row_index];
-        const theme = try computeThemeAlloc(allocator, rowString(row, "tags_text"), rowString(row, "learning"));
+        const theme = try computeThemeAlloc(
+            allocator,
+            rowString(rows.items[candidate.row_index], "tags_text"),
+            rowString(rows.items[candidate.row_index], "learning"),
+        );
         defer allocator.free(theme);
 
         var allow = true;
