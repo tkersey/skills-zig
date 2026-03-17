@@ -387,6 +387,7 @@ pub fn run(
         .orchestration_concurrency => try cmdOrchestrationConcurrency(allocator, sessions_root, opts),
         .find_session => try cmdFindSession(allocator, sessions_root, opts),
         .plan_search => try cmdPlanSearch(allocator, sessions_root, opts),
+        .reply_latency => try cmdReplyLatency(allocator, sessions_root, opts),
         .session_prompts => try cmdSessionPrompts(allocator, sessions_root, opts),
         .report_bundle => try cmdReportBundle(allocator, sessions_root, opts),
         .section_audit => try cmdSectionAudit(allocator, sessions_root, opts),
@@ -452,6 +453,14 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\                           Order oldest-first or newest-first (default: -timestamp)
         \\  --include-body            Include the exact <proposed_plan> block in output rows
         \\  --stats                   Emit scan counters and filter-usage flags
+        ,
+        .reply_latency =>
+        \\usage: seq reply-latency [--session-id <id>|--path <jsonl>|--current] [--mode single-message|contiguous] [--since <iso>] [--until <iso>] [--limit N] [--format table|json|csv|jsonl]
+        \\extra options:
+        \\  --path <path>              Inspect exactly one rollout/session JSONL file
+        \\  --session-id <id>          Resolve exactly one session file by session id substring
+        \\  --current                  Resolve current session via CODEX_THREAD_ID
+        \\  --mode <name>              single-message (default) | contiguous
         ,
         .session_prompts =>
         \\usage: seq session-prompts [--session-id <id>|--path <jsonl>|--current] [--roles <csv>] [--since <iso>] [--until <iso>] [--strip-skill-blocks] [--no-dedupe-exact] [--limit N] [--format table|json|csv|jsonl]
@@ -532,21 +541,21 @@ fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
         .occurrence_export => {
             if (fmt == .table) return error.InvalidFormatForCommand;
         },
-        .artifact_search, .orchestration_concurrency, .find_session, .plan_search, .session_prompts, .query, .token_usage, .routing_gap, .session_tooling, .query_diagnose, .opencode_prompts, .opencode_events => {},
+        .artifact_search, .orchestration_concurrency, .find_session, .plan_search, .reply_latency, .session_prompts, .query, .token_usage, .routing_gap, .session_tooling, .query_diagnose, .opencode_prompts, .opencode_events => {},
         .unknown => return error.InvalidCommand,
     }
 }
 
 fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_path = switch (cmd) {
-        .artifact_search, .orchestration_concurrency, .plan_search, .session_prompts, .session_tooling, .query_diagnose => true,
+        .artifact_search, .orchestration_concurrency, .plan_search, .reply_latency, .session_prompts, .session_tooling, .query_diagnose => true,
         else => false,
     };
     const supports_session_id = switch (cmd) {
-        .artifact_search, .orchestration_concurrency, .plan_search, .session_prompts, .session_tooling => true,
+        .artifact_search, .orchestration_concurrency, .plan_search, .reply_latency, .session_prompts, .session_tooling => true,
         else => false,
     };
-    const supports_current = cmd == .session_prompts;
+    const supports_current = cmd == .session_prompts or cmd == .reply_latency;
     const supports_roles_csv = cmd == .session_prompts or cmd == .artifact_search;
     const supports_strip_skill_blocks = cmd == .session_prompts or cmd == .artifact_search;
     const supports_no_dedupe_exact = cmd == .session_prompts or cmd == .artifact_search;
@@ -593,7 +602,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_repo = cmd == .plan_search;
     const supports_status = cmd == .opencode_events;
     const supports_mode = switch (cmd) {
-        .opencode_prompts, .opencode_events => true,
+        .opencode_prompts, .opencode_events, .reply_latency => true,
         else => false,
     };
     const supports_kind = cmd == .artifact_search;
@@ -614,6 +623,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .find_session,
         .artifact_search,
         .plan_search,
+        .reply_latency,
         .session_prompts,
         .report_bundle,
         .section_audit,
@@ -634,6 +644,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .find_session,
         .artifact_search,
         .plan_search,
+        .reply_latency,
         .session_prompts,
         .report_bundle,
         .section_audit,
@@ -3216,6 +3227,63 @@ fn parseSessionPromptMessageOptions(opts: Options) !datasets.messages.ParseOptio
     };
 }
 
+const ReplyLatencyMode = enum {
+    single_message,
+    contiguous,
+
+    fn parse(raw: ?[]const u8) !ReplyLatencyMode {
+        const value = raw orelse return .single_message;
+        if (std.mem.eql(u8, value, "single-message")) return .single_message;
+        if (std.mem.eql(u8, value, "contiguous")) return .contiguous;
+        printCliError("error: invalid --mode value {s}; expected single-message or contiguous\n", .{value});
+        return error.InvalidModeArg;
+    }
+
+    fn cliName(self: ReplyLatencyMode) []const u8 {
+        return switch (self) {
+            .single_message => "single-message",
+            .contiguous => "contiguous",
+        };
+    }
+};
+
+const ReplyLatencyPending = struct {
+    start_timestamp: []const u8,
+    start_epoch_ms: i64,
+    user_messages: i64,
+    user_text_len_total: i64,
+    preview_parts: std.ArrayList([]const u8),
+
+    fn init(
+        allocator: std.mem.Allocator,
+        start_timestamp: []const u8,
+        start_epoch_ms: i64,
+        first_text: []const u8,
+        first_len: usize,
+    ) !ReplyLatencyPending {
+        var preview_parts: std.ArrayList([]const u8) = .empty;
+        errdefer preview_parts.deinit(allocator);
+        try preview_parts.append(allocator, first_text);
+        return .{
+            .start_timestamp = start_timestamp,
+            .start_epoch_ms = start_epoch_ms,
+            .user_messages = 1,
+            .user_text_len_total = @intCast(first_len),
+            .preview_parts = preview_parts,
+        };
+    }
+
+    fn appendUser(self: *ReplyLatencyPending, allocator: std.mem.Allocator, text: []const u8, text_len: usize) !void {
+        self.user_messages += 1;
+        self.user_text_len_total += @intCast(text_len);
+        try self.preview_parts.append(allocator, text);
+    }
+
+    fn deinit(self: *ReplyLatencyPending, allocator: std.mem.Allocator) void {
+        self.preview_parts.deinit(allocator);
+    }
+};
+
 fn collectSessionPromptRows(
     allocator: std.mem.Allocator,
     input_paths: []const []u8,
@@ -3268,6 +3336,225 @@ fn cmdSessionPrompts(allocator: std.mem.Allocator, sessions_root: []const u8, op
     defer result.deinit(allocator);
 
     try output.writeOutput(allocator, opts.format, result.rows.items, select[0..], opts.out_path);
+}
+
+fn cmdReplyLatency(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    const mode = try ReplyLatencyMode.parse(opts.mode);
+    const parse_options = datasets.messages.ParseOptions{
+        .include_user = true,
+        .include_assistant = true,
+        .strip_echo_assistant = true,
+        .skip_meta_user_messages = true,
+        .dedupe_by_role_and_text = false,
+        .strip_skill_blocks = false,
+    };
+
+    // Do not day-filter by session path: long-lived sessions can produce reply spans days after the file's path date.
+    var input_paths = try resolveSessionPromptInputPaths(allocator, sessions_root, opts, null);
+    defer freePathList(allocator, &input_paths);
+
+    var rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &rows);
+
+    for (input_paths.items) |path| {
+        const content = try readFileAllocOrSkip(allocator, path);
+        if (content == null) continue;
+        defer allocator.free(content.?);
+
+        const parsed = try datasets.messages.parseJsonl(allocator, path, content.?, parse_options);
+        defer datasets.messages.freeRows(allocator, parsed);
+
+        try appendReplyLatencyRowsForSession(allocator, path, parsed, mode, opts, &rows);
+    }
+
+    const columns = [_][]const u8{
+        "path",
+        "session_id",
+        "turn_index",
+        "start_timestamp",
+        "end_timestamp",
+        "duration_seconds",
+        "duration_human",
+        "mode",
+        "user_messages",
+        "user_text_len_total",
+        "user_preview",
+        "assistant_preview",
+    };
+    const sort = [_]spec.SortSpec{
+        .{ .field = "duration_seconds", .descending = true },
+        .{ .field = "start_timestamp", .descending = true },
+        .{ .field = "path", .descending = false },
+        .{ .field = "turn_index", .descending = false },
+    };
+    const query_spec = spec.QuerySpec{
+        .select = columns[0..],
+        .sort = sort[0..],
+        .limit = if (opts.limit == 0) 10 else opts.limit,
+    };
+    var result = try query.execute(allocator, rows.items, query_spec);
+    defer result.deinit(allocator);
+
+    try output.writeOutput(allocator, opts.format, result.rows.items, columns[0..], opts.out_path);
+}
+
+fn appendReplyLatencyRowsForSession(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    parsed: []const datasets.messages.MessageRow,
+    mode: ReplyLatencyMode,
+    opts: Options,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    const session_id = inferSessionIdFromPath(path);
+    var turn_index: i64 = 0;
+    var pending: ?ReplyLatencyPending = null;
+    var previous_role: ?[]const u8 = null;
+    var previous_text: ?[]const u8 = null;
+    var previous_epoch_ms: ?i64 = null;
+    defer if (pending) |*value| value.deinit(allocator);
+
+    for (parsed) |row| {
+        const row_epoch_ms = if (row.timestamp) |timestamp| parseIsoTimestampMillis(timestamp) else null;
+        if (isAdjacentMirroredDuplicate(previous_role, previous_text, previous_epoch_ms, row.role, row.text, row_epoch_ms)) {
+            continue;
+        }
+        previous_role = row.role;
+        previous_text = row.text;
+        previous_epoch_ms = row_epoch_ms;
+
+        if (std.mem.eql(u8, row.role, "user")) {
+            const start_timestamp = row.timestamp orelse {
+                if (pending) |*value| {
+                    value.deinit(allocator);
+                    pending = null;
+                }
+                continue;
+            };
+            const start_epoch_ms = row_epoch_ms orelse {
+                if (pending) |*value| {
+                    value.deinit(allocator);
+                    pending = null;
+                }
+                continue;
+            };
+
+            if (pending) |*value| {
+                try value.appendUser(allocator, row.text, row.text_len);
+            } else {
+                pending = try ReplyLatencyPending.init(
+                    allocator,
+                    start_timestamp,
+                    start_epoch_ms,
+                    row.text,
+                    row.text_len,
+                );
+            }
+            continue;
+        }
+
+        if (!std.mem.eql(u8, row.role, "assistant")) continue;
+        if (pending == null) continue;
+
+        const end_timestamp = row.timestamp orelse {
+            pending.?.deinit(allocator);
+            pending = null;
+            continue;
+        };
+        const end_epoch_ms = row_epoch_ms orelse {
+            pending.?.deinit(allocator);
+            pending = null;
+            continue;
+        };
+
+        const should_emit = switch (mode) {
+            .single_message => pending.?.user_messages == 1,
+            .contiguous => true,
+        };
+        if (should_emit) {
+            turn_index += 1;
+            if (timestampSatisfiesBounds(pending.?.start_timestamp, opts)) {
+                try appendReplyLatencyRow(
+                    allocator,
+                    out_rows,
+                    path,
+                    session_id,
+                    turn_index,
+                    pending.?,
+                    end_timestamp,
+                    end_epoch_ms,
+                    row.text,
+                    mode,
+                );
+            }
+        }
+
+        pending.?.deinit(allocator);
+        pending = null;
+    }
+}
+
+fn isAdjacentMirroredDuplicate(
+    previous_role: ?[]const u8,
+    previous_text: ?[]const u8,
+    previous_epoch_ms: ?i64,
+    role: []const u8,
+    text: []const u8,
+    epoch_ms: ?i64,
+) bool {
+    const last_role = previous_role orelse return false;
+    const last_text = previous_text orelse return false;
+    if (!std.mem.eql(u8, last_role, role)) return false;
+    if (!std.mem.eql(u8, last_text, text)) return false;
+
+    if (previous_epoch_ms == null and epoch_ms == null) return true;
+    if (previous_epoch_ms) |last_ms| {
+        if (epoch_ms) |current_ms| {
+            const diff = current_ms - last_ms;
+            return diff >= -1 and diff <= 1;
+        }
+    }
+    return false;
+}
+
+fn appendReplyLatencyRow(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    path: []const u8,
+    session_id: []const u8,
+    turn_index: i64,
+    pending: ReplyLatencyPending,
+    end_timestamp: []const u8,
+    end_epoch_ms: i64,
+    assistant_text: []const u8,
+    mode: ReplyLatencyMode,
+) !void {
+    const duration_ms = end_epoch_ms - pending.start_epoch_ms;
+    if (duration_ms < 0) return;
+
+    const user_preview = try buildJoinedPreviewAlloc(allocator, pending.preview_parts.items, 160);
+    defer allocator.free(user_preview);
+    const assistant_preview = try buildCollapsedPreviewAlloc(allocator, assistant_text, 120);
+    defer allocator.free(assistant_preview);
+    const duration_human = try formatDurationHumanAlloc(allocator, duration_ms);
+    defer allocator.free(duration_human);
+
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+
+    try row.putOwnedKey("path", .{ .string = path });
+    try row.putOwnedKey("session_id", .{ .string = session_id });
+    try row.putOwnedKey("turn_index", .{ .int = turn_index });
+    try row.putOwnedKey("start_timestamp", .{ .string = pending.start_timestamp });
+    try row.putOwnedKey("end_timestamp", .{ .string = end_timestamp });
+    try row.putOwnedKey("duration_seconds", .{ .float = @as(f64, @floatFromInt(duration_ms)) / 1000.0 });
+    try row.putOwnedKey("duration_human", .{ .string = duration_human });
+    try row.putOwnedKey("mode", .{ .string = mode.cliName() });
+    try row.putOwnedKey("user_messages", .{ .int = pending.user_messages });
+    try row.putOwnedKey("user_text_len_total", .{ .int = pending.user_text_len_total });
+    try row.putOwnedKey("user_preview", .{ .string = user_preview });
+    try row.putOwnedKey("assistant_preview", .{ .string = assistant_preview });
+    try out_rows.append(allocator, row);
 }
 
 fn cmdReportBundle(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
@@ -5752,6 +6039,170 @@ fn trimQueryRows(rows: *std.ArrayList(query.Row), limit: usize) void {
     rows.items.len = limit;
 }
 
+fn previewPushByte(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    max_len: usize,
+    truncated: *bool,
+    byte: u8,
+) !void {
+    if (truncated.*) return;
+    if (out.items.len >= max_len) {
+        truncated.* = true;
+        return;
+    }
+    try out.append(allocator, byte);
+}
+
+fn previewPushSlice(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    text: []const u8,
+    max_len: usize,
+    truncated: *bool,
+) !void {
+    for (text) |byte| {
+        try previewPushByte(allocator, out, max_len, truncated, byte);
+        if (truncated.*) return;
+    }
+}
+
+fn appendCollapsedPreview(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    text: []const u8,
+    max_len: usize,
+    truncated: *bool,
+) !void {
+    var saw_visible = false;
+    var pending_space = false;
+    for (text) |byte| {
+        if (std.ascii.isWhitespace(byte)) {
+            if (saw_visible) pending_space = true;
+            continue;
+        }
+        if (pending_space and out.items.len > 0) {
+            try previewPushByte(allocator, out, max_len, truncated, ' ');
+            if (truncated.*) return;
+        }
+        pending_space = false;
+        saw_visible = true;
+        try previewPushByte(allocator, out, max_len, truncated, byte);
+        if (truncated.*) return;
+    }
+}
+
+fn finalizePreview(allocator: std.mem.Allocator, out: *std.ArrayList(u8), max_len: usize, truncated: bool) ![]u8 {
+    if (truncated and max_len > 0) {
+        const ellipsis = "...";
+        const keep_len = if (max_len > ellipsis.len) max_len - ellipsis.len else 0;
+        if (out.items.len > keep_len) out.items.len = keep_len;
+        while (out.items.len > 0 and out.items[out.items.len - 1] == ' ') out.items.len -= 1;
+        try out.appendSlice(allocator, ellipsis);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn buildCollapsedPreviewAlloc(allocator: std.mem.Allocator, text: []const u8, max_len: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    var truncated = false;
+    try appendCollapsedPreview(allocator, &out, text, max_len, &truncated);
+    return finalizePreview(allocator, &out, max_len, truncated);
+}
+
+fn buildJoinedPreviewAlloc(allocator: std.mem.Allocator, parts: []const []const u8, max_len: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    var truncated = false;
+    for (parts, 0..) |part, idx| {
+        if (idx > 0 and !truncated) {
+            try previewPushSlice(allocator, &out, " | ", max_len, &truncated);
+        }
+        if (truncated) break;
+        try appendCollapsedPreview(allocator, &out, part, max_len, &truncated);
+        if (truncated) break;
+    }
+    return finalizePreview(allocator, &out, max_len, truncated);
+}
+
+fn formatDurationHumanAlloc(allocator: std.mem.Allocator, duration_ms: i64) ![]u8 {
+    const safe_ms = @max(duration_ms, 0);
+    const total_seconds = @divFloor(safe_ms, 1000);
+    const millis: u16 = @intCast(@mod(safe_ms, 1000));
+    const hours = @divFloor(total_seconds, 3600);
+    const minutes = @divFloor(@mod(total_seconds, 3600), 60);
+    const seconds = @mod(total_seconds, 60);
+    if (hours > 0) {
+        return std.fmt.allocPrint(allocator, "{d}h {d}m {d}.{d:0>3}s", .{ hours, minutes, seconds, millis });
+    }
+    if (minutes > 0) {
+        return std.fmt.allocPrint(allocator, "{d}m {d}.{d:0>3}s", .{ minutes, seconds, millis });
+    }
+    return std.fmt.allocPrint(allocator, "{d}.{d:0>3}s", .{ seconds, millis });
+}
+
+fn parseIsoTimestampMillis(ts: []const u8) ?i64 {
+    if (ts.len < 20) return null;
+    if (ts[4] != '-' or ts[7] != '-' or ts[10] != 'T' or ts[13] != ':' or ts[16] != ':') return null;
+
+    const year = std.fmt.parseInt(i64, ts[0..4], 10) catch return null;
+    const month = std.fmt.parseInt(u8, ts[5..7], 10) catch return null;
+    const day = std.fmt.parseInt(u8, ts[8..10], 10) catch return null;
+    const hour = std.fmt.parseInt(i64, ts[11..13], 10) catch return null;
+    const minute = std.fmt.parseInt(i64, ts[14..16], 10) catch return null;
+    const second = std.fmt.parseInt(i64, ts[17..19], 10) catch return null;
+
+    if (month < 1 or month > 12) return null;
+    if (day < 1 or day > daysInMonthForCommands(@intCast(year), month)) return null;
+    if (hour < 0 or hour > 23 or minute < 0 or minute > 59 or second < 0 or second > 59) return null;
+
+    var idx: usize = 19;
+    var millis: i64 = 0;
+    if (idx < ts.len and ts[idx] == '.') {
+        idx += 1;
+        var digit_count: usize = 0;
+        while (idx < ts.len and std.ascii.isDigit(ts[idx])) : (idx += 1) {
+            if (digit_count < 3) millis = millis * 10 + (ts[idx] - '0');
+            digit_count += 1;
+        }
+        if (digit_count == 0) return null;
+        while (digit_count < 3) : (digit_count += 1) millis *= 10;
+    }
+
+    var offset_seconds: i64 = 0;
+    if (idx == ts.len - 1 and ts[idx] == 'Z') {
+        idx += 1;
+    } else {
+        if (idx + 6 != ts.len) return null;
+        const sign = ts[idx];
+        if (sign != '+' and sign != '-') return null;
+        if (ts[idx + 3] != ':') return null;
+        const offset_hours = std.fmt.parseInt(i64, ts[idx + 1 .. idx + 3], 10) catch return null;
+        const offset_minutes = std.fmt.parseInt(i64, ts[idx + 4 .. idx + 6], 10) catch return null;
+        if (offset_hours < 0 or offset_hours > 23 or offset_minutes < 0 or offset_minutes > 59) return null;
+        offset_seconds = offset_hours * 3600 + offset_minutes * 60;
+        if (sign == '-') offset_seconds = -offset_seconds;
+        idx += 6;
+    }
+    if (idx != ts.len) return null;
+
+    const days = daysFromCivil(year, month, day);
+    const day_seconds = hour * 3600 + minute * 60 + second - offset_seconds;
+    return (days * 86_400 + day_seconds) * 1000 + millis;
+}
+
+fn daysFromCivil(year: i64, month: u8, day: u8) i64 {
+    var adjusted_year = year;
+    if (month <= 2) adjusted_year -= 1;
+    const era = @divFloor(if (adjusted_year >= 0) adjusted_year else adjusted_year - 399, 400);
+    const yoe = adjusted_year - era * 400;
+    const shifted_month: i64 = @as(i64, @intCast(month)) + (if (month > 2) @as(i64, -3) else @as(i64, 9));
+    const doy = @divFloor(153 * shifted_month + 2, 5) + @as(i64, @intCast(day)) - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146_097 + doe - 719_468;
+}
+
 test "deriveSessionDayPathFilter honors day bounds for session datasets" {
     const where = [_]spec.WhereClause{
         .{
@@ -6196,6 +6647,145 @@ test "session-prompts preserves duplicates when no-dedupe-exact is set" {
 
     const first = std.mem.indexOf(u8, got, "\"text\": \"repeat\"") orelse unreachable;
     try std.testing.expect(std.mem.indexOfPos(u8, got, first + 1, "\"text\": \"repeat\"") != null);
+}
+
+test "reply-latency defaults to single-message mode with clipped previews" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("2026/03/10");
+    const session_rel = "2026/03/10/rollout-2026-03-10T10-00-00-019c0000-0000-7000-8000-000000000030.jsonl";
+    const session_content =
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Single longest\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:01:30.250Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"First reply\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:02:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Part one\"}]}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-10T10:02:05Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"Part two\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:03:10.500Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Grouped reply\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:03:20Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Quick prompt\"}]}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-10T10:03:25.125Z\",\"payload\":{\"type\":\"agent_message\",\"message\":\"Echo: prior question\\n\\nReply after echo\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:03:30Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"repeat\"}]}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-10T10:03:31Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"repeat\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:03:45Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Duplicate reply\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:04:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Trailing user\"}]}}\n";
+    try tmp.dir.writeFile(.{ .sub_path = session_rel, .data = session_content });
+
+    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_abs);
+    const session_abs = try std.fs.path.join(std.testing.allocator, &.{ root_abs, session_rel });
+    defer std.testing.allocator.free(session_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "reply-latency-default.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const args = [_][]const u8{
+        "--root",
+        root_abs,
+        "--path",
+        session_abs,
+        "--format",
+        "json",
+    };
+    const got = try runCommandWithOutput(std.testing.allocator, .reply_latency, args[0..], output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"mode\": \"single-message\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"turn_index\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"turn_index\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"duration_seconds\": 90.25") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"duration_seconds\": 5.125") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"user_preview\": \"Single longest\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"assistant_preview\": \"Reply after echo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "Part one | Part two") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "repeat | repeat") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "Trailing user") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "Echo:") == null);
+}
+
+test "reply-latency contiguous mode preserves multi-message blocks and filters by start timestamp" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("2026/03/10");
+    const session_rel = "2026/03/10/rollout-2026-03-10T10-00-00-019c0000-0000-7000-8000-000000000031.jsonl";
+    const session_content =
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Before window\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:00:10Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Skip me\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:02:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Part one\"}]}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-10T10:02:05Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"Part two\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:03:10.500Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Grouped reply\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:03:20Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Quick prompt\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:03:25.125Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Quick reply\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:03:30Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"repeat\"}]}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-10T10:03:31Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"repeat\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:03:45Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Duplicate reply\"}]}}\n";
+    try tmp.dir.writeFile(.{ .sub_path = session_rel, .data = session_content });
+
+    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "reply-latency-contiguous.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const args = [_][]const u8{
+        "--root",
+        root_abs,
+        "--mode",
+        "contiguous",
+        "--since",
+        "2026-03-10T10:02:00Z",
+        "--until",
+        "2026-03-10T10:03:29Z",
+        "--format",
+        "json",
+    };
+    const got = try runCommandWithOutput(std.testing.allocator, .reply_latency, args[0..], output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"mode\": \"contiguous\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"turn_index\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"turn_index\": 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"user_preview\": \"Part one | Part two\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"duration_seconds\": 70.5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"user_preview\": \"Quick prompt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "Duplicate reply") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "Before window") == null);
+}
+
+test "reply-latency skips invalid and incomplete turns" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("2026/03/10");
+    const session_rel = "2026/03/10/rollout-2026-03-10T10-00-00-019c0000-0000-7000-8000-000000000032.jsonl";
+    const session_content =
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"missing start\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:00:10Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"should skip\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:01:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"missing end\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"still skip\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:02:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"valid\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:02:02.250Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"kept\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:03:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"trailing\"}]}}\n";
+    try tmp.dir.writeFile(.{ .sub_path = session_rel, .data = session_content });
+
+    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "reply-latency-invalid.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const args = [_][]const u8{
+        "--root",
+        root_abs,
+        "--mode",
+        "contiguous",
+        "--format",
+        "json",
+    };
+    const got = try runCommandWithOutput(std.testing.allocator, .reply_latency, args[0..], output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"user_preview\": \"valid\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"duration_seconds\": 2.25") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "missing start") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "missing end") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "trailing") == null);
 }
 
 test "plan-search extracts strict proposed_plan blocks from a targeted file" {

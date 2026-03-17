@@ -116,6 +116,42 @@ test "golden routing-gap json" {
     try std.testing.expectEqualStrings(expected, got);
 }
 
+test "golden reply-latency default json" {
+    const args = [_][]const u8{
+        "--root",
+        "testdata/golden/reply-latency/sessions",
+        "--format",
+        "json",
+    };
+
+    const got = try runAndReadOutput(std.testing.allocator, .reply_latency, args[0..], ".zig-cache/golden-reply-latency-default.json");
+    defer std.testing.allocator.free(got);
+
+    const expected = try readExpected(std.testing.allocator, "testdata/golden/expected/reply-latency-default.json");
+    defer std.testing.allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, got);
+}
+
+test "golden reply-latency contiguous jsonl" {
+    const args = [_][]const u8{
+        "--root",
+        "testdata/golden/reply-latency/sessions",
+        "--mode",
+        "contiguous",
+        "--format",
+        "jsonl",
+    };
+
+    const got = try runAndReadOutput(std.testing.allocator, .reply_latency, args[0..], ".zig-cache/golden-reply-latency-contiguous.jsonl");
+    defer std.testing.allocator.free(got);
+
+    const expected = try readExpected(std.testing.allocator, "testdata/golden/expected/reply-latency-contiguous.jsonl");
+    defer std.testing.allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, got);
+}
+
 test "golden opencode-prompts jsonl" {
     const args = [_][]const u8{
         "--source",

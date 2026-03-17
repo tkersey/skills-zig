@@ -39,6 +39,7 @@ test "bootstrap parse coverage" {
     try std.testing.expectEqual(lib.Command.orchestration_concurrency, lib.parseCommand("orchestration-concurrency"));
     try std.testing.expectEqual(lib.Command.find_session, lib.parseCommand("find-session"));
     try std.testing.expectEqual(lib.Command.plan_search, lib.parseCommand("plan-search"));
+    try std.testing.expectEqual(lib.Command.reply_latency, lib.parseCommand("reply-latency"));
     try std.testing.expectEqual(lib.Command.session_prompts, lib.parseCommand("session-prompts"));
     try std.testing.expectEqual(lib.Command.report_bundle, lib.parseCommand("report-bundle"));
     try std.testing.expectEqual(lib.Command.section_audit, lib.parseCommand("section-audit"));

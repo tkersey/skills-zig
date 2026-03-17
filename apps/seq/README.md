@@ -41,6 +41,8 @@ Binary output:
 ./zig-out/bin/seq plan-search --root ~/.codex/sessions --repo /Users/tk/workspace/tk/shift --since 2026-03-01T00:00:00Z --format table
 ./zig-out/bin/seq plan-search --root ~/.codex/sessions --repo /Users/tk/workspace/tk/shift --contains "PromptMode" --stats --format jsonl
 ./zig-out/bin/seq plan-search --root ~/.codex/sessions --session-id 019ce80b-9fb4-72a1-9c1e-3d626d4e4913 --include-body --format jsonl
+./zig-out/bin/seq reply-latency --root ~/.codex/sessions --limit 10 --format table
+./zig-out/bin/seq reply-latency --root ~/.codex/sessions --mode contiguous --since 2026-03-01T00:00:00Z --until 2026-03-05T00:00:00Z --format json
 ./zig-out/bin/seq session-tooling --root ~/.codex/sessions --since 2026-03-08T00:00:00Z --until 2026-03-10T23:59:59Z --summary --group-by executable --format table
 ./zig-out/bin/seq query-diagnose --path /absolute/path/to/rollout.jsonl --threshold-ms 10000 --next-actions --format json
 ./zig-out/bin/seq artifact-search --contains "spawn_agent" --kind orchestration --since 2026-03-01T00:00:00Z --limit 10 --format table
@@ -66,6 +68,11 @@ Binary output:
 - matches by repo (`--repo`), session (`--session-id` / `--path`), time (`--since` / `--until`), and title/body text (`--contains` / `--regex`)
 - defaults to newest-first metadata rows and exposes the exact plan block only with `--include-body`
 - `--stats` adds scan counters (`candidate_files`, `files_opened`, `messages_examined`, `plan_blocks_found`, `rows_emitted`, `duration_ms`) plus filter-usage flags
+
+`reply-latency` computes reply waits from ordered user/assistant message sequences:
+- default mode is `single-message`, which measures one user message to the next assistant reply
+- `--mode contiguous` measures a contiguous block of user messages to the next assistant reply
+- emits `turn_index`, timestamps, numeric/human duration, per-turn user message counts, and compact previews
 
 `artifact-search` is the seq-first forensic entrypoint:
 - searches `messages`, `tool_calls`, and `memory_blocks` with one normalized result shape

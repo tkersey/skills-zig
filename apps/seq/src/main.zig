@@ -29,6 +29,7 @@ fn shouldSuppressCliError(err: anyerror) bool {
         error.AmbiguousSessionTarget,
         error.CurrentSessionUnavailable,
         error.InvalidRoleArg,
+        error.InvalidModeArg,
         error.QueryHangDetected,
         => true,
         else => false,
