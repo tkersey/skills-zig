@@ -15,6 +15,8 @@ Native Zig CLI for dependency-aware plan state in `.step/st-plan.jsonl`.
 - `reclaim-stale`
 - `import-mesh-results`
 
+Public contract note: `st` is the required public OrchPlan handoff for orchestration execution; do not document a separate same-turn non-`st` mode.
+
 ## Build
 
 ```bash
