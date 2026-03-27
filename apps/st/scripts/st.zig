@@ -1052,8 +1052,10 @@ fn parseArgs(argv: []const []const u8) !Args {
         .import_plan => if (args.input == null) return error.MissingInputValue,
         .import_orchplan => if (args.input == null) return error.MissingInputValue,
         .claim => {
-            if (std.mem.trim(u8, args.ids, " \t\r\n").len == 0) return error.MissingIdsValue;
             if (args.executor == null) return error.MissingValue;
+            if (args.wave == null and std.mem.trim(u8, args.ids, " \t\r\n").len == 0) {
+                return error.MissingIdsValue;
+            }
         },
         .heartbeat => if (args.id == null) return error.MissingIdValue,
         .set_runtime => {
@@ -1228,6 +1230,21 @@ fn parseCliIds(allocator: std.mem.Allocator, raw: []const u8) ![][]const u8 {
         if (seen.get(item_id) != null) continue;
         try seen.put(item_id, {});
         try out.append(allocator, item_id);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn collectOrchplanWaveTargetIds(
+    allocator: std.mem.Allocator,
+    state: *const ItemState,
+    wave_id: []const u8,
+) ![][]const u8 {
+    var out = std.ArrayList([]const u8).empty;
+    for (state.items.items) |item| {
+        const source = item.source orelse continue;
+        if (!std.mem.eql(u8, source.kind, "orchplan")) continue;
+        if (!std.mem.eql(u8, source.wave_id, wave_id)) continue;
+        try out.append(allocator, item.id);
     }
     return out.toOwnedSlice(allocator);
 }
@@ -1766,12 +1783,23 @@ fn cmdClaim(allocator: std.mem.Allocator, args: Args) !u8 {
     var state = loaded.state;
     defer state.deinit();
 
-    const target_ids = try parseCliIds(allocator, args.ids);
     const executor = try normalizeExecutor(allocator, args.executor.?);
     const wave_id = if (args.wave) |raw|
         try requireNonEmptyString(allocator, raw, "--wave")
     else
         "manual";
+    const orchplan_wave_ids = if (args.wave != null)
+        try collectOrchplanWaveTargetIds(allocator, &state, wave_id)
+    else
+        &.{};
+    const explicit_ids = try parseCliIds(allocator, args.ids);
+    const target_ids = if (orchplan_wave_ids.len > 0) blk: {
+        if (explicit_ids.len > 0) return error.OrchplanWaveClaimDoesNotAcceptIds;
+        break :blk orchplan_wave_ids;
+    } else blk: {
+        if (explicit_ids.len == 0) return error.MissingIdsValue;
+        break :blk explicit_ids;
+    };
     const lease_seconds = try parseLeaseSeconds(args.lease_seconds orelse "900");
     const now = try nowUtcAlloc(allocator);
     const lease_expires_at = try addSecondsUtcAlloc(allocator, std.time.timestamp() + lease_seconds);
@@ -5037,7 +5065,7 @@ test "import-orchplan and claim-safe runtime allow parallel wave progress" {
     );
 
     _ = try cmdImportOrchplan(allocator, .{ .command = .import_orchplan, .file = plan_path, .input = orchplan_path, .replace = true });
-    _ = try cmdClaim(allocator, .{ .command = .claim, .file = plan_path, .ids = "cfg,ui", .executor = "teams", .wave = "w1" });
+    _ = try cmdClaim(allocator, .{ .command = .claim, .file = plan_path, .executor = "teams", .wave = "w1" });
     _ = try cmdSetRuntime(allocator, .{ .command = .set_runtime, .file = plan_path, .id = "cfg", .substrate = "spawn_agent", .thread_id = "thread-cfg" });
     _ = try cmdSetRuntime(allocator, .{ .command = .set_runtime, .file = plan_path, .id = "ui", .substrate = "spawn_agent", .thread_id = "thread-ui" });
 
@@ -5052,6 +5080,40 @@ test "import-orchplan and claim-safe runtime allow parallel wave progress" {
     try std.testing.expectEqualStrings("w1", cfg.claim.?.wave_id);
     try std.testing.expectEqualStrings("src/config", cfg.claim.?.lock_roots[0]);
     try std.testing.expectEqualStrings("src/ui", ui.claim.?.lock_roots[0]);
+}
+
+test "orchplan-backed claim rejects explicit ids when wave is authoritative" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
+    const orchplan_path = try std.fs.path.join(allocator, &.{ root, "orchplan.yaml" });
+    try writeTextAtomic(allocator, orchplan_path,
+        \\schema_version: 1
+        \\kind: OrchPlan
+        \\tasks:
+        \\  - id: cfg
+        \\    title: Update config loader
+        \\    agent: worker
+        \\    scope: ["src/config/**"]
+        \\waves:
+        \\  - id: w1
+        \\    tasks: [cfg]
+    );
+
+    _ = try cmdImportOrchplan(allocator, .{ .command = .import_orchplan, .file = plan_path, .input = orchplan_path, .replace = true });
+    try std.testing.expectError(error.OrchplanWaveClaimDoesNotAcceptIds, cmdClaim(allocator, .{
+        .command = .claim,
+        .file = plan_path,
+        .ids = "cfg",
+        .executor = "teams",
+        .wave = "w1",
+    }));
 }
 
 test "reclaim-stale and import-mesh-results reconcile execution metadata" {
@@ -5082,7 +5144,7 @@ test "reclaim-stale and import-mesh-results reconcile execution metadata" {
     );
 
     _ = try cmdImportOrchplan(allocator, .{ .command = .import_orchplan, .file = plan_path, .input = orchplan_path, .replace = true });
-    _ = try cmdClaim(allocator, .{ .command = .claim, .file = plan_path, .ids = "api", .executor = "mesh", .wave = "w1", .lease_seconds = "60" });
+    _ = try cmdClaim(allocator, .{ .command = .claim, .file = plan_path, .executor = "mesh", .wave = "w1", .lease_seconds = "60" });
     _ = try cmdSetRuntime(allocator, .{ .command = .set_runtime, .file = plan_path, .id = "api", .substrate = "spawn_agents_on_csv", .row_id = "api" });
     _ = try cmdReclaimStale(allocator, .{ .command = .reclaim_stale, .file = plan_path, .now = "2099-01-01T00:00:00Z" });
 

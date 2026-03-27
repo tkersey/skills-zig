@@ -33,7 +33,7 @@ zig build run-st -- --help
 zig build run-st -- add --file .step/st-plan.jsonl --step "Reproduce issue" --priority high
 zig build run-st -- set-priority --file .step/st-plan.jsonl --id st-001 --priority medium
 zig build run-st -- import-orchplan --file .step/st-plan.jsonl --input .step/orchplan.yaml
-zig build run-st -- claim --file .step/st-plan.jsonl --ids "cfg,ui" --executor teams --wave w1
+zig build run-st -- claim --file .step/st-plan.jsonl --wave w1 --executor teams
 zig build run-st -- set-runtime --file .step/st-plan.jsonl --id cfg --substrate spawn_agent --thread-id thread-cfg
 zig build run-st -- set-proof --file .step/st-plan.jsonl --id cfg --proof-state pass --command "zig build test-st" --evidence-ref .step/proof.log
 zig build run-st -- import-mesh-results --file .step/st-plan.jsonl --input .step/mesh-output.csv
