@@ -84,7 +84,7 @@ pub const Client = struct {
     }
 
     pub fn close(self: *Client) void {
-        self.stdin_file.close();
+        _ = self.child.kill() catch {};
         _ = self.child.wait() catch {};
     }
 

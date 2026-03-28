@@ -9,11 +9,12 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - `scripts/cas_conformance_suite.zig`
 - `scripts/cas_smoke_check.zig`
 - `scripts/cas_instance_runner.zig`
+- `scripts/cas_review_session.zig`
 - `scripts/cas_proxy_client.zig`
 
 ## Behavior
 
-- `cas` dispatches `conformance`, `smoke_check`, and `instance_runner`.
+- `cas` dispatches `conformance`, `smoke_check`, `instance_runner`, and `review_session`.
 - `cas_conformance_suite` verifies claim-safe wave handling, stale-claim reclaim, mesh result accountability, and bounded overload retry behavior.
 - `cas_smoke_check` verifies the native v2 handshake plus `experimentalFeature/list`, `thread/start`, `thread/resume`, `turn/start`, `turn/interrupt`, and `turn/steer`.
 - `cas_instance_runner` executes one app-server method per isolated instance and now supports native responses for:
@@ -24,12 +25,26 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
   - `mcpServer/elicitation/request`
   - `item/tool/call`
 - By default, permissions requests are denied, request-user-input questions are answered with the first option label when present, MCP elicitations are declined, and dynamic tool calls return `success: false` with an explanatory text item.
+- `cas_review_session` starts detached `review/start` turns, persists the detached `reviewThreadId` as the recoverable handle, appends raw request/response artifacts to an NDJSON log, and supports fresh-process `status`, `wait`, and `interrupt`.
+- If detached review on a freshly created parent thread still fails with `no rollout found`, the installed `codex` binary is older than the parent-rollout fix; upgrade `codex` or pass `--parent-thread-id` for an already materialized parent thread.
 
 ## API Examples
 
 ```bash
 # Run the dispatcher help surface.
 cas --help
+
+# Start a detached review session for the working tree.
+cas review_session start \
+  --cwd /path/to/workspace \
+  --uncommitted \
+  --json
+
+# Poll a detached review session from a fresh process.
+cas review_session wait \
+  --review-thread-id thr_123 \
+  --timeout-ms 60000 \
+  --json
 
 # Run one conformance scenario with JSON output.
 cas conformance --cwd /path/to/workspace --scenario mesh_row_accountability --json

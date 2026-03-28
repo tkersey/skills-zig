@@ -16,11 +16,13 @@ const UsageText =
     \\Subcommands:
     \\  conformance     | conformance-suite  Run cas_conformance_suite.
     \\  instance_runner | instance-runner   Run cas_instance_runner.
+    \\  review_session  | review-session    Run cas_review_session.
     \\  smoke_check     | smoke-check       Run cas_smoke_check.
     \\
     \\Examples:
     \\  cas conformance --cwd /path/to/repo --json
     \\  cas instance_runner --cwd /path/to/repo --instances 4
+    \\  cas review_session start --cwd /path/to/repo --uncommitted --json
     \\  cas smoke_check --cwd /path/to/repo --json
     \\
     \\Options:
@@ -78,6 +80,9 @@ fn resolveTarget(subcommand: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, subcommand, "instance_runner") or std.mem.eql(u8, subcommand, "instance-runner")) {
         return "cas_instance_runner";
     }
+    if (std.mem.eql(u8, subcommand, "review_session") or std.mem.eql(u8, subcommand, "review-session")) {
+        return "cas_review_session";
+    }
     if (std.mem.eql(u8, subcommand, "smoke_check") or std.mem.eql(u8, subcommand, "smoke-check")) {
         return "cas_smoke_check";
     }
@@ -89,6 +94,8 @@ test "resolveTarget supports supported subcommands" {
     try std.testing.expectEqualStrings("cas_conformance_suite", resolveTarget("conformance-suite").?);
     try std.testing.expectEqualStrings("cas_instance_runner", resolveTarget("instance_runner").?);
     try std.testing.expectEqualStrings("cas_instance_runner", resolveTarget("instance-runner").?);
+    try std.testing.expectEqualStrings("cas_review_session", resolveTarget("review_session").?);
+    try std.testing.expectEqualStrings("cas_review_session", resolveTarget("review-session").?);
     try std.testing.expectEqualStrings("cas_smoke_check", resolveTarget("smoke_check").?);
     try std.testing.expectEqualStrings("cas_smoke_check", resolveTarget("smoke-check").?);
     try std.testing.expect(resolveTarget("unknown") == null);

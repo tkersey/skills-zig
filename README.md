@@ -6,7 +6,7 @@ Monorepo for Zig CLIs with shared internal libraries and independent release str
 
 - `seq` (session/memory mining)
 - `lift` (`bench_stats`, `perf_report`)
-- `cas` (`cas_smoke_check`, `cas_instance_runner`)
+- `cas` (`cas_smoke_check`, `cas_instance_runner`, `cas_review_session`)
 - `cron` (`cron`)
 - `puff` (`puff`)
 - `learnings` (`learnings append` primary, `append_learning` compatibility)

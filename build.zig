@@ -161,6 +161,17 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = cas_meta },
         },
     });
+    const cas_review_session_root = b.createModule(.{
+        .root_source_file = b.path("apps/cas/scripts/cas_review_session.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_json", .module = core_json },
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "core_path", .module = core_path },
+            .{ .name = "app_meta", .module = cas_meta },
+        },
+    });
     const cas_conformance_root = b.createModule(.{
         .root_source_file = b.path("apps/cas/scripts/cas_conformance_suite.zig"),
         .target = target,
@@ -306,6 +317,7 @@ pub fn build(b: *std.Build) void {
     const lift_bench_perf = addExecutable(b, "lift-perf-bench-stats", lift_bench_perf_root);
     const cas_smoke_check = addExecutable(b, "cas_smoke_check", cas_smoke_root);
     const cas_instance_runner = addExecutable(b, "cas_instance_runner", cas_runner_root);
+    const cas_review_session = addExecutable(b, "cas_review_session", cas_review_session_root);
     const cas_conformance_suite = addExecutable(b, "cas_conformance_suite", cas_conformance_root);
     const cas_budget_perf = addExecutable(b, "cas-perf-budget-governor", cas_budget_perf_root);
     const cas = addExecutable(b, "cas", cas_root);
@@ -327,6 +339,7 @@ pub fn build(b: *std.Build) void {
     const lift_bench_perf_install = addInstallStep(b, lift_bench_perf);
     const cas_smoke_check_install = addInstallStep(b, cas_smoke_check);
     const cas_instance_runner_install = addInstallStep(b, cas_instance_runner);
+    const cas_review_session_install = addInstallStep(b, cas_review_session);
     const cas_conformance_suite_install = addInstallStep(b, cas_conformance_suite);
     const cas_budget_perf_install = addInstallStep(b, cas_budget_perf);
     const cas_install = addInstallStep(b, cas);
@@ -347,6 +360,7 @@ pub fn build(b: *std.Build) void {
     install_all.dependOn(&lift_bench_perf_install.step);
     install_all.dependOn(&cas_smoke_check_install.step);
     install_all.dependOn(&cas_instance_runner_install.step);
+    install_all.dependOn(&cas_review_session_install.step);
     install_all.dependOn(&cas_conformance_suite_install.step);
     install_all.dependOn(&cas_budget_perf_install.step);
     install_all.dependOn(&cas_install.step);
@@ -426,6 +440,12 @@ pub fn build(b: *std.Build) void {
         "test-cas-instance-runner",
         "Run cas_instance_runner tests",
     );
+    const run_cas_review_session_tests = addTestStep(
+        b,
+        cas_review_session_root,
+        "test-cas-review-session",
+        "Run cas_review_session tests",
+    );
     const run_cas_conformance_tests = addTestStep(
         b,
         cas_conformance_root,
@@ -442,6 +462,7 @@ pub fn build(b: *std.Build) void {
     test_cas.dependOn(&run_cas_budget_governor_tests.step);
     test_cas.dependOn(&run_cas_smoke_tests.step);
     test_cas.dependOn(&run_cas_runner_tests.step);
+    test_cas.dependOn(&run_cas_review_session_tests.step);
     test_cas.dependOn(&run_cas_conformance_tests.step);
     test_cas.dependOn(&run_cas_proxy_client_tests.step);
 
@@ -512,7 +533,7 @@ pub fn build(b: *std.Build) void {
             .path = b.path("apps/cas"),
             .build_step_name = "build-cas",
             .build_description = "Build cas binaries",
-            .build_deps = &.{ &cas_smoke_check_install.step, &cas_instance_runner_install.step, &cas_conformance_suite_install.step, &cas_install.step },
+            .build_deps = &.{ &cas_smoke_check_install.step, &cas_instance_runner_install.step, &cas_review_session_install.step, &cas_conformance_suite_install.step, &cas_install.step },
             .test_deps = &.{test_cas},
         },
         .{

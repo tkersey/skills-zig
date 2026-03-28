@@ -1,0 +1,960 @@
+const app_meta = @import("app_meta");
+const cas = @import("cas_proxy_client.zig");
+const core_cli = @import("core_cli");
+const core_json = @import("core_json");
+const core_path = @import("core_path");
+const std = @import("std");
+
+const Version = core_cli.normalizeVersion(app_meta.version);
+
+const UsageText =
+    \\cas_review_session.zig
+    \\
+    \\Control detached Codex review sessions via the app-server.
+    \\
+    \\Usage:
+    \\  zig run apps/cas/scripts/cas_review_session.zig -- <start|status|wait|interrupt> [options]
+    \\
+    \\Actions:
+    \\  start      Start a detached review session and persist its handle.
+    \\  status     Read the persisted session and report current review status.
+    \\  wait       Poll the persisted session until the review turn reaches a terminal status.
+    \\  interrupt  Interrupt the persisted detached review turn.
+    \\
+    \\Start options:
+    \\  --cwd DIR                        Workspace for the app-server.
+    \\  --parent-thread-id THREAD_ID     Optional parent thread id to reuse.
+    \\  --uncommitted                    Review staged, unstaged, and untracked changes.
+    \\  --base BRANCH                    Review changes against a base branch.
+    \\  --commit SHA                     Review a specific commit.
+    \\  --title TITLE                    Optional commit title for --commit.
+    \\  --custom-instructions VALUE      Custom review instructions, raw text, @file, or - for stdin.
+    \\
+    \\Status/wait/interrupt options:
+    \\  --review-thread-id THREAD_ID     Detached review thread id handle.
+    \\
+    \\Common options:
+    \\  --json                           Emit machine-readable JSON.
+    \\  --timeout-ms N                   Wait timeout for `wait` (default: 30000).
+    \\  --poll-interval-ms N             Poll interval for `wait` (default: 250).
+    \\  --help                           Show help.
+    \\  --version                        Show version.
+    \\  version                          Show version.
+    \\
+    \\Examples:
+    \\  cas review_session start --cwd /path/to/repo --uncommitted --json
+    \\  cas review_session start --cwd /path/to/repo --base main --json
+    \\  cas review_session status --review-thread-id thr_123 --json
+    \\  cas review_session wait --review-thread-id thr_123 --timeout-ms 60000 --json
+    \\  cas review_session interrupt --review-thread-id thr_123 --json
+;
+
+const Action = enum {
+    start,
+    status,
+    wait,
+    interrupt,
+
+    fn parse(raw: []const u8) ?Action {
+        if (std.mem.eql(u8, raw, "start")) return .start;
+        if (std.mem.eql(u8, raw, "status")) return .status;
+        if (std.mem.eql(u8, raw, "wait")) return .wait;
+        if (std.mem.eql(u8, raw, "interrupt")) return .interrupt;
+        return null;
+    }
+};
+
+const TargetKind = enum {
+    uncommitted,
+    base_branch,
+    commit,
+    custom,
+
+    fn asString(self: TargetKind) []const u8 {
+        return switch (self) {
+            .uncommitted => "uncommittedChanges",
+            .base_branch => "baseBranch",
+            .commit => "commit",
+            .custom => "custom",
+        };
+    }
+};
+
+const TargetConfig = struct {
+    kind: TargetKind,
+    branch: ?[]const u8 = null,
+    sha: ?[]const u8 = null,
+    title: ?[]const u8 = null,
+    instructions: ?[]const u8 = null,
+};
+
+const ParsedArgs = struct {
+    action: ?Action = null,
+    cwd: ?[]const u8 = null,
+    parent_thread_id: ?[]const u8 = null,
+    review_thread_id: ?[]const u8 = null,
+    target: ?TargetConfig = null,
+    json: bool = false,
+    timeout_ms: u32 = 30_000,
+    poll_interval_ms: u32 = 250,
+    show_help: bool = false,
+    show_version: bool = false,
+};
+
+const TargetRecord = struct {
+    type: []const u8,
+    branch: ?[]const u8 = null,
+    sha: ?[]const u8 = null,
+    title: ?[]const u8 = null,
+    instructions: ?[]const u8 = null,
+};
+
+const SessionRecord = struct {
+    schema_version: u32 = 1,
+    cwd: []const u8,
+    parent_thread_id: []const u8,
+    review_thread_id: []const u8,
+    review_turn_id: []const u8,
+    delivery: []const u8,
+    target: TargetRecord,
+    event_log_path: []const u8,
+    created_at_unix_s: i64,
+    last_observed_status: []const u8,
+    codex_version: []const u8,
+};
+
+const ReviewStatus = struct {
+    thread_status: []const u8,
+    turn_status: []const u8,
+    turn_count: usize,
+    materialized: bool,
+    rollout_path: ?[]const u8,
+    raw_response_json: []const u8,
+
+    fn deinit(self: ReviewStatus, allocator: std.mem.Allocator) void {
+        allocator.free(self.thread_status);
+        allocator.free(self.turn_status);
+        if (self.rollout_path) |path| allocator.free(path);
+        allocator.free(self.raw_response_json);
+    }
+};
+
+pub fn main() !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const argv = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, argv);
+    if (try core_cli.handleDefaultHelpAndVersion(argv, UsageText, Version)) return;
+
+    const parsed = parseArgs(allocator, argv) catch |err| {
+        var stderr_writer = std.fs.File.stderr().writer(&.{});
+        const stderr = &stderr_writer.interface;
+        try stderr.print("{s}\n{s}\n", .{ @errorName(err), UsageText });
+        std.process.exit(2);
+    };
+
+    if (parsed.show_version) {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try core_cli.printVersion(stdout, Version);
+        return;
+    }
+
+    if (parsed.show_help or parsed.action == null) {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try core_cli.printHelpWithVersion(stdout, UsageText, Version);
+        return;
+    }
+
+    switch (parsed.action.?) {
+        .start => try cmdStart(allocator, parsed),
+        .status => try cmdStatus(allocator, parsed),
+        .wait => try cmdWait(allocator, parsed),
+        .interrupt => try cmdInterrupt(allocator, parsed),
+    }
+}
+
+fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs {
+    var out = ParsedArgs{};
+    if (argv.len <= 1) return out;
+
+    var i: usize = 1;
+    const first = argv[i];
+    if (core_cli.isHelpArg(first)) {
+        out.show_help = true;
+        return out;
+    }
+    if (core_cli.isVersionArg(first) or core_cli.isVersionSubcommand(first)) {
+        out.show_version = true;
+        return out;
+    }
+
+    out.action = Action.parse(first) orelse return error.UnknownAction;
+    i += 1;
+
+    while (i < argv.len) : (i += 1) {
+        const arg = argv[i];
+        if (core_cli.isHelpArg(arg)) {
+            out.show_help = true;
+            continue;
+        }
+        if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
+            out.show_version = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--json")) {
+            out.json = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--uncommitted")) {
+            setTarget(&out, .{ .kind = .uncommitted });
+            continue;
+        }
+
+        i += 1;
+        if (i >= argv.len) return error.MissingValue;
+        const value = argv[i];
+
+        if (std.mem.eql(u8, arg, "--cwd")) {
+            out.cwd = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--parent-thread-id")) {
+            out.parent_thread_id = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--review-thread-id")) {
+            out.review_thread_id = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--base")) {
+            setTarget(&out, .{ .kind = .base_branch, .branch = value });
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--commit")) {
+            setTarget(&out, .{ .kind = .commit, .sha = value });
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--title")) {
+            if (out.target == null or out.target.?.kind != .commit) return error.TitleRequiresCommit;
+            out.target.?.title = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--custom-instructions")) {
+            const instructions = try loadCustomInstructionsAlloc(allocator, value);
+            setTarget(&out, .{ .kind = .custom, .instructions = instructions });
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--timeout-ms")) {
+            const parsed = try std.fmt.parseInt(i64, value, 10);
+            if (parsed <= 0) return error.InvalidTimeout;
+            out.timeout_ms = @intCast(parsed);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--poll-interval-ms")) {
+            const parsed = try std.fmt.parseInt(i64, value, 10);
+            if (parsed <= 0) return error.InvalidPollInterval;
+            out.poll_interval_ms = @intCast(parsed);
+            continue;
+        }
+        return error.UnknownArg;
+    }
+
+    switch (out.action.?) {
+        .start => {
+            if (out.cwd == null) return error.MissingCwd;
+            if (out.target == null) return error.MissingTarget;
+        },
+        .status, .wait, .interrupt => {
+            if (out.review_thread_id == null) return error.MissingReviewThreadId;
+        },
+    }
+
+    return out;
+}
+
+fn setTarget(parsed: *ParsedArgs, target: TargetConfig) void {
+    parsed.target = target;
+}
+
+fn loadCustomInstructionsAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, raw, "-")) {
+        return std.fs.File.stdin().readToEndAlloc(allocator, 1024 * 1024);
+    }
+    if (std.mem.startsWith(u8, raw, "@")) {
+        return std.fs.cwd().readFileAlloc(allocator, raw[1..], 1024 * 1024);
+    }
+    return allocator.dupe(u8, raw);
+}
+
+fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
+    const cwd = parsed.cwd.?;
+    var client = try cas.Client.start(allocator, .{
+        .cwd = cwd,
+        .client_name = "cas-review-session",
+        .client_title = "CAS Review Session",
+        .client_version = Version,
+    });
+    defer {
+        client.close();
+        client.deinit();
+    }
+
+    const session_dir = try sessionDirAlloc(allocator);
+    const created_parent_thread = parsed.parent_thread_id == null;
+    const parent_thread_id = if (parsed.parent_thread_id) |existing|
+        blk: {
+            try resumeParentThread(allocator, &client, existing, session_dir);
+            break :blk try allocator.dupe(u8, existing);
+        }
+    else
+        try startParentThreadAlloc(allocator, &client, cwd, session_dir);
+
+    const target = parsed.target.?;
+    const review_params_json = try buildReviewStartParamsJson(allocator, parent_thread_id, target);
+    defer allocator.free(review_params_json);
+
+    const parent_event_log_path = try std.fs.path.join(allocator, &.{ session_dir, "parent-thread.ndjson" });
+    appendLogRecord(allocator, parent_event_log_path, "thread/start", "response", parent_thread_id) catch {};
+
+    const review_result_json = client.requestJson("review/start", review_params_json) catch |err| {
+        const raw_message = client.lastError() orelse @errorName(err);
+        const message = if (created_parent_thread and std.mem.indexOf(u8, raw_message, "no rollout found for thread id") != null)
+            "detached review on a freshly created parent thread requires a newer codex build; upgrade codex or supply --parent-thread-id for a materialized parent thread"
+        else
+            raw_message;
+        try renderErrorAndExit(parsed.json, "review/start", message);
+    };
+    defer allocator.free(review_result_json);
+
+    const review_thread_id = try extractReviewThreadIdAlloc(allocator, review_result_json);
+    const review_turn_id = try extractReviewTurnIdAlloc(allocator, review_result_json);
+    const event_log_path = try std.fmt.allocPrint(allocator, "{s}/{s}.events.ndjson", .{ session_dir, review_thread_id });
+    const record_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ session_dir, review_thread_id });
+    const codex_version = try readCodexVersionAlloc(allocator, cwd);
+    const target_record = targetToRecord(target);
+
+    try appendLogRecord(allocator, event_log_path, "review/start", "request", review_params_json);
+    try appendLogRecord(allocator, event_log_path, "review/start", "response", review_result_json);
+
+    const record = SessionRecord{
+        .cwd = cwd,
+        .parent_thread_id = parent_thread_id,
+        .review_thread_id = review_thread_id,
+        .review_turn_id = review_turn_id,
+        .delivery = "detached",
+        .target = target_record,
+        .event_log_path = event_log_path,
+        .created_at_unix_s = std.time.timestamp(),
+        .last_observed_status = "inProgress",
+        .codex_version = codex_version,
+    };
+    try writeSessionRecord(allocator, record_path, record);
+
+    if (parsed.json) {
+        const payload = .{
+            .demo = "cas-review-session",
+            .action = "start",
+            .cwd = cwd,
+            .parentThreadId = parent_thread_id,
+            .reviewThreadId = review_thread_id,
+            .reviewTurnId = review_turn_id,
+            .delivery = "detached",
+            .target = target_record,
+            .recordPath = record_path,
+            .eventLogPath = event_log_path,
+            .codexVersion = codex_version,
+        };
+        try printJson(payload);
+    } else {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try stdout.print("cas_review_session start\ncwd: {s}\nparent thread: {s}\nreview thread: {s}\nreview turn: {s}\nrecord: {s}\nevent log: {s}\n", .{
+            cwd,
+            parent_thread_id,
+            review_thread_id,
+            review_turn_id,
+            record_path,
+            event_log_path,
+        });
+    }
+}
+
+fn cmdStatus(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
+    const loaded = try loadSessionRecord(allocator, parsed.review_thread_id.?);
+    const record = loaded.record;
+
+    var client = try cas.Client.start(allocator, .{
+        .cwd = record.cwd,
+        .client_name = "cas-review-session",
+        .client_title = "CAS Review Session",
+        .client_version = Version,
+    });
+    defer {
+        client.close();
+        client.deinit();
+    }
+
+    const status = try fetchReviewStatus(allocator, &client, record.review_thread_id, record.event_log_path);
+
+    if (parsed.json) {
+        const payload = .{
+            .demo = "cas-review-session",
+            .action = "status",
+            .cwd = record.cwd,
+            .parentThreadId = record.parent_thread_id,
+            .reviewThreadId = record.review_thread_id,
+            .reviewTurnId = record.review_turn_id,
+            .threadStatus = status.thread_status,
+            .turnStatus = status.turn_status,
+            .turnCount = status.turn_count,
+            .materialized = status.materialized,
+            .rolloutPath = status.rollout_path,
+            .recordPath = loaded.record_path,
+            .eventLogPath = record.event_log_path,
+        };
+        try printJson(payload);
+    } else {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try stdout.print("cas_review_session status\nreview thread: {s}\nreview turn: {s}\nthread status: {s}\nturn status: {s}\nturn count: {d}\nmaterialized: {s}\nrecord: {s}\nevent log: {s}\n", .{
+            record.review_thread_id,
+            record.review_turn_id,
+            status.thread_status,
+            status.turn_status,
+            status.turn_count,
+            if (status.materialized) "yes" else "no",
+            loaded.record_path,
+            record.event_log_path,
+        });
+    }
+}
+
+fn cmdWait(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
+    const loaded = try loadSessionRecord(allocator, parsed.review_thread_id.?);
+    var record = loaded.record;
+
+    var client = try cas.Client.start(allocator, .{
+        .cwd = record.cwd,
+        .client_name = "cas-review-session",
+        .client_title = "CAS Review Session",
+        .client_version = Version,
+    });
+    defer {
+        client.close();
+        client.deinit();
+    }
+
+    const started_ms = std.time.milliTimestamp();
+    var latest = try fetchReviewStatus(allocator, &client, record.review_thread_id, record.event_log_path);
+    while (!isTerminalTurnStatus(latest.turn_status)) {
+        if (std.time.milliTimestamp() - started_ms >= parsed.timeout_ms) {
+            if (parsed.json) {
+                const payload = .{
+                    .demo = "cas-review-session",
+                    .action = "wait",
+                    .reviewThreadId = record.review_thread_id,
+                    .reviewTurnId = record.review_turn_id,
+                    .threadStatus = latest.thread_status,
+                    .turnStatus = latest.turn_status,
+                    .turnCount = latest.turn_count,
+                    .materialized = latest.materialized,
+                    .timeoutMs = parsed.timeout_ms,
+                    .timedOut = true,
+                    .eventLogPath = record.event_log_path,
+                };
+                try printJson(payload);
+            } else {
+                var stdout_writer = std.fs.File.stdout().writer(&.{});
+                const stdout = &stdout_writer.interface;
+                try stdout.print("cas_review_session wait timed out after {d}ms\nreview thread: {s}\nturn status: {s}\n", .{
+                    parsed.timeout_ms,
+                    record.review_thread_id,
+                    latest.turn_status,
+                });
+            }
+            std.process.exit(1);
+        }
+        std.Thread.sleep(@as(u64, parsed.poll_interval_ms) * std.time.ns_per_ms);
+        latest = try fetchReviewStatus(allocator, &client, record.review_thread_id, record.event_log_path);
+    }
+
+    record.last_observed_status = latest.turn_status;
+    try writeSessionRecord(allocator, loaded.record_path, record);
+
+    if (parsed.json) {
+        const payload = .{
+            .demo = "cas-review-session",
+            .action = "wait",
+            .reviewThreadId = record.review_thread_id,
+            .reviewTurnId = record.review_turn_id,
+            .threadStatus = latest.thread_status,
+            .turnStatus = latest.turn_status,
+            .turnCount = latest.turn_count,
+            .materialized = latest.materialized,
+            .timedOut = false,
+            .recordPath = loaded.record_path,
+            .eventLogPath = record.event_log_path,
+        };
+        try printJson(payload);
+    } else {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try stdout.print("cas_review_session wait\nreview thread: {s}\nreview turn: {s}\nfinal turn status: {s}\nrecord: {s}\n", .{
+            record.review_thread_id,
+            record.review_turn_id,
+            latest.turn_status,
+            loaded.record_path,
+        });
+    }
+}
+
+fn cmdInterrupt(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
+    const loaded = try loadSessionRecord(allocator, parsed.review_thread_id.?);
+    var record = loaded.record;
+
+    var client = try cas.Client.start(allocator, .{
+        .cwd = record.cwd,
+        .client_name = "cas-review-session",
+        .client_title = "CAS Review Session",
+        .client_version = Version,
+    });
+    defer {
+        client.close();
+        client.deinit();
+    }
+
+    const latest = try fetchReviewStatus(allocator, &client, record.review_thread_id, record.event_log_path);
+    if (isTerminalTurnStatus(latest.turn_status)) {
+        record.last_observed_status = latest.turn_status;
+        try writeSessionRecord(allocator, loaded.record_path, record);
+        if (parsed.json) {
+            const payload = .{
+                .demo = "cas-review-session",
+                .action = "interrupt",
+                .reviewThreadId = record.review_thread_id,
+                .reviewTurnId = record.review_turn_id,
+                .skipped = true,
+                .reason = "already-terminal",
+                .turnStatus = latest.turn_status,
+                .recordPath = loaded.record_path,
+                .eventLogPath = record.event_log_path,
+            };
+            try printJson(payload);
+        } else {
+            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            const stdout = &stdout_writer.interface;
+            try stdout.print("cas_review_session interrupt\nreview thread: {s}\nreview turn: {s}\nresult: already terminal ({s})\nrecord: {s}\n", .{
+                record.review_thread_id,
+                record.review_turn_id,
+                latest.turn_status,
+                loaded.record_path,
+            });
+        }
+        return;
+    }
+
+    if (latest.rollout_path) |path| {
+        const resume_params_json = try stringifyAnyAlloc(allocator, .{
+            .threadId = record.review_thread_id,
+            .path = path,
+        });
+        defer allocator.free(resume_params_json);
+        const resume_result_json = client.requestJson("thread/resume", resume_params_json) catch |err| {
+            const message = client.lastError() orelse @errorName(err);
+            try renderErrorAndExit(parsed.json, "thread/resume", message);
+        };
+        defer allocator.free(resume_result_json);
+        try appendLogRecord(allocator, record.event_log_path, "thread/resume", "request", resume_params_json);
+        try appendLogRecord(allocator, record.event_log_path, "thread/resume", "response", resume_result_json);
+    }
+
+    const params_json = try stringifyAnyAlloc(allocator, .{
+        .threadId = record.review_thread_id,
+        .turnId = record.review_turn_id,
+    });
+    defer allocator.free(params_json);
+
+    const interrupt_result_json = client.requestJson("turn/interrupt", params_json) catch |err| {
+        const message = client.lastError() orelse @errorName(err);
+        try renderErrorAndExit(parsed.json, "turn/interrupt", message);
+    };
+    defer allocator.free(interrupt_result_json);
+
+    try appendLogRecord(allocator, record.event_log_path, "turn/interrupt", "request", params_json);
+    try appendLogRecord(allocator, record.event_log_path, "turn/interrupt", "response", interrupt_result_json);
+
+    record.last_observed_status = "interruptRequested";
+    try writeSessionRecord(allocator, loaded.record_path, record);
+
+    if (parsed.json) {
+        const payload = .{
+            .demo = "cas-review-session",
+            .action = "interrupt",
+            .reviewThreadId = record.review_thread_id,
+            .reviewTurnId = record.review_turn_id,
+            .result = interrupt_result_json,
+            .recordPath = loaded.record_path,
+            .eventLogPath = record.event_log_path,
+        };
+        try printJson(payload);
+    } else {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try stdout.print("cas_review_session interrupt\nreview thread: {s}\nreview turn: {s}\nrecord: {s}\n", .{
+            record.review_thread_id,
+            record.review_turn_id,
+            loaded.record_path,
+        });
+    }
+}
+
+fn fetchReviewStatus(
+    allocator: std.mem.Allocator,
+    client: *cas.Client,
+    review_thread_id: []const u8,
+    event_log_path: []const u8,
+) !ReviewStatus {
+    const params_json = try stringifyAnyAlloc(allocator, .{
+        .threadId = review_thread_id,
+        .includeTurns = true,
+    });
+    defer allocator.free(params_json);
+
+    const response_json = client.requestJson("thread/read", params_json) catch |err| {
+        const detail = client.lastError() orelse @errorName(err);
+        if (std.mem.indexOf(u8, detail, "includeTurns is unavailable") != null or
+            std.mem.indexOf(u8, detail, "not materialized yet") != null)
+        {
+            const fallback_params = try stringifyAnyAlloc(allocator, .{
+                .threadId = review_thread_id,
+                .includeTurns = false,
+            });
+            defer allocator.free(fallback_params);
+            const fallback_json = try client.requestJson("thread/read", fallback_params);
+            try appendLogRecord(allocator, event_log_path, "thread/read", "response", fallback_json);
+            return parseReviewStatusAlloc(allocator, fallback_json, false);
+        }
+        return err;
+    };
+    try appendLogRecord(allocator, event_log_path, "thread/read", "response", response_json);
+    return parseReviewStatusAlloc(allocator, response_json, true);
+}
+
+fn parseReviewStatusAlloc(allocator: std.mem.Allocator, raw_json: []const u8, materialized: bool) !ReviewStatus {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{});
+    defer parsed.deinit();
+    const root_obj = parsed.value.object;
+    const thread_obj = core_json.objectField(root_obj, "thread") orelse return error.MissingThread;
+    const thread_status = blk: {
+        if (core_json.stringField(thread_obj, "status")) |status| break :blk status;
+        if (core_json.objectField(thread_obj, "status")) |status_obj| {
+            if (core_json.stringField(status_obj, "type")) |status| break :blk status;
+        }
+        break :blk "unknown";
+    };
+    var turn_status: []const u8 = if (materialized) "pending" else "materializing";
+    var turn_count: usize = 0;
+    const rollout_path = if (core_json.stringField(thread_obj, "path")) |path|
+        try allocator.dupe(u8, path)
+    else
+        null;
+    if (thread_obj.get("turns")) |turns_val| switch (turns_val) {
+        .array => |arr| {
+            turn_count = arr.items.len;
+            if (arr.items.len > 0) {
+                const last = arr.items[arr.items.len - 1];
+                if (last == .object) {
+                    if (core_json.stringField(last.object, "status")) |status| turn_status = status;
+                }
+            }
+        },
+        else => {},
+    };
+    return .{
+        .thread_status = try allocator.dupe(u8, thread_status),
+        .turn_status = try allocator.dupe(u8, turn_status),
+        .turn_count = turn_count,
+        .materialized = materialized,
+        .rollout_path = rollout_path,
+        .raw_response_json = try allocator.dupe(u8, raw_json),
+    };
+}
+
+fn isTerminalTurnStatus(status: []const u8) bool {
+    return std.mem.eql(u8, status, "completed") or
+        std.mem.eql(u8, status, "interrupted") or
+        std.mem.eql(u8, status, "failed") or
+        std.mem.eql(u8, status, "errored");
+}
+
+fn startParentThreadAlloc(
+    allocator: std.mem.Allocator,
+    client: *cas.Client,
+    cwd: []const u8,
+    session_dir: []const u8,
+) ![]const u8 {
+    const params_json = try stringifyAnyAlloc(allocator, .{
+        .cwd = cwd,
+        .experimentalRawEvents = false,
+    });
+    defer allocator.free(params_json);
+    const result_json = try client.requestJson("thread/start", params_json);
+    defer allocator.free(result_json);
+    const parent_thread_id = try extractStartedThreadIdAlloc(allocator, result_json);
+    const parent_event_log_path = try std.fs.path.join(allocator, &.{ session_dir, "parent-thread.ndjson" });
+    try appendLogRecord(allocator, parent_event_log_path, "thread/start", "request", params_json);
+    try appendLogRecord(allocator, parent_event_log_path, "thread/start", "response", result_json);
+    return parent_thread_id;
+}
+
+fn resumeParentThread(
+    allocator: std.mem.Allocator,
+    client: *cas.Client,
+    parent_thread_id: []const u8,
+    session_dir: []const u8,
+) !void {
+    const params_json = try stringifyAnyAlloc(allocator, .{
+        .threadId = parent_thread_id,
+    });
+    defer allocator.free(params_json);
+    const result_json = try client.requestJson("thread/resume", params_json);
+    defer allocator.free(result_json);
+    const parent_event_log_path = try std.fs.path.join(allocator, &.{ session_dir, "parent-thread.ndjson" });
+    try appendLogRecord(allocator, parent_event_log_path, "thread/resume", "request", params_json);
+    try appendLogRecord(allocator, parent_event_log_path, "thread/resume", "response", result_json);
+}
+
+fn extractStartedThreadIdAlloc(allocator: std.mem.Allocator, raw_json: []const u8) ![]const u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{});
+    defer parsed.deinit();
+    const root_obj = parsed.value.object;
+    const thread_obj = core_json.objectField(root_obj, "thread") orelse return error.MissingThread;
+    const id = core_json.stringField(thread_obj, "id") orelse return error.MissingThreadId;
+    return allocator.dupe(u8, id);
+}
+
+fn extractReviewThreadIdAlloc(allocator: std.mem.Allocator, raw_json: []const u8) ![]const u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{});
+    defer parsed.deinit();
+    const root_obj = parsed.value.object;
+    const review_thread_id = core_json.stringField(root_obj, "reviewThreadId") orelse return error.MissingReviewThreadId;
+    return allocator.dupe(u8, review_thread_id);
+}
+
+fn extractReviewTurnIdAlloc(allocator: std.mem.Allocator, raw_json: []const u8) ![]const u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{});
+    defer parsed.deinit();
+    const root_obj = parsed.value.object;
+    const turn_obj = core_json.objectField(root_obj, "turn") orelse return error.MissingTurn;
+    const turn_id = core_json.stringField(turn_obj, "id") orelse return error.MissingTurnId;
+    return allocator.dupe(u8, turn_id);
+}
+
+fn buildReviewStartParamsJson(
+    allocator: std.mem.Allocator,
+    parent_thread_id: []const u8,
+    target: TargetConfig,
+) ![]u8 {
+    const target_json = try buildTargetJson(allocator, target);
+    defer allocator.free(target_json);
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"threadId\":{s},\"delivery\":\"detached\",\"target\":{s}}}",
+        .{ try quoteJsonStringAlloc(allocator, parent_thread_id), target_json },
+    );
+}
+
+fn buildTargetJson(allocator: std.mem.Allocator, target: TargetConfig) ![]u8 {
+    return switch (target.kind) {
+        .uncommitted => stringifyAnyAlloc(allocator, .{ .type = "uncommittedChanges" }),
+        .base_branch => stringifyAnyAlloc(allocator, .{ .type = "baseBranch", .branch = target.branch.? }),
+        .commit => stringifyAnyAlloc(allocator, .{ .type = "commit", .sha = target.sha.?, .title = target.title }),
+        .custom => stringifyAnyAlloc(allocator, .{ .type = "custom", .instructions = target.instructions.? }),
+    };
+}
+
+fn targetToRecord(target: TargetConfig) TargetRecord {
+    return .{
+        .type = target.kind.asString(),
+        .branch = target.branch,
+        .sha = target.sha,
+        .title = target.title,
+        .instructions = target.instructions,
+    };
+}
+
+fn sessionDirAlloc(allocator: std.mem.Allocator) ![]const u8 {
+    const base = try core_path.expandHomePath(allocator, "~/.codex/cas/review_sessions");
+    try ensureParentPath(base);
+    try std.fs.cwd().makePath(base);
+    return base;
+}
+
+const LoadedSessionRecord = struct {
+    record_path: []const u8,
+    record: SessionRecord,
+};
+
+fn loadSessionRecord(allocator: std.mem.Allocator, review_thread_id: []const u8) !LoadedSessionRecord {
+    const session_dir = try sessionDirAlloc(allocator);
+    const record_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ session_dir, review_thread_id });
+    const file = try std.fs.openFileAbsolute(record_path, .{});
+    defer file.close();
+    const raw = try file.readToEndAlloc(allocator, 1024 * 1024);
+    const parsed = try std.json.parseFromSlice(SessionRecord, allocator, raw, .{});
+    return .{
+        .record_path = record_path,
+        .record = parsed.value,
+    };
+}
+
+fn writeSessionRecord(allocator: std.mem.Allocator, path: []const u8, record: SessionRecord) !void {
+    try ensureParentPath(path);
+    const json = try stringifyAnyAlloc(allocator, record);
+    defer allocator.free(json);
+    var file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(json);
+    try file.writeAll("\n");
+}
+
+fn appendLogRecord(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    method: []const u8,
+    direction: []const u8,
+    payload_json: []const u8,
+) !void {
+    const json_line = try std.fmt.allocPrint(
+        allocator,
+        "{{\"recordedAtUnixS\":{d},\"method\":{s},\"direction\":{s},\"payload\":{s}}}",
+        .{
+            std.time.timestamp(),
+            try quoteJsonStringAlloc(allocator, method),
+            try quoteJsonStringAlloc(allocator, direction),
+            try quoteJsonStringAlloc(allocator, payload_json),
+        },
+    );
+    defer allocator.free(json_line);
+    try ensureParentPath(path);
+    var file = std.fs.openFileAbsolute(path, .{ .mode = .write_only }) catch |err| switch (err) {
+        error.FileNotFound => try std.fs.createFileAbsolute(path, .{ .truncate = false }),
+        else => return err,
+    };
+    defer file.close();
+    try file.seekFromEnd(0);
+    try file.writeAll(json_line);
+    try file.writeAll("\n");
+}
+
+fn ensureParentPath(path: []const u8) !void {
+    const parent = std.fs.path.dirname(path) orelse return;
+    if (parent.len == 0) return;
+
+    if (std.fs.path.isAbsolute(parent)) {
+        const rel = std.mem.trimLeft(u8, parent, "/");
+        if (rel.len == 0) return;
+        var root = try std.fs.openDirAbsolute("/", .{});
+        defer root.close();
+        try root.makePath(rel);
+        return;
+    }
+
+    try std.fs.cwd().makePath(parent);
+}
+
+fn renderErrorAndExit(json_mode: bool, method: []const u8, message: []const u8) !noreturn {
+    if (json_mode) {
+        const payload = .{
+            .demo = "cas-review-session",
+            .method = method,
+            .@"error" = message,
+        };
+        try printJson(payload);
+    } else {
+        var stderr_writer = std.fs.File.stderr().writer(&.{});
+        const stderr = &stderr_writer.interface;
+        try stderr.print("{s}: {s}\n", .{ method, message });
+    }
+    std.process.exit(1);
+}
+
+fn readCodexVersionAlloc(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
+    var child = std.process.Child.init(&.{ "codex", "--version" }, allocator);
+    child.cwd = cwd;
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+    const stdout = try child.stdout.?.readToEndAlloc(allocator, 4096);
+    _ = try child.wait();
+    return allocator.dupe(u8, std.mem.trim(u8, stdout, " \t\r\n"));
+}
+
+fn quoteJsonStringAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(text, .{}, &out.writer);
+    return out.toOwnedSlice();
+}
+
+fn stringifyAnyAlloc(allocator: std.mem.Allocator, value: anytype) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(value, .{}, &out.writer);
+    return out.toOwnedSlice();
+}
+
+fn printJson(value: anytype) !void {
+    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    const stdout = &stdout_writer.interface;
+    try std.json.Stringify.value(value, .{ .whitespace = .indent_2 }, stdout);
+    try stdout.writeAll("\n");
+}
+
+test "parseArgs accepts detached start target" {
+    const argv = [_][]const u8{
+        "cas_review_session",
+        "start",
+        "--cwd",
+        "/tmp/repo",
+        "--base",
+        "main",
+        "--json",
+    };
+
+    const parsed = try parseArgs(std.testing.allocator, &argv);
+    try std.testing.expectEqual(Action.start, parsed.action.?);
+    try std.testing.expectEqualStrings("/tmp/repo", parsed.cwd.?);
+    try std.testing.expect(parsed.json);
+    try std.testing.expectEqual(TargetKind.base_branch, parsed.target.?.kind);
+    try std.testing.expectEqualStrings("main", parsed.target.?.branch.?);
+}
+
+test "parseReviewStatusAlloc handles materialized and pending states" {
+    const materialized = try parseReviewStatusAlloc(
+        std.testing.allocator,
+        "{\"thread\":{\"status\":\"running\",\"turns\":[{\"status\":\"inProgress\"}]}}",
+        true,
+    );
+    defer materialized.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("running", materialized.thread_status);
+    try std.testing.expectEqualStrings("inProgress", materialized.turn_status);
+    try std.testing.expectEqual(@as(usize, 1), materialized.turn_count);
+    try std.testing.expect(materialized.materialized);
+
+    const pending = try parseReviewStatusAlloc(
+        std.testing.allocator,
+        "{\"thread\":{\"status\":\"running\"}}",
+        false,
+    );
+    defer pending.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("running", pending.thread_status);
+    try std.testing.expectEqualStrings("materializing", pending.turn_status);
+    try std.testing.expectEqual(@as(usize, 0), pending.turn_count);
+    try std.testing.expect(!pending.materialized);
+}
