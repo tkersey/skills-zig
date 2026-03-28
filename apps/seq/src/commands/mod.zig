@@ -323,6 +323,7 @@ const Options = struct {
     dataset: ?[]const u8 = null,
     spec_text: ?[]const u8 = null,
     skill: ?[]const u8 = null,
+    history_text: ?[]const u8 = null,
     bucket: ?[]const u8 = null,
     prompt: ?[]const u8 = null,
     kind_text: ?[]const u8 = null,
@@ -381,6 +382,7 @@ pub fn run(
         .skills_rank => try cmdSkillsRank(allocator, sessions_root, opts),
         .skill_trend => try cmdSkillTrend(allocator, sessions_root, opts),
         .skill_report => try cmdSkillReport(allocator, sessions_root, opts),
+        .skill_blocks => try cmdSkillBlocks(allocator, sessions_root, opts),
         .artifact_search => try cmdArtifactSearch(allocator, sessions_root, opts),
         .role_breakdown => try cmdRoleBreakdown(allocator, sessions_root, opts),
         .occurrence_export => try cmdOccurrenceExport(allocator, sessions_root, opts),
@@ -425,6 +427,9 @@ fn printCommandHelp(cmd: lib.Command) !void {
         ,
         .skill_report =>
         \\usage: seq skill-report --skill <name> [--since <iso>] [--until <iso>]
+        ,
+        .skill_blocks =>
+        \\usage: seq skill-blocks --skill <name> [--history <distinct|all|latest>] [--session-id <id>|--path <jsonl>|--current] [--since <iso>] [--until <iso>] [--limit N] [--format json|jsonl]
         ,
         .artifact_search =>
         \\usage: seq artifact-search [--contains <text>|--regex <expr>] [--kind <auto|session|memory|orchestration|tooling|prompt>] [--surface <auto|messages|tool_calls|memory_blocks>] [--roles <csv>] [--tool <name>] [--workdir <path>] [--session-id <id>|--path <jsonl>] [--since <iso>] [--until <iso>] [--follow <none|auto>] [--strip-skill-blocks] [--no-dedupe-exact] [--stats] [--limit N] [--format table|json|csv|jsonl]
@@ -538,6 +543,9 @@ fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
         .skills_rank, .skill_trend, .skill_report, .role_breakdown, .report_bundle, .section_audit, .datasets, .dataset_schema => {
             if (fmt == .jsonl) return error.InvalidFormatForCommand;
         },
+        .skill_blocks => {
+            if (fmt != .json and fmt != .jsonl) return error.InvalidFormatForCommand;
+        },
         .occurrence_export => {
             if (fmt == .table) return error.InvalidFormatForCommand;
         },
@@ -548,14 +556,14 @@ fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
 
 fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_path = switch (cmd) {
-        .artifact_search, .orchestration_concurrency, .plan_search, .reply_latency, .session_prompts, .session_tooling, .query_diagnose => true,
+        .artifact_search, .orchestration_concurrency, .plan_search, .reply_latency, .session_prompts, .session_tooling, .query_diagnose, .skill_blocks => true,
         else => false,
     };
     const supports_session_id = switch (cmd) {
-        .artifact_search, .orchestration_concurrency, .plan_search, .reply_latency, .session_prompts, .session_tooling => true,
+        .artifact_search, .orchestration_concurrency, .plan_search, .reply_latency, .session_prompts, .session_tooling, .skill_blocks => true,
         else => false,
     };
-    const supports_current = cmd == .session_prompts or cmd == .reply_latency;
+    const supports_current = cmd == .session_prompts or cmd == .reply_latency or cmd == .skill_blocks;
     const supports_roles_csv = cmd == .session_prompts or cmd == .artifact_search;
     const supports_strip_skill_blocks = cmd == .session_prompts or cmd == .artifact_search;
     const supports_no_dedupe_exact = cmd == .session_prompts or cmd == .artifact_search;
@@ -575,9 +583,10 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_threshold_ms = cmd == .query_diagnose;
     const supports_strict_hang = cmd == .query_diagnose;
     const supports_skill = switch (cmd) {
-        .skill_trend, .skill_report, .occurrence_export => true,
+        .skill_trend, .skill_report, .occurrence_export, .skill_blocks => true,
         else => false,
     };
+    const supports_history = cmd == .skill_blocks;
     const supports_bucket = cmd == .skill_trend;
     const supports_prompt = cmd == .find_session;
     const supports_sections = cmd == .section_audit;
@@ -630,6 +639,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .token_usage,
         .session_tooling,
         .query_diagnose,
+        .skill_blocks,
         .opencode_prompts,
         .opencode_events,
         => true,
@@ -651,6 +661,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .token_usage,
         .session_tooling,
         .query_diagnose,
+        .skill_blocks,
         .opencode_prompts,
         .opencode_events,
         => true,
@@ -709,6 +720,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.threshold_ms != 10_000, supports_threshold_ms, "--threshold-ms", cmd);
     try ensureOptionAllowed(!opts.strict_hang, supports_strict_hang, "--no-strict-hang", cmd);
     try ensureOptionAllowed(opts.skill != null, supports_skill, "--skill", cmd);
+    try ensureOptionAllowed(opts.history_text != null, supports_history, "--history", cmd);
     try ensureOptionAllowed(opts.bucket != null, supports_bucket, "--bucket", cmd);
     try ensureOptionAllowed(opts.prompt != null, supports_prompt, "--prompt", cmd);
     try ensureOptionAllowed(opts.sections != null, supports_sections, "--sections", cmd);
@@ -1479,6 +1491,310 @@ fn cmdSkillReport(allocator: std.mem.Allocator, sessions_root: []const u8, opts:
         .limit = opts.limit,
     };
     try runDatasetQuery(allocator, "skill_mentions", sessions_root, query_spec, opts.format, opts.out_path, select[0..]);
+}
+
+const SkillBlockHistory = enum {
+    distinct,
+    all,
+    latest,
+
+    fn parse(raw_opt: ?[]const u8) !SkillBlockHistory {
+        const raw = raw_opt orelse return .distinct;
+        if (std.mem.eql(u8, raw, "distinct")) return .distinct;
+        if (std.mem.eql(u8, raw, "all")) return .all;
+        if (std.mem.eql(u8, raw, "latest")) return .latest;
+        printCliError("error: invalid --history value {s}; expected distinct, all, or latest\n", .{raw});
+        return error.InvalidModeArg;
+    }
+};
+
+const ROLE_USER: u8 = 1;
+const ROLE_ASSISTANT: u8 = 2;
+
+const SkillBlockAggregate = struct {
+    skill: []u8,
+    skill_path: ?[]u8,
+    block_hash: []u8,
+    block_text: []u8,
+    first_seen_timestamp: ?[]u8,
+    first_seen_path: []u8,
+    last_seen_timestamp: ?[]u8,
+    last_seen_path: []u8,
+    occurrence_count: usize,
+    roles_mask: u8,
+
+    fn deinit(self: SkillBlockAggregate, allocator: std.mem.Allocator) void {
+        allocator.free(self.skill);
+        if (self.skill_path) |v| allocator.free(v);
+        allocator.free(self.block_hash);
+        allocator.free(self.block_text);
+        if (self.first_seen_timestamp) |v| allocator.free(v);
+        allocator.free(self.first_seen_path);
+        if (self.last_seen_timestamp) |v| allocator.free(v);
+        allocator.free(self.last_seen_path);
+    }
+};
+
+fn compareOptionalTimestamp(lhs: ?[]const u8, rhs: ?[]const u8) std.math.Order {
+    if (lhs == null and rhs == null) return .eq;
+    if (lhs == null) return .gt;
+    if (rhs == null) return .lt;
+    var lhs_buf: [64]u8 = undefined;
+    var rhs_buf: [64]u8 = undefined;
+    const lhs_norm = if (lhs.?.len > 0 and lhs.?[lhs.?.len - 1] == 'Z' and lhs.?.len + 5 <= lhs_buf.len) blk: {
+        @memcpy(lhs_buf[0 .. lhs.?.len - 1], lhs.?[0 .. lhs.?.len - 1]);
+        @memcpy(lhs_buf[lhs.?.len - 1 .. lhs.?.len + 5], "+00:00");
+        break :blk lhs_buf[0 .. lhs.?.len + 5];
+    } else lhs.?;
+    const rhs_norm = if (rhs.?.len > 0 and rhs.?[rhs.?.len - 1] == 'Z' and rhs.?.len + 5 <= rhs_buf.len) blk: {
+        @memcpy(rhs_buf[0 .. rhs.?.len - 1], rhs.?[0 .. rhs.?.len - 1]);
+        @memcpy(rhs_buf[rhs.?.len - 1 .. rhs.?.len + 5], "+00:00");
+        break :blk rhs_buf[0 .. rhs.?.len + 5];
+    } else rhs.?;
+    return std.mem.order(u8, lhs_norm, rhs_norm);
+}
+
+fn roleMaskFromText(role: []const u8) u8 {
+    if (std.mem.eql(u8, role, "user")) return ROLE_USER;
+    if (std.mem.eql(u8, role, "assistant")) return ROLE_ASSISTANT;
+    return 0;
+}
+
+fn rolesString(allocator: std.mem.Allocator, mask: u8) ![]u8 {
+    return switch (mask) {
+        ROLE_ASSISTANT => allocator.dupe(u8, "assistant"),
+        ROLE_USER => allocator.dupe(u8, "user"),
+        ROLE_USER | ROLE_ASSISTANT => allocator.dupe(u8, "assistant,user"),
+        else => allocator.dupe(u8, ""),
+    };
+}
+
+fn skillBlockAllLessThan(_: void, lhs: datasets.skill_blocks.SkillBlockRow, rhs: datasets.skill_blocks.SkillBlockRow) bool {
+    const order = compareOptionalTimestamp(lhs.timestamp, rhs.timestamp);
+    return switch (order) {
+        .lt => true,
+        .gt => false,
+        .eq => std.mem.order(u8, lhs.path, rhs.path) == .lt,
+    };
+}
+
+fn skillBlockDistinctLessThan(_: void, lhs: SkillBlockAggregate, rhs: SkillBlockAggregate) bool {
+    const order = compareOptionalTimestamp(lhs.first_seen_timestamp, rhs.first_seen_timestamp);
+    return switch (order) {
+        .lt => true,
+        .gt => false,
+        .eq => std.mem.order(u8, lhs.block_hash, rhs.block_hash) == .lt,
+    };
+}
+
+fn cloneOptionalString(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
+    if (value) |v| return try allocator.dupe(u8, v);
+    return null;
+}
+
+fn replaceOptionalString(allocator: std.mem.Allocator, slot: *?[]u8, value: ?[]const u8) !void {
+    if (slot.*) |old| allocator.free(old);
+    slot.* = try cloneOptionalString(allocator, value);
+}
+
+fn replaceString(allocator: std.mem.Allocator, slot: *[]u8, value: []const u8) !void {
+    allocator.free(slot.*);
+    slot.* = try allocator.dupe(u8, value);
+}
+
+fn buildSkillBlockAggregate(
+    allocator: std.mem.Allocator,
+    row: datasets.skill_blocks.SkillBlockRow,
+) !SkillBlockAggregate {
+    return .{
+        .skill = try allocator.dupe(u8, row.skill),
+        .skill_path = try cloneOptionalString(allocator, row.skill_path),
+        .block_hash = try allocator.dupe(u8, row.block_hash),
+        .block_text = try allocator.dupe(u8, row.block_text),
+        .first_seen_timestamp = try cloneOptionalString(allocator, row.timestamp),
+        .first_seen_path = try allocator.dupe(u8, row.path),
+        .last_seen_timestamp = try cloneOptionalString(allocator, row.timestamp),
+        .last_seen_path = try allocator.dupe(u8, row.path),
+        .occurrence_count = 1,
+        .roles_mask = roleMaskFromText(row.role),
+    };
+}
+
+fn aggregateSkillBlockRows(
+    allocator: std.mem.Allocator,
+    raw_rows: []const datasets.skill_blocks.SkillBlockRow,
+) !std.ArrayList(SkillBlockAggregate) {
+    var aggregates: std.ArrayList(SkillBlockAggregate) = .empty;
+    errdefer {
+        for (aggregates.items) |row| row.deinit(allocator);
+        aggregates.deinit(allocator);
+    }
+
+    var index_by_hash = std.StringHashMap(usize).init(allocator);
+    defer index_by_hash.deinit();
+
+    for (raw_rows) |row| {
+        if (index_by_hash.get(row.block_hash)) |idx| {
+            var agg = &aggregates.items[idx];
+            agg.occurrence_count += 1;
+            agg.roles_mask |= roleMaskFromText(row.role);
+
+            if (compareOptionalTimestamp(row.timestamp, agg.first_seen_timestamp) == .lt) {
+                try replaceOptionalString(allocator, &agg.first_seen_timestamp, row.timestamp);
+                try replaceString(allocator, &agg.first_seen_path, row.path);
+            }
+            if (compareOptionalTimestamp(row.timestamp, agg.last_seen_timestamp) != .lt) {
+                try replaceOptionalString(allocator, &agg.last_seen_timestamp, row.timestamp);
+                try replaceString(allocator, &agg.last_seen_path, row.path);
+            }
+            continue;
+        }
+
+        const agg = try buildSkillBlockAggregate(allocator, row);
+        try aggregates.append(allocator, agg);
+        try index_by_hash.put(row.block_hash, aggregates.items.len - 1);
+    }
+
+    return aggregates;
+}
+
+fn collectSkillBlockRows(
+    allocator: std.mem.Allocator,
+    input_paths: []const []u8,
+    opts: Options,
+) !std.ArrayList(datasets.skill_blocks.SkillBlockRow) {
+    const skill_name = opts.skill orelse return error.MissingSkillArg;
+    var rows: std.ArrayList(datasets.skill_blocks.SkillBlockRow) = .empty;
+    errdefer {
+        for (rows.items) |row| row.deinit(allocator);
+        rows.deinit(allocator);
+    }
+
+    for (input_paths) |path| {
+        const content = try readFileAllocOrSkip(allocator, path);
+        if (content == null) continue;
+        defer allocator.free(content.?);
+
+        const parsed = try datasets.skill_blocks.parseJsonl(allocator, path, content.?, .{});
+        for (parsed) |row| {
+            if (!std.mem.eql(u8, row.skill, skill_name) or !timestampSatisfiesBounds(row.timestamp, opts)) {
+                row.deinit(allocator);
+                continue;
+            }
+            try rows.append(allocator, row);
+        }
+        allocator.free(parsed);
+    }
+
+    return rows;
+}
+
+fn rawSkillBlockRowsToQueryRows(
+    allocator: std.mem.Allocator,
+    raw_rows: []const datasets.skill_blocks.SkillBlockRow,
+) !std.ArrayList(query.Row) {
+    var out: std.ArrayList(query.Row) = .empty;
+    errdefer deinitQueryRows(allocator, &out);
+
+    for (raw_rows) |row| {
+        var qrow = query.Row.init(allocator);
+        try qrow.putOwnedKey("path", .{ .string = row.path });
+        try putOptionalString(&qrow, "timestamp", row.timestamp);
+        try putOptionalString(&qrow, "day", row.day);
+        try putOptionalString(&qrow, "week", row.week);
+        try putOptionalString(&qrow, "month", row.month);
+        try qrow.putOwnedKey("role", .{ .string = row.role });
+        try qrow.putOwnedKey("skill", .{ .string = row.skill });
+        try putOptionalString(&qrow, "skill_path", row.skill_path);
+        try qrow.putOwnedKey("block_hash", .{ .string = row.block_hash });
+        try qrow.putOwnedKey("block_text", .{ .string = row.block_text });
+        try out.append(allocator, qrow);
+    }
+
+    return out;
+}
+
+fn aggregatedSkillBlockRowsToQueryRows(
+    allocator: std.mem.Allocator,
+    aggregates: []const SkillBlockAggregate,
+) !std.ArrayList(query.Row) {
+    var out: std.ArrayList(query.Row) = .empty;
+    errdefer deinitQueryRows(allocator, &out);
+
+    for (aggregates) |row| {
+        var qrow = query.Row.init(allocator);
+        errdefer qrow.deinit();
+        const roles = try rolesString(allocator, row.roles_mask);
+        defer allocator.free(roles);
+
+        try qrow.putOwnedKey("skill", .{ .string = row.skill });
+        try putOptionalString(&qrow, "skill_path", row.skill_path);
+        try qrow.putOwnedKey("block_hash", .{ .string = row.block_hash });
+        try qrow.putOwnedKey("block_text", .{ .string = row.block_text });
+        try putOptionalString(&qrow, "first_seen_timestamp", row.first_seen_timestamp);
+        try qrow.putOwnedKey("first_seen_path", .{ .string = row.first_seen_path });
+        try putOptionalString(&qrow, "last_seen_timestamp", row.last_seen_timestamp);
+        try qrow.putOwnedKey("last_seen_path", .{ .string = row.last_seen_path });
+        try qrow.putOwnedKey("occurrence_count", .{ .int = @intCast(row.occurrence_count) });
+        try qrow.putOwnedKey("roles", .{ .string = roles });
+        try out.append(allocator, qrow);
+    }
+
+    return out;
+}
+
+fn cmdSkillBlocks(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    const history = try SkillBlockHistory.parse(opts.history_text);
+    const day_filter = deriveSessionDayPathFilterFromOptions(opts);
+    var input_paths = try resolveSessionPromptInputPaths(allocator, sessions_root, opts, day_filter);
+    defer freePathList(allocator, &input_paths);
+
+    var raw_rows = try collectSkillBlockRows(allocator, input_paths.items, opts);
+    defer {
+        for (raw_rows.items) |row| row.deinit(allocator);
+        raw_rows.deinit(allocator);
+    }
+
+    if (history == .all) {
+        std.mem.sort(datasets.skill_blocks.SkillBlockRow, raw_rows.items, {}, skillBlockAllLessThan);
+        const start_idx: usize = if (opts.limit > 0 and raw_rows.items.len > opts.limit) 0 else 0;
+        const end_idx: usize = if (opts.limit > 0 and raw_rows.items.len > opts.limit) opts.limit else raw_rows.items.len;
+        var out_rows = try rawSkillBlockRowsToQueryRows(allocator, raw_rows.items[start_idx..end_idx]);
+        defer deinitQueryRows(allocator, &out_rows);
+        const cols = [_][]const u8{ "path", "timestamp", "day", "week", "month", "role", "skill", "skill_path", "block_hash", "block_text" };
+        try output.writeOutput(allocator, if (opts.format_set) opts.format else .jsonl, out_rows.items, cols[0..], opts.out_path);
+        return;
+    }
+
+    var aggregates = try aggregateSkillBlockRows(allocator, raw_rows.items);
+    defer {
+        for (aggregates.items) |row| row.deinit(allocator);
+        aggregates.deinit(allocator);
+    }
+    std.mem.sort(SkillBlockAggregate, aggregates.items, {}, skillBlockDistinctLessThan);
+
+    var aggregate_slice = aggregates.items;
+    if (history == .latest and aggregates.items.len > 0) {
+        aggregate_slice = aggregates.items[aggregates.items.len - 1 ..];
+    } else if (history == .distinct and opts.limit > 0 and aggregates.items.len > opts.limit) {
+        aggregate_slice = aggregates.items[0..opts.limit];
+    }
+
+    var out_rows = try aggregatedSkillBlockRowsToQueryRows(allocator, aggregate_slice);
+    defer deinitQueryRows(allocator, &out_rows);
+    const cols = [_][]const u8{
+        "skill",
+        "skill_path",
+        "block_hash",
+        "block_text",
+        "first_seen_timestamp",
+        "first_seen_path",
+        "last_seen_timestamp",
+        "last_seen_path",
+        "occurrence_count",
+        "roles",
+    };
+    try output.writeOutput(allocator, if (opts.format_set) opts.format else .jsonl, out_rows.items, cols[0..], opts.out_path);
 }
 
 fn cmdRoleBreakdown(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
@@ -5671,6 +5987,10 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.skill = args[i];
+        } else if (std.mem.eql(u8, arg, "--history")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.history_text = args[i];
         } else if (std.mem.eql(u8, arg, "--bucket")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -6484,6 +6804,8 @@ test "parse options supports common flags" {
         "/tmp/prompt-history.jsonl",
         "--source",
         "db",
+        "--history",
+        "distinct",
         "--include-raw",
         "--include-body",
         "--strip-skill-blocks",
@@ -6504,6 +6826,7 @@ test "parse options supports common flags" {
     try std.testing.expectEqualStrings("~/sessions", opts.root.?);
     try std.testing.expectEqualStrings("/tmp/session.jsonl", opts.path.?);
     try std.testing.expectEqualStrings("019ca0e5-0beb-7740-a9bc-81664d994266", opts.session_id.?);
+    try std.testing.expectEqualStrings("distinct", opts.history_text.?);
     try std.testing.expectEqual(@as(i64, 4), opts.floor_threshold);
     try std.testing.expect(opts.fail_on_floor);
     try std.testing.expect(opts.fail_on_mesh_truth);
@@ -6551,6 +6874,10 @@ test "parseOptions rejects unknown option" {
 test "validateCommandOptions rejects unsupported path on skill-report" {
     const opts = Options{ .path = "/tmp/session.jsonl" };
     try std.testing.expectError(error.UnsupportedOption, validateCommandOptions(.skill_report, opts));
+}
+
+test "validateFormatForCommand rejects table for skill-blocks" {
+    try std.testing.expectError(error.InvalidFormatForCommand, validateFormatForCommand(.skill_blocks, .table));
 }
 
 fn runCommandWithOutput(
@@ -6997,4 +7324,75 @@ test "query-diagnose flags strict hangs and supports fail-on-hang" {
         output_path,
     };
     try std.testing.expectError(error.QueryHangDetected, run(std.testing.allocator, .query_diagnose, fail_args[0..]));
+}
+
+test "skill-blocks distinct returns one aggregated version with metadata" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("2026/03/10");
+    const session_rel = "2026/03/10/rollout-2026-03-10T10-00-00-019c0000-0000-7000-8000-000000000020.jsonl";
+    const session_content =
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"<skill>\\n<name>accretive</name>\\n<path>/tmp/accretive/SKILL.md</path>\\n# one\\n</skill>\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:01:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"<skill>\\n<name>accretive</name>\\n<path>/tmp/accretive/SKILL.md</path>\\n# one\\n</skill>\"}]}}\n";
+    try tmp.dir.writeFile(.{ .sub_path = session_rel, .data = session_content });
+
+    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "skill-blocks-distinct.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const args = [_][]const u8{
+        "--root",
+        root_abs,
+        "--skill",
+        "accretive",
+        "--session-id",
+        "019c0000-0000-7000-8000-000000000020",
+        "--format",
+        "json",
+    };
+    const got = try runCommandWithOutput(std.testing.allocator, .skill_blocks, args[0..], output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"occurrence_count\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"roles\": \"assistant,user\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"first_seen_timestamp\": \"2026-03-10T10:00:00+00:00\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"last_seen_timestamp\": \"2026-03-10T10:01:00+00:00\"") != null);
+}
+
+test "skill-blocks history all preserves duplicate occurrences" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("2026/03/10");
+    const session_rel = "2026/03/10/rollout-2026-03-10T10-00-00-019c0000-0000-7000-8000-000000000021.jsonl";
+    const session_content =
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"<skill>\\n<name>accretive</name>\\n# one\\n</skill>\"}]}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-10T10:00:01Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"<skill>\\n<name>accretive</name>\\n# one\\n</skill>\"}}\n";
+    try tmp.dir.writeFile(.{ .sub_path = session_rel, .data = session_content });
+
+    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "skill-blocks-all.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const args = [_][]const u8{
+        "--root",
+        root_abs,
+        "--skill",
+        "accretive",
+        "--history",
+        "all",
+        "--session-id",
+        "019c0000-0000-7000-8000-000000000021",
+        "--format",
+        "json",
+    };
+    const got = try runCommandWithOutput(std.testing.allocator, .skill_blocks, args[0..], output_path);
+    defer std.testing.allocator.free(got);
+
+    const needle = "\"skill\": \"accretive\"";
+    try std.testing.expect(std.mem.indexOf(u8, got, needle) != null);
+    try std.testing.expect(std.mem.count(u8, got, needle) == 2);
 }

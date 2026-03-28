@@ -12,6 +12,7 @@ comptime {
     _ = @import("plan_blocks.zig");
     _ = @import("datasets/messages.zig");
     _ = @import("datasets/skill_mentions.zig");
+    _ = @import("datasets/skill_blocks.zig");
     _ = @import("datasets/token_events.zig");
     _ = @import("datasets/token_deltas.zig");
     _ = @import("datasets/token_sessions.zig");
@@ -33,6 +34,7 @@ test "bootstrap parse coverage" {
     try std.testing.expectEqual(lib.Command.skills_rank, lib.parseCommand("skills-rank"));
     try std.testing.expectEqual(lib.Command.skill_trend, lib.parseCommand("skill-trend"));
     try std.testing.expectEqual(lib.Command.skill_report, lib.parseCommand("skill-report"));
+    try std.testing.expectEqual(lib.Command.skill_blocks, lib.parseCommand("skill-blocks"));
     try std.testing.expectEqual(lib.Command.artifact_search, lib.parseCommand("artifact-search"));
     try std.testing.expectEqual(lib.Command.role_breakdown, lib.parseCommand("role-breakdown"));
     try std.testing.expectEqual(lib.Command.occurrence_export, lib.parseCommand("occurrence-export"));
