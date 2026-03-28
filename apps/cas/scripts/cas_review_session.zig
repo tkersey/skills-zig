@@ -341,13 +341,10 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
 
     const session_dir = try sessionDirAlloc(allocator);
     const created_parent_thread = parsed.parent_thread_id == null;
-    const parent_thread_id = if (parsed.parent_thread_id) |existing|
-        blk: {
-            try resumeParentThread(allocator, &client, existing, session_dir);
-            break :blk try allocator.dupe(u8, existing);
-        }
-    else
-        try startParentThreadAlloc(allocator, &client, cwd, session_dir);
+    const parent_thread_id = if (parsed.parent_thread_id) |existing| blk: {
+        try resumeParentThread(allocator, &client, existing, session_dir);
+        break :blk try allocator.dupe(u8, existing);
+    } else try startParentThreadAlloc(allocator, &client, cwd, session_dir);
 
     const target = parsed.target.?;
     const review_params_json = try buildReviewStartParamsJson(allocator, parent_thread_id, target);
@@ -1042,7 +1039,10 @@ fn renderErrorAndExit(json_mode: bool, method: []const u8, message: []const u8) 
 }
 
 fn readCodexVersionAlloc(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 {
-    var child = std.process.Child.init(&.{ "codex", "--version" }, allocator);
+    const codex_path = try cas.resolveExecutableAlloc(allocator, "codex");
+    defer allocator.free(codex_path);
+
+    var child = std.process.Child.init(&.{ codex_path, "--version" }, allocator);
     child.cwd = cwd;
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;

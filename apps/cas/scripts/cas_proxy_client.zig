@@ -43,7 +43,10 @@ pub const Client = struct {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(allocator);
 
-        try argv.append(allocator, opts.codex_path);
+        const resolved_codex_path = try resolveExecutableAlloc(allocator, opts.codex_path);
+        defer allocator.free(resolved_codex_path);
+
+        try argv.append(allocator, resolved_codex_path);
         try argv.append(allocator, "app-server");
 
         var child = std.process.Child.init(argv.items, allocator);
@@ -631,6 +634,46 @@ pub const Client = struct {
         }
     }
 };
+
+pub fn resolveExecutableAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    if (value.len == 0) return error.MissingExecutable;
+
+    if (std.mem.indexOfScalar(u8, value, '/') != null) {
+        std.fs.cwd().access(value, .{}) catch return error.ExecutableNotFound;
+        return allocator.dupe(u8, value);
+    }
+
+    const exe_dir = std.fs.selfExeDirPathAlloc(allocator) catch null;
+    if (exe_dir) |dir| {
+        defer allocator.free(dir);
+        const sibling = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, value });
+        errdefer allocator.free(sibling);
+        if (pathExists(sibling)) return sibling;
+        allocator.free(sibling);
+    }
+
+    const path_env = std.posix.getenv("PATH") orelse return error.ExecutableNotFound;
+    var iter = std.mem.splitScalar(u8, path_env, ':');
+    while (iter.next()) |dir| {
+        if (dir.len == 0) continue;
+        const candidate = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, value });
+        errdefer allocator.free(candidate);
+        if (pathExists(candidate)) return candidate;
+        allocator.free(candidate);
+    }
+
+    return error.ExecutableNotFound;
+}
+
+fn pathExists(path: []const u8) bool {
+    if (std.fs.path.isAbsolute(path)) {
+        std.fs.accessAbsolute(path, .{}) catch return false;
+        return true;
+    }
+    std.fs.cwd().access(path, .{}) catch return false;
+    return true;
+}
 
 pub const ObjectMap = core_json.ObjectMap;
 
