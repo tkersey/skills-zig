@@ -69,7 +69,15 @@ pub fn main() !void {
     try child_argv.append(allocator, target_exec);
     try child_argv.appendSlice(allocator, argv[2..]);
 
-    const exit_code = try delegate.runCommand(allocator, child_argv.items);
+    const exit_code = delegate.runCommand(allocator, child_argv.items) catch |err| {
+        var stderr_writer = std.fs.File.stderr().writer(&.{});
+        const stderr = &stderr_writer.interface;
+        try stderr.print(
+            "failed to launch {s}: {s}\ninstall or expose the full CAS binary set beside `cas` ({s}, cas_smoke_check, cas_instance_runner, cas_conformance_suite)\n",
+            .{ target_name, @errorName(err), target_name },
+        );
+        std.process.exit(1);
+    };
     std.process.exit(exit_code);
 }
 

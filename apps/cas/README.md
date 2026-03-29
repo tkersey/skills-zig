@@ -25,7 +25,8 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
   - `mcpServer/elicitation/request`
   - `item/tool/call`
 - By default, permissions requests are denied, request-user-input questions are answered with the first option label when present, MCP elicitations are declined, and dynamic tool calls return `success: false` with an explanatory text item.
-- `cas_review_session` starts detached `review/start` turns, persists the detached `reviewThreadId` as the recoverable handle, appends raw request/response artifacts to an NDJSON log, supports fresh-process `status`, `wait`, and `interrupt`, and can keep the originating process alive with `start --wait` to return a normalized `reviewResult`.
+- `cas_review_session` starts detached `review/start` turns, persists the detached `reviewThreadId` as the recoverable handle, appends raw request/response artifacts to an NDJSON log, supports fresh-process `status`, `wait`, and `interrupt`, treats `start -> wait` as the primary flow, and keeps `start --wait` only as a convenience wrapper over the same lifecycle.
+- JSON review-session output now includes `resolvedCodexPath`, `resolvedCodexVersion`, `compatibilityVerdict`, `failureCode`, and `failureHint` in addition to `reviewResult*` fields so callers can distinguish compatibility/setup failures from terminal review outcomes.
 - If detached review on a freshly created parent thread still fails with `no rollout found`, the installed `codex` binary is older than the parent-rollout fix; upgrade `codex` or pass `--parent-thread-id` for an already materialized parent thread.
 
 ## API Examples
@@ -40,9 +41,8 @@ cas review_session start \
   --uncommitted \
   --json
 
-# Start and wait in one process, returning reviewResult JSON when available.
+# Start detached review and keep the handle.
 cas review_session start \
-  --wait \
   --cwd /path/to/workspace \
   --base main \
   --json
@@ -50,7 +50,14 @@ cas review_session start \
 # Poll a detached review session from a fresh process.
 cas review_session wait \
   --review-thread-id thr_123 \
-  --timeout-ms 60000 \
+  --timeout-ms 300000 \
+  --json
+
+# Convenience wrapper when one process is preferred.
+cas review_session start \
+  --wait \
+  --cwd /path/to/workspace \
+  --base main \
   --json
 
 # Run one conformance scenario with JSON output.
