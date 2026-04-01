@@ -24,12 +24,26 @@ const UsageText =
     \\Start options:
     \\  --cwd DIR                        Workspace for the app-server.
     \\  --parent-thread-id THREAD_ID     Optional parent thread id to reuse.
+    \\  --parent-mode MODE               Parent strategy: auto|fresh|reuse (default: auto).
     \\  --wait                           Keep the start process alive until the review turn reaches a terminal status.
     \\  --uncommitted                    Review staged, unstaged, and untracked changes.
     \\  --base BRANCH                    Review changes against a base branch.
     \\  --commit SHA                     Review a specific commit.
     \\  --title TITLE                    Optional commit title for --commit.
     \\  --custom-instructions VALUE      Custom review instructions, raw text, @file, or - for stdin.
+    \\
+    \\Approval/runtime options:
+    \\  --exec-approval VALUE            auto|accept|acceptForSession|decline|cancel.
+    \\  --file-approval VALUE            auto|accept|acceptForSession|decline|cancel.
+    \\  --permissions-approval VALUE     deny|grant-turn|grant-session.
+    \\  --request-user-input-response-json JSON
+    \\                                   Exact result payload for item/tool/requestUserInput.
+    \\  --elicitation-action VALUE       decline|cancel|accept.
+    \\  --elicitation-content-json JSON  Content payload when elicitation action is accept.
+    \\  --dynamic-tool-response-json JSON
+    \\                                   Exact result payload for item/tool/call.
+    \\  --read-only                      Decline exec + file approvals.
+    \\  --fallback MODE                  none|native-review (default: none).
     \\
     \\Status/wait/interrupt options:
     \\  --review-thread-id THREAD_ID     Detached review thread id handle.
@@ -66,6 +80,31 @@ const Action = enum {
     }
 };
 
+const ParentMode = enum {
+    auto,
+    fresh,
+    reuse,
+
+    fn parse(raw: []const u8) ?ParentMode {
+        if (std.mem.eql(u8, raw, "auto")) return .auto;
+        if (std.mem.eql(u8, raw, "fresh")) return .fresh;
+        if (std.mem.eql(u8, raw, "reuse")) return .reuse;
+        return null;
+    }
+};
+
+const FallbackMode = enum {
+    none,
+    native_review,
+
+    fn parse(raw: []const u8) ?FallbackMode {
+        if (std.mem.eql(u8, raw, "none")) return .none;
+        if (std.mem.eql(u8, raw, "native-review")) return .native_review;
+        if (std.mem.eql(u8, raw, "native_review")) return .native_review;
+        return null;
+    }
+};
+
 const TargetKind = enum {
     uncommitted,
     base_branch,
@@ -94,12 +133,22 @@ const ParsedArgs = struct {
     action: ?Action = null,
     cwd: ?[]const u8 = null,
     parent_thread_id: ?[]const u8 = null,
+    parent_mode: ParentMode = .auto,
     review_thread_id: ?[]const u8 = null,
     target: ?TargetConfig = null,
     wait_after_start: bool = false,
     json: bool = false,
     timeout_ms: u32 = 300_000,
     poll_interval_ms: u32 = 250,
+    exec_approval: ?[]const u8 = null,
+    file_approval: ?[]const u8 = null,
+    permissions_approval: ?[]const u8 = null,
+    request_user_input_response_json: ?[]const u8 = null,
+    elicitation_action: ?[]const u8 = null,
+    elicitation_content_json: ?[]const u8 = null,
+    dynamic_tool_response_json: ?[]const u8 = null,
+    read_only: bool = false,
+    fallback_mode: FallbackMode = .none,
     show_help: bool = false,
     show_version: bool = false,
 };
@@ -145,6 +194,9 @@ const ReviewStatus = struct {
     turn_count: usize,
     materialized: bool,
     rollout_path: ?[]const u8,
+    turn_error_message: ?[]const u8,
+    last_turn_has_entered_review_mode: bool,
+    last_turn_has_exited_review_mode: bool,
     review_result_available: bool,
     review_result_source: ?[]const u8,
     review_result_json: ?[]const u8,
@@ -154,8 +206,21 @@ const ReviewStatus = struct {
         allocator.free(self.thread_status);
         allocator.free(self.turn_status);
         if (self.rollout_path) |path| allocator.free(path);
+        if (self.turn_error_message) |message| allocator.free(message);
         if (self.review_result_json) |json| allocator.free(json);
         allocator.free(self.raw_response_json);
+    }
+};
+
+const NativeFallbackResult = struct {
+    exit_code: u8,
+    ok: bool,
+    stdout_text: ?[]const u8,
+    stderr_text: ?[]const u8,
+
+    fn deinit(self: NativeFallbackResult, allocator: std.mem.Allocator) void {
+        if (self.stdout_text) |value| allocator.free(value);
+        if (self.stderr_text) |value| allocator.free(value);
     }
 };
 
@@ -254,6 +319,10 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             out.json = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--read-only")) {
+            out.read_only = true;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--wait")) {
             out.wait_after_start = true;
             continue;
@@ -273,6 +342,10 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
         }
         if (std.mem.eql(u8, arg, "--parent-thread-id")) {
             out.parent_thread_id = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--parent-mode")) {
+            out.parent_mode = ParentMode.parse(value) orelse return error.InvalidParentMode;
             continue;
         }
         if (std.mem.eql(u8, arg, "--review-thread-id")) {
@@ -309,6 +382,38 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             out.poll_interval_ms = @intCast(parsed);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--exec-approval")) {
+            out.exec_approval = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--file-approval")) {
+            out.file_approval = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--permissions-approval")) {
+            out.permissions_approval = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--request-user-input-response-json")) {
+            out.request_user_input_response_json = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--elicitation-action")) {
+            out.elicitation_action = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--elicitation-content-json")) {
+            out.elicitation_content_json = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--dynamic-tool-response-json")) {
+            out.dynamic_tool_response_json = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--fallback")) {
+            out.fallback_mode = FallbackMode.parse(value) orelse return error.InvalidFallbackMode;
+            continue;
+        }
         return error.UnknownArg;
     }
 
@@ -316,6 +421,8 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
         .start => {
             if (out.cwd == null) return error.MissingCwd;
             if (out.target == null) return error.MissingTarget;
+            if (out.parent_mode == .fresh and out.parent_thread_id != null) return error.FreshParentModeDisallowsParentThreadId;
+            if (out.parent_mode == .reuse and out.parent_thread_id == null) return error.ReuseParentModeRequiresParentThreadId;
         },
         .status, .wait, .interrupt => {
             if (out.review_thread_id == null) return error.MissingReviewThreadId;
@@ -383,6 +490,14 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
         .client_name = "cas-review-session",
         .client_title = "CAS Review Session",
         .client_version = Version,
+        .exec_approval = parsed.exec_approval,
+        .file_approval = parsed.file_approval,
+        .permissions_approval = parsed.permissions_approval,
+        .request_user_input_response_json = parsed.request_user_input_response_json,
+        .elicitation_action = parsed.elicitation_action,
+        .elicitation_content_json = parsed.elicitation_content_json,
+        .dynamic_tool_response_json = parsed.dynamic_tool_response_json,
+        .read_only = parsed.read_only,
     }) catch |err| {
         try renderErrorAndExit(
             parsed.json,
@@ -403,23 +518,136 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
     }
 
     const session_dir = try sessionDirAlloc(allocator);
+    const parent_event_log_path = try std.fs.path.join(allocator, &.{ session_dir, "parent-thread.ndjson" });
+    const target = parsed.target.?;
+    const target_record = targetToRecord(target);
     const created_parent_thread = parsed.parent_thread_id == null;
     const parent_thread_id = if (parsed.parent_thread_id) |existing| blk: {
         try resumeParentThread(allocator, &client, existing, session_dir);
+        var parent_status = try fetchReviewStatus(allocator, &client, existing, parent_event_log_path);
+        defer parent_status.deinit(allocator);
+        if (failureInfoForParentReuse(&parent_status)) |failure| {
+            try renderErrorAndExit(
+                parsed.json,
+                "start",
+                "review/start",
+                failure.hint,
+                cwd,
+                output_receipt,
+                failure,
+            );
+        }
         break :blk try allocator.dupe(u8, existing);
     } else try startParentThreadAlloc(allocator, &client, cwd, session_dir);
-
-    const target = parsed.target.?;
     const review_params_json = try buildReviewStartParamsJson(allocator, parent_thread_id, target);
     defer allocator.free(review_params_json);
-
-    const parent_event_log_path = try std.fs.path.join(allocator, &.{ session_dir, "parent-thread.ndjson" });
     appendLogRecord(allocator, parent_event_log_path, "thread/start", "response", parent_thread_id) catch {};
 
-    const review_result_json = client.requestJson("review/start", review_params_json) catch |err| {
+    var review_result_json: []u8 = undefined;
+    var review_start_retry_used = false;
+    review_result_json = client.requestJson("review/start", review_params_json) catch |err| blk: {
         const raw_message = client.lastError() orelse @errorName(err);
         const failure = failureInfoForReviewStart(raw_message, created_parent_thread);
+        if (created_parent_thread and failure != null) {
+            materializeParentThreadTurn(
+                allocator,
+                &client,
+                parent_thread_id,
+                parent_event_log_path,
+                parsed.timeout_ms,
+                parsed.poll_interval_ms,
+            ) catch {
+                try renderErrorAndExit(
+                    parsed.json,
+                    "start",
+                    "review/start",
+                    "fresh detached review parent could not be materialized before retry",
+                    cwd,
+                    .{
+                        .resolved_codex_path = resolved_codex_path,
+                        .resolved_codex_version = codex_version,
+                        .compatibility_verdict = "incompatible",
+                    },
+                    .{
+                        .code = "parent_materialization_failed",
+                        .hint = "fresh parent-thread retry could not materialize rollout state; upgrade codex or pass a clean materialized --parent-thread-id",
+                    },
+                );
+            };
+
+            review_start_retry_used = true;
+            break :blk client.requestJson("review/start", review_params_json) catch |retry_err| {
+                const retry_message = client.lastError() orelse @errorName(retry_err);
+                const retry_failure = failureInfoForReviewStart(retry_message, created_parent_thread);
+                const message = if (retry_failure) |value| value.hint else retry_message;
+                try maybeRunNativeFallbackAndExitStart(
+                    allocator,
+                    parsed,
+                    cwd,
+                    resolved_codex_path,
+                    parent_thread_id,
+                    "",
+                    "",
+                    target_record,
+                    "",
+                    parent_event_log_path,
+                    .{
+                        .resolved_codex_path = resolved_codex_path,
+                        .resolved_codex_version = codex_version,
+                        .compatibility_verdict = if (retry_failure != null) "incompatible" else "not_checked",
+                    },
+                    null,
+                    false,
+                    false,
+                    retry_failure orelse .{
+                        .code = "review_turn_failed",
+                        .hint = "detached review startup failed after fresh-parent materialization retry",
+                    },
+                );
+                try renderErrorAndExit(
+                    parsed.json,
+                    "start",
+                    "review/start",
+                    message,
+                    cwd,
+                    .{
+                        .resolved_codex_path = resolved_codex_path,
+                        .resolved_codex_version = codex_version,
+                        .compatibility_verdict = if (retry_failure != null) "incompatible" else "not_checked",
+                    },
+                    retry_failure orelse .{
+                        .code = "review_turn_failed",
+                        .hint = "detached review startup failed after fresh-parent materialization retry",
+                    },
+                );
+            };
+        }
+
         const message = if (failure) |value| value.hint else raw_message;
+        try maybeRunNativeFallbackAndExitStart(
+            allocator,
+            parsed,
+            cwd,
+            resolved_codex_path,
+            parent_thread_id,
+            "",
+            "",
+            target_record,
+            "",
+            parent_event_log_path,
+            .{
+                .resolved_codex_path = resolved_codex_path,
+                .resolved_codex_version = codex_version,
+                .compatibility_verdict = if (failure != null) "incompatible" else "not_checked",
+            },
+            null,
+            false,
+            false,
+            failure orelse .{
+                .code = "review_turn_failed",
+                .hint = "detached review startup failed after app-server launch",
+            },
+        );
         try renderErrorAndExit(
             parsed.json,
             "start",
@@ -429,10 +657,7 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
             .{
                 .resolved_codex_path = resolved_codex_path,
                 .resolved_codex_version = codex_version,
-                .compatibility_verdict = if (failure) |value|
-                    if (std.mem.eql(u8, value.code, "incompatible_codex_review_runtime")) "incompatible" else "not_checked"
-                else
-                    "not_checked",
+                .compatibility_verdict = if (failure != null) "incompatible" else "not_checked",
             },
             failure orelse .{
                 .code = "review_turn_failed",
@@ -446,10 +671,12 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
     const review_turn_id = try extractReviewTurnIdAlloc(allocator, review_result_json);
     const event_log_path = try std.fmt.allocPrint(allocator, "{s}/{s}.events.ndjson", .{ session_dir, review_thread_id });
     const record_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ session_dir, review_thread_id });
-    const target_record = targetToRecord(target);
 
     try appendLogRecord(allocator, event_log_path, "review/start", "request", review_params_json);
     try appendLogRecord(allocator, event_log_path, "review/start", "response", review_result_json);
+    if (review_start_retry_used) {
+        appendLogRecord(allocator, event_log_path, "review/start", "note", "{\"retry\":\"fresh-parent-materialization\"}") catch {};
+    }
 
     var record = SessionRecord{
         .cwd = cwd,
@@ -502,6 +729,7 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                             .code = "wait_timed_out",
                             .hint = "retry cas review_session wait on the same review thread or increase --timeout-ms",
                         },
+                        null,
                     );
                 } else {
                     var stdout_writer = std.fs.File.stdout().writer(&.{});
@@ -517,6 +745,30 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                 const latest_status = try fetchReviewStatus(allocator, &client, record.review_thread_id, record.event_log_path);
                 record.last_observed_status = timeoutStatusString(&latest_status);
                 try writeSessionRecord(allocator, record_path, record);
+                try maybeRunNativeFallbackAndExitStart(
+                    allocator,
+                    parsed,
+                    cwd,
+                    resolved_codex_path,
+                    parent_thread_id,
+                    review_thread_id,
+                    review_turn_id,
+                    target_record,
+                    record_path,
+                    event_log_path,
+                    .{
+                        .resolved_codex_path = resolved_codex_path,
+                        .resolved_codex_version = codex_version,
+                        .compatibility_verdict = "compatible",
+                    },
+                    latest_status,
+                    false,
+                    true,
+                    failureInfoForStatus(&latest_status) orelse .{
+                        .code = "review_result_unavailable",
+                        .hint = "detached review reached terminal status without a materialized reviewResult",
+                    },
+                );
                 if (parsed.json) {
                     try printStartJson(
                         allocator,
@@ -536,9 +788,10 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                         false,
                         true,
                         .{
-                            .code = "review_result_unavailable",
-                            .hint = "detached review reached terminal status without a materialized reviewResult",
+                            .code = failureInfoForStatus(&latest_status).?.code,
+                            .hint = failureInfoForStatus(&latest_status).?.hint,
                         },
+                        null,
                     );
                 } else {
                     var stdout_writer = std.fs.File.stdout().writer(&.{});
@@ -572,6 +825,7 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                 latest,
                 false,
                 true,
+                null,
                 null,
             );
         } else {
@@ -608,6 +862,7 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
             null,
             false,
             false,
+            null,
             null,
         );
     } else {
@@ -661,6 +916,7 @@ fn cmdStatus(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
             null,
             null,
             failureInfoForStatus(&status),
+            null,
         );
     } else {
         var stdout_writer = std.fs.File.stdout().writer(&.{});
@@ -728,6 +984,7 @@ fn cmdWait(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                         .code = "wait_timed_out",
                         .hint = "retry cas review_session wait on the same review thread or increase --timeout-ms",
                     },
+                    null,
                 );
             } else {
                 var stdout_writer = std.fs.File.stdout().writer(&.{});
@@ -743,6 +1000,17 @@ fn cmdWait(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
             const terminal_status = try fetchReviewStatus(allocator, &client, record.review_thread_id, record.event_log_path);
             record.last_observed_status = timeoutStatusString(&terminal_status);
             try writeSessionRecord(allocator, loaded.record_path, record);
+            try maybeRunNativeFallbackAndExitWait(
+                allocator,
+                parsed,
+                record,
+                loaded.record_path,
+                terminal_status,
+                failureInfoForStatus(&terminal_status) orelse .{
+                    .code = "review_result_unavailable",
+                    .hint = "detached review reached terminal status without a materialized reviewResult",
+                },
+            );
             if (parsed.json) {
                 try printStatusJson(
                     allocator,
@@ -762,9 +1030,10 @@ fn cmdWait(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                     null,
                     false,
                     .{
-                        .code = "review_result_unavailable",
-                        .hint = "detached review reached terminal status without a materialized reviewResult",
+                        .code = failureInfoForStatus(&terminal_status).?.code,
+                        .hint = failureInfoForStatus(&terminal_status).?.hint,
                     },
+                    null,
                 );
             } else {
                 var stdout_writer = std.fs.File.stdout().writer(&.{});
@@ -799,6 +1068,7 @@ fn cmdWait(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
             },
             null,
             false,
+            null,
             null,
         );
     } else {
@@ -1015,6 +1285,9 @@ fn parseReviewStatusAlloc(allocator: std.mem.Allocator, raw_json: []const u8, ma
     };
     var turn_status: []const u8 = if (materialized) "pending" else "materializing";
     var turn_count: usize = 0;
+    var turn_error_message: ?[]const u8 = null;
+    var last_turn_has_entered_review_mode = false;
+    var last_turn_has_exited_review_mode = false;
     const rollout_path = if (core_json.stringField(thread_obj, "path")) |path|
         try allocator.dupe(u8, path)
     else
@@ -1026,6 +1299,20 @@ fn parseReviewStatusAlloc(allocator: std.mem.Allocator, raw_json: []const u8, ma
                 const last = arr.items[arr.items.len - 1];
                 if (last == .object) {
                     if (core_json.stringField(last.object, "status")) |status| turn_status = status;
+                    if (last.object.get("error")) |error_val| {
+                        turn_error_message = try extractErrorMessageAlloc(allocator, error_val);
+                    }
+                    if (last.object.get("items")) |items_val| switch (items_val) {
+                        .array => |items| {
+                            for (items.items) |item| {
+                                if (item != .object) continue;
+                                const item_type = core_json.stringField(item.object, "type") orelse continue;
+                                if (std.mem.eql(u8, item_type, "enteredReviewMode")) last_turn_has_entered_review_mode = true;
+                                if (std.mem.eql(u8, item_type, "exitedReviewMode")) last_turn_has_exited_review_mode = true;
+                            }
+                        },
+                        else => {},
+                    };
                 }
             }
         },
@@ -1037,10 +1324,27 @@ fn parseReviewStatusAlloc(allocator: std.mem.Allocator, raw_json: []const u8, ma
         .turn_count = turn_count,
         .materialized = materialized,
         .rollout_path = rollout_path,
+        .turn_error_message = turn_error_message,
+        .last_turn_has_entered_review_mode = last_turn_has_entered_review_mode,
+        .last_turn_has_exited_review_mode = last_turn_has_exited_review_mode,
         .review_result_available = false,
         .review_result_source = null,
         .review_result_json = null,
         .raw_response_json = try allocator.dupe(u8, raw_json),
+    };
+}
+
+fn extractErrorMessageAlloc(allocator: std.mem.Allocator, value: std.json.Value) !?[]u8 {
+    return switch (value) {
+        .null => null,
+        .string => |text| try allocator.dupe(u8, text),
+        .object => |obj| blk: {
+            if (core_json.stringField(obj, "message")) |text| {
+                break :blk try allocator.dupe(u8, text);
+            }
+            break :blk null;
+        },
+        else => null,
     };
 }
 
@@ -1077,6 +1381,165 @@ fn maybeResumeMaterializedThread(
     try appendLogRecord(allocator, event_log_path, "thread/resume", "request", params_json);
     try appendLogRecord(allocator, event_log_path, "thread/resume", "response", resume_result_json);
     return true;
+}
+
+fn failureInfoForParentReuse(status: *const ReviewStatus) ?FailureInfo {
+    if (!status.materialized or status.rollout_path == null or status.turn_count == 0) {
+        return .{
+            .code = "parent_thread_not_materialized",
+            .hint = "supplied parent thread is not safely materialized for detached review reuse; pass a materialized thread or use --parent-mode fresh",
+        };
+    }
+    if (std.mem.eql(u8, status.turn_status, "inProgress")) {
+        return .{
+            .code = "unsafe_parent_thread_state",
+            .hint = "supplied parent thread still has an active turn; wait for it to finish or choose another parent thread",
+        };
+    }
+    if (std.mem.eql(u8, status.turn_status, "interrupted") or
+        std.mem.eql(u8, status.turn_status, "failed") or
+        std.mem.eql(u8, status.turn_status, "errored"))
+    {
+        return .{
+            .code = "unsafe_parent_thread_state",
+            .hint = "supplied parent thread ended in an interrupted or failed state; reuse a clean materialized parent thread instead",
+        };
+    }
+    if (status.last_turn_has_entered_review_mode and !status.last_turn_has_exited_review_mode) {
+        return .{
+            .code = "unsafe_parent_thread_state",
+            .hint = "supplied parent thread still carries unfinished review-mode state; reuse a clean materialized parent thread instead",
+        };
+    }
+    return null;
+}
+
+fn buildTurnStartParamsJson(allocator: std.mem.Allocator, thread_id: []const u8, text: []const u8) ![]u8 {
+    return stringifyAnyAlloc(allocator, .{
+        .threadId = thread_id,
+        .input = .{
+            .{ .type = "text", .text = text },
+        },
+    });
+}
+
+fn waitForThreadTerminalState(
+    allocator: std.mem.Allocator,
+    client: *cas.Client,
+    thread_id: []const u8,
+    event_log_path: []const u8,
+    timeout_ms: u32,
+    poll_interval_ms: u32,
+) !ReviewStatus {
+    const started_ms = std.time.milliTimestamp();
+    while (true) {
+        const latest = try fetchReviewStatus(allocator, client, thread_id, event_log_path);
+        if (isTerminalTurnStatus(latest.turn_status)) return latest;
+        latest.deinit(allocator);
+        if (std.time.milliTimestamp() - started_ms >= timeout_ms) return error.WaitTimedOut;
+        std.Thread.sleep(@as(u64, poll_interval_ms) * std.time.ns_per_ms);
+    }
+}
+
+fn materializeParentThreadTurn(
+    allocator: std.mem.Allocator,
+    client: *cas.Client,
+    parent_thread_id: []const u8,
+    event_log_path: []const u8,
+    timeout_ms: u32,
+    poll_interval_ms: u32,
+) !void {
+    const params_json = try buildTurnStartParamsJson(
+        allocator,
+        parent_thread_id,
+        "Internal bootstrap for detached review parent materialization. Reply with OK only.",
+    );
+    defer allocator.free(params_json);
+    const result_json = try client.requestJson("turn/start", params_json);
+    defer allocator.free(result_json);
+    try appendLogRecord(allocator, event_log_path, "turn/start", "request", params_json);
+    try appendLogRecord(allocator, event_log_path, "turn/start", "response", result_json);
+
+    var terminal_status = try waitForThreadTerminalState(
+        allocator,
+        client,
+        parent_thread_id,
+        event_log_path,
+        timeout_ms,
+        poll_interval_ms,
+    );
+    defer terminal_status.deinit(allocator);
+    if (std.mem.eql(u8, terminal_status.turn_status, "failed") or
+        std.mem.eql(u8, terminal_status.turn_status, "errored"))
+    {
+        return error.ParentMaterializationFailed;
+    }
+}
+
+fn appendNativeReviewArgs(allocator: std.mem.Allocator, args: *std.ArrayList([]const u8), target: TargetRecord) !void {
+    if (std.mem.eql(u8, target.type, "uncommittedChanges")) {
+        try args.append(allocator, "--uncommitted");
+        return;
+    }
+    if (std.mem.eql(u8, target.type, "baseBranch")) {
+        try args.append(allocator, "--base");
+        try args.append(allocator, target.branch.?);
+        return;
+    }
+    if (std.mem.eql(u8, target.type, "commit")) {
+        try args.append(allocator, "--commit");
+        try args.append(allocator, target.sha.?);
+        if (target.title) |title| {
+            try args.append(allocator, "--title");
+            try args.append(allocator, title);
+        }
+        return;
+    }
+    if (std.mem.eql(u8, target.type, "custom")) {
+        try args.append(allocator, target.instructions.?);
+        return;
+    }
+}
+
+fn runNativeReviewFallbackAlloc(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    codex_path: []const u8,
+    target: TargetRecord,
+) !NativeFallbackResult {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+
+    try argv.append(allocator, codex_path);
+    try argv.append(allocator, "review");
+    try appendNativeReviewArgs(allocator, &argv, target);
+
+    var child = std.process.Child.init(argv.items, allocator);
+    child.cwd = cwd;
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    try child.spawn();
+
+    const stdout_bytes = try child.stdout.?.readToEndAlloc(allocator, 1024 * 1024);
+    const stderr_bytes = try child.stderr.?.readToEndAlloc(allocator, 1024 * 1024);
+    const term = try child.wait();
+    const exit_code: u8 = switch (term) {
+        .Exited => |code| @intCast(@min(code, 255)),
+        else => 1,
+    };
+    return .{
+        .exit_code = exit_code,
+        .ok = exit_code == 0,
+        .stdout_text = if (stdout_bytes.len > 0) stdout_bytes else blk: {
+            allocator.free(stdout_bytes);
+            break :blk null;
+        },
+        .stderr_text = if (stderr_bytes.len > 0) stderr_bytes else blk: {
+            allocator.free(stderr_bytes);
+            break :blk null;
+        },
+    };
 }
 
 fn isTerminalTurnStatus(status: []const u8) bool {
@@ -1314,6 +1777,112 @@ fn renderErrorAndExit(
     std.process.exit(1);
 }
 
+fn maybeRunNativeFallbackAndExitStart(
+    allocator: std.mem.Allocator,
+    parsed: ParsedArgs,
+    cwd: []const u8,
+    codex_path: []const u8,
+    parent_thread_id: []const u8,
+    review_thread_id: []const u8,
+    review_turn_id: []const u8,
+    target_record: TargetRecord,
+    record_path: []const u8,
+    event_log_path: []const u8,
+    receipt: OutputReceipt,
+    status: ?ReviewStatus,
+    timed_out: bool,
+    waited: bool,
+    failure: FailureInfo,
+) !void {
+    if (parsed.fallback_mode != .native_review) return;
+
+    var fallback = try runNativeReviewFallbackAlloc(allocator, cwd, codex_path, target_record);
+    defer fallback.deinit(allocator);
+
+    if (parsed.json) {
+        try printStartJson(
+            allocator,
+            cwd,
+            parent_thread_id,
+            review_thread_id,
+            review_turn_id,
+            target_record,
+            record_path,
+            event_log_path,
+            receipt,
+            status,
+            timed_out,
+            waited,
+            failure,
+            fallback,
+        );
+    } else if (fallback.stdout_text) |text| {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try stdout.writeAll(text);
+        if (!std.mem.endsWith(u8, text, "\n")) try stdout.writeAll("\n");
+    }
+
+    if (fallback.stderr_text) |text| {
+        var stderr_writer = std.fs.File.stderr().writer(&.{});
+        const stderr = &stderr_writer.interface;
+        try stderr.writeAll(text);
+        if (!std.mem.endsWith(u8, text, "\n")) try stderr.writeAll("\n");
+    }
+    std.process.exit(if (fallback.ok) 0 else 1);
+}
+
+fn maybeRunNativeFallbackAndExitWait(
+    allocator: std.mem.Allocator,
+    parsed: ParsedArgs,
+    record: SessionRecord,
+    record_path: []const u8,
+    status: ReviewStatus,
+    failure: FailureInfo,
+) !void {
+    if (parsed.fallback_mode != .native_review) return;
+
+    const codex_path = record.resolved_codex_path orelse "codex";
+    var fallback = try runNativeReviewFallbackAlloc(allocator, record.cwd, codex_path, record.target);
+    defer fallback.deinit(allocator);
+
+    if (parsed.json) {
+        try printStatusJson(
+            allocator,
+            .wait,
+            record.cwd,
+            record.parent_thread_id,
+            record.review_thread_id,
+            record.review_turn_id,
+            status,
+            record_path,
+            record.event_log_path,
+            .{
+                .resolved_codex_path = record.resolved_codex_path,
+                .resolved_codex_version = record.codex_version,
+                .compatibility_verdict = record.compatibility_verdict orelse "not_checked",
+            },
+            null,
+            false,
+            failure,
+            fallback,
+        );
+    } else if (fallback.stdout_text) |text| {
+        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        const stdout = &stdout_writer.interface;
+        try stdout.writeAll(text);
+        if (!std.mem.endsWith(u8, text, "\n")) try stdout.writeAll("\n");
+    }
+
+    if (fallback.stderr_text) |text| {
+        var stderr_writer = std.fs.File.stderr().writer(&.{});
+        const stderr = &stderr_writer.interface;
+        try stderr.writeAll(text);
+        if (!std.mem.endsWith(u8, text, "\n")) try stderr.writeAll("\n");
+    }
+    std.process.exit(if (fallback.ok) 0 else 1);
+}
+
 fn readCodexVersionAlloc(allocator: std.mem.Allocator, cwd: []const u8, codex_path: []const u8) ![]const u8 {
     var child = std.process.Child.init(&.{ codex_path, "--version" }, allocator);
     child.cwd = cwd;
@@ -1366,6 +1935,7 @@ fn printStatusJson(
     timeout_ms: ?u32,
     timed_out: ?bool,
     failure: ?FailureInfo,
+    fallback: ?NativeFallbackResult,
 ) !void {
     var stdout_writer = std.fs.File.stdout().writer(&.{});
     const stdout = &stdout_writer.interface;
@@ -1380,6 +1950,19 @@ fn printStatusJson(
     const resolved_codex_version_json = if (receipt.resolved_codex_version) |value| try quoteJsonStringAlloc(allocator, value) else "null";
     const failure_code_json = if (failure) |value| try quoteJsonStringAlloc(allocator, value.code) else "null";
     const failure_hint_json = if (failure) |value| try quoteJsonStringAlloc(allocator, value.hint) else "null";
+    const fallback_transport_json = if (fallback != null) "\"native-review\"" else "null";
+    const fallback_exit_code_json = if (fallback) |value|
+        try std.fmt.allocPrint(allocator, "{d}", .{value.exit_code})
+    else
+        "null";
+    const fallback_stdout_json = if (fallback) |value|
+        if (value.stdout_text) |text| try quoteJsonStringAlloc(allocator, text) else "null"
+    else
+        "null";
+    const fallback_stderr_json = if (fallback) |value|
+        if (value.stderr_text) |text| try quoteJsonStringAlloc(allocator, text) else "null"
+    else
+        "null";
     const timeout_json = if (timeout_ms) |value|
         try std.fmt.allocPrint(allocator, "{d}", .{value})
     else
@@ -1390,7 +1973,7 @@ fn printStatusJson(
         "null";
 
     try stdout.print(
-        "{{\"demo\":\"cas-review-session\",\"action\":\"{s}\",\"cwd\":{s},\"parentThreadId\":{s},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"threadStatus\":{s},\"turnStatus\":{s},\"turnCount\":{d},\"materialized\":{s},\"rolloutPath\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"resolvedCodexPath\":{s},\"resolvedCodexVersion\":{s},\"compatibilityVerdict\":{s},\"timeoutMs\":{s},\"timedOut\":{s},\"failureCode\":{s},\"failureHint\":{s},\"reviewResultAvailable\":{s},\"reviewResultSource\":{s},\"reviewResult\":{s}}}\n",
+        "{{\"demo\":\"cas-review-session\",\"action\":\"{s}\",\"cwd\":{s},\"parentThreadId\":{s},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"threadStatus\":{s},\"turnStatus\":{s},\"turnCount\":{d},\"materialized\":{s},\"rolloutPath\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"resolvedCodexPath\":{s},\"resolvedCodexVersion\":{s},\"compatibilityVerdict\":{s},\"timeoutMs\":{s},\"timedOut\":{s},\"failureCode\":{s},\"failureHint\":{s},\"fallbackUsed\":{s},\"fallbackTransport\":{s},\"fallbackExitCode\":{s},\"fallbackOutputText\":{s},\"fallbackErrorText\":{s},\"reviewResultAvailable\":{s},\"reviewResultSource\":{s},\"reviewResult\":{s}}}\n",
         .{
             @tagName(action),
             cwd_json,
@@ -1411,6 +1994,11 @@ fn printStatusJson(
             timed_out_json,
             failure_code_json,
             failure_hint_json,
+            if (fallback != null) "true" else "false",
+            fallback_transport_json,
+            fallback_exit_code_json,
+            fallback_stdout_json,
+            fallback_stderr_json,
             if (status.review_result_available) "true" else "false",
             review_result_source_json,
             review_result_json,
@@ -1432,6 +2020,7 @@ fn printStartJson(
     timed_out: bool,
     waited: bool,
     failure: ?FailureInfo,
+    fallback: ?NativeFallbackResult,
 ) !void {
     var stdout_writer = std.fs.File.stdout().writer(&.{});
     const stdout = &stdout_writer.interface;
@@ -1463,9 +2052,22 @@ fn printStartJson(
     const resolved_codex_version_json = if (receipt.resolved_codex_version) |value| try quoteJsonStringAlloc(allocator, value) else "null";
     const failure_code_json = if (failure) |value| try quoteJsonStringAlloc(allocator, value.code) else "null";
     const failure_hint_json = if (failure) |value| try quoteJsonStringAlloc(allocator, value.hint) else "null";
+    const fallback_transport_json = if (fallback != null) "\"native-review\"" else "null";
+    const fallback_exit_code_json = if (fallback) |value|
+        try std.fmt.allocPrint(allocator, "{d}", .{value.exit_code})
+    else
+        "null";
+    const fallback_stdout_json = if (fallback) |value|
+        if (value.stdout_text) |text| try quoteJsonStringAlloc(allocator, text) else "null"
+    else
+        "null";
+    const fallback_stderr_json = if (fallback) |value|
+        if (value.stderr_text) |text| try quoteJsonStringAlloc(allocator, text) else "null"
+    else
+        "null";
 
     try stdout.print(
-        "{{\"demo\":\"cas-review-session\",\"action\":\"start\",\"cwd\":{s},\"parentThreadId\":{s},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"delivery\":\"detached\",\"target\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"codexVersion\":{s},\"resolvedCodexPath\":{s},\"resolvedCodexVersion\":{s},\"compatibilityVerdict\":{s},\"waited\":{s},\"timedOut\":{s},\"threadStatus\":{s},\"turnStatus\":{s},\"turnCount\":{d},\"materialized\":{s},\"rolloutPath\":{s},\"failureCode\":{s},\"failureHint\":{s},\"reviewResultAvailable\":{s},\"reviewResultSource\":{s},\"reviewResult\":{s}}}\n",
+        "{{\"demo\":\"cas-review-session\",\"action\":\"start\",\"cwd\":{s},\"parentThreadId\":{s},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"delivery\":\"detached\",\"target\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"codexVersion\":{s},\"resolvedCodexPath\":{s},\"resolvedCodexVersion\":{s},\"compatibilityVerdict\":{s},\"waited\":{s},\"timedOut\":{s},\"threadStatus\":{s},\"turnStatus\":{s},\"turnCount\":{d},\"materialized\":{s},\"rolloutPath\":{s},\"failureCode\":{s},\"failureHint\":{s},\"fallbackUsed\":{s},\"fallbackTransport\":{s},\"fallbackExitCode\":{s},\"fallbackOutputText\":{s},\"fallbackErrorText\":{s},\"reviewResultAvailable\":{s},\"reviewResultSource\":{s},\"reviewResult\":{s}}}\n",
         .{
             try quoteJsonStringAlloc(allocator, cwd),
             try quoteJsonStringAlloc(allocator, parent_thread_id),
@@ -1487,6 +2089,11 @@ fn printStartJson(
             rollout_path_json,
             failure_code_json,
             failure_hint_json,
+            if (fallback != null) "true" else "false",
+            fallback_transport_json,
+            fallback_exit_code_json,
+            fallback_stdout_json,
+            fallback_stderr_json,
             review_result_available_json,
             review_result_source_json,
             review_result_json,
@@ -1515,8 +2122,31 @@ fn failureInfoForReviewStart(raw_message: []const u8, created_parent_thread: boo
 
 fn failureInfoForStatus(status: *const ReviewStatus) ?FailureInfo {
     if (isTerminalTurnStatus(status.turn_status) and !status.review_result_available) {
+        if (std.mem.eql(u8, status.turn_status, "interrupted")) {
+            return .{
+                .code = "review_interrupted",
+                .hint = "detached review was interrupted before a materialized reviewResult was written",
+            };
+        }
+        if (status.turn_error_message) |message| {
+            if (std.mem.indexOf(u8, message, "approval") != null or
+                std.mem.indexOf(u8, message, "permission") != null or
+                std.mem.indexOf(u8, message, "denied") != null)
+            {
+                return .{
+                    .code = "approval_denied",
+                    .hint = "detached review stopped on an approval or permissions denial before emitting a structured reviewResult",
+                };
+            }
+        }
+        if (std.mem.eql(u8, status.turn_status, "failed") or std.mem.eql(u8, status.turn_status, "errored")) {
+            return .{
+                .code = "review_failed",
+                .hint = "detached review ended in a failed or errored state before emitting a structured reviewResult",
+            };
+        }
         return .{
-            .code = "review_result_unavailable",
+            .code = "review_output_missing",
             .hint = "detached review reached terminal status without a materialized reviewResult",
         };
     }
@@ -1651,6 +2281,45 @@ test "parseArgs captures start --wait" {
     try std.testing.expectEqual(TargetKind.base_branch, parsed.target.?.kind);
 }
 
+test "parseArgs captures parent mode approvals and fallback" {
+    const argv = [_][]const u8{
+        "cas_review_session",
+        "start",
+        "--cwd",
+        "/tmp/repo",
+        "--parent-thread-id",
+        "thr_parent",
+        "--parent-mode",
+        "reuse",
+        "--uncommitted",
+        "--exec-approval",
+        "decline",
+        "--file-approval",
+        "acceptForSession",
+        "--permissions-approval",
+        "grant-session",
+        "--request-user-input-response-json",
+        "{\"answers\":{}}",
+        "--elicitation-action",
+        "accept",
+        "--elicitation-content-json",
+        "{\"contentItems\":[{\"type\":\"inputText\",\"text\":\"ok\"}]}",
+        "--dynamic-tool-response-json",
+        "{\"success\":true,\"contentItems\":[]}",
+        "--fallback",
+        "native-review",
+        "--json",
+    };
+
+    const parsed = try parseArgs(std.testing.allocator, &argv);
+    try std.testing.expectEqual(ParentMode.reuse, parsed.parent_mode);
+    try std.testing.expectEqual(FallbackMode.native_review, parsed.fallback_mode);
+    try std.testing.expectEqualStrings("thr_parent", parsed.parent_thread_id.?);
+    try std.testing.expectEqualStrings("decline", parsed.exec_approval.?);
+    try std.testing.expectEqualStrings("acceptForSession", parsed.file_approval.?);
+    try std.testing.expectEqualStrings("grant-session", parsed.permissions_approval.?);
+}
+
 test "parseReviewStatusAlloc handles materialized and pending states" {
     const materialized = try parseReviewStatusAlloc(
         std.testing.allocator,
@@ -1737,6 +2406,9 @@ test "failureInfoForStatus flags missing terminal review result" {
         .turn_count = 1,
         .materialized = true,
         .rollout_path = null,
+        .turn_error_message = null,
+        .last_turn_has_entered_review_mode = false,
+        .last_turn_has_exited_review_mode = false,
         .review_result_available = false,
         .review_result_source = null,
         .review_result_json = null,
@@ -1745,5 +2417,60 @@ test "failureInfoForStatus flags missing terminal review result" {
     defer status.deinit(std.testing.allocator);
 
     const failure = failureInfoForStatus(&status).?;
-    try std.testing.expectEqualStrings("review_result_unavailable", failure.code);
+    try std.testing.expectEqualStrings("review_output_missing", failure.code);
+}
+
+test "failureInfoForStatus maps interrupted and approval failures" {
+    var interrupted = ReviewStatus{
+        .thread_status = try std.testing.allocator.dupe(u8, "idle"),
+        .turn_status = try std.testing.allocator.dupe(u8, "interrupted"),
+        .turn_count = 1,
+        .materialized = true,
+        .rollout_path = null,
+        .turn_error_message = null,
+        .last_turn_has_entered_review_mode = true,
+        .last_turn_has_exited_review_mode = false,
+        .review_result_available = false,
+        .review_result_source = null,
+        .review_result_json = null,
+        .raw_response_json = try std.testing.allocator.dupe(u8, "{}"),
+    };
+    defer interrupted.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("review_interrupted", failureInfoForStatus(&interrupted).?.code);
+
+    var denied = ReviewStatus{
+        .thread_status = try std.testing.allocator.dupe(u8, "idle"),
+        .turn_status = try std.testing.allocator.dupe(u8, "failed"),
+        .turn_count = 1,
+        .materialized = true,
+        .rollout_path = null,
+        .turn_error_message = try std.testing.allocator.dupe(u8, "permission denied by approval policy"),
+        .last_turn_has_entered_review_mode = false,
+        .last_turn_has_exited_review_mode = false,
+        .review_result_available = false,
+        .review_result_source = null,
+        .review_result_json = null,
+        .raw_response_json = try std.testing.allocator.dupe(u8, "{}"),
+    };
+    defer denied.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("approval_denied", failureInfoForStatus(&denied).?.code);
+}
+
+test "failureInfoForParentReuse rejects unsafe parents" {
+    var parent = ReviewStatus{
+        .thread_status = try std.testing.allocator.dupe(u8, "idle"),
+        .turn_status = try std.testing.allocator.dupe(u8, "interrupted"),
+        .turn_count = 1,
+        .materialized = true,
+        .rollout_path = try std.testing.allocator.dupe(u8, "/tmp/rollout.jsonl"),
+        .turn_error_message = null,
+        .last_turn_has_entered_review_mode = true,
+        .last_turn_has_exited_review_mode = false,
+        .review_result_available = false,
+        .review_result_source = null,
+        .review_result_json = null,
+        .raw_response_json = try std.testing.allocator.dupe(u8, "{}"),
+    };
+    defer parent.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("unsafe_parent_thread_state", failureInfoForParentReuse(&parent).?.code);
 }

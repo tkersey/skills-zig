@@ -26,8 +26,10 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
   - `item/tool/call`
 - By default, permissions requests are denied, request-user-input questions are answered with the first option label when present, MCP elicitations are declined, and dynamic tool calls return `success: false` with an explanatory text item.
 - `cas_review_session` starts detached `review/start` turns, persists the detached `reviewThreadId` as the recoverable handle, appends raw request/response artifacts to an NDJSON log, supports fresh-process `status`, `wait`, and `interrupt`, treats `start -> wait` as the primary flow, and keeps `start --wait` only as a convenience wrapper over the same lifecycle.
-- JSON review-session output now includes `resolvedCodexPath`, `resolvedCodexVersion`, `compatibilityVerdict`, `failureCode`, and `failureHint` in addition to `reviewResult*` fields so callers can distinguish compatibility/setup failures from terminal review outcomes.
-- If detached review on a freshly created parent thread still fails with `no rollout found`, the installed `codex` binary is older than the parent-rollout fix; upgrade `codex` or pass `--parent-thread-id` for an already materialized parent thread.
+- `cas review_session start` now supports `--parent-mode auto|fresh|reuse`. `reuse` rejects unsafe parent threads, and fresh-parent startup retries once after a bootstrap materialization turn when older Codex builds cannot detach review from a just-created parent thread.
+- `cas review_session` now forwards the native approval/runtime overrides already supported by the CAS Zig client: `--exec-approval`, `--file-approval`, `--permissions-approval`, `--request-user-input-response-json`, `--elicitation-action`, `--elicitation-content-json`, `--dynamic-tool-response-json`, and `--read-only`.
+- JSON review-session output now includes `resolvedCodexPath`, `resolvedCodexVersion`, `compatibilityVerdict`, `failureCode`, `failureHint`, plus optional `fallback*` fields when `--fallback native-review` is used.
+- Terminal review failures are now classified more precisely: `review_interrupted`, `approval_denied`, `review_failed`, `review_output_missing`, `parent_thread_not_materialized`, and `unsafe_parent_thread_state`.
 
 ## API Examples
 
@@ -39,6 +41,14 @@ cas --help
 cas review_session start \
   --cwd /path/to/workspace \
   --uncommitted \
+  --json
+
+# Reuse only a clean materialized parent thread.
+cas review_session start \
+  --cwd /path/to/workspace \
+  --parent-thread-id thr_parent \
+  --parent-mode reuse \
+  --base main \
   --json
 
 # Start detached review and keep the handle.
@@ -58,6 +68,7 @@ cas review_session start \
   --wait \
   --cwd /path/to/workspace \
   --base main \
+  --fallback native-review \
   --json
 
 # Run one conformance scenario with JSON output.
