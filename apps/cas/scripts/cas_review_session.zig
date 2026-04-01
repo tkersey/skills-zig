@@ -188,11 +188,15 @@ const FailureInfo = struct {
     hint: []const u8,
 };
 
+const parent_materialization_prompt =
+    "Internal bootstrap for detached review parent materialization. Reply with OK only.";
+
 const ReviewStatus = struct {
     thread_status: []const u8,
     turn_status: []const u8,
     turn_count: usize,
     materialized: bool,
+    thread_preview: []const u8,
     rollout_path: ?[]const u8,
     turn_error_message: ?[]const u8,
     last_turn_has_entered_review_mode: bool,
@@ -205,6 +209,7 @@ const ReviewStatus = struct {
     fn deinit(self: ReviewStatus, allocator: std.mem.Allocator) void {
         allocator.free(self.thread_status);
         allocator.free(self.turn_status);
+        allocator.free(self.thread_preview);
         if (self.rollout_path) |path| allocator.free(path);
         if (self.turn_error_message) |message| allocator.free(message);
         if (self.review_result_json) |json| allocator.free(json);
@@ -744,6 +749,11 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
             error.ReviewResultUnavailable => {
                 const latest_status = try fetchReviewStatus(allocator, &client, record.review_thread_id, record.event_log_path);
                 record.last_observed_status = timeoutStatusString(&latest_status);
+                if (failureInfoForStatus(&latest_status)) |failure| {
+                    if (std.mem.eql(u8, failure.code, "incompatible_codex_review_runtime")) {
+                        record.compatibility_verdict = "incompatible";
+                    }
+                }
                 try writeSessionRecord(allocator, record_path, record);
                 try maybeRunNativeFallbackAndExitStart(
                     allocator,
@@ -782,7 +792,7 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                         .{
                             .resolved_codex_path = resolved_codex_path,
                             .resolved_codex_version = codex_version,
-                            .compatibility_verdict = "compatible",
+                            .compatibility_verdict = record.compatibility_verdict orelse "compatible",
                         },
                         latest_status,
                         false,
@@ -999,6 +1009,11 @@ fn cmdWait(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
         error.ReviewResultUnavailable => {
             const terminal_status = try fetchReviewStatus(allocator, &client, record.review_thread_id, record.event_log_path);
             record.last_observed_status = timeoutStatusString(&terminal_status);
+            if (failureInfoForStatus(&terminal_status)) |failure| {
+                if (std.mem.eql(u8, failure.code, "incompatible_codex_review_runtime")) {
+                    record.compatibility_verdict = "incompatible";
+                }
+            }
             try writeSessionRecord(allocator, loaded.record_path, record);
             try maybeRunNativeFallbackAndExitWait(
                 allocator,
@@ -1276,6 +1291,10 @@ fn parseReviewStatusAlloc(allocator: std.mem.Allocator, raw_json: []const u8, ma
     defer parsed.deinit();
     const root_obj = parsed.value.object;
     const thread_obj = core_json.objectField(root_obj, "thread") orelse return error.MissingThread;
+    const thread_preview = if (core_json.stringField(thread_obj, "preview")) |preview|
+        try allocator.dupe(u8, preview)
+    else
+        try allocator.dupe(u8, "");
     const thread_status = blk: {
         if (core_json.stringField(thread_obj, "status")) |status| break :blk status;
         if (core_json.objectField(thread_obj, "status")) |status_obj| {
@@ -1323,6 +1342,7 @@ fn parseReviewStatusAlloc(allocator: std.mem.Allocator, raw_json: []const u8, ma
         .turn_status = try allocator.dupe(u8, turn_status),
         .turn_count = turn_count,
         .materialized = materialized,
+        .thread_preview = thread_preview,
         .rollout_path = rollout_path,
         .turn_error_message = turn_error_message,
         .last_turn_has_entered_review_mode = last_turn_has_entered_review_mode,
@@ -1452,7 +1472,7 @@ fn materializeParentThreadTurn(
     const params_json = try buildTurnStartParamsJson(
         allocator,
         parent_thread_id,
-        "Internal bootstrap for detached review parent materialization. Reply with OK only.",
+        parent_materialization_prompt,
     );
     defer allocator.free(params_json);
     const result_json = try client.requestJson("turn/start", params_json);
@@ -2122,6 +2142,14 @@ fn failureInfoForReviewStart(raw_message: []const u8, created_parent_thread: boo
 
 fn failureInfoForStatus(status: *const ReviewStatus) ?FailureInfo {
     if (isTerminalTurnStatus(status.turn_status) and !status.review_result_available) {
+        if (std.mem.eql(u8, status.thread_preview, parent_materialization_prompt) and
+            !status.last_turn_has_entered_review_mode)
+        {
+            return .{
+                .code = "incompatible_codex_review_runtime",
+                .hint = "detached review resolved to the fresh-parent bootstrap thread instead of a review-mode thread; installed codex runtime is not producing a usable detached review thread on this path",
+            };
+        }
         if (std.mem.eql(u8, status.turn_status, "interrupted")) {
             return .{
                 .code = "review_interrupted",
@@ -2405,6 +2433,7 @@ test "failureInfoForStatus flags missing terminal review result" {
         .turn_status = try std.testing.allocator.dupe(u8, "completed"),
         .turn_count = 1,
         .materialized = true,
+        .thread_preview = try std.testing.allocator.dupe(u8, ""),
         .rollout_path = null,
         .turn_error_message = null,
         .last_turn_has_entered_review_mode = false,
@@ -2426,6 +2455,7 @@ test "failureInfoForStatus maps interrupted and approval failures" {
         .turn_status = try std.testing.allocator.dupe(u8, "interrupted"),
         .turn_count = 1,
         .materialized = true,
+        .thread_preview = try std.testing.allocator.dupe(u8, ""),
         .rollout_path = null,
         .turn_error_message = null,
         .last_turn_has_entered_review_mode = true,
@@ -2443,6 +2473,7 @@ test "failureInfoForStatus maps interrupted and approval failures" {
         .turn_status = try std.testing.allocator.dupe(u8, "failed"),
         .turn_count = 1,
         .materialized = true,
+        .thread_preview = try std.testing.allocator.dupe(u8, ""),
         .rollout_path = null,
         .turn_error_message = try std.testing.allocator.dupe(u8, "permission denied by approval policy"),
         .last_turn_has_entered_review_mode = false,
@@ -2462,6 +2493,7 @@ test "failureInfoForParentReuse rejects unsafe parents" {
         .turn_status = try std.testing.allocator.dupe(u8, "interrupted"),
         .turn_count = 1,
         .materialized = true,
+        .thread_preview = try std.testing.allocator.dupe(u8, ""),
         .rollout_path = try std.testing.allocator.dupe(u8, "/tmp/rollout.jsonl"),
         .turn_error_message = null,
         .last_turn_has_entered_review_mode = true,
@@ -2473,4 +2505,26 @@ test "failureInfoForParentReuse rejects unsafe parents" {
     };
     defer parent.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("unsafe_parent_thread_state", failureInfoForParentReuse(&parent).?.code);
+}
+
+test "failureInfoForStatus flags bootstrap-thread substitution as incompatible runtime" {
+    var status = ReviewStatus{
+        .thread_status = try std.testing.allocator.dupe(u8, "idle"),
+        .turn_status = try std.testing.allocator.dupe(u8, "completed"),
+        .turn_count = 1,
+        .materialized = true,
+        .thread_preview = try std.testing.allocator.dupe(u8, parent_materialization_prompt),
+        .rollout_path = try std.testing.allocator.dupe(u8, "/tmp/bootstrap-rollout.jsonl"),
+        .turn_error_message = null,
+        .last_turn_has_entered_review_mode = false,
+        .last_turn_has_exited_review_mode = false,
+        .review_result_available = false,
+        .review_result_source = null,
+        .review_result_json = null,
+        .raw_response_json = try std.testing.allocator.dupe(u8, "{}"),
+    };
+    defer status.deinit(std.testing.allocator);
+
+    const failure = failureInfoForStatus(&status).?;
+    try std.testing.expectEqualStrings("incompatible_codex_review_runtime", failure.code);
 }
