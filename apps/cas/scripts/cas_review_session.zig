@@ -478,7 +478,7 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                 .resolved_codex_path = resolved_codex_path,
             },
             .{
-                .code = "review_turn_failed",
+                .code = "review_failed",
                 .hint = "verify the resolved codex binary is executable and supports app-server mode",
             },
         );
@@ -512,7 +512,7 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
             cwd,
             output_receipt,
             .{
-                .code = "review_turn_failed",
+                .code = "review_failed",
                 .hint = "codex app-server failed before detached review startup completed",
             },
         );
@@ -605,7 +605,7 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                     false,
                     false,
                     retry_failure orelse .{
-                        .code = "review_turn_failed",
+                        .code = "review_failed",
                         .hint = "detached review startup failed after fresh-parent materialization retry",
                     },
                 );
@@ -621,7 +621,7 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                         .compatibility_verdict = if (retry_failure != null) "incompatible" else "not_checked",
                     },
                     retry_failure orelse .{
-                        .code = "review_turn_failed",
+                        .code = "review_failed",
                         .hint = "detached review startup failed after fresh-parent materialization retry",
                     },
                 );
@@ -649,7 +649,7 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
             false,
             false,
             failure orelse .{
-                .code = "review_turn_failed",
+                .code = "review_failed",
                 .hint = "detached review startup failed after app-server launch",
             },
         );
@@ -665,7 +665,7 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                 .compatibility_verdict = if (failure != null) "incompatible" else "not_checked",
             },
             failure orelse .{
-                .code = "review_turn_failed",
+                .code = "review_failed",
                 .hint = "detached review startup failed after app-server launch",
             },
         );
@@ -775,7 +775,7 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                     false,
                     true,
                     failureInfoForStatus(&latest_status) orelse .{
-                        .code = "review_result_unavailable",
+                        .code = "review_output_missing",
                         .hint = "detached review reached terminal status without a materialized reviewResult",
                     },
                 );
@@ -1022,7 +1022,7 @@ fn cmdWait(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                 loaded.record_path,
                 terminal_status,
                 failureInfoForStatus(&terminal_status) orelse .{
-                    .code = "review_result_unavailable",
+                    .code = "review_output_missing",
                     .hint = "detached review reached terminal status without a materialized reviewResult",
                 },
             );
@@ -1164,7 +1164,7 @@ fn cmdInterrupt(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                     .compatibility_verdict = record.compatibility_verdict orelse "not_checked",
                 },
                 .{
-                    .code = "review_turn_failed",
+                    .code = "review_failed",
                     .hint = "detached review thread could not be resumed before interrupt",
                 },
             );
@@ -1194,7 +1194,7 @@ fn cmdInterrupt(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                 .compatibility_verdict = record.compatibility_verdict orelse "not_checked",
             },
             .{
-                .code = "review_turn_failed",
+                .code = "review_failed",
                 .hint = "detached review thread could not be interrupted cleanly",
             },
         );

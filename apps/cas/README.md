@@ -30,6 +30,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - `cas review_session` now forwards the native approval/runtime overrides already supported by the CAS Zig client: `--exec-approval`, `--file-approval`, `--permissions-approval`, `--request-user-input-response-json`, `--elicitation-action`, `--elicitation-content-json`, `--dynamic-tool-response-json`, and `--read-only`.
 - JSON review-session output now includes `resolvedCodexPath`, `resolvedCodexVersion`, `compatibilityVerdict`, `failureCode`, `failureHint`, plus optional `fallback*` fields when `--fallback native-review` is used.
 - Terminal review failures are now classified more precisely: `review_interrupted`, `approval_denied`, `review_failed`, `review_output_missing`, `parent_thread_not_materialized`, and `unsafe_parent_thread_state`.
+- Repo-owned first-party callers should keep native fallback caller-owned: treat `start -> wait` as one detached CAS attempt, and switch to native `codex review` outside CAS after inspecting the JSON verdict when the resolved runtime is incompatible.
 
 ## API Examples
 
