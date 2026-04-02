@@ -8,8 +8,12 @@ const seq_cli = @import("seq_perf_cli");
 const st_cli = @import("st_cli");
 
 const Version = "0.0.0-dev";
+const HelpSurface = core_cli.HelpSurface{
+    .executable_name = "perf_hub",
+    .help_text = UsageText,
+};
 const UsageText =
-    \\perf_hub.zig
+    \\perf_hub
     \\
     \\Native control plane for local perf evidence.
     \\
@@ -405,8 +409,10 @@ pub fn main() !void {
 
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
-    if (try core_cli.handleDefaultHelpAndVersion(argv, UsageText, Version)) return;
-    const parsed = try parseArgs(argv[1..]);
+    if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
+    const parsed = parseArgs(argv[1..]) catch |err| {
+        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
+    };
     switch (parsed.command) {
         .list => try cmdList(parsed.target),
         .manifest => try cmdManifest(allocator),
@@ -1794,8 +1800,8 @@ test "inferBinary maps lift driver case to bench_stats" {
     try std.testing.expectEqualStrings("bench_stats", inferBinary("lift-bench-stats-driver"));
 }
 
-test "coverageStatusFor marks fully landed deep families as landed" {
-    try std.testing.expectEqualStrings("landed", coverageStatusFor("seq"));
+test "coverageStatusFor reflects current manifest coverage" {
+    try std.testing.expectEqualStrings("partial", coverageStatusFor("seq"));
     try std.testing.expectEqualStrings("landed", coverageStatusFor("cron"));
     try std.testing.expectEqualStrings("landed", coverageStatusFor("st"));
 }

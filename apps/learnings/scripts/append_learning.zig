@@ -13,9 +13,7 @@ const StandaloneSurface = Surface{
     .program_name = "append_learning",
     .usage_line = "usage: append_learning [-h] [--status STATUS] --learning LEARNING [--evidence EVIDENCE] [--application APPLICATION] [--tag TAG] [--related-id RELATED_ID] [--supersedes-id SUPERSEDES_ID] [--repo REPO] [--path PATH] [--source SOURCE] [--allow-duplicate] [--quality-mode {strict,best_effort}] [--allow-temp-path]",
     .help_text =
-    \\append_learning.zig
-    \\
-    \\Marker: append_learning.zig
+    \\append_learning
     \\
     \\usage: append_learning [-h] [--status STATUS] --learning LEARNING [--evidence EVIDENCE] [--application APPLICATION] [--tag TAG] [--related-id RELATED_ID] [--supersedes-id SUPERSEDES_ID] [--repo REPO] [--path PATH] [--source SOURCE] [--allow-duplicate] [--quality-mode {strict,best_effort}] [--allow-temp-path]
     \\
@@ -50,8 +48,6 @@ const SubcommandSurface = Surface{
     .usage_line = "usage: learnings append [-h] [--status STATUS] --learning LEARNING [--evidence EVIDENCE] [--application APPLICATION] [--tag TAG] [--related-id RELATED_ID] [--supersedes-id SUPERSEDES_ID] [--repo REPO] [--path PATH] [--source SOURCE] [--allow-duplicate] [--quality-mode {strict,best_effort}] [--allow-temp-path]",
     .help_text =
     \\learnings append
-    \\
-    \\Marker: append_learning.zig
     \\
     \\usage: learnings append [-h] [--status STATUS] --learning LEARNING [--evidence EVIDENCE] [--application APPLICATION] [--tag TAG] [--related-id RELATED_ID] [--supersedes-id SUPERSEDES_ID] [--repo REPO] [--path PATH] [--source SOURCE] [--allow-duplicate] [--quality-mode {strict,best_effort}] [--allow-temp-path]
     \\
@@ -196,7 +192,6 @@ pub fn runWithAllocator(
     args: []const []const u8,
     surface: Surface,
 ) !void {
-
     var opts = Options{};
     defer opts.deinit(allocator);
 
@@ -206,7 +201,7 @@ pub fn runWithAllocator(
         if (core_cli.isHelpArg(arg)) {
             var stdout_writer = std.fs.File.stdout().writer(&.{});
             const stdout = &stdout_writer.interface;
-            try stdout.print("{s}\n", .{surface.help_text});
+            try core_cli.printHelpSurface(stdout, asHelpSurface(surface), Version);
             return;
         }
         if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
@@ -462,10 +457,16 @@ pub fn runWithAllocator(
 }
 
 fn exitParseError(surface: Surface, comptime fmt: []const u8, args: anytype) noreturn {
-    std.debug.print("{s}\n", .{surface.usage_line});
-    std.debug.print("{s}: error: ", .{surface.program_name});
-    std.debug.print(fmt ++ "\n", args);
-    std.process.exit(2);
+    const detail = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch null;
+    defer if (detail) |value| std.heap.page_allocator.free(value);
+    core_cli.exitUsageFailure(asHelpSurface(surface), Version, "InvalidArgument", detail);
+}
+
+fn asHelpSurface(surface: Surface) core_cli.HelpSurface {
+    return .{
+        .executable_name = surface.program_name,
+        .help_text = surface.help_text,
+    };
 }
 
 fn isAsciiAlnum(c: u8) bool {

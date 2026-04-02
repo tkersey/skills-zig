@@ -3,11 +3,13 @@ const core_cli = @import("core_cli");
 const app_meta = @import("app_meta");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
+const HelpSurface = core_cli.HelpSurface{
+    .executable_name = "mesh",
+    .help_text = UsageText,
+};
 
 const UsageText =
-    \\mesh.zig
-    \\
-    \\Marker: mesh.zig
+    \\mesh
     \\
     \\Plan-driven orchestration helpers for streaming batch contracts, budget clamps, and event-only ledgers.
     \\
@@ -163,11 +165,7 @@ pub fn main() !void {
     }
 
     const cmd = resolveCommand(argv[1]) orelse {
-        var stderr_writer = std.fs.File.stderr().writer(&.{});
-        const stderr = &stderr_writer.interface;
-        try stderr.print("Unknown command: {s}\n", .{argv[1]});
-        try core_cli.printHelpWithVersion(stderr, UsageText, Version);
-        std.process.exit(2);
+        core_cli.exitUsageFailure(HelpSurface, Version, "UnknownCommand", argv[1]);
     };
 
     if (argv.len >= 3 and core_cli.isHelpArg(argv[2])) {
@@ -212,7 +210,7 @@ fn resolveCommand(raw: []const u8) ?Command {
 fn printHelp() !void {
     var stdout_writer = std.fs.File.stdout().writer(&.{});
     const stdout = &stdout_writer.interface;
-    try core_cli.printHelpWithVersion(stdout, UsageText, Version);
+    try core_cli.printHelpSurface(stdout, HelpSurface, Version);
 }
 
 fn printVersion() !void {

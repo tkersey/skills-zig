@@ -9,9 +9,8 @@ const ScriptName = "puff.sh";
 const Version = core_cli.normalizeVersion(app_meta.version);
 
 const UsageText =
-    \\puff.zig
+    \\puff
     \\
-    \\Marker: puff.zig
     \\Delegates non-help invocations to:
     \\  bash <resolved puff.sh>
     \\

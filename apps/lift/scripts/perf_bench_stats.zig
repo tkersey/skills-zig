@@ -5,8 +5,12 @@ const core_cli = @import("core_cli");
 const app_meta = @import("app_meta");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
+const HelpSurface = core_cli.HelpSurface{
+    .executable_name = "lift-perf-bench-stats",
+    .help_text = UsageText,
+};
 const UsageText =
-    \\perf_bench_stats.zig
+    \\lift-perf-bench-stats
     \\
     \\Performance harness for bench_stats parser.
     \\
@@ -73,14 +77,18 @@ pub fn main() !void {
 
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
-    if (try core_cli.handleDefaultHelpAndVersion(argv, UsageText, Version)) return;
+    if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
 
-    var cli = try parseCliOptions(allocator);
+    var cli = parseCliOptions(allocator) catch |err| {
+        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
+    };
     defer freeCliOptions(allocator, &cli);
 
-    const config = try loadConfig(allocator, cli.config_path);
-    if (config.rounds < 3) return error.InvalidRounds;
-    if (config.iterations < 100) return error.InvalidIterations;
+    const config = loadConfig(allocator, cli.config_path) catch |err| {
+        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), cli.config_path);
+    };
+    if (config.rounds < 3) core_cli.exitUsageFailure(HelpSurface, Version, "InvalidRounds", cli.config_path);
+    if (config.iterations < 100) core_cli.exitUsageFailure(HelpSurface, Version, "InvalidIterations", cli.config_path);
 
     const summary = try benchmarkBenchStats(allocator, config.iterations, config.rounds);
     const trend_tolerance_pct = cli.trend_tolerance_override orelse config.trend_tolerance_pct;
@@ -129,7 +137,7 @@ fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
         if (core_cli.isHelpArg(arg)) {
             var stdout_writer = std.fs.File.stdout().writer(&.{});
             const stdout = &stdout_writer.interface;
-            try core_cli.printHelpWithVersion(stdout, UsageText, Version);
+            try core_cli.printHelpSurface(stdout, HelpSurface, Version);
             std.process.exit(0);
         }
         if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {

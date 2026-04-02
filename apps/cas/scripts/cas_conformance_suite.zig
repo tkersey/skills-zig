@@ -5,14 +5,18 @@ const std = @import("std");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
 const MaxCommandOutputBytes = 8 * 1024 * 1024;
+const HelpSurface = core_cli.HelpSurface{
+    .executable_name = "cas_conformance_suite",
+    .help_text = UsageText,
+};
 
 const UsageText =
-    \\cas_conformance_suite.zig
+    \\cas_conformance_suite
     \\
     \\Run CAS-backed swarm conformance checks for smoke preflight, durable claims, mesh reconciliation, and retry policy.
     \\
     \\Usage:
-    \\  zig run apps/cas/scripts/cas_conformance_suite.zig -- --cwd DIR [options]
+    \\  cas_conformance_suite --cwd DIR [options]
     \\
     \\Required:
     \\  --cwd DIR                         Workspace for CAS smoke preflight.
@@ -148,13 +152,10 @@ pub fn main() !void {
 
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
-    if (try core_cli.handleDefaultHelpAndVersion(argv, UsageText, Version)) return;
+    if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
 
     const parsed = parseArgs(allocator, argv) catch |err| {
-        var stderr_writer = std.fs.File.stderr().writer(&.{});
-        const stderr = &stderr_writer.interface;
-        try stderr.print("{s}\n{s}\n", .{ @errorName(err), UsageText });
-        std.process.exit(2);
+        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
     };
 
     if (parsed.show_version) {
@@ -167,15 +168,12 @@ pub fn main() !void {
     if (parsed.show_help) {
         var stdout_writer = std.fs.File.stdout().writer(&.{});
         const stdout = &stdout_writer.interface;
-        try core_cli.printHelpWithVersion(stdout, UsageText, Version);
+        try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
     }
 
     const cwd = parsed.cwd orelse {
-        var stderr_writer = std.fs.File.stderr().writer(&.{});
-        const stderr = &stderr_writer.interface;
-        try stderr.print("Missing --cwd\n{s}\n", .{UsageText});
-        std.process.exit(2);
+        core_cli.exitUsageFailure(HelpSurface, Version, "MissingValue", "--cwd");
     };
 
     const ctx = Context{

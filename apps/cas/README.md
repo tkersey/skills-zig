@@ -36,16 +36,16 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 
 ```bash
 # Run the dispatcher help surface.
-cas --help
+./zig-out/bin/cas --help
 
 # Start a detached review session for the working tree.
-cas review_session start \
+./zig-out/bin/cas review_session start \
   --cwd /path/to/workspace \
   --uncommitted \
   --json
 
 # Reuse only a clean materialized parent thread.
-cas review_session start \
+./zig-out/bin/cas review_session start \
   --cwd /path/to/workspace \
   --parent-thread-id thr_parent \
   --parent-mode reuse \
@@ -53,19 +53,19 @@ cas review_session start \
   --json
 
 # Start detached review and keep the handle.
-cas review_session start \
+./zig-out/bin/cas review_session start \
   --cwd /path/to/workspace \
   --base main \
   --json
 
 # Poll a detached review session from a fresh process.
-cas review_session wait \
+./zig-out/bin/cas review_session wait \
   --review-thread-id thr_123 \
   --timeout-ms 300000 \
   --json
 
 # Convenience wrapper when one process is preferred.
-cas review_session start \
+./zig-out/bin/cas review_session start \
   --wait \
   --cwd /path/to/workspace \
   --base main \
@@ -73,24 +73,24 @@ cas review_session start \
   --json
 
 # Run one conformance scenario with JSON output.
-cas conformance --cwd /path/to/workspace --scenario mesh_row_accountability --json
+./zig-out/bin/cas conformance --cwd /path/to/workspace --scenario mesh_row_accountability --json
 
 # Filter thread/list by title substring.
-cas instance_runner \
+./zig-out/bin/cas instance_runner \
   --cwd /path/to/workspace \
   --method thread/list \
   --params-json '{"cursor":null,"limit":10,"searchTerm":"rollback"}' \
   --json
 
 # Start a turn on an existing thread.
-cas instance_runner \
+./zig-out/bin/cas instance_runner \
   --cwd /path/to/workspace \
   --method turn/start \
   --params-json '{"threadId":"thr_123","input":[{"type":"text","text":"summarize the repo"}]}' \
   --json
 
 # Grant requested permissions for the current request and accept an elicitation payload.
-cas instance_runner \
+./zig-out/bin/cas instance_runner \
   --cwd /path/to/workspace \
   --method turn/start \
   --params-json '{"threadId":"thr_123","input":[{"type":"text","text":"continue"}]}' \
@@ -105,7 +105,7 @@ cas instance_runner \
 ```bash
 zig build test-cas
 zig build build-cas -Doptimize=ReleaseFast
-zig build run-cas-conformance-suite
+./zig-out/bin/cas_conformance_suite --help
 bash apps/cas/scripts/perf/budget_governor_gate.sh
 
 # Linux-only bounded fuzz smoke (matches CI behavior).

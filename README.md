@@ -54,9 +54,10 @@ zig build build-parse-arch -Doptimize=ReleaseFast
 Run helpers:
 
 ```bash
-zig build run-seq -- --help
-zig build run-bench-stats
-zig build run-cas-smoke-check
+zig build -Doptimize=ReleaseFast
+./zig-out/bin/seq --help
+./zig-out/bin/bench_stats --help
+./zig-out/bin/cas_smoke_check --help
 ```
 
 ## Local Perf

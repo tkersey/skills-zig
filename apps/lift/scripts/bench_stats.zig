@@ -4,14 +4,19 @@ const core_cli = @import("core_cli");
 const app_meta = @import("app_meta");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
+const HelpSurface = core_cli.HelpSurface{
+    .executable_name = "bench_stats",
+    .help_text = UsageText,
+};
+const MaxInputBytes = 16 * 1024 * 1024;
 
 const UsageText =
-    \\bench_stats.zig
+    \\bench_stats
     \\
     \\Summarize benchmark samples with basic statistics and percentiles.
     \\
     \\Usage:
-    \\  zig run codex/skills/lift/scripts/bench_stats.zig -- [options]
+    \\  bench_stats [options]
     \\
     \\Options:
     \\  --input PATH       Input file path (default: stdin)
@@ -97,25 +102,29 @@ pub fn main() !void {
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
 
-    if (try core_cli.handleDefaultHelpAndVersion(argv, UsageText, Version)) return;
+    if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
 
-    var cfg = try parseArgs(argv);
+    var cfg = parseArgs(argv) catch |err| {
+        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
+    };
     if (cfg.input_path != null and cfg.input_path.?.len == 0) cfg.input_path = null;
     if (cfg.compare_path != null and cfg.compare_path.?.len == 0) cfg.compare_path = null;
 
     if (cfg.compare_path) |compare_path| {
         const ci_samples = cfg.ci_samples orelse 1000;
         if (!(cfg.ci_alpha > 0.0 and cfg.ci_alpha < 1.0)) {
-            try core_io.writeToStreamAllowBrokenPipe(std.fs.File.stderr(), "error: --ci-alpha must be in (0, 1)\n");
-            std.process.exit(2);
+            core_cli.exitUsageFailure(HelpSurface, Version, "InvalidCiAlpha", "--ci-alpha");
         }
 
-        const baseline_text = if (cfg.input_path) |path|
-            try std.fs.cwd().readFileAlloc(allocator, path, std.math.maxInt(usize))
-        else
-            try std.fs.File.stdin().readToEndAlloc(allocator, std.math.maxInt(usize));
+        const baseline_text = readInputAlloc(allocator, cfg.input_path) catch |err| switch (err) {
+            error.InputTooLarge => core_cli.exitUsageFailure(HelpSurface, Version, "InputTooLarge", "baseline input exceeds 16 MiB"),
+            else => return err,
+        };
         defer allocator.free(baseline_text);
-        const variant_text = try std.fs.cwd().readFileAlloc(allocator, compare_path, std.math.maxInt(usize));
+        const variant_text = readFileWithLimitAlloc(allocator, compare_path) catch |err| switch (err) {
+            error.InputTooLarge => core_cli.exitUsageFailure(HelpSurface, Version, "InputTooLarge", "compare input exceeds 16 MiB"),
+            else => return err,
+        };
         defer allocator.free(variant_text);
 
         var baseline_values: std.ArrayList(f64) = .empty;
@@ -220,10 +229,10 @@ pub fn main() !void {
         return;
     }
 
-    const input_text = if (cfg.input_path) |path|
-        try std.fs.cwd().readFileAlloc(allocator, path, std.math.maxInt(usize))
-    else
-        try std.fs.File.stdin().readToEndAlloc(allocator, std.math.maxInt(usize));
+    const input_text = readInputAlloc(allocator, cfg.input_path) catch |err| switch (err) {
+        error.InputTooLarge => core_cli.exitUsageFailure(HelpSurface, Version, "InputTooLarge", "input exceeds 16 MiB"),
+        else => return err,
+    };
     defer allocator.free(input_text);
 
     var values: std.ArrayList(f64) = .empty;
@@ -270,7 +279,7 @@ fn parseArgs(argv: []const []const u8) !Config {
         if (core_cli.isHelpArg(arg)) {
             var stdout_writer = std.fs.File.stdout().writer(&.{});
             const stdout = &stdout_writer.interface;
-            try core_cli.printHelpWithVersion(stdout, UsageText, Version);
+            try core_cli.printHelpSurface(stdout, HelpSurface, Version);
             std.process.exit(0);
         }
         if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
@@ -335,6 +344,21 @@ fn parseArgs(argv: []const []const u8) !Config {
         return error.UnknownArg;
     }
     return cfg;
+}
+
+fn readInputAlloc(allocator: std.mem.Allocator, path: ?[]const u8) ![]u8 {
+    if (path) |value| return readFileWithLimitAlloc(allocator, value);
+    return std.fs.File.stdin().readToEndAlloc(allocator, MaxInputBytes) catch |err| switch (err) {
+        error.FileTooBig => error.InputTooLarge,
+        else => err,
+    };
+}
+
+fn readFileWithLimitAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    return std.fs.cwd().readFileAlloc(allocator, path, MaxInputBytes) catch |err| switch (err) {
+        error.FileTooBig => error.InputTooLarge,
+        else => err,
+    };
 }
 
 fn parseValuesFromText(
@@ -890,6 +914,34 @@ test "compare json output is valid json" {
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.items, .{});
     defer parsed.deinit();
+}
+
+test "usage text references installed binary" {
+    try std.testing.expect(std.mem.indexOf(u8, UsageText, "zig run codex/skills") == null);
+    try std.testing.expect(std.mem.indexOf(u8, UsageText, "bench_stats [options]") != null);
+}
+
+test "readFileWithLimitAlloc rejects oversized files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try tmp.dir.createFile("oversized.txt", .{});
+    defer file.close();
+
+    const chunk = [_]u8{'a'} ** 4096;
+    var remaining: usize = MaxInputBytes + 1;
+    while (remaining > 0) {
+        const to_write = @min(remaining, chunk.len);
+        try file.writeAll(chunk[0..to_write]);
+        remaining -= to_write;
+    }
+
+    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_abs);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "oversized.txt" });
+    defer std.testing.allocator.free(path);
+
+    try std.testing.expectError(error.InputTooLarge, readFileWithLimitAlloc(std.testing.allocator, path));
 }
 
 fn parseLineWithAlloc(alloc: std.mem.Allocator, line: []const u8) !void {

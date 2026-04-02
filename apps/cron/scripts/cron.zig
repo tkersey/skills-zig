@@ -595,9 +595,8 @@ fn printUsage() !void {
     var stdout_writer = stdout_file.writer(&.{});
     const stdout = &stdout_writer.interface;
     try stdout.writeAll(
-        \\cron.zig
+        \\cron
         \\
-        \\Marker: cron.zig
         \\Manage Codex automations with native Zig runtime (no Python/shell delegation).
         \\
         \\Usage:

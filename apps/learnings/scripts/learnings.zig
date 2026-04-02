@@ -9,11 +9,13 @@ const query_spec = seq_bundle.query_spec;
 
 const Version = core_cli.normalizeVersion(app_meta.version);
 const ProgramName = "learnings";
+const HelpSurface = core_cli.HelpSurface{
+    .executable_name = "learnings",
+    .help_text = UsageText,
+};
 
 const UsageText =
-    \\learnings.zig
-    \\
-    \\Marker: learnings.zig
+    \\learnings
     \\
     \\usage: learnings [-h] [--path PATH] {append,datasets,dataset-schema,query,recent,recall,codify-candidates,quality-audit,value-report} ...
     \\
@@ -326,14 +328,14 @@ pub fn main() !void {
     if (argv.len <= 1) {
         var stdout_writer = std.fs.File.stdout().writer(&.{});
         const stdout = &stdout_writer.interface;
-        try core_cli.printHelpWithVersion(stdout, UsageText, Version);
+        try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
     }
 
     if (core_cli.isHelpArg(argv[1])) {
         var stdout_writer = std.fs.File.stdout().writer(&.{});
         const stdout = &stdout_writer.interface;
-        try core_cli.printHelpWithVersion(stdout, UsageText, Version);
+        try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
     }
     if (core_cli.isVersionArg(argv[1]) or core_cli.isVersionSubcommand(argv[1])) {
@@ -694,7 +696,7 @@ fn printParseError(err: anyerror, argv: []const []const u8) noreturn {
         },
     }
 
-    stderr.print("{s}\n", .{UsageText}) catch {};
+    core_cli.printHelpSurface(stderr, HelpSurface, Version) catch {};
     std.process.exit(2);
 }
 
@@ -743,10 +745,12 @@ fn lastPathValue(args: []const []const u8) !?[]const u8 {
 
 fn exitAppendParseError(comptime fmt: []const u8, args: anytype) noreturn {
     const surface = append_learning_cli.subcommandSurface();
-    std.debug.print("{s}\n", .{surface.usage_line});
-    std.debug.print("{s}: error: ", .{surface.program_name});
-    std.debug.print(fmt ++ "\n", args);
-    std.process.exit(2);
+    const detail = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch null;
+    defer if (detail) |value| std.heap.page_allocator.free(value);
+    core_cli.exitUsageFailure(.{
+        .executable_name = surface.program_name,
+        .help_text = surface.help_text,
+    }, Version, "InvalidArgument", detail);
 }
 
 fn parsePositiveInt(text: []const u8) !usize {

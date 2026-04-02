@@ -4,9 +4,13 @@ const core_cli = @import("core_cli");
 const app_meta = @import("app_meta");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
+const HelpSurface = core_cli.HelpSurface{
+    .executable_name = "cas",
+    .help_text = UsageText,
+};
 
 const UsageText =
-    \\cas.zig
+    \\cas
     \\
     \\CAS dispatcher for subcommand-style usage.
     \\
@@ -39,7 +43,7 @@ pub fn main() !void {
     if (argv.len <= 1 or delegate.isHelpRequested(argv) or std.mem.eql(u8, argv[1], "help")) {
         var stdout_writer = std.fs.File.stdout().writer(&.{});
         const stdout = &stdout_writer.interface;
-        try core_cli.printHelpWithVersion(stdout, UsageText, Version);
+        try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
     }
 
@@ -51,11 +55,7 @@ pub fn main() !void {
     }
 
     const target_name = resolveTarget(argv[1]) orelse {
-        var stderr_writer = std.fs.File.stderr().writer(&.{});
-        const stderr = &stderr_writer.interface;
-        try stderr.print("Unknown subcommand: {s}\n", .{argv[1]});
-        try core_cli.printHelpWithVersion(stderr, UsageText, Version);
-        std.process.exit(2);
+        core_cli.exitUsageFailure(HelpSurface, Version, "UnknownSubcommand", argv[1]);
     };
 
     const target_exec = blk: {

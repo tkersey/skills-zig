@@ -4,14 +4,18 @@ const core_cli = @import("core_cli");
 const std = @import("std");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
+const HelpSurface = core_cli.HelpSurface{
+    .executable_name = "cas_smoke_check",
+    .help_text = UsageText,
+};
 
 const UsageText =
-    \\cas_smoke_check.zig
+    \\cas_smoke_check
     \\
     \\Smoke-check cas support for key app-server APIs.
     \\
     \\Usage:
-    \\  zig run codex/skills/cas/scripts/cas_smoke_check.zig -- --cwd DIR [options]
+    \\  cas_smoke_check --cwd DIR [options]
     \\
     \\Required:
     \\  --cwd DIR                        Workspace for cas/app-server.
@@ -49,13 +53,10 @@ pub fn main() !void {
 
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
-    if (try core_cli.handleDefaultHelpAndVersion(argv, UsageText, Version)) return;
+    if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
 
     const parsed = parseArgs(allocator, argv) catch |err| {
-        var stderr_writer = std.fs.File.stderr().writer(&.{});
-        const stderr = &stderr_writer.interface;
-        try stderr.print("{s}\n{s}\n", .{ @errorName(err), UsageText });
-        return;
+        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
     };
 
     if (parsed.show_version) {
@@ -68,15 +69,12 @@ pub fn main() !void {
     if (parsed.show_help) {
         var stdout_writer = std.fs.File.stdout().writer(&.{});
         const stdout = &stdout_writer.interface;
-        try core_cli.printHelpWithVersion(stdout, UsageText, Version);
+        try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
     }
 
     const cwd = parsed.cwd orelse {
-        var stderr_writer = std.fs.File.stderr().writer(&.{});
-        const stderr = &stderr_writer.interface;
-        try stderr.print("Missing --cwd\n{s}\n", .{UsageText});
-        std.process.exit(2);
+        core_cli.exitUsageFailure(HelpSurface, Version, "MissingValue", "--cwd");
     };
 
     var checks: std.ArrayList(CheckResult) = .empty;
@@ -546,6 +544,11 @@ test "parseArgs rejects non-positive request timeout" {
     };
 
     try std.testing.expectError(error.InvalidTimeout, parseArgs(std.testing.allocator, &argv));
+}
+
+test "usage text references installed binary" {
+    try std.testing.expect(std.mem.indexOf(u8, UsageText, "zig run codex/skills") == null);
+    try std.testing.expect(std.mem.indexOf(u8, UsageText, "cas_smoke_check --cwd DIR [options]") != null);
 }
 
 test "countDataRows and extractThreadId parse expected fields" {

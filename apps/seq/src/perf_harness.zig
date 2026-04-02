@@ -5,8 +5,12 @@ const core_cli = @import("core_cli");
 const app_meta = @import("app_meta");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
+const HelpSurface = core_cli.HelpSurface{
+    .executable_name = "seq-perf",
+    .help_text = UsageText,
+};
 const UsageText =
-    \\perf_harness.zig
+    \\seq-perf
     \\
     \\Frozen workload harness for seq query engine.
     \\
@@ -32,13 +36,17 @@ pub fn main() !void {
 
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
-    if (try core_cli.handleDefaultHelpAndVersion(argv, UsageText, Version)) return;
+    if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
 
-    const config_path = try parseConfigPath(allocator);
+    const config_path = parseConfigPath(allocator) catch |err| {
+        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
+    };
     defer allocator.free(config_path);
 
-    const config = try loadConfig(allocator, config_path);
-    if (config.rounds < 3) return error.InvalidRounds;
+    const config = loadConfig(allocator, config_path) catch |err| {
+        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), config_path);
+    };
+    if (config.rounds < 3) core_cli.exitUsageFailure(HelpSurface, Version, "InvalidRounds", config_path);
 
     var rows = try buildFrozenRows(allocator, config.rows);
     defer deinitRows(allocator, &rows);
@@ -85,7 +93,7 @@ fn parseConfigPath(allocator: std.mem.Allocator) ![]u8 {
         if (core_cli.isHelpArg(arg)) {
             var stdout_writer = std.fs.File.stdout().writer(&.{});
             const stdout = &stdout_writer.interface;
-            try core_cli.printHelpWithVersion(stdout, UsageText, Version);
+            try core_cli.printHelpSurface(stdout, HelpSurface, Version);
             std.process.exit(0);
         }
         if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {

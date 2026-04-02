@@ -81,7 +81,7 @@ fn runLegacyNumericSeqCompat(stdout: anytype, argv: []const []const u8) !bool {
 pub fn main() !void {
     runMain() catch |err| {
         if (shouldIgnoreWriteError(err)) return;
-        if (shouldSuppressCliError(err)) return;
+        if (shouldSuppressCliError(err)) std.process.exit(2);
         return err;
     };
 }
@@ -125,7 +125,8 @@ fn runMain() !void {
                 return;
             }
 
-            try stdout.print("unknown command: {s}\n", .{arg});
+            var stderr_writer = std.fs.File.stderr().writer(&.{});
+            try stderr_writer.interface.print("unknown command: {s}\n", .{arg});
             return error.InvalidCommand;
         },
         else => {

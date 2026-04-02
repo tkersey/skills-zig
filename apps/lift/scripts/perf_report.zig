@@ -4,14 +4,18 @@ const core_cli = @import("core_cli");
 const app_meta = @import("app_meta");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
+const HelpSurface = core_cli.HelpSurface{
+    .executable_name = "perf_report",
+    .help_text = UsageText,
+};
 
 const UsageText =
-    \\perf_report.zig
+    \\perf_report
     \\
     \\Generate a performance report template in Markdown.
     \\
     \\Usage:
-    \\  zig run codex/skills/lift/scripts/perf_report.zig -- [options]
+    \\  perf_report [options]
     \\
     \\Options:
     \\  --title TEXT    Report title (default: Untitled)
@@ -38,9 +42,11 @@ pub fn main() !void {
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
 
-    if (try core_cli.handleDefaultHelpAndVersion(argv, UsageText, Version)) return;
+    if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
 
-    const cfg = try parseArgs(argv);
+    const cfg = parseArgs(argv) catch |err| {
+        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
+    };
     const report_date = try currentDateIso(allocator);
     defer allocator.free(report_date);
 
@@ -146,7 +152,7 @@ fn parseArgs(argv: []const []const u8) !Config {
         if (core_cli.isHelpArg(arg)) {
             var stdout_writer = std.fs.File.stdout().writer(&.{});
             const stdout = &stdout_writer.interface;
-            try core_cli.printHelpWithVersion(stdout, UsageText, Version);
+            try core_cli.printHelpSurface(stdout, HelpSurface, Version);
             std.process.exit(0);
         }
         if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {

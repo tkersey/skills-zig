@@ -4,14 +4,18 @@ const core_cli = @import("core_cli");
 const std = @import("std");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
+const HelpSurface = core_cli.HelpSurface{
+    .executable_name = "cas_instance_runner",
+    .help_text = UsageText,
+};
 
 const UsageText =
-    \\cas_instance_runner.zig
+    \\cas_instance_runner
     \\
     \\Run many cas sessions and execute one request per instance.
     \\
     \\Usage:
-    \\  zig run codex/skills/cas/scripts/cas_instance_runner.zig -- --cwd DIR [options]
+    \\  cas_instance_runner --cwd DIR [options]
     \\
     \\Required:
     \\  --cwd DIR
@@ -92,13 +96,10 @@ pub fn main() !void {
 
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
-    if (try core_cli.handleDefaultHelpAndVersion(argv, UsageText, Version)) return;
+    if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
 
     const opts = parseArgs(allocator, argv) catch |err| {
-        var stderr_writer = std.fs.File.stderr().writer(&.{});
-        const stderr = &stderr_writer.interface;
-        try stderr.print("{s}\n{s}\n", .{ @errorName(err), UsageText });
-        std.process.exit(2);
+        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
     };
 
     if (opts.show_version) {
@@ -111,15 +112,12 @@ pub fn main() !void {
     if (opts.show_help) {
         var stdout_writer = std.fs.File.stdout().writer(&.{});
         const stdout = &stdout_writer.interface;
-        try core_cli.printHelpWithVersion(stdout, UsageText, Version);
+        try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
     }
 
     const cwd = opts.cwd orelse {
-        var stderr_writer = std.fs.File.stderr().writer(&.{});
-        const stderr = &stderr_writer.interface;
-        try stderr.print("Missing --cwd\n{s}\n", .{UsageText});
-        std.process.exit(2);
+        core_cli.exitUsageFailure(HelpSurface, Version, "MissingValue", "--cwd");
     };
 
     if (opts.instances > 1 and opts.state_file_dir == null) {

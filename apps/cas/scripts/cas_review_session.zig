@@ -6,14 +6,18 @@ const core_path = @import("core_path");
 const std = @import("std");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
+const HelpSurface = core_cli.HelpSurface{
+    .executable_name = "cas_review_session",
+    .help_text = UsageText,
+};
 
 const UsageText =
-    \\cas_review_session.zig
+    \\cas_review_session
     \\
     \\Control detached Codex review sessions via the app-server.
     \\
     \\Usage:
-    \\  zig run apps/cas/scripts/cas_review_session.zig -- <start|status|wait|interrupt> [options]
+    \\  cas_review_session <start|status|wait|interrupt> [options]
     \\
     \\Actions:
     \\  start      Start a detached review session and persist its handle.
@@ -261,13 +265,10 @@ pub fn main() !void {
 
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
-    if (try core_cli.handleDefaultHelpAndVersion(argv, UsageText, Version)) return;
+    if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
 
     const parsed = parseArgs(allocator, argv) catch |err| {
-        var stderr_writer = std.fs.File.stderr().writer(&.{});
-        const stderr = &stderr_writer.interface;
-        try stderr.print("{s}\n{s}\n", .{ @errorName(err), UsageText });
-        std.process.exit(2);
+        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
     };
 
     if (parsed.show_version) {
@@ -280,7 +281,7 @@ pub fn main() !void {
     if (parsed.show_help or parsed.action == null) {
         var stdout_writer = std.fs.File.stdout().writer(&.{});
         const stdout = &stdout_writer.interface;
-        try core_cli.printHelpWithVersion(stdout, UsageText, Version);
+        try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
     }
 

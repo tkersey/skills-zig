@@ -5,11 +5,14 @@ const collector = @import("parse_arch_collector");
 const eval_suite = @import("parse_arch_eval_suite");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
+const HelpSurface = core_cli.HelpSurface{
+    .executable_name = "parse-arch",
+    .help_text = UsageText,
+};
 
 const UsageText =
-    \\parse_arch.zig
+    \\parse-arch
     \\
-    \\Marker: parse_arch.zig
     \\Infer repository architecture signals and validate the parse eval suite.
     \\
     \\Usage:
@@ -63,7 +66,7 @@ pub fn main() !void {
     const argv = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, argv);
 
-    if (try core_cli.handleDefaultHelpAndVersion(argv, UsageText, Version)) return;
+    if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
     const command = resolveCommand(argv[1]) orelse return usageError("Unknown command", argv[1]);
     switch (command) {
         .collect => try cmdCollect(allocator, argv[2..]),
@@ -226,13 +229,13 @@ fn usageError(prefix: []const u8, value: []const u8) !void {
     var stderr_writer = std.fs.File.stderr().writer(&.{});
     const stderr = &stderr_writer.interface;
     try stderr.print("{s}: {s}\n", .{ prefix, value });
-    try core_cli.printHelpWithVersion(stderr, UsageText, Version);
+    try core_cli.printHelpSurface(stderr, HelpSurface, Version);
     std.process.exit(2);
 }
 
 fn printHelp() !void {
     var stdout_writer = std.fs.File.stdout().writer(&.{});
-    try core_cli.printHelpWithVersion(&stdout_writer.interface, UsageText, Version);
+    try core_cli.printHelpSurface(&stdout_writer.interface, HelpSurface, Version);
 }
 
 test "collect parser accepts alias forms and json flags" {

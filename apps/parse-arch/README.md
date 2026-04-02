@@ -17,16 +17,16 @@ Native Zig CLI for repository architecture signal collection.
 
 ## Collect examples
 ```bash
-parse-arch collect /path/to/repo
-parse-arch collect --repo-path /path/to/repo --focus-path src --focus-path test
-parse-arch collect --repo /path/to/repo --json
-parse-arch collect /path/to/repo --format json
+./zig-out/bin/parse-arch collect /path/to/repo
+./zig-out/bin/parse-arch collect --repo-path /path/to/repo --focus-path src --focus-path test
+./zig-out/bin/parse-arch collect --repo /path/to/repo --json
+./zig-out/bin/parse-arch collect /path/to/repo --format json
 ```
 
 ## Build
 ```bash
 zig build build-parse-arch -Doptimize=ReleaseFast
 zig build test-parse-arch
-zig build run-parse-arch -- --help
-zig build run-parse-arch -- eval --suite apps/parse-arch/references/eval/suite.yaml
+./zig-out/bin/parse-arch --help
+./zig-out/bin/parse-arch eval --suite apps/parse-arch/references/eval/suite.yaml
 ```

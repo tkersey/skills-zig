@@ -6,11 +6,13 @@ const std = @import("std");
 const Version = core_cli.normalizeVersion(app_meta.version);
 const SchemaVersion: i64 = 3;
 const PlanSyncVersion: i64 = 1;
+const HelpSurface = core_cli.HelpSurface{
+    .executable_name = "st",
+    .help_text = UsageText,
+};
 
 const UsageText =
-    \\st.zig
-    \\
-    \\Marker: st.zig
+    \\st
     \\
     \\Manage dependency-aware JSONL v3 plan state.
     \\
@@ -583,14 +585,14 @@ pub fn main() !void {
     if (argv.len <= 1) {
         var stdout_writer = std.fs.File.stdout().writer(&.{});
         const stdout = &stdout_writer.interface;
-        try core_cli.printHelpWithVersion(stdout, UsageText, Version);
+        try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
     }
 
     if (core_cli.isHelpArg(argv[1])) {
         var stdout_writer = std.fs.File.stdout().writer(&.{});
         const stdout = &stdout_writer.interface;
-        try core_cli.printHelpWithVersion(stdout, UsageText, Version);
+        try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
     }
 
@@ -604,7 +606,7 @@ pub fn main() !void {
     if (argv.len >= 3 and core_cli.isHelpArg(argv[2])) {
         var stdout_writer = std.fs.File.stdout().writer(&.{});
         const stdout = &stdout_writer.interface;
-        try core_cli.printHelpWithVersion(stdout, UsageText, Version);
+        try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
     }
 
@@ -627,10 +629,7 @@ pub fn main() !void {
 }
 
 fn exitWithError(err: anyerror) !void {
-    var stderr_writer = std.fs.File.stderr().writer(&.{});
-    const stderr = &stderr_writer.interface;
-    try stderr.print("error: {s}\n", .{@errorName(err)});
-    std.process.exit(2);
+    core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
 }
 
 fn parseArgs(argv: []const []const u8) !Args {
@@ -4982,6 +4981,9 @@ test "select auto-includes dependency closure and deselect rejects stranded depe
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -5033,6 +5035,9 @@ test "select auto-includes dependency closure and deselect rejects stranded depe
 test "import-orchplan and claim-safe runtime allow parallel wave progress" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -5086,6 +5091,9 @@ test "orchplan-backed claim rejects explicit ids when wave is authoritative" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -5119,6 +5127,9 @@ test "orchplan-backed claim rejects explicit ids when wave is authoritative" {
 test "reclaim-stale and import-mesh-results reconcile execution metadata" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
