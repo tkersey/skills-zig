@@ -151,7 +151,10 @@ pub fn computeBudgetGovernorFromSlice(
     input: []const u8,
     now_sec_opt: ?i64,
 ) !GovernorOut {
-    var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, input, .{});
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+
+    var parsed_json = try std.json.parseFromSlice(std.json.Value, arena_state.allocator(), input, .{});
     defer parsed_json.deinit();
 
     const root = switch (parsed_json.value) {

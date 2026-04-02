@@ -226,6 +226,11 @@ const GroupKeyData = struct {
     values: []spec.Scalar,
 };
 
+const CountGroupState = struct {
+    value: spec.Scalar,
+    count: i64,
+};
+
 const RegexAtomMode = enum {
     exact,
     prefix,
@@ -313,6 +318,10 @@ fn executeGrouped(
     where_clauses: []const CompiledWhereClause,
     result: *QueryResult,
 ) !void {
+    if (singleGroupCountMetric(query)) |count_alias| {
+        return executeGroupedSingleCount(allocator, input_rows, query, where_clauses, count_alias, result);
+    }
+
     var metrics: std.ArrayList(CompiledMetric) = .empty;
     defer {
         for (metrics.items) |metric| {
@@ -391,6 +400,71 @@ fn executeGrouped(
             try out.putOwnedKey(metric.alias, group.metric_states[idx].finalize());
         }
 
+        try result.rows.append(allocator, out);
+    }
+
+    if (query.sort.len > 0) {
+        sortRows(result.rows.items, query.sort);
+    }
+    applyLimit(&result.rows, query.limit);
+}
+
+fn singleGroupCountMetric(query: spec.QuerySpec) ?[]const u8 {
+    if (query.group_by.len != 1) return null;
+    if (query.metrics.len == 0) return "count";
+    if (query.metrics.len != 1) return null;
+
+    const metric = query.metrics[0];
+    if (metric.op != .count) return null;
+    return metric.alias orelse "count";
+}
+
+fn executeGroupedSingleCount(
+    allocator: std.mem.Allocator,
+    input_rows: []const Row,
+    query: spec.QuerySpec,
+    where_clauses: []const CompiledWhereClause,
+    count_alias: []const u8,
+    result: *QueryResult,
+) !void {
+    const group_field = query.group_by[0];
+
+    var group_index = std.StringHashMap(usize).init(allocator);
+    defer {
+        var it = group_index.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        group_index.deinit();
+    }
+
+    var groups: std.ArrayList(CountGroupState) = .empty;
+    defer groups.deinit(allocator);
+
+    for (input_rows) |row| {
+        result.scanned_rows += 1;
+        if (!try rowMatches(row, where_clauses)) continue;
+
+        const value = row.valueOrNull(group_field);
+        const key = try scalarHashKey(allocator, value);
+        if (group_index.get(key)) |idx| {
+            allocator.free(key);
+            groups.items[idx].count += 1;
+            continue;
+        }
+
+        const next_idx = groups.items.len;
+        try group_index.put(key, next_idx);
+        try groups.append(allocator, .{
+            .value = value,
+            .count = 1,
+        });
+    }
+
+    for (groups.items) |group| {
+        var out = Row.init(allocator);
+        errdefer out.deinit();
+
+        try out.putOwnedKey(group_field, group.value);
+        try out.putOwnedKey(count_alias, .{ .int = group.count });
         try result.rows.append(allocator, out);
     }
 
@@ -1398,4 +1472,30 @@ test "grouped default count metric and explicit metrics" {
     try expectIntField(detailed.rows.items[1], "max_delta_total_tokens", 40);
     try expectIntField(detailed.rows.items[1], "models", 2);
     try expectIntField(detailed.rows.items[1], "rows", 4);
+}
+
+test "single-field grouped count supports custom alias and sort" {
+    var rows = try buildToolRows(std.testing.allocator);
+    defer deinitRows(std.testing.allocator, &rows);
+
+    const query = spec.QuerySpec{
+        .group_by = &.{"tool"},
+        .metrics = &.{.{ .op = .count, .alias = "rows" }},
+        .sort = &.{ .{ .field = "rows", .descending = true }, .{ .field = "tool" } },
+    };
+
+    var result = try execute(std.testing.allocator, rows.items, query);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 5), result.rows.items.len);
+    try expectStringField(result.rows.items[0], "tool", "search");
+    try expectIntField(result.rows.items[0], "rows", 3);
+    try expectStringField(result.rows.items[1], "tool", "grep");
+    try expectIntField(result.rows.items[1], "rows", 1);
+    try expectStringField(result.rows.items[2], "tool", "shell");
+    try expectIntField(result.rows.items[2], "rows", 1);
+    try expectStringField(result.rows.items[3], "tool", "web_search");
+    try expectIntField(result.rows.items[3], "rows", 1);
+    try std.testing.expect(result.rows.items[4].valueOrNull("tool").isNull());
+    try expectIntField(result.rows.items[4], "rows", 1);
 }

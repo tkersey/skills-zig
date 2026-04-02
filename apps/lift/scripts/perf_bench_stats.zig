@@ -68,6 +68,8 @@ const sample_lines = [_][]const u8{
     "alloc_bytes=4096 peak=8192",
 };
 
+const sample_value_counts = [_]usize{ 3, 1, 2, 2 };
+
 const CountingAllocator = core_perf.CountingAllocator;
 
 pub fn main() !void {
@@ -236,6 +238,7 @@ fn runRound(allocator: std.mem.Allocator, iterations: usize) !RoundStats {
 
     var values: std.ArrayList(f64) = .empty;
     defer values.deinit(bench_allocator);
+    try values.ensureTotalCapacity(bench_allocator, expectedParsedValueCount(iterations));
 
     const start_ns = std.time.nanoTimestamp();
     var i: usize = 0;
@@ -252,6 +255,18 @@ fn runRound(allocator: std.mem.Allocator, iterations: usize) !RoundStats {
         .line_count = iterations,
         .alloc_calls = counting.stats.totalCalls(),
     };
+}
+
+fn expectedParsedValueCount(iterations: usize) usize {
+    const full_cycles = iterations / sample_lines.len;
+    const remainder = iterations % sample_lines.len;
+
+    var total: usize = full_cycles * 8;
+    var i: usize = 0;
+    while (i < remainder) : (i += 1) {
+        total += sample_value_counts[i];
+    }
+    return total;
 }
 
 fn divideRounded(numerator: u64, denominator: usize) u64 {

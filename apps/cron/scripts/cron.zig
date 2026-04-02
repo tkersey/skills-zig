@@ -270,6 +270,12 @@ const Stmt = struct {
         return self.allocator.dupe(u8, std.mem.sliceTo(raw, 0));
     }
 
+    fn textColumn(self: *Stmt, col: c_int) []const u8 {
+        if (c.sqlite3_column_type(self.handle, col) == c.SQLITE_NULL) return "";
+        const raw = c.sqlite3_column_text(self.handle, col) orelse return "";
+        return std.mem.sliceTo(raw, 0);
+    }
+
     fn nullableTextColumnAlloc(self: *Stmt, col: c_int) !?[]u8 {
         if (c.sqlite3_column_type(self.handle, col) == c.SQLITE_NULL) return null;
         const raw = c.sqlite3_column_text(self.handle, col) orelse return null;
@@ -1710,6 +1716,10 @@ fn cmdList(allocator: std.mem.Allocator, db_path: []const u8, args: ListArgs) !v
 }
 
 fn cmdShow(allocator: std.mem.Allocator, db_path: []const u8, args: ShowArgs) !void {
+    if (!args.json and args.resolve.automation_id != null and args.resolve.name == null) {
+        return cmdShowByIdPlain(allocator, db_path, args.resolve.automation_id.?);
+    }
+
     var db = try Db.open(allocator, db_path);
     defer db.close();
 
@@ -1745,6 +1755,44 @@ fn cmdShow(allocator: std.mem.Allocator, db_path: []const u8, args: ShowArgs) !v
     try stdout.print("rrule: {s}\n", .{row.rrule});
     try stdout.print("created_at: {d}\n", .{row.created_at});
     try stdout.print("updated_at: {d}\n", .{row.updated_at});
+}
+
+fn cmdShowByIdPlain(allocator: std.mem.Allocator, db_path: []const u8, automation_id: []const u8) !void {
+    var db = try Db.open(allocator, db_path);
+    defer db.close();
+
+    var stmt = try db.prepare(allocator, "select id, name, prompt, status, next_run_at, last_run_at, cwds, rrule, created_at, updated_at from automations where id = ?");
+    defer stmt.deinit();
+
+    try stmt.bindAll(&.{.{ .text = automation_id }});
+
+    switch (try stmt.step()) {
+        .done => return userErrorFmt("no automation with id {s}", .{automation_id}),
+        .row => {},
+    }
+
+    var stdout_file = std.fs.File.stdout();
+    var stdout_writer = stdout_file.writer(&.{});
+    const stdout = &stdout_writer.interface;
+
+    try stdout.print("id: {s}\n", .{stmt.textColumn(0)});
+    try stdout.print("name: {s}\n", .{stmt.textColumn(1)});
+    try stdout.print("prompt: {s}\n", .{stmt.textColumn(2)});
+    try stdout.print("status: {s}\n", .{stmt.textColumn(3)});
+    if (stmt.nullableIntColumn(4)) |value| {
+        try stdout.print("next_run_at: {d}\n", .{value});
+    } else {
+        try stdout.writeAll("next_run_at: null\n");
+    }
+    if (stmt.nullableIntColumn(5)) |value| {
+        try stdout.print("last_run_at: {d}\n", .{value});
+    } else {
+        try stdout.writeAll("last_run_at: null\n");
+    }
+    try stdout.print("cwds: {s}\n", .{stmt.textColumn(6)});
+    try stdout.print("rrule: {s}\n", .{stmt.textColumn(7)});
+    try stdout.print("created_at: {d}\n", .{stmt.intColumn(8)});
+    try stdout.print("updated_at: {d}\n", .{stmt.intColumn(9)});
 }
 
 fn cmdCreate(allocator: std.mem.Allocator, db_path: []const u8, args: CreateArgs) !void {
