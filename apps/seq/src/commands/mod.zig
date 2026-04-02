@@ -5,6 +5,7 @@ const plan_blocks = @import("../plan_blocks.zig");
 const query = @import("../query/engine.zig");
 const spec = @import("../types/spec.zig");
 const output = @import("../output/mod.zig");
+const time_utils = @import("../time_utils.zig");
 
 pub const DatasetMeta = struct {
     name: []const u8,
@@ -339,6 +340,7 @@ const Options = struct {
     status: ?[]const u8 = null,
     mode: ?[]const u8 = null,
     part_type: ?[]const u8 = null,
+    timezone_text: ?[]const u8 = null,
     since: ?[]const u8 = null,
     until: ?[]const u8 = null,
     session: ?[]const u8 = null,
@@ -484,7 +486,13 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\usage: seq section-audit --sections <csv> [--since <iso>] [--until <iso>]
         ,
         .token_usage =>
-        \\usage: seq token-usage [--since <iso>] [--until <iso>] [--top N]
+        \\usage: seq token-usage [--since <iso>] [--until <iso>] [--path <jsonl>|--session-id <id>] [--group-by day|path] [--tz utc|local|+HH:MM|-HH:MM] [--summary] [--top N] [--format table|json|csv|jsonl]
+        \\extra options:
+        \\  --path <path>              Restrict the report to one rollout/session JSONL file
+        \\  --session-id <id>          Restrict the report to one session file by session id substring
+        \\  --group-by <name>          day (default) | path
+        \\  --tz <name>                utc (default) | local | +HH:MM | -HH:MM
+        \\  --summary                  Emit one summary row with totals and averages
         ,
         .routing_gap =>
         \\usage: seq routing-gap --cue-spec <json|@path> [--discovery-skills <csv>] [--format table|json|csv|jsonl]
@@ -556,11 +564,11 @@ fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
 
 fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_path = switch (cmd) {
-        .artifact_search, .orchestration_concurrency, .plan_search, .reply_latency, .session_prompts, .session_tooling, .query_diagnose, .skill_blocks => true,
+        .artifact_search, .orchestration_concurrency, .plan_search, .reply_latency, .session_prompts, .session_tooling, .query_diagnose, .skill_blocks, .token_usage => true,
         else => false,
     };
     const supports_session_id = switch (cmd) {
-        .artifact_search, .orchestration_concurrency, .plan_search, .reply_latency, .session_prompts, .session_tooling, .skill_blocks => true,
+        .artifact_search, .orchestration_concurrency, .plan_search, .reply_latency, .session_prompts, .session_tooling, .skill_blocks, .token_usage => true,
         else => false,
     };
     const supports_current = cmd == .session_prompts or cmd == .reply_latency or cmd == .skill_blocks;
@@ -568,7 +576,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_strip_skill_blocks = cmd == .session_prompts or cmd == .artifact_search;
     const supports_no_dedupe_exact = cmd == .session_prompts or cmd == .artifact_search;
     const supports_summary = switch (cmd) {
-        .session_tooling, .query_diagnose => true,
+        .session_tooling, .query_diagnose, .token_usage => true,
         else => false,
     };
     const supports_next_actions = cmd == .query_diagnose;
@@ -672,7 +680,11 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         else => false,
     };
     const supports_group_by = switch (cmd) {
-        .session_tooling, .opencode_prompts, .opencode_events => true,
+        .session_tooling, .opencode_prompts, .opencode_events, .token_usage => true,
+        else => false,
+    };
+    const supports_timezone = switch (cmd) {
+        .token_usage => true,
         else => false,
     };
     const supports_metric = switch (cmd) {
@@ -742,6 +754,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.stats, supports_stats, "--stats", cmd);
     try ensureOptionAllowed(opts.include_body, supports_include_body, "--include-body", cmd);
     try ensureOptionAllowed(opts.part_type != null, supports_part_type, "--part-type", cmd);
+    try ensureOptionAllowed(opts.timezone_text != null, supports_timezone, "--tz", cmd);
     try ensureOptionAllowed(opts.since != null, supports_since, "--since", cmd);
     try ensureOptionAllowed(opts.until != null, supports_until, "--until", cmd);
     try ensureOptionAllowed(opts.session != null, supports_session, "--session", cmd);
@@ -3930,21 +3943,353 @@ fn cmdSectionAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts
     try output.writeOutput(allocator, opts.format, out_rows.items, cols[0..], opts.out_path);
 }
 
+const TokenUsageGroupBy = enum {
+    day,
+    path,
+
+    fn parse(raw_opt: ?[]const u8) !TokenUsageGroupBy {
+        const raw = raw_opt orelse return .day;
+        if (std.mem.eql(u8, raw, "day")) return .day;
+        if (std.mem.eql(u8, raw, "path")) return .path;
+        printCliError("error: token-usage --group-by must be day or path\n", .{});
+        return error.InvalidGroupByArg;
+    }
+
+    fn fieldName(self: TokenUsageGroupBy) []const u8 {
+        return switch (self) {
+            .day => "day",
+            .path => "path",
+        };
+    }
+};
+
+const TokenUsageBucket = struct {
+    key: []u8,
+    total_tokens: i64 = 0,
+    rows: i64 = 0,
+};
+
 fn cmdTokenUsage(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
-    var where: std.ArrayList(spec.WhereClause) = .empty;
-    defer where.deinit(allocator);
-    try appendSessionTimeBounds(allocator, &where, opts);
-    const query_spec = spec.QuerySpec{
-        .where = where.items,
-        .group_by = &.{"day"},
-        .metrics = &.{
-            .{ .op = .sum, .field = "delta_total_tokens", .alias = "total_tokens" },
-            .{ .op = .count, .alias = "rows" },
-        },
-        .sort = &.{.{ .field = "day", .descending = false }},
-        .limit = opts.limit,
+    const group_by = try TokenUsageGroupBy.parse(opts.group_by_text);
+    const timezone = try time_utils.parseTimeZone(opts.timezone_text);
+    const timezone_label = try time_utils.timeZoneLabelAlloc(allocator, timezone);
+    defer allocator.free(timezone_label);
+
+    const since_ms = try parseTokenUsageBoundMillis(opts.since, "--since");
+    const until_ms = try parseTokenUsageBoundMillis(opts.until, "--until");
+
+    var paths = try resolveSessionPromptInputPaths(allocator, sessions_root, opts, null);
+    defer freePathList(allocator, &paths);
+
+    var buckets: std.ArrayList(TokenUsageBucket) = .empty;
+    var bucket_index: std.StringHashMap(usize) = .init(allocator);
+    defer deinitTokenUsageBuckets(allocator, &buckets, &bucket_index);
+    var daily_buckets: std.ArrayList(TokenUsageBucket) = .empty;
+    var daily_bucket_index: std.StringHashMap(usize) = .init(allocator);
+    defer deinitTokenUsageBuckets(allocator, &daily_buckets, &daily_bucket_index);
+
+    var included_paths: std.StringHashMap(void) = .init(allocator);
+    defer deinitStringSet(allocator, &included_paths);
+
+    var total_tokens: i64 = 0;
+    var total_rows: i64 = 0;
+    var min_day_buf: [10]u8 = undefined;
+    var max_day_buf: [10]u8 = undefined;
+    var have_day_bounds = false;
+
+    for (paths.items) |path| {
+        var events = try datasets.token_events.parseTokenEventsFile(allocator, path, true);
+        defer events.deinit(allocator);
+        var deltas = try datasets.token_deltas.buildDeltas(allocator, events.items, .{});
+        defer deltas.deinit(allocator);
+
+        for (deltas.items) |row| {
+            const ts_text = row.timestamp orelse continue;
+            const ts_ms = time_utils.parseIsoTimestampMillis(ts_text.slice()) orelse continue;
+            if (!timestampMillisSatisfiesBounds(ts_ms, since_ms, until_ms)) continue;
+
+            const delta_total = row.delta_total_tokens orelse continue;
+
+            var day_buf: [10]u8 = undefined;
+            const local_day = tokenUsageDayKeyFromMillis(ts_ms, timezone, &day_buf) orelse continue;
+            if (!have_day_bounds) {
+                @memcpy(min_day_buf[0..], local_day);
+                @memcpy(max_day_buf[0..], local_day);
+                have_day_bounds = true;
+            } else {
+                if (std.mem.order(u8, local_day, min_day_buf[0..]) == .lt) @memcpy(min_day_buf[0..], local_day);
+                if (std.mem.order(u8, local_day, max_day_buf[0..]) == .gt) @memcpy(max_day_buf[0..], local_day);
+            }
+
+            try addTokenUsageBucket(allocator, &daily_bucket_index, &daily_buckets, local_day, delta_total);
+            const bucket_key = switch (group_by) {
+                .day => local_day,
+                .path => path,
+            };
+            try addTokenUsageBucket(allocator, &bucket_index, &buckets, bucket_key, delta_total);
+            try addToStringSet(allocator, &included_paths, path);
+            total_tokens += delta_total;
+            total_rows += 1;
+        }
+    }
+
+    switch (group_by) {
+        .day => std.mem.sort(TokenUsageBucket, buckets.items, {}, tokenUsageBucketLessDayAsc),
+        .path => std.mem.sort(TokenUsageBucket, buckets.items, {}, tokenUsageBucketLessTotalDesc),
+    }
+    std.mem.sort(TokenUsageBucket, daily_buckets.items, {}, tokenUsageBucketLessDayAsc);
+
+    var out_rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &out_rows);
+
+    if (opts.summary) {
+        try appendTokenUsageSummaryRow(
+            allocator,
+            &out_rows,
+            opts,
+            sessions_root,
+            group_by,
+            timezone_label,
+            total_tokens,
+            total_rows,
+            included_paths.count(),
+            daily_buckets.items,
+            have_day_bounds,
+            if (have_day_bounds) min_day_buf[0..] else null,
+            if (have_day_bounds) max_day_buf[0..] else null,
+            since_ms,
+            until_ms,
+            timezone,
+        );
+        const cols = [_][]const u8{
+            "scope_kind",
+            "scope_target",
+            "group_by",
+            "tz",
+            "total_tokens",
+            "calendar_days",
+            "active_days",
+            "average_tokens_per_calendar_day",
+            "average_tokens_per_active_day",
+            "median_tokens_per_active_day",
+            "first_day",
+            "last_day",
+            "partial_current_day",
+            "path_count",
+            "rows",
+        };
+        try output.writeOutput(allocator, opts.format, out_rows.items, cols[0..], opts.out_path);
+        return;
+    }
+
+    for (buckets.items) |bucket| {
+        var qrow = query.Row.init(allocator);
+        try qrow.putOwnedKey(group_by.fieldName(), .{ .string = bucket.key });
+        try qrow.putOwnedKey("total_tokens", .{ .int = bucket.total_tokens });
+        try qrow.putOwnedKey("rows", .{ .int = bucket.rows });
+        if (group_by == .path or opts.timezone_text != null) {
+            try qrow.putOwnedKey("tz", .{ .string = timezone_label });
+            try qrow.putOwnedKey("scope_kind", .{ .string = tokenUsageScopeKind(opts, group_by) });
+        }
+        try out_rows.append(allocator, qrow);
+    }
+
+    trimQueryRows(&out_rows, opts.limit);
+    const day_cols_extended = [_][]const u8{ "day", "total_tokens", "rows", "tz", "scope_kind" };
+    const day_cols_legacy = [_][]const u8{ "day", "rows", "total_tokens" };
+    const path_cols = [_][]const u8{ "path", "total_tokens", "rows", "tz", "scope_kind" };
+    const cols: []const []const u8 = switch (group_by) {
+        .day => if (opts.timezone_text != null) day_cols_extended[0..] else day_cols_legacy[0..],
+        .path => path_cols[0..],
     };
-    try runDatasetQuery(allocator, "token_deltas", sessions_root, query_spec, opts.format, opts.out_path, null);
+    try output.writeOutput(allocator, opts.format, out_rows.items, cols[0..], opts.out_path);
+}
+
+fn parseTokenUsageBoundMillis(raw_opt: ?[]const u8, flag_name: []const u8) !?i64 {
+    const raw = raw_opt orelse return null;
+    return time_utils.parseIsoTimestampMillis(raw) orelse blk: {
+        printCliError("error: token-usage {s} must be an ISO-8601 timestamp with timezone\n", .{flag_name});
+        break :blk error.InvalidTimestampArg;
+    };
+}
+
+fn timestampMillisSatisfiesBounds(ts_ms: i64, since_ms: ?i64, until_ms: ?i64) bool {
+    if (since_ms) |value| {
+        if (ts_ms < value) return false;
+    }
+    if (until_ms) |value| {
+        if (ts_ms > value) return false;
+    }
+    return true;
+}
+
+fn tokenUsageDayKeyFromMillis(ts_ms: i64, timezone: time_utils.TimeZone, out: *[10]u8) ?[]const u8 {
+    const date = time_utils.dateFromTimestampMillis(ts_ms, timezone) orelse return null;
+    time_utils.formatDateInto(date, out);
+    return out[0..];
+}
+
+fn addTokenUsageBucket(
+    allocator: std.mem.Allocator,
+    index: *std.StringHashMap(usize),
+    buckets: *std.ArrayList(TokenUsageBucket),
+    key: []const u8,
+    delta_total: i64,
+) !void {
+    if (index.get(key)) |existing_idx| {
+        buckets.items[existing_idx].total_tokens += delta_total;
+        buckets.items[existing_idx].rows += 1;
+        return;
+    }
+
+    const owned_key = try allocator.dupe(u8, key);
+    errdefer allocator.free(owned_key);
+    try buckets.append(allocator, .{
+        .key = owned_key,
+        .total_tokens = delta_total,
+        .rows = 1,
+    });
+    errdefer {
+        const popped = buckets.pop().?;
+        allocator.free(popped.key);
+    }
+    try index.put(owned_key, buckets.items.len - 1);
+}
+
+fn deinitTokenUsageBuckets(
+    allocator: std.mem.Allocator,
+    buckets: *std.ArrayList(TokenUsageBucket),
+    index: *std.StringHashMap(usize),
+) void {
+    for (buckets.items) |bucket| allocator.free(bucket.key);
+    buckets.deinit(allocator);
+    index.deinit();
+}
+
+fn tokenUsageBucketLessDayAsc(_: void, lhs: TokenUsageBucket, rhs: TokenUsageBucket) bool {
+    return std.mem.order(u8, lhs.key, rhs.key) == .lt;
+}
+
+fn tokenUsageBucketLessTotalDesc(_: void, lhs: TokenUsageBucket, rhs: TokenUsageBucket) bool {
+    if (lhs.total_tokens != rhs.total_tokens) return lhs.total_tokens > rhs.total_tokens;
+    return std.mem.order(u8, lhs.key, rhs.key) == .lt;
+}
+
+fn tokenUsageScopeKind(opts: Options, group_by: TokenUsageGroupBy) []const u8 {
+    if (group_by == .path) return "grouped_paths";
+    if (opts.path != null) return "path";
+    if (opts.session_id != null) return "session";
+    return "corpus";
+}
+
+fn tokenUsageScopeTarget(opts: Options, sessions_root: []const u8) []const u8 {
+    if (opts.path) |value| return value;
+    if (opts.session_id) |value| return value;
+    return sessions_root;
+}
+
+fn appendTokenUsageSummaryRow(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    opts: Options,
+    sessions_root: []const u8,
+    group_by: TokenUsageGroupBy,
+    timezone_label: []const u8,
+    total_tokens: i64,
+    total_rows: i64,
+    path_count: usize,
+    daily_buckets: []const TokenUsageBucket,
+    have_day_bounds: bool,
+    min_day: ?[]const u8,
+    max_day: ?[]const u8,
+    since_ms: ?i64,
+    until_ms: ?i64,
+    timezone: time_utils.TimeZone,
+) !void {
+    _ = have_day_bounds;
+    var row = query.Row.init(allocator);
+
+    const scope_kind = tokenUsageScopeKind(opts, group_by);
+    try row.putOwnedKey("scope_kind", .{ .string = scope_kind });
+    try row.putOwnedKey("scope_target", .{ .string = tokenUsageScopeTarget(opts, sessions_root) });
+    try row.putOwnedKey("group_by", .{ .string = group_by.fieldName() });
+    try row.putOwnedKey("tz", .{ .string = timezone_label });
+    try row.putOwnedKey("total_tokens", .{ .int = total_tokens });
+    try row.putOwnedKey("path_count", .{ .int = @intCast(path_count) });
+    try row.putOwnedKey("rows", .{ .int = total_rows });
+
+    const start_day = try tokenUsageSummaryBoundaryDayAlloc(allocator, since_ms, timezone, min_day);
+    defer if (start_day) |value| allocator.free(value);
+    const end_day = try tokenUsageSummaryBoundaryDayAlloc(allocator, until_ms, timezone, max_day);
+    defer if (end_day) |value| allocator.free(value);
+
+    if (start_day) |value| try row.putOwnedKey("first_day", .{ .string = value });
+    if (end_day) |value| try row.putOwnedKey("last_day", .{ .string = value });
+
+    const active_days_count: i64 = @intCast(daily_buckets.len);
+    try row.putOwnedKey("active_days", .{ .int = active_days_count });
+
+    var calendar_days: i64 = 0;
+    if (start_day) |start_text| {
+        if (end_day) |end_text| {
+            const start_date = time_utils.parseDayLiteral(start_text) orelse null;
+            const end_date = time_utils.parseDayLiteral(end_text) orelse null;
+            if (start_date != null and end_date != null) {
+                calendar_days = time_utils.daysBetweenInclusive(start_date.?, end_date.?);
+            }
+        }
+    }
+    try row.putOwnedKey("calendar_days", .{ .int = calendar_days });
+
+    if (calendar_days > 0) {
+        try row.putOwnedKey("average_tokens_per_calendar_day", .{ .float = @as(f64, @floatFromInt(total_tokens)) / @as(f64, @floatFromInt(calendar_days)) });
+    }
+    if (active_days_count > 0) {
+        try row.putOwnedKey("average_tokens_per_active_day", .{ .float = @as(f64, @floatFromInt(total_tokens)) / @as(f64, @floatFromInt(active_days_count)) });
+        try row.putOwnedKey("median_tokens_per_active_day", .{ .float = try tokenUsageMedianActiveDay(allocator, daily_buckets) });
+    }
+
+    var now_day_buf: [10]u8 = undefined;
+    const now_day = tokenUsageDayKeyFromMillis(std.time.milliTimestamp(), timezone, &now_day_buf);
+    const partial_current_day = if (end_day) |value|
+        if (now_day) |current| std.mem.eql(u8, value, current) else false
+    else
+        false;
+    try row.putOwnedKey("partial_current_day", .{ .bool = partial_current_day });
+
+    try out_rows.append(allocator, row);
+}
+
+fn tokenUsageSummaryBoundaryDayAlloc(
+    allocator: std.mem.Allocator,
+    bound_ms: ?i64,
+    timezone: time_utils.TimeZone,
+    fallback_day: ?[]const u8,
+) !?[]u8 {
+    if (bound_ms) |value| {
+        const date = time_utils.dateFromTimestampMillis(value, timezone) orelse return null;
+        var buf: [10]u8 = undefined;
+        time_utils.formatDateInto(date, &buf);
+        return try allocator.dupe(u8, buf[0..]);
+    }
+    const fallback = fallback_day orelse return null;
+    return try allocator.dupe(u8, fallback);
+}
+
+fn tokenUsageMedianActiveDay(
+    allocator: std.mem.Allocator,
+    buckets: []const TokenUsageBucket,
+) !f64 {
+    if (buckets.len == 0) return 0;
+
+    var totals = try allocator.alloc(i64, buckets.len);
+    defer allocator.free(totals);
+    for (buckets, 0..) |bucket, idx| totals[idx] = bucket.total_tokens;
+    std.mem.sort(i64, totals, {}, std.sort.asc(i64));
+
+    const mid = totals.len / 2;
+    if (@mod(totals.len, 2) == 1) return @floatFromInt(totals[mid]);
+    return (@as(f64, @floatFromInt(totals[mid - 1])) + @as(f64, @floatFromInt(totals[mid]))) / 2.0;
 }
 
 const CueSpec = struct {
@@ -4424,6 +4769,8 @@ fn timestampSatisfiesBounds(ts_opt: ?[]const u8, opts: Options) bool {
 }
 
 fn compareNormalizedTimestamp(lhs: []const u8, raw_rhs: []const u8) std.math.Order {
+    if (time_utils.compareIsoInstants(lhs, raw_rhs)) |order| return order;
+
     var buffer: [64]u8 = undefined;
     const rhs = if (raw_rhs.len > 0 and raw_rhs[raw_rhs.len - 1] == 'Z' and raw_rhs.len + 5 <= buffer.len) blk: {
         @memcpy(buffer[0 .. raw_rhs.len - 1], raw_rhs[0 .. raw_rhs.len - 1]);
@@ -6051,6 +6398,10 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.part_type = args[i];
+        } else if (std.mem.eql(u8, arg, "--tz")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.timezone_text = args[i];
         } else if (std.mem.eql(u8, arg, "--since")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -6463,64 +6814,7 @@ fn formatDurationHumanAlloc(allocator: std.mem.Allocator, duration_ms: i64) ![]u
 }
 
 fn parseIsoTimestampMillis(ts: []const u8) ?i64 {
-    if (ts.len < 20) return null;
-    if (ts[4] != '-' or ts[7] != '-' or ts[10] != 'T' or ts[13] != ':' or ts[16] != ':') return null;
-
-    const year = std.fmt.parseInt(i64, ts[0..4], 10) catch return null;
-    const month = std.fmt.parseInt(u8, ts[5..7], 10) catch return null;
-    const day = std.fmt.parseInt(u8, ts[8..10], 10) catch return null;
-    const hour = std.fmt.parseInt(i64, ts[11..13], 10) catch return null;
-    const minute = std.fmt.parseInt(i64, ts[14..16], 10) catch return null;
-    const second = std.fmt.parseInt(i64, ts[17..19], 10) catch return null;
-
-    if (month < 1 or month > 12) return null;
-    if (day < 1 or day > daysInMonthForCommands(@intCast(year), month)) return null;
-    if (hour < 0 or hour > 23 or minute < 0 or minute > 59 or second < 0 or second > 59) return null;
-
-    var idx: usize = 19;
-    var millis: i64 = 0;
-    if (idx < ts.len and ts[idx] == '.') {
-        idx += 1;
-        var digit_count: usize = 0;
-        while (idx < ts.len and std.ascii.isDigit(ts[idx])) : (idx += 1) {
-            if (digit_count < 3) millis = millis * 10 + (ts[idx] - '0');
-            digit_count += 1;
-        }
-        if (digit_count == 0) return null;
-        while (digit_count < 3) : (digit_count += 1) millis *= 10;
-    }
-
-    var offset_seconds: i64 = 0;
-    if (idx == ts.len - 1 and ts[idx] == 'Z') {
-        idx += 1;
-    } else {
-        if (idx + 6 != ts.len) return null;
-        const sign = ts[idx];
-        if (sign != '+' and sign != '-') return null;
-        if (ts[idx + 3] != ':') return null;
-        const offset_hours = std.fmt.parseInt(i64, ts[idx + 1 .. idx + 3], 10) catch return null;
-        const offset_minutes = std.fmt.parseInt(i64, ts[idx + 4 .. idx + 6], 10) catch return null;
-        if (offset_hours < 0 or offset_hours > 23 or offset_minutes < 0 or offset_minutes > 59) return null;
-        offset_seconds = offset_hours * 3600 + offset_minutes * 60;
-        if (sign == '-') offset_seconds = -offset_seconds;
-        idx += 6;
-    }
-    if (idx != ts.len) return null;
-
-    const days = daysFromCivil(year, month, day);
-    const day_seconds = hour * 3600 + minute * 60 + second - offset_seconds;
-    return (days * 86_400 + day_seconds) * 1000 + millis;
-}
-
-fn daysFromCivil(year: i64, month: u8, day: u8) i64 {
-    var adjusted_year = year;
-    if (month <= 2) adjusted_year -= 1;
-    const era = @divFloor(if (adjusted_year >= 0) adjusted_year else adjusted_year - 399, 400);
-    const yoe = adjusted_year - era * 400;
-    const shifted_month: i64 = @as(i64, @intCast(month)) + (if (month > 2) @as(i64, -3) else @as(i64, 9));
-    const doy = @divFloor(153 * shifted_month + 2, 5) + @as(i64, @intCast(day)) - 1;
-    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    return era * 146_097 + doe - 719_468;
+    return time_utils.parseIsoTimestampMillis(ts);
 }
 
 test "deriveSessionDayPathFilter honors day bounds for session datasets" {
@@ -6784,6 +7078,8 @@ test "parse options supports common flags" {
         "normal",
         "--part-type",
         "file",
+        "--tz",
+        "local",
         "--session",
         "ses_abc",
         "--since",
@@ -6842,6 +7138,7 @@ test "parse options supports common flags" {
     try std.testing.expectEqualStrings("completed", opts.status.?);
     try std.testing.expectEqualStrings("normal", opts.mode.?);
     try std.testing.expectEqualStrings("file", opts.part_type.?);
+    try std.testing.expectEqualStrings("local", opts.timezone_text.?);
     try std.testing.expectEqualStrings("ses_abc", opts.session.?);
     try std.testing.expectEqualStrings("1772700000000", opts.since.?);
     try std.testing.expectEqualStrings("2026-03-05T00:00:00Z", opts.until.?);
@@ -6864,6 +7161,51 @@ test "parse options supports common flags" {
     try std.testing.expectEqual(@as(i64, 12000), opts.threshold_ms);
     try std.testing.expect(opts.fail_on_hang);
     try std.testing.expect(opts.help);
+}
+
+test "token-usage summary rebuckets by timezone and computes averages from exact bounds" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("2026/03/26");
+    const session_rel = "2026/03/26/rollout-2026-03-26T00-00-00-019c0000-0000-7000-8000-000000000099.jsonl";
+    const session_content =
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-26T00:10:00Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":5}}}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-26T07:10:00Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":12}}}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-27T00:20:00Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":20}}}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-27T08:00:00Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":30}}}}\n";
+    try tmp.dir.writeFile(.{ .sub_path = session_rel, .data = session_content });
+
+    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "token-usage-summary.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const args = [_][]const u8{
+        "--root",
+        root_abs,
+        "--since",
+        "2026-03-26T00:00:00-07:00",
+        "--until",
+        "2026-03-27T23:59:59-07:00",
+        "--tz",
+        "-07:00",
+        "--summary",
+        "--format",
+        "json",
+    };
+    const got = try runCommandWithOutput(std.testing.allocator, .token_usage, args[0..], output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"total_tokens\": 25") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"calendar_days\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"active_days\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"average_tokens_per_calendar_day\": 12.5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"average_tokens_per_active_day\": 12.5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"median_tokens_per_active_day\": 12.5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"first_day\": \"2026-03-26\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"last_day\": \"2026-03-27\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"partial_current_day\": false") != null);
 }
 
 test "parseOptions rejects unknown option" {

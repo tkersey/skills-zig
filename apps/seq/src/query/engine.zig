@@ -1,5 +1,6 @@
 const std = @import("std");
 const spec = @import("../types/spec.zig");
+const time_utils = @import("../time_utils.zig");
 
 pub const Row = struct {
     allocator: std.mem.Allocator,
@@ -665,6 +666,14 @@ fn clauseList(clause: spec.WhereClause) ?[]const spec.Scalar {
 }
 
 fn relationalMatch(lhs: spec.Scalar, rhs: spec.Scalar, op: spec.WhereOp) bool {
+    if (lhs == .string and rhs == .string) {
+        if (time_utils.parseIsoTimestampMillis(lhs.string)) |lhs_ms| {
+            if (time_utils.parseIsoTimestampMillis(rhs.string)) |rhs_ms| {
+                return compareOrderInt(lhs_ms, rhs_ms, op);
+            }
+        }
+    }
+
     const lhs_num = valueAsFloat(lhs);
     const rhs_num = valueAsFloat(rhs);
     if (lhs_num != null and rhs_num != null) {
@@ -673,6 +682,16 @@ fn relationalMatch(lhs: spec.Scalar, rhs: spec.Scalar, op: spec.WhereOp) bool {
 
     if (lhs.isNull() or rhs.isNull()) return false;
     return compareOrderByTag(lhs, rhs, op);
+}
+
+fn compareOrderInt(lhs: i64, rhs: i64, op: spec.WhereOp) bool {
+    return switch (op) {
+        .gt => lhs > rhs,
+        .gte => lhs >= rhs,
+        .lt => lhs < rhs,
+        .lte => lhs <= rhs,
+        else => false,
+    };
 }
 
 fn compareOrder(lhs: f64, rhs: f64, op: spec.WhereOp) bool {
@@ -1137,6 +1156,29 @@ test "non-grouped regex alternation matches expected tools" {
     try expectIntField(result.rows.items[2], "id", 3);
     try expectIntField(result.rows.items[3], "id", 4);
     try expectIntField(result.rows.items[4], "id", 5);
+}
+
+test "relationalMatch compares ISO timestamps by instant across offsets" {
+    try std.testing.expect(relationalMatch(
+        .{ .string = "2026-03-26T07:00:00Z" },
+        .{ .string = "2026-03-26T00:00:00-07:00" },
+        .gte,
+    ));
+    try std.testing.expect(relationalMatch(
+        .{ .string = "2026-03-26T07:00:00Z" },
+        .{ .string = "2026-03-26T00:00:00-07:00" },
+        .lte,
+    ));
+    try std.testing.expect(relationalMatch(
+        .{ .string = "2026-03-26T07:00:01Z" },
+        .{ .string = "2026-03-26T00:00:00-07:00" },
+        .gt,
+    ));
+    try std.testing.expect(!relationalMatch(
+        .{ .string = "2026-03-26T00:07:40.672Z" },
+        .{ .string = "2026-03-26T00:00:00-07:00" },
+        .gte,
+    ));
 }
 
 test "non-grouped contains_any and regex_any operators" {
