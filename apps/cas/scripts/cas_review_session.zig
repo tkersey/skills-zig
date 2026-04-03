@@ -192,8 +192,15 @@ const FailureInfo = struct {
     hint: []const u8,
 };
 
+const SemverTriplet = struct {
+    major: u32,
+    minor: u32,
+    patch: u32,
+};
+
 const parent_materialization_prompt =
     "Internal bootstrap for detached review parent materialization. Reply with OK only.";
+const review_fallback_text = "Reviewer failed to output a response.";
 
 const ReviewStatus = struct {
     thread_status: []const u8,
@@ -256,6 +263,23 @@ const ReviewResultJson = struct {
     overallCorrectness: []const u8,
     overallExplanation: []const u8,
     overallConfidenceScore: f32,
+};
+
+const LiveReviewNotificationState = struct {
+    review_thread_id: []const u8,
+    review_turn_id: []const u8,
+    review_text: ?[]u8 = null,
+    observed_terminal_status: ?[]const u8 = null,
+    observed_turn_error_message: ?[]u8 = null,
+    saw_entered_review_mode: bool = false,
+    saw_exited_review_mode: bool = false,
+
+    fn deinit(self: *LiveReviewNotificationState, allocator: std.mem.Allocator) void {
+        if (self.review_text) |text| allocator.free(text);
+        if (self.observed_turn_error_message) |text| allocator.free(text);
+        self.review_text = null;
+        self.observed_turn_error_message = null;
+    }
 };
 
 pub fn main() !void {
@@ -528,9 +552,23 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
     const target = parsed.target.?;
     const target_record = targetToRecord(target);
     const created_parent_thread = parsed.parent_thread_id == null;
+    if (!parsed.wait_after_start and codexDetachedReviewNeedsLiveConnection(codex_version)) {
+        try renderErrorAndExit(
+            parsed.json,
+            "start",
+            "review/start",
+            "split detached review start is not resumable on codex 0.118.x stdio transport",
+            cwd,
+            output_receipt,
+            .{
+                .code = "incompatible_codex_review_runtime",
+                .hint = "codex 0.118.x streams detached review results on the live app-server connection; use cas review_session start --wait, native codex review, or a future websocket-backed CAS lane",
+            },
+        );
+    }
     const parent_thread_id = if (parsed.parent_thread_id) |existing| blk: {
         try resumeParentThread(allocator, &client, existing, session_dir);
-        var parent_status = try fetchReviewStatus(allocator, &client, existing, parent_event_log_path);
+        var parent_status = try fetchReviewStatus(allocator, &client, existing, parent_event_log_path, null);
         defer parent_status.deinit(allocator);
         if (failureInfoForParentReuse(&parent_status)) |failure| {
             try renderErrorAndExit(
@@ -551,10 +589,36 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
 
     var review_result_json: []u8 = undefined;
     var review_start_retry_used = false;
+    const pre_materialize_parent = created_parent_thread and shouldPreMaterializeDetachedReviewParent(parsed.parent_mode, codex_version);
+    if (pre_materialize_parent) {
+        // Codex 0.118.x requires a persisted parent rollout before detached review/start.
+        materializeParentThreadTurn(
+            allocator,
+            &client,
+            parent_thread_id,
+            parent_event_log_path,
+            parsed.timeout_ms,
+            parsed.poll_interval_ms,
+        ) catch {
+            try renderErrorAndExit(
+                parsed.json,
+                "start",
+                "review/start",
+                "fresh detached review parent could not be materialized before detached review launch",
+                cwd,
+                output_receipt,
+                .{
+                    .code = "parent_materialization_failed",
+                    .hint = "auto parent-mode could not bootstrap a materialized parent thread for this codex runtime; pass a clean materialized --parent-thread-id or use native codex review",
+                },
+            );
+        };
+        appendLogRecord(allocator, parent_event_log_path, "review/start", "note", "{\"compatibility\":\"pre-materialized-fresh-parent\"}") catch {};
+    }
     review_result_json = client.requestJson("review/start", review_params_json) catch |err| blk: {
         const raw_message = client.lastError() orelse @errorName(err);
         const failure = failureInfoForReviewStart(raw_message, created_parent_thread);
-        if (created_parent_thread and failure != null) {
+        if (created_parent_thread and failure != null and !pre_materialize_parent) {
             materializeParentThreadTurn(
                 allocator,
                 &client,
@@ -705,12 +769,13 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
             allocator,
             &client,
             record.review_thread_id,
+            record.review_turn_id,
             record.event_log_path,
             parsed.timeout_ms,
             parsed.poll_interval_ms,
         ) catch |err| switch (err) {
             error.WaitTimedOut => {
-                const timeout_status = try fetchReviewStatus(allocator, &client, record.review_thread_id, record.event_log_path);
+                const timeout_status = try fetchReviewStatus(allocator, &client, record.review_thread_id, record.event_log_path, null);
                 record.last_observed_status = timeoutStatusString(&timeout_status);
                 try writeSessionRecord(allocator, record_path, record);
                 if (parsed.json) {
@@ -747,20 +812,44 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                 }
                 std.process.exit(1);
             },
-            error.ReviewResultUnavailable => {
-                const latest_status = try fetchReviewStatus(allocator, &client, record.review_thread_id, record.event_log_path);
-                record.last_observed_status = timeoutStatusString(&latest_status);
-                if (failureInfoForStatus(&latest_status)) |failure| {
-                    if (std.mem.eql(u8, failure.code, "incompatible_codex_review_runtime")) {
-                        record.compatibility_verdict = "incompatible";
-                    }
+            else => return err,
+        };
+        record.last_observed_status = latest.turn_status;
+        if (!latest.review_result_available) {
+            if (failureInfoForStatus(&latest)) |failure| {
+                if (std.mem.eql(u8, failure.code, "incompatible_codex_review_runtime")) {
+                    record.compatibility_verdict = "incompatible";
                 }
-                try writeSessionRecord(allocator, record_path, record);
-                try maybeRunNativeFallbackAndExitStart(
+            }
+            try writeSessionRecord(allocator, record_path, record);
+            try maybeRunNativeFallbackAndExitStart(
+                allocator,
+                parsed,
+                cwd,
+                resolved_codex_path,
+                parent_thread_id,
+                review_thread_id,
+                review_turn_id,
+                target_record,
+                record_path,
+                event_log_path,
+                .{
+                    .resolved_codex_path = resolved_codex_path,
+                    .resolved_codex_version = codex_version,
+                    .compatibility_verdict = record.compatibility_verdict orelse "compatible",
+                },
+                latest,
+                false,
+                true,
+                failureInfoForStatus(&latest) orelse .{
+                    .code = "review_output_missing",
+                    .hint = "detached review reached terminal status without a materialized reviewResult",
+                },
+            );
+            if (parsed.json) {
+                try printStartJson(
                     allocator,
-                    parsed,
                     cwd,
-                    resolved_codex_path,
                     parent_thread_id,
                     review_thread_id,
                     review_turn_id,
@@ -770,52 +859,26 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                     .{
                         .resolved_codex_path = resolved_codex_path,
                         .resolved_codex_version = codex_version,
-                        .compatibility_verdict = "compatible",
+                        .compatibility_verdict = record.compatibility_verdict orelse "compatible",
                     },
-                    latest_status,
+                    latest,
                     false,
                     true,
-                    failureInfoForStatus(&latest_status) orelse .{
+                    failureInfoForStatus(&latest) orelse .{
                         .code = "review_output_missing",
                         .hint = "detached review reached terminal status without a materialized reviewResult",
                     },
+                    null,
                 );
-                if (parsed.json) {
-                    try printStartJson(
-                        allocator,
-                        cwd,
-                        parent_thread_id,
-                        review_thread_id,
-                        review_turn_id,
-                        target_record,
-                        record_path,
-                        event_log_path,
-                        .{
-                            .resolved_codex_path = resolved_codex_path,
-                            .resolved_codex_version = codex_version,
-                            .compatibility_verdict = record.compatibility_verdict orelse "compatible",
-                        },
-                        latest_status,
-                        false,
-                        true,
-                        .{
-                            .code = failureInfoForStatus(&latest_status).?.code,
-                            .hint = failureInfoForStatus(&latest_status).?.hint,
-                        },
-                        null,
-                    );
-                } else {
-                    var stdout_writer = std.fs.File.stdout().writer(&.{});
-                    const stdout = &stdout_writer.interface;
-                    try stdout.print("cas_review_session start reached terminal status without a reviewResult\nreview thread: {s}\n", .{
-                        review_thread_id,
-                    });
-                }
-                std.process.exit(1);
-            },
-            else => return err,
-        };
-        record.last_observed_status = latest.turn_status;
+            } else {
+                var stdout_writer = std.fs.File.stdout().writer(&.{});
+                const stdout = &stdout_writer.interface;
+                try stdout.print("cas_review_session start reached terminal status without a reviewResult\nreview thread: {s}\n", .{
+                    review_thread_id,
+                });
+            }
+            std.process.exit(1);
+        }
         try writeSessionRecord(allocator, record_path, record);
 
         if (parsed.json) {
@@ -906,7 +969,7 @@ fn cmdStatus(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
         client.deinit();
     }
 
-    const status = try fetchReviewStatus(allocator, &client, record.review_thread_id, record.event_log_path);
+    const status = try fetchReviewStatus(allocator, &client, record.review_thread_id, record.event_log_path, null);
 
     if (parsed.json) {
         try printStatusJson(
@@ -948,6 +1011,24 @@ fn cmdStatus(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
 fn cmdWait(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
     const loaded = try loadSessionRecord(allocator, parsed.review_thread_id.?);
     var record = loaded.record;
+    if (codexDetachedReviewNeedsLiveConnection(record.codex_version)) {
+        try renderErrorAndExit(
+            parsed.json,
+            "wait",
+            "review/start",
+            "split detached review wait is not resumable on codex 0.118.x stdio transport",
+            record.cwd,
+            .{
+                .resolved_codex_path = record.resolved_codex_path,
+                .resolved_codex_version = record.codex_version,
+                .compatibility_verdict = record.compatibility_verdict orelse "incompatible",
+            },
+            .{
+                .code = "incompatible_codex_review_runtime",
+                .hint = "codex 0.118.x streams detached review results on the live app-server connection; use cas review_session start --wait, native codex review, or a future websocket-backed CAS lane",
+            },
+        );
+    }
 
     var client = try cas.Client.start(allocator, .{
         .cwd = record.cwd,
@@ -965,12 +1046,13 @@ fn cmdWait(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
         allocator,
         &client,
         record.review_thread_id,
+        record.review_turn_id,
         record.event_log_path,
         parsed.timeout_ms,
         parsed.poll_interval_ms,
     ) catch |err| switch (err) {
         error.WaitTimedOut => {
-            const timeout_status = try fetchReviewStatus(allocator, &client, record.review_thread_id, record.event_log_path);
+            const timeout_status = try fetchReviewStatus(allocator, &client, record.review_thread_id, record.event_log_path, null);
             record.last_observed_status = timeoutStatusString(&timeout_status);
             try writeSessionRecord(allocator, loaded.record_path, record);
             if (parsed.json) {
@@ -1007,63 +1089,61 @@ fn cmdWait(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
             }
             std.process.exit(1);
         },
-        error.ReviewResultUnavailable => {
-            const terminal_status = try fetchReviewStatus(allocator, &client, record.review_thread_id, record.event_log_path);
-            record.last_observed_status = timeoutStatusString(&terminal_status);
-            if (failureInfoForStatus(&terminal_status)) |failure| {
-                if (std.mem.eql(u8, failure.code, "incompatible_codex_review_runtime")) {
-                    record.compatibility_verdict = "incompatible";
-                }
-            }
-            try writeSessionRecord(allocator, loaded.record_path, record);
-            try maybeRunNativeFallbackAndExitWait(
-                allocator,
-                parsed,
-                record,
-                loaded.record_path,
-                terminal_status,
-                failureInfoForStatus(&terminal_status) orelse .{
-                    .code = "review_output_missing",
-                    .hint = "detached review reached terminal status without a materialized reviewResult",
-                },
-            );
-            if (parsed.json) {
-                try printStatusJson(
-                    allocator,
-                    .wait,
-                    null,
-                    null,
-                    record.review_thread_id,
-                    record.review_turn_id,
-                    terminal_status,
-                    loaded.record_path,
-                    record.event_log_path,
-                    .{
-                        .resolved_codex_path = record.resolved_codex_path,
-                        .resolved_codex_version = record.codex_version,
-                        .compatibility_verdict = record.compatibility_verdict orelse "not_checked",
-                    },
-                    null,
-                    false,
-                    .{
-                        .code = failureInfoForStatus(&terminal_status).?.code,
-                        .hint = failureInfoForStatus(&terminal_status).?.hint,
-                    },
-                    null,
-                );
-            } else {
-                var stdout_writer = std.fs.File.stdout().writer(&.{});
-                const stdout = &stdout_writer.interface;
-                try stdout.print("cas_review_session wait reached terminal status without a reviewResult\nreview thread: {s}\n", .{
-                    record.review_thread_id,
-                });
-            }
-            std.process.exit(1);
-        },
         else => return err,
     };
 
     record.last_observed_status = latest.turn_status;
+    if (!latest.review_result_available) {
+        if (failureInfoForStatus(&latest)) |failure| {
+            if (std.mem.eql(u8, failure.code, "incompatible_codex_review_runtime")) {
+                record.compatibility_verdict = "incompatible";
+            }
+        }
+        try writeSessionRecord(allocator, loaded.record_path, record);
+        try maybeRunNativeFallbackAndExitWait(
+            allocator,
+            parsed,
+            record,
+            loaded.record_path,
+            latest,
+            failureInfoForStatus(&latest) orelse .{
+                .code = "review_output_missing",
+                .hint = "detached review reached terminal status without a materialized reviewResult",
+            },
+        );
+        if (parsed.json) {
+            try printStatusJson(
+                allocator,
+                .wait,
+                null,
+                null,
+                record.review_thread_id,
+                record.review_turn_id,
+                latest,
+                loaded.record_path,
+                record.event_log_path,
+                .{
+                    .resolved_codex_path = record.resolved_codex_path,
+                    .resolved_codex_version = record.codex_version,
+                    .compatibility_verdict = record.compatibility_verdict orelse "not_checked",
+                },
+                null,
+                false,
+                failureInfoForStatus(&latest) orelse .{
+                    .code = "review_output_missing",
+                    .hint = "detached review reached terminal status without a materialized reviewResult",
+                },
+                null,
+            );
+        } else {
+            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            const stdout = &stdout_writer.interface;
+            try stdout.print("cas_review_session wait reached terminal status without a reviewResult\nreview thread: {s}\n", .{
+                record.review_thread_id,
+            });
+        }
+        std.process.exit(1);
+    }
     try writeSessionRecord(allocator, loaded.record_path, record);
 
     if (parsed.json) {
@@ -1115,7 +1195,7 @@ fn cmdInterrupt(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
         client.deinit();
     }
 
-    const latest = try fetchReviewStatus(allocator, &client, record.review_thread_id, record.event_log_path);
+    const latest = try fetchReviewStatus(allocator, &client, record.review_thread_id, record.event_log_path, null);
     if (isTerminalTurnStatus(latest.turn_status)) {
         record.last_observed_status = latest.turn_status;
         try writeSessionRecord(allocator, loaded.record_path, record);
@@ -1235,6 +1315,7 @@ fn fetchReviewStatus(
     client: *cas.Client,
     review_thread_id: []const u8,
     event_log_path: []const u8,
+    live_notifications: ?*LiveReviewNotificationState,
 ) !ReviewStatus {
     const params_json = try stringifyAnyAlloc(allocator, .{
         .threadId = review_thread_id,
@@ -1242,7 +1323,16 @@ fn fetchReviewStatus(
     });
     defer allocator.free(params_json);
 
-    const response_json = client.requestJson("thread/read", params_json) catch |err| {
+    var captured_notifications: std.ArrayList([]u8) = .empty;
+    defer {
+        for (captured_notifications.items) |line| allocator.free(line);
+        captured_notifications.deinit(allocator);
+    }
+
+    const response_json = (if (live_notifications != null)
+        client.requestJsonCaptureNotifications("thread/read", params_json, &captured_notifications)
+    else
+        client.requestJson("thread/read", params_json)) catch |err| {
         const detail = client.lastError() orelse @errorName(err);
         if (std.mem.indexOf(u8, detail, "includeTurns is unavailable") != null or
             std.mem.indexOf(u8, detail, "not materialized yet") != null)
@@ -1252,25 +1342,44 @@ fn fetchReviewStatus(
                 .includeTurns = false,
             });
             defer allocator.free(fallback_params);
-            const fallback_json = try client.requestJson("thread/read", fallback_params);
+            const fallback_json = if (live_notifications != null)
+                try client.requestJsonCaptureNotifications("thread/read", fallback_params, &captured_notifications)
+            else
+                try client.requestJson("thread/read", fallback_params);
+            if (live_notifications) |state| {
+                try absorbLiveReviewNotifications(allocator, &captured_notifications, event_log_path, state);
+            }
             try appendLogRecord(allocator, event_log_path, "thread/read", "response", fallback_json);
             var status = try parseReviewStatusAlloc(allocator, fallback_json, false);
             try populateReviewResult(allocator, &status);
+            try populateReviewResultFromLiveNotifications(allocator, &status, live_notifications);
             if (try maybeResumeMaterializedThread(allocator, client, review_thread_id, event_log_path, &status)) {
                 allocator.free(fallback_json);
-                const resumed_json = try client.requestJson("thread/read", fallback_params);
+                captured_notifications.clearRetainingCapacity();
+                const resumed_json = if (live_notifications != null)
+                    try client.requestJsonCaptureNotifications("thread/read", fallback_params, &captured_notifications)
+                else
+                    try client.requestJson("thread/read", fallback_params);
+                if (live_notifications) |state| {
+                    try absorbLiveReviewNotifications(allocator, &captured_notifications, event_log_path, state);
+                }
                 try appendLogRecord(allocator, event_log_path, "thread/read", "response", resumed_json);
                 var resumed_status = try parseReviewStatusAlloc(allocator, resumed_json, false);
                 try populateReviewResult(allocator, &resumed_status);
+                try populateReviewResultFromLiveNotifications(allocator, &resumed_status, live_notifications);
                 return resumed_status;
             }
             return status;
         }
         return err;
     };
+    if (live_notifications) |state| {
+        try absorbLiveReviewNotifications(allocator, &captured_notifications, event_log_path, state);
+    }
     try appendLogRecord(allocator, event_log_path, "thread/read", "response", response_json);
     var status = try parseReviewStatusAlloc(allocator, response_json, true);
     try populateReviewResult(allocator, &status);
+    try populateReviewResultFromLiveNotifications(allocator, &status, live_notifications);
     if (try maybeResumeMaterializedThread(allocator, client, review_thread_id, event_log_path, &status)) {
         allocator.free(response_json);
         const params_after_resume = try stringifyAnyAlloc(allocator, .{
@@ -1278,10 +1387,18 @@ fn fetchReviewStatus(
             .includeTurns = true,
         });
         defer allocator.free(params_after_resume);
-        const resumed_json = try client.requestJson("thread/read", params_after_resume);
+        captured_notifications.clearRetainingCapacity();
+        const resumed_json = if (live_notifications != null)
+            try client.requestJsonCaptureNotifications("thread/read", params_after_resume, &captured_notifications)
+        else
+            try client.requestJson("thread/read", params_after_resume);
+        if (live_notifications) |state| {
+            try absorbLiveReviewNotifications(allocator, &captured_notifications, event_log_path, state);
+        }
         try appendLogRecord(allocator, event_log_path, "thread/read", "response", resumed_json);
         var resumed_status = try parseReviewStatusAlloc(allocator, resumed_json, true);
         try populateReviewResult(allocator, &resumed_status);
+        try populateReviewResultFromLiveNotifications(allocator, &resumed_status, live_notifications);
         return resumed_status;
     }
     return status;
@@ -1380,6 +1497,95 @@ fn populateReviewResult(allocator: std.mem.Allocator, status: *ReviewStatus) !vo
     }
 }
 
+fn absorbLiveReviewNotifications(
+    allocator: std.mem.Allocator,
+    captured_notifications: *const std.ArrayList([]u8),
+    event_log_path: []const u8,
+    live_notifications: *LiveReviewNotificationState,
+) !void {
+    for (captured_notifications.items) |line| {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+        defer parsed.deinit();
+        const root_obj = switch (parsed.value) {
+            .object => |obj| obj,
+            else => continue,
+        };
+        const method = core_json.stringField(root_obj, "method") orelse continue;
+        try appendLogRecord(allocator, event_log_path, method, "notification", line);
+        if (std.mem.eql(u8, method, "turn/aborted")) {
+            const params_obj = core_json.objectField(root_obj, "params") orelse continue;
+            const thread_id = core_json.stringField(params_obj, "threadId") orelse continue;
+            const turn_id = core_json.stringField(params_obj, "turnId") orelse continue;
+            if (std.mem.eql(u8, thread_id, live_notifications.review_thread_id) and
+                std.mem.eql(u8, turn_id, live_notifications.review_turn_id))
+            {
+                live_notifications.observed_terminal_status = "interrupted";
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, method, "turn/completed")) {
+            const params_obj = core_json.objectField(root_obj, "params") orelse continue;
+            const thread_id = core_json.stringField(params_obj, "threadId") orelse continue;
+            if (!std.mem.eql(u8, thread_id, live_notifications.review_thread_id)) continue;
+            const turn_obj = core_json.objectField(params_obj, "turn") orelse continue;
+            const turn_id = core_json.stringField(turn_obj, "id") orelse continue;
+            if (!std.mem.eql(u8, turn_id, live_notifications.review_turn_id)) continue;
+            const turn_status = core_json.stringField(turn_obj, "status") orelse continue;
+            live_notifications.observed_terminal_status =
+                if (std.mem.eql(u8, turn_status, "completed")) "completed" else if (std.mem.eql(u8, turn_status, "failed")) "failed" else if (std.mem.eql(u8, turn_status, "errored")) "errored" else if (std.mem.eql(u8, turn_status, "interrupted")) "interrupted" else turn_status;
+            if (turn_obj.get("error")) |error_val| {
+                if (live_notifications.observed_turn_error_message) |existing| allocator.free(existing);
+                live_notifications.observed_turn_error_message = try extractErrorMessageAlloc(allocator, error_val);
+            }
+            continue;
+        }
+        if (!std.mem.eql(u8, method, "item/started") and !std.mem.eql(u8, method, "item/completed")) continue;
+        const params_obj = core_json.objectField(root_obj, "params") orelse continue;
+        const thread_id = core_json.stringField(params_obj, "threadId") orelse continue;
+        const turn_id = core_json.stringField(params_obj, "turnId") orelse continue;
+        if (!std.mem.eql(u8, thread_id, live_notifications.review_thread_id)) continue;
+        if (!std.mem.eql(u8, turn_id, live_notifications.review_turn_id)) continue;
+        const item_obj = core_json.objectField(params_obj, "item") orelse continue;
+        const item_type = core_json.stringField(item_obj, "type") orelse continue;
+        if (std.mem.eql(u8, item_type, "enteredReviewMode")) {
+            live_notifications.saw_entered_review_mode = true;
+            continue;
+        }
+        if (!std.mem.eql(u8, item_type, "exitedReviewMode")) continue;
+        live_notifications.saw_exited_review_mode = true;
+        const review_text = core_json.stringField(item_obj, "review") orelse continue;
+        if (live_notifications.review_text) |existing| allocator.free(existing);
+        live_notifications.review_text = try allocator.dupe(u8, review_text);
+    }
+}
+
+fn populateReviewResultFromLiveNotifications(
+    allocator: std.mem.Allocator,
+    status: *ReviewStatus,
+    live_notifications: ?*LiveReviewNotificationState,
+) !void {
+    const state = live_notifications orelse return;
+    status.last_turn_has_entered_review_mode = status.last_turn_has_entered_review_mode or state.saw_entered_review_mode;
+    status.last_turn_has_exited_review_mode = status.last_turn_has_exited_review_mode or state.saw_exited_review_mode;
+    if (state.observed_terminal_status) |observed_status| {
+        allocator.free(status.turn_status);
+        status.turn_status = try allocator.dupe(u8, observed_status);
+    }
+    if (status.turn_error_message == null) {
+        if (state.observed_turn_error_message) |message| {
+            status.turn_error_message = try allocator.dupe(u8, message);
+        }
+    }
+    const review_text = state.review_text orelse return;
+    if (!isTerminalTurnStatus(status.turn_status)) return;
+    if (status.review_result_available) return;
+    if (!std.mem.eql(u8, status.turn_status, "completed")) return;
+    if (std.mem.eql(u8, review_text, review_fallback_text)) return;
+    status.review_result_available = true;
+    status.review_result_source = "notification_exited_review_mode";
+    status.review_result_json = try buildReviewResultJsonFromRenderedTextAlloc(allocator, review_text);
+}
+
 fn maybeResumeMaterializedThread(
     allocator: std.mem.Allocator,
     client: *cas.Client,
@@ -1454,7 +1660,7 @@ fn waitForThreadTerminalState(
 ) !ReviewStatus {
     const started_ms = std.time.milliTimestamp();
     while (true) {
-        const latest = try fetchReviewStatus(allocator, client, thread_id, event_log_path);
+        const latest = try fetchReviewStatus(allocator, client, thread_id, event_log_path, null);
         if (isTerminalTurnStatus(latest.turn_status)) return latest;
         latest.deinit(allocator);
         if (std.time.milliTimestamp() - started_ms >= timeout_ms) return error.WaitTimedOut;
@@ -1574,17 +1780,34 @@ fn waitForReviewCompletion(
     allocator: std.mem.Allocator,
     client: *cas.Client,
     review_thread_id: []const u8,
+    review_turn_id: []const u8,
     event_log_path: []const u8,
     timeout_ms: u32,
     poll_interval_ms: u32,
 ) !ReviewStatus {
     const started_ms = std.time.milliTimestamp();
+    var live_notifications = LiveReviewNotificationState{
+        .review_thread_id = review_thread_id,
+        .review_turn_id = review_turn_id,
+    };
+    defer live_notifications.deinit(allocator);
     while (true) {
-        const latest = try fetchReviewStatus(allocator, client, review_thread_id, event_log_path);
-        if (isTerminalTurnStatus(latest.turn_status) and latest.review_result_available) return latest;
-        if (isTerminalTurnStatus(latest.turn_status) and !latest.review_result_available) {
-            latest.deinit(allocator);
-            return error.ReviewResultUnavailable;
+        var captured_notifications: std.ArrayList([]u8) = .empty;
+        defer {
+            for (captured_notifications.items) |line| allocator.free(line);
+            captured_notifications.deinit(allocator);
+        }
+
+        const poll_result_json = try client.requestJsonCaptureNotifications(
+            "experimentalFeature/list",
+            "{\"cursor\":null,\"limit\":1}",
+            &captured_notifications,
+        );
+        allocator.free(poll_result_json);
+        try absorbLiveReviewNotifications(allocator, &captured_notifications, event_log_path, &live_notifications);
+
+        if (live_notifications.observed_terminal_status != null) {
+            return try fetchReviewStatus(allocator, client, review_thread_id, event_log_path, &live_notifications);
         }
         if (std.time.milliTimestamp() - started_ms >= timeout_ms) return error.WaitTimedOut;
         std.Thread.sleep(@as(u64, poll_interval_ms) * std.time.ns_per_ms);
@@ -1609,6 +1832,11 @@ fn startParentThreadAlloc(
     try appendLogRecord(allocator, parent_event_log_path, "thread/start", "request", params_json);
     try appendLogRecord(allocator, parent_event_log_path, "thread/start", "response", result_json);
     return parent_thread_id;
+}
+
+fn codexDetachedReviewNeedsLiveConnection(codex_version: []const u8) bool {
+    const semver = parseSemverTriplet(codex_version) orelse return false;
+    return semver.major == 0 and semver.minor == 118;
 }
 
 fn resumeParentThread(
@@ -1914,6 +2142,44 @@ fn readCodexVersionAlloc(allocator: std.mem.Allocator, cwd: []const u8, codex_pa
     const stdout = try child.stdout.?.readToEndAlloc(allocator, 4096);
     _ = try child.wait();
     return allocator.dupe(u8, std.mem.trim(u8, stdout, " \t\r\n"));
+}
+
+fn shouldPreMaterializeDetachedReviewParent(parent_mode: ParentMode, codex_version: []const u8) bool {
+    if (parent_mode != .auto) return false;
+    return codexDetachedReviewNeedsLiveConnection(codex_version);
+}
+
+fn parseSemverTriplet(raw: []const u8) ?SemverTriplet {
+    var cursor: usize = 0;
+    while (cursor < raw.len and !std.ascii.isDigit(raw[cursor])) : (cursor += 1) {}
+    if (cursor == raw.len) return null;
+
+    const major = parseVersionComponent(raw[cursor..]) orelse return null;
+    cursor += major.next_offset;
+    if (cursor >= raw.len or raw[cursor] != '.') return null;
+    cursor += 1;
+
+    const minor = parseVersionComponent(raw[cursor..]) orelse return null;
+    cursor += minor.next_offset;
+    if (cursor >= raw.len or raw[cursor] != '.') return null;
+    cursor += 1;
+
+    const patch = parseVersionComponent(raw[cursor..]) orelse return null;
+    return .{
+        .major = major.value,
+        .minor = minor.value,
+        .patch = patch.value,
+    };
+}
+
+fn parseVersionComponent(raw: []const u8) ?struct { value: u32, next_offset: usize } {
+    var len: usize = 0;
+    while (len < raw.len and std.ascii.isDigit(raw[len])) : (len += 1) {}
+    if (len == 0) return null;
+    return .{
+        .value = std.fmt.parseInt(u32, raw[0..len], 10) catch return null,
+        .next_offset = len,
+    };
 }
 
 fn quoteJsonStringAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
@@ -2264,6 +2530,20 @@ fn buildReviewResultJsonAlloc(allocator: std.mem.Allocator, review_output_obj: s
     return stringifyAnyAlloc(allocator, payload);
 }
 
+fn buildReviewResultJsonFromRenderedTextAlloc(allocator: std.mem.Allocator, review_text: []const u8) ![]u8 {
+    var findings = std.ArrayList(ReviewFindingJson).empty;
+    defer findings.deinit(allocator);
+    const trimmed = std.mem.trim(u8, review_text, " \t\r\n");
+    const payload = ReviewResultJson{
+        .findings = try findings.toOwnedSlice(allocator),
+        .overallCorrectness = "",
+        .overallExplanation = if (trimmed.len > 0) trimmed else "Reviewer failed to output a response.",
+        .overallConfidenceScore = 0.0,
+    };
+    defer allocator.free(payload.findings);
+    return stringifyAnyAlloc(allocator, payload);
+}
+
 fn floatField(obj: std.json.ObjectMap, key: []const u8) ?f32 {
     const value = obj.get(key) orelse return null;
     return switch (value) {
@@ -2426,6 +2706,38 @@ test "readReviewResultJsonFromRolloutAlloc returns null when review output is ab
 test "failureInfoForReviewStart maps detached parent rollout error" {
     const failure = failureInfoForReviewStart("no rollout found for thread id thr_123", true).?;
     try std.testing.expectEqualStrings("incompatible_codex_review_runtime", failure.code);
+}
+
+test "buildReviewResultJsonFromRenderedTextAlloc preserves review text" {
+    const json = try buildReviewResultJsonFromRenderedTextAlloc(std.testing.allocator, "Looks solid overall.");
+    defer std.testing.allocator.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const root_obj = parsed.value.object;
+    try std.testing.expectEqualStrings("Looks solid overall.", core_json.stringField(root_obj, "overallExplanation").?);
+    try std.testing.expectEqual(@as(usize, 0), root_obj.get("findings").?.array.items.len);
+}
+
+test "shouldPreMaterializeDetachedReviewParent gates auto mode for codex 0.118" {
+    try std.testing.expect(shouldPreMaterializeDetachedReviewParent(.auto, "codex-cli 0.118.0"));
+    try std.testing.expect(shouldPreMaterializeDetachedReviewParent(.auto, "0.118.3-dev"));
+    try std.testing.expect(!shouldPreMaterializeDetachedReviewParent(.auto, "codex-cli 0.119.0"));
+    try std.testing.expect(!shouldPreMaterializeDetachedReviewParent(.fresh, "codex-cli 0.118.0"));
+    try std.testing.expect(!shouldPreMaterializeDetachedReviewParent(.reuse, "codex-cli 0.118.0"));
+}
+
+test "codexDetachedReviewNeedsLiveConnection matches 0.118 only" {
+    try std.testing.expect(codexDetachedReviewNeedsLiveConnection("codex-cli 0.118.0"));
+    try std.testing.expect(!codexDetachedReviewNeedsLiveConnection("codex-cli 0.119.0"));
+}
+
+test "parseSemverTriplet extracts version from codex banner text" {
+    const parsed = parseSemverTriplet("codex-cli 0.118.0").?;
+    try std.testing.expectEqual(@as(u32, 0), parsed.major);
+    try std.testing.expectEqual(@as(u32, 118), parsed.minor);
+    try std.testing.expectEqual(@as(u32, 0), parsed.patch);
+    try std.testing.expect(parseSemverTriplet("codex-cli dev-build") == null);
 }
 
 test "failureInfoForStatus flags missing terminal review result" {

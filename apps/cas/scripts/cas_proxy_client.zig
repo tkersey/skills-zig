@@ -96,6 +96,15 @@ pub const Client = struct {
     }
 
     pub fn requestJson(self: *Client, method: []const u8, params_json: ?[]const u8) ![]u8 {
+        return self.requestJsonCaptureNotifications(method, params_json, null);
+    }
+
+    pub fn requestJsonCaptureNotifications(
+        self: *Client,
+        method: []const u8,
+        params_json: ?[]const u8,
+        notification_lines: ?*std.ArrayList([]u8),
+    ) ![]u8 {
         const request_id = self.next_request_id;
         self.next_request_id += 1;
 
@@ -114,6 +123,12 @@ pub const Client = struct {
 
             try self.autoHandleServerRequest(msg_obj);
 
+            if (notification_lines) |lines| {
+                if (isNotificationMessage(msg_obj)) {
+                    try lines.append(self.allocator, try self.allocator.dupe(u8, line));
+                }
+            }
+
             const response_id = blk: {
                 const id_val = msg_obj.get("id") orelse break :blk null;
                 break :blk core_json.intFromValue(id_val);
@@ -130,6 +145,10 @@ pub const Client = struct {
             }
             return error.InvalidAppServerResponse;
         }
+    }
+
+    fn isNotificationMessage(msg_obj: core_json.ObjectMap) bool {
+        return core_json.stringField(msg_obj, "method") != null and msg_obj.get("id") == null;
     }
 
     fn handshake(self: *Client, opts: ClientOptions) !void {
