@@ -533,7 +533,7 @@ pub fn build(b: *std.Build) void {
             .path = b.path("apps/cas"),
             .build_step_name = "build-cas",
             .build_description = "Build cas binaries",
-            .build_deps = &.{ &cas_smoke_check_install.step, &cas_instance_runner_install.step, &cas_review_session_install.step, &cas_conformance_suite_install.step, &cas_install.step },
+            .build_deps = &.{ &cas_smoke_check_install.step, &cas_instance_runner_install.step, &cas_review_session_install.step, &cas_conformance_suite_install.step, &cas_budget_perf_install.step, &cas_install.step },
             .test_deps = &.{test_cas},
         },
         .{
