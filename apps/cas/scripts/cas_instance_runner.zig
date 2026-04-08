@@ -1,5 +1,6 @@
 const app_meta = @import("app_meta");
 const cas = @import("cas_proxy_client.zig");
+const cas_websocket = @import("cas_websocket_transport.zig");
 const core_cli = @import("core_cli");
 const std = @import("std");
 
@@ -85,8 +86,15 @@ const StartFailure = struct {
 const RequestResult = struct {
     instance: usize,
     ok: bool,
+    transport: []const u8,
     summary: ?[]const u8 = null,
     @"error": ?[]const u8 = null,
+};
+
+const InstanceSlot = struct {
+    client: cas.Client,
+    transport: []const u8,
+    managed_server: ?cas_websocket.ManagedServer = null,
 };
 
 pub fn main() !void {
@@ -129,8 +137,9 @@ pub fn main() !void {
     const params = try buildParamsJson(allocator, opts.method, opts.params_json, opts.params_file);
     defer allocator.free(params);
     _ = opts.request_timeout_ms;
+    const resolved_codex_path = cas.resolveExecutableAlloc(allocator, "codex") catch "codex";
 
-    var slots = try allocator.alloc(?cas.Client, opts.instances);
+    var slots = try allocator.alloc(?InstanceSlot, opts.instances);
     defer allocator.free(slots);
     for (slots) |*slot| slot.* = null;
 
@@ -154,7 +163,62 @@ pub fn main() !void {
         const client_name = try std.fmt.allocPrint(allocator, "{s}-{d}", .{ opts.client_prefix, instance_num });
         defer allocator.free(client_name);
 
-        const client = cas.Client.start(allocator, .{
+        var transport: []const u8 = "stdio";
+        var managed_server: ?cas_websocket.ManagedServer = cas_websocket.startManagedLoopbackServer(
+            allocator,
+            cwd,
+            resolved_codex_path,
+        ) catch null;
+
+        const client = if (managed_server) |server|
+            cas.Client.start(allocator, .{
+                .cwd = cwd,
+                .state_file = state_file,
+                .client_name = client_name,
+                .server_request_timeout_ms = opts.server_request_timeout_ms,
+                .exec_approval = opts.exec_approval,
+                .file_approval = opts.file_approval,
+                .permissions_approval = opts.permissions_approval,
+                .request_user_input_response_json = opts.request_user_input_response_json,
+                .elicitation_action = opts.elicitation_action,
+                .elicitation_content_json = opts.elicitation_content_json,
+                .dynamic_tool_response_json = opts.dynamic_tool_response_json,
+                .read_only = opts.read_only,
+                .opt_out_notification_methods = opts.opt_out_methods,
+                .websocket_url = server.listen_url,
+            }) catch blk: {
+                var owned_server = server;
+                owned_server.kill();
+                managed_server = null;
+                break :blk cas.Client.start(allocator, .{
+                    .cwd = cwd,
+                    .state_file = state_file,
+                    .client_name = client_name,
+                    .server_request_timeout_ms = opts.server_request_timeout_ms,
+                    .exec_approval = opts.exec_approval,
+                    .file_approval = opts.file_approval,
+                    .permissions_approval = opts.permissions_approval,
+                    .request_user_input_response_json = opts.request_user_input_response_json,
+                    .elicitation_action = opts.elicitation_action,
+                    .elicitation_content_json = opts.elicitation_content_json,
+                    .dynamic_tool_response_json = opts.dynamic_tool_response_json,
+                    .read_only = opts.read_only,
+                    .opt_out_notification_methods = opts.opt_out_methods,
+                }) catch |err| {
+                    const msg = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
+                    try start_failures.append(allocator, .{
+                        .instance = instance_num,
+                        .@"error" = msg,
+                    });
+                    if (opts.verbose) {
+                        var stderr_writer = std.fs.File.stderr().writer(&.{});
+                        const stderr = &stderr_writer.interface;
+                        try stderr.print("[start:{d}] fail: {s}\n", .{ instance_num, msg });
+                    }
+                    continue;
+                };
+            }
+        else cas.Client.start(allocator, .{
             .cwd = cwd,
             .state_file = state_file,
             .client_name = client_name,
@@ -182,11 +246,16 @@ pub fn main() !void {
             continue;
         };
 
-        slots[i] = client;
+        if (managed_server != null) transport = "websocket";
+        slots[i] = .{
+            .client = client,
+            .transport = transport,
+            .managed_server = managed_server,
+        };
         if (opts.verbose) {
             var stderr_writer = std.fs.File.stderr().writer(&.{});
             const stderr = &stderr_writer.interface;
-            try stderr.print("[start:{d}] ok\n", .{instance_num});
+            try stderr.print("[start:{d}] ok ({s})\n", .{ instance_num, transport });
         }
     }
     const after_start = std.time.milliTimestamp();
@@ -196,10 +265,12 @@ pub fn main() !void {
     while (i < opts.instances) : (i += 1) {
         const instance_num = i + 1;
         if (slots[i] == null) continue;
-        var client = slots[i].?;
+        var slot = slots[i].?;
+        var client = slot.client;
         defer {
             client.close();
             client.deinit();
+            if (slot.managed_server) |*server| server.kill();
             slots[i] = null;
         }
 
@@ -211,12 +282,13 @@ pub fn main() !void {
             try request_results.append(allocator, .{
                 .instance = instance_num,
                 .ok = false,
+                .transport = slot.transport,
                 .@"error" = summary,
             });
             if (opts.verbose) {
                 var stderr_writer = std.fs.File.stderr().writer(&.{});
                 const stderr = &stderr_writer.interface;
-                try stderr.print("[request:{d}] fail: {s}\n", .{ instance_num, summary });
+                try stderr.print("[request:{d}] fail ({s}): {s}\n", .{ instance_num, slot.transport, summary });
             }
             continue;
         };
@@ -226,18 +298,21 @@ pub fn main() !void {
         try request_results.append(allocator, .{
             .instance = instance_num,
             .ok = true,
+            .transport = slot.transport,
             .summary = summary,
         });
         if (opts.verbose) {
             var stderr_writer = std.fs.File.stderr().writer(&.{});
             const stderr = &stderr_writer.interface;
-            try stderr.print("[request:{d}] ok\n", .{instance_num});
+            try stderr.print("[request:{d}] ok ({s})\n", .{ instance_num, slot.transport });
         }
     }
     const after_requests = std.time.milliTimestamp();
 
     const requests_ok = countRequestSuccess(request_results.items);
     const requests_failed = request_results.items.len - requests_ok;
+    const websocket_count = countTransport(request_results.items, "websocket");
+    const stdio_count = countTransport(request_results.items, "stdio");
     const instances_started = request_results.items.len;
     const sample_results = request_results.items[0..@min(opts.sample, request_results.items.len)];
 
@@ -252,6 +327,10 @@ pub fn main() !void {
         .start_failures = start_failures.items,
         .requests_ok = requests_ok,
         .requests_failed = requests_failed,
+        .transport_counts = .{
+            .websocket = websocket_count,
+            .stdio = stdio_count,
+        },
         .timing_ms = .{
             .start_all_clients = after_start - started_at,
             .run_all_requests = after_requests - after_start,
@@ -275,6 +354,7 @@ pub fn main() !void {
         try stdout.print("instances started:   {d}\n", .{instances_started});
         try stdout.print("requests ok:      {d}\n", .{requests_ok});
         try stdout.print("requests failed:  {d}\n", .{requests_failed});
+        try stdout.print("transport counts: websocket={d}, stdio={d}\n", .{ websocket_count, stdio_count });
         try stdout.print("timing ms: start={d}, request={d}, total={d}\n", .{
             after_start - started_at,
             after_requests - after_start,
@@ -284,13 +364,15 @@ pub fn main() !void {
             try stdout.writeAll("sample results:\n");
             for (sample_results) |sample| {
                 if (sample.ok) {
-                    try stdout.print("- instance {d}: ok {s}\n", .{
+                    try stdout.print("- instance {d}: ok ({s}) {s}\n", .{
                         sample.instance,
+                        sample.transport,
                         sample.summary orelse "{}",
                     });
                 } else {
-                    try stdout.print("- instance {d}: fail {s}\n", .{
+                    try stdout.print("- instance {d}: fail ({s}) {s}\n", .{
                         sample.instance,
+                        sample.transport,
                         sample.@"error" orelse "unknown",
                     });
                 }
@@ -566,6 +648,14 @@ fn countRequestSuccess(items: []const RequestResult) usize {
     var count: usize = 0;
     for (items) |item| {
         if (item.ok) count += 1;
+    }
+    return count;
+}
+
+fn countTransport(items: []const RequestResult, transport: []const u8) usize {
+    var count: usize = 0;
+    for (items) |item| {
+        if (std.mem.eql(u8, item.transport, transport)) count += 1;
     }
     return count;
 }

@@ -1,5 +1,11 @@
 const core_json = @import("core_json");
 const std = @import("std");
+const websocket_transport = @import("cas_websocket_transport.zig");
+
+pub const TransportKind = enum {
+    stdio,
+    websocket,
+};
 
 pub const ClientOptions = struct {
     cwd: []const u8,
@@ -20,13 +26,17 @@ pub const ClientOptions = struct {
     dynamic_tool_response_json: ?[]const u8 = null,
     read_only: bool = false,
     opt_out_notification_methods: []const []const u8 = &.{},
+    websocket_url: ?[]const u8 = null,
+    websocket_connect_timeout_ms: u32 = 10_000,
 };
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
-    child: std.process.Child,
-    stdin_file: std.fs.File,
-    stdout_file: std.fs.File,
+    transport_kind: TransportKind,
+    child: ?std.process.Child,
+    stdin_file: ?std.fs.File,
+    stdout_file: ?std.fs.File,
+    websocket: ?websocket_transport.Connection,
     line_buf: std.ArrayList(u8) = .empty,
     next_request_id: i64 = 1,
     last_error: ?[]u8 = null,
@@ -40,6 +50,14 @@ pub const Client = struct {
     read_only: bool,
 
     pub fn start(allocator: std.mem.Allocator, opts: ClientOptions) !Client {
+        if (opts.websocket_url) |url| {
+            return startWebsocket(allocator, opts, url);
+        }
+
+        return startStdio(allocator, opts);
+    }
+
+    fn startStdio(allocator: std.mem.Allocator, opts: ClientOptions) !Client {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(allocator);
 
@@ -61,9 +79,41 @@ pub const Client = struct {
 
         var client = Client{
             .allocator = allocator,
+            .transport_kind = .stdio,
             .child = child,
             .stdin_file = stdin_file,
             .stdout_file = stdout_file,
+            .websocket = null,
+            .line_buf = .empty,
+            .next_request_id = 1,
+            .last_error = null,
+            .exec_approval = opts.exec_approval,
+            .file_approval = opts.file_approval,
+            .permissions_approval = opts.permissions_approval,
+            .request_user_input_response_json = opts.request_user_input_response_json,
+            .elicitation_action = opts.elicitation_action,
+            .elicitation_content_json = opts.elicitation_content_json,
+            .dynamic_tool_response_json = opts.dynamic_tool_response_json,
+            .read_only = opts.read_only,
+        };
+        try client.handshake(opts);
+        return client;
+    }
+
+    fn startWebsocket(allocator: std.mem.Allocator, opts: ClientOptions, url: []const u8) !Client {
+        var websocket = try websocket_transport.Connection.connect(allocator, url, opts.websocket_connect_timeout_ms);
+        errdefer {
+            websocket.close();
+            websocket.deinit();
+        }
+
+        var client = Client{
+            .allocator = allocator,
+            .transport_kind = .websocket,
+            .child = null,
+            .stdin_file = null,
+            .stdout_file = null,
+            .websocket = websocket,
             .line_buf = .empty,
             .next_request_id = 1,
             .last_error = null,
@@ -84,11 +134,15 @@ pub const Client = struct {
         if (self.last_error) |owned| self.allocator.free(owned);
         self.last_error = null;
         self.line_buf.deinit(self.allocator);
+        if (self.websocket) |*websocket| websocket.deinit();
     }
 
     pub fn close(self: *Client) void {
-        _ = self.child.kill() catch {};
-        _ = self.child.wait() catch {};
+        if (self.websocket) |*websocket| websocket.close();
+        if (self.child) |*child| {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+        }
     }
 
     pub fn lastError(self: *const Client) ?[]const u8 {
@@ -294,8 +348,13 @@ pub const Client = struct {
         defer payload_writer.deinit();
         try std.json.Stringify.value(msg, .{}, &payload_writer.writer);
         const payload = payload_writer.written();
-        try self.stdin_file.writeAll(payload);
-        try self.stdin_file.writeAll("\n");
+        switch (self.transport_kind) {
+            .stdio => {
+                try self.stdin_file.?.writeAll(payload);
+                try self.stdin_file.?.writeAll("\n");
+            },
+            .websocket => try self.websocket.?.sendText(payload),
+        }
     }
 
     fn autoHandleServerRequest(self: *Client, msg_obj: core_json.ObjectMap) !void {
@@ -392,8 +451,13 @@ pub const Client = struct {
         try payload_writer.writer.writeAll("}");
 
         const payload = payload_writer.written();
-        try self.stdin_file.writeAll(payload);
-        try self.stdin_file.writeAll("\n");
+        switch (self.transport_kind) {
+            .stdio => {
+                try self.stdin_file.?.writeAll(payload);
+                try self.stdin_file.?.writeAll("\n");
+            },
+            .websocket => try self.websocket.?.sendText(payload),
+        }
     }
 
     fn sendServerError(self: *Client, id: i64, code: i64, message: []const u8) !void {
@@ -629,6 +693,10 @@ pub const Client = struct {
     }
 
     fn readLineAlloc(self: *Client) !?[]u8 {
+        if (self.transport_kind == .websocket) {
+            return try self.websocket.?.readTextAlloc();
+        }
+
         while (true) {
             if (std.mem.indexOfScalar(u8, self.line_buf.items, '\n')) |nl_idx| {
                 const line = try self.allocator.dupe(u8, self.line_buf.items[0..nl_idx]);
@@ -642,7 +710,7 @@ pub const Client = struct {
             }
 
             var tmp: [4096]u8 = undefined;
-            const n = try self.stdout_file.read(&tmp);
+            const n = try self.stdout_file.?.read(&tmp);
             if (n == 0) {
                 if (self.line_buf.items.len == 0) return null;
                 const tail = try self.allocator.dupe(u8, self.line_buf.items);
@@ -715,9 +783,11 @@ pub fn intField(obj: ObjectMap, key: []const u8) ?i64 {
 test "resolveExecDecision honors read_only and explicit approvals" {
     var client = Client{
         .allocator = std.testing.allocator,
-        .child = undefined,
-        .stdin_file = undefined,
-        .stdout_file = undefined,
+        .transport_kind = .stdio,
+        .child = null,
+        .stdin_file = null,
+        .stdout_file = null,
+        .websocket = null,
         .line_buf = .empty,
         .next_request_id = 1,
         .last_error = null,
@@ -748,9 +818,11 @@ test "resolveExecDecision honors read_only and explicit approvals" {
 test "resolveAutoExecDecision prefers acceptForSession when available" {
     var client = Client{
         .allocator = std.testing.allocator,
-        .child = undefined,
-        .stdin_file = undefined,
-        .stdout_file = undefined,
+        .transport_kind = .stdio,
+        .child = null,
+        .stdin_file = null,
+        .stdout_file = null,
+        .websocket = null,
         .line_buf = .empty,
         .next_request_id = 1,
         .last_error = null,
@@ -783,9 +855,11 @@ test "resolveAutoExecDecision prefers acceptForSession when available" {
 test "resolveAutoExecDecision falls back to amendment object before decline" {
     var client = Client{
         .allocator = std.testing.allocator,
-        .child = undefined,
-        .stdin_file = undefined,
-        .stdout_file = undefined,
+        .transport_kind = .stdio,
+        .child = null,
+        .stdin_file = null,
+        .stdout_file = null,
+        .websocket = null,
         .line_buf = .empty,
         .next_request_id = 1,
         .last_error = null,
@@ -815,9 +889,11 @@ test "resolveAutoExecDecision falls back to amendment object before decline" {
 test "resolvePermissionsApproval honors explicit grants and read_only" {
     var client = Client{
         .allocator = std.testing.allocator,
-        .child = undefined,
-        .stdin_file = undefined,
-        .stdout_file = undefined,
+        .transport_kind = .stdio,
+        .child = null,
+        .stdin_file = null,
+        .stdout_file = null,
+        .websocket = null,
         .line_buf = .empty,
         .next_request_id = 1,
         .last_error = null,
@@ -855,9 +931,11 @@ test "defaultRequestUserInputAnswer prefers first option label" {
 test "resolveElicitationAction defaults to decline" {
     var client = Client{
         .allocator = std.testing.allocator,
-        .child = undefined,
-        .stdin_file = undefined,
-        .stdout_file = undefined,
+        .transport_kind = .stdio,
+        .child = null,
+        .stdin_file = null,
+        .stdout_file = null,
+        .websocket = null,
         .line_buf = .empty,
         .next_request_id = 1,
         .last_error = null,

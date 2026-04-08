@@ -1,5 +1,6 @@
 const app_meta = @import("app_meta");
 const cas = @import("cas_proxy_client.zig");
+const cas_websocket = @import("cas_websocket_transport.zig");
 const core_cli = @import("core_cli");
 const core_json = @import("core_json");
 const core_path = @import("core_path");
@@ -166,7 +167,7 @@ const TargetRecord = struct {
 };
 
 const SessionRecord = struct {
-    schema_version: u32 = 2,
+    schema_version: u32 = 3,
     cwd: []const u8,
     parent_thread_id: []const u8,
     review_thread_id: []const u8,
@@ -179,12 +180,31 @@ const SessionRecord = struct {
     codex_version: []const u8,
     resolved_codex_path: ?[]const u8 = null,
     compatibility_verdict: ?[]const u8 = null,
+    transport_kind: ?[]const u8 = null,
+    transport_selection_reason: ?[]const u8 = null,
+    managed_server_pid: ?u64 = null,
+    managed_server_listen_url: ?[]const u8 = null,
+    managed_server_stderr_log_path: ?[]const u8 = null,
+    orphan_ttl_seconds: ?u32 = null,
+    terminal_review_result_source: ?[]const u8 = null,
+    terminal_review_result_json: ?[]const u8 = null,
+    terminal_fallback_transport: ?[]const u8 = null,
+    terminal_fallback_exit_code: ?u8 = null,
+    terminal_fallback_output_text: ?[]const u8 = null,
+    terminal_fallback_error_text: ?[]const u8 = null,
 };
 
 const OutputReceipt = struct {
     resolved_codex_path: ?[]const u8 = null,
     resolved_codex_version: ?[]const u8 = null,
     compatibility_verdict: []const u8 = "not_checked",
+    selected_transport: []const u8 = "stdio",
+    selection_reason: []const u8 = "default_stdio",
+    degraded_fallback: bool = false,
+    managed_server_pid: ?u64 = null,
+    managed_server_listen_url: ?[]const u8 = null,
+    managed_server_stderr_log_path: ?[]const u8 = null,
+    orphan_ttl_seconds: ?u32 = null,
 };
 
 const FailureInfo = struct {
@@ -201,6 +221,7 @@ const SemverTriplet = struct {
 const parent_materialization_prompt =
     "Internal bootstrap for detached review parent materialization. Reply with OK only.";
 const review_fallback_text = "Reviewer failed to output a response.";
+const managed_server_orphan_ttl_seconds: u32 = 15 * 60;
 
 const ReviewStatus = struct {
     thread_status: []const u8,
@@ -511,24 +532,13 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
     const output_receipt = OutputReceipt{
         .resolved_codex_path = resolved_codex_path,
         .resolved_codex_version = codex_version,
-        .compatibility_verdict = "not_checked",
+        .compatibility_verdict = "compatible",
+        .selected_transport = "websocket",
+        .selection_reason = "detached_review_requires_cross_process_truth",
+        .orphan_ttl_seconds = managed_server_orphan_ttl_seconds,
     };
 
-    var client = cas.Client.start(allocator, .{
-        .cwd = cwd,
-        .codex_path = resolved_codex_path,
-        .client_name = "cas-review-session",
-        .client_title = "CAS Review Session",
-        .client_version = Version,
-        .exec_approval = parsed.exec_approval,
-        .file_approval = parsed.file_approval,
-        .permissions_approval = parsed.permissions_approval,
-        .request_user_input_response_json = parsed.request_user_input_response_json,
-        .elicitation_action = parsed.elicitation_action,
-        .elicitation_content_json = parsed.elicitation_content_json,
-        .dynamic_tool_response_json = parsed.dynamic_tool_response_json,
-        .read_only = parsed.read_only,
-    }) catch |err| {
+    var managed_server = startManagedWebsocketServer(allocator, cwd, resolved_codex_path) catch |err| {
         try renderErrorAndExit(
             parsed.json,
             "start",
@@ -537,8 +547,44 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
             cwd,
             output_receipt,
             .{
-                .code = "review_failed",
-                .hint = "codex app-server failed before detached review startup completed",
+                .code = "websocket_bootstrap_failed",
+                .hint = "CAS could not start the managed websocket app-server for detached review",
+            },
+        );
+    };
+    const managed_server_pid = managed_server.processId();
+    const managed_server_listen_url = managed_server.listen_url;
+
+    var client = connectReviewClient(
+        allocator,
+        cwd,
+        resolved_codex_path,
+        codex_version,
+        "websocket",
+        managed_server_listen_url,
+        parsed,
+    ) catch |err| {
+        managed_server.kill();
+        managed_server.deinit(allocator);
+        try renderErrorAndExit(
+            parsed.json,
+            "start",
+            "review/start",
+            @errorName(err),
+            cwd,
+            .{
+                .resolved_codex_path = resolved_codex_path,
+                .resolved_codex_version = codex_version,
+                .compatibility_verdict = "compatible",
+                .selected_transport = "websocket",
+                .selection_reason = "detached_review_requires_cross_process_truth",
+                .managed_server_pid = managed_server_pid,
+                .managed_server_listen_url = managed_server_listen_url,
+                .orphan_ttl_seconds = managed_server_orphan_ttl_seconds,
+            },
+            .{
+                .code = "websocket_bootstrap_failed",
+                .hint = "CAS started the managed websocket app-server but could not complete the websocket client handshake",
             },
         );
     };
@@ -548,27 +594,14 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
     }
 
     const session_dir = try sessionDirAlloc(allocator);
-    const parent_event_log_path = try std.fs.path.join(allocator, &.{ session_dir, "parent-thread.ndjson" });
     const target = parsed.target.?;
     const target_record = targetToRecord(target);
     const created_parent_thread = parsed.parent_thread_id == null;
-    if (!parsed.wait_after_start and codexDetachedReviewNeedsLiveConnection(codex_version)) {
-        try renderErrorAndExit(
-            parsed.json,
-            "start",
-            "review/start",
-            "split detached review start is not resumable on codex 0.118.x stdio transport",
-            cwd,
-            output_receipt,
-            .{
-                .code = "incompatible_codex_review_runtime",
-                .hint = "codex 0.118.x streams detached review results on the live app-server connection; use cas review_session start --wait, native codex review, or a future websocket-backed CAS lane",
-            },
-        );
-    }
     const parent_thread_id = if (parsed.parent_thread_id) |existing| blk: {
-        try resumeParentThread(allocator, &client, existing, session_dir);
-        var parent_status = try fetchReviewStatus(allocator, &client, existing, parent_event_log_path, null);
+        const existing_parent_event_log_path = try parentEventLogPathAlloc(allocator, session_dir, existing);
+        defer allocator.free(existing_parent_event_log_path);
+        try resumeParentThread(allocator, &client, existing, existing_parent_event_log_path);
+        var parent_status = try fetchReviewStatus(allocator, &client, existing, existing_parent_event_log_path, null);
         defer parent_status.deinit(allocator);
         if (failureInfoForParentReuse(&parent_status)) |failure| {
             try renderErrorAndExit(
@@ -583,6 +616,8 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
         }
         break :blk try allocator.dupe(u8, existing);
     } else try startParentThreadAlloc(allocator, &client, cwd, session_dir);
+    const parent_event_log_path = try parentEventLogPathAlloc(allocator, session_dir, parent_thread_id);
+    defer allocator.free(parent_event_log_path);
     const review_params_json = try buildReviewStartParamsJson(allocator, parent_thread_id, target);
     defer allocator.free(review_params_json);
     appendLogRecord(allocator, parent_event_log_path, "thread/start", "response", parent_thread_id) catch {};
@@ -761,6 +796,12 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
         .codex_version = codex_version,
         .resolved_codex_path = resolved_codex_path,
         .compatibility_verdict = "compatible",
+        .transport_kind = "websocket",
+        .transport_selection_reason = "detached_review_requires_cross_process_truth",
+        .managed_server_pid = managed_server_pid,
+        .managed_server_listen_url = managed_server_listen_url,
+        .managed_server_stderr_log_path = null,
+        .orphan_ttl_seconds = managed_server_orphan_ttl_seconds,
     };
     try writeSessionRecord(allocator, record_path, record);
 
@@ -792,6 +833,11 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                             .resolved_codex_path = resolved_codex_path,
                             .resolved_codex_version = codex_version,
                             .compatibility_verdict = "compatible",
+                            .selected_transport = "websocket",
+                            .selection_reason = "detached_review_requires_cross_process_truth",
+                            .managed_server_pid = managed_server_pid,
+                            .managed_server_listen_url = managed_server_listen_url,
+                            .orphan_ttl_seconds = managed_server_orphan_ttl_seconds,
                         },
                         timeout_status,
                         true,
@@ -860,6 +906,11 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                         .resolved_codex_path = resolved_codex_path,
                         .resolved_codex_version = codex_version,
                         .compatibility_verdict = record.compatibility_verdict orelse "compatible",
+                        .selected_transport = "websocket",
+                        .selection_reason = "detached_review_requires_cross_process_truth",
+                        .managed_server_pid = managed_server_pid,
+                        .managed_server_listen_url = managed_server_listen_url,
+                        .orphan_ttl_seconds = managed_server_orphan_ttl_seconds,
                     },
                     latest,
                     false,
@@ -895,6 +946,11 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                     .resolved_codex_path = resolved_codex_path,
                     .resolved_codex_version = codex_version,
                     .compatibility_verdict = "compatible",
+                    .selected_transport = "websocket",
+                    .selection_reason = "detached_review_requires_cross_process_truth",
+                    .managed_server_pid = managed_server_pid,
+                    .managed_server_listen_url = managed_server_listen_url,
+                    .orphan_ttl_seconds = managed_server_orphan_ttl_seconds,
                 },
                 latest,
                 false,
@@ -932,6 +988,11 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                 .resolved_codex_path = resolved_codex_path,
                 .resolved_codex_version = codex_version,
                 .compatibility_verdict = "compatible",
+                .selected_transport = "websocket",
+                .selection_reason = "detached_review_requires_cross_process_truth",
+                .managed_server_pid = managed_server_pid,
+                .managed_server_listen_url = managed_server_listen_url,
+                .orphan_ttl_seconds = managed_server_orphan_ttl_seconds,
             },
             null,
             false,
@@ -957,19 +1018,71 @@ fn cmdStatus(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
     const loaded = try loadSessionRecord(allocator, parsed.review_thread_id.?);
     const record = loaded.record;
 
-    var client = try cas.Client.start(allocator, .{
-        .cwd = record.cwd,
-        .codex_path = record.resolved_codex_path orelse "codex",
-        .client_name = "cas-review-session",
-        .client_title = "CAS Review Session",
-        .client_version = Version,
-    });
+    if (record.terminal_fallback_transport != null and record.terminal_review_result_json != null) {
+        const status = try makeStoredFallbackStatus(allocator, record);
+        defer status.deinit(allocator);
+        if (parsed.json) {
+            try printStatusJson(
+                allocator,
+                .status,
+                record.cwd,
+                record.parent_thread_id,
+                record.review_thread_id,
+                record.review_turn_id,
+                status,
+                loaded.record_path,
+                record.event_log_path,
+                .{
+                    .resolved_codex_path = record.resolved_codex_path,
+                    .resolved_codex_version = record.codex_version,
+                    .compatibility_verdict = record.compatibility_verdict orelse "compatible",
+                    .selected_transport = record.terminal_fallback_transport.?,
+                    .selection_reason = "stored_terminal_fallback",
+                    .degraded_fallback = true,
+                    .managed_server_pid = record.managed_server_pid,
+                    .managed_server_listen_url = record.managed_server_listen_url,
+                    .managed_server_stderr_log_path = record.managed_server_stderr_log_path,
+                    .orphan_ttl_seconds = record.orphan_ttl_seconds,
+                },
+                null,
+                null,
+                null,
+                .{
+                    .exit_code = record.terminal_fallback_exit_code orelse 0,
+                    .ok = (record.terminal_fallback_exit_code orelse 1) == 0,
+                    .stdout_text = record.terminal_fallback_output_text,
+                    .stderr_text = record.terminal_fallback_error_text,
+                },
+            );
+        } else {
+            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            const stdout = &stdout_writer.interface;
+            try stdout.print("cas_review_session status\nreview thread: {s}\nreview turn: {s}\nturn status: {s}\ntransport: native-review (stored fallback)\nrecord: {s}\n", .{
+                record.review_thread_id,
+                record.review_turn_id,
+                status.turn_status,
+                loaded.record_path,
+            });
+        }
+        return;
+    }
+
+    var client = try connectReviewClient(
+        allocator,
+        record.cwd,
+        record.resolved_codex_path orelse "codex",
+        record.codex_version,
+        record.transport_kind,
+        record.managed_server_listen_url,
+        parsed,
+    );
     defer {
         client.close();
         client.deinit();
     }
 
-    const status = try fetchReviewStatus(allocator, &client, record.review_thread_id, record.event_log_path, null);
+    var status = try fetchReviewStatus(allocator, &client, record.review_thread_id, record.event_log_path, null);
+    try applyRecordedStatusOverlay(allocator, record, &status);
 
     if (parsed.json) {
         try printStatusJson(
@@ -986,6 +1099,12 @@ fn cmdStatus(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                 .resolved_codex_path = record.resolved_codex_path,
                 .resolved_codex_version = record.codex_version,
                 .compatibility_verdict = record.compatibility_verdict orelse "not_checked",
+                .selected_transport = record.transport_kind orelse "stdio",
+                .selection_reason = record.transport_selection_reason orelse "legacy_record",
+                .managed_server_pid = record.managed_server_pid,
+                .managed_server_listen_url = record.managed_server_listen_url,
+                .managed_server_stderr_log_path = record.managed_server_stderr_log_path,
+                .orphan_ttl_seconds = record.orphan_ttl_seconds,
             },
             null,
             null,
@@ -1011,32 +1130,70 @@ fn cmdStatus(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
 fn cmdWait(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
     const loaded = try loadSessionRecord(allocator, parsed.review_thread_id.?);
     var record = loaded.record;
-    if (codexDetachedReviewNeedsLiveConnection(record.codex_version)) {
-        try renderErrorAndExit(
-            parsed.json,
-            "wait",
-            "review/start",
-            "split detached review wait is not resumable on codex 0.118.x stdio transport",
-            record.cwd,
-            .{
-                .resolved_codex_path = record.resolved_codex_path,
-                .resolved_codex_version = record.codex_version,
-                .compatibility_verdict = record.compatibility_verdict orelse "incompatible",
-            },
-            .{
-                .code = "incompatible_codex_review_runtime",
-                .hint = "codex 0.118.x streams detached review results on the live app-server connection; use cas review_session start --wait, native codex review, or a future websocket-backed CAS lane",
-            },
-        );
+    if (record.terminal_fallback_transport != null and record.terminal_review_result_json != null) {
+        const status = try makeStoredFallbackStatus(allocator, record);
+        defer status.deinit(allocator);
+        if (parsed.json) {
+            try printStatusJson(
+                allocator,
+                .wait,
+                record.cwd,
+                record.parent_thread_id,
+                record.review_thread_id,
+                record.review_turn_id,
+                status,
+                loaded.record_path,
+                record.event_log_path,
+                .{
+                    .resolved_codex_path = record.resolved_codex_path,
+                    .resolved_codex_version = record.codex_version,
+                    .compatibility_verdict = record.compatibility_verdict orelse "compatible",
+                    .selected_transport = record.terminal_fallback_transport.?,
+                    .selection_reason = "stored_terminal_fallback",
+                    .degraded_fallback = true,
+                    .managed_server_pid = record.managed_server_pid,
+                    .managed_server_listen_url = record.managed_server_listen_url,
+                    .managed_server_stderr_log_path = record.managed_server_stderr_log_path,
+                    .orphan_ttl_seconds = record.orphan_ttl_seconds,
+                },
+                null,
+                false,
+                null,
+                .{
+                    .exit_code = record.terminal_fallback_exit_code orelse 0,
+                    .ok = (record.terminal_fallback_exit_code orelse 1) == 0,
+                    .stdout_text = record.terminal_fallback_output_text,
+                    .stderr_text = record.terminal_fallback_error_text,
+                },
+            );
+        }
+        return;
     }
 
-    var client = try cas.Client.start(allocator, .{
-        .cwd = record.cwd,
-        .codex_path = record.resolved_codex_path orelse "codex",
-        .client_name = "cas-review-session",
-        .client_title = "CAS Review Session",
-        .client_version = Version,
-    });
+    var client = connectReviewClient(
+        allocator,
+        record.cwd,
+        record.resolved_codex_path orelse "codex",
+        record.codex_version,
+        record.transport_kind,
+        record.managed_server_listen_url,
+        parsed,
+    ) catch |err| {
+        if (parsed.fallback_mode == .native_review) {
+            try maybeRunNativeFallbackAndExitWait(
+                allocator,
+                parsed,
+                &record,
+                loaded.record_path,
+                null,
+                .{
+                    .code = "review_transport_lost",
+                    .hint = "managed websocket review transport could not be reconnected; returning explicit native-review fallback",
+                },
+            );
+        }
+        return err;
+    };
     defer {
         client.close();
         client.deinit();
@@ -1052,7 +1209,8 @@ fn cmdWait(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
         parsed.poll_interval_ms,
     ) catch |err| switch (err) {
         error.WaitTimedOut => {
-            const timeout_status = try fetchReviewStatus(allocator, &client, record.review_thread_id, record.event_log_path, null);
+            var timeout_status = try fetchReviewStatus(allocator, &client, record.review_thread_id, record.event_log_path, null);
+            try applyRecordedStatusOverlay(allocator, record, &timeout_status);
             record.last_observed_status = timeoutStatusString(&timeout_status);
             try writeSessionRecord(allocator, loaded.record_path, record);
             if (parsed.json) {
@@ -1070,6 +1228,12 @@ fn cmdWait(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                         .resolved_codex_path = record.resolved_codex_path,
                         .resolved_codex_version = record.codex_version,
                         .compatibility_verdict = record.compatibility_verdict orelse "not_checked",
+                        .selected_transport = record.transport_kind orelse "stdio",
+                        .selection_reason = record.transport_selection_reason orelse "legacy_record",
+                        .managed_server_pid = record.managed_server_pid,
+                        .managed_server_listen_url = record.managed_server_listen_url,
+                        .managed_server_stderr_log_path = record.managed_server_stderr_log_path,
+                        .orphan_ttl_seconds = record.orphan_ttl_seconds,
                     },
                     parsed.timeout_ms,
                     true,
@@ -1089,7 +1253,22 @@ fn cmdWait(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
             }
             std.process.exit(1);
         },
-        else => return err,
+        else => {
+            if (parsed.fallback_mode == .native_review and isTransportLossError(err)) {
+                try maybeRunNativeFallbackAndExitWait(
+                    allocator,
+                    parsed,
+                    &record,
+                    loaded.record_path,
+                    null,
+                    .{
+                        .code = "review_transport_lost",
+                        .hint = "managed websocket review transport was lost while waiting; returning explicit native-review fallback",
+                    },
+                );
+            }
+            return err;
+        },
     };
 
     record.last_observed_status = latest.turn_status;
@@ -1103,7 +1282,7 @@ fn cmdWait(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
         try maybeRunNativeFallbackAndExitWait(
             allocator,
             parsed,
-            record,
+            &record,
             loaded.record_path,
             latest,
             failureInfoForStatus(&latest) orelse .{
@@ -1126,6 +1305,12 @@ fn cmdWait(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                     .resolved_codex_path = record.resolved_codex_path,
                     .resolved_codex_version = record.codex_version,
                     .compatibility_verdict = record.compatibility_verdict orelse "not_checked",
+                    .selected_transport = record.transport_kind orelse "stdio",
+                    .selection_reason = record.transport_selection_reason orelse "legacy_record",
+                    .managed_server_pid = record.managed_server_pid,
+                    .managed_server_listen_url = record.managed_server_listen_url,
+                    .managed_server_stderr_log_path = record.managed_server_stderr_log_path,
+                    .orphan_ttl_seconds = record.orphan_ttl_seconds,
                 },
                 null,
                 false,
@@ -1161,6 +1346,12 @@ fn cmdWait(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                 .resolved_codex_path = record.resolved_codex_path,
                 .resolved_codex_version = record.codex_version,
                 .compatibility_verdict = record.compatibility_verdict orelse "not_checked",
+                .selected_transport = record.transport_kind orelse "stdio",
+                .selection_reason = record.transport_selection_reason orelse "legacy_record",
+                .managed_server_pid = record.managed_server_pid,
+                .managed_server_listen_url = record.managed_server_listen_url,
+                .managed_server_stderr_log_path = record.managed_server_stderr_log_path,
+                .orphan_ttl_seconds = record.orphan_ttl_seconds,
             },
             null,
             false,
@@ -1183,13 +1374,33 @@ fn cmdInterrupt(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
     const loaded = try loadSessionRecord(allocator, parsed.review_thread_id.?);
     var record = loaded.record;
 
-    var client = try cas.Client.start(allocator, .{
-        .cwd = record.cwd,
-        .codex_path = record.resolved_codex_path orelse "codex",
-        .client_name = "cas-review-session",
-        .client_title = "CAS Review Session",
-        .client_version = Version,
-    });
+    if (record.terminal_fallback_transport != null) {
+        if (parsed.json) {
+            const payload = .{
+                .demo = "cas-review-session",
+                .action = "interrupt",
+                .reviewThreadId = record.review_thread_id,
+                .reviewTurnId = record.review_turn_id,
+                .skipped = true,
+                .reason = "stored-terminal-fallback",
+                .turnStatus = record.last_observed_status,
+                .recordPath = loaded.record_path,
+                .eventLogPath = record.event_log_path,
+            };
+            try printJson(payload);
+        }
+        return;
+    }
+
+    var client = try connectReviewClient(
+        allocator,
+        record.cwd,
+        record.resolved_codex_path orelse "codex",
+        record.codex_version,
+        record.transport_kind,
+        record.managed_server_listen_url,
+        parsed,
+    );
     defer {
         client.close();
         client.deinit();
@@ -1776,6 +1987,10 @@ fn isTerminalTurnStatus(status: []const u8) bool {
         std.mem.eql(u8, status, "errored");
 }
 
+fn isTransportLossError(err: anyerror) bool {
+    return err == error.AppServerClosed or err == error.ConnectionResetByPeer or err == error.BrokenPipe or err == error.EndOfStream;
+}
+
 fn waitForReviewCompletion(
     allocator: std.mem.Allocator,
     client: *cas.Client,
@@ -1828,7 +2043,8 @@ fn startParentThreadAlloc(
     const result_json = try client.requestJson("thread/start", params_json);
     defer allocator.free(result_json);
     const parent_thread_id = try extractStartedThreadIdAlloc(allocator, result_json);
-    const parent_event_log_path = try std.fs.path.join(allocator, &.{ session_dir, "parent-thread.ndjson" });
+    const parent_event_log_path = try parentEventLogPathAlloc(allocator, session_dir, parent_thread_id);
+    defer allocator.free(parent_event_log_path);
     try appendLogRecord(allocator, parent_event_log_path, "thread/start", "request", params_json);
     try appendLogRecord(allocator, parent_event_log_path, "thread/start", "response", result_json);
     return parent_thread_id;
@@ -1843,7 +2059,7 @@ fn resumeParentThread(
     allocator: std.mem.Allocator,
     client: *cas.Client,
     parent_thread_id: []const u8,
-    session_dir: []const u8,
+    parent_event_log_path: []const u8,
 ) !void {
     const params_json = try stringifyAnyAlloc(allocator, .{
         .threadId = parent_thread_id,
@@ -1851,7 +2067,6 @@ fn resumeParentThread(
     defer allocator.free(params_json);
     const result_json = try client.requestJson("thread/resume", params_json);
     defer allocator.free(result_json);
-    const parent_event_log_path = try std.fs.path.join(allocator, &.{ session_dir, "parent-thread.ndjson" });
     try appendLogRecord(allocator, parent_event_log_path, "thread/resume", "request", params_json);
     try appendLogRecord(allocator, parent_event_log_path, "thread/resume", "response", result_json);
 }
@@ -1922,6 +2137,77 @@ fn sessionDirAlloc(allocator: std.mem.Allocator) ![]const u8 {
     return base;
 }
 
+fn parentEventLogPathAlloc(
+    allocator: std.mem.Allocator,
+    session_dir: []const u8,
+    parent_thread_id: []const u8,
+) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}/{s}.parent.events.ndjson", .{ session_dir, parent_thread_id });
+}
+
+fn startManagedWebsocketServer(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    codex_path: []const u8,
+) !cas_websocket.ManagedServer {
+    return cas_websocket.startManagedLoopbackServer(allocator, cwd, codex_path);
+}
+
+fn connectReviewClient(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    codex_path: []const u8,
+    codex_version: []const u8,
+    transport_kind: ?[]const u8,
+    websocket_url: ?[]const u8,
+    parsed: ParsedArgs,
+) !cas.Client {
+    _ = codex_version;
+    return cas.Client.start(allocator, .{
+        .cwd = cwd,
+        .codex_path = codex_path,
+        .client_name = "cas-review-session",
+        .client_title = "CAS Review Session",
+        .client_version = Version,
+        .exec_approval = parsed.exec_approval,
+        .file_approval = parsed.file_approval,
+        .permissions_approval = parsed.permissions_approval,
+        .request_user_input_response_json = parsed.request_user_input_response_json,
+        .elicitation_action = parsed.elicitation_action,
+        .elicitation_content_json = parsed.elicitation_content_json,
+        .dynamic_tool_response_json = parsed.dynamic_tool_response_json,
+        .read_only = parsed.read_only,
+        .websocket_url = if (transport_kind != null and std.mem.eql(u8, transport_kind.?, "websocket")) websocket_url else null,
+    });
+}
+
+fn makeStoredFallbackStatus(allocator: std.mem.Allocator, record: SessionRecord) !ReviewStatus {
+    return .{
+        .thread_status = try allocator.dupe(u8, "terminal"),
+        .turn_status = try allocator.dupe(u8, record.last_observed_status),
+        .turn_count = 1,
+        .materialized = true,
+        .thread_preview = try allocator.dupe(u8, ""),
+        .rollout_path = null,
+        .turn_error_message = null,
+        .last_turn_has_entered_review_mode = true,
+        .last_turn_has_exited_review_mode = true,
+        .review_result_available = record.terminal_review_result_json != null,
+        .review_result_source = if (record.terminal_review_result_source) |value| try allocator.dupe(u8, value) else null,
+        .review_result_json = if (record.terminal_review_result_json) |value| try allocator.dupe(u8, value) else null,
+        .raw_response_json = try allocator.dupe(u8, "{}"),
+    };
+}
+
+fn applyRecordedStatusOverlay(allocator: std.mem.Allocator, record: SessionRecord, status: *ReviewStatus) !void {
+    if (std.mem.eql(u8, record.last_observed_status, "interruptRequested") and
+        std.mem.eql(u8, status.turn_status, "inProgress"))
+    {
+        allocator.free(status.turn_status);
+        status.turn_status = try allocator.dupe(u8, "interruptRequested");
+    }
+}
+
 const LoadedSessionRecord = struct {
     record_path: []const u8,
     record: SessionRecord,
@@ -1944,10 +2230,13 @@ fn writeSessionRecord(allocator: std.mem.Allocator, path: []const u8, record: Se
     try ensureParentPath(path);
     const json = try stringifyAnyAlloc(allocator, record);
     defer allocator.free(json);
-    var file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    const temp_path = try std.fmt.allocPrint(allocator, "{s}.tmp-{d}", .{ path, std.time.nanoTimestamp() });
+    defer allocator.free(temp_path);
+    var file = try std.fs.createFileAbsolute(temp_path, .{ .truncate = true });
     defer file.close();
     try file.writeAll(json);
     try file.writeAll("\n");
+    try std.fs.renameAbsolute(temp_path, path);
 }
 
 fn appendLogRecord(
@@ -2084,9 +2373,9 @@ fn maybeRunNativeFallbackAndExitStart(
 fn maybeRunNativeFallbackAndExitWait(
     allocator: std.mem.Allocator,
     parsed: ParsedArgs,
-    record: SessionRecord,
+    record: *SessionRecord,
     record_path: []const u8,
-    status: ReviewStatus,
+    status: ?ReviewStatus,
     failure: FailureInfo,
 ) !void {
     if (parsed.fallback_mode != .native_review) return;
@@ -2094,6 +2383,19 @@ fn maybeRunNativeFallbackAndExitWait(
     const codex_path = record.resolved_codex_path orelse "codex";
     var fallback = try runNativeReviewFallbackAlloc(allocator, record.cwd, codex_path, record.target);
     defer fallback.deinit(allocator);
+
+    record.last_observed_status = if (fallback.ok) "completed" else "failed";
+    record.compatibility_verdict = "compatible";
+    record.terminal_fallback_transport = "native-review";
+    record.terminal_fallback_exit_code = fallback.exit_code;
+    record.terminal_fallback_output_text = fallback.stdout_text;
+    record.terminal_fallback_error_text = fallback.stderr_text;
+    record.terminal_review_result_source = "native_fallback";
+    record.terminal_review_result_json = try buildReviewResultJsonFromRenderedTextAlloc(
+        allocator,
+        fallback.stdout_text orelse fallback.stderr_text orelse review_fallback_text,
+    );
+    try writeSessionRecord(allocator, record_path, record.*);
 
     if (parsed.json) {
         try printStatusJson(
@@ -2103,13 +2405,20 @@ fn maybeRunNativeFallbackAndExitWait(
             record.parent_thread_id,
             record.review_thread_id,
             record.review_turn_id,
-            status,
+            if (status) |value| value else try makeStoredFallbackStatus(allocator, record.*),
             record_path,
             record.event_log_path,
             .{
                 .resolved_codex_path = record.resolved_codex_path,
                 .resolved_codex_version = record.codex_version,
-                .compatibility_verdict = record.compatibility_verdict orelse "not_checked",
+                .compatibility_verdict = record.compatibility_verdict orelse "compatible",
+                .selected_transport = "native-review",
+                .selection_reason = "websocket_transport_lost",
+                .degraded_fallback = true,
+                .managed_server_pid = record.managed_server_pid,
+                .managed_server_listen_url = record.managed_server_listen_url,
+                .managed_server_stderr_log_path = record.managed_server_stderr_log_path,
+                .orphan_ttl_seconds = record.orphan_ttl_seconds,
             },
             null,
             false,
@@ -2235,6 +2544,18 @@ fn printStatusJson(
     const review_result_json = status.review_result_json orelse "null";
     const resolved_codex_path_json = if (receipt.resolved_codex_path) |value| try quoteJsonStringAlloc(allocator, value) else "null";
     const resolved_codex_version_json = if (receipt.resolved_codex_version) |value| try quoteJsonStringAlloc(allocator, value) else "null";
+    const selected_transport_json = try quoteJsonStringAlloc(allocator, receipt.selected_transport);
+    const selection_reason_json = try quoteJsonStringAlloc(allocator, receipt.selection_reason);
+    const managed_server_pid_json = if (receipt.managed_server_pid) |value|
+        try std.fmt.allocPrint(allocator, "{d}", .{value})
+    else
+        "null";
+    const managed_server_listen_url_json = if (receipt.managed_server_listen_url) |value| try quoteJsonStringAlloc(allocator, value) else "null";
+    const managed_server_stderr_log_path_json = if (receipt.managed_server_stderr_log_path) |value| try quoteJsonStringAlloc(allocator, value) else "null";
+    const orphan_ttl_seconds_json = if (receipt.orphan_ttl_seconds) |value|
+        try std.fmt.allocPrint(allocator, "{d}", .{value})
+    else
+        "null";
     const failure_code_json = if (failure) |value| try quoteJsonStringAlloc(allocator, value.code) else "null";
     const failure_hint_json = if (failure) |value| try quoteJsonStringAlloc(allocator, value.hint) else "null";
     const fallback_transport_json = if (fallback != null) "\"native-review\"" else "null";
@@ -2260,7 +2581,7 @@ fn printStatusJson(
         "null";
 
     try stdout.print(
-        "{{\"demo\":\"cas-review-session\",\"action\":\"{s}\",\"cwd\":{s},\"parentThreadId\":{s},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"threadStatus\":{s},\"turnStatus\":{s},\"turnCount\":{d},\"materialized\":{s},\"rolloutPath\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"resolvedCodexPath\":{s},\"resolvedCodexVersion\":{s},\"compatibilityVerdict\":{s},\"timeoutMs\":{s},\"timedOut\":{s},\"failureCode\":{s},\"failureHint\":{s},\"fallbackUsed\":{s},\"fallbackTransport\":{s},\"fallbackExitCode\":{s},\"fallbackOutputText\":{s},\"fallbackErrorText\":{s},\"reviewResultAvailable\":{s},\"reviewResultSource\":{s},\"reviewResult\":{s}}}\n",
+        "{{\"demo\":\"cas-review-session\",\"action\":\"{s}\",\"cwd\":{s},\"parentThreadId\":{s},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"threadStatus\":{s},\"turnStatus\":{s},\"turnCount\":{d},\"materialized\":{s},\"rolloutPath\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"resolvedCodexPath\":{s},\"resolvedCodexVersion\":{s},\"compatibilityVerdict\":{s},\"selectedTransport\":{s},\"selectionReason\":{s},\"degradedFallback\":{s},\"managedServerPid\":{s},\"managedServerListenUrl\":{s},\"managedServerStderrLogPath\":{s},\"orphanTtlSeconds\":{s}",
         .{
             @tagName(action),
             cwd_json,
@@ -2277,6 +2598,18 @@ fn printStatusJson(
             resolved_codex_path_json,
             resolved_codex_version_json,
             try quoteJsonStringAlloc(allocator, receipt.compatibility_verdict),
+            selected_transport_json,
+            selection_reason_json,
+            if (receipt.degraded_fallback) "true" else "false",
+            managed_server_pid_json,
+            managed_server_listen_url_json,
+            managed_server_stderr_log_path_json,
+            orphan_ttl_seconds_json,
+        },
+    );
+    try stdout.print(
+        ",\"timeoutMs\":{s},\"timedOut\":{s},\"failureCode\":{s},\"failureHint\":{s},\"fallbackUsed\":{s},\"fallbackTransport\":{s},\"fallbackExitCode\":{s},\"fallbackOutputText\":{s},\"fallbackErrorText\":{s},\"reviewResultAvailable\":{s},\"reviewResultSource\":{s},\"reviewResult\":{s}}}\n",
+        .{
             timeout_json,
             timed_out_json,
             failure_code_json,
@@ -2337,6 +2670,18 @@ fn printStartJson(
     const review_result_json = if (status) |value| value.review_result_json orelse "null" else "null";
     const resolved_codex_path_json = if (receipt.resolved_codex_path) |value| try quoteJsonStringAlloc(allocator, value) else "null";
     const resolved_codex_version_json = if (receipt.resolved_codex_version) |value| try quoteJsonStringAlloc(allocator, value) else "null";
+    const selected_transport_json = try quoteJsonStringAlloc(allocator, receipt.selected_transport);
+    const selection_reason_json = try quoteJsonStringAlloc(allocator, receipt.selection_reason);
+    const managed_server_pid_json = if (receipt.managed_server_pid) |value|
+        try std.fmt.allocPrint(allocator, "{d}", .{value})
+    else
+        "null";
+    const managed_server_listen_url_json = if (receipt.managed_server_listen_url) |value| try quoteJsonStringAlloc(allocator, value) else "null";
+    const managed_server_stderr_log_path_json = if (receipt.managed_server_stderr_log_path) |value| try quoteJsonStringAlloc(allocator, value) else "null";
+    const orphan_ttl_seconds_json = if (receipt.orphan_ttl_seconds) |value|
+        try std.fmt.allocPrint(allocator, "{d}", .{value})
+    else
+        "null";
     const failure_code_json = if (failure) |value| try quoteJsonStringAlloc(allocator, value.code) else "null";
     const failure_hint_json = if (failure) |value| try quoteJsonStringAlloc(allocator, value.hint) else "null";
     const fallback_transport_json = if (fallback != null) "\"native-review\"" else "null";
@@ -2354,7 +2699,7 @@ fn printStartJson(
         "null";
 
     try stdout.print(
-        "{{\"demo\":\"cas-review-session\",\"action\":\"start\",\"cwd\":{s},\"parentThreadId\":{s},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"delivery\":\"detached\",\"target\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"codexVersion\":{s},\"resolvedCodexPath\":{s},\"resolvedCodexVersion\":{s},\"compatibilityVerdict\":{s},\"waited\":{s},\"timedOut\":{s},\"threadStatus\":{s},\"turnStatus\":{s},\"turnCount\":{d},\"materialized\":{s},\"rolloutPath\":{s},\"failureCode\":{s},\"failureHint\":{s},\"fallbackUsed\":{s},\"fallbackTransport\":{s},\"fallbackExitCode\":{s},\"fallbackOutputText\":{s},\"fallbackErrorText\":{s},\"reviewResultAvailable\":{s},\"reviewResultSource\":{s},\"reviewResult\":{s}}}\n",
+        "{{\"demo\":\"cas-review-session\",\"action\":\"start\",\"cwd\":{s},\"parentThreadId\":{s},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"delivery\":\"detached\",\"target\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"codexVersion\":{s},\"resolvedCodexPath\":{s},\"resolvedCodexVersion\":{s},\"compatibilityVerdict\":{s},\"selectedTransport\":{s},\"selectionReason\":{s},\"degradedFallback\":{s},\"managedServerPid\":{s},\"managedServerListenUrl\":{s},\"managedServerStderrLogPath\":{s},\"orphanTtlSeconds\":{s},\"waited\":{s},\"timedOut\":{s},\"threadStatus\":{s},\"turnStatus\":{s}",
         .{
             try quoteJsonStringAlloc(allocator, cwd),
             try quoteJsonStringAlloc(allocator, parent_thread_id),
@@ -2367,10 +2712,22 @@ fn printStartJson(
             resolved_codex_path_json,
             resolved_codex_version_json,
             try quoteJsonStringAlloc(allocator, receipt.compatibility_verdict),
+            selected_transport_json,
+            selection_reason_json,
+            if (receipt.degraded_fallback) "true" else "false",
+            managed_server_pid_json,
+            managed_server_listen_url_json,
+            managed_server_stderr_log_path_json,
+            orphan_ttl_seconds_json,
             waited_json,
             timed_out_json,
             thread_status_json,
             turn_status_json,
+        },
+    );
+    try stdout.print(
+        ",\"turnCount\":{d},\"materialized\":{s},\"rolloutPath\":{s},\"failureCode\":{s},\"failureHint\":{s},\"fallbackUsed\":{s},\"fallbackTransport\":{s},\"fallbackExitCode\":{s},\"fallbackOutputText\":{s},\"fallbackErrorText\":{s},\"reviewResultAvailable\":{s},\"reviewResultSource\":{s},\"reviewResult\":{s}}}\n",
+        .{
             turn_count,
             materialized_json,
             rollout_path_json,
@@ -2409,14 +2766,6 @@ fn failureInfoForReviewStart(raw_message: []const u8, created_parent_thread: boo
 
 fn failureInfoForStatus(status: *const ReviewStatus) ?FailureInfo {
     if (isTerminalTurnStatus(status.turn_status) and !status.review_result_available) {
-        if (std.mem.eql(u8, status.thread_preview, parent_materialization_prompt) and
-            !status.last_turn_has_entered_review_mode)
-        {
-            return .{
-                .code = "incompatible_codex_review_runtime",
-                .hint = "detached review resolved to the fresh-parent bootstrap thread instead of a review-mode thread; installed codex runtime is not producing a usable detached review thread on this path",
-            };
-        }
         if (std.mem.eql(u8, status.turn_status, "interrupted")) {
             return .{
                 .code = "review_interrupted",
@@ -2438,6 +2787,14 @@ fn failureInfoForStatus(status: *const ReviewStatus) ?FailureInfo {
             return .{
                 .code = "review_failed",
                 .hint = "detached review ended in a failed or errored state before emitting a structured reviewResult",
+            };
+        }
+        if (std.mem.eql(u8, status.thread_preview, parent_materialization_prompt) and
+            !status.last_turn_has_entered_review_mode)
+        {
+            return .{
+                .code = "incompatible_codex_review_runtime",
+                .hint = "detached review resolved to the fresh-parent bootstrap thread instead of a review-mode thread; installed codex runtime is not producing a usable detached review thread on this path",
             };
         }
         return .{
@@ -2840,4 +3197,26 @@ test "failureInfoForStatus flags bootstrap-thread substitution as incompatible r
 
     const failure = failureInfoForStatus(&status).?;
     try std.testing.expectEqualStrings("incompatible_codex_review_runtime", failure.code);
+}
+
+test "failureInfoForStatus prefers interrupted over bootstrap-thread heuristic" {
+    var status = ReviewStatus{
+        .thread_status = try std.testing.allocator.dupe(u8, "idle"),
+        .turn_status = try std.testing.allocator.dupe(u8, "interrupted"),
+        .turn_count = 1,
+        .materialized = true,
+        .thread_preview = try std.testing.allocator.dupe(u8, parent_materialization_prompt),
+        .rollout_path = try std.testing.allocator.dupe(u8, "/tmp/bootstrap-rollout.jsonl"),
+        .turn_error_message = null,
+        .last_turn_has_entered_review_mode = false,
+        .last_turn_has_exited_review_mode = false,
+        .review_result_available = false,
+        .review_result_source = null,
+        .review_result_json = null,
+        .raw_response_json = try std.testing.allocator.dupe(u8, "{}"),
+    };
+    defer status.deinit(std.testing.allocator);
+
+    const failure = failureInfoForStatus(&status).?;
+    try std.testing.expectEqualStrings("review_interrupted", failure.code);
 }
