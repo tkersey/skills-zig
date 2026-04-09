@@ -231,6 +231,58 @@ const CountGroupState = struct {
     count: i64,
 };
 
+const SingleFieldGroupIndex = struct {
+    string_index: std.StringHashMap(usize),
+    int_index: std.AutoHashMap(i64, usize),
+    float_index: std.StringHashMap(usize),
+    bool_index: [2]?usize = .{ null, null },
+    null_index: ?usize = null,
+
+    fn init(allocator: std.mem.Allocator) SingleFieldGroupIndex {
+        return .{
+            .string_index = std.StringHashMap(usize).init(allocator),
+            .int_index = std.AutoHashMap(i64, usize).init(allocator),
+            .float_index = std.StringHashMap(usize).init(allocator),
+        };
+    }
+
+    fn deinit(self: *SingleFieldGroupIndex, allocator: std.mem.Allocator) void {
+        self.string_index.deinit();
+        self.int_index.deinit();
+
+        var float_it = self.float_index.iterator();
+        while (float_it.next()) |entry| allocator.free(entry.key_ptr.*);
+        self.float_index.deinit();
+    }
+
+    fn get(self: *SingleFieldGroupIndex, allocator: std.mem.Allocator, value: spec.Scalar) !?usize {
+        return switch (value) {
+            .string => |text| self.string_index.get(text),
+            .int => |number| self.int_index.get(number),
+            .float => {
+                const key = try scalarHashKey(allocator, value);
+                defer allocator.free(key);
+                return self.float_index.get(key);
+            },
+            .bool => |flag| self.bool_index[@intFromBool(flag)],
+            .null => self.null_index,
+        };
+    }
+
+    fn put(self: *SingleFieldGroupIndex, allocator: std.mem.Allocator, value: spec.Scalar, idx: usize) !void {
+        switch (value) {
+            .string => |text| try self.string_index.put(text, idx),
+            .int => |number| try self.int_index.put(number, idx),
+            .float => {
+                const key = try scalarHashKey(allocator, value);
+                try self.float_index.put(key, idx);
+            },
+            .bool => |flag| self.bool_index[@intFromBool(flag)] = idx,
+            .null => self.null_index = idx,
+        }
+    }
+};
+
 const RegexAtomMode = enum {
     exact,
     prefix,
@@ -318,37 +370,19 @@ fn executeGrouped(
     where_clauses: []const CompiledWhereClause,
     result: *QueryResult,
 ) !void {
+    if (query.group_by.len == 1) {
+        if (singleGroupCountMetric(query)) |count_alias| {
+            return executeGroupedSingleCount(allocator, input_rows, query, where_clauses, count_alias, result);
+        }
+        return executeGroupedSingleField(allocator, input_rows, query, where_clauses, result);
+    }
+
     if (singleGroupCountMetric(query)) |count_alias| {
         return executeGroupedSingleCount(allocator, input_rows, query, where_clauses, count_alias, result);
     }
 
-    var metrics: std.ArrayList(CompiledMetric) = .empty;
-    defer {
-        for (metrics.items) |metric| {
-            if (metric.alias_owned) allocator.free(metric.alias);
-        }
-        metrics.deinit(allocator);
-    }
-
-    if (query.metrics.len == 0) {
-        try metrics.append(allocator, .{
-            .op = .count,
-            .field = null,
-            .alias = "count",
-            .alias_owned = false,
-        });
-    } else {
-        for (query.metrics) |metric| {
-            const alias = try spec.metricAlias(allocator, metric);
-            const alias_owned = metric.alias == null and metric.op != .count and metric.field != null;
-            try metrics.append(allocator, .{
-                .op = metric.op,
-                .field = metric.field,
-                .alias = alias,
-                .alias_owned = alias_owned,
-            });
-        }
-    }
+    var metrics = try compileMetrics(allocator, query.metrics);
+    defer deinitCompiledMetrics(allocator, &metrics);
 
     var group_index = std.StringHashMap(usize).init(allocator);
     defer {
@@ -409,6 +443,72 @@ fn executeGrouped(
     applyLimit(&result.rows, query.limit);
 }
 
+fn executeGroupedSingleField(
+    allocator: std.mem.Allocator,
+    input_rows: []const Row,
+    query: spec.QuerySpec,
+    where_clauses: []const CompiledWhereClause,
+    result: *QueryResult,
+) !void {
+    const group_field = query.group_by[0];
+
+    var metrics = try compileMetrics(allocator, query.metrics);
+    defer deinitCompiledMetrics(allocator, &metrics);
+
+    var group_index = SingleFieldGroupIndex.init(allocator);
+    defer group_index.deinit(allocator);
+
+    var groups: std.ArrayList(GroupState) = .empty;
+    defer {
+        for (groups.items) |*group| group.deinit(allocator);
+        groups.deinit(allocator);
+    }
+
+    for (input_rows) |row| {
+        result.scanned_rows += 1;
+        if (!try rowMatches(row, where_clauses)) continue;
+
+        const value = row.valueOrNull(group_field);
+        if (try group_index.get(allocator, value)) |idx| {
+            for (groups.items[idx].metric_states, metrics.items) |*state, metric| {
+                try state.update(allocator, row, metric.field);
+            }
+            continue;
+        }
+
+        const key_values = try allocator.alloc(spec.Scalar, 1);
+        errdefer allocator.free(key_values);
+        key_values[0] = value;
+
+        var group = try GroupState.init(allocator, key_values, metrics.items);
+        errdefer group.deinit(allocator);
+        for (group.metric_states, metrics.items) |*state, metric| {
+            try state.update(allocator, row, metric.field);
+        }
+
+        const next_idx = groups.items.len;
+        try group_index.put(allocator, value, next_idx);
+        try groups.append(allocator, group);
+    }
+
+    for (groups.items) |group| {
+        var out = Row.init(allocator);
+        errdefer out.deinit();
+
+        try out.putOwnedKey(group_field, group.key_values[0]);
+        for (metrics.items, 0..) |metric, idx| {
+            try out.putOwnedKey(metric.alias, group.metric_states[idx].finalize());
+        }
+
+        try result.rows.append(allocator, out);
+    }
+
+    if (query.sort.len > 0) {
+        sortRows(result.rows.items, query.sort);
+    }
+    applyLimit(&result.rows, query.limit);
+}
+
 fn singleGroupCountMetric(query: spec.QuerySpec) ?[]const u8 {
     if (query.group_by.len != 1) return null;
     if (query.metrics.len == 0) return "count";
@@ -429,12 +529,8 @@ fn executeGroupedSingleCount(
 ) !void {
     const group_field = query.group_by[0];
 
-    var group_index = std.StringHashMap(usize).init(allocator);
-    defer {
-        var it = group_index.iterator();
-        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
-        group_index.deinit();
-    }
+    var group_index = SingleFieldGroupIndex.init(allocator);
+    defer group_index.deinit(allocator);
 
     var groups: std.ArrayList(CountGroupState) = .empty;
     defer groups.deinit(allocator);
@@ -444,15 +540,13 @@ fn executeGroupedSingleCount(
         if (!try rowMatches(row, where_clauses)) continue;
 
         const value = row.valueOrNull(group_field);
-        const key = try scalarHashKey(allocator, value);
-        if (group_index.get(key)) |idx| {
-            allocator.free(key);
+        if (try group_index.get(allocator, value)) |idx| {
             groups.items[idx].count += 1;
             continue;
         }
 
         const next_idx = groups.items.len;
-        try group_index.put(key, next_idx);
+        try group_index.put(allocator, value, next_idx);
         try groups.append(allocator, .{
             .value = value,
             .count = 1,
@@ -472,6 +566,44 @@ fn executeGroupedSingleCount(
         sortRows(result.rows.items, query.sort);
     }
     applyLimit(&result.rows, query.limit);
+}
+
+fn compileMetrics(
+    allocator: std.mem.Allocator,
+    metric_specs: []const spec.MetricSpec,
+) !std.ArrayList(CompiledMetric) {
+    var metrics: std.ArrayList(CompiledMetric) = .empty;
+    errdefer deinitCompiledMetrics(allocator, &metrics);
+
+    if (metric_specs.len == 0) {
+        try metrics.append(allocator, .{
+            .op = .count,
+            .field = null,
+            .alias = "count",
+            .alias_owned = false,
+        });
+        return metrics;
+    }
+
+    for (metric_specs) |metric| {
+        const alias = try spec.metricAlias(allocator, metric);
+        const alias_owned = metric.alias == null and metric.op != .count and metric.field != null;
+        try metrics.append(allocator, .{
+            .op = metric.op,
+            .field = metric.field,
+            .alias = alias,
+            .alias_owned = alias_owned,
+        });
+    }
+
+    return metrics;
+}
+
+fn deinitCompiledMetrics(allocator: std.mem.Allocator, metrics: *std.ArrayList(CompiledMetric)) void {
+    for (metrics.items) |metric| {
+        if (metric.alias_owned) allocator.free(metric.alias);
+    }
+    metrics.deinit(allocator);
 }
 
 fn buildGroupKey(
@@ -1498,4 +1630,32 @@ test "single-field grouped count supports custom alias and sort" {
     try expectIntField(result.rows.items[3], "rows", 1);
     try std.testing.expect(result.rows.items[4].valueOrNull("tool").isNull());
     try expectIntField(result.rows.items[4], "rows", 1);
+}
+
+test "single-field grouped explicit metrics support integer groups" {
+    var rows = try buildSkillRows(std.testing.allocator);
+    defer deinitRows(std.testing.allocator, &rows);
+
+    const query = spec.QuerySpec{
+        .group_by = &.{"segment"},
+        .metrics = &.{
+            .{ .op = .sum, .field = "delta_total_tokens", .alias = "sum_tokens" },
+            .{ .op = .count, .alias = "rows" },
+        },
+        .sort = &.{.{ .field = "segment" }},
+    };
+
+    var result = try execute(std.testing.allocator, rows.items, query);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), result.rows.items.len);
+    try expectIntField(result.rows.items[0], "segment", 0);
+    try expectIntField(result.rows.items[0], "sum_tokens", 220);
+    try expectIntField(result.rows.items[0], "rows", 3);
+    try expectIntField(result.rows.items[1], "segment", 1);
+    try expectIntField(result.rows.items[1], "sum_tokens", 70);
+    try expectIntField(result.rows.items[1], "rows", 3);
+    try expectIntField(result.rows.items[2], "segment", 2);
+    try expectIntField(result.rows.items[2], "sum_tokens", 40);
+    try expectIntField(result.rows.items[2], "rows", 1);
 }
