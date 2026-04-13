@@ -65,6 +65,8 @@ Examples:
 ## Homebrew Tap Handoff
 
 Homebrew formula updates are intentionally handled in a separate tap repository.
+This repo does not support installing its CLIs into user-global paths from source builds.
+Build artifacts are only allowed under repo-local `zig-out/bin`; shipped installs must flow through a tagged release plus the tap formula update.
 After a tagged release in this repo:
 
 1. Copy the release asset URL and SHA256 for the relevant CLI archive.

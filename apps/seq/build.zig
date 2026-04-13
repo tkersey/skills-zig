@@ -1,6 +1,8 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
+    enforceRepoLocalInstallOnly(b);
+
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const core_path = b.createModule(.{
@@ -120,4 +122,23 @@ fn addVersionModule(b: *std.Build, raw_version: []const u8) *std.Build.Module {
     const options = b.addOptions();
     options.addOption([]const u8, "version", std.mem.trim(u8, raw_version, " \t\r\n"));
     return options.createModule();
+}
+
+fn enforceRepoLocalInstallOnly(b: *std.Build) void {
+    const expected_prefix = b.build_root.join(b.allocator, &.{"zig-out"}) catch @panic("OOM");
+    defer b.allocator.free(expected_prefix);
+
+    const expected_exe_dir = b.pathJoin(&.{ expected_prefix, "bin" });
+    defer b.allocator.free(expected_exe_dir);
+
+    if (b.dest_dir != null or
+        !std.mem.eql(u8, b.install_prefix, expected_prefix) or
+        !std.mem.eql(u8, b.install_path, expected_prefix) or
+        !std.mem.eql(u8, b.exe_dir, expected_exe_dir))
+    {
+        std.debug.panic(
+            "skills-zig forbids external installs; ship CLIs via the Homebrew tap release flow only. expected install_prefix={s} exe_dir={s}; got install_prefix={s} exe_dir={s} dest_dir={?s}",
+            .{ expected_prefix, expected_exe_dir, b.install_prefix, b.exe_dir, b.dest_dir },
+        );
+    }
 }

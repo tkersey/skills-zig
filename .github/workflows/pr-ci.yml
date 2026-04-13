@@ -73,6 +73,31 @@ jobs:
               - "scripts/perf/**"
               - "docs/release/**"
 
+  install-prefix-guard:
+    needs: changes
+    if: needs.changes.outputs.core == 'true' || needs.changes.outputs.seq == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Root build rejects custom install prefix
+        run: |
+          set -euo pipefail
+          if zig build build-st -Doptimize=ReleaseFast --prefix "${RUNNER_TEMP}/skills-zig-prefix"; then
+            echo "expected root build to reject a custom install prefix" >&2
+            exit 1
+          fi
+      - name: Standalone seq build rejects custom install prefix
+        working-directory: apps/seq
+        run: |
+          set -euo pipefail
+          if zig build -Doptimize=ReleaseFast --prefix "${RUNNER_TEMP}/seq-prefix"; then
+            echo "expected standalone seq build to reject a custom install prefix" >&2
+            exit 1
+          fi
+
   seq:
     needs: changes
     if: needs.changes.outputs.seq == 'true' || needs.changes.outputs.core == 'true'

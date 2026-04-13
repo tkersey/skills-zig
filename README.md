@@ -132,3 +132,5 @@ Each release workflow verifies that both archives are present.
 ## Homebrew
 
 Tap formulas are maintained in a separate tap repository. See `docs/release/README.md`.
+Homebrew/tap is the only supported install path for shipped CLIs.
+Repo builds are development-only and must stay under `./zig-out/bin`; this build graph now rejects redirected installs via `--prefix`, `--prefix-exe-dir`, or `DESTDIR`.
