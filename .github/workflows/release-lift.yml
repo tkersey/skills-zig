@@ -42,6 +42,7 @@ jobs:
           mkdir -p dist/lift
           cp zig-out/bin/bench_stats dist/lift/lift-bench-stats
           cp zig-out/bin/perf_report dist/lift/lift-perf-report
+          cp zig-out/bin/lift-perf-bench-stats dist/lift/lift-perf-bench-stats
           TAR_NAME="${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
           tar -czf "${TAR_NAME}" -C dist/lift .
       - name: Upload lift workflow artifact
