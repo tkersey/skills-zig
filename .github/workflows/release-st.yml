@@ -4,12 +4,21 @@ on:
   push:
     tags:
       - "st-v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Release tag to publish
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-st-${{ github.ref_name }}
+  group: release-st-${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -25,11 +34,13 @@ jobs:
     runs-on: ${{ matrix.runs_on }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
       - name: Validate st tag matches VERSION
         run: |
           expected_tag="st-v$(tr -d '[:space:]' < apps/st/VERSION)"
-          if [ "${GITHUB_REF_NAME}" != "${expected_tag}" ]; then
-            echo "Tag mismatch: expected ${expected_tag}, got ${GITHUB_REF_NAME}" >&2
+          if [ "${RELEASE_TAG}" != "${expected_tag}" ]; then
+            echo "Tag mismatch: expected ${expected_tag}, got ${RELEASE_TAG}" >&2
             exit 1
           fi
       - uses: mlugg/setup-zig@v2
@@ -39,7 +50,7 @@ jobs:
         run: zig build build-st -Doptimize=ReleaseFast
       - name: Package st artifact
         run: |
-          TAR_NAME="${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+          TAR_NAME="${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
           echo "TAR_NAME=${TAR_NAME}" >> "$GITHUB_ENV"
           mkdir -p dist/st
           cp zig-out/bin/st dist/st/st
@@ -59,7 +70,7 @@ jobs:
       - name: Download st release artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: ${{ github.ref_name }}-*.tar.gz
+          pattern: ${{ env.RELEASE_TAG }}-*.tar.gz
           path: release-assets
           merge-multiple: true
       - name: Verify st artifact set
@@ -73,5 +84,6 @@ jobs:
       - name: Publish st release assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           fail_on_unmatched_files: true
           files: release-assets/*.tar.gz

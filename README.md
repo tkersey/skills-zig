@@ -98,6 +98,9 @@ Per-app VERSION files are the source of truth:
 - `apps/st/VERSION`
 - `apps/parse-arch/VERSION`
 
+PRs that touch release-relevant CLI surfaces must bump the corresponding `VERSION` file.
+The check is conservative: app-local changes count for that app, and shared shipped surfaces such as `build.zig`, `build.zig.zon`, and `libs/core/**` count for every shipped CLI.
+
 Independent tags trigger independent workflows, and each tag must match its app VERSION file:
 
 - `seq-v*` -> `.github/workflows/release-seq.yml`
@@ -109,6 +112,9 @@ Independent tags trigger independent workflows, and each tag must match its app 
 - `mesh-v*` -> `.github/workflows/release-mesh.yml`
 - `st-v*` -> `.github/workflows/release-st.yml`
 - `parse-arch-v*` -> `.github/workflows/release-parse-arch.yml`
+
+Pushes to `main` auto-create any missing release tags for changed `VERSION` files and dispatch the matching release workflow.
+Manual tag pushes still work, but they are no longer the only path.
 
 Required tag forms:
 

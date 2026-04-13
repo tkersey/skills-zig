@@ -4,12 +4,21 @@ on:
   push:
     tags:
       - "parse-arch-v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Release tag to publish
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-parse-arch-${{ github.ref_name }}
+  group: release-parse-arch-${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -25,11 +34,13 @@ jobs:
     runs-on: ${{ matrix.runs_on }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
       - name: Validate parse-arch tag matches VERSION
         run: |
           expected_tag="parse-arch-v$(tr -d '[:space:]' < apps/parse-arch/VERSION)"
-          if [ "${GITHUB_REF_NAME}" != "${expected_tag}" ]; then
-            echo "Tag mismatch: expected ${expected_tag}, got ${GITHUB_REF_NAME}" >&2
+          if [ "${RELEASE_TAG}" != "${expected_tag}" ]; then
+            echo "Tag mismatch: expected ${expected_tag}, got ${RELEASE_TAG}" >&2
             exit 1
           fi
       - uses: mlugg/setup-zig@v2
@@ -41,7 +52,7 @@ jobs:
         run: zig build test-parse-arch
       - name: Package parse-arch artifact
         run: |
-          TAR_NAME="${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz"
+          TAR_NAME="${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
           echo "TAR_NAME=${TAR_NAME}" >> "$GITHUB_ENV"
           mkdir -p dist/parse-arch
           cp zig-out/bin/parse-arch dist/parse-arch/parse-arch
@@ -61,7 +72,7 @@ jobs:
       - name: Download parse-arch release artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: ${{ github.ref_name }}-*.tar.gz
+          pattern: ${{ env.RELEASE_TAG }}-*.tar.gz
           path: release-assets
           merge-multiple: true
       - name: Verify parse-arch artifact set
@@ -75,5 +86,6 @@ jobs:
       - name: Publish parse-arch release assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           fail_on_unmatched_files: true
           files: release-assets/*.tar.gz

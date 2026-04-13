@@ -1,0 +1,124 @@
+name: Auto Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "build.zig"
+      - "build.zig.zon"
+      - "apps/**"
+      - "libs/core/**"
+      - ".github/scripts/**"
+      - ".github/workflows/release-*.yml"
+      - ".github/workflows/auto-release.yml"
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      affected_json: ${{ steps.detect.outputs.affected_json }}
+      version_changed_json: ${{ steps.detect.outputs.version_changed_json }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: detect
+        run: |
+          set -euo pipefail
+          base="${{ github.event.before }}"
+          head="${{ github.sha }}"
+          affected="$("./.github/scripts/release_apps.sh" affected "$base" "$head")"
+          version_changed="$("./.github/scripts/release_apps.sh" version-changed "$base" "$head")"
+          affected_json="$(printf '%s\n' "$affected" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+          version_changed_json="$(printf '%s\n' "$version_changed" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+          echo "affected_json=$affected_json" >> "$GITHUB_OUTPUT"
+          echo "version_changed_json=$version_changed_json" >> "$GITHUB_OUTPUT"
+          echo "affected=$affected_json"
+          echo "version_changed=$version_changed_json"
+
+  contract:
+    needs: detect
+    if: needs.detect.outputs.affected_json != '[]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require VERSION bumps for release-relevant CLI changes
+        run: |
+          set -euo pipefail
+          base="${{ github.event.before }}"
+          head="${{ github.sha }}"
+          mapfile -t affected < <(jq -r '.[]' <<< '${{ needs.detect.outputs.affected_json }}')
+          missing=()
+          for app in "${affected[@]}"; do
+            if git diff --quiet "$base" "$head" -- "apps/$app/VERSION"; then
+              missing+=("$app")
+            fi
+          done
+
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "Release-relevant CLI changes reached main without VERSION bumps: ${missing[*]}" >&2
+            exit 1
+          fi
+
+  dispatch:
+    needs:
+      - detect
+      - contract
+    if: needs.detect.outputs.version_changed_json != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJson(needs.detect.outputs.version_changed_json) }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch tags
+        run: git fetch --tags origin
+      - id: tag
+        name: Create release tag if needed
+        run: |
+          set -euo pipefail
+          app="${{ matrix.app }}"
+          version="$(tr -d '[:space:]' < "apps/$app/VERSION")"
+          tag="${app}-v${version}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release already exists for $tag"
+            echo "dispatch=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            existing_sha="$(git rev-list -n 1 "$tag")"
+            if [ "$existing_sha" != "${GITHUB_SHA}" ]; then
+              echo "tag $tag already exists at $existing_sha, expected ${GITHUB_SHA}" >&2
+              exit 1
+            fi
+          else
+            git config user.name github-actions
+            git config user.email github-actions@github.com
+            git tag "$tag" "${GITHUB_SHA}"
+            git push origin "refs/tags/$tag"
+          fi
+
+          echo "dispatch=true" >> "$GITHUB_OUTPUT"
+      - name: Dispatch release workflow
+        if: steps.tag.outputs.dispatch == 'true'
+        run: |
+          set -euo pipefail
+          gh workflow run "release-${{ matrix.app }}.yml" \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            -f tag_name="${{ steps.tag.outputs.tag }}"

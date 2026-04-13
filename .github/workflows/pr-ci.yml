@@ -18,6 +18,7 @@ on:
       - "libs/core/**"
       - ".github/scripts/**"
       - ".github/workflows/release-*.yml"
+      - ".github/workflows/auto-release.yml"
       - "scripts/perf/**"
       - "docs/release/**"
       - ".github/workflows/pr-ci.yml"
@@ -70,6 +71,7 @@ jobs:
               - "libs/core/**"
               - ".github/scripts/**"
               - ".github/workflows/release-*.yml"
+              - ".github/workflows/auto-release.yml"
               - "scripts/perf/**"
               - "docs/release/**"
 
@@ -95,6 +97,37 @@ jobs:
           set -euo pipefail
           if zig build -Doptimize=ReleaseFast --prefix "${RUNNER_TEMP}/seq-prefix"; then
             echo "expected standalone seq build to reject a custom install prefix" >&2
+            exit 1
+          fi
+
+  release-contract:
+    needs: changes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require VERSION bumps for release-relevant CLI changes
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          mapfile -t affected < <(.github/scripts/release_apps.sh affected "$base" "$head")
+          if [ "${#affected[@]}" -eq 0 ]; then
+            echo "No release-relevant CLI surfaces changed."
+            exit 0
+          fi
+
+          echo "Affected release apps: ${affected[*]}"
+          missing=()
+          for app in "${affected[@]}"; do
+            if git diff --quiet "$base" "$head" -- "apps/$app/VERSION"; then
+              missing+=("$app")
+            fi
+          done
+
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "Missing VERSION bumps for release-relevant CLI changes: ${missing[*]}" >&2
             exit 1
           fi
 

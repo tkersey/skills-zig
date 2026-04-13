@@ -4,12 +4,21 @@ on:
   push:
     tags:
       - "seq-v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Release tag to publish
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-seq-${{ github.ref_name }}
+  group: release-seq-${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -25,16 +34,18 @@ jobs:
     runs-on: ${{ matrix.runs_on }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
       - name: Validate tag matches apps/seq/VERSION
         run: |
           version="$(tr -d '[:space:]' < apps/seq/VERSION)"
           expected_tag="seq-v${version}"
-          if [ "${GITHUB_REF_NAME}" != "${expected_tag}" ]; then
-            echo "Tag mismatch: got '${GITHUB_REF_NAME}', expected '${expected_tag}'"
+          if [ "${RELEASE_TAG}" != "${expected_tag}" ]; then
+            echo "Tag mismatch: got '${RELEASE_TAG}', expected '${expected_tag}'"
             exit 1
           fi
       - name: Set tarball name
-        run: echo "TAR_NAME=${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz" >> "$GITHUB_ENV"
+        run: echo "TAR_NAME=${RELEASE_TAG}-${{ matrix.target }}.tar.gz" >> "$GITHUB_ENV"
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
@@ -61,7 +72,7 @@ jobs:
       - name: Download seq release artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: ${{ github.ref_name }}-*.tar.gz
+          pattern: ${{ env.RELEASE_TAG }}-*.tar.gz
           path: release-assets
           merge-multiple: true
       - name: Verify seq artifact set
@@ -75,5 +86,6 @@ jobs:
       - name: Publish seq release assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           fail_on_unmatched_files: true
           files: release-assets/*.tar.gz

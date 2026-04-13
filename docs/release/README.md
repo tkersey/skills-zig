@@ -24,6 +24,15 @@ Per-app VERSION files:
 - `apps/st/VERSION`
 - `apps/parse-arch/VERSION`
 
+Release contract:
+
+1. If a PR changes a release-relevant CLI surface, it must also bump that CLI's `VERSION` file.
+2. Release-relevant surfaces are conservative:
+   - `apps/<cli>/**` except the per-app `README.md` counts for that CLI.
+   - shared shipped surfaces (`build.zig`, `build.zig.zon`, `libs/core/**`) count for every shipped CLI.
+   - `.github/workflows/release-<cli>.yml` counts for that CLI's packaged artifact contract.
+3. When those `VERSION` bumps land on `main`, `.github/workflows/auto-release.yml` creates any missing tags and dispatches the matching release workflows automatically.
+
 Release tags must match file versions:
 
 - `seq-v<version>` where `<version>` equals `apps/seq/VERSION`
