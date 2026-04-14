@@ -74,13 +74,17 @@ jobs:
   publish:
     needs: release
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Download st release artifacts
-        uses: actions/download-artifact@v6
-        with:
-          pattern: ${{ env.RELEASE_TAG }}-*.tar.gz
-          path: release-assets
-          merge-multiple: true
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          gh run download "${{ github.run_id }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir release-assets \
+            --pattern "${RELEASE_TAG}-*.tar.gz"
       - name: Verify st artifact set
         run: |
           set -euo pipefail
@@ -90,8 +94,10 @@ jobs:
             exit 1
           fi
       - name: Publish st release assets
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          fail_on_unmatched_files: true
-          files: release-assets/*.tar.gz
+        run: |
+          set -euo pipefail
+          if gh release view "${RELEASE_TAG}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" release-assets/*.tar.gz --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "${RELEASE_TAG}" release-assets/*.tar.gz --repo "$GITHUB_REPOSITORY" --verify-tag --title "${RELEASE_TAG}"
+          fi
