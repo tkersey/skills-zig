@@ -5,7 +5,7 @@ const std = @import("std");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
 const SchemaVersion: i64 = 3;
-const PlanSyncVersion: i64 = 1;
+const PlanSyncVersion: i64 = 2;
 const HelpSurface = core_cli.HelpSurface{
     .executable_name = "st",
     .help_text = UsageText,
@@ -16,7 +16,7 @@ const UsageText =
     \\
     \\Manage dependency-aware JSONL v3 plan state.
     \\
-    \\usage: st {init,add,select,deselect,set-status,set-priority,set-deps,set-notes,add-comment,remove,show,ready,blocked,doctor,emit-plan-sync,emit-update-plan,export,import-plan,import-orchplan,claim,heartbeat,set-runtime,set-proof,release,reclaim-stale,import-mesh-results} [options]
+    \\usage: st {init,add,select,deselect,set-status,set-priority,set-deps,set-notes,add-comment,remove,show,ready,blocked,doctor,emit-plan-sync,emit-update-plan,import-update-plan,export,import-plan,import-orchplan,claim,heartbeat,set-runtime,set-proof,release,reclaim-stale,import-mesh-results} [options]
     \\
     \\commands:
     \\  init              Initialize plan storage
@@ -35,6 +35,7 @@ const UsageText =
     \\  doctor            Inspect or repair seq contract integrity
     \\  emit-plan-sync    Emit dual-runtime plan_sync payload JSON
     \\  emit-update-plan  Emit legacy update_plan payload JSON
+    \\  import-update-plan  Import Codex update_plan payload or transcript into mirrored durable fields
     \\  export            Export snapshot JSON
     \\  import-plan       Import snapshot JSON
     \\  import-orchplan   Import OrchPlan tasks into the durable ledger
@@ -306,6 +307,7 @@ pub const Command = enum {
     emit_plan_sync,
     emit_update_plan,
     heartbeat,
+    import_update_plan,
     import_mesh_results,
     import_orchplan,
     import_plan,
@@ -346,6 +348,7 @@ const command_defs = [_]CommandDef{
     .{ .name = "doctor", .command = .doctor },
     .{ .name = "emit-plan-sync", .command = .emit_plan_sync },
     .{ .name = "emit-update-plan", .command = .emit_update_plan },
+    .{ .name = "import-update-plan", .command = .import_update_plan },
     .{ .name = "export", .command = .@"export" },
     .{ .name = "import-plan", .command = .import_plan },
     .{ .name = "import-orchplan", .command = .import_orchplan },
@@ -438,6 +441,7 @@ pub const Args = struct {
     evidence_ref: ?[]const u8 = null,
     reason: ?[]const u8 = null,
     now: ?[]const u8 = null,
+    transcript_path: ?[]const u8 = null,
 
     replace: bool = false,
     repair_seq: bool = false,
@@ -871,6 +875,21 @@ fn parseArgs(argv: []const []const u8) !Args {
             .emit_plan_sync, .emit_update_plan => {
                 return error.InvalidEmitArg;
             },
+            .import_update_plan => {
+                if (std.mem.eql(u8, token, "--input")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingInputValue;
+                    args.input = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--transcript-path")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingInputValue;
+                    args.transcript_path = argv[i];
+                    continue;
+                }
+                return error.InvalidImportArg;
+            },
             .@"export" => {
                 if (std.mem.eql(u8, token, "--output")) {
                     i += 1;
@@ -1049,6 +1068,10 @@ fn parseArgs(argv: []const []const u8) !Args {
         },
         .remove => if (args.id == null) return error.MissingIdValue,
         .import_plan => if (args.input == null) return error.MissingInputValue,
+        .import_update_plan => {
+            if (args.input == null and args.transcript_path == null) return error.MissingInputValue;
+            if (args.input != null and args.transcript_path != null) return error.InvalidImportArg;
+        },
         .import_orchplan => if (args.input == null) return error.MissingInputValue,
         .claim => {
             if (args.executor == null) return error.MissingValue;
@@ -1107,6 +1130,7 @@ fn isMutatingCommand(command: Command) bool {
         .set_notes,
         .add_comment,
         .remove,
+        .import_update_plan,
         .import_plan,
         .import_orchplan,
         .claim,
@@ -1314,6 +1338,7 @@ fn runCommand(allocator: std.mem.Allocator, args: Args) !u8 {
         .emit_plan_sync => try cmdEmitPlanSync(allocator, args),
         .emit_update_plan => try cmdEmitUpdatePlan(allocator, args),
         .heartbeat => try cmdHeartbeat(allocator, args),
+        .import_update_plan => try cmdImportUpdatePlan(allocator, args),
         .@"export" => try cmdExport(allocator, args),
         .import_plan => try cmdImportPlan(allocator, args),
         .import_orchplan => try cmdImportOrchplan(allocator, args),
@@ -1669,6 +1694,42 @@ fn cmdEmitUpdatePlan(allocator: std.mem.Allocator, args: Args) !u8 {
     var stdout_writer = std.fs.File.stdout().writer(&.{});
     const stdout = &stdout_writer.interface;
     try emitUpdatePlan(allocator, stdout, &state, args.allow_multiple_in_progress, false);
+    return 0;
+}
+
+fn cmdImportUpdatePlan(allocator: std.mem.Allocator, args: Args) !u8 {
+    const imported_entries = if (args.transcript_path) |transcript_path|
+        try parseUpdatePlanEntriesFromTranscript(allocator, transcript_path)
+    else
+        try parseUpdatePlanEntriesFromInputFile(allocator, args.input.?);
+
+    const loaded = try loadValidatedState(allocator, args.file, args.allow_multiple_in_progress);
+    var state = loaded.state;
+    defer state.deinit();
+
+    const changed = try applyCodexUpdatePlanImport(allocator, &state, imported_entries, args.allow_multiple_in_progress);
+
+    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    const stdout = &stdout_writer.interface;
+
+    if (changed) {
+        const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
+        const ts = try nowUtcAlloc(allocator);
+        try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, ts, meta, null);
+        if (args.transcript_path) |transcript_path| {
+            try stdout.print("imported update_plan from transcript {s}\n", .{transcript_path});
+        } else {
+            try stdout.print("imported update_plan from {s}\n", .{args.input.?});
+        }
+    } else {
+        if (args.transcript_path) |transcript_path| {
+            try stdout.print("update_plan already in sync with {s}\n", .{transcript_path});
+        } else {
+            try stdout.print("update_plan already in sync with {s}\n", .{args.input.?});
+        }
+    }
+
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
     return 0;
 }
 
@@ -3633,7 +3694,7 @@ fn emitPlanSync(
         try writeEnrichedItemObject(writer, row);
     }
     try writer.writeAll("],\"codex\":{\"plan\":[");
-    try writeCodexPlan(writer, enriched);
+    try writeCodexPlan(allocator, writer, enriched);
     try writer.writeAll("]},\"opencode\":{\"todos\":[");
     try writeOpencodeTodos(writer, enriched);
     try writer.writeAll("]}}\n");
@@ -3654,26 +3715,32 @@ fn emitUpdatePlan(
     }
 
     try writer.writeAll("{\"plan\":[");
-    try writeCodexPlan(writer, enriched);
+    try writeCodexPlan(allocator, writer, enriched);
     try writer.writeAll("]}\n");
 }
 
-fn writeCodexPlan(writer: anytype, rows: []const EnrichedItem) !void {
+fn writeCodexPlan(allocator: std.mem.Allocator, writer: anytype, rows: []const EnrichedItem) !void {
     var wrote_any = false;
     for (rows) |row| {
         if (!effectiveInPlan(row.item.*)) continue;
         if (wrote_any) try writer.writeByte(',');
-        try writeCodexPlanEntry(writer, row);
+        try writeCodexPlanEntry(allocator, writer, row);
         wrote_any = true;
     }
 }
 
-fn writeCodexPlanEntry(writer: anytype, row: EnrichedItem) !void {
+fn writeCodexPlanEntry(allocator: std.mem.Allocator, writer: anytype, row: EnrichedItem) !void {
+    const step_text = try codexPlanStepAlloc(allocator, row.item.*);
+    defer allocator.free(step_text);
     try writer.writeAll("{\"step\":");
-    try std.json.Stringify.value(row.item.step, .{}, writer);
+    try std.json.Stringify.value(step_text, .{}, writer);
     try writer.writeAll(",\"status\":");
     try std.json.Stringify.value(codexPlanStatusForRow(row), .{}, writer);
     try writer.writeByte('}');
+}
+
+fn codexPlanStepAlloc(allocator: std.mem.Allocator, item: Item) ![]const u8 {
+    return try std.fmt.allocPrint(allocator, "[{s}] {s}", .{ item.id, item.step });
 }
 
 fn codexPlanStatusForRow(row: EnrichedItem) []const u8 {
@@ -3801,6 +3868,318 @@ fn normalizeItemPlanMembership(item: *Item) void {
     if (item.status == .in_progress) {
         item.in_plan = true;
     }
+}
+
+const CodexPlanEntry = struct {
+    id: []const u8,
+    step: []const u8,
+    status: Status,
+};
+
+fn parseUpdatePlanEntriesFromInputFile(allocator: std.mem.Allocator, input_path: []const u8) ![]CodexPlanEntry {
+    const bytes = try readFileAlloc(allocator, input_path, 32 * 1024 * 1024);
+    return parseUpdatePlanEntriesFromBytes(allocator, bytes);
+}
+
+fn parseUpdatePlanEntriesFromTranscript(allocator: std.mem.Allocator, transcript_path: []const u8) ![]CodexPlanEntry {
+    const bytes = try readFileAlloc(allocator, transcript_path, 64 * 1024 * 1024);
+    return parseUpdatePlanEntriesFromTranscriptBytes(allocator, bytes);
+}
+
+fn parseUpdatePlanEntriesFromBytes(allocator: std.mem.Allocator, input_bytes: []const u8) ![]CodexPlanEntry {
+    const trimmed = std.mem.trim(u8, input_bytes, " \t\r\n");
+    const payload = if (std.mem.startsWith(u8, trimmed, "update_plan:"))
+        std.mem.trimLeft(u8, trimmed["update_plan:".len..], " \t\r\n")
+    else
+        trimmed;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
+    return parseUpdatePlanEntries(allocator, parsed.value);
+}
+
+fn parseUpdatePlanEntriesFromTranscriptBytes(allocator: std.mem.Allocator, transcript_bytes: []const u8) ![]CodexPlanEntry {
+    var last_turn_context_index: usize = 0;
+    var seen_turn_context = false;
+    var line_index: usize = 0;
+
+    var first_pass = std.mem.splitScalar(u8, transcript_bytes, '\n');
+    while (first_pass.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len == 0) continue;
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+
+        if (stringField(parsed.value, "type")) |line_type| {
+            if (std.mem.eql(u8, line_type, "turn_context")) {
+                last_turn_context_index = line_index;
+                seen_turn_context = true;
+            }
+        }
+        line_index += 1;
+    }
+
+    if (!seen_turn_context) return error.MissingTurnContext;
+
+    var latest_arguments: ?[]const u8 = null;
+    line_index = 0;
+    var second_pass = std.mem.splitScalar(u8, transcript_bytes, '\n');
+    while (second_pass.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len == 0) continue;
+
+        if (line_index < last_turn_context_index) {
+            line_index += 1;
+            continue;
+        }
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+
+        if (stringField(parsed.value, "type")) |line_type| {
+            if (std.mem.eql(u8, line_type, "response_item")) {
+                if (objectField(parsed.value, "payload")) |payload| {
+                    const payload_type = stringField(payload, "type");
+                    const tool_name = stringField(payload, "name");
+                    if (payload_type != null and tool_name != null and
+                        std.mem.eql(u8, payload_type.?, "function_call") and
+                        std.mem.eql(u8, tool_name.?, "update_plan"))
+                    {
+                        if (stringField(payload, "arguments")) |arguments| {
+                            latest_arguments = try allocator.dupe(u8, arguments);
+                        }
+                    }
+                }
+            }
+        }
+        line_index += 1;
+    }
+
+    const arguments = latest_arguments orelse return error.MissingUpdatePlanInTranscript;
+    const parsed_arguments = try std.json.parseFromSlice(std.json.Value, allocator, arguments, .{});
+    return parseUpdatePlanEntries(allocator, parsed_arguments.value);
+}
+
+fn parseUpdatePlanEntries(allocator: std.mem.Allocator, value: std.json.Value) ![]CodexPlanEntry {
+    const plan_value = switch (value) {
+        .array => value,
+        .object => |obj| obj.get("plan") orelse return error.MissingPlanArray,
+        else => return error.InvalidUpdatePlan,
+    };
+    const plan_items = switch (plan_value) {
+        .array => |arr| arr.items,
+        else => return error.InvalidUpdatePlan,
+    };
+
+    var out = std.ArrayList(CodexPlanEntry).empty;
+    var seen = std.StringHashMap(void).init(allocator);
+
+    for (plan_items) |raw_entry| {
+        const obj = switch (raw_entry) {
+            .object => |entry| entry,
+            else => return error.InvalidUpdatePlanEntry,
+        };
+        const step_raw = asString(obj.get("step") orelse return error.MissingStepValue) orelse return error.MissingStepValue;
+        const status_raw = asString(obj.get("status") orelse return error.MissingStatusValue) orelse return error.MissingStatusValue;
+        const parsed_step = try parseCodexPlanStep(allocator, step_raw);
+        if (seen.get(parsed_step.id) != null) return error.DuplicateItemId;
+        try seen.put(parsed_step.id, {});
+        try out.append(allocator, .{
+            .id = parsed_step.id,
+            .step = parsed_step.step,
+            .status = try normalizeCodexPlanStatus(status_raw),
+        });
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn parseCodexPlanStep(allocator: std.mem.Allocator, raw: []const u8) !struct { id: []const u8, step: []const u8 } {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len < 3 or trimmed[0] != '[') return error.InvalidCodexPlanStep;
+    const closing = std.mem.indexOfScalar(u8, trimmed, ']') orelse return error.InvalidCodexPlanStep;
+    if (closing <= 1) return error.InvalidCodexPlanStep;
+
+    const id = try requireNonEmptyString(allocator, trimmed[1..closing], "codex plan id");
+    const step = try requireNonEmptyString(allocator, std.mem.trimLeft(u8, trimmed[closing + 1 ..], " \t\r\n"), "codex plan step");
+    return .{ .id = id, .step = step };
+}
+
+fn normalizeCodexPlanStatus(raw: []const u8) !Status {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "pending")) return .pending;
+    if (std.ascii.eqlIgnoreCase(trimmed, "in_progress")) return .in_progress;
+    if (std.ascii.eqlIgnoreCase(trimmed, "completed")) return .completed;
+    return error.InvalidCodexPlanStatus;
+}
+
+fn applyCodexUpdatePlanImport(
+    allocator: std.mem.Allocator,
+    state: *ItemState,
+    imported_entries: []const CodexPlanEntry,
+    allow_multiple_in_progress: bool,
+) !bool {
+    var changed = false;
+    var imported_ids = std.StringHashMap(void).init(allocator);
+    defer imported_ids.deinit();
+
+    for (imported_entries) |entry| {
+        const item = state.get(entry.id) orelse return error.UnknownItemId;
+        _ = item;
+        try imported_ids.put(entry.id, {});
+    }
+
+    var reordered = std.ArrayList(Item).empty;
+    defer reordered.deinit(allocator);
+
+    for (imported_entries) |entry| {
+        const current = state.get(entry.id).?;
+        var item = current.*;
+        const original = current.*;
+
+        if (original.status == .canceled or original.status == .deferred) {
+            return error.InvalidMirroredStatusTransition;
+        }
+        if (original.status == .completed and entry.status != .completed) {
+            return error.InvalidMirroredStatusTransition;
+        }
+        if (original.claim) |claim| {
+            if (claim.state == .held and entry.status == .completed) {
+                return error.InvalidMirroredStatusTransition;
+            }
+        }
+
+        item.step = entry.step;
+        item.status = entry.status;
+        item.in_plan = true;
+        normalizeItemPlanMembership(&item);
+
+        if (!itemsEqual(item, original)) changed = true;
+        try reordered.append(allocator, item);
+    }
+
+    for (state.items.items) |existing| {
+        if (imported_ids.get(existing.id) != null) continue;
+        var item = existing;
+        const original = existing;
+
+        if (item.status == .in_progress) {
+            if ((item.claim != null and item.claim.?.state == .held) or item.runtime != null) {
+                return error.InvalidMirroredStatusTransition;
+            }
+            item.status = .pending;
+        }
+        item.in_plan = false;
+        normalizeItemPlanMembership(&item);
+
+        if (!itemsEqual(item, original)) changed = true;
+        try reordered.append(allocator, item);
+    }
+
+    if (!itemOrderMatches(state, reordered.items)) changed = true;
+
+    state.clear();
+    for (reordered.items) |item| {
+        try state.upsert(item);
+    }
+    try validateState(state, allow_multiple_in_progress);
+    return changed;
+}
+
+fn itemOrderMatches(state: *const ItemState, reordered: []const Item) bool {
+    if (state.items.items.len != reordered.len) return false;
+    for (state.items.items, reordered) |lhs, rhs| {
+        if (!std.mem.eql(u8, lhs.id, rhs.id)) return false;
+    }
+    return true;
+}
+
+fn itemsEqual(lhs: Item, rhs: Item) bool {
+    return std.mem.eql(u8, lhs.id, rhs.id) and
+        std.mem.eql(u8, lhs.step, rhs.step) and
+        lhs.status == rhs.status and
+        lhs.priority == rhs.priority and
+        lhs.in_plan == rhs.in_plan and
+        depsEqual(lhs.deps, rhs.deps) and
+        std.mem.eql(u8, lhs.notes, rhs.notes) and
+        commentsEqual(lhs.comments, rhs.comments) and
+        stringListsEqual(lhs.related_to, rhs.related_to) and
+        stringListsEqual(lhs.scope, rhs.scope) and
+        stringListsEqual(lhs.location, rhs.location) and
+        stringListsEqual(lhs.validation, rhs.validation) and
+        std.mem.eql(u8, lhs.agent, rhs.agent) and
+        std.mem.eql(u8, lhs.role, rhs.role) and
+        sourceMetaEqual(lhs.source, rhs.source) and
+        claimMetaEqual(lhs.claim, rhs.claim) and
+        runtimeMetaEqual(lhs.runtime, rhs.runtime) and
+        proofMetaEqual(lhs.proof, rhs.proof);
+}
+
+fn depsEqual(lhs: []Dep, rhs: []Dep) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        if (!std.mem.eql(u8, left.id, right.id) or !std.mem.eql(u8, left.type, right.type)) return false;
+    }
+    return true;
+}
+
+fn commentsEqual(lhs: []const Comment, rhs: []const Comment) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        if (!std.mem.eql(u8, left.ts, right.ts) or !std.mem.eql(u8, left.author, right.author) or !std.mem.eql(u8, left.text, right.text)) return false;
+    }
+    return true;
+}
+
+fn stringListsEqual(lhs: []const []const u8, rhs: []const []const u8) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        if (!std.mem.eql(u8, left, right)) return false;
+    }
+    return true;
+}
+
+fn sourceMetaEqual(lhs: ?SourceMeta, rhs: ?SourceMeta) bool {
+    if (lhs == null and rhs == null) return true;
+    if (lhs == null or rhs == null) return false;
+    return std.mem.eql(u8, lhs.?.kind, rhs.?.kind) and
+        std.mem.eql(u8, lhs.?.locator, rhs.?.locator) and
+        std.mem.eql(u8, lhs.?.source_task_id, rhs.?.source_task_id) and
+        std.mem.eql(u8, lhs.?.wave_id, rhs.?.wave_id);
+}
+
+fn claimMetaEqual(lhs: ?ClaimMeta, rhs: ?ClaimMeta) bool {
+    if (lhs == null and rhs == null) return true;
+    if (lhs == null or rhs == null) return false;
+    return lhs.?.state == rhs.?.state and
+        std.mem.eql(u8, lhs.?.owner, rhs.?.owner) and
+        std.mem.eql(u8, lhs.?.executor, rhs.?.executor) and
+        std.mem.eql(u8, lhs.?.wave_id, rhs.?.wave_id) and
+        stringListsEqual(lhs.?.lock_roots, rhs.?.lock_roots) and
+        std.mem.eql(u8, lhs.?.claimed_at, rhs.?.claimed_at) and
+        lhs.?.lease_seconds == rhs.?.lease_seconds and
+        std.mem.eql(u8, lhs.?.lease_expires_at, rhs.?.lease_expires_at) and
+        std.mem.eql(u8, lhs.?.heartbeat_at, rhs.?.heartbeat_at) and
+        lhs.?.attempts == rhs.?.attempts;
+}
+
+fn runtimeMetaEqual(lhs: ?RuntimeMeta, rhs: ?RuntimeMeta) bool {
+    if (lhs == null and rhs == null) return true;
+    if (lhs == null or rhs == null) return false;
+    return std.mem.eql(u8, lhs.?.substrate, rhs.?.substrate) and
+        std.mem.eql(u8, lhs.?.thread_id, rhs.?.thread_id) and
+        std.mem.eql(u8, lhs.?.agent_id, rhs.?.agent_id) and
+        std.mem.eql(u8, lhs.?.row_id, rhs.?.row_id) and
+        std.mem.eql(u8, lhs.?.output_ref, rhs.?.output_ref) and
+        std.mem.eql(u8, lhs.?.last_event, rhs.?.last_event);
+}
+
+fn proofMetaEqual(lhs: ?ProofMeta, rhs: ?ProofMeta) bool {
+    if (lhs == null and rhs == null) return true;
+    if (lhs == null or rhs == null) return false;
+    return lhs.?.state == rhs.?.state and
+        std.mem.eql(u8, lhs.?.command, rhs.?.command) and
+        std.mem.eql(u8, lhs.?.evidence_ref, rhs.?.evidence_ref) and
+        std.mem.eql(u8, lhs.?.last_run_at, rhs.?.last_run_at);
 }
 
 fn normalizeStatePlanMembership(state: *ItemState) void {
@@ -4624,11 +5003,15 @@ fn ensureLockSidecarGitignored(allocator: std.mem.Allocator, plan_file: []const 
     const parent = std.fs.path.dirname(plan_file) orelse ".";
     const git_root = findGitRootAlloc(allocator, parent) catch return;
     if (git_root.len == 0) return;
+    const git_root_real = std.fs.realpathAlloc(allocator, git_root) catch git_root;
 
-    const lock_path = try std.fmt.allocPrint(allocator, "{s}.lock", .{plan_file});
-    const lock_rel = try std.fs.path.relative(allocator, git_root, lock_path);
+    const plan_rel = if (std.fs.path.isAbsolute(plan_file)) blk: {
+        const plan_real = std.fs.realpathAlloc(allocator, plan_file) catch plan_file;
+        break :blk try std.fs.path.relative(allocator, git_root_real, plan_real);
+    } else plan_file;
+    const lock_rel = try std.fmt.allocPrint(allocator, "{s}.lock", .{plan_rel});
 
-    var argv = [_][]const u8{ "git", "-C", git_root, "check-ignore", "-q", "--", lock_rel };
+    var argv = [_][]const u8{ "git", "-C", git_root_real, "check-ignore", "-q", "--", lock_rel };
     const result = try runCommandCapture(allocator, null, &argv);
     if (result.exit_code == 0) return;
     if (result.exit_code == 1) {
@@ -4813,6 +5196,7 @@ test "parseCommand and parseOutputFormat recognize known values" {
     try std.testing.expectEqual(Command.set_priority, parseCommand("set-priority").?);
     try std.testing.expectEqual(Command.emit_plan_sync, parseCommand("emit-plan-sync").?);
     try std.testing.expectEqual(Command.emit_update_plan, parseCommand("emit-update-plan").?);
+    try std.testing.expectEqual(Command.import_update_plan, parseCommand("import-update-plan").?);
     try std.testing.expect(parseCommand("unknown-cmd") == null);
 
     try std.testing.expectEqual(OutputFormat.markdown, parseOutputFormat("markdown").?);
@@ -4943,7 +5327,7 @@ test "emitPlanSync keeps inventory while filtering mirrored plan projections" {
     const actual = try out.toOwnedSlice();
 
     try std.testing.expectEqualStrings(
-        "{\"version\":1,\"items\":[{\"id\":\"st-001\",\"step\":\"First step\",\"status\":\"pending\",\"priority\":\"high\",\"in_plan\":true,\"deps\":[],\"notes\":\"\",\"comments\":[],\"dep_state\":\"ready\",\"waiting_on\":[]},{\"id\":\"st-002\",\"step\":\"Canceled step\",\"status\":\"canceled\",\"priority\":\"low\",\"in_plan\":false,\"deps\":[],\"notes\":\"\",\"comments\":[],\"dep_state\":\"n/a\",\"waiting_on\":[]}],\"codex\":{\"plan\":[{\"step\":\"First step\",\"status\":\"pending\"}]},\"opencode\":{\"todos\":[{\"content\":\"First step\",\"status\":\"pending\",\"priority\":\"high\"}]}}\n",
+        "{\"version\":2,\"items\":[{\"id\":\"st-001\",\"step\":\"First step\",\"status\":\"pending\",\"priority\":\"high\",\"in_plan\":true,\"deps\":[],\"notes\":\"\",\"comments\":[],\"dep_state\":\"ready\",\"waiting_on\":[]},{\"id\":\"st-002\",\"step\":\"Canceled step\",\"status\":\"canceled\",\"priority\":\"low\",\"in_plan\":false,\"deps\":[],\"notes\":\"\",\"comments\":[],\"dep_state\":\"n/a\",\"waiting_on\":[]}],\"codex\":{\"plan\":[{\"step\":\"[st-001] First step\",\"status\":\"pending\"}]},\"opencode\":{\"todos\":[{\"content\":\"First step\",\"status\":\"pending\",\"priority\":\"high\"}]}}\n",
         actual,
     );
 }
@@ -4972,9 +5356,221 @@ test "emitUpdatePlan preserves legacy payload shape" {
     const actual = try out.toOwnedSlice();
 
     try std.testing.expectEqualStrings(
-        "{\"plan\":[{\"step\":\"High priority step\",\"status\":\"in_progress\"}]}\n",
+        "{\"plan\":[{\"step\":\"[st-001] High priority step\",\"status\":\"in_progress\"}]}\n",
         actual,
     );
+}
+
+test "importUpdatePlan updates mirrored fields and preserves durable metadata" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
+    const update_plan_path = try std.fs.path.join(allocator, &.{ root, "update-plan.json" });
+
+    _ = try cmdInit(allocator, .{ .command = .init, .file = plan_path, .replace = true });
+    _ = try cmdAdd(allocator, .{
+        .command = .add,
+        .file = plan_path,
+        .id = "st-001",
+        .step = "Initial parent",
+        .priority = "high",
+    });
+    _ = try cmdAdd(allocator, .{
+        .command = .add,
+        .file = plan_path,
+        .id = "st-002",
+        .step = "Initial child",
+        .priority = "medium",
+        .backlog_only = true,
+    });
+    _ = try cmdSetDeps(allocator, .{
+        .command = .set_deps,
+        .file = plan_path,
+        .id = "st-002",
+        .deps = "st-001",
+    });
+    _ = try cmdSetNotes(allocator, .{
+        .command = .set_notes,
+        .file = plan_path,
+        .id = "st-002",
+        .notes = "preserve me",
+    });
+
+    try writeTextAtomic(allocator, update_plan_path,
+        \\{"plan":[
+        \\  {"step":"[st-002] Renamed child","status":"pending"},
+        \\  {"step":"[st-001] Parent complete","status":"completed"}
+        \\]}
+    );
+
+    _ = try cmdImportUpdatePlan(allocator, .{
+        .command = .import_update_plan,
+        .file = plan_path,
+        .input = update_plan_path,
+    });
+
+    var loaded = try loadValidatedState(allocator, plan_path, false);
+    defer loaded.state.deinit();
+
+    try std.testing.expectEqualStrings("st-002", loaded.state.items.items[0].id);
+    try std.testing.expectEqualStrings("Renamed child", loaded.state.items.items[0].step);
+    try std.testing.expectEqual(Status.pending, loaded.state.items.items[0].status);
+    try std.testing.expect(loaded.state.items.items[0].in_plan);
+    try std.testing.expectEqualStrings("preserve me", loaded.state.items.items[0].notes);
+    try std.testing.expectEqualStrings("st-001", loaded.state.items.items[0].deps[0].id);
+
+    try std.testing.expectEqualStrings("st-001", loaded.state.items.items[1].id);
+    try std.testing.expectEqualStrings("Parent complete", loaded.state.items.items[1].step);
+    try std.testing.expectEqual(Status.completed, loaded.state.items.items[1].status);
+    try std.testing.expect(!loaded.state.items.items[1].in_plan);
+}
+
+test "importUpdatePlan transcript path uses latest turn boundary" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
+    const transcript_path = try std.fs.path.join(allocator, &.{ root, "session.jsonl" });
+
+    _ = try cmdInit(allocator, .{ .command = .init, .file = plan_path, .replace = true });
+    _ = try cmdAdd(allocator, .{
+        .command = .add,
+        .file = plan_path,
+        .id = "st-001",
+        .step = "First",
+        .priority = "medium",
+    });
+    _ = try cmdAdd(allocator, .{
+        .command = .add,
+        .file = plan_path,
+        .id = "st-002",
+        .step = "Second",
+        .priority = "medium",
+        .backlog_only = true,
+    });
+
+    try writeTextAtomic(allocator, transcript_path,
+        \\{"type":"turn_context","payload":{"turn_id":"1"}}
+        \\{"type":"response_item","payload":{"type":"function_call","name":"update_plan","arguments":"{\"plan\":[{\"step\":\"[st-001] Old choice\",\"status\":\"pending\"}]}" }}
+        \\{"type":"turn_context","payload":{"turn_id":"2"}}
+        \\{"type":"response_item","payload":{"type":"function_call","name":"update_plan","arguments":"{\"plan\":[{\"step\":\"[st-002] Latest choice\",\"status\":\"pending\"}]}" }}
+    );
+
+    _ = try cmdImportUpdatePlan(allocator, .{
+        .command = .import_update_plan,
+        .file = plan_path,
+        .transcript_path = transcript_path,
+    });
+
+    var loaded = try loadValidatedState(allocator, plan_path, false);
+    defer loaded.state.deinit();
+
+    try std.testing.expectEqualStrings("st-002", loaded.state.items.items[0].id);
+    try std.testing.expectEqualStrings("Latest choice", loaded.state.items.items[0].step);
+    try std.testing.expect(loaded.state.items.items[0].in_plan);
+    try std.testing.expect(!loaded.state.items.items[1].in_plan);
+}
+
+test "importUpdatePlan rejects malformed codex plan steps" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
+    const update_plan_path = try std.fs.path.join(allocator, &.{ root, "bad-update-plan.json" });
+
+    _ = try cmdInit(allocator, .{ .command = .init, .file = plan_path, .replace = true });
+    _ = try cmdAdd(allocator, .{
+        .command = .add,
+        .file = plan_path,
+        .id = "st-001",
+        .step = "Only step",
+        .priority = "medium",
+    });
+
+    try writeTextAtomic(allocator, update_plan_path,
+        \\{"plan":[{"step":"Only step","status":"pending"}]}
+    );
+
+    try std.testing.expectError(error.InvalidCodexPlanStep, cmdImportUpdatePlan(allocator, .{
+        .command = .import_update_plan,
+        .file = plan_path,
+        .input = update_plan_path,
+    }));
+}
+
+test "importUpdatePlan no-op path avoids rewriting the durable plan" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
+    const update_plan_path = try std.fs.path.join(allocator, &.{ root, "update-plan.json" });
+
+    _ = try cmdInit(allocator, .{ .command = .init, .file = plan_path, .replace = true });
+    _ = try cmdAdd(allocator, .{
+        .command = .add,
+        .file = plan_path,
+        .id = "st-001",
+        .step = "Stable step",
+        .priority = "medium",
+    });
+
+    try writeTextAtomic(allocator, update_plan_path,
+        \\{"plan":[{"step":"[st-001] Stable step","status":"pending"}]}
+    );
+
+    _ = try cmdImportUpdatePlan(allocator, .{
+        .command = .import_update_plan,
+        .file = plan_path,
+        .input = update_plan_path,
+    });
+
+    const after_first = try readFileAlloc(allocator, plan_path, 1024 * 1024);
+    const seq_after_first = (try readRecords(allocator, plan_path)).latest_seq;
+
+    _ = try cmdImportUpdatePlan(allocator, .{
+        .command = .import_update_plan,
+        .file = plan_path,
+        .input = update_plan_path,
+    });
+
+    const after_second = try readFileAlloc(allocator, plan_path, 1024 * 1024);
+    const seq_after_second = (try readRecords(allocator, plan_path)).latest_seq;
+
+    try std.testing.expectEqual(seq_after_first, seq_after_second);
+    try std.testing.expectEqualStrings(after_first, after_second);
 }
 
 test "select auto-includes dependency closure and deselect rejects stranded dependents" {
