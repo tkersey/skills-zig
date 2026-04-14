@@ -27,6 +27,8 @@ Binary output:
 ./zig-out/bin/seq datasets
 ./zig-out/bin/seq dataset-schema --dataset messages
 ./zig-out/bin/seq dataset-schema --dataset memory_blocks
+./zig-out/bin/seq dataset-schema --dataset memory_stage1_outputs
+./zig-out/bin/seq dataset-schema --dataset memory_extensions
 ./zig-out/bin/seq dataset-schema --dataset opencode_prompts
 ./zig-out/bin/seq dataset-schema --dataset opencode_events
 ./zig-out/bin/seq dataset-schema --dataset opencode_tool_calls
@@ -47,6 +49,12 @@ Binary output:
 ./zig-out/bin/seq query-diagnose --path /absolute/path/to/rollout.jsonl --threshold-ms 10000 --next-actions --format json
 ./zig-out/bin/seq artifact-search --contains "spawn_agent" --kind orchestration --since 2026-03-01T00:00:00Z --limit 10 --format table
 ./zig-out/bin/seq artifact-search --contains "MEMORY.md" --kind memory --stats --format table
+./zig-out/bin/seq memory-provenance --thread-id 019bae5d-7d12-7b01-9cb5-b8bb6046b85b --format table
+./zig-out/bin/seq memory-provenance --rollout-summary-file rollout_summaries/2026-01-11T18-42-01-jpEf-resolve_merge_pr_11_squash_cleanup.md --format json
+./zig-out/bin/seq memory-map --thread-id 019bae5d-7d12-7b01-9cb5-b8bb6046b85b --format table
+./zig-out/bin/seq memory-map --contains synesthesia --limit 5 --format table
+./zig-out/bin/seq memory-history --thread-id 019bae5d-7d12-7b01-9cb5-b8bb6046b85b --format table
+./zig-out/bin/seq memory-history --contains synesthesia --since 2026-04-01T00:00:00Z --limit 5 --format table
 ./zig-out/bin/seq opencode-prompts --limit 20 --format jsonl
 ./zig-out/bin/seq opencode-prompts --session ses_abc --since 1772700000000 --latest --format table
 ./zig-out/bin/seq opencode-prompts --source db --contains "grill me" --mode normal --select session_slug,message_id,prompt_text,part_types --sort -time_created_epoch_ms --format table
@@ -81,12 +89,37 @@ Binary output:
 - emits `next_action_kind` / `next_action` suggestions for follow-up commands
 - `--stats` adds scan counters (`surfaces_scanned`, `candidate_files`, `files_opened`, `rows_examined`, `rows_emitted`, `duration_ms`)
 
+`memory-provenance` answers the targeted origin question for one memory thread or rollout summary:
+- accepts `--thread-id` or `--rollout-summary-file`
+- joins live `stage1_outputs` truth from the Codex state DB with current memory artifacts
+- emits `current_surfaces`, `active_extensions`, `evidence_ref`, and an exact `session-prompts` follow-up command
+
+`memory-map` is the archaeology-first artifact router:
+- targeted mode (`--thread-id`) maps the live stage1 row, rollout summary artifact, and current memory-block surfaces for one memory thread
+- topic mode (`--contains` / `--regex`) searches memory artifacts directly and emits the fastest proof path for each hit
+
+`memory-history` emits an observed evidence timeline instead of inventing historical diffs:
+- targeted mode (`--thread-id`) summarizes stage1 + rollout-summary observable timestamps for one thread
+- topic mode (`--contains` / `--regex`) emits a topic-scoped artifact timeline with proof pointers
+- summary rows always lead the output; event rows follow in timestamp order
+
 `memory_blocks` is a markdown-block dataset over `~/.codex/memories`:
 - one row per heading-delimited block
 - exposes `doc_kind`, `heading_path`, `title`, `body`, `preview`, and optional `thread_id` / `rollout_path`
 - use it when memory inventory is not enough and you need searchable body content
+
+`memory_stage1_outputs` is the current Codex memory-selection truth from the local state DB:
+- one row per `stage1_outputs` entry joined to the owning `threads` row
+- exposes `selected_for_phase2`, `usage_count`, `last_usage`, `rollout_path`, `cwd`, and `memory_mode`
+
+`memory_extensions` inventories the live `~/.codex/memories_extensions` tree:
+- one row per extension directory
+- exposes whether `instructions.md` is present and where it lives
+
 `query.params` is now functional for dataset-specific source overrides:
 - `memory_files`: `params.memory_root`, `params.include_preview`
+- `memory_stage1_outputs`: `params.state_db_path`
+- `memory_extensions`: `params.extensions_root`
 - `opencode_prompts`: `params.source`, `params.opencode_db_path`, `params.opencode_path`, `params.include_raw`, `params.include_summary_fallback`
 - `opencode_events`: `params.source`, `params.opencode_db_path`, `params.opencode_path`, `params.include_raw`
 

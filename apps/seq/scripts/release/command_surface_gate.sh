@@ -40,6 +40,18 @@ if ! "$BIN_PATH" --help | rg -q '^- artifact-search$'; then
   echo "required command missing: artifact-search" >&2
   exit 1
 fi
+if ! "$BIN_PATH" --help | rg -q '^- memory-provenance$'; then
+  echo "required command missing: memory-provenance" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" --help | rg -q '^- memory-map$'; then
+  echo "required command missing: memory-map" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" --help | rg -q '^- memory-history$'; then
+  echo "required command missing: memory-history" >&2
+  exit 1
+fi
 if ! "$BIN_PATH" --help | rg -q '^- plan-search$'; then
   echo "required command missing: plan-search" >&2
   exit 1

@@ -172,6 +172,16 @@ pub const dataset_meta = [_]DatasetMeta{
         .fields = &.{ "path", "relative_path", "doc_kind", "heading_path", "title", "body", "preview", "updated_at", "thread_id", "rollout_path", "keywords" },
     },
     .{
+        .name = "memory_stage1_outputs",
+        .description = "Codex memory stage-1 outputs joined with thread metadata from the local state DB",
+        .fields = &.{ "thread_id", "source_updated_at", "generated_at", "rollout_slug", "usage_count", "last_usage", "selected_for_phase2", "selected_for_phase2_source_updated_at", "rollout_path", "cwd", "git_branch", "source", "title", "memory_mode" },
+    },
+    .{
+        .name = "memory_extensions",
+        .description = "Live memory extension directories under ~/.codex/memories_extensions",
+        .fields = &.{ "extension_name", "instructions_path", "has_instructions", "modified_at", "size_bytes" },
+    },
+    .{
         .name = "opencode_prompts",
         .description = "Prompt rows mined from Opencode DB (with JSONL fallback)",
         .fields = &.{
@@ -320,6 +330,8 @@ const Options = struct {
     root: ?[]const u8 = null,
     path: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
+    thread_id: ?[]const u8 = null,
+    rollout_summary_file: ?[]const u8 = null,
     out_path: ?[]const u8 = null,
     dataset: ?[]const u8 = null,
     spec_text: ?[]const u8 = null,
@@ -348,6 +360,10 @@ const Options = struct {
     sort_text: ?[]const u8 = null,
     group_by_text: ?[]const u8 = null,
     metric_text: ?[]const u8 = null,
+    trace_text: ?[]const u8 = null,
+    state_db_path: ?[]const u8 = null,
+    memory_root_text: ?[]const u8 = null,
+    extensions_root_text: ?[]const u8 = null,
     opencode_db_path: ?[]const u8 = null,
     opencode_path: ?[]const u8 = null,
     opencode_source_text: ?[]const u8 = null,
@@ -402,6 +418,9 @@ pub fn run(
         .query => try cmdQuery(allocator, sessions_root, opts),
         .session_tooling => try cmdSessionTooling(allocator, sessions_root, opts),
         .query_diagnose => try cmdQueryDiagnose(allocator, sessions_root, opts),
+        .memory_provenance => try cmdMemoryProvenance(allocator, opts),
+        .memory_map => try cmdMemoryMap(allocator, opts),
+        .memory_history => try cmdMemoryHistory(allocator, opts),
         .opencode_prompts => try cmdOpencodePrompts(allocator, sessions_root, opts),
         .opencode_events => try cmdOpencodeEvents(allocator, sessions_root, opts),
         .unknown => return error.InvalidCommand,
@@ -512,6 +531,15 @@ fn printCommandHelp(cmd: lib.Command) !void {
         .query_diagnose =>
         \\usage: seq query-diagnose [--session-id <id>|--path <jsonl>] [--since <iso>] [--until <iso>] [--threshold-ms N] [--strict-hang] [--fail-on-hang] [--next-actions] [--summary] [--format table|json|csv|jsonl]
         ,
+        .memory_provenance =>
+        \\usage: seq memory-provenance (--thread-id <id> | --rollout-summary-file <path>) [--state-db-path <path>] [--memory-root <path>] [--extensions-root <path>] [--trace none|auto|always] [--format table|json|csv|jsonl]
+        ,
+        .memory_map =>
+        \\usage: seq memory-map (--thread-id <id> | --contains <text> | --regex <expr>) [--memory-root <path>] [--extensions-root <path>] [--since <iso>] [--until <iso>] [--trace none|auto|always] [--limit N] [--format table|json|csv|jsonl]
+        ,
+        .memory_history =>
+        \\usage: seq memory-history (--thread-id <id> | --contains <text> | --regex <expr>) [--state-db-path <path>] [--memory-root <path>] [--extensions-root <path>] [--since <iso>] [--until <iso>] [--trace none|auto|always] [--limit N] [--format table|json|csv|jsonl]
+        ,
         .opencode_prompts =>
         \\usage: seq opencode-prompts [--spec <json|@path>] [--contains <text>] [--regex <expr>] [--session <id|slug>] [--since <epoch-ms|iso>] [--until <epoch-ms|iso>] [--latest] [--mode <name>] [--part-type <name>] [--group-by <csv>] [--metric <csv>] [--select <csv>] [--sort <csv>] [--source auto|db|jsonl] [--opencode-db-path <path>] [--opencode-path <path>] [--include-raw] [--limit N] [--format table|json|csv|jsonl]
         ,
@@ -557,7 +585,7 @@ fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
         .occurrence_export => {
             if (fmt == .table) return error.InvalidFormatForCommand;
         },
-        .artifact_search, .orchestration_concurrency, .find_session, .plan_search, .reply_latency, .session_prompts, .query, .token_usage, .routing_gap, .session_tooling, .query_diagnose, .opencode_prompts, .opencode_events => {},
+        .artifact_search, .orchestration_concurrency, .find_session, .plan_search, .reply_latency, .session_prompts, .query, .token_usage, .routing_gap, .session_tooling, .query_diagnose, .memory_provenance, .memory_map, .memory_history, .opencode_prompts, .opencode_events => {},
         .unknown => return error.InvalidCommand,
     }
 }
@@ -606,11 +634,11 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         else => false,
     };
     const supports_contains = switch (cmd) {
-        .artifact_search, .plan_search, .opencode_prompts, .opencode_events => true,
+        .artifact_search, .plan_search, .memory_map, .memory_history, .opencode_prompts, .opencode_events => true,
         else => false,
     };
     const supports_regex = switch (cmd) {
-        .artifact_search, .plan_search, .opencode_prompts, .opencode_events => true,
+        .artifact_search, .plan_search, .memory_map, .memory_history, .opencode_prompts, .opencode_events => true,
         else => false,
     };
     const supports_role = cmd == .opencode_events;
@@ -647,6 +675,8 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .token_usage,
         .session_tooling,
         .query_diagnose,
+        .memory_map,
+        .memory_history,
         .skill_blocks,
         .opencode_prompts,
         .opencode_events,
@@ -669,6 +699,8 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .token_usage,
         .session_tooling,
         .query_diagnose,
+        .memory_map,
+        .memory_history,
         .skill_blocks,
         .opencode_prompts,
         .opencode_events,
@@ -715,6 +747,12 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .opencode_prompts, .opencode_events => true,
         else => false,
     };
+    const supports_thread_id = cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history;
+    const supports_rollout_summary_file = cmd == .memory_provenance;
+    const supports_trace = cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history;
+    const supports_state_db_path = cmd == .memory_provenance or cmd == .memory_history;
+    const supports_memory_root = cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history;
+    const supports_extensions_root = cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history;
 
     try ensureOptionAllowed(opts.path != null, supports_path, "--path", cmd);
     try ensureOptionAllowed(opts.session_id != null, supports_session_id, "--session-id", cmd);
@@ -766,6 +804,12 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.opencode_path != null, supports_opencode_path, "--opencode-path", cmd);
     try ensureOptionAllowed(opts.opencode_source_text != null, supports_opencode_source, "--source", cmd);
     try ensureOptionAllowed(opts.include_raw, supports_include_raw, "--include-raw", cmd);
+    try ensureOptionAllowed(opts.thread_id != null, supports_thread_id, "--thread-id", cmd);
+    try ensureOptionAllowed(opts.rollout_summary_file != null, supports_rollout_summary_file, "--rollout-summary-file", cmd);
+    try ensureOptionAllowed(opts.trace_text != null, supports_trace, "--trace", cmd);
+    try ensureOptionAllowed(opts.state_db_path != null, supports_state_db_path, "--state-db-path", cmd);
+    try ensureOptionAllowed(opts.memory_root_text != null, supports_memory_root, "--memory-root", cmd);
+    try ensureOptionAllowed(opts.extensions_root_text != null, supports_extensions_root, "--extensions-root", cmd);
 }
 
 fn cmdDatasets(allocator: std.mem.Allocator, opts: Options) !void {
@@ -868,6 +912,12 @@ const ArtifactSurface = enum {
 const ArtifactFollow = enum {
     none,
     auto,
+};
+
+const MemoryTrace = enum {
+    none,
+    auto,
+    always,
 };
 
 const ArtifactStats = struct {
@@ -992,6 +1042,14 @@ fn parseArtifactFollow(raw_opt: ?[]const u8) !ArtifactFollow {
     const raw = raw_opt orelse return .auto;
     if (std.mem.eql(u8, raw, "auto")) return .auto;
     if (std.mem.eql(u8, raw, "none")) return .none;
+    return error.InvalidModeArg;
+}
+
+fn parseMemoryTrace(raw_opt: ?[]const u8) !MemoryTrace {
+    const raw = raw_opt orelse return .auto;
+    if (std.mem.eql(u8, raw, "none")) return .none;
+    if (std.mem.eql(u8, raw, "auto")) return .auto;
+    if (std.mem.eql(u8, raw, "always")) return .always;
     return error.InvalidModeArg;
 }
 
@@ -1306,6 +1364,664 @@ fn attachArtifactStats(row: *query.Row, stats: ArtifactStats) !void {
     try row.putOwnedKey("duration_ms", .{ .int = stats.duration_ms });
     try row.putOwnedKey("used_time_bounds", .{ .bool = stats.used_time_bounds });
     try row.putOwnedKey("used_targeted_session", .{ .bool = stats.used_targeted_session });
+}
+
+fn cmdMemoryProvenance(allocator: std.mem.Allocator, opts: Options) !void {
+    if (opts.thread_id == null and opts.rollout_summary_file == null) {
+        printCliError("error: memory-provenance requires --thread-id or --rollout-summary-file\n", .{});
+        return error.MissingThreadIdArg;
+    }
+    if (opts.thread_id != null and opts.rollout_summary_file != null) {
+        printCliError("error: memory-provenance accepts exactly one of --thread-id or --rollout-summary-file\n", .{});
+        return error.InvalidSessionTarget;
+    }
+
+    const trace = try parseMemoryTrace(opts.trace_text);
+
+    var stage1_rows = try datasets.memory_stage1_outputs.collect(allocator, .{ .state_db_path = opts.state_db_path });
+    defer datasets.memory_stage1_outputs.deinitRows(allocator, &stage1_rows);
+    var memory_rows = try datasets.memory_blocks.collect(allocator, .{ .memory_root = opts.memory_root_text });
+    defer datasets.memory_blocks.deinitRows(allocator, &memory_rows);
+    var extension_rows = try datasets.memory_extensions.collect(allocator, .{ .extensions_root = opts.extensions_root_text });
+    defer datasets.memory_extensions.deinitRows(allocator, &extension_rows);
+
+    const target_thread_id = if (opts.thread_id) |thread_id|
+        thread_id
+    else
+        try resolveThreadIdFromRolloutSummary(memory_rows.items, opts.rollout_summary_file.?);
+
+    const stage1_row = findMemoryStage1OutputRow(stage1_rows.items, target_thread_id) orelse {
+        printCliError("error: no stage1 memory row for thread {s}\n", .{target_thread_id});
+        return error.SessionNotFound;
+    };
+
+    const rollout_summary_row = findRolloutSummaryRow(memory_rows.items, target_thread_id, stage1_row.rollout_path, opts.rollout_summary_file);
+    if (rollout_summary_row == null) {
+        printCliError("error: no rollout summary artifact for thread {s}\n", .{target_thread_id});
+        return error.SessionNotFound;
+    }
+    const current_surfaces = try collectCurrentSurfacesSummary(allocator, memory_rows.items, target_thread_id, stage1_row.rollout_path, rollout_summary_row);
+    defer allocator.free(current_surfaces);
+    const active_extensions = try collectActiveExtensionsSummary(allocator, extension_rows.items);
+    defer allocator.free(active_extensions);
+
+    const next_action = try std.fmt.allocPrint(
+        allocator,
+        "seq session-prompts --path {s} --roles user,assistant --strip-skill-blocks --limit 40 --format jsonl",
+        .{stage1_row.rollout_path},
+    );
+    defer allocator.free(next_action);
+
+    const state_db_path = try datasets.codex_state_sqlite.resolveDefaultDbPath(allocator, opts.state_db_path);
+    defer allocator.free(state_db_path);
+
+    var rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &rows);
+
+    var row = query.Row.init(allocator);
+    const evidence_ref = try std.fmt.allocPrint(allocator, "stage1_outputs:{s}", .{stage1_row.thread_id});
+    defer allocator.free(evidence_ref);
+    try row.putOwnedKey("thread_id", .{ .string = stage1_row.thread_id });
+    try putOptionalString(&row, "introduced_at", stage1_row.generated_at);
+    try putOptionalString(&row, "source_updated_at", stage1_row.source_updated_at);
+    try putOptionalString(&row, "generated_at", stage1_row.generated_at);
+    try putOptionalInt(&row, "usage_count", stage1_row.usage_count);
+    try putOptionalString(&row, "last_usage", stage1_row.last_usage);
+    try row.putOwnedKey("selected_for_phase2", .{ .bool = stage1_row.selected_for_phase2 });
+    if (rollout_summary_row) |summary_row| {
+        try row.putOwnedKey("rollout_summary_file", .{ .string = summary_row.relative_path });
+    } else {
+        try row.putOwnedKey("rollout_summary_file", .null);
+    }
+    try row.putOwnedKey("rollout_path", .{ .string = stage1_row.rollout_path });
+    try row.putOwnedKey("cwd", .{ .string = stage1_row.cwd });
+    try putOptionalString(&row, "git_branch", stage1_row.git_branch);
+    try row.putOwnedKey("current_surfaces", .{ .string = current_surfaces });
+    try row.putOwnedKey("active_extensions", .{ .string = active_extensions });
+    if (shouldExpandMemoryTrace(trace, true) and rollout_summary_row != null) {
+        try row.putOwnedKey("rollout_summary_preview", .{ .string = rollout_summary_row.?.preview });
+    } else {
+        try row.putOwnedKey("rollout_summary_preview", .null);
+    }
+    try row.putOwnedKey("path", .{ .string = state_db_path });
+    try row.putOwnedKey("evidence_ref", .{ .string = evidence_ref });
+    try row.putOwnedKey("next_action_kind", .{ .string = "session-prompts" });
+    try row.putOwnedKey("next_action", .{ .string = next_action });
+    try row.putOwnedKey("warnings", .null);
+    try rows.append(allocator, row);
+
+    const cols = [_][]const u8{
+        "thread_id",
+        "introduced_at",
+        "source_updated_at",
+        "generated_at",
+        "usage_count",
+        "last_usage",
+        "selected_for_phase2",
+        "rollout_summary_file",
+        "rollout_path",
+        "cwd",
+        "git_branch",
+        "current_surfaces",
+        "active_extensions",
+        "rollout_summary_preview",
+        "evidence_ref",
+        "next_action_kind",
+        "next_action",
+        "warnings",
+    };
+    try output.writeOutput(allocator, opts.format, rows.items, cols[0..], opts.out_path);
+}
+
+fn cmdMemoryMap(allocator: std.mem.Allocator, opts: Options) !void {
+    if (opts.thread_id == null and opts.contains == null and opts.regex == null) {
+        printCliError("error: memory-map requires --thread-id or --contains/--regex\n", .{});
+        return error.MissingContainsArg;
+    }
+
+    const trace = try parseMemoryTrace(opts.trace_text);
+    const use_regex = opts.regex != null;
+    const query_text = opts.contains orelse opts.regex;
+
+    var memory_rows = try datasets.memory_blocks.collect(allocator, .{ .memory_root = opts.memory_root_text });
+    defer datasets.memory_blocks.deinitRows(allocator, &memory_rows);
+
+    var rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &rows);
+
+    if (opts.thread_id) |thread_id| {
+        var stage1_rows = try datasets.memory_stage1_outputs.collect(allocator, .{ .state_db_path = opts.state_db_path });
+        defer datasets.memory_stage1_outputs.deinitRows(allocator, &stage1_rows);
+        const stage1_row = findMemoryStage1OutputRow(stage1_rows.items, thread_id) orelse {
+            printCliError("error: no stage1 memory row for thread {s}\n", .{thread_id});
+            return error.SessionNotFound;
+        };
+        const state_db_path = try datasets.codex_state_sqlite.resolveDefaultDbPath(allocator, opts.state_db_path);
+        defer allocator.free(state_db_path);
+
+        const preview = try std.fmt.allocPrint(
+            allocator,
+            "selected_for_phase2={s} cwd={s}",
+            .{ if (stage1_row.selected_for_phase2) "true" else "false", stage1_row.cwd },
+        );
+        defer allocator.free(preview);
+
+        try appendMemoryMapRow(
+            allocator,
+            &rows,
+            "stage1_outputs",
+            state_db_path,
+            null,
+            "stage1_outputs row",
+            stage1_row.thread_id,
+            stage1_row.rollout_path,
+            "thread_id",
+            preview,
+            try std.fmt.allocPrint(allocator, "stage1_outputs:{s}", .{stage1_row.thread_id}),
+            "session-prompts",
+            try std.fmt.allocPrint(allocator, "seq session-prompts --path {s} --roles user,assistant --strip-skill-blocks --limit 40 --format jsonl", .{stage1_row.rollout_path}),
+        );
+
+        const rollout_summary_row = findRolloutSummaryRow(memory_rows.items, thread_id, stage1_row.rollout_path, null);
+        for (memory_rows.items) |block_row| {
+            if (!memoryBlockMatchesThread(block_row, thread_id, stage1_row.rollout_path, rollout_summary_row)) continue;
+            const next_action_kind: []const u8 = if (block_row.rollout_path != null) "session-prompts" else "none";
+            const next_action = if (block_row.rollout_path) |rollout_path|
+                try std.fmt.allocPrint(allocator, "seq session-prompts --path {s} --roles user,assistant --strip-skill-blocks --limit 40 --format jsonl", .{rollout_path})
+            else
+                try allocator.dupe(u8, "");
+            try appendMemoryMapRow(
+                allocator,
+                &rows,
+                block_row.doc_kind,
+                block_row.path,
+                if (block_row.heading_path.len > 0) block_row.heading_path else null,
+                block_row.title,
+                block_row.thread_id,
+                block_row.rollout_path,
+                "thread_id",
+                if (shouldExpandMemoryTrace(trace, true)) block_row.preview else "",
+                try buildMemoryBlockEvidenceRef(allocator, block_row),
+                next_action_kind,
+                next_action,
+            );
+        }
+    } else {
+        const match_kind = if (use_regex) "regex" else "contains";
+        for (memory_rows.items) |block_row| {
+            if (!timestampSatisfiesBounds(block_row.updated_at, opts)) continue;
+            const keywords = block_row.keywords orelse "";
+            const score = try matchScoreForText(allocator, query_text.?, use_regex, &.{ block_row.title, block_row.heading_path, block_row.body, keywords, block_row.relative_path });
+            if (score == null) continue;
+            const next_action_kind: []const u8 = if (block_row.rollout_path != null) "session-prompts" else "none";
+            const next_action = if (block_row.rollout_path) |rollout_path|
+                try std.fmt.allocPrint(allocator, "seq session-prompts --path {s} --roles user,assistant --strip-skill-blocks --limit 40 --format jsonl", .{rollout_path})
+            else
+                try allocator.dupe(u8, "");
+            try appendMemoryMapRow(
+                allocator,
+                &rows,
+                block_row.doc_kind,
+                block_row.path,
+                if (block_row.heading_path.len > 0) block_row.heading_path else null,
+                block_row.title,
+                block_row.thread_id,
+                block_row.rollout_path,
+                match_kind,
+                block_row.preview,
+                try buildMemoryBlockEvidenceRef(allocator, block_row),
+                next_action_kind,
+                next_action,
+            );
+            try rows.items[rows.items.len - 1].putOwnedKey("score", .{ .int = score.? });
+            try putOptionalString(&rows.items[rows.items.len - 1], "updated_at", block_row.updated_at);
+        }
+    }
+
+    const select_targeted = [_][]const u8{ "surface", "path", "heading_path", "title", "thread_id", "rollout_path", "match_kind", "preview", "evidence_ref", "next_action_kind", "next_action" };
+    const select_search = [_][]const u8{ "surface", "path", "heading_path", "title", "thread_id", "rollout_path", "match_kind", "score", "updated_at", "preview", "evidence_ref", "next_action_kind", "next_action" };
+    const select: []const []const u8 = if (opts.thread_id != null) select_targeted[0..] else select_search[0..];
+
+    if (opts.thread_id == null) {
+        const sort = [_]spec.SortSpec{
+            .{ .field = "score", .descending = true },
+            .{ .field = "updated_at", .descending = true },
+        };
+        const limit = if (opts.limit == 0) 20 else opts.limit;
+        const query_spec = spec.QuerySpec{
+            .sort = sort[0..],
+            .limit = limit,
+            .select = select[0..],
+        };
+        var result = try query.execute(allocator, rows.items, query_spec);
+        defer result.deinit(allocator);
+        try output.writeOutput(allocator, opts.format, result.rows.items, select[0..], opts.out_path);
+    } else {
+        try output.writeOutput(allocator, opts.format, rows.items, select[0..], opts.out_path);
+    }
+}
+
+fn cmdMemoryHistory(allocator: std.mem.Allocator, opts: Options) !void {
+    if (opts.thread_id == null and opts.contains == null and opts.regex == null) {
+        printCliError("error: memory-history requires --thread-id or --contains/--regex\n", .{});
+        return error.MissingContainsArg;
+    }
+
+    const trace = try parseMemoryTrace(opts.trace_text);
+    var rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &rows);
+
+    if (opts.thread_id) |thread_id| {
+        var stage1_rows = try datasets.memory_stage1_outputs.collect(allocator, .{ .state_db_path = opts.state_db_path });
+        defer datasets.memory_stage1_outputs.deinitRows(allocator, &stage1_rows);
+        var memory_rows = try datasets.memory_blocks.collect(allocator, .{ .memory_root = opts.memory_root_text });
+        defer datasets.memory_blocks.deinitRows(allocator, &memory_rows);
+
+        const stage1_row = findMemoryStage1OutputRow(stage1_rows.items, thread_id) orelse {
+            printCliError("error: no stage1 memory row for thread {s}\n", .{thread_id});
+            return error.SessionNotFound;
+        };
+        const rollout_summary_row = findRolloutSummaryRow(memory_rows.items, thread_id, stage1_row.rollout_path, null);
+
+        var event_count: i64 = 0;
+        if (timestampSatisfiesBounds(stage1_row.generated_at, opts)) event_count += 1;
+        if (stage1_row.source_updated_at != null and !optionalStringsEqual(stage1_row.source_updated_at, stage1_row.generated_at) and timestampSatisfiesBounds(stage1_row.source_updated_at, opts)) event_count += 1;
+        if (timestampSatisfiesBounds(stage1_row.last_usage, opts)) event_count += 1;
+        if (rollout_summary_row != null and timestampSatisfiesBounds(rollout_summary_row.?.updated_at, opts)) event_count += 1;
+
+        var summary_row = query.Row.init(allocator);
+        try summary_row.putOwnedKey("row_order", .{ .int = 0 });
+        const summary_evidence = try std.fmt.allocPrint(allocator, "stage1_outputs:{s}", .{stage1_row.thread_id});
+        defer allocator.free(summary_evidence);
+        const summary_next_action = try std.fmt.allocPrint(allocator, "seq session-prompts --path {s} --roles user,assistant --strip-skill-blocks --limit 40 --format jsonl", .{stage1_row.rollout_path});
+        defer allocator.free(summary_next_action);
+        try summary_row.putOwnedKey("row_kind", .{ .string = "summary" });
+        try summary_row.putOwnedKey("thread_id", .{ .string = stage1_row.thread_id });
+        try summary_row.putOwnedKey("summary", .{ .string = "observed_evidence_timeline" });
+        try summary_row.putOwnedKey("event_count", .{ .int = event_count });
+        try summary_row.putOwnedKey("evidence_ref", .{ .string = summary_evidence });
+        try summary_row.putOwnedKey("next_action_kind", .{ .string = "session-prompts" });
+        try summary_row.putOwnedKey("next_action", .{ .string = summary_next_action });
+        try rows.append(allocator, summary_row);
+
+        if (timestampSatisfiesBounds(stage1_row.generated_at, opts)) {
+            const preview = try std.fmt.allocPrint(allocator, "generated_at={s}", .{stage1_row.generated_at.?});
+            defer allocator.free(preview);
+            try appendMemoryHistoryEvent(allocator, &rows, "stage1_generated", stage1_row.generated_at.?, stage1_row.thread_id, stage1_row.rollout_path, try std.fmt.allocPrint(allocator, "stage1_outputs:{s}", .{stage1_row.thread_id}), preview);
+        }
+        if (stage1_row.source_updated_at) |source_updated_at| {
+            if (!optionalStringsEqual(stage1_row.source_updated_at, stage1_row.generated_at) and timestampSatisfiesBounds(stage1_row.source_updated_at, opts)) {
+                const preview = try std.fmt.allocPrint(allocator, "source_updated_at={s}", .{source_updated_at});
+                defer allocator.free(preview);
+                try appendMemoryHistoryEvent(allocator, &rows, "stage1_source_updated", source_updated_at, stage1_row.thread_id, stage1_row.rollout_path, try std.fmt.allocPrint(allocator, "stage1_outputs:{s}", .{stage1_row.thread_id}), preview);
+            }
+        }
+        if (stage1_row.last_usage) |last_usage| {
+            if (timestampSatisfiesBounds(stage1_row.last_usage, opts)) {
+                const preview = try std.fmt.allocPrint(allocator, "last_usage={s}", .{last_usage});
+                defer allocator.free(preview);
+                try appendMemoryHistoryEvent(allocator, &rows, "stage1_last_usage", last_usage, stage1_row.thread_id, stage1_row.rollout_path, try std.fmt.allocPrint(allocator, "stage1_outputs:{s}", .{stage1_row.thread_id}), preview);
+            }
+        }
+        if (rollout_summary_row) |summary_block| {
+            if (timestampSatisfiesBounds(summary_block.updated_at, opts)) {
+                try appendMemoryHistoryEvent(
+                    allocator,
+                    &rows,
+                    "rollout_summary_updated",
+                    summary_block.updated_at.?,
+                    stage1_row.thread_id,
+                    stage1_row.rollout_path,
+                    try buildMemoryBlockEvidenceRef(allocator, summary_block.*),
+                    if (shouldExpandMemoryTrace(trace, true)) summary_block.preview else "rollout_summary_updated",
+                );
+            }
+        }
+    } else {
+        const use_regex = opts.regex != null;
+        const query_text = opts.contains orelse opts.regex orelse unreachable;
+        var memory_rows = try datasets.memory_blocks.collect(allocator, .{ .memory_root = opts.memory_root_text });
+        defer datasets.memory_blocks.deinitRows(allocator, &memory_rows);
+
+        var event_count: i64 = 0;
+        for (memory_rows.items) |block_row| {
+            if (!timestampSatisfiesBounds(block_row.updated_at, opts)) continue;
+            const keywords = block_row.keywords orelse "";
+            const score = try matchScoreForText(allocator, query_text, use_regex, &.{ block_row.title, block_row.heading_path, block_row.body, keywords, block_row.relative_path });
+            if (score == null) continue;
+            event_count += 1;
+        }
+
+        var summary_row = query.Row.init(allocator);
+        try summary_row.putOwnedKey("row_order", .{ .int = 0 });
+        const topic_next_action = try std.fmt.allocPrint(allocator, "seq artifact-search --contains {s} --kind memory --format table", .{query_text});
+        defer allocator.free(topic_next_action);
+        try summary_row.putOwnedKey("row_kind", .{ .string = "summary" });
+        try summary_row.putOwnedKey("thread_id", .null);
+        try summary_row.putOwnedKey("summary", .{ .string = "topic_artifact_timeline" });
+        try summary_row.putOwnedKey("event_count", .{ .int = event_count });
+        try summary_row.putOwnedKey("evidence_ref", .{ .string = "memory_blocks:topic-search" });
+        try summary_row.putOwnedKey("next_action_kind", .{ .string = "artifact-search" });
+        try summary_row.putOwnedKey("next_action", .{ .string = topic_next_action });
+        try rows.append(allocator, summary_row);
+
+        for (memory_rows.items) |block_row| {
+            if (!timestampSatisfiesBounds(block_row.updated_at, opts)) continue;
+            const keywords = block_row.keywords orelse "";
+            const score = try matchScoreForText(allocator, query_text, use_regex, &.{ block_row.title, block_row.heading_path, block_row.body, keywords, block_row.relative_path });
+            if (score == null) continue;
+            try appendMemoryHistoryEvent(
+                allocator,
+                &rows,
+                "artifact_match",
+                block_row.updated_at.?,
+                block_row.thread_id,
+                block_row.rollout_path,
+                try buildMemoryBlockEvidenceRef(allocator, block_row),
+                block_row.preview,
+            );
+            try rows.items[rows.items.len - 1].putOwnedKey("score", .{ .int = score.? });
+        }
+    }
+
+    const cols = [_][]const u8{ "row_kind", "timestamp", "change_kind", "thread_id", "summary", "preview", "evidence_ref", "next_action_kind", "next_action", "event_count", "score" };
+    const limit = if (opts.limit == 0) 200 else opts.limit;
+    var ordered: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &ordered);
+    for (rows.items) |row| {
+        if (scalarStringEq(row.valueOrNull("row_kind"), "summary")) {
+            try ordered.append(allocator, try row.cloneSelected(allocator, cols[0..]));
+        }
+    }
+    var event_rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &event_rows);
+    for (rows.items) |row| {
+        if (!scalarStringEq(row.valueOrNull("row_kind"), "summary")) {
+            try event_rows.append(allocator, try row.cloneSelected(allocator, cols[0..]));
+        }
+    }
+    std.mem.sort(query.Row, event_rows.items, {}, historyRowLessThan);
+
+    const remaining = if (limit > ordered.items.len) limit - ordered.items.len else 0;
+    const emit_count = @min(remaining, event_rows.items.len);
+    for (event_rows.items[0..emit_count]) |row| {
+        try ordered.append(allocator, try row.cloneAll(allocator));
+    }
+
+    try output.writeOutput(allocator, opts.format, ordered.items, cols[0..], opts.out_path);
+}
+
+fn historyRowLessThan(_: void, lhs: query.Row, rhs: query.Row) bool {
+    const lhs_ts = switch (lhs.valueOrNull("timestamp")) {
+        .string => |text| text,
+        else => "",
+    };
+    const rhs_ts = switch (rhs.valueOrNull("timestamp")) {
+        .string => |text| text,
+        else => "",
+    };
+    const order = compareNormalizedTimestamp(lhs_ts, rhs_ts);
+    if (order != .eq) return order == .lt;
+    const lhs_ref = switch (lhs.valueOrNull("evidence_ref")) {
+        .string => |text| text,
+        else => "",
+    };
+    const rhs_ref = switch (rhs.valueOrNull("evidence_ref")) {
+        .string => |text| text,
+        else => "",
+    };
+    return std.mem.order(u8, lhs_ref, rhs_ref) == .lt;
+}
+
+fn resolveThreadIdFromRolloutSummary(
+    rows: []const datasets.memory_blocks.Row,
+    input_path: []const u8,
+) ![]const u8 {
+    if (!std.mem.containsAtLeast(u8, input_path, 1, "/") and !std.fs.path.isAbsolute(input_path)) {
+        printCliError("error: --rollout-summary-file requires a full relative or absolute path\n", .{});
+        return error.SessionNotFound;
+    }
+    if (findUniqueRolloutSummaryMatch(rows, input_path, .exact)) |row| {
+        if (row.thread_id != null) return row.thread_id.?;
+    }
+    printCliError("error: could not resolve rollout summary path {s}\n", .{input_path});
+    return error.SessionNotFound;
+}
+
+const RolloutSummaryMatchMode = enum {
+    exact,
+    basename,
+};
+
+fn findUniqueRolloutSummaryMatch(
+    rows: []const datasets.memory_blocks.Row,
+    input_path: []const u8,
+    mode: RolloutSummaryMatchMode,
+) ?*const datasets.memory_blocks.Row {
+    const input_base = std.fs.path.basename(input_path);
+    var match: ?*const datasets.memory_blocks.Row = null;
+    for (rows) |*row| {
+        if (!std.mem.eql(u8, row.doc_kind, "rollout_summary")) continue;
+        const matches = switch (mode) {
+            .exact => std.mem.eql(u8, row.path, input_path) or std.mem.eql(u8, row.relative_path, input_path),
+            .basename => std.mem.eql(u8, std.fs.path.basename(row.relative_path), input_base),
+        };
+        if (!matches) continue;
+        if (match != null) {
+            const same_file = std.mem.eql(u8, match.?.relative_path, row.relative_path);
+            if (!same_file) {
+                printCliError("error: rollout summary selector {s} is ambiguous; use the full relative or absolute path\n", .{input_path});
+                return null;
+            }
+            if (row.heading_path.len < match.?.heading_path.len) {
+                match = row;
+            }
+            continue;
+        }
+        match = row;
+    }
+    return match;
+}
+
+fn findMemoryStage1OutputRow(
+    rows: []const datasets.memory_stage1_outputs.Row,
+    thread_id: []const u8,
+) ?*const datasets.memory_stage1_outputs.Row {
+    for (rows) |*row| {
+        if (std.mem.eql(u8, row.thread_id, thread_id)) return row;
+    }
+    return null;
+}
+
+fn findRolloutSummaryRow(
+    rows: []const datasets.memory_blocks.Row,
+    thread_id: []const u8,
+    rollout_path: []const u8,
+    rollout_summary_file_opt: ?[]const u8,
+) ?*const datasets.memory_blocks.Row {
+    for (rows) |*row| {
+        if (!std.mem.eql(u8, row.doc_kind, "rollout_summary")) continue;
+        if (row.thread_id != null and std.mem.eql(u8, row.thread_id.?, thread_id)) return row;
+        if (row.rollout_path != null and std.mem.eql(u8, row.rollout_path.?, rollout_path)) return row;
+    }
+    if (rollout_summary_file_opt) |input_path| {
+        if (findUniqueRolloutSummaryMatch(rows, input_path, .exact)) |row| return row;
+    }
+    return null;
+}
+
+fn memoryBlockMatchesThread(
+    row: datasets.memory_blocks.Row,
+    thread_id: []const u8,
+    rollout_path: []const u8,
+    rollout_summary_row: ?*const datasets.memory_blocks.Row,
+) bool {
+    if (row.thread_id != null and std.mem.eql(u8, row.thread_id.?, thread_id)) return true;
+    if (row.rollout_path != null and std.mem.eql(u8, row.rollout_path.?, rollout_path)) return true;
+    const summary_row = rollout_summary_row orelse return false;
+    if (std.mem.eql(u8, row.relative_path, summary_row.relative_path)) return true;
+    if (!std.mem.eql(u8, row.doc_kind, "memory_registry") and !std.mem.eql(u8, row.doc_kind, "memory_summary") and !std.mem.eql(u8, row.doc_kind, "memory_doc")) return false;
+    const summary_base = std.fs.path.basename(summary_row.relative_path);
+    return containsIgnoreCaseAscii(row.body, thread_id) and
+        (containsIgnoreCaseAscii(row.body, summary_row.relative_path) or containsIgnoreCaseAscii(row.body, summary_base));
+}
+
+fn collectCurrentSurfacesSummary(
+    allocator: std.mem.Allocator,
+    rows: []const datasets.memory_blocks.Row,
+    thread_id: []const u8,
+    rollout_path: []const u8,
+    rollout_summary_row: ?*const datasets.memory_blocks.Row,
+) ![]u8 {
+    var labels: std.ArrayList([]const u8) = .empty;
+    defer labels.deinit(allocator);
+
+    try labels.append(allocator, "stage1_outputs");
+    for (rows) |row| {
+        if (!memoryBlockMatchesThread(row, thread_id, rollout_path, rollout_summary_row)) continue;
+        const label = if (std.mem.eql(u8, row.doc_kind, "memory_registry"))
+            "memory_registry"
+        else if (std.mem.eql(u8, row.doc_kind, "memory_summary"))
+            "memory_summary"
+        else if (std.mem.eql(u8, row.doc_kind, "memory_skill"))
+            "memory_skill"
+        else if (std.mem.eql(u8, row.doc_kind, "rollout_summary"))
+            "rollout_summary"
+        else
+            "memory_doc";
+        var already = false;
+        for (labels.items) |existing| {
+            if (std.mem.eql(u8, existing, label)) {
+                already = true;
+                break;
+            }
+        }
+        if (!already) try labels.append(allocator, label);
+    }
+
+    return joinStringList(allocator, labels.items);
+}
+
+fn collectActiveExtensionsSummary(
+    allocator: std.mem.Allocator,
+    rows: []const datasets.memory_extensions.Row,
+) ![]u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(allocator);
+    for (rows) |row| {
+        if (row.has_instructions) try names.append(allocator, row.extension_name);
+    }
+    return joinStringList(allocator, names.items);
+}
+
+fn collectProvenanceWarnings(
+    allocator: std.mem.Allocator,
+    rollout_summary_row: ?*const datasets.memory_blocks.Row,
+) !?[]u8 {
+    if (rollout_summary_row == null) return try allocator.dupe(u8, "missing_rollout_summary_artifact");
+    return null;
+}
+
+fn joinStringList(allocator: std.mem.Allocator, items: []const []const u8) ![]u8 {
+    if (items.len == 0) return allocator.dupe(u8, "");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    for (items, 0..) |item, idx| {
+        if (idx > 0) try out.appendSlice(allocator, ",");
+        try out.appendSlice(allocator, item);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn buildMemoryBlockEvidenceRef(allocator: std.mem.Allocator, row: datasets.memory_blocks.Row) ![]u8 {
+    if (row.heading_path.len > 0) {
+        return std.fmt.allocPrint(allocator, "memory_blocks:{s}#{s}", .{ row.relative_path, row.heading_path });
+    }
+    return std.fmt.allocPrint(allocator, "memory_blocks:{s}", .{row.relative_path});
+}
+
+fn appendMemoryMapRow(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    surface: []const u8,
+    path: []const u8,
+    heading_path: ?[]const u8,
+    title: []const u8,
+    thread_id: ?[]const u8,
+    rollout_path: ?[]const u8,
+    match_kind: []const u8,
+    preview: []const u8,
+    evidence_ref: []const u8,
+    next_action_kind: []const u8,
+    next_action: []const u8,
+) !void {
+    defer allocator.free(evidence_ref);
+    defer allocator.free(next_action);
+    var row = query.Row.init(allocator);
+    try row.putOwnedKey("surface", .{ .string = surface });
+    try row.putOwnedKey("path", .{ .string = path });
+    try putOptionalString(&row, "heading_path", heading_path);
+    try row.putOwnedKey("title", .{ .string = title });
+    try putOptionalString(&row, "thread_id", thread_id);
+    try putOptionalString(&row, "rollout_path", rollout_path);
+    try row.putOwnedKey("match_kind", .{ .string = match_kind });
+    try row.putOwnedKey("preview", .{ .string = preview });
+    try row.putOwnedKey("evidence_ref", .{ .string = evidence_ref });
+    try row.putOwnedKey("next_action_kind", .{ .string = next_action_kind });
+    if (next_action.len > 0) {
+        try row.putOwnedKey("next_action", .{ .string = next_action });
+    } else {
+        try row.putOwnedKey("next_action", .null);
+    }
+    try out_rows.append(allocator, row);
+}
+
+fn appendMemoryHistoryEvent(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    change_kind: []const u8,
+    timestamp: []const u8,
+    thread_id: ?[]const u8,
+    rollout_path: ?[]const u8,
+    evidence_ref: []const u8,
+    preview: []const u8,
+) !void {
+    defer allocator.free(evidence_ref);
+    var row = query.Row.init(allocator);
+    try row.putOwnedKey("row_order", .{ .int = 1 });
+    try row.putOwnedKey("row_kind", .{ .string = "event" });
+    try row.putOwnedKey("timestamp", .{ .string = timestamp });
+    try row.putOwnedKey("change_kind", .{ .string = change_kind });
+    try putOptionalString(&row, "thread_id", thread_id);
+    try row.putOwnedKey("summary", .null);
+    try row.putOwnedKey("preview", .{ .string = preview });
+    try row.putOwnedKey("evidence_ref", .{ .string = evidence_ref });
+    if (rollout_path) |path| {
+        const next_action = try std.fmt.allocPrint(allocator, "seq session-prompts --path {s} --roles user,assistant --strip-skill-blocks --limit 40 --format jsonl", .{path});
+        defer allocator.free(next_action);
+        try row.putOwnedKey("next_action_kind", .{ .string = "session-prompts" });
+        try row.putOwnedKey("next_action", .{ .string = next_action });
+    } else {
+        try row.putOwnedKey("next_action_kind", .{ .string = "none" });
+        try row.putOwnedKey("next_action", .null);
+    }
+    try row.putOwnedKey("event_count", .null);
+    try row.putOwnedKey("score", .null);
+    try out_rows.append(allocator, row);
+}
+
+fn shouldExpandMemoryTrace(trace: MemoryTrace, specific_target: bool) bool {
+    return switch (trace) {
+        .none => false,
+        .always => true,
+        .auto => specific_target,
+    };
+}
+
+fn optionalStringsEqual(lhs: ?[]const u8, rhs: ?[]const u8) bool {
+    if (lhs == null and rhs == null) return true;
+    if (lhs == null or rhs == null) return false;
+    return std.mem.eql(u8, lhs.?, rhs.?);
 }
 
 fn containsIgnoreCaseAscii(haystack: []const u8, needle: []const u8) bool {
@@ -4928,6 +5644,10 @@ fn collectDatasetRows(
         try collectMemoryFilesRows(allocator, query_params, &rows);
     } else if (std.mem.eql(u8, dataset_name, "memory_blocks")) {
         try collectMemoryBlocksRows(allocator, query_params, &rows);
+    } else if (std.mem.eql(u8, dataset_name, "memory_stage1_outputs")) {
+        try collectMemoryStage1OutputRows(allocator, query_params, &rows);
+    } else if (std.mem.eql(u8, dataset_name, "memory_extensions")) {
+        try collectMemoryExtensionRows(allocator, query_params, &rows);
     } else if (std.mem.eql(u8, dataset_name, "opencode_prompts")) {
         try collectOpencodePromptRows(allocator, query_params, &rows);
     } else if (std.mem.eql(u8, dataset_name, "opencode_events")) {
@@ -5429,6 +6149,67 @@ fn collectMemoryBlocksRows(
         try putOptionalString(&qrow, "thread_id", row.thread_id);
         try putOptionalString(&qrow, "rollout_path", row.rollout_path);
         try putOptionalString(&qrow, "keywords", row.keywords);
+        try out_rows.append(allocator, qrow);
+    }
+}
+
+fn collectMemoryStage1OutputRows(
+    allocator: std.mem.Allocator,
+    query_params: []const spec.ParamSpec,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    var options = datasets.memory_stage1_outputs.Options{};
+    if (paramString(query_params, "state_db_path")) |state_db_path| {
+        options.state_db_path = state_db_path;
+    }
+
+    var parsed = try datasets.memory_stage1_outputs.collect(allocator, options);
+    defer datasets.memory_stage1_outputs.deinitRows(allocator, &parsed);
+
+    for (parsed.items) |row| {
+        var qrow = query.Row.init(allocator);
+        try qrow.putOwnedKey("thread_id", .{ .string = row.thread_id });
+        try putOptionalString(&qrow, "source_updated_at", row.source_updated_at);
+        try putOptionalString(&qrow, "generated_at", row.generated_at);
+        try putOptionalString(&qrow, "rollout_slug", row.rollout_slug);
+        try putOptionalInt(&qrow, "usage_count", row.usage_count);
+        try putOptionalString(&qrow, "last_usage", row.last_usage);
+        try qrow.putOwnedKey("selected_for_phase2", .{ .bool = row.selected_for_phase2 });
+        try putOptionalString(&qrow, "selected_for_phase2_source_updated_at", row.selected_for_phase2_source_updated_at);
+        try qrow.putOwnedKey("rollout_path", .{ .string = row.rollout_path });
+        try qrow.putOwnedKey("cwd", .{ .string = row.cwd });
+        try putOptionalString(&qrow, "git_branch", row.git_branch);
+        try qrow.putOwnedKey("source", .{ .string = row.source });
+        try qrow.putOwnedKey("title", .{ .string = row.title });
+        try qrow.putOwnedKey("memory_mode", .{ .string = row.memory_mode });
+        try out_rows.append(allocator, qrow);
+    }
+}
+
+fn collectMemoryExtensionRows(
+    allocator: std.mem.Allocator,
+    query_params: []const spec.ParamSpec,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    var options = datasets.memory_extensions.Options{};
+    if (paramString(query_params, "extensions_root")) |extensions_root| {
+        options.extensions_root = extensions_root;
+    }
+
+    var parsed = try datasets.memory_extensions.collect(allocator, options);
+    defer datasets.memory_extensions.deinitRows(allocator, &parsed);
+
+    for (parsed.items) |row| {
+        var qrow = query.Row.init(allocator);
+        try qrow.putOwnedKey("extension_name", .{ .string = row.extension_name });
+        try putOptionalString(&qrow, "instructions_path", row.instructions_path);
+        try qrow.putOwnedKey("has_instructions", .{ .bool = row.has_instructions });
+        try putOptionalString(&qrow, "modified_at", row.modified_at);
+        if (row.size_bytes) |value| {
+            try qrow.putOwnedKey("size_bytes", .{ .int = @intCast(value) });
+        } else {
+            try qrow.putOwnedKey("size_bytes", .null);
+        }
         try out_rows.append(allocator, qrow);
     }
 }
@@ -6318,6 +7099,14 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.session_id = args[i];
+        } else if (std.mem.eql(u8, arg, "--thread-id")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.thread_id = args[i];
+        } else if (std.mem.eql(u8, arg, "--rollout-summary-file")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.rollout_summary_file = args[i];
         } else if (std.mem.eql(u8, arg, "--output")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -6430,6 +7219,22 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.sort_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--trace")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.trace_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--state-db-path")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.state_db_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--memory-root")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.memory_root_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--extensions-root")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.extensions_root_text = args[i];
         } else if (std.mem.eql(u8, arg, "--opencode-db-path")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;

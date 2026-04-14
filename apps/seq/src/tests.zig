@@ -19,6 +19,9 @@ comptime {
     _ = @import("datasets/tool_calls.zig");
     _ = @import("datasets/memory_files.zig");
     _ = @import("datasets/memory_blocks.zig");
+    _ = @import("datasets/codex_state_sqlite.zig");
+    _ = @import("datasets/memory_stage1_outputs.zig");
+    _ = @import("datasets/memory_extensions.zig");
     _ = @import("datasets/opencode_prompts.zig");
     _ = @import("datasets/opencode_events.zig");
     _ = @import("datasets/opencode_sqlite.zig");
@@ -52,6 +55,9 @@ test "bootstrap parse coverage" {
     try std.testing.expectEqual(lib.Command.query, lib.parseCommand("query"));
     try std.testing.expectEqual(lib.Command.session_tooling, lib.parseCommand("session-tooling"));
     try std.testing.expectEqual(lib.Command.query_diagnose, lib.parseCommand("query-diagnose"));
+    try std.testing.expectEqual(lib.Command.memory_provenance, lib.parseCommand("memory-provenance"));
+    try std.testing.expectEqual(lib.Command.memory_map, lib.parseCommand("memory-map"));
+    try std.testing.expectEqual(lib.Command.memory_history, lib.parseCommand("memory-history"));
     try std.testing.expectEqual(lib.Command.opencode_prompts, lib.parseCommand("opencode-prompts"));
     try std.testing.expectEqual(lib.Command.opencode_events, lib.parseCommand("opencode-events"));
     try std.testing.expectEqual(lib.Command.unknown, lib.parseCommand("invalid"));
