@@ -30,8 +30,10 @@ jobs:
         include:
           - target: linux-x86_64
             runs_on: ubuntu-latest
+            zig_archive: zig-x86_64-linux-0.15.2.tar.xz
           - target: darwin-arm64
             runs_on: macos-14
+            zig_archive: zig-aarch64-macos-0.15.2.tar.xz
     runs-on: ${{ matrix.runs_on }}
     steps:
       - uses: actions/checkout@v5
@@ -44,9 +46,14 @@ jobs:
             echo "Tag mismatch: expected ${expected_tag}, got ${RELEASE_TAG}" >&2
             exit 1
           fi
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
+      - name: Install Zig 0.15.2
+        run: |
+          set -euo pipefail
+          archive="${{ matrix.zig_archive }}"
+          curl -fsSLO "https://ziglang.org/download/0.15.2/${archive}"
+          tar -xf "${archive}"
+          zig_dir="${archive%.tar.xz}"
+          echo "${PWD}/${zig_dir}" >> "$GITHUB_PATH"
       - name: Build st binary
         run: zig build build-st -Doptimize=ReleaseFast
       - name: Package st artifact
