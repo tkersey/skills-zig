@@ -95,7 +95,7 @@ pub fn parseTokenEventsReader(
     allocator: std.mem.Allocator,
     path: []const u8,
     dedupe: bool,
-    reader: anytype,
+    reader: *std.Io.Reader,
 ) !std.ArrayList(Row) {
     return parseTokenEventsReaderWithOptions(allocator, path, .{
         .dedupe = dedupe,
@@ -107,7 +107,7 @@ pub fn parseTokenEventsReaderWithOptions(
     allocator: std.mem.Allocator,
     path: []const u8,
     options: ParseOptions,
-    reader: anytype,
+    reader: *std.Io.Reader,
 ) !std.ArrayList(Row) {
     var rows = std.ArrayList(Row).empty;
     errdefer rows.deinit(allocator);
@@ -116,10 +116,9 @@ pub fn parseTokenEventsReaderWithOptions(
     var carry: std.ArrayList(u8) = .empty;
     defer carry.deinit(allocator);
 
-    var in = reader;
     var chunk: [stream_chunk_size]u8 = undefined;
     while (true) {
-        const read_len = try in.read(chunk[0..]);
+        const read_len = try reader.readSliceShort(chunk[0..]);
         if (read_len == 0) break;
 
         try carry.appendSlice(allocator, chunk[0..read_len]);
@@ -159,9 +158,11 @@ pub fn parseTokenEventsFileWithOptions(
     path: []const u8,
     options: ParseOptions,
 ) !std.ArrayList(Row) {
-    const file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
-    return parseTokenEventsReaderWithOptions(allocator, path, options, file);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+    return parseTokenEventsReaderWithOptions(allocator, path, options, &reader.interface);
 }
 
 fn appendParsedLine(
@@ -799,15 +800,17 @@ fn expectMaybeRowsEqual(got: ?Row, want: ?Row) !void {
     if (want) |expected| try expectRowsEqual(got.?, expected);
 }
 
-fn fuzzTokenCountParity(_: void, input: []const u8) !void {
+fn fuzzTokenCountParity(_: void, smith: *std.testing.Smith) !void {
+    var storage: [512]u8 = undefined;
+    for (&storage) |*b| b.* = smith.value(u8);
+    const len = smith.value(usize) % (storage.len + 1);
+    const input = storage[0..len];
     const path = "fuzz.jsonl";
     const got = parseTokenCountLine(input, path) catch |err| switch (err) {
         error.TextTooLong => null,
-        else => return err,
     };
     const want = parseTokenCountLineStdJson(input, path) catch |err| switch (err) {
         error.TextTooLong => null,
-        else => return err,
     };
     try expectMaybeRowsEqual(got, want);
 }
@@ -949,8 +952,8 @@ test "parseTokenEventsReader keeps dedupe/reset semantics" {
         \\{"type":"event_msg","timestamp":"2026-02-19T10:12:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":5}}}}
     ;
 
-    var fbs = std.io.fixedBufferStream(content);
-    var streamed = try parseTokenEventsReader(std.testing.allocator, "stream.jsonl", true, fbs.reader());
+    var reader = std.Io.Reader.fixed(content);
+    var streamed = try parseTokenEventsReader(std.testing.allocator, "stream.jsonl", true, &reader);
     defer streamed.deinit(std.testing.allocator);
 
     var from_slice = try parseTokenEvents(std.testing.allocator, "stream.jsonl", content, true);
@@ -980,7 +983,7 @@ test "parseTokenEventsWithOptions can skip timestamp derivation" {
 }
 
 test "parseTokenEvents parity with std.json reference on golden sample" {
-    const content = try std.fs.cwd().readFileAlloc(std.testing.allocator, "testdata/golden/sessions/sample.jsonl", 256 * 1024);
+    const content = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), "testdata/golden/sessions/sample.jsonl", std.testing.allocator, .limited(256 * 1024));
     defer std.testing.allocator.free(content);
 
     var got = try parseTokenEvents(std.testing.allocator, "sample.jsonl", content, true);

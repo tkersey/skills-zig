@@ -66,10 +66,10 @@ pub fn collect(allocator: std.mem.Allocator, options: Options) !RowList {
         const absolute_path = try std.fs.path.join(allocator, &.{ root_abs, relative_path });
         defer allocator.free(absolute_path);
 
-        const file = std.fs.openFileAbsolute(absolute_path, .{}) catch continue;
-        defer file.close();
+        const file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), absolute_path, .{}) catch continue;
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
 
-        const stat = file.stat() catch continue;
+        const stat = file.stat(std.Io.Threaded.global_single_threaded.io()) catch continue;
 
         const base_name = std.fs.path.basename(relative_path);
         const category = if (std.mem.indexOfScalar(u8, relative_path, '/')) |sep| relative_path[0..sep] else "root";
@@ -100,8 +100,7 @@ fn resolveMemoryRoot(allocator: std.mem.Allocator, override_root: ?[]const u8) !
         return toAbsolutePath(allocator, path);
     }
 
-    const home = try std.process.getEnvVarOwned(allocator, "HOME");
-    defer allocator.free(home);
+    const home = std.Io.Threaded.global_single_threaded.environString("HOME") orelse return error.EnvironmentVariableNotFound;
     return std.fs.path.join(allocator, &.{ home, ".codex", "memories" });
 }
 
@@ -111,7 +110,7 @@ fn toAbsolutePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 
     if (std.fs.path.isAbsolute(expanded)) return allocator.dupe(u8, expanded);
 
-    const cwd = try std.process.getCwdAlloc(allocator);
+    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
     defer allocator.free(cwd);
     return std.fs.path.join(allocator, &.{ cwd, expanded });
 }
@@ -127,16 +126,16 @@ fn collectFilePaths(allocator: std.mem.Allocator, root_abs: []const u8) !std.Arr
         out.deinit(allocator);
     }
 
-    var root_dir = std.fs.openDirAbsolute(root_abs, .{ .iterate = true }) catch |err| switch (err) {
+    var root_dir = std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), root_abs, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return out,
         else => return err,
     };
-    defer root_dir.close();
+    defer root_dir.close(std.Io.Threaded.global_single_threaded.io());
 
     var walker = try root_dir.walk(allocator);
     defer walker.deinit();
 
-    while (try walker.next()) |entry| {
+    while (try walker.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
         if (entry.kind != .file) continue;
         try out.append(allocator, try allocator.dupe(u8, entry.path));
     }
@@ -156,10 +155,11 @@ fn fileExtension(name: []const u8) []const u8 {
 }
 
 fn readPreview(allocator: std.mem.Allocator, absolute_path: []const u8) ![]u8 {
-    const file = std.fs.openFileAbsolute(absolute_path, .{}) catch return allocator.dupe(u8, "");
-    defer file.close();
+    const file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), absolute_path, .{}) catch return allocator.dupe(u8, "");
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
 
-    const content = file.readToEndAlloc(allocator, 8 * 1024) catch return allocator.dupe(u8, "");
+    var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const content = reader.interface.allocRemaining(allocator, .limited(8 * 1024)) catch return allocator.dupe(u8, "");
     defer allocator.free(content);
 
     var lines = std.mem.splitScalar(u8, content, '\n');

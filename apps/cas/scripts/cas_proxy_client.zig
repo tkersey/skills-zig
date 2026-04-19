@@ -34,8 +34,8 @@ pub const Client = struct {
     allocator: std.mem.Allocator,
     transport_kind: TransportKind,
     child: ?std.process.Child,
-    stdin_file: ?std.fs.File,
-    stdout_file: ?std.fs.File,
+    stdin_file: ?std.Io.File,
+    stdout_file: ?std.Io.File,
     websocket: ?websocket_transport.Connection,
     line_buf: std.ArrayList(u8) = .empty,
     next_request_id: i64 = 1,
@@ -67,12 +67,14 @@ pub const Client = struct {
         try argv.append(allocator, resolved_codex_path);
         try argv.append(allocator, "app-server");
 
-        var child = std.process.Child.init(argv.items, allocator);
-        child.cwd = opts.cwd;
-        child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
-        try child.spawn();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const child = try std.process.spawn(io, .{
+            .argv = argv.items,
+            .cwd = .{ .path = opts.cwd },
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .ignore,
+        });
 
         const stdin_file = child.stdin orelse return error.ChildMissingStdin;
         const stdout_file = child.stdout orelse return error.ChildMissingStdout;
@@ -140,8 +142,7 @@ pub const Client = struct {
     pub fn close(self: *Client) void {
         if (self.websocket) |*websocket| websocket.close();
         if (self.child) |*child| {
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            child.kill(std.Io.Threaded.global_single_threaded.io());
         }
     }
 
@@ -276,9 +277,9 @@ pub const Client = struct {
             try self.sendToServer(initialize);
         }
 
-        const started_ms = std.time.milliTimestamp();
+        const started_ms = monotonicMillis();
         const timeout_ms: i64 = 10_000;
-        while (std.time.milliTimestamp() - started_ms < timeout_ms) {
+        while (monotonicMillis() - started_ms < timeout_ms) {
             const line = (try self.readLineAlloc()) orelse return error.AppServerClosed;
             defer self.allocator.free(line);
 
@@ -350,8 +351,9 @@ pub const Client = struct {
         const payload = payload_writer.written();
         switch (self.transport_kind) {
             .stdio => {
-                try self.stdin_file.?.writeAll(payload);
-                try self.stdin_file.?.writeAll("\n");
+                const io = std.Io.Threaded.global_single_threaded.io();
+                try self.stdin_file.?.writeStreamingAll(io, payload);
+                try self.stdin_file.?.writeStreamingAll(io, "\n");
             },
             .websocket => try self.websocket.?.sendText(payload),
         }
@@ -453,8 +455,9 @@ pub const Client = struct {
         const payload = payload_writer.written();
         switch (self.transport_kind) {
             .stdio => {
-                try self.stdin_file.?.writeAll(payload);
-                try self.stdin_file.?.writeAll("\n");
+                const io = std.Io.Threaded.global_single_threaded.io();
+                try self.stdin_file.?.writeStreamingAll(io, payload);
+                try self.stdin_file.?.writeStreamingAll(io, "\n");
             },
             .websocket => try self.websocket.?.sendText(payload),
         }
@@ -710,7 +713,8 @@ pub const Client = struct {
             }
 
             var tmp: [4096]u8 = undefined;
-            const n = try self.stdout_file.?.read(&tmp);
+            var reader = self.stdout_file.?.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+            const n = try reader.interface.readSliceShort(tmp[0..]);
             if (n == 0) {
                 if (self.line_buf.items.len == 0) return null;
                 const tail = try self.allocator.dupe(u8, self.line_buf.items);
@@ -727,11 +731,11 @@ pub fn resolveExecutableAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]
     if (value.len == 0) return error.MissingExecutable;
 
     if (std.mem.indexOfScalar(u8, value, '/') != null) {
-        std.fs.cwd().access(value, .{}) catch return error.ExecutableNotFound;
+        std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), value, .{}) catch return error.ExecutableNotFound;
         return allocator.dupe(u8, value);
     }
 
-    const exe_dir = std.fs.selfExeDirPathAlloc(allocator) catch null;
+    const exe_dir = std.process.executableDirPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator) catch null;
     if (exe_dir) |dir| {
         defer allocator.free(dir);
         const sibling = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, value });
@@ -740,7 +744,7 @@ pub fn resolveExecutableAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]
         allocator.free(sibling);
     }
 
-    const path_env = std.posix.getenv("PATH") orelse return error.ExecutableNotFound;
+    const path_env = std.Io.Threaded.global_single_threaded.environString("PATH") orelse return error.ExecutableNotFound;
     var iter = std.mem.splitScalar(u8, path_env, ':');
     while (iter.next()) |dir| {
         if (dir.len == 0) continue;
@@ -753,12 +757,17 @@ pub fn resolveExecutableAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]
     return error.ExecutableNotFound;
 }
 
+fn monotonicMillis() i64 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    return @intCast(@divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000));
+}
+
 fn pathExists(path: []const u8) bool {
     if (std.fs.path.isAbsolute(path)) {
-        std.fs.accessAbsolute(path, .{}) catch return false;
+        std.Io.Dir.accessAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return false;
         return true;
     }
-    std.fs.cwd().access(path, .{}) catch return false;
+    std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return false;
     return true;
 }
 

@@ -5,6 +5,10 @@ const core_cli = @import("core_cli");
 const app_meta = @import("app_meta");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
+const HelpSurface = core_cli.HelpSurface{
+    .executable_name = "seq-perf-parser",
+    .help_text = UsageText,
+};
 const UsageText =
     \\perf_parser.zig
     \\
@@ -79,16 +83,12 @@ const BaselineRow = struct {
 
 const CountingAllocator = core_perf.CountingAllocator;
 
-pub fn main() !void {
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa_state.deinit();
-    const allocator = gpa_state.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
 
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
-    if (try core_cli.handleDefaultHelpAndVersion(argv, UsageText, Version)) return;
-
-    var cli = try parseCliOptions(allocator);
+    var cli = try parseCliOptions(allocator, argv);
     defer freeCliOptions(allocator, &cli);
 
     const config = try loadConfig(allocator, cli.config_path);
@@ -111,7 +111,7 @@ pub fn main() !void {
     else
         null;
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
 
     try stdout.print("mode={s}\n", .{summary.mode});
@@ -154,47 +154,42 @@ pub fn main() !void {
     try stdout.writeAll("status=PASS\n");
 }
 
-fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
+fn parseCliOptions(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions {
     var out = CliOptions{
         .config_path = try allocator.dupe(u8, "perf/parser/workload_config.json"),
     };
 
-    var args = std.process.args();
-    _ = args.next();
-
-    while (args.next()) |arg| {
-        if (core_cli.isHelpArg(arg)) {
-            var stdout_writer = std.fs.File.stdout().writer(&.{});
-            const stdout = &stdout_writer.interface;
-            try core_cli.printHelpWithVersion(stdout, UsageText, Version);
-            std.process.exit(0);
-        }
-        if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
-            var stdout_writer = std.fs.File.stdout().writer(&.{});
-            const stdout = &stdout_writer.interface;
-            try core_cli.printVersion(stdout, Version);
-            std.process.exit(0);
-        }
+    var i: usize = 1;
+    while (i < argv.len) : (i += 1) {
+        const arg = argv[i];
         if (std.mem.eql(u8, arg, "--config")) {
-            const path = args.next() orelse return error.MissingConfigPath;
+            i += 1;
+            if (i >= argv.len) return error.MissingConfigPath;
+            const path = argv[i];
             allocator.free(out.config_path);
             out.config_path = try allocator.dupe(u8, path);
             continue;
         }
         if (std.mem.eql(u8, arg, "--artifact")) {
-            const path = args.next() orelse return error.MissingArtifactPath;
+            i += 1;
+            if (i >= argv.len) return error.MissingArtifactPath;
+            const path = argv[i];
             if (out.artifact_path) |existing| allocator.free(existing);
             out.artifact_path = try allocator.dupe(u8, path);
             continue;
         }
         if (std.mem.eql(u8, arg, "--real-corpus-dir")) {
-            const path = args.next() orelse return error.MissingCorpusPath;
+            i += 1;
+            if (i >= argv.len) return error.MissingCorpusPath;
+            const path = argv[i];
             if (out.real_corpus_dir) |existing| allocator.free(existing);
             out.real_corpus_dir = try allocator.dupe(u8, path);
             continue;
         }
         if (std.mem.eql(u8, arg, "--trend-tolerance-pct")) {
-            const value = args.next() orelse return error.MissingTrendTolerance;
+            i += 1;
+            if (i >= argv.len) return error.MissingTrendTolerance;
+            const value = argv[i];
             out.trend_tolerance_override = try std.fmt.parseFloat(f64, value);
             continue;
         }
@@ -216,7 +211,12 @@ fn freeCliOptions(allocator: std.mem.Allocator, cli: *CliOptions) void {
 }
 
 fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !ParserPerfConfig {
-    const data = try std.fs.cwd().readFileAlloc(allocator, path, 1 * 1024 * 1024);
+    const data = try std.Io.Dir.cwd().readFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        path,
+        allocator,
+        .limited(1 * 1024 * 1024),
+    );
     defer allocator.free(data);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
@@ -329,7 +329,12 @@ fn enforceTrendGate(summary: PerfSummary, previous: BenchmarkArtifact, tolerance
 }
 
 fn loadArtifact(allocator: std.mem.Allocator, path: []const u8) !?BenchmarkArtifact {
-    const data = std.fs.cwd().readFileAlloc(allocator, path, 1 * 1024 * 1024) catch |err| switch (err) {
+    const data = std.Io.Dir.cwd().readFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        path,
+        allocator,
+        .limited(1 * 1024 * 1024),
+    ) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -356,19 +361,19 @@ fn loadArtifact(allocator: std.mem.Allocator, path: []const u8) !?BenchmarkArtif
 
 fn writeArtifact(path: []const u8, summary: PerfSummary) !void {
     if (std.fs.path.dirname(path)) |dir_path| {
-        if (dir_path.len > 0) try std.fs.cwd().makePath(dir_path);
+        if (dir_path.len > 0) try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), dir_path);
     }
 
-    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
+    var file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), path, .{ .truncate = true });
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
 
-    var writer = file.writer(&.{});
+    var writer = file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const out = &writer.interface;
     try out.print(
         "{{\n  \"mode\": \"{s}\",\n  \"captured_unix_s\": {d},\n  \"speedup_pct\": {d:.6},\n  \"alloc_call_reduction_pct\": {d:.6},\n  \"fast_p95_ns_per_line\": {d}\n}}\n",
         .{
             summary.mode,
-            std.time.timestamp(),
+            @divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, std.time.ns_per_s),
             summary.speedup_pct,
             summary.alloc_call_reduction_pct,
             summary.fast_p95_ns_per_line,
@@ -377,8 +382,8 @@ fn writeArtifact(path: []const u8, summary: PerfSummary) !void {
 }
 
 fn loadRealCorpusJsonl(allocator: std.mem.Allocator, dir_path: []const u8) ![]u8 {
-    var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
-    defer dir.close();
+    var dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), dir_path, .{ .iterate = true });
+    defer dir.close(std.Io.Threaded.global_single_threaded.io());
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -387,11 +392,16 @@ fn loadRealCorpusJsonl(allocator: std.mem.Allocator, dir_path: []const u8) ![]u8
     defer walker.deinit();
 
     var file_count: usize = 0;
-    while (try walker.next()) |entry| {
+    while (try walker.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".jsonl")) continue;
 
-        const content = try dir.readFileAlloc(allocator, entry.path, 64 * 1024 * 1024);
+        const content = try dir.readFileAlloc(
+            std.Io.Threaded.global_single_threaded.io(),
+            entry.path,
+            allocator,
+            .limited(64 * 1024 * 1024),
+        );
         defer allocator.free(content);
         try out.appendSlice(allocator, content);
         if (out.items.len == 0 or out.items[out.items.len - 1] != '\n') {
@@ -405,18 +415,18 @@ fn loadRealCorpusJsonl(allocator: std.mem.Allocator, dir_path: []const u8) ![]u8
 }
 
 fn runFastRound(content: []const u8) !RoundStats {
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
 
     var counting = CountingAllocator.init(gpa_state.allocator());
     const alloc = counting.allocator();
 
-    var timer = try std.time.Timer.start();
+    const start_ns = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds;
     var rows = try token_events.parseTokenEventsWithOptions(alloc, "parser-perf.jsonl", content, .{
         .dedupe = true,
         .derive_timestamp_fields = false,
     });
-    const elapsed_ns = timer.read();
+    const elapsed_ns: u64 = @intCast(@max(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds - start_ns, 1));
     const row_count = rows.items.len;
     rows.deinit(alloc);
 
@@ -429,15 +439,15 @@ fn runFastRound(content: []const u8) !RoundStats {
 }
 
 fn runBaselineRound(content: []const u8) !RoundStats {
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
 
     var counting = CountingAllocator.init(gpa_state.allocator());
     const alloc = counting.allocator();
 
-    var timer = try std.time.Timer.start();
+    const start_ns = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds;
     const row_count = try parseBaselineTokenEvents(alloc, content, true);
-    const elapsed_ns = timer.read();
+    const elapsed_ns: u64 = @intCast(@max(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds - start_ns, 1));
 
     return .{
         .elapsed_ns = elapsed_ns,
@@ -448,10 +458,9 @@ fn runBaselineRound(content: []const u8) !RoundStats {
 }
 
 fn buildSyntheticTokenEvents(allocator: std.mem.Allocator, line_count: usize) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
+    var writer = std.Io.Writer.Allocating.init(allocator);
+    errdefer writer.deinit();
 
-    var writer = out.writer(allocator);
     for (0..line_count) |i| {
         const total_tokens: i64 = @intCast(5000 + (i / 2));
         const input_tokens = total_tokens - 6;
@@ -462,7 +471,7 @@ fn buildSyntheticTokenEvents(allocator: std.mem.Allocator, line_count: usize) ![
         const minute = i % 60;
 
         try writeSyntheticTokenEventLine(
-            &writer,
+            &writer.writer,
             minute,
             input_tokens,
             cached_tokens,
@@ -477,7 +486,7 @@ fn buildSyntheticTokenEvents(allocator: std.mem.Allocator, line_count: usize) ![
         );
     }
 
-    return out.toOwnedSlice(allocator);
+    return writer.toOwnedSlice();
 }
 
 fn writeSyntheticTokenEventLine(

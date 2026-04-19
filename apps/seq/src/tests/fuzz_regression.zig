@@ -1,12 +1,16 @@
 const std = @import("std");
 const lib = @import("../lib.zig");
 
-fn fuzzParseCommand(_: void, input: []const u8) !void {
+fn fuzzParseCommand(_: void, smith: *std.testing.Smith) !void {
+    var storage: [256]u8 = undefined;
+    for (&storage) |*b| b.* = smith.value(u8);
+    const len = smith.value(usize) % (storage.len + 1);
+    const input = storage[0..len];
     _ = lib.parseCommand(input);
 }
 
 test "fuzz corpus parseCommand regression seeds" {
-    const content = try std.fs.cwd().readFileAlloc(std.testing.allocator, "testdata/fuzz/parse-command.txt", 64 * 1024);
+    const content = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), "testdata/fuzz/parse-command.txt", std.testing.allocator, .limited(64 * 1024));
     defer std.testing.allocator.free(content);
 
     var lines = std.mem.splitScalar(u8, content, '\n');

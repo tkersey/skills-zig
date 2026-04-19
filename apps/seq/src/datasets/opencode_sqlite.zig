@@ -45,11 +45,12 @@ pub const Db = struct {
     handle: *c.sqlite3,
 
     pub fn open(allocator: std.mem.Allocator, db_path: []const u8) !Db {
-        const probe = std.fs.openFileAbsolute(db_path, .{}) catch |err| switch (err) {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const probe = std.Io.Dir.openFileAbsolute(io, db_path, .{}) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => return error.MissingOpencodeDb,
             else => return err,
         };
-        probe.close();
+        probe.close(io);
 
         const path_z = try allocator.dupeZ(u8, db_path);
         defer allocator.free(path_z);
@@ -147,7 +148,7 @@ pub fn toAbsolutePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 
     if (std.fs.path.isAbsolute(expanded)) return allocator.dupe(u8, expanded);
 
-    const cwd = try std.process.getCwdAlloc(allocator);
+    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
     defer allocator.free(cwd);
     return std.fs.path.join(allocator, &.{ cwd, expanded });
 }
@@ -155,16 +156,14 @@ pub fn toAbsolutePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 pub fn resolveDefaultDbPath(allocator: std.mem.Allocator, override_path: ?[]const u8) ![]u8 {
     if (override_path) |path| return toAbsolutePath(allocator, path);
 
-    const home = try std.process.getEnvVarOwned(allocator, "HOME");
-    defer allocator.free(home);
+    const home = std.Io.Threaded.global_single_threaded.environString("HOME") orelse return error.EnvironmentVariableNotFound;
     return std.fs.path.join(allocator, &.{ home, ".local", "share", "opencode", "opencode.db" });
 }
 
 pub fn resolveDefaultJsonlPath(allocator: std.mem.Allocator, override_path: ?[]const u8) ![]u8 {
     if (override_path) |path| return toAbsolutePath(allocator, path);
 
-    const home = try std.process.getEnvVarOwned(allocator, "HOME");
-    defer allocator.free(home);
+    const home = std.Io.Threaded.global_single_threaded.environString("HOME") orelse return error.EnvironmentVariableNotFound;
     return std.fs.path.join(allocator, &.{ home, ".local", "state", "opencode", "prompt-history.jsonl" });
 }
 

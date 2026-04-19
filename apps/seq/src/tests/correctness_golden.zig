@@ -16,11 +16,11 @@ fn runAndReadOutput(
     try all_args.append(allocator, out_path);
 
     try commands.run(allocator, cmd, all_args.items);
-    return std.fs.cwd().readFileAlloc(allocator, out_path, 1 * 1024 * 1024);
+    return std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), out_path, allocator, .limited(1 * 1024 * 1024));
 }
 
 fn readExpected(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    return std.fs.cwd().readFileAlloc(allocator, path, 1 * 1024 * 1024);
+    return std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(1 * 1024 * 1024));
 }
 
 test "golden role-breakdown json" {

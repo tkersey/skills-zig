@@ -84,7 +84,7 @@ fn isMessageCandidate(line: []const u8) bool {
 }
 
 fn stripEchoView(text: []const u8) []const u8 {
-    const left = std.mem.trimLeft(u8, text, " \t\r\n");
+    const left = std.mem.trim(u8, text, " \t\r\n");
     if (!std.mem.startsWith(u8, left, "Echo:")) return text;
 
     const newline_idx = std.mem.indexOfScalar(u8, left, '\n') orelse return "";
@@ -104,7 +104,7 @@ fn stripEchoView(text: []const u8) []const u8 {
 }
 
 fn isMetaUserMessage(text: []const u8) bool {
-    const s = std.mem.trimLeft(u8, text, " \t\r\n");
+    const s = std.mem.trim(u8, text, " \t\r\n");
     if (std.mem.startsWith(u8, s, "# AGENTS.md instructions")) return true;
     if (std.mem.startsWith(u8, s, "<environment_context>")) return true;
     if (std.mem.startsWith(u8, s, "<INSTRUCTIONS>")) return true;

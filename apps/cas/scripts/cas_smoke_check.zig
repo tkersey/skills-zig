@@ -46,13 +46,9 @@ const ParsedArgs = struct {
     show_version: bool = false,
 };
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
 
     const parsed = parseArgs(allocator, argv) catch |err| {
@@ -60,14 +56,14 @@ pub fn main() !void {
     };
 
     if (parsed.show_version) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, Version);
         return;
     }
 
     if (parsed.show_help) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
@@ -275,7 +271,7 @@ pub fn main() !void {
             steer_ok = false;
             steer_detail = "no threadId available for turn/steer check";
         } else {
-            const expected_turn_id = try std.fmt.allocPrint(allocator, "cas-smoke-{d}", .{std.time.timestamp()});
+            const expected_turn_id = try std.fmt.allocPrint(allocator, "cas-smoke-{d}", .{@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000)});
             defer allocator.free(expected_turn_id);
 
             const steer_params = try stringifyAnyAlloc(allocator, .{
@@ -328,12 +324,12 @@ pub fn main() !void {
             .ok = overall_ok,
             .checks = checks.items,
         };
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try std.json.Stringify.value(report, .{ .whitespace = .indent_2 }, stdout);
         try stdout.writeAll("\n");
     } else {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try stdout.print("cas smoke-check\n", .{});
         try stdout.print("cwd: {s}\n", .{cwd});

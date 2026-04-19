@@ -1,6 +1,4 @@
 const std = @import("std");
-const zlinter = @import("zlinter");
-
 pub fn build(b: *std.Build) void {
     enforceRepoLocalInstallOnly(b);
 
@@ -311,7 +309,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const seq = addExecutable(b, "seq", seq_root);
-    seq.linkLibC();
+    seq.root_module.linkSystemLibrary("c", .{});
     seq.root_module.linkSystemLibrary("sqlite3", .{});
     const seq_perf = addExecutable(b, "seq-perf", seq_perf_root);
     const bench_stats = addExecutable(b, "bench_stats", lift_bench_root);
@@ -324,7 +322,7 @@ pub fn build(b: *std.Build) void {
     const cas_budget_perf = addExecutable(b, "cas-perf-budget-governor", cas_budget_perf_root);
     const cas = addExecutable(b, "cas", cas_root);
     const cron = addExecutable(b, "cron", cron_root);
-    cron.linkLibC();
+    cron.root_module.linkSystemLibrary("c", .{});
     cron.root_module.linkSystemLibrary("sqlite3", .{});
     const puff = addExecutable(b, "puff", puff_root);
     const learnings = addExecutable(b, "learnings", learnings_root);
@@ -599,9 +597,9 @@ pub fn build(b: *std.Build) void {
     ) orelse false;
     const lint_step = b.step("lint", "Run zlinter checks");
     if (enable_zlinter) {
-        lint_step.dependOn(buildLintStep(b, target, optimize, mesh, &app_surfaces));
+        lint_step.dependOn(buildLintStep(b, target, &app_surfaces));
     } else {
-        const lint_cmd = b.addSystemCommand(&.{ "zig", "build", "lint", "-Denable_zlinter=true" });
+        const lint_cmd = b.addSystemCommand(&.{ "zig", "build", "lint", "-Doptimize=ReleaseFast", "-Denable_zlinter=true" });
         if (b.args) |args| {
             lint_cmd.addArg("--");
             lint_cmd.addArgs(args);
@@ -733,7 +731,7 @@ fn addTestStepWithOptions(
 ) *std.Build.Step.Run {
     const tests = b.addTest(.{ .root_module = root_module });
     if (options.link_libc) {
-        tests.linkLibC();
+        tests.root_module.linkSystemLibrary("c", .{});
         if (options.sqlite) tests.root_module.linkSystemLibrary("sqlite3", .{});
     }
     const run_tests = b.addRunArtifact(tests);
@@ -772,15 +770,13 @@ fn enforceRepoLocalInstallOnly(b: *std.Build) void {
 fn buildLintStep(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    mesh: *std.Build.Step.Compile,
     app_surfaces: []const AppSurface,
 ) *std.Build.Step {
+    const zlinter = @import("zlinter");
     var lint_builder = zlinter.builder(b, .{
         .target = target,
-        .optimize = optimize,
+        .optimize = .ReleaseFast,
     });
-    lint_builder.addSource(.compiled(mesh));
     for (app_surfaces) |surface| {
         lint_builder.addPaths(.{ .include = &.{surface.path} });
     }
@@ -789,6 +785,11 @@ fn buildLintStep(
             b.path("libs/core"),
             b.path("build.zig"),
             b.path("tools"),
+        },
+        // `zlinter` routes `@cImport` files through `zls` translate-c, which
+        // currently emits spurious stderr for this one seq helper on 0.16.
+        .exclude = &.{
+            b.path("apps/seq/src/time_utils.zig"),
         },
     });
     lint_builder.addRule(.{ .builtin = .no_unused }, .{});

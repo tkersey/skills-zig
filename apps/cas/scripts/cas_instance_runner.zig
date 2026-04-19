@@ -97,13 +97,9 @@ const InstanceSlot = struct {
     managed_server: ?cas_websocket.ManagedServer = null,
 };
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
 
     const opts = parseArgs(allocator, argv) catch |err| {
@@ -111,14 +107,14 @@ pub fn main() !void {
     };
 
     if (opts.show_version) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, Version);
         return;
     }
 
     if (opts.show_help) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
@@ -129,7 +125,7 @@ pub fn main() !void {
     };
 
     if (opts.instances > 1 and opts.state_file_dir == null) {
-        var stderr_writer = std.fs.File.stderr().writer(&.{});
+        var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stderr = &stderr_writer.interface;
         try stderr.writeAll("Note: by default, state is derived from --cwd, so parallel instances may share it. Use --state-file-dir for per-instance state isolation.\n");
     }
@@ -148,7 +144,7 @@ pub fn main() !void {
     var request_results: std.ArrayList(RequestResult) = .empty;
     defer request_results.deinit(allocator);
 
-    const started_at = std.time.milliTimestamp();
+    const started_at = @divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000);
 
     // Phase 1: start all clients.
     var i: usize = 0;
@@ -211,40 +207,41 @@ pub fn main() !void {
                         .@"error" = msg,
                     });
                     if (opts.verbose) {
-                        var stderr_writer = std.fs.File.stderr().writer(&.{});
+                        var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
                         const stderr = &stderr_writer.interface;
                         try stderr.print("[start:{d}] fail: {s}\n", .{ instance_num, msg });
                     }
                     continue;
                 };
             }
-        else cas.Client.start(allocator, .{
-            .cwd = cwd,
-            .state_file = state_file,
-            .client_name = client_name,
-            .server_request_timeout_ms = opts.server_request_timeout_ms,
-            .exec_approval = opts.exec_approval,
-            .file_approval = opts.file_approval,
-            .permissions_approval = opts.permissions_approval,
-            .request_user_input_response_json = opts.request_user_input_response_json,
-            .elicitation_action = opts.elicitation_action,
-            .elicitation_content_json = opts.elicitation_content_json,
-            .dynamic_tool_response_json = opts.dynamic_tool_response_json,
-            .read_only = opts.read_only,
-            .opt_out_notification_methods = opts.opt_out_methods,
-        }) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
-            try start_failures.append(allocator, .{
-                .instance = instance_num,
-                .@"error" = msg,
-            });
-            if (opts.verbose) {
-                var stderr_writer = std.fs.File.stderr().writer(&.{});
-                const stderr = &stderr_writer.interface;
-                try stderr.print("[start:{d}] fail: {s}\n", .{ instance_num, msg });
-            }
-            continue;
-        };
+        else
+            cas.Client.start(allocator, .{
+                .cwd = cwd,
+                .state_file = state_file,
+                .client_name = client_name,
+                .server_request_timeout_ms = opts.server_request_timeout_ms,
+                .exec_approval = opts.exec_approval,
+                .file_approval = opts.file_approval,
+                .permissions_approval = opts.permissions_approval,
+                .request_user_input_response_json = opts.request_user_input_response_json,
+                .elicitation_action = opts.elicitation_action,
+                .elicitation_content_json = opts.elicitation_content_json,
+                .dynamic_tool_response_json = opts.dynamic_tool_response_json,
+                .read_only = opts.read_only,
+                .opt_out_notification_methods = opts.opt_out_methods,
+            }) catch |err| {
+                const msg = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
+                try start_failures.append(allocator, .{
+                    .instance = instance_num,
+                    .@"error" = msg,
+                });
+                if (opts.verbose) {
+                    var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+                    const stderr = &stderr_writer.interface;
+                    try stderr.print("[start:{d}] fail: {s}\n", .{ instance_num, msg });
+                }
+                continue;
+            };
 
         if (managed_server != null) transport = "websocket";
         slots[i] = .{
@@ -253,12 +250,12 @@ pub fn main() !void {
             .managed_server = managed_server,
         };
         if (opts.verbose) {
-            var stderr_writer = std.fs.File.stderr().writer(&.{});
+            var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             const stderr = &stderr_writer.interface;
             try stderr.print("[start:{d}] ok ({s})\n", .{ instance_num, transport });
         }
     }
-    const after_start = std.time.milliTimestamp();
+    const after_start = monotonicMillis();
 
     // Phase 2: run requests for started clients.
     i = 0;
@@ -286,7 +283,7 @@ pub fn main() !void {
                 .@"error" = summary,
             });
             if (opts.verbose) {
-                var stderr_writer = std.fs.File.stderr().writer(&.{});
+                var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
                 const stderr = &stderr_writer.interface;
                 try stderr.print("[request:{d}] fail ({s}): {s}\n", .{ instance_num, slot.transport, summary });
             }
@@ -302,12 +299,12 @@ pub fn main() !void {
             .summary = summary,
         });
         if (opts.verbose) {
-            var stderr_writer = std.fs.File.stderr().writer(&.{});
+            var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             const stderr = &stderr_writer.interface;
             try stderr.print("[request:{d}] ok ({s})\n", .{ instance_num, slot.transport });
         }
     }
-    const after_requests = std.time.milliTimestamp();
+    const after_requests = monotonicMillis();
 
     const requests_ok = countRequestSuccess(request_results.items);
     const requests_failed = request_results.items.len - requests_ok;
@@ -340,12 +337,12 @@ pub fn main() !void {
     };
 
     if (opts.json) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try std.json.Stringify.value(payload, .{ .whitespace = .indent_2 }, stdout);
         try stdout.writeAll("\n");
     } else {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try stdout.print("cas_instance_runner summary\n", .{});
         try stdout.print("cwd: {s}\n", .{cwd});
@@ -517,7 +514,7 @@ fn buildParamsJson(allocator: std.mem.Allocator, method: []const u8, params_json
         return allocator.dupe(u8, raw);
     }
     if (params_file) |path| {
-        const raw = try std.fs.cwd().readFileAlloc(allocator, path, 4 * 1024 * 1024);
+        const raw = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(4 * 1024 * 1024));
         var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
         defer parsed_json.deinit();
         return raw;
@@ -642,6 +639,11 @@ fn summarizeResult(allocator: std.mem.Allocator, method: []const u8, result_json
     }
     try out.writer.writeAll("]}");
     return out.toOwnedSlice();
+}
+
+fn monotonicMillis() i64 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    return @intCast(@divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000));
 }
 
 fn countRequestSuccess(items: []const RequestResult) usize {

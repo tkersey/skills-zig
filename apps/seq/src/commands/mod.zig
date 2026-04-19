@@ -7,6 +7,15 @@ const spec = @import("../types/spec.zig");
 const output = @import("../output/mod.zig");
 const time_utils = @import("../time_utils.zig");
 
+fn defaultIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn getEnvVarOwned(allocator: std.mem.Allocator, comptime key: [:0]const u8) ![]u8 {
+    const value = std.c.getenv(key) orelse return error.EnvironmentVariableNotFound;
+    return allocator.dupe(u8, std.mem.span(value));
+}
+
 pub const DatasetMeta = struct {
     name: []const u8,
     description: []const u8,
@@ -428,7 +437,7 @@ pub fn run(
 }
 
 fn printCommandHelp(cmd: lib.Command) !void {
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
 
     const common =
@@ -558,7 +567,7 @@ fn printCommandHelp(cmd: lib.Command) !void {
 }
 
 fn printCliError(comptime fmt: []const u8, args: anytype) void {
-    var stderr_writer = std.fs.File.stderr().writer(&.{});
+    var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stderr = &stderr_writer.interface;
     stderr.print(fmt, args) catch {};
 }
@@ -939,7 +948,7 @@ fn cmdArtifactSearch(allocator: std.mem.Allocator, sessions_root: []const u8, op
     const follow = try parseArtifactFollow(opts.follow_text);
     _ = follow;
 
-    const start_ms = std.time.milliTimestamp();
+    const start_ms = @divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000);
     var stats = ArtifactStats{
         .used_time_bounds = opts.since != null or opts.until != null,
         .used_targeted_session = opts.path != null or opts.session_id != null,
@@ -961,7 +970,7 @@ fn cmdArtifactSearch(allocator: std.mem.Allocator, sessions_root: []const u8, op
         try searchToolCallHits(allocator, sessions_root, opts, query_text, use_regex, &stats, &hit_rows);
     }
 
-    const duration_delta = std.time.milliTimestamp() - start_ms;
+    const duration_delta = @divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000) - start_ms;
     stats.duration_ms = @intCast(@max(duration_delta, 0));
 
     const limit = if (opts.limit == 0) 20 else opts.limit;
@@ -1912,14 +1921,6 @@ fn collectActiveExtensionsSummary(
         if (row.has_instructions) try names.append(allocator, row.extension_name);
     }
     return joinStringList(allocator, names.items);
-}
-
-fn collectProvenanceWarnings(
-    allocator: std.mem.Allocator,
-    rollout_summary_row: ?*const datasets.memory_blocks.Row,
-) !?[]u8 {
-    if (rollout_summary_row == null) return try allocator.dupe(u8, "missing_rollout_summary_artifact");
-    return null;
 }
 
 fn joinStringList(allocator: std.mem.Allocator, items: []const []const u8) ![]u8 {
@@ -2975,17 +2976,18 @@ fn countCsvDataRows(allocator: std.mem.Allocator, csv_path: []const u8) !?i64 {
     const absolute = try toAbsolutePath(allocator, csv_path);
     defer allocator.free(absolute);
 
-    const file = std.fs.openFileAbsolute(absolute, .{}) catch return null;
-    defer file.close();
+    const file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), absolute, .{}) catch return null;
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
 
-    const content = file.readToEndAlloc(allocator, 64 * 1024 * 1024) catch return null;
+    var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const content = reader.interface.allocRemaining(allocator, .limited(64 * 1024 * 1024)) catch return null;
     defer allocator.free(content);
 
     var rows: i64 = 0;
     var seen_header = false;
     var line_it = std.mem.splitScalar(u8, content, '\n');
     while (line_it.next()) |raw_line| {
-        const line = std.mem.trimRight(u8, raw_line, "\r");
+        const line = std.mem.trim(u8, raw_line, "\r");
         if (line.len == 0) continue;
         if (!seen_header) {
             seen_header = true;
@@ -3881,7 +3883,7 @@ const PlanSearchStats = struct {
 };
 
 fn cmdPlanSearch(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
-    const start_ms = std.time.milliTimestamp();
+    const start_ms = @divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000);
     const repo_root = try resolvePlanSearchRepoRoot(allocator, opts);
     defer if (repo_root) |value| allocator.free(value);
 
@@ -3959,7 +3961,7 @@ fn cmdPlanSearch(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
         }
     }
 
-    const duration_delta = std.time.milliTimestamp() - start_ms;
+    const duration_delta = @divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000) - start_ms;
     stats.duration_ms = @intCast(@max(duration_delta, 0));
 
     const descending = try parsePlanSearchDescending(opts.sort_text);
@@ -4106,7 +4108,7 @@ fn normalizeRepoMatchPath(allocator: std.mem.Allocator, raw_path: []const u8) ![
     const absolute = try toAbsolutePath(allocator, raw_path);
     defer allocator.free(absolute);
 
-    const canonical = std.fs.cwd().realpathAlloc(allocator, absolute) catch null;
+    const canonical = std.Io.Dir.realPathFileAbsoluteAlloc(defaultIo(), absolute, allocator) catch null;
     if (canonical) |value| {
         defer allocator.free(value);
         return trimTrailingPathSeparatorsAlloc(allocator, value);
@@ -4128,9 +4130,9 @@ fn parentPathOrNull(path: []const u8) ?[]const u8 {
 
 fn pathHasGitMarker(path: []const u8) bool {
     if (!std.fs.path.isAbsolute(path)) return false;
-    var dir = std.fs.openDirAbsolute(path, .{}) catch return false;
-    defer dir.close();
-    dir.access(".git", .{}) catch return false;
+    var dir = std.Io.Dir.openDirAbsolute(defaultIo(), path, .{}) catch return false;
+    defer dir.close(defaultIo());
+    dir.access(defaultIo(), ".git", .{}) catch return false;
     return true;
 }
 
@@ -4172,7 +4174,7 @@ fn attachPlanSearchStats(row: *query.Row, stats: PlanSearchStats) !void {
 }
 
 fn currentSessionIdFromEnv(allocator: std.mem.Allocator) ![]u8 {
-    return std.process.getEnvVarOwned(allocator, "CODEX_THREAD_ID") catch {
+    return getEnvVarOwned(allocator, "CODEX_THREAD_ID") catch {
         printCliError("error: --current requires CODEX_THREAD_ID in the environment\n", .{});
         return error.CurrentSessionUnavailable;
     };
@@ -4198,11 +4200,11 @@ fn resolveSessionPromptInputPaths(
         errdefer freePathList(allocator, &out);
 
         const absolute = try toAbsolutePath(allocator, single_path);
-        const file = std.fs.openFileAbsolute(absolute, .{}) catch {
+        const file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), absolute, .{}) catch {
             allocator.free(absolute);
             return error.SessionNotFound;
         };
-        file.close();
+        file.close(std.Io.Threaded.global_single_threaded.io());
         try out.append(allocator, absolute);
         return out;
     }
@@ -4966,7 +4968,7 @@ fn appendTokenUsageSummaryRow(
     }
 
     var now_day_buf: [10]u8 = undefined;
-    const now_day = tokenUsageDayKeyFromMillis(std.time.milliTimestamp(), timezone, &now_day_buf);
+    const now_day = tokenUsageDayKeyFromMillis(@as(i64, @intCast(@divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000))), timezone, &now_day_buf);
     const partial_current_day = if (end_day) |value|
         if (now_day) |current| std.mem.eql(u8, value, current) else false
     else
@@ -7331,19 +7333,19 @@ fn toAbsolutePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 
     if (std.fs.path.isAbsolute(expanded)) return allocator.dupe(u8, expanded);
 
-    const cwd = try std.process.getCwdAlloc(allocator);
+    const cwd = try std.process.currentPathAlloc(defaultIo(), allocator);
     defer allocator.free(cwd);
     return std.fs.path.join(allocator, &.{ cwd, expanded });
 }
 
 fn expandHomePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     if (std.mem.eql(u8, path, "~")) {
-        return std.process.getEnvVarOwned(allocator, "HOME");
+        const home = std.c.getenv("HOME") orelse return error.EnvironmentVariableNotFound;
+        return allocator.dupe(u8, std.mem.span(home));
     }
     if (std.mem.startsWith(u8, path, "~/")) {
-        const home = try std.process.getEnvVarOwned(allocator, "HOME");
-        defer allocator.free(home);
-        return std.fs.path.join(allocator, &.{ home, path[2..] });
+        const home = std.c.getenv("HOME") orelse return error.EnvironmentVariableNotFound;
+        return std.fs.path.join(allocator, &.{ std.mem.span(home), path[2..] });
     }
     return allocator.dupe(u8, path);
 }
@@ -7356,16 +7358,16 @@ fn collectJsonlPaths(
     var out = std.ArrayList([]u8).empty;
     errdefer freePathList(allocator, &out);
 
-    var root_dir = std.fs.openDirAbsolute(root_abs, .{ .iterate = true }) catch |err| switch (err) {
+    var root_dir = std.Io.Dir.openDirAbsolute(defaultIo(), root_abs, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return out,
         else => return err,
     };
-    defer root_dir.close();
+    defer root_dir.close(defaultIo());
 
     var walker = try root_dir.walk(allocator);
     defer walker.deinit();
 
-    while (try walker.next()) |entry| {
+    while (try walker.next(defaultIo())) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".jsonl")) continue;
         const abs = try std.fs.path.join(allocator, &.{ root_abs, entry.path });
@@ -7386,15 +7388,13 @@ fn collectJsonlPaths(
 
 fn loadSpecText(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     if (raw.len > 1 and raw[0] == '@') {
-        return std.fs.cwd().readFileAlloc(allocator, raw[1..], 2 * 1024 * 1024);
+        return std.Io.Dir.cwd().readFileAlloc(defaultIo(), raw[1..], allocator, .limited(2 * 1024 * 1024));
     }
     return allocator.dupe(u8, raw);
 }
 
 fn readFileAllocOrSkip(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
-    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
-    defer file.close();
-    return file.readToEndAlloc(allocator, 256 * 1024 * 1024) catch null;
+    return std.Io.Dir.cwd().readFileAlloc(defaultIo(), path, allocator, .limited(256 * 1024 * 1024)) catch null;
 }
 
 fn freePathList(allocator: std.mem.Allocator, list: *std.ArrayList([]u8)) void {
@@ -7647,16 +7647,16 @@ test "collectJsonlPaths applies day filter pushdown on path dates" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("2026/02/26");
-    try tmp.dir.makePath("2026/02/27");
-    try tmp.dir.makePath("2026/03/01");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/02/26");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/02/27");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/03/01");
 
-    try tmp.dir.writeFile(.{ .sub_path = "2026/02/26/a.jsonl", .data = "{}\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "2026/02/27/b.jsonl", .data = "{}\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "2026/03/01/c.jsonl", .data = "{}\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "2026/03/01/notes.txt", .data = "ignore\n" });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "2026/02/26/a.jsonl", .data = "{}\n" });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "2026/02/27/b.jsonl", .data = "{}\n" });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "2026/03/01/c.jsonl", .data = "{}\n" });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "2026/03/01/notes.txt", .data = "ignore\n" });
 
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
 
     var filter = SessionDayPathFilter{};
@@ -7696,8 +7696,8 @@ test "tool invocation datasets expose command text and flattened args" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("2026/03/09");
-    try tmp.dir.writeFile(.{
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/03/09");
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
         .sub_path = "2026/03/09/sample.jsonl",
         .data =
         \\{"type":"response_item","timestamp":"2026-03-09T04:01:05Z","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"learnings recall --query \\\"Commit and push the changes for $st\\\" --limit 5 --drop-superseded\",\"workdir\":\"/Users/tk/.dotfiles\",\"yield_time_ms\":1000}"}}
@@ -7706,7 +7706,7 @@ test "tool invocation datasets expose command text and flattened args" {
         ,
     });
 
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
 
     var invocation_rows = try collectDatasetRows(std.testing.allocator, "tool_invocations", root_abs, &.{}, &.{});
@@ -7728,7 +7728,7 @@ test "summarizeSessionConcurrency computes configured and effective maxima" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
         .sub_path = "wave-a.csv",
         .data =
         \\id,objective
@@ -7737,7 +7737,7 @@ test "summarizeSessionConcurrency computes configured and effective maxima" {
         \\U03,c
         ,
     });
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
         .sub_path = "wave-b.csv",
         .data =
         \\id,objective
@@ -7745,7 +7745,7 @@ test "summarizeSessionConcurrency computes configured and effective maxima" {
         ,
     });
 
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
 
     const csv_a = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "wave-a.csv" });
@@ -7771,7 +7771,7 @@ test "summarizeSessionConcurrency computes configured and effective maxima" {
     const session_content = try std.mem.concat(std.testing.allocator, u8, &.{ line_a, line_b, line_c });
     defer std.testing.allocator.free(session_content);
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
         .sub_path = "rollout-2026-02-28T00-00-00-019ca0e5-0beb-7740-a9bc-81664d994266.jsonl",
         .data = session_content,
     });
@@ -7809,12 +7809,12 @@ test "summarizeSessionConcurrency reports mesh truth false for spawn_agent-only 
         "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"wait\",\"arguments\":\"{\\\"ids\\\":[\\\"A\\\"]}\"}}\n" ++
         "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"close_agent\",\"arguments\":\"{\\\"id\\\":\\\"A\\\"}\"}}\n";
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
         .sub_path = "rollout-2026-03-02T00-00-00-019caeb9-23af-7de2-985b-3d954b4df213.jsonl",
         .data = session_content,
     });
 
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
     const session_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "rollout-2026-03-02T00-00-00-019caeb9-23af-7de2-985b-3d954b4df213.jsonl" });
     defer std.testing.allocator.free(session_path);
@@ -7972,16 +7972,16 @@ test "token-usage summary rebuckets by timezone and computes averages from exact
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("2026/03/26");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/03/26");
     const session_rel = "2026/03/26/rollout-2026-03-26T00-00-00-019c0000-0000-7000-8000-000000000099.jsonl";
     const session_content =
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-26T00:10:00Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":5}}}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-26T07:10:00Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":12}}}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-27T00:20:00Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":20}}}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-27T08:00:00Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":30}}}}\n";
-    try tmp.dir.writeFile(.{ .sub_path = session_rel, .data = session_content });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = session_rel, .data = session_content });
 
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
     const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "token-usage-summary.json" });
     defer std.testing.allocator.free(output_path);
@@ -8041,16 +8041,17 @@ fn runCommandWithOutput(
 
     try run(allocator, cmd, all_args.items);
 
-    const file = try std.fs.openFileAbsolute(output_path, .{});
-    defer file.close();
-    return file.readToEndAlloc(allocator, 1 * 1024 * 1024);
+    const file = try std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), output_path, .{});
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+    return reader.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024));
 }
 
 test "session-prompts resolves a single targeted file and supports role filters" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("2026/03/10");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/03/10");
     const target_content =
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Before\\n<skill>\\n<name>seq</name>\\n</skill>\\nAfter\"}]}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Echo: prompt\\n\\nAnswer\"}]}}\n";
@@ -8059,10 +8060,10 @@ test "session-prompts resolves a single targeted file and supports role filters"
 
     const target_rel = "2026/03/10/rollout-2026-03-10T10-00-00-019c0000-0000-7000-8000-000000000010.jsonl";
     const other_rel = "2026/03/10/rollout-2025-10-20T10-00-00-019a0000-0000-7000-8000-000000000011.jsonl";
-    try tmp.dir.writeFile(.{ .sub_path = target_rel, .data = target_content });
-    try tmp.dir.writeFile(.{ .sub_path = other_rel, .data = other_content });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = target_rel, .data = target_content });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = other_rel, .data = other_content });
 
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
     const target_abs = try std.fs.path.join(std.testing.allocator, &.{ root_abs, target_rel });
     defer std.testing.allocator.free(target_abs);
@@ -8095,14 +8096,14 @@ test "session-prompts preserves duplicates when no-dedupe-exact is set" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("2026/03/10");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/03/10");
     const session_content =
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"repeat\"}]}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-10T10:00:01Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"repeat\"}}\n";
     const session_rel = "2026/03/10/rollout-2026-03-10T10-00-00-019c0000-0000-7000-8000-000000000012.jsonl";
-    try tmp.dir.writeFile(.{ .sub_path = session_rel, .data = session_content });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = session_rel, .data = session_content });
 
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
     const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "session-prompts-dupes.json" });
     defer std.testing.allocator.free(output_path);
@@ -8127,7 +8128,7 @@ test "reply-latency defaults to single-message mode with clipped previews" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("2026/03/10");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/03/10");
     const session_rel = "2026/03/10/rollout-2026-03-10T10-00-00-019c0000-0000-7000-8000-000000000030.jsonl";
     const session_content =
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Single longest\"}]}}\n" ++
@@ -8141,9 +8142,9 @@ test "reply-latency defaults to single-message mode with clipped previews" {
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-10T10:03:31Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"repeat\"}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:03:45Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Duplicate reply\"}]}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:04:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Trailing user\"}]}}\n";
-    try tmp.dir.writeFile(.{ .sub_path = session_rel, .data = session_content });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = session_rel, .data = session_content });
 
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
     const session_abs = try std.fs.path.join(std.testing.allocator, &.{ root_abs, session_rel });
     defer std.testing.allocator.free(session_abs);
@@ -8178,7 +8179,7 @@ test "reply-latency contiguous mode preserves multi-message blocks and filters b
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("2026/03/10");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/03/10");
     const session_rel = "2026/03/10/rollout-2026-03-10T10-00-00-019c0000-0000-7000-8000-000000000031.jsonl";
     const session_content =
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Before window\"}]}}\n" ++
@@ -8191,9 +8192,9 @@ test "reply-latency contiguous mode preserves multi-message blocks and filters b
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:03:30Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"repeat\"}]}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-10T10:03:31Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"repeat\"}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:03:45Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Duplicate reply\"}]}}\n";
-    try tmp.dir.writeFile(.{ .sub_path = session_rel, .data = session_content });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = session_rel, .data = session_content });
 
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
     const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "reply-latency-contiguous.json" });
     defer std.testing.allocator.free(output_path);
@@ -8227,7 +8228,7 @@ test "reply-latency skips invalid and incomplete turns" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("2026/03/10");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/03/10");
     const session_rel = "2026/03/10/rollout-2026-03-10T10-00-00-019c0000-0000-7000-8000-000000000032.jsonl";
     const session_content =
         "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"missing start\"}]}}\n" ++
@@ -8237,9 +8238,9 @@ test "reply-latency skips invalid and incomplete turns" {
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:02:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"valid\"}]}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:02:02.250Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"kept\"}]}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:03:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"trailing\"}]}}\n";
-    try tmp.dir.writeFile(.{ .sub_path = session_rel, .data = session_content });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = session_rel, .data = session_content });
 
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
     const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "reply-latency-invalid.json" });
     defer std.testing.allocator.free(output_path);
@@ -8266,15 +8267,15 @@ test "plan-search extracts strict proposed_plan blocks from a targeted file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("2026/03/10");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/03/10");
     const session_rel = "2026/03/10/rollout-2026-03-10T10-00-00-019c0000-0000-7000-8000-000000000013.jsonl";
     const session_content =
         "{\"timestamp\":\"2026-03-10T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019c0000-0000-7000-8000-000000000013\",\"cwd\":\"/Users/tk/workspace/tk/shift\"}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Echo: prompt\\n\\n<proposed_plan>\\nIteration: 4\\n# First\\nBody\\n</proposed_plan>\"}]}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"<proposed_plan>\\nIteration: 5\\n# Broken\"}]}}\n";
-    try tmp.dir.writeFile(.{ .sub_path = session_rel, .data = session_content });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = session_rel, .data = session_content });
 
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
     const session_abs = try std.fs.path.join(std.testing.allocator, &.{ root_abs, session_rel });
     defer std.testing.allocator.free(session_abs);
@@ -8305,12 +8306,12 @@ test "plan-search applies repo filter, stats, and chronological sort" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("sessions/2026/03/10");
-    try tmp.dir.makePath("sessions/2026/03/11");
-    try tmp.dir.makePath("repos/repo-a");
-    try tmp.dir.makePath("repos/repo-b");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/03/10");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/03/11");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "repos/repo-a");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "repos/repo-b");
 
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
     const sessions_abs = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "sessions" });
     defer std.testing.allocator.free(sessions_abs);
@@ -8345,15 +8346,15 @@ test "plan-search applies repo filter, stats, and chronological sort" {
         .{repo_b},
     );
     defer std.testing.allocator.free(session_other_content);
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
         .sub_path = session_a_rel,
         .data = session_a_content,
     });
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
         .sub_path = session_b_rel,
         .data = session_b_content,
     });
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
         .sub_path = session_other_rel,
         .data = session_other_content,
     });
@@ -8388,7 +8389,7 @@ test "session-tooling summary groups by primary executable" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("2026/03/05");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/03/05");
     const session_content =
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:00:00Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"q1\",\"arguments\":\"{\\\"cmd\\\":\\\"seq query --spec @spec.json\\\"}\"}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:00:12Z\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"q1\",\"output\":\"Chunk ID: aa\\nWall time: 12.250 seconds\\nProcess running with session ID 77\\nOutput:\\n\"}}\n" ++
@@ -8396,12 +8397,12 @@ test "session-tooling summary groups by primary executable" {
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:01:01Z\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"e1\",\"output\":\"Chunk ID: bb\\nWall time: 0.050 seconds\\nProcess exited with code 0\\nOutput:\\n\"}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:02:00Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"e2\",\"arguments\":\"{\\\"cmd\\\":\\\"jq .\\\"}\"}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:02:01Z\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"e2\",\"output\":\"Chunk ID: cc\\nWall time: 0.090 seconds\\nProcess exited with code 2\\nOutput:\\n\"}}\n";
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
         .sub_path = "2026/03/05/rollout-2026-03-05T00-00-00-019c0000-0000-7000-8000-000000000001.jsonl",
         .data = session_content,
     });
 
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
     const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "session-tooling-summary.json" });
     defer std.testing.allocator.free(output_path);
@@ -8428,16 +8429,16 @@ test "query-diagnose flags strict hangs and supports fail-on-hang" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("2026/03/05");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/03/05");
     const session_content =
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:00:00Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"q1\",\"arguments\":\"{\\\"cmd\\\":\\\"seq query --spec @spec.json\\\"}\"}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:00:12Z\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"q1\",\"output\":\"Chunk ID: aa\\nWall time: 12.250 seconds\\nProcess running with session ID 77\\nOutput:\\n\"}}\n";
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
         .sub_path = "2026/03/05/rollout-2026-03-05T00-00-00-019c0000-0000-7000-8000-000000000002.jsonl",
         .data = session_content,
     });
 
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
     const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "query-diagnose.json" });
     defer std.testing.allocator.free(output_path);
@@ -8477,14 +8478,14 @@ test "skill-blocks distinct returns one aggregated version with metadata" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("2026/03/10");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/03/10");
     const session_rel = "2026/03/10/rollout-2026-03-10T10-00-00-019c0000-0000-7000-8000-000000000020.jsonl";
     const session_content =
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"<skill>\\n<name>accretive</name>\\n<path>/tmp/accretive/SKILL.md</path>\\n# one\\n</skill>\"}]}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:01:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"<skill>\\n<name>accretive</name>\\n<path>/tmp/accretive/SKILL.md</path>\\n# one\\n</skill>\"}]}}\n";
-    try tmp.dir.writeFile(.{ .sub_path = session_rel, .data = session_content });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = session_rel, .data = session_content });
 
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
     const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "skill-blocks-distinct.json" });
     defer std.testing.allocator.free(output_path);
@@ -8512,14 +8513,14 @@ test "skill-blocks history all preserves duplicate occurrences" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("2026/03/10");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/03/10");
     const session_rel = "2026/03/10/rollout-2026-03-10T10-00-00-019c0000-0000-7000-8000-000000000021.jsonl";
     const session_content =
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"<skill>\\n<name>accretive</name>\\n# one\\n</skill>\"}]}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-10T10:00:01Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"<skill>\\n<name>accretive</name>\\n# one\\n</skill>\"}}\n";
-    try tmp.dir.writeFile(.{ .sub_path = session_rel, .data = session_content });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = session_rel, .data = session_content });
 
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
     const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "skill-blocks-all.json" });
     defer std.testing.allocator.free(output_path);

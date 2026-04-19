@@ -32,11 +32,11 @@ pub const Db = struct {
     handle: *c.sqlite3,
 
     pub fn open(allocator: std.mem.Allocator, db_path: []const u8) !Db {
-        const probe = std.fs.openFileAbsolute(db_path, .{}) catch |err| switch (err) {
+        const probe = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), db_path, .{}) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => return error.MissingCodexStateDb,
             else => return err,
         };
-        probe.close();
+        probe.close(std.Io.Threaded.global_single_threaded.io());
 
         const path_z = try allocator.dupeZ(u8, db_path);
         defer allocator.free(path_z);
@@ -134,7 +134,7 @@ pub fn toAbsolutePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 
     if (std.fs.path.isAbsolute(expanded)) return allocator.dupe(u8, expanded);
 
-    const cwd = try std.process.getCwdAlloc(allocator);
+    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
     defer allocator.free(cwd);
     return std.fs.path.join(allocator, &.{ cwd, expanded });
 }
@@ -142,8 +142,7 @@ pub fn toAbsolutePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 pub fn resolveDefaultDbPath(allocator: std.mem.Allocator, override_path: ?[]const u8) ![]u8 {
     if (override_path) |path| return toAbsolutePath(allocator, path);
 
-    const home = try std.process.getEnvVarOwned(allocator, "HOME");
-    defer allocator.free(home);
+    const home = std.Io.Threaded.global_single_threaded.environString("HOME") orelse return error.EnvironmentVariableNotFound;
     const codex_home = try std.fs.path.join(allocator, &.{ home, ".codex" });
     defer allocator.free(codex_home);
 
@@ -151,18 +150,18 @@ pub fn resolveDefaultDbPath(allocator: std.mem.Allocator, override_path: ?[]cons
 }
 
 pub fn discoverLatestStateDbPath(allocator: std.mem.Allocator, codex_home: []const u8) ![]u8 {
-    var dir = std.fs.openDirAbsolute(codex_home, .{ .iterate = true }) catch |err| switch (err) {
+    var dir = std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), codex_home, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return error.MissingCodexStateDb,
         else => return err,
     };
-    defer dir.close();
+    defer dir.close(std.Io.Threaded.global_single_threaded.io());
 
     var iter = dir.iterate();
     var best_version: ?u32 = null;
     var best_name: ?[]u8 = null;
     defer if (best_name) |value| allocator.free(value);
 
-    while (try iter.next()) |entry| {
+    while (try iter.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
         if (entry.kind != .file) continue;
         const version = parseStateDbVersion(entry.name) orelse continue;
         if (best_version == null or version > best_version.?) {
@@ -222,13 +221,13 @@ test "discoverLatestStateDbPath picks the highest numeric version" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "state_3.sqlite", .data = "" });
-    try tmp.dir.writeFile(.{ .sub_path = "state_5.sqlite", .data = "" });
-    try tmp.dir.writeFile(.{ .sub_path = "state_4.sqlite", .data = "" });
-    try tmp.dir.writeFile(.{ .sub_path = "state.sqlite", .data = "" });
-    try tmp.dir.writeFile(.{ .sub_path = "state_5.sqlite-wal", .data = "" });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "state_3.sqlite", .data = "" });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "state_5.sqlite", .data = "" });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "state_4.sqlite", .data = "" });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "state.sqlite", .data = "" });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "state_5.sqlite-wal", .data = "" });
 
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
 
     const db_path = try discoverLatestStateDbPath(std.testing.allocator, root_abs);

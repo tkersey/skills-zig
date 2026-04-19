@@ -126,10 +126,10 @@ const COUNTERFACTUAL_TOKENS = [_][]const u8{ "because", "prevent", "otherwise" }
 const Options = struct {
     status: []const u8 = "review_later",
     learning: ?[]const u8 = null,
-    evidence: std.ArrayListUnmanaged([]const u8) = .{},
+    evidence: std.ArrayListUnmanaged([]const u8) = .empty,
     application: []const u8 = "",
-    tags: std.ArrayListUnmanaged([]const u8) = .{},
-    related_ids: std.ArrayListUnmanaged([]const u8) = .{},
+    tags: std.ArrayListUnmanaged([]const u8) = .empty,
+    related_ids: std.ArrayListUnmanaged([]const u8) = .empty,
     supersedes_id: []const u8 = "",
     repo: []const u8 = "",
     path: []const u8 = ".learnings.jsonl",
@@ -168,13 +168,9 @@ const Date = struct {
     day: i64,
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
 
     try runWithAllocator(allocator, if (argv.len > 1) argv[1..] else &.{}, StandaloneSurface);
 }
@@ -199,13 +195,13 @@ pub fn runWithAllocator(
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (core_cli.isHelpArg(arg)) {
-            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             const stdout = &stdout_writer.interface;
             try core_cli.printHelpSurface(stdout, asHelpSurface(surface), Version);
             return;
         }
         if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
-            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             const stdout = &stdout_writer.interface;
             try core_cli.printVersion(stdout, Version);
             return;
@@ -300,7 +296,7 @@ pub fn runWithAllocator(
         exitParseError(surface, "the following arguments are required: --learning", .{});
     };
 
-    const cwd = try std.process.getCwdAlloc(allocator);
+    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
     defer allocator.free(cwd);
 
     const repo_root = try discoverRepoRootAlloc(allocator, cwd);
@@ -316,7 +312,7 @@ pub fn runWithAllocator(
     const learning = try normalizeLearningAlloc(allocator, learning_raw);
     defer allocator.free(learning);
     if (learning.len == 0) {
-        var stderr_writer = std.fs.File.stderr().writer(&.{});
+        var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stderr = &stderr_writer.interface;
         try stderr.print("error: learning is empty\n", .{});
         std.process.exit(1);
@@ -422,7 +418,7 @@ pub fn runWithAllocator(
         const existing_id = try findDuplicateExistingIdAlloc(allocator, output_path, fp);
         if (existing_id) |id| {
             defer allocator.free(id);
-            var stderr_writer = std.fs.File.stderr().writer(&.{});
+            var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             const stderr = &stderr_writer.interface;
             try stderr.print("duplicate-skip: fingerprint={s} existing_id={s} path={s}\n", .{ fp, id, output_path });
             return;
@@ -451,7 +447,7 @@ pub fn runWithAllocator(
 
     try appendJsonLine(output_path, line);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("appended: id={s} status={s} path={s}\n", .{ record_id, status, output_path });
 }
@@ -540,7 +536,7 @@ fn validateQuality(
     repo_root: []const u8,
     allow_temp_path: bool,
 ) !bool {
-    var stderr_writer = std.fs.File.stderr().writer(&.{});
+    var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stderr = &stderr_writer.interface;
 
     var has_errors = false;
@@ -737,7 +733,10 @@ fn discoverRepoRootAlloc(allocator: std.mem.Allocator, start: []const u8) ![]u8 
 
     if (root.len == 0) return allocator.dupe(u8, start);
 
-    return std.fs.realpathAlloc(allocator, root) catch allocator.dupe(u8, root);
+    return if (std.fs.path.isAbsolute(root))
+        std.Io.Dir.realPathFileAbsoluteAlloc(std.Io.Threaded.global_single_threaded.io(), root, allocator) catch allocator.dupe(u8, root)
+    else
+        std.Io.Dir.cwd().realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), root, allocator) catch allocator.dupe(u8, root);
 }
 
 fn inferRepoSlugAlloc(allocator: std.mem.Allocator, repo_root: []const u8) ![]u8 {
@@ -823,42 +822,27 @@ fn runGitAlloc(allocator: std.mem.Allocator, cwd: []const u8, args: []const []co
     try argv.append(allocator, "git");
     try argv.appendSlice(allocator, args);
 
-    var child = std.process.Child.init(argv.items, allocator);
-    child.cwd = cwd;
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
+    const result = std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
+        .argv = argv.items,
+        .cwd = .{ .path = cwd },
+        .stderr_limit = .limited(0),
+        .stdout_limit = .limited(4 * 1024 * 1024),
+    }) catch return allocator.dupe(u8, "");
+    defer allocator.free(result.stderr);
 
-    child.spawn() catch return allocator.dupe(u8, "");
-
-    const stdout_file = child.stdout orelse {
-        _ = child.wait() catch {};
-        return allocator.dupe(u8, "");
-    };
-
-    const raw_output = stdout_file.readToEndAlloc(allocator, 4 * 1024 * 1024) catch {
-        _ = child.wait() catch {};
-        return allocator.dupe(u8, "");
-    };
-    errdefer allocator.free(raw_output);
-
-    const term = child.wait() catch {
-        allocator.free(raw_output);
-        return allocator.dupe(u8, "");
-    };
-
-    switch (term) {
-        .Exited => |code| {
-            if (code != 0) {
-                allocator.free(raw_output);
-                return allocator.dupe(u8, "");
-            }
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            allocator.free(result.stdout);
+            return allocator.dupe(u8, "");
         },
         else => {
-            allocator.free(raw_output);
+            allocator.free(result.stdout);
             return allocator.dupe(u8, "");
         },
     }
+
+    const raw_output = result.stdout;
+    errdefer allocator.free(raw_output);
 
     const trimmed = std.mem.trim(u8, raw_output, " \t\r\n");
     const out = try allocator.dupe(u8, trimmed);
@@ -867,7 +851,7 @@ fn runGitAlloc(allocator: std.mem.Allocator, cwd: []const u8, args: []const []co
 }
 
 fn nowUtcAlloc(allocator: std.mem.Allocator) ![]u8 {
-    const now_sec: i64 = std.time.timestamp();
+    const now_sec: i64 = @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000));
     var days = @divFloor(now_sec, 86_400);
     var seconds_of_day = now_sec - days * 86_400;
     if (seconds_of_day < 0) {
@@ -953,39 +937,42 @@ fn ensureParentPath(path: []const u8) !void {
     if (parent.len == 0) return;
 
     if (std.fs.path.isAbsolute(parent)) {
-        const rel = std.mem.trimLeft(u8, parent, "/");
+        const rel = std.mem.trim(u8, parent, "/");
         if (rel.len == 0) return;
-        var root = try std.fs.openDirAbsolute("/", .{});
-        defer root.close();
-        try root.makePath(rel);
+        var root = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), "/", .{});
+        defer root.close(std.Io.Threaded.global_single_threaded.io());
+        try root.createDirPath(std.Io.Threaded.global_single_threaded.io(), rel);
         return;
     }
 
-    try std.fs.cwd().makePath(parent);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), parent);
 }
 
 fn appendJsonLine(path: []const u8, json_line: []const u8) !void {
     try ensureParentPath(path);
 
-    var file = std.fs.openFileAbsolute(path, .{ .mode = .write_only }) catch |err| switch (err) {
-        error.FileNotFound => try std.fs.createFileAbsolute(path, .{ .truncate = false }),
+    var file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{ .mode = .write_only }) catch |err| switch (err) {
+        error.FileNotFound => try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), path, .{ .truncate = false }),
         else => return err,
     };
-    defer file.close();
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
 
-    try file.seekFromEnd(0);
-    try file.writeAll(json_line);
-    try file.writeAll("\n");
+    const end_pos = (try file.stat(std.Io.Threaded.global_single_threaded.io())).size;
+    var writer = file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    try writer.seekTo(end_pos);
+    try writer.interface.writeAll(json_line);
+    try writer.interface.writeAll("\n");
 }
 
 fn findDuplicateExistingIdAlloc(allocator: std.mem.Allocator, path: []const u8, fingerprint: []const u8) !?[]u8 {
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+    const file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
-    defer file.close();
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
 
-    const data = try file.readToEndAlloc(allocator, 64 * 1024 * 1024);
+    var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const data = try reader.interface.allocRemaining(allocator, .limited(64 * 1024 * 1024));
     defer allocator.free(data);
 
     var lines = std.mem.splitScalar(u8, data, '\n');
@@ -1027,7 +1014,8 @@ fn encodeRecordJsonAlloc(allocator: std.mem.Allocator, record: Record) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
 
-    const writer = out.writer(allocator);
+    var writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    const writer = &writer_alloc.writer;
 
     try writer.writeByte('{');
     var first = true;

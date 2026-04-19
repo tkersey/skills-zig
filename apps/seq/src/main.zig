@@ -81,29 +81,26 @@ fn runLegacyNumericSeqCompat(stdout: anytype, argv: []const []const u8) !bool {
     return true;
 }
 
-pub fn main() !void {
-    runMain() catch |err| {
+pub fn main(init: std.process.Init) !void {
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    runMain(init.gpa, argv) catch |err| {
         if (shouldIgnoreWriteError(err)) return;
         if (shouldSuppressCliError(err)) std.process.exit(2);
         return err;
     };
 }
 
-fn runMain() !void {
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa_state.deinit();
-    const allocator = gpa_state.allocator();
+fn runMain(allocator: std.mem.Allocator, argv: []const []const u8) !void {
+    var arg_index: usize = 1;
 
-    var args = std.process.args();
-    _ = args.next();
-
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
 
-    const arg = args.next() orelse {
+    const arg = if (arg_index < argv.len) argv[arg_index] else {
         try printCommandList(stdout);
         return;
     };
+    arg_index += 1;
 
     if (lib.isHelpArg(arg)) {
         try printCommandList(stdout);
@@ -120,15 +117,15 @@ fn runMain() !void {
             var unknown_args: std.ArrayList([]const u8) = .empty;
             defer unknown_args.deinit(allocator);
             try unknown_args.append(allocator, arg);
-            while (args.next()) |next_arg| {
-                try unknown_args.append(allocator, next_arg);
+            while (arg_index < argv.len) : (arg_index += 1) {
+                try unknown_args.append(allocator, argv[arg_index]);
             }
 
             if (try runLegacyNumericSeqCompat(stdout, unknown_args.items)) {
                 return;
             }
 
-            var stderr_writer = std.fs.File.stderr().writer(&.{});
+            var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             try stderr_writer.interface.print("unknown command: {s}\n", .{arg});
             return error.InvalidCommand;
         },
@@ -136,8 +133,8 @@ fn runMain() !void {
             var extra_args: std.ArrayList([]const u8) = .empty;
             defer extra_args.deinit(allocator);
 
-            while (args.next()) |next_arg| {
-                try extra_args.append(allocator, next_arg);
+            while (arg_index < argv.len) : (arg_index += 1) {
+                try extra_args.append(allocator, argv[arg_index]);
             }
 
             try commands.run(allocator, cmd, extra_args.items);
@@ -153,28 +150,28 @@ test "shouldIgnoreWriteError recognizes broken pipe write failures" {
 
 test "legacy numeric compatibility handles one to three positional args" {
     var out: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&out);
+    var writer = std.Io.Writer.fixed(&out);
 
-    try std.testing.expect(try runLegacyNumericSeqCompat(fbs.writer(), &[_][]const u8{"9"}));
-    try std.testing.expectEqualStrings("1\n2\n3\n4\n5\n6\n7\n8\n9\n", fbs.getWritten());
+    try std.testing.expect(try runLegacyNumericSeqCompat(&writer, &[_][]const u8{"9"}));
+    try std.testing.expectEqualStrings("1\n2\n3\n4\n5\n6\n7\n8\n9\n", writer.buffer[0..writer.end]);
 }
 
 test "legacy numeric compatibility handles explicit start/end and start/step/end" {
     var out_two: [256]u8 = undefined;
-    var fbs_two = std.io.fixedBufferStream(&out_two);
-    try std.testing.expect(try runLegacyNumericSeqCompat(fbs_two.writer(), &[_][]const u8{ "1", "9" }));
-    try std.testing.expectEqualStrings("1\n2\n3\n4\n5\n6\n7\n8\n9\n", fbs_two.getWritten());
+    var writer_two = std.Io.Writer.fixed(&out_two);
+    try std.testing.expect(try runLegacyNumericSeqCompat(&writer_two, &[_][]const u8{ "1", "9" }));
+    try std.testing.expectEqualStrings("1\n2\n3\n4\n5\n6\n7\n8\n9\n", writer_two.buffer[0..writer_two.end]);
 
     var out_three: [256]u8 = undefined;
-    var fbs_three = std.io.fixedBufferStream(&out_three);
-    try std.testing.expect(try runLegacyNumericSeqCompat(fbs_three.writer(), &[_][]const u8{ "1", "2", "9" }));
-    try std.testing.expectEqualStrings("1\n3\n5\n7\n9\n", fbs_three.getWritten());
+    var writer_three = std.Io.Writer.fixed(&out_three);
+    try std.testing.expect(try runLegacyNumericSeqCompat(&writer_three, &[_][]const u8{ "1", "2", "9" }));
+    try std.testing.expectEqualStrings("1\n3\n5\n7\n9\n", writer_three.buffer[0..writer_three.end]);
 }
 
 test "legacy numeric compatibility ignores non-numeric invocations" {
     var out: [64]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&out);
+    var writer = std.Io.Writer.fixed(&out);
 
-    try std.testing.expect(!(try runLegacyNumericSeqCompat(fbs.writer(), &[_][]const u8{"datasets"})));
-    try std.testing.expectEqualStrings("", fbs.getWritten());
+    try std.testing.expect(!(try runLegacyNumericSeqCompat(&writer, &[_][]const u8{"datasets"})));
+    try std.testing.expectEqualStrings("", writer.buffer[0..writer.end]);
 }

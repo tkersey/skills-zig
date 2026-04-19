@@ -37,7 +37,7 @@ pub fn build(b: *std.Build) void {
         .name = "seq",
         .root_module = root_module,
     });
-    exe.linkLibC();
+    exe.root_module.linkSystemLibrary("c", .{});
     exe.root_module.linkSystemLibrary("sqlite3", .{});
 
     b.installArtifact(exe);
@@ -63,7 +63,7 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.addTest(.{
         .root_module = tests_mod,
     });
-    unit_tests.linkLibC();
+    unit_tests.root_module.linkSystemLibrary("c", .{});
     unit_tests.root_module.linkSystemLibrary("sqlite3", .{});
     const run_unit_tests = b.addRunArtifact(unit_tests);
 

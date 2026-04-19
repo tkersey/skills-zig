@@ -34,13 +34,9 @@ const Config = struct {
     output: []const u8 = "perf-report.md",
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
 
@@ -52,7 +48,8 @@ pub fn main() !void {
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
-    const w = out.writer(allocator);
+    var writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    const w = &writer_alloc.writer;
 
     try w.print(
         \\# Performance Report: {s}
@@ -134,13 +131,13 @@ pub fn main() !void {
         \\
     );
 
-    try std.fs.cwd().writeFile(.{
+    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{
         .sub_path = cfg.output,
         .data = out.items,
     });
     const success_message = try std.fmt.allocPrint(allocator, "Wrote {s}\n", .{cfg.output});
     defer allocator.free(success_message);
-    try writeToStreamAllowBrokenPipe(std.fs.File.stdout(), success_message);
+    try writeToStreamAllowBrokenPipe(std.Io.File.stdout(), success_message);
 }
 
 fn parseArgs(argv: []const []const u8) !Config {
@@ -150,13 +147,13 @@ fn parseArgs(argv: []const []const u8) !Config {
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
         if (core_cli.isHelpArg(arg)) {
-            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             const stdout = &stdout_writer.interface;
             try core_cli.printHelpSurface(stdout, HelpSurface, Version);
             std.process.exit(0);
         }
         if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
-            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             const stdout = &stdout_writer.interface;
             try core_cli.printVersion(stdout, Version);
             std.process.exit(0);
@@ -191,7 +188,7 @@ fn parseArgs(argv: []const []const u8) !Config {
 }
 
 fn currentDateIso(allocator: std.mem.Allocator) ![]u8 {
-    const now_sec: i64 = std.time.timestamp();
+    const now_sec: i64 = @intCast(@divFloor(std.Io.Clock.real.now(core_io.defaultIo()).nanoseconds, 1_000_000_000));
     const days: i64 = @divFloor(now_sec, 86_400);
     const date = civilFromDays(days);
     const year_u: u64 = @intCast(@max(date.year, 0));
@@ -226,7 +223,7 @@ fn civilFromDays(days_since_unix_epoch: i64) Date {
     };
 }
 
-fn writeToStreamAllowBrokenPipe(file: std.fs.File, bytes: []const u8) !void {
+fn writeToStreamAllowBrokenPipe(file: std.Io.File, bytes: []const u8) !void {
     return core_io.writeAllAllowBrokenPipe(file, bytes);
 }
 

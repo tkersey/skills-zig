@@ -141,13 +141,9 @@ const DepRow = struct {
     interactive_lead: bool,
 };
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (argv.len <= 1) {
         try printHelp();
@@ -208,13 +204,13 @@ fn resolveCommand(raw: []const u8) ?Command {
 }
 
 fn printHelp() !void {
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try core_cli.printHelpSurface(stdout, HelpSurface, Version);
 }
 
 fn printVersion() !void {
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try core_cli.printVersion(stdout, Version);
 }
@@ -321,7 +317,7 @@ fn cmdBudget(args: []const []const u8) !void {
         consecutive_clean_waves,
     );
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
 
     if (!format_json) {
@@ -451,7 +447,7 @@ fn cmdReplay(args: []const []const u8) !void {
         remaining -= n;
     }
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
 
     try stdout.print(
@@ -478,7 +474,7 @@ fn cmdReplay(args: []const []const u8) !void {
 
 fn cmdPlanSync(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const input_path = try parseRequiredPath(args, "--input-json");
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, 16 * 1024 * 1024);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), input_path, allocator, .limited(16 * 1024 * 1024));
     const steps = try parsePlanSteps(allocator, bytes);
 
     var pending: usize = 0;
@@ -489,7 +485,7 @@ fn cmdPlanSync(allocator: std.mem.Allocator, args: []const []const u8) !void {
         if (std.mem.eql(u8, step.status, "pending")) pending += 1 else if (std.mem.eql(u8, step.status, "in_progress")) in_progress += 1 else if (std.mem.eql(u8, step.status, "completed")) completed += 1 else other += 1;
     }
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print(
         "{{\"command\":\"plan_sync\",\"total_steps\":{d},\"pending\":{d},\"in_progress\":{d},\"completed\":{d},\"other\":{d}}}\n",
@@ -502,12 +498,13 @@ fn cmdSlice(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const output_path = parseOptionalPath(args, "--output-json");
     const max_slices = parseOptionalUsize(args, "--max-slices") orelse std.math.maxInt(usize);
 
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, 16 * 1024 * 1024);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), input_path, allocator, .limited(16 * 1024 * 1024));
     const steps = try parsePlanSteps(allocator, bytes);
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
-    var writer = out.writer(allocator);
+    var writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    const writer = &writer_alloc.writer;
 
     try writer.writeAll("{\"command\":\"slice\",\"units\":[");
 
@@ -536,7 +533,7 @@ fn cmdSlice(allocator: std.mem.Allocator, args: []const []const u8) !void {
         try writeTextFile(path, out.items);
     }
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.writeAll(out.items);
 }
@@ -554,7 +551,8 @@ fn cmdWave(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     var csv: std.ArrayList(u8) = .empty;
     defer csv.deinit(allocator);
-    var writer = csv.writer(allocator);
+    var writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &csv);
+    const writer = &writer_alloc.writer;
 
     try writer.writeAll("id,objective,unit_scope,write_scope,constraints,invariants,proof_command,risk_tier,candidate_id,triplet_index,lane,base_sha,delivery_mode,attempt,variant,budget_tier\n");
 
@@ -616,7 +614,7 @@ fn cmdWave(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     try writeTextFile(csv_path, csv.items);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print(
         "{{\"command\":\"wave\",\"lane\":\"{s}\",\"triplet_width\":{d},\"units_in\":{d},\"units_selected\":{d},\"rows_emitted\":{d},\"csv_path\":",
@@ -646,7 +644,7 @@ fn cmdRunCsv(allocator: std.mem.Allocator, args: []const []const u8) !void {
         return error.CsvPathCollision;
     }
 
-    const csv_bytes = try std.fs.cwd().readFileAlloc(allocator, csv_path, 16 * 1024 * 1024);
+    const csv_bytes = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), csv_path, allocator, .limited(16 * 1024 * 1024));
     var lines = std.mem.splitScalar(u8, csv_bytes, '\n');
     const header_line = lines.next() orelse return error.EmptyCsv;
     const headers = try parseHeaderColumns(allocator, header_line);
@@ -665,7 +663,8 @@ fn cmdRunCsv(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
-    var outw = output.writer(allocator);
+    var writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &output);
+    const outw = &writer_alloc.writer;
 
     try outw.writeAll("id,candidate_id,triplet_index,lane,decision,proof_status,write_scope,risk_tier,base_sha,proof_attempts,proof_evidence\n");
 
@@ -714,7 +713,7 @@ fn cmdRunCsv(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     try writeTextFile(output_csv_path, output.items);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("{{\"command\":\"run_csv\",\"row_count\":{d},\"csv_path\":", .{row_count});
     try std.json.Stringify.value(csv_path, .{}, stdout);
@@ -738,12 +737,12 @@ fn cmdRunCsv(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
 fn cmdLedger(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const input_path = try parseRequiredPath(args, "--input-json");
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, input_path, 16 * 1024 * 1024);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), input_path, allocator, .limited(16 * 1024 * 1024));
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
 
     if (parsed.value != .object) return error.LedgerInputMustBeObject;
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
 
     try stdout.print("{{\"command\":\"ledger\",\"events\":{{", .{});
@@ -773,7 +772,7 @@ fn cmdOrchplanToUnits(allocator: std.mem.Allocator, args: []const []const u8) !v
         return error.InvalidFormat;
     }
 
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, orchplan_path, 32 * 1024 * 1024);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), orchplan_path, allocator, .limited(32 * 1024 * 1024));
     const tasks = try parseOrchplanTasks(allocator, bytes);
 
     var warnings: std.ArrayList([]const u8) = .empty;
@@ -825,13 +824,14 @@ fn cmdOrchplanToUnits(allocator: std.mem.Allocator, args: []const []const u8) !v
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
-    const out_writer = out.writer(allocator);
+    var writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    const out_writer = &writer_alloc.writer;
     try writeUnitsPayloadJson(out_writer, units.items);
     try writeTextFile(output_json_path, out.items);
 
     if (std.mem.eql(u8, format, "quiet")) return;
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print(
         "{{\"command\":\"orchplan_to_units\",\"orchplan\":",
@@ -889,13 +889,13 @@ fn cmdPrepareCrfipBatch(allocator: std.mem.Allocator, args: []const []const u8) 
     const run_csv_json = try runSelfJsonCommand(allocator, run_csv_args.items);
 
     if (std.mem.eql(u8, format, "paths")) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try stdout.print("{s}\n{s}\n", .{ csv_path, out_path });
         return;
     }
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("{{\"command\":\"prepare_crfip_batch\",\"run_dir\":", .{});
     try std.json.Stringify.value(run_dir, .{}, stdout);
@@ -1059,7 +1059,7 @@ fn cmdDoctor(allocator: std.mem.Allocator, args: []const []const u8) !void {
                         try archived_misses.append(allocator, p);
                     }
                     const expanded = try expandPathWithHome(allocator, p);
-                    std.fs.cwd().access(expanded, .{}) catch {
+                    std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), expanded, .{}) catch {
                         try archived_missing_files.append(allocator, p);
                     };
                 }
@@ -1106,7 +1106,7 @@ fn cmdDoctor(allocator: std.mem.Allocator, args: []const []const u8) !void {
         }
     }
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     if (std.mem.eql(u8, format, "json")) {
         try stdout.writeAll("{\"command\":\"mesh_doctor\",\"seq\":");
@@ -1236,7 +1236,7 @@ fn cmdLaneCompletenessLint(allocator: std.mem.Allocator, args: []const []const u
     );
     defer errors.deinit(allocator);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
 
     if (errors.items.len == 0) {
@@ -1261,7 +1261,7 @@ fn cmdLaneCompletenessLint(allocator: std.mem.Allocator, args: []const []const u
 
 fn cmdContractDriftLint(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const repo_root = parseOptionalPath(args, "--repo-root") orelse blk: {
-        break :blk try std.process.getCwdAlloc(allocator);
+        break :blk try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
     };
 
     const DriftRule = struct {
@@ -1312,7 +1312,7 @@ fn cmdContractDriftLint(allocator: std.mem.Allocator, args: []const []const u8) 
         const file_path = try std.fs.path.resolve(allocator, &.{ repo_root, rule.rel_path });
         defer allocator.free(file_path);
 
-        const bytes = std.fs.cwd().readFileAlloc(allocator, file_path, 16 * 1024 * 1024) catch |err| {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), file_path, allocator, .limited(16 * 1024 * 1024)) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "{s}: file missing ({s})", .{ rule.rel_path, @errorName(err) });
             try missing.append(allocator, msg);
             continue;
@@ -1326,7 +1326,7 @@ fn cmdContractDriftLint(allocator: std.mem.Allocator, args: []const []const u8) 
         }
     }
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     if (missing.items.len == 0) {
         try stdout.writeAll("contract_drift_lint: PASS\n");
@@ -1413,7 +1413,7 @@ fn cmdMigrationGate(allocator: std.mem.Allocator, args: []const []const u8) !voi
         try appendLintError(allocator, &errors, "python files still present under codex/skills/mesh", .{});
     }
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     if (std.mem.eql(u8, format, "json")) {
         try stdout.writeAll("{\"command\":\"migration_gate\",\"contract_drift\":{");
@@ -1630,7 +1630,7 @@ fn evaluateLaneLint(
     defer fixer_states.deinit();
 
     for (csv_paths) |path| {
-        const bytes = std.fs.cwd().readFileAlloc(allocator, path, 32 * 1024 * 1024) catch |err| {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(32 * 1024 * 1024)) catch |err| {
             try appendLintError(allocator, &errors, "{s}: read failed ({s})", .{ path, @errorName(err) });
             continue;
         };
@@ -1884,7 +1884,7 @@ fn forEachDepToken(raw: []const u8, context: anytype, comptime cb: fn (@TypeOf(c
 }
 
 fn validateDepsCsvPath(allocator: std.mem.Allocator, deps_csv_path: []const u8) !void {
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, deps_csv_path, 16 * 1024 * 1024);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), deps_csv_path, allocator, .limited(16 * 1024 * 1024));
     defer allocator.free(bytes);
     try validateDepsCsvBytes(allocator, bytes);
 }
@@ -2013,7 +2013,7 @@ fn appendPlanStepsFromArray(
 }
 
 fn parseSliceUnits(allocator: std.mem.Allocator, path: []const u8) ![]SliceUnit {
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, path, 16 * 1024 * 1024);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(16 * 1024 * 1024));
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
 
     if (parsed.value != .object) return error.InvalidUnitsJson;
@@ -2313,21 +2313,21 @@ fn parseYamlInlineList(allocator: std.mem.Allocator, raw: []const u8) ![]const [
 fn expandPathWithHome(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
     if (raw.len == 0) return raw;
     if (raw[0] != '~') return raw;
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return raw;
+    const home = std.Io.Threaded.global_single_threaded.environString("HOME") orelse return raw;
     if (raw.len == 1) return home;
     if (raw[1] == '/') return try std.fmt.allocPrint(allocator, "{s}{s}", .{ home, raw[1..] });
     return raw;
 }
 
 fn defaultArtifactRoot(allocator: std.mem.Allocator) ![]const u8 {
-    const env = std.process.getEnvVarOwned(allocator, "CODEX_MESH_ARTIFACT_ROOT") catch "";
-    if (env.len > 0) return try expandPathWithHome(allocator, env);
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return ".codex/mesh-artifacts";
+    const env = std.c.getenv("CODEX_MESH_ARTIFACT_ROOT");
+    if (env != null and std.mem.span(env.?).len > 0) return try expandPathWithHome(allocator, std.mem.span(env.?));
+    const home = std.Io.Threaded.global_single_threaded.environString("HOME") orelse return ".codex/mesh-artifacts";
     return try std.fmt.allocPrint(allocator, "{s}/.codex/mesh-artifacts", .{home});
 }
 
 fn defaultRunId(allocator: std.mem.Allocator) ![]const u8 {
-    const now = std.time.timestamp();
+    const now = @as(i64, @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000)));
     return try std.fmt.allocPrint(allocator, "{d}", .{now});
 }
 
@@ -2453,7 +2453,8 @@ fn writeCrfipCandidateCsv(
 ) !void {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
-    const writer = out.writer(allocator);
+    var writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    const writer = &writer_alloc.writer;
     try writer.writeAll("id,objective,unit_scope,write_scope,constraints,invariants,proof_command,risk_tier,candidate_id,triplet_index,lane,base_sha,delivery_mode,attempt,variant,budget_tier\n");
 
     for (selected) |unit| {
@@ -2516,27 +2517,24 @@ fn runCommandCapture(
     argv: []const []const u8,
     cwd: ?[]const u8,
 ) !CommandRunResult {
-    var child = std.process.Child.init(argv, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    if (cwd) |cwd_path| child.cwd = cwd_path;
-    try child.spawn();
-
-    const out = try child.stdout.?.readToEndAlloc(allocator, 32 * 1024 * 1024);
-    const err = try child.stderr.?.readToEndAlloc(allocator, 32 * 1024 * 1024);
-    const term = try child.wait();
-    const code: u8 = switch (term) {
-        .Exited => |c| @intCast(c),
+    const result = try std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
+        .argv = argv,
+        .cwd = if (cwd) |cwd_path| .{ .path = cwd_path } else .inherit,
+        .stdout_limit = .limited(32 * 1024 * 1024),
+        .stderr_limit = .limited(32 * 1024 * 1024),
+    });
+    const code: u8 = switch (result.term) {
+        .exited => |c| @intCast(c),
         else => 1,
     };
-    return .{ .exit_code = code, .stdout = out, .stderr = err };
+    return .{ .exit_code = code, .stdout = result.stdout, .stderr = result.stderr };
 }
 
 fn runSelfJsonCommand(
     allocator: std.mem.Allocator,
     cmd_args: []const []const u8,
 ) !std.json.Value {
-    const exe_path = try std.fs.selfExePathAlloc(allocator);
+    const exe_path = try std.process.executablePathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.append(allocator, exe_path);
@@ -2555,7 +2553,7 @@ fn runSelfCommandCapture(
     allocator: std.mem.Allocator,
     cmd_args: []const []const u8,
 ) !CommandRunResult {
-    const exe_path = try std.fs.selfExePathAlloc(allocator);
+    const exe_path = try std.process.executablePathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.append(allocator, exe_path);
@@ -2564,7 +2562,7 @@ fn runSelfCommandCapture(
 }
 
 fn defaultSessionsRoot(allocator: std.mem.Allocator) ![]const u8 {
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return "~/.codex/sessions";
+    const home = std.Io.Threaded.global_single_threaded.environString("HOME") orelse return "~/.codex/sessions";
     return try std.fmt.allocPrint(allocator, "{s}/.codex/sessions", .{home});
 }
 
@@ -2619,7 +2617,7 @@ fn extractSpawnCsvPairs(
     allocator: std.mem.Allocator,
     rollout_jsonl: []const u8,
 ) ![]SpawnCsvPair {
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, rollout_jsonl, 64 * 1024 * 1024);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), rollout_jsonl, allocator, .limited(64 * 1024 * 1024));
     var out: std.ArrayList(SpawnCsvPair) = .empty;
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |line_raw| {
@@ -2660,7 +2658,7 @@ fn isPathUnderRoot(
 ) bool {
     const root_path = expandPathWithHome(allocator, root_path_raw) catch return false;
     const candidate = expandPathWithHome(allocator, candidate_raw) catch return false;
-    const cwd = std.process.getCwdAlloc(allocator) catch return false;
+    const cwd = std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator) catch return false;
     const abs_root = std.fs.path.resolve(allocator, &.{ cwd, root_path }) catch return false;
     const abs_candidate = std.fs.path.resolve(allocator, &.{ cwd, candidate }) catch return false;
     if (!std.mem.startsWith(u8, abs_candidate, abs_root)) return false;
@@ -2681,10 +2679,10 @@ fn expandSimpleGlob(allocator: std.mem.Allocator, pattern: []const u8) ![]const 
     const suffix = file_pat[star_idx + 1 ..];
 
     var out: std.ArrayList([]const u8) = .empty;
-    var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
-    defer dir.close();
+    var dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), dir_path, .{ .iterate = true });
+    defer dir.close(std.Io.Threaded.global_single_threaded.io());
     var it = dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
         if (!std.mem.endsWith(u8, entry.name, suffix)) continue;
@@ -2697,11 +2695,11 @@ fn expandSimpleGlob(allocator: std.mem.Allocator, pattern: []const u8) ![]const 
 
 fn findPythonFilesUnder(allocator: std.mem.Allocator, root_rel: []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
-    var dir = std.fs.cwd().openDir(root_rel, .{ .iterate = true }) catch return &.{};
-    defer dir.close();
+    var dir = std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), root_rel, .{ .iterate = true }) catch return &.{};
+    defer dir.close(std.Io.Threaded.global_single_threaded.io());
     var walker = try dir.walk(allocator);
     defer walker.deinit();
-    while (try walker.next()) |entry| {
+    while (try walker.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".py")) continue;
         const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root_rel, entry.path });
@@ -2968,15 +2966,15 @@ fn writeJsonString(writer: anytype, value: []const u8) !void {
 
 fn writeTextFile(path: []const u8, bytes: []const u8) !void {
     if (std.fs.path.dirname(path)) |dir| {
-        if (dir.len > 0) try std.fs.cwd().makePath(dir);
+        if (dir.len > 0) try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), dir);
     }
-    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(bytes);
+    var file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), path, .{ .truncate = true });
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), bytes);
 }
 
 fn pathsAreDistinct(allocator: std.mem.Allocator, path_a: []const u8, path_b: []const u8) bool {
-    const cwd = std.process.getCwdAlloc(allocator) catch return !std.mem.eql(u8, path_a, path_b);
+    const cwd = std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator) catch return !std.mem.eql(u8, path_a, path_b);
     defer allocator.free(cwd);
 
     const abs_a = std.fs.path.resolve(allocator, &.{ cwd, path_a }) catch return !std.mem.eql(u8, path_a, path_b);
@@ -3127,6 +3125,7 @@ test "evaluateLaneLint enforces candidate_crfip lanes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    const io = std.Io.Threaded.global_single_threaded.io();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3136,8 +3135,8 @@ test "evaluateLaneLint enforces candidate_crfip lanes" {
         \\u1,obj,u1,s1,,,,med,u1-coder-1,1,coder,HEAD,patch_first,1,baseline,unknown
         \\u1,obj,u1,s1,,,,med,u1-reducer-2,2,reducer,HEAD,patch_first,1,baseline,unknown
     ;
-    try tmp.dir.writeFile(.{ .sub_path = "pass.csv", .data = pass_csv });
-    const pass_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "pass.csv");
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "pass.csv", .data = pass_csv });
+    const pass_abs = try tmp.dir.realPathFileAlloc(io, "pass.csv", std.testing.allocator);
     defer std.testing.allocator.free(pass_abs);
     const pass_paths = [_][]const u8{pass_abs};
     var pass_errors = try evaluateLaneLint(
@@ -3155,8 +3154,8 @@ test "evaluateLaneLint enforces candidate_crfip lanes" {
         \\id,objective,unit_scope,write_scope,constraints,invariants,proof_command,risk_tier,candidate_id,triplet_index,lane,base_sha,delivery_mode,attempt,variant,budget_tier
         \\u1,obj,u1,s1,,,,med,u1-coder-1,1,coder,HEAD,patch_first,1,baseline,unknown
     ;
-    try tmp.dir.writeFile(.{ .sub_path = "fail.csv", .data = fail_csv });
-    const fail_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "fail.csv");
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "fail.csv", .data = fail_csv });
+    const fail_abs = try tmp.dir.realPathFileAlloc(io, "fail.csv", std.testing.allocator);
     defer std.testing.allocator.free(fail_abs);
     const fail_paths = [_][]const u8{fail_abs};
     var fail_errors = try evaluateLaneLint(
@@ -3231,13 +3230,11 @@ test "validateDepsCsvBytes enforces deadlock guards" {
     );
 }
 
-fn fuzzBudgetDecisionTarget(_: void, input: []const u8) !void {
-    if (input.len < 4) return;
-
-    const remaining_five_hour = @as(f64, @floatFromInt(input[0]));
-    const remaining_weekly = @as(f64, @floatFromInt(input[1]));
-    const max_threads = @max(@as(usize, 1), @as(usize, input[2] % 32));
-    const previous_triplet_width = @as(usize, (input[3] % 3) + 1);
+fn fuzzBudgetDecisionTarget(_: void, smith: *std.testing.Smith) !void {
+    const remaining_five_hour = @as(f64, @floatFromInt(smith.value(u8)));
+    const remaining_weekly = @as(f64, @floatFromInt(smith.value(u8)));
+    const max_threads = @max(@as(usize, 1), @as(usize, smith.value(u8) % 32));
+    const previous_triplet_width = @as(usize, (smith.value(u8) % 3) + 1);
 
     const decision = computeBudgetDecision(remaining_five_hour, remaining_weekly, max_threads, 33, 10, 25, previous_triplet_width, false, 0, 0);
     try std.testing.expect(decision.max_active_units >= 1);

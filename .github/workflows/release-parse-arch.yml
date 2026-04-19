@@ -45,7 +45,7 @@ jobs:
           fi
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
       - name: Build parse-arch binary
         run: zig build build-parse-arch -Doptimize=ReleaseFast
       - name: Test parse-arch

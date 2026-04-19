@@ -15,22 +15,22 @@ pub const ManagedServer = struct {
     }
 
     pub fn processId(self: *const ManagedServer) u64 {
+        const child_id = self.child.id orelse return 0;
         return switch (builtin.os.tag) {
-            .windows => @intCast(@intFromPtr(self.child.id)),
+            .windows => @intCast(@intFromPtr(child_id)),
             .wasi => 0,
-            else => @intCast(self.child.id),
+            else => @intCast(child_id),
         };
     }
 
     pub fn kill(self: *ManagedServer) void {
-        _ = self.child.kill() catch {};
-        _ = self.child.wait() catch {};
+        self.child.kill(std.Io.Threaded.global_single_threaded.io());
     }
 };
 
 pub const Connection = struct {
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: std.Io.net.Stream,
     read_buf: std.ArrayList(u8) = .empty,
 
     pub fn connect(
@@ -39,17 +39,19 @@ pub const Connection = struct {
         timeout_ms: u32,
     ) !Connection {
         const parsed = try parseWsUrl(ws_url);
-        const address = try std.net.Address.parseIp(parsed.host, parsed.port);
-        const started_ms = std.time.milliTimestamp();
+        const address = try std.Io.net.IpAddress.parse(parsed.host, parsed.port);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const started_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
         while (true) {
-            const stream = std.net.tcpConnectToAddress(address) catch |err| {
-                if (std.time.milliTimestamp() - started_ms >= timeout_ms) return err;
-                std.Thread.sleep(50 * std.time.ns_per_ms);
+            const stream = address.connect(io, .{ .mode = .stream }) catch |err| {
+                const now_ms = @divFloor(std.Io.Clock.awake.now(io).nanoseconds, 1_000_000);
+                if (now_ms - started_ms >= timeout_ms) return err;
+                std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
                 continue;
             };
 
             handshakeClient(allocator, stream, parsed.host, parsed.port, parsed.path) catch |err| {
-                stream.close();
+                stream.close(io);
                 return err;
             };
 
@@ -62,7 +64,7 @@ pub const Connection = struct {
     }
 
     pub fn close(self: *Connection) void {
-        self.stream.close();
+        self.stream.close(std.Io.Threaded.global_single_threaded.io());
     }
 
     pub fn deinit(self: *Connection) void {
@@ -123,17 +125,17 @@ pub const Connection = struct {
         var payload_len: u64 = second & 0x7F;
         if (payload_len == 126) {
             var extended: [2]u8 = undefined;
-            _ = try self.stream.readAtLeast(&extended, extended.len);
+            try readStreamExact(self.stream, &extended);
             payload_len = mem.readInt(u16, &extended, .big);
         } else if (payload_len == 127) {
             var extended: [8]u8 = undefined;
-            _ = try self.stream.readAtLeast(&extended, extended.len);
+            try readStreamExact(self.stream, &extended);
             payload_len = mem.readInt(u64, &extended, .big);
         }
 
         var mask: [4]u8 = undefined;
         if (masked) {
-            _ = try self.stream.readAtLeast(&mask, mask.len);
+            try readStreamExact(self.stream, &mask);
         }
 
         const payload = if (payload_len == 0)
@@ -141,7 +143,7 @@ pub const Connection = struct {
         else blk: {
             const owned = try self.allocator.alloc(u8, @intCast(payload_len));
             errdefer self.allocator.free(owned);
-            _ = try self.stream.readAtLeast(owned, owned.len);
+            try readStreamExact(self.stream, owned);
             if (masked) applyMask(&mask, owned);
             break :blk owned;
         };
@@ -159,10 +161,11 @@ pub fn startManagedLoopbackServer(
     cwd: []const u8,
     codex_path: []const u8,
 ) !ManagedServer {
-    var address = try std.net.Address.parseIp(loopback_host, 0);
-    var listener = try address.listen(.{});
-    const port = listener.listen_address.getPort();
-    listener.stream.close();
+    var address = try std.Io.net.IpAddress.parse(loopback_host, 0);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var listener = try address.listen(io, .{ .mode = .stream });
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
 
     const listen_url = try std.fmt.allocPrint(allocator, "ws://{s}:{d}", .{ loopback_host, port });
     errdefer allocator.free(listen_url);
@@ -174,15 +177,14 @@ pub fn startManagedLoopbackServer(
     try argv.append(allocator, "--listen");
     try argv.append(allocator, listen_url);
 
-    var child = std.process.Child.init(argv.items, allocator);
-    child.cwd = cwd;
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
-        child.pgid = 0;
-    }
-    try child.spawn();
+    const child = try std.process.spawn(io, .{
+        .argv = argv.items,
+        .cwd = .{ .path = cwd },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
+    });
 
     return .{
         .child = child,
@@ -227,7 +229,7 @@ fn parseWsUrl(ws_url: []const u8) !ParsedWsUrl {
     const slash_idx = mem.indexOfScalar(u8, remainder, '/') orelse remainder.len;
     const authority = remainder[0..slash_idx];
     const path = if (slash_idx < remainder.len) remainder[slash_idx..] else "/";
-    const authority_addr = try std.net.Address.parseIpAndPort(authority);
+    const authority_addr = try std.Io.net.IpAddress.parseLiteral(authority);
     const colon_idx = mem.lastIndexOfScalar(u8, authority, ':') orelse return error.InvalidWebSocketUrl;
     return .{
         .host = authority[0..colon_idx],
@@ -238,13 +240,13 @@ fn parseWsUrl(ws_url: []const u8) !ParsedWsUrl {
 
 fn handshakeClient(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    stream: std.Io.net.Stream,
     host: []const u8,
     port: u16,
     path: []const u8,
 ) !void {
     var random_bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&random_bytes);
+    std.Io.Threaded.global_single_threaded.io().random(&random_bytes);
     var key_buf: [24]u8 = undefined;
     const key = std.base64.standard.Encoder.encode(&key_buf, &random_bytes);
 
@@ -254,13 +256,16 @@ fn handshakeClient(
         .{ path, host, port, key },
     );
     defer allocator.free(request);
-    try stream.writeAll(request);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var stream_writer = stream.writer(io, &.{});
+    try stream_writer.interface.writeAll(request);
 
     var response_buf: std.ArrayList(u8) = .empty;
     defer response_buf.deinit(allocator);
+    var stream_reader = stream.reader(io, &.{});
     while (mem.indexOf(u8, response_buf.items, "\r\n\r\n") == null) {
         var tmp: [1024]u8 = undefined;
-        const n = try stream.read(&tmp);
+        const n = try stream_reader.interface.readSliceShort(tmp[0..]);
         if (n == 0) return error.WebSocketHandshakeClosed;
         try response_buf.appendSlice(allocator, tmp[0..n]);
     }
@@ -316,16 +321,17 @@ fn writeClientFrame(self: *Connection, opcode: u8, payload: []const u8) !void {
     }
 
     var mask: [4]u8 = undefined;
-    std.crypto.random.bytes(&mask);
+    std.Io.Threaded.global_single_threaded.io().random(&mask);
     @memcpy(header[header_len .. header_len + 4], &mask);
     header_len += 4;
 
-    try self.stream.writeAll(header[0..header_len]);
+    var stream_writer = self.stream.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    try stream_writer.interface.writeAll(header[0..header_len]);
     if (payload_len == 0) return;
     const masked = try self.allocator.dupe(u8, payload);
     defer self.allocator.free(masked);
     applyMask(&mask, masked);
-    try self.stream.writeAll(masked);
+    try stream_writer.interface.writeAll(masked);
 }
 
 fn applyMask(mask: *const [4]u8, payload: []u8) void {
@@ -336,6 +342,11 @@ fn applyMask(mask: *const [4]u8, payload: []u8) void {
 
 fn readByte(self: *Connection) !u8 {
     var buf: [1]u8 = undefined;
-    _ = try self.stream.readAtLeast(&buf, 1);
+    try readStreamExact(self.stream, &buf);
     return buf[0];
+}
+
+fn readStreamExact(stream: std.Io.net.Stream, dest: []u8) !void {
+    var reader = stream.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+    try reader.interface.readSliceAll(dest);
 }

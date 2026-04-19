@@ -83,7 +83,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
       - name: Root build rejects custom install prefix
         run: |
           set -euo pipefail
@@ -142,7 +142,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
       - name: Build seq
         run: zig build -Doptimize=ReleaseFast
       - name: Test seq
@@ -160,7 +160,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
       - name: Fuzz seq (Linux)
         run: ../../.github/scripts/linux_fuzz_gate.sh -- zig test --dep core_path --dep core_cli -Mroot=src/tests.zig -Mcore_path=../../libs/core/src/path_helpers.zig -Mcore_cli=../../libs/core/src/cli_helpers.zig -ffuzz --test-filter "fuzz "
 
@@ -172,7 +172,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
       - name: Build lift binaries
         run: zig build build-lift -Doptimize=ReleaseFast
       - name: Test lift
@@ -187,7 +187,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
       - name: Fuzz lift bench_stats (Linux)
         run: .github/scripts/linux_fuzz_gate.sh -- zig test --dep core_io --dep core_cli -Mroot=apps/lift/scripts/bench_stats.zig -Mcore_io=libs/core/src/io_helpers.zig -Mcore_cli=libs/core/src/cli_helpers.zig -ffuzz --test-filter "fuzz "
 
@@ -199,7 +199,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
       - name: Build cas binaries
         run: zig build build-cas -Doptimize=ReleaseFast
       - name: Test CAS budget governor
@@ -214,7 +214,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
       - name: Fuzz CAS budget governor (Linux)
         run: .github/scripts/linux_fuzz_gate.sh -- zig test --dep core_json --dep core_io --dep core_cli -Mroot=apps/cas/scripts/budget_governor.zig -Mcore_json=libs/core/src/json_helpers.zig -Mcore_io=libs/core/src/io_helpers.zig -Mcore_cli=libs/core/src/cli_helpers.zig -ffuzz --test-filter "fuzz governor"
 
@@ -226,7 +226,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
       - name: Build cron binaries
         run: zig build build-cron -Doptimize=ReleaseFast
       - name: Test cron
@@ -240,7 +240,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
       - name: Build puff binaries
         run: zig build build-puff -Doptimize=ReleaseFast
 
@@ -252,7 +252,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
       - name: Build learnings binaries
         run: zig build build-learnings -Doptimize=ReleaseFast
       - name: Test learnings
@@ -268,7 +268,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
       - name: Build st
         run: zig build build-st -Doptimize=ReleaseFast
       - name: Test st
@@ -282,7 +282,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
       - name: Build mesh
         run: zig build build-mesh -Doptimize=ReleaseFast
       - name: Test mesh
@@ -296,7 +296,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
       - name: Build parse-arch
         run: zig build build-parse-arch -Doptimize=ReleaseFast
       - name: Test parse-arch

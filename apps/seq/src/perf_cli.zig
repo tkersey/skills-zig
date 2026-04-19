@@ -53,89 +53,89 @@ pub fn runPerfCase(allocator: std.mem.Allocator, perf_case: PerfCase, temp_root:
             "--spec", query_spec_arg,
         }, output_path),
         .session_tooling => try runCommandWithOutput(allocator, .session_tooling, &.{
-            "--root", sessions_root,
-            "--summary",
-            "--group-by", "executable",
-            "--format", "json",
+            "--root",     sessions_root,
+            "--summary",  "--group-by",
+            "executable", "--format",
+            "json",
         }, output_path),
         .orchestration_concurrency => try runCommandWithOutput(allocator, .orchestration_concurrency, &.{
-            "--path", sample_path,
+            "--path",   sample_path,
             "--format", "json",
         }, output_path),
         .datasets => try runCommandWithOutput(allocator, .datasets, &.{}, output_path),
         .dataset_schema => try runCommandWithOutput(allocator, .dataset_schema, &.{
             "--dataset", "memory_blocks",
-            "--format", "json",
+            "--format",  "json",
         }, output_path),
         .artifact_search => try runCommandWithOutput(allocator, .artifact_search, &.{
-            "--path", sample_path,
-            "--surface", "messages",
+            "--path",     sample_path,
+            "--surface",  "messages",
             "--contains", "learnings",
-            "--limit", "5",
-            "--format", "json",
+            "--limit",    "5",
+            "--format",   "json",
         }, output_path),
         .find_session => try runCommandWithOutput(allocator, .find_session, &.{
-            "--root", sessions_root,
+            "--root",   sessions_root,
             "--prompt", "artifact-search",
-            "--limit", "5",
+            "--limit",  "5",
             "--format", "json",
         }, output_path),
         .session_prompts => try runCommandWithOutput(allocator, .session_prompts, &.{
-            "--path", sample_path,
+            "--path",   sample_path,
             "--format", "json",
         }, output_path),
         .query_diagnose => try runCommandWithOutput(allocator, .query_diagnose, &.{
-            "--path", sample_path,
+            "--path",   sample_path,
             "--format", "json",
         }, output_path),
         .skills_rank => try runCommandWithOutput(allocator, .skills_rank, &.{
-            "--root", sessions_root,
+            "--root",   sessions_root,
             "--format", "json",
         }, output_path),
         .skill_trend => try runCommandWithOutput(allocator, .skill_trend, &.{
-            "--root", sessions_root,
-            "--skill", "mesh",
+            "--root",   sessions_root,
+            "--skill",  "mesh",
             "--bucket", "day",
             "--format", "json",
         }, output_path),
         .skill_report => try runCommandWithOutput(allocator, .skill_report, &.{
-            "--root", sessions_root,
-            "--skill", "mesh",
+            "--root",   sessions_root,
+            "--skill",  "mesh",
             "--format", "json",
         }, output_path),
         .role_breakdown => try runCommandWithOutput(allocator, .role_breakdown, &.{
-            "--root", sessions_root,
+            "--root",   sessions_root,
             "--format", "json",
         }, output_path),
         .occurrence_export => try runCommandWithOutput(allocator, .occurrence_export, &.{
-            "--root", sessions_root,
+            "--root",   sessions_root,
             "--format", "json",
         }, output_path),
         .report_bundle => try runCommandWithOutput(allocator, .report_bundle, &.{
-            "--root", sessions_root,
-            "--top", "5",
+            "--root",   sessions_root,
+            "--top",    "5",
             "--format", "json",
         }, output_path),
         .section_audit => try runCommandWithOutput(allocator, .section_audit, &.{
-            "--root", sessions_root,
+            "--root",     sessions_root,
             "--sections", "Counterexample,Invariants",
-            "--format", "json",
+            "--format",   "json",
         }, output_path),
         .token_usage => try runCommandWithOutput(allocator, .token_usage, &.{
-            "--root", sessions_root,
+            "--root",   sessions_root,
             "--format", "json",
         }, output_path),
         .routing_gap => try runCommandWithOutput(allocator, .routing_gap, &.{
-            "--cue-spec", routing_gap_spec_arg,
+            "--cue-spec",         routing_gap_spec_arg,
             "--discovery-skills", "grill-me,prove-it,complexity-mitigator,invariant-ace,tk",
-            "--root", sessions_root,
-            "--format", "json",
+            "--root",             sessions_root,
+            "--format",           "json",
         }, output_path),
     }
 }
 
 fn resolveFixturePath(allocator: std.mem.Allocator, relative_path: []const u8) ![]u8 {
-    std.fs.cwd().access(relative_path, .{}) catch |err| switch (err) {
+    std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), relative_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return std.fs.path.join(allocator, &.{ "apps/seq", relative_path }),
         else => return err,
     };
@@ -162,7 +162,7 @@ test "runPerfCase covers promoted native seq families" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
 
     const cases = [_]PerfCase{

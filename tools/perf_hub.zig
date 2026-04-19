@@ -402,13 +402,9 @@ const ParsedArgs = struct {
     target: ?[]const u8 = null,
 };
 
-pub fn main() !void {
-    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena_state.deinit();
-    const allocator = arena_state.allocator();
-
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
     const parsed = parseArgs(argv[1..]) catch |err| {
         core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
@@ -456,7 +452,7 @@ fn parseCommand(raw: []const u8) ?Command {
 }
 
 fn cmdList(target: ?[]const u8) !void {
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     for (CompatCases) |case_cfg| {
         if (!matchesTarget(case_cfg.descriptor.case_id, case_cfg.descriptor.binary, target)) continue;
@@ -478,12 +474,12 @@ fn cmdList(target: ?[]const u8) !void {
 }
 
 fn cmdManifest(allocator: std.mem.Allocator) !void {
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     try perf_contract.writeManifestJson(allocator, &stdout_writer.interface, allManifests());
 }
 
 fn cmdAudit() !void {
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     for (allManifests()) |manifest| {
         for (manifest.coverages) |coverage| {
@@ -566,7 +562,7 @@ fn cmdDoctor(allocator: std.mem.Allocator, target: ?[]const u8) !void {
         count += 1;
     }
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("machine_id={s}\n", .{machine_name});
     try stdout.print("cases={d}\n", .{count});
@@ -579,7 +575,7 @@ fn cmdCapture(allocator: std.mem.Allocator, target: ?[]const u8) !void {
     var built = BuiltState.init(allocator);
     defer built.deinit();
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
 
     for (CompatCases) |case_cfg| {
@@ -603,7 +599,7 @@ fn cmdCompare(allocator: std.mem.Allocator, target: ?[]const u8) !void {
 
     var rows: std.ArrayList(CompareRow) = .empty;
     defer rows.deinit(allocator);
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     var any_fail = false;
 
@@ -672,7 +668,7 @@ fn compareCompatCase(allocator: std.mem.Allocator, machine_dir: []const u8, case
         return .{ .status = "FAIL", .case_id = case_cfg.descriptor.case_id, .binary = case_cfg.descriptor.binary, .detail = "missing baseline" };
     }
 
-    const baseline_data = try std.fs.cwd().readFileAlloc(allocator, baseline_path, 4 * 1024 * 1024);
+    const baseline_data = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), baseline_path, allocator, .limited(4 * 1024 * 1024));
     defer allocator.free(baseline_data);
     var baseline = try std.json.parseFromSlice(std.json.Value, allocator, baseline_data, .{});
     defer baseline.deinit();
@@ -715,7 +711,7 @@ fn compareDeepCase(allocator: std.mem.Allocator, machine_dir: []const u8, case_c
     if (!pathExists(baseline_path)) {
         return .{ .status = "FAIL", .case_id = case_cfg.descriptor.case_id, .binary = case_cfg.descriptor.binary, .detail = "missing baseline" };
     }
-    const baseline_data = try std.fs.cwd().readFileAlloc(allocator, baseline_path, 4 * 1024 * 1024);
+    const baseline_data = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), baseline_path, allocator, .limited(4 * 1024 * 1024));
     defer allocator.free(baseline_data);
     var baseline = try std.json.parseFromSlice(std.json.Value, allocator, baseline_data, .{});
     defer baseline.deinit();
@@ -757,13 +753,13 @@ fn compareDeepCase(allocator: std.mem.Allocator, machine_dir: []const u8, case_c
 fn writeCompareSummaryRows(allocator: std.mem.Allocator, machine_dir: []const u8, rows: []const CompareRow) !void {
     const reports_dir = try std.fs.path.join(allocator, &.{ machine_dir, "reports" });
     defer allocator.free(reports_dir);
-    try std.fs.cwd().makePath(reports_dir);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), reports_dir);
     const latest_path = try std.fs.path.join(allocator, &.{ reports_dir, "latest-compare.json" });
     defer allocator.free(latest_path);
 
-    var file = try std.fs.cwd().createFile(latest_path, .{});
-    defer file.close();
-    var writer = file.writer(&.{});
+    var file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), latest_path, .{});
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    var writer = file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     try writer.interface.writeAll("{\"rows\":[");
     for (rows, 0..) |row, idx| {
         if (idx > 0) try writer.interface.writeByte(',');
@@ -810,7 +806,9 @@ fn ensureCurrentMachineDir(allocator: std.mem.Allocator) ![]u8 {
     defer allocator.free(current_name);
     const dir_path = try std.fs.path.join(allocator, &.{ ".perf-local", current_name });
     errdefer allocator.free(dir_path);
-    try std.fs.cwd().makePath(try std.fs.path.join(allocator, &.{ dir_path, "baselines" }));
+    const baseline_dir = try std.fs.path.join(allocator, &.{ dir_path, "baselines" });
+    defer allocator.free(baseline_dir);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), baseline_dir);
     return dir_path;
 }
 
@@ -859,7 +857,7 @@ fn resolveBinaryExecPath(allocator: std.mem.Allocator, case_cfg: CompatCase) ![]
 
 fn compatBaselinePath(allocator: std.mem.Allocator, machine_dir: []const u8, binary: []const u8, case_id: []const u8, latest: bool) ![]u8 {
     const dir_path = try std.fs.path.join(allocator, &.{ machine_dir, "baselines", binary });
-    try std.fs.cwd().makePath(dir_path);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), dir_path);
     allocator.free(dir_path);
     const file_name = if (latest)
         try std.fmt.allocPrint(allocator, "{s}.latest.json", .{case_id})
@@ -905,7 +903,7 @@ fn runDriverCase(allocator: std.mem.Allocator, case_cfg: CompatCase, capture: bo
         else => return error.InvalidCommand,
     }
     _ = capture;
-    return std.fs.cwd().readFileAlloc(allocator, artifact_path, 1024 * 1024);
+    return std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), artifact_path, allocator, .limited(1024 * 1024));
 }
 
 fn runMeasuredCase(allocator: std.mem.Allocator, case_cfg: CompatCase) !Metrics {
@@ -924,7 +922,7 @@ fn runMeasuredCase(allocator: std.mem.Allocator, case_cfg: CompatCase) !Metrics 
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
         if (result.exit_code != 0) {
-            var stderr_writer = std.fs.File.stderr().writer(&.{});
+            var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             try stderr_writer.interface.print("case warmup failed: {s} exit={d}\n{s}\n", .{
                 case_cfg.descriptor.case_id,
                 result.exit_code,
@@ -938,13 +936,13 @@ fn runMeasuredCase(allocator: std.mem.Allocator, case_cfg: CompatCase) !Metrics 
     while (sample_idx < case_cfg.samples) : (sample_idx += 1) {
         const run = try renderCompatRun(allocator, case_cfg, temp_root);
         defer allocator.free(run.cwd);
-        var timer = try std.time.Timer.start();
+        const start_ns = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds;
         const result = try runChildCapture(allocator, run.cwd, run.argv);
-        const elapsed = timer.read();
+        const elapsed: u64 = @intCast(@max(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds - start_ns, 1));
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
         if (result.exit_code != 0) {
-            var stderr_writer = std.fs.File.stderr().writer(&.{});
+            var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             try stderr_writer.interface.print("case sample failed: {s} exit={d}\n{s}\n", .{
                 case_cfg.descriptor.case_id,
                 result.exit_code,
@@ -986,9 +984,9 @@ fn runDeepMeasuredCase(allocator: std.mem.Allocator, case_cfg: DeepCase) !Metric
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         var counting = core_perf.CountingAllocator.init(arena.allocator());
-        var timer = try std.time.Timer.start();
+        const start_ns = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds;
         try executeDeepCase(counting.allocator(), case_cfg.setup, temp_root);
-        try samples.append(allocator, timer.read());
+        try samples.append(allocator, @intCast(@max(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds - start_ns, 1)));
         try alloc_samples.append(allocator, counting.stats.totalCalls());
     }
 
@@ -1125,7 +1123,8 @@ fn compareUpperBoundField(allocator: std.mem.Allocator, current: std.json.Value,
 fn writeMetricsArtifact(allocator: std.mem.Allocator, path: []const u8, case_cfg: CompatCase, metrics: Metrics, compare_status: []const u8, compare_detail: []const u8) !void {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
-    var writer = out.writer(allocator);
+    const writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    var writer = writer_alloc.writer;
     const machine_name = try currentMachineDirName(allocator);
     defer allocator.free(machine_name);
     const sha = try gitShaAlloc(allocator);
@@ -1145,13 +1144,14 @@ fn writeMetricsArtifact(allocator: std.mem.Allocator, path: []const u8, case_cfg
     try writer.print("}},\"compare_status\":\"{s}\",\"compare_detail\":", .{compare_status});
     try writeJsonString(&writer, compare_detail);
     try writer.writeAll("}\n");
-    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = out.items });
+    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = path, .data = out.items });
 }
 
 fn writeDriverArtifact(allocator: std.mem.Allocator, path: []const u8, case_cfg: CompatCase, raw_json: []const u8, compare_status: []const u8, compare_detail: []const u8) !void {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
-    var writer = out.writer(allocator);
+    const writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    var writer = writer_alloc.writer;
     const machine_name = try currentMachineDirName(allocator);
     defer allocator.free(machine_name);
     const sha = try gitShaAlloc(allocator);
@@ -1164,7 +1164,7 @@ fn writeDriverArtifact(allocator: std.mem.Allocator, path: []const u8, case_cfg:
     try writer.print(",\"compare_status\":\"{s}\",\"compare_detail\":", .{compare_status});
     try writeJsonString(&writer, compare_detail);
     try writer.writeAll("}\n");
-    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = out.items });
+    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = path, .data = out.items });
 }
 
 fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root: []const u8) !CommandRun {
@@ -1192,15 +1192,15 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
             const wrapper_dir = try std.fs.path.join(allocator, &.{ temp_root, "cas-wrapper" });
             try makeRepoAwarePath(allocator, wrapper_dir);
             const wrapper_binary = try std.fs.path.join(allocator, &.{ wrapper_dir, "cas" });
-            try std.fs.cwd().copyFile(binary_path, std.fs.cwd(), wrapper_binary, .{});
+            try std.Io.Dir.copyFileAbsolute(binary_path, wrapper_binary, std.Io.Threaded.global_single_threaded.io(), .{});
             try makeExecutable(wrapper_binary);
             const stub_path = try std.fs.path.join(allocator, &.{ wrapper_dir, "cas_smoke_check" });
-            try std.fs.cwd().writeFile(.{ .sub_path = stub_path, .data = "#!/usr/bin/env bash\nexit 0\n" });
+            try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = stub_path, .data = "#!/usr/bin/env bash\nexit 0\n" });
             try makeExecutable(stub_path);
             return .{ .cwd = cwd, .argv = try allocator.dupe([]const u8, &.{ wrapper_binary, "smoke_check" }) };
         },
         .cron_list => {
-            const db_name = try std.fmt.allocPrint(allocator, "codex-dev-{d}.db", .{std.time.milliTimestamp()});
+            const db_name = try std.fmt.allocPrint(allocator, "codex-dev-{d}.db", .{@divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000)});
             const db_path = try std.fs.path.join(allocator, &.{ temp_root, db_name });
             try seedCronDb(allocator, db_path);
             try args.appendSlice(allocator, &.{ binary_path, "--db", db_path, "list" });
@@ -1210,7 +1210,7 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
             const script_dir = try std.fs.path.join(allocator, &.{ codex_home, "skills", "puff", "scripts" });
             try makeRepoAwarePath(allocator, script_dir);
             const script_path = try std.fs.path.join(allocator, &.{ script_dir, "puff.sh" });
-            try std.fs.cwd().writeFile(.{ .sub_path = script_path, .data = "#!/usr/bin/env bash\nexit 0\n" });
+            try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = script_path, .data = "#!/usr/bin/env bash\nexit 0\n" });
             try makeExecutable(script_path);
             try args.appendSlice(allocator, &.{ "/usr/bin/env", try std.fmt.allocPrint(allocator, "CODEX_HOME={s}", .{codex_home}), binary_path, "status" });
         },
@@ -1222,7 +1222,7 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
         .append_learning_help => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
         .append_learning_append => {
             const fixture_path = try std.fs.path.join(allocator, &.{ temp_root, "learnings.jsonl" });
-            try std.fs.cwd().copyFile("apps/learnings/perf/fixtures/learnings.jsonl", std.fs.cwd(), fixture_path, .{});
+            try std.Io.Dir.copyFileAbsolute("apps/learnings/perf/fixtures/learnings.jsonl", fixture_path, std.Io.Threaded.global_single_threaded.io(), .{});
             try args.appendSlice(allocator, &.{ binary_path, "--path", fixture_path, "--status", "do_more", "--learning", "When running local perf comparisons, prefer machine-scoped baselines to avoid cross-host noise.", "--evidence", "Local compare uses one machine and one baseline directory.", "--application", "Use .perf-local baselines before refactors to avoid cross-host drift.", "--tag", "perf" });
         },
         .mesh_budget => try args.appendSlice(allocator, &.{ binary_path, "budget", "--remaining-five-hour", "42", "--remaining-weekly", "38", "--max-threads", "12", "--previous-triplet-width", "3", "--prior-wave-instability", "false", "--consecutive-unstable-waves", "0", "--consecutive-clean-waves", "1" }),
@@ -1287,43 +1287,39 @@ const ChildResult = struct {
 };
 
 fn runChildCapture(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) !ChildResult {
-    var child = std.process.Child.init(argv, allocator);
-    child.cwd = cwd;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    try child.spawn();
-    const stdout_data = try child.stdout.?.readToEndAlloc(allocator, 8 * 1024 * 1024);
-    errdefer allocator.free(stdout_data);
-    const stderr_data = try child.stderr.?.readToEndAlloc(allocator, 2 * 1024 * 1024);
-    errdefer allocator.free(stderr_data);
-    const term = try child.wait();
+    const result = try std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
+        .argv = argv,
+        .cwd = .{ .path = cwd },
+        .stdout_limit = .limited(8 * 1024 * 1024),
+        .stderr_limit = .limited(2 * 1024 * 1024),
+    });
     return .{
-        .exit_code = switch (term) {
-            .Exited => |code| code,
-            .Signal, .Stopped, .Unknown => 1,
+        .exit_code = switch (result.term) {
+            .exited => |code| code,
+            .signal, .stopped, .unknown => 1,
         },
-        .stdout = stdout_data,
-        .stderr = stderr_data,
+        .stdout = result.stdout,
+        .stderr = result.stderr,
     };
 }
 
 fn makeTempRoot(allocator: std.mem.Allocator, label: []const u8) ![]u8 {
-    const cwd = try std.process.getCwdAlloc(allocator);
+    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
     defer allocator.free(cwd);
-    const stamp = std.time.nanoTimestamp();
+    const stamp = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds;
     const base = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/perf-hub/{d}-{s}", .{ cwd, stamp, label });
     try makeRepoAwarePath(allocator, base);
     return base;
 }
 
 fn cleanupTempRoot(path: []const u8) void {
-    std.fs.cwd().deleteTree(path) catch {};
+    std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), path) catch {};
 }
 
 fn makeExecutable(path: []const u8) !void {
-    var file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-    defer file.close();
-    try file.chmod(0o755);
+    var file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{ .mode = .read_write });
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    try file.setPermissions(std.Io.Threaded.global_single_threaded.io(), @enumFromInt(0o755));
 }
 
 fn seedCronDb(allocator: std.mem.Allocator, db_path: []const u8) !void {
@@ -1368,7 +1364,7 @@ fn seedCronDb(allocator: std.mem.Allocator, db_path: []const u8) !void {
     var err_msg: ?[*:0]u8 = null;
     if (Sqlite.sqlite3_exec(db_opt.?, schema_z, null, null, &err_msg) != Sqlite.SQLITE_OK) {
         if (err_msg) |msg| {
-            var stderr_writer = std.fs.File.stderr().writer(&.{});
+            var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             try stderr_writer.interface.print("seedCronDb sqlite error: {s}\n", .{std.mem.sliceTo(msg, 0)});
         }
         return error.InvalidData;
@@ -1426,11 +1422,11 @@ fn cmdReport(allocator: std.mem.Allocator) !void {
     defer allocator.free(machine_dir);
     const reports_dir = try std.fs.path.join(allocator, &.{ machine_dir, "reports" });
     defer allocator.free(reports_dir);
-    try std.fs.cwd().makePath(reports_dir);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), reports_dir);
     const latest_path = try std.fs.path.join(allocator, &.{ machine_dir, "reports", "latest-compare.json" });
     defer allocator.free(latest_path);
-    std.fs.cwd().access(latest_path, .{}) catch return error.MissingCompareSummary;
-    const data = try std.fs.cwd().readFileAlloc(allocator, latest_path, 4 * 1024 * 1024);
+    std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), latest_path, .{}) catch return error.MissingCompareSummary;
+    const data = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), latest_path, allocator, .limited(4 * 1024 * 1024));
     defer allocator.free(data);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
@@ -1448,7 +1444,7 @@ fn cmdReport(allocator: std.mem.Allocator) !void {
         if (std.mem.eql(u8, status, "PASS")) entry.value_ptr.pass += 1 else entry.value_ptr.fail += 1;
     }
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     var row_keys: std.ArrayList([]const u8) = .empty;
     defer row_keys.deinit(allocator);
@@ -1482,7 +1478,7 @@ fn cmdAccept(allocator: std.mem.Allocator) !void {
     defer allocator.free(baselines_dir);
     const accepted_dir = try std.fs.path.join(allocator, &.{ machine_dir, "accepted" });
     defer allocator.free(accepted_dir);
-    try std.fs.cwd().makePath(accepted_dir);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), accepted_dir);
 
     const sha = try gitShaAlloc(allocator);
     defer allocator.free(sha);
@@ -1492,13 +1488,13 @@ fn cmdAccept(allocator: std.mem.Allocator) !void {
     defer allocator.free(snapshot_name);
     const snapshot_path = try std.fs.path.join(allocator, &.{ accepted_dir, snapshot_name });
     defer allocator.free(snapshot_path);
-    try copyTree(std.fs.cwd(), baselines_dir, snapshot_path);
+    try copyTree(std.Io.Dir.cwd(), baselines_dir, snapshot_path);
 
     const active_path = try std.fs.path.join(allocator, &.{ machine_dir, "active-baseline.json" });
     defer allocator.free(active_path);
-    var file = try std.fs.cwd().createFile(active_path, .{});
-    defer file.close();
-    var writer = file.writer(&.{});
+    var file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), active_path, .{});
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    var writer = file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     try writer.interface.print(
         "{{\"accepted_at\":\"{s}\",\"git_sha\":\"{s}\",\"snapshot_path\":\"{s}\"}}\n",
         .{ ts, sha, snapshot_path },
@@ -1513,11 +1509,11 @@ fn resolveMachineDir(allocator: std.mem.Allocator, perf_root: []const u8) ![]u8 
     errdefer allocator.free(preferred);
     if (pathExists(preferred)) return preferred;
 
-    var dir = try std.fs.cwd().openDir(perf_root, .{ .iterate = true });
-    defer dir.close();
+    var dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), perf_root, .{ .iterate = true });
+    defer dir.close(std.Io.Threaded.global_single_threaded.io());
     var it = dir.iterate();
     var fallback: ?[]u8 = null;
-    while (try it.next()) |entry| {
+    while (try it.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
         if (entry.kind != .directory) continue;
         if (fallback != null) return error.AmbiguousMachineDir;
         fallback = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ perf_root, entry.name });
@@ -1564,53 +1560,54 @@ fn inferBinary(case_id: []const u8) []const u8 {
 }
 
 fn gitShaAlloc(allocator: std.mem.Allocator) ![]u8 {
-    var child = std.process.Child.init(&.{ "git", "rev-parse", "--short", "HEAD" }, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
-    const output = try child.stdout.?.readToEndAlloc(allocator, 256);
-    defer allocator.free(output);
-    _ = try child.wait();
-    return allocator.dupe(u8, std.mem.trim(u8, output, " \t\r\n"));
+    const result = try std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
+        .argv = &.{ "git", "rev-parse", "--short", "HEAD" },
+        .stdout_limit = .limited(256),
+        .stderr_limit = .limited(0),
+    });
+    defer allocator.free(result.stderr);
+    defer allocator.free(result.stdout);
+    return allocator.dupe(u8, std.mem.trim(u8, result.stdout, " \t\r\n"));
 }
 
 fn nowTagAlloc(allocator: std.mem.Allocator) ![]u8 {
-    const now = std.time.timestamp();
+    const now = @as(i64, @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000)));
     return std.fmt.allocPrint(allocator, "{d}", .{now});
 }
 
-fn copyTree(cwd: std.fs.Dir, source: []const u8, dest: []const u8) !void {
-    try cwd.makePath(dest);
-    var src = try cwd.openDir(source, .{ .iterate = true });
-    defer src.close();
+fn copyTree(cwd: std.Io.Dir, source: []const u8, dest: []const u8) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try cwd.createDirPath(io, dest);
+    var src = try cwd.openDir(io, source, .{ .iterate = true });
+    defer src.close(io);
     var it = src.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         const src_path = try std.fs.path.join(std.heap.page_allocator, &.{ source, entry.name });
         defer std.heap.page_allocator.free(src_path);
         const dest_path = try std.fs.path.join(std.heap.page_allocator, &.{ dest, entry.name });
         defer std.heap.page_allocator.free(dest_path);
         switch (entry.kind) {
             .directory => try copyTree(cwd, src_path, dest_path),
-            .file => try cwd.copyFile(src_path, cwd, dest_path, .{}),
+            .file => try cwd.copyFile(src_path, cwd, dest_path, io, .{}),
             else => {},
         }
     }
 }
 
 fn pathExists(path: []const u8) bool {
-    std.fs.cwd().access(path, .{}) catch return false;
+    std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return false;
     return true;
 }
 
 fn makeRepoAwarePath(allocator: std.mem.Allocator, path: []const u8) !void {
-    const cwd = try std.process.getCwdAlloc(allocator);
+    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
     defer allocator.free(cwd);
     if (std.fs.path.isAbsolute(path) and std.mem.startsWith(u8, path, cwd)) {
         const rel = if (path.len == cwd.len) "." else path[cwd.len + 1 ..];
-        try std.fs.cwd().makePath(rel);
+        try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), rel);
         return;
     }
-    try std.fs.cwd().makePath(path);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), path);
 }
 
 fn isKnownBinaryName(text: []const u8) bool {
@@ -1631,7 +1628,8 @@ fn writeLatestReport(
 ) !void {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
-    var writer = out.writer(allocator);
+    const writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    var writer = writer_alloc.writer;
     try writer.writeAll("{\"rows\":[");
     for (row_keys, 0..) |key, idx| {
         const counts = totals.get(key).?;
@@ -1639,7 +1637,7 @@ fn writeLatestReport(
         try writer.print("{{\"binary\":\"{s}\",\"pass\":{d},\"fail\":{d}}}", .{ key, counts.pass, counts.fail });
     }
     try writer.writeAll("]}\n");
-    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = out.items });
+    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = path, .data = out.items });
 }
 
 fn writeCutoverStatus(allocator: std.mem.Allocator, path: []const u8, rows: std.json.Array) !void {
@@ -1691,7 +1689,8 @@ fn writeCutoverStatus(allocator: std.mem.Allocator, path: []const u8, rows: std.
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
-    var writer = out.writer(allocator);
+    const writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    var writer = writer_alloc.writer;
     try writer.print(
         "{{\"native_public_ownership\":true,\"preserved_matrix_parity\":{s},\"seq_surface_integrated\":{s},\"cron_deep_driver_status\":\"{s}\",\"st_deep_driver_status\":\"{s}\",\"wave_b_residuals\":[",
         .{
@@ -1706,7 +1705,7 @@ fn writeCutoverStatus(allocator: std.mem.Allocator, path: []const u8, rows: std.
         try writeJsonString(&writer, item);
     }
     try writer.writeAll("]}\n");
-    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = out.items });
+    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = path, .data = out.items });
 }
 
 fn coverageStatusFor(binary: []const u8) []const u8 {
@@ -1743,18 +1742,18 @@ test "resolveMachineDir prefers current machine directory when multiple director
     defer tmp.cleanup();
 
     const alloc = std.testing.allocator;
-    const cwd_before = try std.process.getCwdAlloc(alloc);
+    const cwd_before = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), alloc);
     defer alloc.free(cwd_before);
-    try std.posix.fchdir(tmp.dir.fd);
-    defer std.posix.chdir(cwd_before) catch {};
+    try std.process.setCurrentDir(std.Io.Threaded.global_single_threaded.io(), tmp.dir);
+    defer std.process.setCurrentPath(std.Io.Threaded.global_single_threaded.io(), cwd_before) catch {};
 
-    try tmp.dir.makePath(".perf-local");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), ".perf-local");
     const current_name = try currentMachineDirName(alloc);
     defer alloc.free(current_name);
     const current_path = try std.fmt.allocPrint(alloc, ".perf-local/{s}", .{current_name});
     defer alloc.free(current_path);
-    try tmp.dir.makePath(current_path);
-    try tmp.dir.makePath(".perf-local/other-machine");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), current_path);
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), ".perf-local/other-machine");
 
     const resolved = try resolveMachineDir(alloc, ".perf-local");
     defer alloc.free(resolved);
@@ -1766,12 +1765,12 @@ test "resolveMachineDir falls back to a single legacy directory" {
     defer tmp.cleanup();
 
     const alloc = std.testing.allocator;
-    const cwd_before = try std.process.getCwdAlloc(alloc);
+    const cwd_before = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), alloc);
     defer alloc.free(cwd_before);
-    try std.posix.fchdir(tmp.dir.fd);
-    defer std.posix.chdir(cwd_before) catch {};
+    try std.process.setCurrentDir(std.Io.Threaded.global_single_threaded.io(), tmp.dir);
+    defer std.process.setCurrentPath(std.Io.Threaded.global_single_threaded.io(), cwd_before) catch {};
 
-    try tmp.dir.makePath(".perf-local/legacy-only");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), ".perf-local/legacy-only");
     const resolved = try resolveMachineDir(alloc, ".perf-local");
     defer alloc.free(resolved);
     try std.testing.expect(std.mem.endsWith(u8, resolved, "legacy-only"));
@@ -1782,16 +1781,16 @@ test "report errors clearly when compare summary is missing" {
     defer tmp.cleanup();
 
     const alloc = std.testing.allocator;
-    const cwd_before = try std.process.getCwdAlloc(alloc);
+    const cwd_before = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), alloc);
     defer alloc.free(cwd_before);
-    try std.posix.fchdir(tmp.dir.fd);
-    defer std.posix.chdir(cwd_before) catch {};
+    try std.process.setCurrentDir(std.Io.Threaded.global_single_threaded.io(), tmp.dir);
+    defer std.process.setCurrentPath(std.Io.Threaded.global_single_threaded.io(), cwd_before) catch {};
 
     const current_name = try currentMachineDirName(alloc);
     defer alloc.free(current_name);
     const reports_path = try std.fmt.allocPrint(alloc, ".perf-local/{s}/reports", .{current_name});
     defer alloc.free(reports_path);
-    try tmp.dir.makePath(reports_path);
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), reports_path);
 
     try std.testing.expectError(error.MissingCompareSummary, cmdReport(alloc));
 }

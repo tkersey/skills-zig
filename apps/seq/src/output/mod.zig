@@ -69,14 +69,14 @@ pub fn writeOutput(
     defer allocator.free(rendered);
 
     if (out_path) |path| {
-        try std.fs.cwd().writeFile(.{
+        try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{
             .sub_path = path,
             .data = rendered,
         });
         return;
     }
 
-    var stdout = std.fs.File.stdout().writer(&.{});
+    var stdout = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     try stdout.interface.writeAll(rendered);
 }
 
@@ -101,13 +101,13 @@ pub fn formatTable(
         }
     }
 
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-    var writer = out.writer(allocator);
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
 
     for (columns, 0..) |col, i| {
         if (i > 0) try writer.writeAll("  ");
-        try writePadded(&writer, col, widths[i]);
+        try writePadded(writer, col, widths[i]);
     }
     try writer.writeByte('\n');
 
@@ -122,12 +122,12 @@ pub fn formatTable(
         for (columns, 0..) |col, i| {
             if (i > 0) try writer.writeAll("  ");
             const text = scalarToText(row.valueOrNull(col), cell_buf[0..]);
-            try writePadded(&writer, text, widths[i]);
+            try writePadded(writer, text, widths[i]);
         }
         try writer.writeByte('\n');
     }
 
-    return out.toOwnedSlice(allocator);
+    return writer_alloc.toOwnedSlice();
 }
 
 pub fn formatCsv(
@@ -135,13 +135,13 @@ pub fn formatCsv(
     rows: []const query.Row,
     columns: []const []const u8,
 ) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-    var writer = out.writer(allocator);
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
 
     for (columns, 0..) |col, i| {
         if (i > 0) try writer.writeByte(',');
-        try writeCsvCell(&writer, col);
+        try writeCsvCell(writer, col);
     }
     try writer.writeByte('\n');
 
@@ -150,12 +150,12 @@ pub fn formatCsv(
         for (columns, 0..) |col, i| {
             if (i > 0) try writer.writeByte(',');
             const text = scalarToText(row.valueOrNull(col), cell_buf[0..]);
-            try writeCsvCell(&writer, text);
+            try writeCsvCell(writer, text);
         }
         try writer.writeByte('\n');
     }
 
-    return out.toOwnedSlice(allocator);
+    return writer_alloc.toOwnedSlice();
 }
 
 pub fn formatJson(
@@ -164,9 +164,9 @@ pub fn formatJson(
     columns: []const []const u8,
     pretty: bool,
 ) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-    var writer = out.writer(allocator);
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
 
     if (pretty) {
         try writer.writeAll("[\n");
@@ -180,7 +180,7 @@ pub fn formatJson(
             if (pretty) try writer.writeByte('\n');
         }
         if (pretty) try writer.writeAll("  ");
-        try writeJsonObject(&writer, row, columns, pretty, if (pretty) "    " else "");
+        try writeJsonObject(writer, row, columns, pretty, if (pretty) "    " else "");
     }
 
     if (pretty) {
@@ -190,7 +190,7 @@ pub fn formatJson(
         try writer.writeByte(']');
     }
 
-    return out.toOwnedSlice(allocator);
+    return writer_alloc.toOwnedSlice();
 }
 
 pub fn formatJsonl(
@@ -198,16 +198,16 @@ pub fn formatJsonl(
     rows: []const query.Row,
     columns: []const []const u8,
 ) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-    var writer = out.writer(allocator);
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
 
     for (rows) |row| {
-        try writeJsonObject(&writer, row, columns, false, "");
+        try writeJsonObject(writer, row, columns, false, "");
         try writer.writeByte('\n');
     }
 
-    return out.toOwnedSlice(allocator);
+    return writer_alloc.toOwnedSlice();
 }
 
 fn writeJsonObject(

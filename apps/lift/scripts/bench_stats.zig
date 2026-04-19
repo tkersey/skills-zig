@@ -94,13 +94,9 @@ const CiDelta = struct {
     p99: ?CiInterval = null,
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
 
@@ -136,11 +132,11 @@ pub fn main() !void {
         try parseValuesFromText(variant_text, cfg.parse_all, cfg.scale, allocator, &variant_values);
 
         if (baseline_values.items.len == 0) {
-            try core_io.writeToStreamAllowBrokenPipe(std.fs.File.stdout(), "No numeric baseline samples found.\n");
+            try core_io.writeToStreamAllowBrokenPipe(std.Io.File.stdout(), "No numeric baseline samples found.\n");
             std.process.exit(1);
         }
         if (variant_values.items.len == 0) {
-            try core_io.writeToStreamAllowBrokenPipe(std.fs.File.stdout(), "No numeric variant samples found.\n");
+            try core_io.writeToStreamAllowBrokenPipe(std.Io.File.stdout(), "No numeric variant samples found.\n");
             std.process.exit(1);
         }
 
@@ -184,7 +180,8 @@ pub fn main() !void {
 
         var output: std.ArrayList(u8) = .empty;
         defer output.deinit(allocator);
-        var writer = output.writer(allocator);
+        var writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &output);
+        const writer = &writer_alloc.writer;
 
         if (cfg.output_json) {
             try writeCompareJson(
@@ -198,7 +195,7 @@ pub fn main() !void {
                 ci,
             );
             try writer.writeAll("\n");
-            try core_io.writeToStreamAllowBrokenPipe(std.fs.File.stdout(), output.items);
+            try core_io.writeToStreamAllowBrokenPipe(std.Io.File.stdout(), output.items);
             return;
         }
 
@@ -225,7 +222,7 @@ pub fn main() !void {
             try printCiMetric(allocator, writer, "p99", ci.p99.?, cfg.unit);
         }
 
-        try core_io.writeToStreamAllowBrokenPipe(std.fs.File.stdout(), output.items);
+        try core_io.writeToStreamAllowBrokenPipe(std.Io.File.stdout(), output.items);
         return;
     }
 
@@ -240,7 +237,7 @@ pub fn main() !void {
     try parseValuesFromText(input_text, cfg.parse_all, cfg.scale, allocator, &values);
 
     if (values.items.len == 0) {
-        try core_io.writeToStreamAllowBrokenPipe(std.fs.File.stdout(), "No numeric samples found.\n");
+        try core_io.writeToStreamAllowBrokenPipe(std.Io.File.stdout(), "No numeric samples found.\n");
         std.process.exit(1);
     }
 
@@ -248,12 +245,13 @@ pub fn main() !void {
 
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(allocator);
-    var writer = output.writer(allocator);
+    var writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &output);
+    const writer = &writer_alloc.writer;
 
     if (cfg.output_json) {
         try writeReportJson(writer, report);
         try writer.writeAll("\n");
-        try core_io.writeToStreamAllowBrokenPipe(std.fs.File.stdout(), output.items);
+        try core_io.writeToStreamAllowBrokenPipe(std.Io.File.stdout(), output.items);
         return;
     }
 
@@ -268,7 +266,7 @@ pub fn main() !void {
     try printMetric(allocator, writer, "median", report.median, cfg.unit);
     try printMetric(allocator, writer, "stdev", report.stdev, cfg.unit);
 
-    try core_io.writeToStreamAllowBrokenPipe(std.fs.File.stdout(), output.items);
+    try core_io.writeToStreamAllowBrokenPipe(std.Io.File.stdout(), output.items);
 }
 
 fn parseArgs(argv: []const []const u8) !Config {
@@ -277,13 +275,13 @@ fn parseArgs(argv: []const []const u8) !Config {
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
         if (core_cli.isHelpArg(arg)) {
-            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             const stdout = &stdout_writer.interface;
             try core_cli.printHelpSurface(stdout, HelpSurface, Version);
             std.process.exit(0);
         }
         if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
-            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             const stdout = &stdout_writer.interface;
             try core_cli.printVersion(stdout, Version);
             std.process.exit(0);
@@ -348,15 +346,16 @@ fn parseArgs(argv: []const []const u8) !Config {
 
 fn readInputAlloc(allocator: std.mem.Allocator, path: ?[]const u8) ![]u8 {
     if (path) |value| return readFileWithLimitAlloc(allocator, value);
-    return std.fs.File.stdin().readToEndAlloc(allocator, MaxInputBytes) catch |err| switch (err) {
-        error.FileTooBig => error.InputTooLarge,
+    return core_io.readStdinAlloc(allocator, MaxInputBytes) catch |err| switch (err) {
+        error.StreamTooLong => error.InputTooLarge,
         else => err,
     };
 }
 
 fn readFileWithLimitAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    return std.fs.cwd().readFileAlloc(allocator, path, MaxInputBytes) catch |err| switch (err) {
+    return core_io.readFileAlloc(allocator, path, MaxInputBytes) catch |err| switch (err) {
         error.FileTooBig => error.InputTooLarge,
+        error.StreamTooLong => error.InputTooLarge,
         else => err,
     };
 }
@@ -370,7 +369,7 @@ fn parseValuesFromText(
 ) !void {
     var lines = std.mem.splitScalar(u8, input_text, '\n');
     while (lines.next()) |raw_line| {
-        const line = std.mem.trimRight(u8, raw_line, "\r");
+        const line = std.mem.trim(u8, raw_line, "\r");
         const trimmed = std.mem.trim(u8, line, " \t");
         if (trimmed.len == 0) continue;
         if (trimmed[0] == '#') continue;
@@ -437,7 +436,7 @@ fn percentile(sorted_values: []const f64, p: f64) f64 {
 }
 
 fn defaultSeed() u64 {
-    const ts: i64 = @intCast(std.time.nanoTimestamp());
+    const ts: i64 = @intCast(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds);
     return @bitCast(ts);
 }
 
@@ -877,9 +876,8 @@ test "bootstrap CI returns ordered interval" {
 }
 
 test "compare json output is valid json" {
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(std.testing.allocator);
-    const writer = out.writer(std.testing.allocator);
+    var writer_alloc = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer writer_alloc.deinit();
 
     const baseline = Report{
         .count = 3,
@@ -910,9 +908,9 @@ test "compare json output is valid json" {
 
     const delta = computeDelta(baseline, variant);
     const delta_pct = computeDeltaPct(baseline, delta);
-    try writeCompareJson(writer, baseline, variant, delta, delta_pct, 0, 0.05, .{});
+    try writeCompareJson(&writer_alloc.writer, baseline, variant, delta, delta_pct, 0, 0.05, .{});
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.items, .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, writer_alloc.written(), .{});
     defer parsed.deinit();
 }
 
@@ -925,18 +923,19 @@ test "readFileWithLimitAlloc rejects oversized files" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var file = try tmp.dir.createFile("oversized.txt", .{});
-    defer file.close();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var file = try tmp.dir.createFile(io, "oversized.txt", .{});
+    defer file.close(io);
 
     const chunk = [_]u8{'a'} ** 4096;
     var remaining: usize = MaxInputBytes + 1;
     while (remaining > 0) {
         const to_write = @min(remaining, chunk.len);
-        try file.writeAll(chunk[0..to_write]);
+        try file.writeStreamingAll(io, chunk[0..to_write]);
         remaining -= to_write;
     }
 
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
     const path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "oversized.txt" });
     defer std.testing.allocator.free(path);
@@ -955,7 +954,11 @@ test "allocation failures parse line" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, parseLineWithAlloc, .{line});
 }
 
-fn fuzzParseLineTarget(_: void, input: []const u8) !void {
+fn fuzzParseLineTarget(_: void, smith: *std.testing.Smith) !void {
+    var storage: [512]u8 = undefined;
+    for (&storage) |*b| b.* = smith.value(u8);
+    const len = smith.value(usize) % (storage.len + 1);
+    const input = storage[0..len];
     var list: std.ArrayList(f64) = .empty;
     defer list.deinit(std.testing.allocator);
     _ = parseNumbersFromLine(input, true, std.testing.allocator, &list) catch {};

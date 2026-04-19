@@ -343,11 +343,12 @@ fn collectFromJsonl(allocator: std.mem.Allocator, options: Options) !RowList {
     const source_path = try sqlite.resolveDefaultJsonlPath(allocator, options.opencode_path);
     defer allocator.free(source_path);
 
-    const file = std.fs.openFileAbsolute(source_path, .{}) catch |err| switch (err) {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file = std.Io.Dir.openFileAbsolute(io, source_path, .{}) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return error.MissingOpencodeHistory,
         else => return err,
     };
-    defer file.close();
+    defer file.close(io);
 
     var rows = RowList.empty;
     errdefer deinitRows(allocator, &rows);
@@ -356,9 +357,10 @@ fn collectFromJsonl(allocator: std.mem.Allocator, options: Options) !RowList {
     var pending: std.ArrayList(u8) = .empty;
     defer pending.deinit(allocator);
     var buf: [64 * 1024]u8 = undefined;
+    var reader = file.reader(io, &buf);
 
     read_loop: while (true) {
-        const read_n = try file.read(&buf);
+        const read_n = try reader.interface.readSliceShort(buf[0..]);
         if (read_n == 0) break;
 
         var start: usize = 0;
@@ -370,7 +372,7 @@ fn collectFromJsonl(allocator: std.mem.Allocator, options: Options) !RowList {
                 if (pending.items.len > 8 * 1024 * 1024) return error.StreamTooLong;
             }
             line_number += 1;
-            const line = std.mem.trimRight(u8, pending.items, "\r");
+            const line = std.mem.trim(u8, pending.items, "\r");
             if (line.len > 0) {
                 const maybe_row = try parseJsonlLine(allocator, source_path, line, line_number, options);
                 if (maybe_row) |row| {
@@ -390,7 +392,7 @@ fn collectFromJsonl(allocator: std.mem.Allocator, options: Options) !RowList {
 
     if (pending.items.len > 0) {
         line_number += 1;
-        const line = std.mem.trimRight(u8, pending.items, "\r");
+        const line = std.mem.trim(u8, pending.items, "\r");
         if (line.len > 0) {
             const maybe_row = try parseJsonlLine(allocator, source_path, line, line_number, options);
             if (maybe_row) |row| {
@@ -666,7 +668,7 @@ test "collect jsonl fallback returns db-native shape" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
         .sub_path = "prompt-history.jsonl",
         .data =
         \\{"input":"one","parts":[],"mode":"normal"}
@@ -674,7 +676,7 @@ test "collect jsonl fallback returns db-native shape" {
         ,
     });
 
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
     const source_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "prompt-history.jsonl" });
     defer std.testing.allocator.free(source_path);

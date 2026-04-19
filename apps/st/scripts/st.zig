@@ -558,20 +558,21 @@ pub fn runPerfCase(allocator: std.mem.Allocator, perf_case: PerfCase, base_dir: 
 
 const StdoutGuard = struct {
     saved_fd: std.posix.fd_t,
-    devnull: std.fs.File,
+    devnull: std.Io.File,
 };
 
 fn silenceStdout() !StdoutGuard {
-    const saved_fd = try std.posix.dup(std.posix.STDOUT_FILENO);
-    const devnull = try std.fs.openFileAbsolute("/dev/null", .{ .mode = .write_only });
-    try std.posix.dup2(devnull.handle, std.posix.STDOUT_FILENO);
+    const saved_fd = std.c.dup(std.posix.STDOUT_FILENO);
+    if (saved_fd < 0) return error.SystemResources;
+    const devnull = try std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), "/dev/null", .{ .mode = .write_only });
+    if (std.c.dup2(devnull.handle, std.posix.STDOUT_FILENO) < 0) return error.SystemResources;
     return .{ .saved_fd = saved_fd, .devnull = devnull };
 }
 
 fn restoreStdout(guard: StdoutGuard) void {
-    std.posix.dup2(guard.saved_fd, std.posix.STDOUT_FILENO) catch {};
-    std.posix.close(guard.saved_fd);
-    guard.devnull.close();
+    _ = std.c.dup2(guard.saved_fd, std.posix.STDOUT_FILENO);
+    _ = std.c.close(guard.saved_fd);
+    guard.devnull.close(std.Io.Threaded.global_single_threaded.io());
 }
 
 const ParsedRecords = struct {
@@ -579,36 +580,33 @@ const ParsedRecords = struct {
     latest_seq: i64,
 };
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const argv = try std.process.argsAlloc(allocator);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (argv.len <= 1) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
     }
 
     if (core_cli.isHelpArg(argv[1])) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
     }
 
     if (core_cli.isVersionArg(argv[1]) or core_cli.isVersionSubcommand(argv[1])) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, Version);
         return;
     }
 
     if (argv.len >= 3 and core_cli.isHelpArg(argv[2])) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
@@ -1360,11 +1358,11 @@ fn cmdInit(allocator: std.mem.Allocator, args: Args) !u8 {
     if (!exists or (try fileSize(path)) == 0) {
         const ts = try nowUtcAlloc(allocator);
         try writeInitRecord(allocator, path, ts);
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try stdout.print("initialized {s}\n", .{path});
     } else {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try stdout.print("already initialized: {s}\n", .{path});
     }
@@ -1377,7 +1375,7 @@ fn cmdInit(allocator: std.mem.Allocator, args: Args) !u8 {
         const ts = try nowUtcAlloc(allocator);
         try writeCanonicalRecords(path, &state, parsed.latest_seq + 1, ts, meta, null);
 
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try stdout.print("cleared plan in {s}\n", .{path});
     }
@@ -1420,7 +1418,7 @@ fn cmdAdd(allocator: std.mem.Allocator, args: Args) !u8 {
     const ts = try nowUtcAlloc(allocator);
     try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, ts, meta, null);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("upserted {s}\n", .{item_id});
     try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
@@ -1440,7 +1438,7 @@ fn cmdSelect(allocator: std.mem.Allocator, args: Args) !u8 {
     const ts = try nowUtcAlloc(allocator);
     try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, ts, meta, null);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("selected {d} item(s)\n", .{target_ids.len});
     try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
@@ -1460,7 +1458,7 @@ fn cmdDeselect(allocator: std.mem.Allocator, args: Args) !u8 {
     const ts = try nowUtcAlloc(allocator);
     try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, ts, meta, null);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("deselected {d} item(s)\n", .{target_ids.len});
     try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
@@ -1484,7 +1482,7 @@ fn cmdSetStatus(allocator: std.mem.Allocator, args: Args) !u8 {
     const ts = try nowUtcAlloc(allocator);
     try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, ts, meta, null);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("updated {s} -> {s}\n", .{ item_id, status.asString() });
     try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
@@ -1507,7 +1505,7 @@ fn cmdSetPriority(allocator: std.mem.Allocator, args: Args) !u8 {
     const ts = try nowUtcAlloc(allocator);
     try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, ts, meta, null);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("updated {s} priority -> {s}\n", .{ item_id, priority.asString() });
     try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
@@ -1530,7 +1528,7 @@ fn cmdSetDeps(allocator: std.mem.Allocator, args: Args) !u8 {
     const ts = try nowUtcAlloc(allocator);
     try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, ts, meta, null);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     if (deps.len == 0) {
         try stdout.print("updated {s} deps -> (none)\n", .{item_id});
@@ -1566,7 +1564,7 @@ fn cmdSetNotes(allocator: std.mem.Allocator, args: Args) !u8 {
     const ts = try nowUtcAlloc(allocator);
     try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, ts, meta, null);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("updated {s} notes\n", .{item_id});
     try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
@@ -1596,7 +1594,7 @@ fn cmdAddComment(allocator: std.mem.Allocator, args: Args) !u8 {
     const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
     try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, ts, meta, null);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("added comment to {s}\n", .{item_id});
     try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
@@ -1617,7 +1615,7 @@ fn cmdRemove(allocator: std.mem.Allocator, args: Args) !u8 {
     const ts = try nowUtcAlloc(allocator);
     try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, ts, meta, null);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("removed {s}\n", .{item_id});
     try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
@@ -1629,7 +1627,7 @@ fn cmdShow(allocator: std.mem.Allocator, args: Args) !u8 {
     var state = loaded.state;
     defer state.deinit();
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try renderShow(allocator, stdout, &state, args.format, args.surface);
     return 0;
@@ -1649,7 +1647,7 @@ fn cmdReady(allocator: std.mem.Allocator, args: Args) !u8 {
     }
     const filtered_rows = try filterRowsBySurface(allocator, rows.items, args.surface);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try renderItemRows(allocator, stdout, filtered_rows, args.format);
     return 0;
@@ -1669,7 +1667,7 @@ fn cmdBlocked(allocator: std.mem.Allocator, args: Args) !u8 {
     }
     const filtered_rows = try filterRowsBySurface(allocator, rows.items, args.surface);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try renderItemRows(allocator, stdout, filtered_rows, args.format);
     return 0;
@@ -1680,7 +1678,7 @@ fn cmdEmitPlanSync(allocator: std.mem.Allocator, args: Args) !u8 {
     var state = loaded.state;
     defer state.deinit();
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try emitPlanSync(allocator, stdout, &state, args.allow_multiple_in_progress, false);
     return 0;
@@ -1691,7 +1689,7 @@ fn cmdEmitUpdatePlan(allocator: std.mem.Allocator, args: Args) !u8 {
     var state = loaded.state;
     defer state.deinit();
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try emitUpdatePlan(allocator, stdout, &state, args.allow_multiple_in_progress, false);
     return 0;
@@ -1709,7 +1707,7 @@ fn cmdImportUpdatePlan(allocator: std.mem.Allocator, args: Args) !u8 {
 
     const changed = try applyCodexUpdatePlanImport(allocator, &state, imported_entries, args.allow_multiple_in_progress);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
 
     if (changed) {
@@ -1747,11 +1745,11 @@ fn cmdExport(allocator: std.mem.Allocator, args: Args) !u8 {
 
     if (args.output) |output_path| {
         try writeTextAtomic(allocator, output_path, payload);
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try stdout.print("wrote {s}\n", .{output_path});
     } else {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try stdout.writeAll(payload);
     }
@@ -1793,7 +1791,7 @@ fn cmdImportPlan(allocator: std.mem.Allocator, args: Args) !u8 {
     const ts = try nowUtcAlloc(allocator);
     try writeCanonicalRecords(args.file, &state, loaded.latest_seq + bump, ts, meta, null);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     if (args.replace) {
         try stdout.print("replaced plan from {s}\n", .{input_path});
@@ -1827,7 +1825,7 @@ fn cmdImportOrchplan(allocator: std.mem.Allocator, args: Args) !u8 {
     const ts = try nowUtcAlloc(allocator);
     try writeCanonicalRecords(args.file, &state, loaded.latest_seq + bump, ts, meta, null);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     if (args.replace) {
         try stdout.print("replaced plan from orchplan {s}\n", .{input_path});
@@ -1862,7 +1860,7 @@ fn cmdClaim(allocator: std.mem.Allocator, args: Args) !u8 {
     };
     const lease_seconds = try parseLeaseSeconds(args.lease_seconds orelse "900");
     const now = try nowUtcAlloc(allocator);
-    const lease_expires_at = try addSecondsUtcAlloc(allocator, std.time.timestamp() + lease_seconds);
+    const lease_expires_at = try addSecondsUtcAlloc(allocator, @as(i64, @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000))) + lease_seconds);
     const actor = buildMutationMeta(allocator, args.allow_multiple_in_progress).actor;
 
     var claimed_roots: std.ArrayList([]const []const u8) = .empty;
@@ -1906,7 +1904,7 @@ fn cmdClaim(allocator: std.mem.Allocator, args: Args) !u8 {
     const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
     try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, now, meta, null);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("claimed {d} item(s) in wave {s}\n", .{ target_ids.len, wave_id });
     try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
@@ -1926,14 +1924,14 @@ fn cmdHeartbeat(allocator: std.mem.Allocator, args: Args) !u8 {
     const now = try nowUtcAlloc(allocator);
     claim.heartbeat_at = now;
     const lease_seconds = if (claim.lease_seconds > 0) claim.lease_seconds else 900;
-    claim.lease_expires_at = try addSecondsUtcAlloc(allocator, std.time.timestamp() + lease_seconds);
+    claim.lease_expires_at = try addSecondsUtcAlloc(allocator, @as(i64, @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000))) + lease_seconds);
     item.claim = claim;
 
     try validateState(&state, args.allow_multiple_in_progress);
     const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
     try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, now, meta, null);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("heartbeat refreshed for {s}\n", .{item_id});
     try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
@@ -1973,7 +1971,7 @@ fn cmdSetRuntime(allocator: std.mem.Allocator, args: Args) !u8 {
     const now = try nowUtcAlloc(allocator);
     try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, now, meta, null);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("attached runtime metadata to {s}\n", .{item_id});
     try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
@@ -2001,7 +1999,7 @@ fn cmdSetProof(allocator: std.mem.Allocator, args: Args) !u8 {
     const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
     try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, proof.last_run_at, meta, null);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("updated proof for {s} -> {s}\n", .{ item_id, proof.state.asString() });
     try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
@@ -2052,7 +2050,7 @@ fn cmdRelease(allocator: std.mem.Allocator, args: Args) !u8 {
     const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
     try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, now, meta, null);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("released claim for {s}\n", .{item_id});
     try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
@@ -2091,7 +2089,7 @@ fn cmdReclaimStale(allocator: std.mem.Allocator, args: Args) !u8 {
     const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
     try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, now, meta, null);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("reclaimed {d} stale claim(s)\n", .{reclaimed});
     try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
@@ -2188,7 +2186,7 @@ fn cmdImportMeshResults(allocator: std.mem.Allocator, args: Args) !u8 {
     const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
     try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, now, meta, null);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("imported mesh results for {d} item(s) across {d} row(s)\n", .{ updated, rows_seen });
     try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
@@ -2209,7 +2207,7 @@ fn cmdDoctor(allocator: std.mem.Allocator, args: Args) !u8 {
     const parsed = try readRecordsNoSeqValidation(allocator, args.file);
     const issues = try collectSeqContractIssues(allocator, parsed.records);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
 
     if (issues.len == 0) {
@@ -2398,7 +2396,7 @@ fn lockRootFromScopeToken(allocator: std.mem.Allocator, raw: []const u8) ![]cons
     if (std.mem.endsWith(u8, token, "/**/*")) token = token[0 .. token.len - 5];
     if (std.mem.endsWith(u8, token, "/**")) token = token[0 .. token.len - 3];
     const glob_index = std.mem.indexOfAny(u8, token, "*?[") orelse token.len;
-    token = std.mem.trimRight(u8, token[0..glob_index], "/");
+    token = std.mem.trim(u8, token[0..glob_index], "/");
     if (isBroadScopeToken(token)) return ".";
     return token;
 }
@@ -3034,14 +3032,14 @@ fn applyEventOp(allocator: std.mem.Allocator, state: *ItemState, record: std.jso
     if (std.mem.eql(u8, op, "add_comment") or std.mem.eql(u8, op, "append_comment") or std.mem.eql(u8, op, "comment")) {
         var comment_value = objectField(record, "comment");
 
-        var fallback_comment_obj = std.json.ObjectMap.init(allocator);
+        var fallback_comment_obj: std.json.ObjectMap = .empty;
         if (comment_value == null) {
             const ts = stringField(record, "ts") orelse return error.InvalidComment;
             const author = stringField(record, "author") orelse return error.InvalidComment;
             const text = stringField(record, "text") orelse return error.InvalidComment;
-            try fallback_comment_obj.put("ts", .{ .string = ts });
-            try fallback_comment_obj.put("author", .{ .string = author });
-            try fallback_comment_obj.put("text", .{ .string = text });
+            try fallback_comment_obj.put(allocator, "ts", .{ .string = ts });
+            try fallback_comment_obj.put(allocator, "author", .{ .string = author });
+            try fallback_comment_obj.put(allocator, "text", .{ .string = text });
             comment_value = .{ .object = fallback_comment_obj };
         }
 
@@ -3421,7 +3419,8 @@ fn renderItemRows(allocator: std.mem.Allocator, writer: anytype, rows: []const E
                 var detail_buf: std.ArrayList(u8) = .empty;
                 defer detail_buf.deinit(allocator);
                 if (row.dep_state != .na) {
-                    try detail_buf.writer(allocator).print("dep_state: {s}", .{row.dep_state.asString()});
+                    var detail_writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &detail_buf);
+                    try detail_writer_alloc.writer.print("dep_state: {s}", .{row.dep_state.asString()});
                 }
                 if (row.item.deps.len > 0) {
                     if (detail_buf.items.len > 0) try detail_buf.appendSlice(allocator, "; ");
@@ -3431,7 +3430,9 @@ fn renderItemRows(allocator: std.mem.Allocator, writer: anytype, rows: []const E
                         if (std.mem.eql(u8, dep.type, "blocks")) {
                             try detail_buf.appendSlice(allocator, dep.id);
                         } else {
-                            try detail_buf.writer(allocator).print("{s}:{s}", .{ dep.id, dep.type });
+                            const dep_text = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ dep.id, dep.type });
+                            defer allocator.free(dep_text);
+                            try detail_buf.appendSlice(allocator, dep_text);
                         }
                     }
                 }
@@ -3527,7 +3528,8 @@ fn renderShowMarkdown(
             defer details.deinit(allocator);
 
             if (row.dep_state != .na) {
-                try details.writer(allocator).print("dep_state: {s}", .{row.dep_state.asString()});
+                var details_writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &details);
+                try details_writer_alloc.writer.print("dep_state: {s}", .{row.dep_state.asString()});
             }
             if (row.item.deps.len > 0) {
                 if (details.items.len > 0) try details.appendSlice(allocator, "; ");
@@ -3537,7 +3539,9 @@ fn renderShowMarkdown(
                     if (std.mem.eql(u8, dep.type, "blocks")) {
                         try details.appendSlice(allocator, dep.id);
                     } else {
-                        try details.writer(allocator).print("{s}:{s}", .{ dep.id, dep.type });
+                        const dep_text = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ dep.id, dep.type });
+                        defer allocator.free(dep_text);
+                        try details.appendSlice(allocator, dep_text);
                     }
                 }
             }
@@ -3551,7 +3555,9 @@ fn renderShowMarkdown(
             }
             if (row.item.status != .pending and row.item.status != .completed) {
                 if (details.items.len > 0) try details.appendSlice(allocator, "; ");
-                try details.writer(allocator).print("status: {s}", .{row.item.status.asString()});
+                const status_text = try std.fmt.allocPrint(allocator, "status: {s}", .{row.item.status.asString()});
+                defer allocator.free(status_text);
+                try details.appendSlice(allocator, status_text);
             }
 
             if (details.items.len > 0) {
@@ -3889,7 +3895,7 @@ fn parseUpdatePlanEntriesFromTranscript(allocator: std.mem.Allocator, transcript
 fn parseUpdatePlanEntriesFromBytes(allocator: std.mem.Allocator, input_bytes: []const u8) ![]CodexPlanEntry {
     const trimmed = std.mem.trim(u8, input_bytes, " \t\r\n");
     const payload = if (std.mem.startsWith(u8, trimmed, "update_plan:"))
-        std.mem.trimLeft(u8, trimmed["update_plan:".len..], " \t\r\n")
+        std.mem.trim(u8, trimmed["update_plan:".len..], " \t\r\n")
     else
         trimmed;
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload, .{});
@@ -4000,7 +4006,7 @@ fn parseCodexPlanStep(allocator: std.mem.Allocator, raw: []const u8) !struct { i
     if (closing <= 1) return error.InvalidCodexPlanStep;
 
     const id = try requireNonEmptyString(allocator, trimmed[1..closing], "codex plan id");
-    const step = try requireNonEmptyString(allocator, std.mem.trimLeft(u8, trimmed[closing + 1 ..], " \t\r\n"), "codex plan step");
+    const step = try requireNonEmptyString(allocator, std.mem.trim(u8, trimmed[closing + 1 ..], " \t\r\n"), "codex plan step");
     return .{ .id = id, .step = step };
 }
 
@@ -4900,15 +4906,18 @@ fn requireNonEmptyString(allocator: std.mem.Allocator, raw: []const u8, field: [
 }
 
 fn defaultCommentAuthor() []const u8 {
-    if (std.process.getEnvVarOwned(std.heap.page_allocator, "ST_COMMENT_AUTHOR")) |v| {
-        if (std.mem.trim(u8, v, " \t\r\n").len > 0) return v;
-    } else |_| {}
-    if (std.process.getEnvVarOwned(std.heap.page_allocator, "USER")) |v| {
-        if (std.mem.trim(u8, v, " \t\r\n").len > 0) return v;
-    } else |_| {}
-    if (std.process.getEnvVarOwned(std.heap.page_allocator, "LOGNAME")) |v| {
-        if (std.mem.trim(u8, v, " \t\r\n").len > 0) return v;
-    } else |_| {}
+    if (std.c.getenv("ST_COMMENT_AUTHOR")) |v| {
+        const trimmed = std.mem.trim(u8, std.mem.span(v), " \t\r\n");
+        if (trimmed.len > 0) return trimmed;
+    }
+    if (std.c.getenv("USER")) |v| {
+        const trimmed = std.mem.trim(u8, std.mem.span(v), " \t\r\n");
+        if (trimmed.len > 0) return trimmed;
+    }
+    if (std.c.getenv("LOGNAME")) |v| {
+        const trimmed = std.mem.trim(u8, std.mem.span(v), " \t\r\n");
+        if (trimmed.len > 0) return trimmed;
+    }
     return "unknown";
 }
 
@@ -4921,23 +4930,24 @@ fn currentProcessId() i64 {
 }
 
 fn buildMutationMeta(allocator: std.mem.Allocator, allow_multiple: bool) MutationMeta {
+    _ = allocator;
     const actor = blk: {
-        if (std.process.getEnvVarOwned(allocator, "ST_ACTOR")) |v| {
-            const trimmed = std.mem.trim(u8, v, " \t\r\n");
+        if (std.c.getenv("ST_ACTOR")) |v| {
+            const trimmed = std.mem.trim(u8, std.mem.span(v), " \t\r\n");
             if (trimmed.len > 0) break :blk trimmed;
-        } else |_| {}
+        }
         break :blk defaultCommentAuthor();
     };
 
     const session = blk: {
-        if (std.process.getEnvVarOwned(allocator, "ST_SESSION_ID")) |v| {
-            const trimmed = std.mem.trim(u8, v, " \t\r\n");
+        if (std.c.getenv("ST_SESSION_ID")) |v| {
+            const trimmed = std.mem.trim(u8, std.mem.span(v), " \t\r\n");
             if (trimmed.len > 0) break :blk trimmed;
-        } else |_| {}
-        if (std.process.getEnvVarOwned(allocator, "CODEX_THREAD_ID")) |v| {
-            const trimmed = std.mem.trim(u8, v, " \t\r\n");
+        }
+        if (std.c.getenv("CODEX_THREAD_ID")) |v| {
+            const trimmed = std.mem.trim(u8, std.mem.span(v), " \t\r\n");
             if (trimmed.len > 0) break :blk trimmed;
-        } else |_| {}
+        }
         break :blk null;
     };
 
@@ -4950,7 +4960,7 @@ fn buildMutationMeta(allocator: std.mem.Allocator, allow_multiple: bool) Mutatio
 }
 
 fn nowUtcAlloc(allocator: std.mem.Allocator) ![]u8 {
-    const now_sec: i64 = std.time.timestamp();
+    const now_sec: i64 = @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000));
     var days = @divFloor(now_sec, 86_400);
     var seconds_of_day = now_sec - days * 86_400;
     if (seconds_of_day < 0) {
@@ -5003,11 +5013,16 @@ fn ensureLockSidecarGitignored(allocator: std.mem.Allocator, plan_file: []const 
     const parent = std.fs.path.dirname(plan_file) orelse ".";
     const git_root = findGitRootAlloc(allocator, parent) catch return;
     if (git_root.len == 0) return;
-    const git_root_real = std.fs.realpathAlloc(allocator, git_root) catch git_root;
+    const git_root_real_alloc = if (std.fs.path.isAbsolute(git_root))
+        std.Io.Dir.realPathFileAbsoluteAlloc(std.Io.Threaded.global_single_threaded.io(), git_root, allocator) catch null
+    else
+        std.Io.Dir.cwd().realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), git_root, allocator) catch null;
+    defer if (git_root_real_alloc) |p| allocator.free(p);
+    const git_root_real = git_root_real_alloc orelse git_root;
 
     const plan_rel = if (std.fs.path.isAbsolute(plan_file)) blk: {
-        const plan_real = std.fs.realpathAlloc(allocator, plan_file) catch plan_file;
-        break :blk try std.fs.path.relative(allocator, git_root_real, plan_real);
+        const plan_real = std.Io.Dir.realPathFileAbsoluteAlloc(std.Io.Threaded.global_single_threaded.io(), plan_file, allocator) catch plan_file;
+        break :blk try std.fs.path.relative(allocator, git_root_real, null, git_root_real, plan_real);
     } else plan_file;
     const lock_rel = try std.fmt.allocPrint(allocator, "{s}.lock", .{plan_rel});
 
@@ -5042,63 +5057,59 @@ const CommandCapture = struct {
 };
 
 fn runCommandCapture(allocator: std.mem.Allocator, cwd: ?[]const u8, argv: []const []const u8) !CommandCapture {
-    var child = std.process.Child.init(argv, allocator);
-    child.cwd = cwd;
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    try child.spawn();
-
-    const stdout_data = try child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024);
-    const stderr_data = try child.stderr.?.readToEndAlloc(allocator, 1024 * 1024);
-
-    const term = try child.wait();
-    const exit_code: i32 = switch (term) {
-        .Exited => |code| code,
+    const result = try std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
+        .argv = argv,
+        .cwd = if (cwd) |path| .{ .path = path } else .inherit,
+        .stdout_limit = .limited(4 * 1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+    });
+    const exit_code: i32 = switch (result.term) {
+        .exited => |code| code,
         else => -1,
     };
 
     return .{
         .exit_code = exit_code,
-        .stdout = stdout_data,
-        .stderr = stderr_data,
+        .stdout = result.stdout,
+        .stderr = result.stderr,
     };
 }
 
 fn fileExists(path: []const u8) bool {
     if (std.fs.path.isAbsolute(path)) {
-        std.fs.accessAbsolute(path, .{}) catch return false;
+        std.Io.Dir.accessAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return false;
         return true;
     }
-    std.fs.cwd().access(path, .{}) catch return false;
+    std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return false;
     return true;
 }
 
 fn fileSize(path: []const u8) !u64 {
     if (std.fs.path.isAbsolute(path)) {
-        var file = try std.fs.openFileAbsolute(path, .{});
-        defer file.close();
-        const stat = try file.stat();
+        var file = try std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{});
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
+        const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
         return stat.size;
     }
 
-    var file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    const stat = try file.stat();
+    var file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{});
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
     return stat.size;
 }
 
 fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]const u8 {
     if (std.fs.path.isAbsolute(path)) {
-        var file = try std.fs.openFileAbsolute(path, .{});
-        defer file.close();
-        return file.readToEndAlloc(allocator, max_bytes);
+        var file = try std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{});
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
+        var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+        return reader.interface.allocRemaining(allocator, .limited(max_bytes));
     }
 
-    var file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    return file.readToEndAlloc(allocator, max_bytes);
+    var file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{});
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+    return reader.interface.allocRemaining(allocator, .limited(max_bytes));
 }
 
 fn writeTextAtomic(allocator: std.mem.Allocator, path: []const u8, text: []const u8) !void {
@@ -5106,29 +5117,29 @@ fn writeTextAtomic(allocator: std.mem.Allocator, path: []const u8, text: []const
 
     const base = std.fs.path.basename(path);
     const parent = std.fs.path.dirname(path) orelse ".";
-    const tmp_name = try std.fmt.allocPrint(allocator, ".{s}.{d}.tmp", .{ base, std.time.nanoTimestamp() });
+    const tmp_name = try std.fmt.allocPrint(allocator, ".{s}.{d}.tmp", .{ base, std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds });
 
     if (std.fs.path.isAbsolute(path)) {
-        var dir = try std.fs.openDirAbsolute(parent, .{});
-        defer dir.close();
+        var dir = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), parent, .{});
+        defer dir.close(std.Io.Threaded.global_single_threaded.io());
 
-        var file = try dir.createFile(tmp_name, .{ .truncate = true, .read = true });
-        defer file.close();
-        try file.writeAll(text);
-        try file.sync();
-        try dir.rename(tmp_name, base);
+        var file = try dir.createFile(std.Io.Threaded.global_single_threaded.io(), tmp_name, .{ .truncate = true, .read = true });
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
+        try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), text);
+        try file.sync(std.Io.Threaded.global_single_threaded.io());
+        try dir.rename(tmp_name, dir, base, std.Io.Threaded.global_single_threaded.io());
         return;
     }
 
-    var cwd = std.fs.cwd();
-    var dir = try cwd.openDir(parent, .{});
-    defer dir.close();
+    const cwd = std.Io.Dir.cwd();
+    var dir = try cwd.openDir(std.Io.Threaded.global_single_threaded.io(), parent, .{});
+    defer dir.close(std.Io.Threaded.global_single_threaded.io());
 
-    var file = try dir.createFile(tmp_name, .{ .truncate = true, .read = true });
-    defer file.close();
-    try file.writeAll(text);
-    try file.sync();
-    try dir.rename(tmp_name, base);
+    var file = try dir.createFile(std.Io.Threaded.global_single_threaded.io(), tmp_name, .{ .truncate = true, .read = true });
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), text);
+    try file.sync(std.Io.Threaded.global_single_threaded.io());
+    try dir.rename(tmp_name, dir, base, std.Io.Threaded.global_single_threaded.io());
 }
 
 fn ensureParentPath(path: []const u8) !void {
@@ -5136,30 +5147,28 @@ fn ensureParentPath(path: []const u8) !void {
     if (parent.len == 0 or std.mem.eql(u8, parent, ".")) return;
 
     if (std.fs.path.isAbsolute(parent)) {
-        const rel = std.mem.trimLeft(u8, parent, "/");
+        const rel = std.mem.trim(u8, parent, "/");
         if (rel.len == 0) return;
-        var root = try std.fs.openDirAbsolute("/", .{});
-        defer root.close();
-        try root.makePath(rel);
+        var root = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), "/", .{});
+        defer root.close(std.Io.Threaded.global_single_threaded.io());
+        try root.createDirPath(std.Io.Threaded.global_single_threaded.io(), rel);
         return;
     }
 
-    try std.fs.cwd().makePath(parent);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), parent);
 }
 
 fn joinCommaLimited(buf: []u8, items: []const []const u8) ![]const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const writer = fbs.writer();
+    var writer = std.Io.Writer.fixed(buf);
     for (items, 0..) |item, idx| {
         if (idx > 0) try writer.writeAll(",");
         try writer.writeAll(item);
     }
-    return fbs.getWritten();
+    return writer.buffer;
 }
 
 fn formatDepsLimited(buf: []u8, deps: []const Dep) ![]const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const writer = fbs.writer();
+    var writer = std.Io.Writer.fixed(buf);
     for (deps, 0..) |dep, idx| {
         if (idx > 0) try writer.writeAll(",");
         if (std.mem.eql(u8, dep.type, "blocks")) {
@@ -5168,7 +5177,11 @@ fn formatDepsLimited(buf: []u8, deps: []const Dep) ![]const u8 {
             try writer.print("{s}:{s}", .{ dep.id, dep.type });
         }
     }
-    return fbs.getWritten();
+    return writer.buffer;
+}
+
+fn tmpDirRootAlloc(allocator: std.mem.Allocator, dir: std.Io.Dir) ![]u8 {
+    return dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
 }
 
 fn makeSeqRecord(
@@ -5177,11 +5190,11 @@ fn makeSeqRecord(
     seq: i64,
     op: []const u8,
 ) !std.json.Value {
-    var obj = std.json.ObjectMap.init(allocator);
-    try obj.put("v", .{ .integer = SchemaVersion });
-    try obj.put("lane", .{ .string = lane });
-    try obj.put("seq", .{ .integer = seq });
-    try obj.put("op", .{ .string = op });
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(allocator, "v", .{ .integer = SchemaVersion });
+    try obj.put(allocator, "lane", .{ .string = lane });
+    try obj.put(allocator, "seq", .{ .integer = seq });
+    try obj.put(allocator, "op", .{ .string = op });
     return .{ .object = obj };
 }
 
@@ -5372,7 +5385,7 @@ test "importUpdatePlan updates mirrored fields and preserves durable metadata" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
     const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
     const update_plan_path = try std.fs.path.join(allocator, &.{ root, "update-plan.json" });
 
@@ -5445,7 +5458,7 @@ test "importUpdatePlan transcript path uses latest turn boundary" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
     const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
     const transcript_path = try std.fs.path.join(allocator, &.{ root, "session.jsonl" });
 
@@ -5499,7 +5512,7 @@ test "importUpdatePlan rejects malformed codex plan steps" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
     const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
     const update_plan_path = try std.fs.path.join(allocator, &.{ root, "bad-update-plan.json" });
 
@@ -5534,7 +5547,7 @@ test "importUpdatePlan no-op path avoids rewriting the durable plan" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
     const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
     const update_plan_path = try std.fs.path.join(allocator, &.{ root, "update-plan.json" });
 
@@ -5584,7 +5597,7 @@ test "select auto-includes dependency closure and deselect rejects stranded depe
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
     const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
 
     _ = try cmdInit(allocator, .{ .command = .init, .file = plan_path, .replace = true });
@@ -5639,7 +5652,7 @@ test "import-orchplan and claim-safe runtime allow parallel wave progress" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
     const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
     const orchplan_path = try std.fs.path.join(allocator, &.{ root, "orchplan.yaml" });
     try writeTextAtomic(allocator, orchplan_path,
@@ -5694,7 +5707,7 @@ test "orchplan-backed claim rejects explicit ids when wave is authoritative" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
     const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
     const orchplan_path = try std.fs.path.join(allocator, &.{ root, "orchplan.yaml" });
     try writeTextAtomic(allocator, orchplan_path,
@@ -5731,7 +5744,7 @@ test "reclaim-stale and import-mesh-results reconcile execution metadata" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const root = try tmp.dir.realpathAlloc(allocator, ".");
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
     const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
     const orchplan_path = try std.fs.path.join(allocator, &.{ root, "mesh-orchplan.yaml" });
     const results_path = try std.fs.path.join(allocator, &.{ root, "mesh-results.csv" });
@@ -5785,7 +5798,7 @@ test "runPerfCase covers representative Wave B seams" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    const root = try tmpDirRootAlloc(alloc, tmp.dir);
 
     const cases = [_]PerfCase{
         .init,
@@ -5810,7 +5823,7 @@ test "collectSeqContractIssues detects non-monotonic trailing seq" {
     };
     defer for (&records) |*record| {
         if (record.* == .object) {
-            record.object.deinit();
+            record.object.deinit(std.testing.allocator);
         }
     };
 

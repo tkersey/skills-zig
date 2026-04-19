@@ -4,14 +4,14 @@ const time_utils = @import("../time_utils.zig");
 
 pub const Row = struct {
     allocator: std.mem.Allocator,
-    fields: std.StringArrayHashMap(spec.Scalar),
+    fields: std.StringHashMap(spec.Scalar),
     owned_keys: std.ArrayList([]u8),
     owned_string_values: std.ArrayList([]u8),
 
     pub fn init(allocator: std.mem.Allocator) Row {
         return .{
             .allocator = allocator,
-            .fields = std.StringArrayHashMap(spec.Scalar).init(allocator),
+            .fields = std.StringHashMap(spec.Scalar).init(allocator),
             .owned_keys = .empty,
             .owned_string_values = .empty,
         };

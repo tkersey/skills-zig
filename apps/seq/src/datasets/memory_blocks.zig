@@ -80,9 +80,10 @@ pub fn collect(allocator: std.mem.Allocator, options: Options) !RowList {
 }
 
 fn readFileAllocOrSkip(allocator: std.mem.Allocator, absolute_path: []const u8) !?[]u8 {
-    const file = std.fs.openFileAbsolute(absolute_path, .{}) catch return null;
-    defer file.close();
-    return file.readToEndAlloc(allocator, 256 * 1024) catch null;
+    const file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), absolute_path, .{}) catch return null;
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+    return reader.interface.allocRemaining(allocator, .limited(256 * 1024)) catch null;
 }
 
 fn extractMetadata(allocator: std.mem.Allocator, content: []const u8) !Metadata {
@@ -292,14 +293,13 @@ test "collect parses rollout summary headings into blocks" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("rollout_summaries");
-    try tmp.dir.writeFile(.{
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "rollout_summaries");
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
         .sub_path = "rollout_summaries/example.md",
-        .data =
-            "thread_id: abc\nupdated_at: 2026-03-11T00:00:00Z\nrollout_path: /tmp/run.jsonl\n\n# Title\n\nIntro text.\n\n## Task 1\n\nOutcome: success\n",
+        .data = "thread_id: abc\nupdated_at: 2026-03-11T00:00:00Z\nrollout_path: /tmp/run.jsonl\n\n# Title\n\nIntro text.\n\n## Task 1\n\nOutcome: success\n",
     });
 
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
 
     var rows = try collect(std.testing.allocator, .{ .memory_root = root_abs });

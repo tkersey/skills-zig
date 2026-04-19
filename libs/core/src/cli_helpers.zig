@@ -69,7 +69,7 @@ pub fn handleDefaultHelpAndVersionSurface(
     surface: HelpSurface,
     version_text: []const u8,
 ) !bool {
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
 
     if (argv.len <= 1) {
@@ -95,7 +95,7 @@ pub fn exitUsageFailure(
     err_token: []const u8,
     detail: ?[]const u8,
 ) noreturn {
-    var stderr_writer = std.fs.File.stderr().writer(&.{});
+    var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stderr = &stderr_writer.interface;
     printUsageFailureWithHelp(stderr, surface, version_text, err_token, detail) catch {};
     std.process.exit(2);

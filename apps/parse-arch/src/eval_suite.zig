@@ -57,7 +57,7 @@ pub fn runEval(allocator: std.mem.Allocator, writer: anytype, options: EvalOptio
 }
 
 pub fn loadSuite(allocator: std.mem.Allocator, suite_path: []const u8) !Suite {
-    const bytes = try std.fs.cwd().readFileAlloc(allocator, suite_path, 1024 * 1024);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), suite_path, allocator, .limited(1024 * 1024));
     return try parseSuiteYaml(allocator, bytes);
 }
 

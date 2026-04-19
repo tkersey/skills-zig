@@ -303,13 +303,9 @@ const LiveReviewNotificationState = struct {
     }
 };
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
 
     const parsed = parseArgs(allocator, argv) catch |err| {
@@ -317,14 +313,14 @@ pub fn main() !void {
     };
 
     if (parsed.show_version) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, Version);
         return;
     }
 
     if (parsed.show_help or parsed.action == null) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
@@ -489,10 +485,11 @@ fn setTarget(parsed: *ParsedArgs, target: TargetConfig) void {
 
 fn loadCustomInstructionsAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
     if (std.mem.eql(u8, raw, "-")) {
-        return std.fs.File.stdin().readToEndAlloc(allocator, 1024 * 1024);
+        var reader = std.Io.File.stdin().reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+        return reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
     }
     if (std.mem.startsWith(u8, raw, "@")) {
-        return std.fs.cwd().readFileAlloc(allocator, raw[1..], 1024 * 1024);
+        return std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), raw[1..], allocator, .limited(1024 * 1024));
     }
     return allocator.dupe(u8, raw);
 }
@@ -791,7 +788,7 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
         .delivery = "detached",
         .target = target_record,
         .event_log_path = event_log_path,
-        .created_at_unix_s = std.time.timestamp(),
+        .created_at_unix_s = @as(i64, @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000))),
         .last_observed_status = "inProgress",
         .codex_version = codex_version,
         .resolved_codex_path = resolved_codex_path,
@@ -849,7 +846,7 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                         null,
                     );
                 } else {
-                    var stdout_writer = std.fs.File.stdout().writer(&.{});
+                    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
                     const stdout = &stdout_writer.interface;
                     try stdout.print("cas_review_session start timed out after {d}ms\nreview thread: {s}\n", .{
                         parsed.timeout_ms,
@@ -922,7 +919,7 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                     null,
                 );
             } else {
-                var stdout_writer = std.fs.File.stdout().writer(&.{});
+                var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
                 const stdout = &stdout_writer.interface;
                 try stdout.print("cas_review_session start reached terminal status without a reviewResult\nreview thread: {s}\n", .{
                     review_thread_id,
@@ -959,7 +956,7 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                 null,
             );
         } else {
-            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             const stdout = &stdout_writer.interface;
             try stdout.print("cas_review_session start\ncwd: {s}\nparent thread: {s}\nreview thread: {s}\nreview turn: {s}\nfinal turn status: {s}\nrecord: {s}\nevent log: {s}\n", .{
                 cwd,
@@ -1001,7 +998,7 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
             null,
         );
     } else {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try stdout.print("cas_review_session start\ncwd: {s}\nparent thread: {s}\nreview thread: {s}\nreview turn: {s}\nrecord: {s}\nevent log: {s}\n", .{
             cwd,
@@ -1055,7 +1052,7 @@ fn cmdStatus(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                 },
             );
         } else {
-            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             const stdout = &stdout_writer.interface;
             try stdout.print("cas_review_session status\nreview thread: {s}\nreview turn: {s}\nturn status: {s}\ntransport: native-review (stored fallback)\nrecord: {s}\n", .{
                 record.review_thread_id,
@@ -1112,7 +1109,7 @@ fn cmdStatus(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
             null,
         );
     } else {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try stdout.print("cas_review_session status\nreview thread: {s}\nreview turn: {s}\nthread status: {s}\nturn status: {s}\nturn count: {d}\nmaterialized: {s}\nrecord: {s}\nevent log: {s}\n", .{
             record.review_thread_id,
@@ -1244,7 +1241,7 @@ fn cmdWait(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                     null,
                 );
             } else {
-                var stdout_writer = std.fs.File.stdout().writer(&.{});
+                var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
                 const stdout = &stdout_writer.interface;
                 try stdout.print("cas_review_session wait timed out after {d}ms\nreview thread: {s}\n", .{
                     parsed.timeout_ms,
@@ -1321,7 +1318,7 @@ fn cmdWait(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
                 null,
             );
         } else {
-            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             const stdout = &stdout_writer.interface;
             try stdout.print("cas_review_session wait reached terminal status without a reviewResult\nreview thread: {s}\n", .{
                 record.review_thread_id,
@@ -1359,7 +1356,7 @@ fn cmdWait(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
             null,
         );
     } else {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try stdout.print("cas_review_session wait\nreview thread: {s}\nreview turn: {s}\nfinal turn status: {s}\nrecord: {s}\n", .{
             record.review_thread_id,
@@ -1424,7 +1421,7 @@ fn cmdInterrupt(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
             };
             try printJson(payload);
         } else {
-            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             const stdout = &stdout_writer.interface;
             try stdout.print("cas_review_session interrupt\nreview thread: {s}\nreview turn: {s}\nresult: already terminal ({s})\nrecord: {s}\n", .{
                 record.review_thread_id,
@@ -1511,7 +1508,7 @@ fn cmdInterrupt(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
         };
         try printJson(payload);
     } else {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try stdout.print("cas_review_session interrupt\nreview thread: {s}\nreview turn: {s}\nrecord: {s}\n", .{
             record.review_thread_id,
@@ -1869,13 +1866,13 @@ fn waitForThreadTerminalState(
     timeout_ms: u32,
     poll_interval_ms: u32,
 ) !ReviewStatus {
-    const started_ms = std.time.milliTimestamp();
+    const started_ms = @divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000);
     while (true) {
         const latest = try fetchReviewStatus(allocator, client, thread_id, event_log_path, null);
         if (isTerminalTurnStatus(latest.turn_status)) return latest;
         latest.deinit(allocator);
-        if (std.time.milliTimestamp() - started_ms >= timeout_ms) return error.WaitTimedOut;
-        std.Thread.sleep(@as(u64, poll_interval_ms) * std.time.ns_per_ms);
+        if (@divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000) - started_ms >= timeout_ms) return error.WaitTimedOut;
+        std.Io.sleep(std.Io.Threaded.global_single_threaded.io(), .fromMilliseconds(poll_interval_ms), .awake) catch {};
     }
 }
 
@@ -1952,29 +1949,25 @@ fn runNativeReviewFallbackAlloc(
     try argv.append(allocator, "review");
     try appendNativeReviewArgs(allocator, &argv, target);
 
-    var child = std.process.Child.init(argv.items, allocator);
-    child.cwd = cwd;
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    try child.spawn();
-
-    const stdout_bytes = try child.stdout.?.readToEndAlloc(allocator, 1024 * 1024);
-    const stderr_bytes = try child.stderr.?.readToEndAlloc(allocator, 1024 * 1024);
-    const term = try child.wait();
-    const exit_code: u8 = switch (term) {
-        .Exited => |code| @intCast(@min(code, 255)),
+    const result = try std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
+        .argv = argv.items,
+        .cwd = .{ .path = cwd },
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+    });
+    const exit_code: u8 = switch (result.term) {
+        .exited => |code| @intCast(@min(code, 255)),
         else => 1,
     };
     return .{
         .exit_code = exit_code,
         .ok = exit_code == 0,
-        .stdout_text = if (stdout_bytes.len > 0) stdout_bytes else blk: {
-            allocator.free(stdout_bytes);
+        .stdout_text = if (result.stdout.len > 0) result.stdout else blk: {
+            allocator.free(result.stdout);
             break :blk null;
         },
-        .stderr_text = if (stderr_bytes.len > 0) stderr_bytes else blk: {
-            allocator.free(stderr_bytes);
+        .stderr_text = if (result.stderr.len > 0) result.stderr else blk: {
+            allocator.free(result.stderr);
             break :blk null;
         },
     };
@@ -2000,7 +1993,7 @@ fn waitForReviewCompletion(
     timeout_ms: u32,
     poll_interval_ms: u32,
 ) !ReviewStatus {
-    const started_ms = std.time.milliTimestamp();
+    const started_ms = @divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000);
     var live_notifications = LiveReviewNotificationState{
         .review_thread_id = review_thread_id,
         .review_turn_id = review_turn_id,
@@ -2024,8 +2017,8 @@ fn waitForReviewCompletion(
         if (live_notifications.observed_terminal_status != null) {
             return try fetchReviewStatus(allocator, client, review_thread_id, event_log_path, &live_notifications);
         }
-        if (std.time.milliTimestamp() - started_ms >= timeout_ms) return error.WaitTimedOut;
-        std.Thread.sleep(@as(u64, poll_interval_ms) * std.time.ns_per_ms);
+        if (@divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000) - started_ms >= timeout_ms) return error.WaitTimedOut;
+        std.Io.sleep(std.Io.Threaded.global_single_threaded.io(), .fromMilliseconds(poll_interval_ms), .awake) catch {};
     }
 }
 
@@ -2133,7 +2126,7 @@ fn targetToRecord(target: TargetConfig) TargetRecord {
 fn sessionDirAlloc(allocator: std.mem.Allocator) ![]const u8 {
     const base = try core_path.expandHomePath(allocator, "~/.codex/cas/review_sessions");
     try ensureParentPath(base);
-    try std.fs.cwd().makePath(base);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), base);
     return base;
 }
 
@@ -2216,9 +2209,10 @@ const LoadedSessionRecord = struct {
 fn loadSessionRecord(allocator: std.mem.Allocator, review_thread_id: []const u8) !LoadedSessionRecord {
     const session_dir = try sessionDirAlloc(allocator);
     const record_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ session_dir, review_thread_id });
-    const file = try std.fs.openFileAbsolute(record_path, .{});
-    defer file.close();
-    const raw = try file.readToEndAlloc(allocator, 1024 * 1024);
+    const file = try std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), record_path, .{});
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const raw = try reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
     const parsed = try std.json.parseFromSlice(SessionRecord, allocator, raw, .{});
     return .{
         .record_path = record_path,
@@ -2230,13 +2224,13 @@ fn writeSessionRecord(allocator: std.mem.Allocator, path: []const u8, record: Se
     try ensureParentPath(path);
     const json = try stringifyAnyAlloc(allocator, record);
     defer allocator.free(json);
-    const temp_path = try std.fmt.allocPrint(allocator, "{s}.tmp-{d}", .{ path, std.time.nanoTimestamp() });
+    const temp_path = try std.fmt.allocPrint(allocator, "{s}.tmp-{d}", .{ path, std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds });
     defer allocator.free(temp_path);
-    var file = try std.fs.createFileAbsolute(temp_path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(json);
-    try file.writeAll("\n");
-    try std.fs.renameAbsolute(temp_path, path);
+    var file = try std.Io.Dir.createFileAbsolute(std.Io.Threaded.global_single_threaded.io(), temp_path, .{ .truncate = true });
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), json);
+    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), "\n");
+    try std.Io.Dir.renameAbsolute(temp_path, path, std.Io.Threaded.global_single_threaded.io());
 }
 
 fn appendLogRecord(
@@ -2250,7 +2244,7 @@ fn appendLogRecord(
         allocator,
         "{{\"recordedAtUnixS\":{d},\"method\":{s},\"direction\":{s},\"payload\":{s}}}",
         .{
-            std.time.timestamp(),
+            @divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000),
             try quoteJsonStringAlloc(allocator, method),
             try quoteJsonStringAlloc(allocator, direction),
             try quoteJsonStringAlloc(allocator, payload_json),
@@ -2258,14 +2252,16 @@ fn appendLogRecord(
     );
     defer allocator.free(json_line);
     try ensureParentPath(path);
-    var file = std.fs.openFileAbsolute(path, .{ .mode = .write_only }) catch |err| switch (err) {
-        error.FileNotFound => try std.fs.createFileAbsolute(path, .{ .truncate = false }),
+    var file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{ .mode = .write_only }) catch |err| switch (err) {
+        error.FileNotFound => try std.Io.Dir.createFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{ .truncate = false }),
         else => return err,
     };
-    defer file.close();
-    try file.seekFromEnd(0);
-    try file.writeAll(json_line);
-    try file.writeAll("\n");
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    const end_pos = (try file.stat(std.Io.Threaded.global_single_threaded.io())).size;
+    var writer = file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    try writer.seekTo(end_pos);
+    try writer.interface.writeAll(json_line);
+    try writer.interface.writeAll("\n");
 }
 
 fn ensureParentPath(path: []const u8) !void {
@@ -2273,15 +2269,15 @@ fn ensureParentPath(path: []const u8) !void {
     if (parent.len == 0) return;
 
     if (std.fs.path.isAbsolute(parent)) {
-        const rel = std.mem.trimLeft(u8, parent, "/");
+        const rel = std.mem.trim(u8, parent, "/");
         if (rel.len == 0) return;
-        var root = try std.fs.openDirAbsolute("/", .{});
-        defer root.close();
-        try root.makePath(rel);
+        var root = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), "/", .{});
+        defer root.close(std.Io.Threaded.global_single_threaded.io());
+        try root.createDirPath(std.Io.Threaded.global_single_threaded.io(), rel);
         return;
     }
 
-    try std.fs.cwd().makePath(parent);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), parent);
 }
 
 fn renderErrorAndExit(
@@ -2308,7 +2304,7 @@ fn renderErrorAndExit(
         };
         try printJson(payload);
     } else {
-        var stderr_writer = std.fs.File.stderr().writer(&.{});
+        var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stderr = &stderr_writer.interface;
         try stderr.print("{s}: {s} ({s})\n", .{ method, message, failure.code });
     }
@@ -2355,14 +2351,14 @@ fn maybeRunNativeFallbackAndExitStart(
             fallback,
         );
     } else if (fallback.stdout_text) |text| {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try stdout.writeAll(text);
         if (!std.mem.endsWith(u8, text, "\n")) try stdout.writeAll("\n");
     }
 
     if (fallback.stderr_text) |text| {
-        var stderr_writer = std.fs.File.stderr().writer(&.{});
+        var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stderr = &stderr_writer.interface;
         try stderr.writeAll(text);
         if (!std.mem.endsWith(u8, text, "\n")) try stderr.writeAll("\n");
@@ -2426,14 +2422,14 @@ fn maybeRunNativeFallbackAndExitWait(
             fallback,
         );
     } else if (fallback.stdout_text) |text| {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try stdout.writeAll(text);
         if (!std.mem.endsWith(u8, text, "\n")) try stdout.writeAll("\n");
     }
 
     if (fallback.stderr_text) |text| {
-        var stderr_writer = std.fs.File.stderr().writer(&.{});
+        var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stderr = &stderr_writer.interface;
         try stderr.writeAll(text);
         if (!std.mem.endsWith(u8, text, "\n")) try stderr.writeAll("\n");
@@ -2442,15 +2438,15 @@ fn maybeRunNativeFallbackAndExitWait(
 }
 
 fn readCodexVersionAlloc(allocator: std.mem.Allocator, cwd: []const u8, codex_path: []const u8) ![]const u8 {
-    var child = std.process.Child.init(&.{ codex_path, "--version" }, allocator);
-    child.cwd = cwd;
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
-    const stdout = try child.stdout.?.readToEndAlloc(allocator, 4096);
-    _ = try child.wait();
-    return allocator.dupe(u8, std.mem.trim(u8, stdout, " \t\r\n"));
+    const result = try std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
+        .argv = &.{ codex_path, "--version" },
+        .cwd = .{ .path = cwd },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(0),
+    });
+    defer allocator.free(result.stderr);
+    defer allocator.free(result.stdout);
+    return allocator.dupe(u8, std.mem.trim(u8, result.stdout, " \t\r\n"));
 }
 
 fn shouldPreMaterializeDetachedReviewParent(parent_mode: ParentMode, codex_version: []const u8) bool {
@@ -2506,7 +2502,7 @@ fn stringifyAnyAlloc(allocator: std.mem.Allocator, value: anytype) ![]u8 {
 }
 
 fn printJson(value: anytype) !void {
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try std.json.Stringify.value(value, .{ .whitespace = .indent_2 }, stdout);
     try stdout.writeAll("\n");
@@ -2533,7 +2529,7 @@ fn printStatusJson(
     failure: ?FailureInfo,
     fallback: ?NativeFallbackResult,
 ) !void {
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
 
     const cwd_json = if (cwd) |value| try quoteJsonStringAlloc(allocator, value) else "null";
@@ -2642,7 +2638,7 @@ fn printStartJson(
     failure: ?FailureInfo,
     fallback: ?NativeFallbackResult,
 ) !void {
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
 
     const target_json = try stringifyAnyAlloc(allocator, target_record);
@@ -2810,9 +2806,10 @@ fn timeoutStatusString(status: *const ReviewStatus) []const u8 {
 }
 
 fn readReviewResultJsonFromRolloutAlloc(allocator: std.mem.Allocator, rollout_path: []const u8) !?[]u8 {
-    const file = try std.fs.openFileAbsolute(rollout_path, .{});
-    defer file.close();
-    const bytes = try file.readToEndAlloc(allocator, 16 * 1024 * 1024);
+    const file = try std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), rollout_path, .{});
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const bytes = try reader.interface.allocRemaining(allocator, .limited(16 * 1024 * 1024));
     defer allocator.free(bytes);
 
     var latest_json: ?[]u8 = null;
@@ -3019,9 +3016,9 @@ test "readReviewResultJsonFromRolloutAlloc extracts exited review output" {
         \\{"type":"event_msg","payload":{"type":"entered_review_mode","user_facing_hint":"current changes"}}
         \\{"type":"event_msg","payload":{"type":"exited_review_mode","review_output":{"findings":[{"title":"Prefer helper","body":"Use the helper.","confidence_score":0.75,"priority":1,"code_location":{"absolute_file_path":"/tmp/file.zig","line_range":{"start":7,"end":9}}}],"overall_correctness":"patch is correct","overall_explanation":"Looks good.","overall_confidence_score":0.9}}}
     ;
-    try tmp.dir.writeFile(.{ .sub_path = "rollout.jsonl", .data = rollout });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "rollout.jsonl", .data = rollout });
 
-    const rollout_path = try tmp.dir.realpathAlloc(std.testing.allocator, "rollout.jsonl");
+    const rollout_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "rollout.jsonl", std.testing.allocator);
     defer std.testing.allocator.free(rollout_path);
 
     const json = (try readReviewResultJsonFromRolloutAlloc(std.testing.allocator, rollout_path)).?;
@@ -3052,9 +3049,9 @@ test "readReviewResultJsonFromRolloutAlloc returns null when review output is ab
         \\{"type":"event_msg","payload":{"type":"entered_review_mode","user_facing_hint":"current changes"}}
         \\{"type":"event_msg","payload":{"type":"exited_review_mode","review_output":null}}
     ;
-    try tmp.dir.writeFile(.{ .sub_path = "rollout.jsonl", .data = rollout });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "rollout.jsonl", .data = rollout });
 
-    const rollout_path = try tmp.dir.realpathAlloc(std.testing.allocator, "rollout.jsonl");
+    const rollout_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "rollout.jsonl", std.testing.allocator);
     defer std.testing.allocator.free(rollout_path);
 
     try std.testing.expect((try readReviewResultJsonFromRolloutAlloc(std.testing.allocator, rollout_path)) == null);

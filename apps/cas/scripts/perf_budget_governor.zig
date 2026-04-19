@@ -93,16 +93,12 @@ const sample_payloads = [_][]const u8{
 
 const CountingAllocator = core_perf.CountingAllocator;
 
-pub fn main() !void {
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa_state.deinit();
-    const allocator = gpa_state.allocator();
-
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
 
-    var cli = parseCliOptions(allocator) catch |err| {
+    var cli = parseCliOptions(allocator, argv) catch |err| {
         core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
     };
     defer freeCliOptions(allocator, &cli);
@@ -120,7 +116,7 @@ pub fn main() !void {
     else
         null;
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("rounds={d}\n", .{summary.rounds});
     try stdout.print("eval_count={d}\n", .{summary.eval_count});
@@ -147,41 +143,46 @@ pub fn main() !void {
     try stdout.writeAll("status=PASS\n");
 }
 
-fn parseCliOptions(allocator: std.mem.Allocator) !CliOptions {
+fn parseCliOptions(allocator: std.mem.Allocator, argv: []const []const u8) !CliOptions {
     var out = CliOptions{
         .config_path = try allocator.dupe(u8, "perf/budget_governor/workload_config.json"),
     };
 
-    var args = std.process.args();
-    _ = args.next();
-
-    while (args.next()) |arg| {
+    var i: usize = 1;
+    while (i < argv.len) : (i += 1) {
+        const arg = argv[i];
         if (core_cli.isHelpArg(arg)) {
-            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             const stdout = &stdout_writer.interface;
             try core_cli.printHelpSurface(stdout, HelpSurface, Version);
             std.process.exit(0);
         }
         if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
-            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             const stdout = &stdout_writer.interface;
             try core_cli.printVersion(stdout, Version);
             std.process.exit(0);
         }
         if (std.mem.eql(u8, arg, "--config")) {
-            const path = args.next() orelse return error.MissingConfigPath;
+            i += 1;
+            if (i >= argv.len) return error.MissingConfigPath;
+            const path = argv[i];
             allocator.free(out.config_path);
             out.config_path = try allocator.dupe(u8, path);
             continue;
         }
         if (std.mem.eql(u8, arg, "--artifact")) {
-            const path = args.next() orelse return error.MissingArtifactPath;
+            i += 1;
+            if (i >= argv.len) return error.MissingArtifactPath;
+            const path = argv[i];
             if (out.artifact_path) |existing| allocator.free(existing);
             out.artifact_path = try allocator.dupe(u8, path);
             continue;
         }
         if (std.mem.eql(u8, arg, "--trend-tolerance-pct")) {
-            const value = args.next() orelse return error.MissingTrendTolerance;
+            i += 1;
+            if (i >= argv.len) return error.MissingTrendTolerance;
+            const value = argv[i];
             out.trend_tolerance_override = try std.fmt.parseFloat(f64, value);
             continue;
         }
@@ -202,7 +203,7 @@ fn freeCliOptions(allocator: std.mem.Allocator, cli: *CliOptions) void {
 }
 
 fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !PerfConfig {
-    const data = try std.fs.cwd().readFileAlloc(allocator, path, 1 * 1024 * 1024);
+    const data = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(1 * 1024 * 1024));
     defer allocator.free(data);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
@@ -248,20 +249,20 @@ fn benchmarkGovernor(allocator: std.mem.Allocator, iterations: usize, rounds: us
 }
 
 fn runRound(iterations: usize) !RoundStats {
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
 
     var counting = CountingAllocator.init(gpa_state.allocator());
     const alloc = counting.allocator();
 
-    var timer = try std.time.Timer.start();
+    const start_ns = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds;
     var ok_count: usize = 0;
     for (0..iterations) |i| {
         const payload = sample_payloads[i % sample_payloads.len];
         const out = try governor.computeBudgetGovernorFromSlice(alloc, payload, 1_700_000_000);
         if (out.ok) ok_count += 1;
     }
-    const elapsed_ns = timer.read();
+    const elapsed_ns: u64 = @intCast(@max(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds - start_ns, 1));
     if (ok_count == 0) return error.AllEvaluationsFailed;
 
     return .{
@@ -280,7 +281,12 @@ fn enforceTrendGate(summary: PerfSummary, previous: BenchmarkArtifact, tolerance
 }
 
 fn loadArtifact(allocator: std.mem.Allocator, path: []const u8) !?BenchmarkArtifact {
-    const data = std.fs.cwd().readFileAlloc(allocator, path, 1 * 1024 * 1024) catch |err| switch (err) {
+    const data = std.Io.Dir.cwd().readFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        path,
+        allocator,
+        .limited(1 * 1024 * 1024),
+    ) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -304,19 +310,20 @@ fn loadArtifact(allocator: std.mem.Allocator, path: []const u8) !?BenchmarkArtif
 }
 
 fn writeArtifact(path: []const u8, summary: PerfSummary) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
     if (std.fs.path.dirname(path)) |dir_path| {
-        if (dir_path.len > 0) try std.fs.cwd().makePath(dir_path);
+        if (dir_path.len > 0) try std.Io.Dir.cwd().createDirPath(io, dir_path);
     }
 
-    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
 
-    var writer = file.writer(&.{});
+    var writer = file.writer(io, &.{});
     const out = &writer.interface;
     try out.print(
         "{{\n  \"captured_unix_s\": {d},\n  \"p95_ns_per_eval\": {d},\n  \"p50_alloc_calls_per_eval\": {d}\n}}\n",
         .{
-            std.time.timestamp(),
+            @as(i64, @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000))),
             summary.p95_ns_per_eval,
             summary.p50_alloc_calls_per_eval,
         },

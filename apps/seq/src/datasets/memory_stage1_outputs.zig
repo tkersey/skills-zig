@@ -78,8 +78,7 @@ pub fn collect(allocator: std.mem.Allocator, options: Options) !RowList {
     var rows: RowList = .empty;
     errdefer deinitRows(allocator, &rows);
 
-    var stmt = try db.prepare(
-        allocator,
+    var stmt = try db.prepare(allocator,
         \\SELECT
         \\  s.thread_id,
         \\  s.source_updated_at,
@@ -160,8 +159,8 @@ test "collect reads joined stage1 and thread rows" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "state_5.sqlite", .data = "" });
-    const db_path = try tmp.dir.realpathAlloc(std.testing.allocator, "state_5.sqlite");
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "state_5.sqlite", .data = "" });
+    const db_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "state_5.sqlite", std.testing.allocator);
     defer std.testing.allocator.free(db_path);
 
     var db = try sqlite.Db.open(std.testing.allocator, db_path);
@@ -227,8 +226,8 @@ test "collect fails closed when required schema columns are missing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "state_5.sqlite", .data = "" });
-    const db_path = try tmp.dir.realpathAlloc(std.testing.allocator, "state_5.sqlite");
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "state_5.sqlite", .data = "" });
+    const db_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "state_5.sqlite", std.testing.allocator);
     defer std.testing.allocator.free(db_path);
 
     var db = try sqlite.Db.open(std.testing.allocator, db_path);

@@ -317,29 +317,25 @@ const CohortStats = struct {
     recall_delta_median_min: ?f64 = null,
 };
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (argv.len <= 1) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
     }
 
     if (core_cli.isHelpArg(argv[1])) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
     }
     if (core_cli.isVersionArg(argv[1]) or core_cli.isVersionSubcommand(argv[1])) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, Version);
         return;
@@ -354,7 +350,7 @@ pub fn main() !void {
         return;
     }
 
-    const cwd = try std.process.getCwdAlloc(allocator);
+    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
     defer allocator.free(cwd);
     const repo_root = try discoverRepoRootAlloc(allocator, cwd);
     defer allocator.free(repo_root);
@@ -630,7 +626,7 @@ fn parseArgs(argv: []const []const u8) !Args {
 
 fn printParseError(err: anyerror, argv: []const []const u8) noreturn {
     _ = argv;
-    var stderr_writer = std.fs.File.stderr().writer(&.{});
+    var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stderr = &stderr_writer.interface;
 
     switch (err) {
@@ -774,7 +770,7 @@ fn cmdDatasets(allocator: std.mem.Allocator) !void {
     const rendered = try query_output.render(allocator, .table, rows.items, cols[0..]);
     defer allocator.free(rendered);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     try stdout_writer.interface.writeAll(rendered);
 }
 
@@ -795,7 +791,7 @@ fn appendDatasetRow(
 
 fn cmdDatasetSchema(allocator: std.mem.Allocator, dataset: []const u8) !void {
     _ = allocator;
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
 
     if (std.mem.eql(u8, dataset, "learnings")) {
@@ -838,7 +834,7 @@ fn cmdQuery(
     spec_arg: []const u8,
 ) !void {
     const spec_json = parseJsonArgAlloc(allocator, repo_root, spec_arg) catch |err| {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try stdout.print("Invalid --spec JSON: {s}\n", .{@errorName(err)});
         return;
@@ -846,7 +842,7 @@ fn cmdQuery(
     defer allocator.free(spec_json);
 
     var parsed_spec_value = std.json.parseFromSlice(std.json.Value, allocator, spec_json, .{}) catch {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try stdout.print("Spec must be a JSON object.\n", .{});
         return;
@@ -856,7 +852,7 @@ fn cmdQuery(
     const root = switch (parsed_spec_value.value) {
         .object => |obj| obj,
         else => {
-            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             const stdout = &stdout_writer.interface;
             try stdout.print("Spec must be a JSON object.\n", .{});
             return;
@@ -866,7 +862,7 @@ fn cmdQuery(
     const dataset_name = switch (root.get("dataset") orelse .null) {
         .string => |value| value,
         else => {
-            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             const stdout = &stdout_writer.interface;
             try stdout.print("Spec must include dataset (string).\n", .{});
             return;
@@ -878,14 +874,14 @@ fn cmdQuery(
             const fmt_text = switch (fmt_value) {
                 .string => |value| value,
                 else => {
-                    var stdout_writer = std.fs.File.stdout().writer(&.{});
+                    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
                     const stdout = &stdout_writer.interface;
                     try stdout.print("Spec format must be one of: table, json, csv, jsonl.\n", .{});
                     return;
                 },
             };
             break :blk query_output.Format.parse(fmt_text) catch {
-                var stdout_writer = std.fs.File.stdout().writer(&.{});
+                var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
                 const stdout = &stdout_writer.interface;
                 try stdout.print("Spec format must be one of: table, json, csv, jsonl.\n", .{});
                 return;
@@ -900,7 +896,7 @@ fn cmdQuery(
     };
 
     var rows = collectDatasetRows(allocator, jsonl_path, dataset_name) catch {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try stdout.print("Unknown dataset: {s}\n", .{dataset_name});
         return;
@@ -914,7 +910,7 @@ fn cmdQuery(
     defer arena.deinit();
 
     const query_spec_value = query_spec.parseQuerySpecValue(arena.allocator(), parsed_spec_value.value) catch |err| {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try stdout.print("Invalid --spec JSON: {s}\n", .{@errorName(err)});
         return;
@@ -931,7 +927,7 @@ fn cmdQuery(
     const rendered = try query_output.render(allocator, format, result.rows.items, columns_opt);
     defer allocator.free(rendered);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     try stdout_writer.interface.writeAll(rendered);
 }
 
@@ -987,7 +983,7 @@ fn cmdRecent(
     const rendered = try query_output.render(allocator, .table, out_rows.items, cols[0..]);
     defer allocator.free(rendered);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     try stdout_writer.interface.writeAll(rendered);
 }
 
@@ -1004,7 +1000,7 @@ fn cmdRecall(
     _ = repo_root;
 
     if (std.mem.trim(u8, query_text, " \t\r\n").len == 0) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try stdout.print("error: --query is required\n", .{});
         return;
@@ -1017,7 +1013,7 @@ fn cmdRecall(
     }
 
     if (rows.items.len == 0) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try stdout.print("(no learnings file at {s})\n", .{jsonl_path});
         return;
@@ -1063,7 +1059,7 @@ fn cmdRecall(
     try appendPathHintsFromCsv(allocator, &path_hints, raw_paths);
     try appendPathHintsFromQuery(allocator, &path_hints, query_text);
 
-    const now_sec = std.time.timestamp();
+    const now_sec = @as(i64, @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000)));
 
     var candidates: std.ArrayList(RecallCandidate) = .empty;
     defer candidates.deinit(allocator);
@@ -1205,7 +1201,7 @@ fn cmdCodifyCandidates(
     }
 
     if (rows.items.len == 0) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try stdout.print("(no learnings file at {s})\n", .{jsonl_path});
         return;
@@ -1270,7 +1266,7 @@ fn cmdCodifyCandidates(
         results.deinit(allocator);
     }
 
-    const now_sec = std.time.timestamp();
+    const now_sec = @as(i64, @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000)));
 
     var it = groups.iterator();
     while (it.next()) |entry| {
@@ -1756,8 +1752,7 @@ fn resolveSessionsRootAlloc(
         return std.fmt.allocPrint(allocator, "{s}/{s}", .{ repo_root, raw_root });
     }
 
-    const home = std.process.getEnvVarOwned(allocator, "HOME") catch return error.MissingHomeEnv;
-    defer allocator.free(home);
+    const home = std.Io.Threaded.global_single_threaded.environString("HOME") orelse return error.MissingHomeEnv;
     return std.fmt.allocPrint(allocator, "{s}/.codex/sessions", .{home});
 }
 
@@ -1770,13 +1765,13 @@ fn collectSessionSummaries(
 ) !std.ArrayList(SessionSummary) {
     var out: std.ArrayList(SessionSummary) = .empty;
 
-    var root_dir = std.fs.openDirAbsolute(sessions_root, .{ .iterate = true }) catch return out;
-    defer root_dir.close();
+    var root_dir = std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), sessions_root, .{ .iterate = true }) catch return out;
+    defer root_dir.close(std.Io.Threaded.global_single_threaded.io());
 
     var walker = try root_dir.walk(allocator);
     defer walker.deinit();
 
-    while (try walker.next()) |entry| {
+    while (try walker.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".jsonl")) continue;
 
@@ -1791,7 +1786,7 @@ fn collectSessionSummaries(
         const abs_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ sessions_root, entry.path });
         defer allocator.free(abs_path);
 
-        const data = std.fs.cwd().readFileAlloc(allocator, abs_path, 128 * 1024 * 1024) catch continue;
+        const data = std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), abs_path, allocator, .limited(128 * 1024 * 1024)) catch continue;
         defer allocator.free(data);
         if (data.len == 0) continue;
 
@@ -2141,21 +2136,21 @@ fn appendValueReportRow(
 
 fn emitOutput(output_path: []const u8, rendered: []const u8) !void {
     if (output_path.len == 0) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         try stdout_writer.interface.writeAll(rendered);
         return;
     }
 
     if (std.fs.path.isAbsolute(output_path)) {
-        var file = try std.fs.createFileAbsolute(output_path, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(rendered);
+        var file = try std.Io.Dir.createFileAbsolute(std.Io.Threaded.global_single_threaded.io(), output_path, .{ .truncate = true });
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
+        try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), rendered);
         return;
     }
 
-    var file = try std.fs.cwd().createFile(output_path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(rendered);
+    var file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), output_path, .{ .truncate = true });
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), rendered);
 }
 
 fn collectDatasetRows(
@@ -2181,13 +2176,14 @@ fn collectLearningRows(
 ) !std.ArrayList(query_engine.Row) {
     var rows: std.ArrayList(query_engine.Row) = .empty;
 
-    const file = std.fs.openFileAbsolute(jsonl_path, .{}) catch |err| switch (err) {
+    const file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), jsonl_path, .{}) catch |err| switch (err) {
         error.FileNotFound => return rows,
         else => return err,
     };
-    defer file.close();
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
 
-    const data = try file.readToEndAlloc(allocator, 64 * 1024 * 1024);
+    var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const data = try reader.interface.allocRemaining(allocator, .limited(64 * 1024 * 1024));
     defer allocator.free(data);
 
     var lines = std.mem.splitScalar(u8, data, '\n');
@@ -2432,7 +2428,7 @@ fn renderRecallTable(
     const rendered = try query_output.render(allocator, .table, out_rows.items, cols[0..]);
     defer allocator.free(rendered);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     try stdout_writer.interface.writeAll(rendered);
 }
 
@@ -2458,7 +2454,7 @@ fn renderRecallJson(
     const rendered = try query_output.render(allocator, .json, out_rows.items, null);
     defer allocator.free(rendered);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     try stdout_writer.interface.writeAll(rendered);
 }
 
@@ -2490,7 +2486,7 @@ fn renderCodifyTable(
     const rendered = try query_output.render(allocator, .table, out_rows.items, cols[0..]);
     defer allocator.free(rendered);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     try stdout_writer.interface.writeAll(rendered);
 }
 
@@ -2519,7 +2515,7 @@ fn renderCodifyJson(
     const rendered = try query_output.render(allocator, .json, out_rows.items, null);
     defer allocator.free(rendered);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     try stdout_writer.interface.writeAll(rendered);
 }
 
@@ -2771,7 +2767,7 @@ fn lessStringAsc(_: void, a: []const u8, b: []const u8) bool {
 }
 
 fn renderErrorLine(comptime fmt: []const u8, args: anytype) !void {
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print(fmt, args);
 }
@@ -2793,7 +2789,7 @@ fn parseJsonArgAlloc(
         try std.fmt.allocPrint(allocator, "{s}/{s}", .{ repo_root, raw });
     defer allocator.free(path);
 
-    return std.fs.cwd().readFileAlloc(allocator, path, 8 * 1024 * 1024);
+    return std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(8 * 1024 * 1024));
 }
 
 fn valueAsScalarString(value: query_spec.Scalar) query_spec.Scalar {
@@ -3051,33 +3047,28 @@ fn runGitAlloc(
     try argv.append(allocator, "git");
     try argv.appendSlice(allocator, args);
 
-    var child = std.process.Child.init(argv.items, allocator);
-    child.cwd = cwd;
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
+    const result = try std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
+        .argv = argv.items,
+        .cwd = .{ .path = cwd },
+        .stdout_limit = .limited(4 * 1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+    });
+    defer allocator.free(result.stderr);
 
-    try child.spawn();
-
-    const stdout_data = try child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024);
-    const stderr_data = try child.stderr.?.readToEndAlloc(allocator, 1024 * 1024);
-    defer allocator.free(stderr_data);
-
-    const term = try child.wait();
-    switch (term) {
-        .Exited => |code| {
+    switch (result.term) {
+        .exited => |code| {
             if (code != 0) {
-                allocator.free(stdout_data);
+                allocator.free(result.stdout);
                 return error.GitCommandFailed;
             }
         },
         else => {
-            allocator.free(stdout_data);
+            allocator.free(result.stdout);
             return error.GitCommandFailed;
         },
     }
 
-    return stdout_data;
+    return result.stdout;
 }
 
 fn toLowerAscii(c: u8) u8 {
@@ -3271,7 +3262,11 @@ test "iso week basic" {
     try std.testing.expect(w.week >= 1);
 }
 
-fn fuzzTokenizeTarget(_: void, input: []const u8) !void {
+fn fuzzTokenizeTarget(_: void, smith: *std.testing.Smith) !void {
+    var storage: [512]u8 = undefined;
+    for (&storage) |*b| b.* = smith.value(u8);
+    const len = smith.value(usize) % (storage.len + 1);
+    const input = storage[0..len];
     var set = try tokenizeSet(std.testing.allocator, input);
     defer deinitOwnedStringSet(std.testing.allocator, &set);
 }

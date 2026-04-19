@@ -29,16 +29,12 @@ const WorkloadConfig = struct {
     rounds: usize = 15,
 };
 
-pub fn main() !void {
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa_state.deinit();
-    const allocator = gpa_state.allocator();
-
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
 
-    const config_path = parseConfigPath(allocator) catch |err| {
+    const config_path = parseConfigPath(allocator, argv) catch |err| {
         core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
     };
     defer allocator.free(config_path);
@@ -75,7 +71,7 @@ pub fn main() !void {
     const optimized_p50 = try percentile50(allocator, optimized_samples);
     const speedup_pct = computeSpeedupPct(baseline_p50, optimized_p50);
 
-    var stdout = std.fs.File.stdout().writer(&.{});
+    var stdout = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     try stdout.interface.print("workload_rows={d}\n", .{config.rows});
     try stdout.interface.print("rounds={d}\n", .{config.rounds});
     try stdout.interface.print("baseline_p50_ns={d}\n", .{baseline_p50});
@@ -85,25 +81,26 @@ pub fn main() !void {
     try stdout.interface.writeAll("status=PASS\n");
 }
 
-fn parseConfigPath(allocator: std.mem.Allocator) ![]u8 {
-    var args = std.process.args();
-    _ = args.next();
-
-    while (args.next()) |arg| {
+fn parseConfigPath(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
+    var i: usize = 1;
+    while (i < argv.len) : (i += 1) {
+        const arg = argv[i];
         if (core_cli.isHelpArg(arg)) {
-            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             const stdout = &stdout_writer.interface;
             try core_cli.printHelpSurface(stdout, HelpSurface, Version);
             std.process.exit(0);
         }
         if (core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) {
-            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             const stdout = &stdout_writer.interface;
             try core_cli.printVersion(stdout, Version);
             std.process.exit(0);
         }
         if (std.mem.eql(u8, arg, "--config")) {
-            const path = args.next() orelse return error.MissingConfigPath;
+            i += 1;
+            if (i >= argv.len) return error.MissingConfigPath;
+            const path = argv[i];
             return allocator.dupe(u8, path);
         }
     }
@@ -112,7 +109,7 @@ fn parseConfigPath(allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !WorkloadConfig {
-    const data = try std.fs.cwd().readFileAlloc(allocator, path, 1 * 1024 * 1024);
+    const data = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(1 * 1024 * 1024));
     defer allocator.free(data);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
@@ -169,7 +166,7 @@ fn runBaselineRound(
     base_rows: []const query.Row,
     query_spec: spec.QuerySpec,
 ) !u64 {
-    var timer = try std.time.Timer.start();
+    const start_ns = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds;
 
     var cloned_rows: std.ArrayList(query.Row) = .empty;
     defer deinitRows(allocator, &cloned_rows);
@@ -181,7 +178,7 @@ fn runBaselineRound(
     var result = try query.execute(allocator, cloned_rows.items, query_spec);
     defer result.deinit(allocator);
 
-    return timer.read();
+    return @intCast(@max(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds - start_ns, 1));
 }
 
 fn runOptimizedRound(
@@ -189,10 +186,10 @@ fn runOptimizedRound(
     base_rows: []const query.Row,
     query_spec: spec.QuerySpec,
 ) !u64 {
-    var timer = try std.time.Timer.start();
+    const start_ns = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds;
     var result = try query.execute(allocator, base_rows, query_spec);
     defer result.deinit(allocator);
-    return timer.read();
+    return @intCast(@max(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds - start_ns, 1));
 }
 
 fn percentile50(allocator: std.mem.Allocator, samples: []const u64) !u64 {

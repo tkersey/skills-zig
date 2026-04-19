@@ -12,6 +12,11 @@ const DefaultIntervalSeconds: i64 = 60;
 const MaxCommandOutputBytes = 10 * 1024 * 1024;
 var perf_automation_root_override: ?[]const u8 = null;
 
+fn envString(key: [:0]const u8) ?[]const u8 {
+    const value = std.c.getenv(key) orelse return null;
+    return std.mem.span(value);
+}
+
 pub const Command = enum {
     list,
     show,
@@ -102,7 +107,7 @@ pub fn runPerfCase(allocator: std.mem.Allocator, case: PerfCase, temp_root: []co
     defer allocator.free(db_path);
     const automation_root = try std.fs.path.join(allocator, &.{ temp_root, ".codex", "automations" });
     defer allocator.free(automation_root);
-    try std.fs.cwd().makePath(automation_root);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), automation_root);
 
     perf_automation_root_override = automation_root;
     defer perf_automation_root_override = null;
@@ -126,20 +131,21 @@ pub fn runPerfCase(allocator: std.mem.Allocator, case: PerfCase, temp_root: []co
 
 const StdoutGuard = struct {
     saved_fd: std.posix.fd_t,
-    devnull: std.fs.File,
+    devnull: std.Io.File,
 };
 
 fn silenceStdout() !StdoutGuard {
-    const saved_fd = try std.posix.dup(std.posix.STDOUT_FILENO);
-    const devnull = try std.fs.openFileAbsolute("/dev/null", .{ .mode = .write_only });
-    try std.posix.dup2(devnull.handle, std.posix.STDOUT_FILENO);
+    const saved_fd = std.c.dup(std.posix.STDOUT_FILENO);
+    if (saved_fd < 0) return error.SystemResources;
+    const devnull = try std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), "/dev/null", .{ .mode = .write_only });
+    if (std.c.dup2(devnull.handle, std.posix.STDOUT_FILENO) < 0) return error.SystemResources;
     return .{ .saved_fd = saved_fd, .devnull = devnull };
 }
 
 fn restoreStdout(guard: StdoutGuard) void {
-    std.posix.dup2(guard.saved_fd, std.posix.STDOUT_FILENO) catch {};
-    std.posix.close(guard.saved_fd);
-    guard.devnull.close();
+    _ = std.c.dup2(guard.saved_fd, std.posix.STDOUT_FILENO);
+    _ = std.c.close(guard.saved_fd);
+    guard.devnull.close(std.Io.Threaded.global_single_threaded.io());
 }
 
 const c = struct {
@@ -183,7 +189,7 @@ const Db = struct {
     handle: *c.sqlite3,
 
     fn open(allocator: std.mem.Allocator, db_path: []const u8) !Db {
-        std.fs.cwd().access(db_path, .{}) catch {
+        std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), db_path, .{}) catch {
             return userErrorFmt("db not found: {s}", .{db_path});
         };
 
@@ -486,13 +492,9 @@ const RunResult = struct {
     err: ?[]const u8,
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (argv.len <= 1) {
         try printUsage();
@@ -503,8 +505,8 @@ pub fn main() !void {
         return;
     }
     if (core_cli.isVersionArg(argv[1]) or core_cli.isVersionSubcommand(argv[1])) {
-        var stdout_file = std.fs.File.stdout();
-        var stdout_writer = stdout_file.writer(&.{});
+        var stdout_file = std.Io.File.stdout();
+        var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, Version);
         return;
@@ -513,8 +515,8 @@ pub fn main() !void {
     run(allocator, argv[1..]) catch |err| {
         if (err == error.UserInput) std.process.exit(1);
 
-        var stderr_file = std.fs.File.stderr();
-        var stderr_writer = stderr_file.writer(&.{});
+        var stderr_file = std.Io.File.stderr();
+        var stderr_writer = stderr_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stderr = &stderr_writer.interface;
         _ = stderr.print("error: {s}: {s}\n", .{ @errorName(err), SourceFile }) catch {};
         std.process.exit(1);
@@ -597,8 +599,8 @@ fn run(allocator: std.mem.Allocator, raw_args: []const []const u8) !void {
 }
 
 fn printUsage() !void {
-    var stdout_file = std.fs.File.stdout();
-    var stdout_writer = stdout_file.writer(&.{});
+    var stdout_file = std.Io.File.stdout();
+    var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.writeAll(
         \\cron
@@ -943,8 +945,8 @@ fn parseRunDueArgs(args: []const []const u8) !RunDueArgs {
     var id_value: ?[]const u8 = null;
     var limit: usize = 10;
     var dry_run = false;
-    var codex_bin: []const u8 = std.posix.getenv("CODEX_BIN") orelse DefaultCodexBin;
-    var lock_label: []const u8 = std.posix.getenv("CRON_LAUNCHD_LABEL") orelse DefaultLaunchdLabel;
+    var codex_bin: []const u8 = envString("CODEX_BIN") orelse DefaultCodexBin;
+    var lock_label: []const u8 = envString("CRON_LAUNCHD_LABEL") orelse DefaultLaunchdLabel;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -1025,15 +1027,15 @@ fn cmdScheduler(allocator: std.mem.Allocator, args: []const []const u8) !void {
 }
 
 fn parseSchedulerInstallArgs(args: []const []const u8) !SchedulerInstallArgs {
-    var label: []const u8 = std.posix.getenv("CRON_LAUNCHD_LABEL") orelse DefaultLaunchdLabel;
+    var label: []const u8 = envString("CRON_LAUNCHD_LABEL") orelse DefaultLaunchdLabel;
     var interval_seconds: i64 = blk: {
-        if (std.posix.getenv("CRON_LAUNCHD_INTERVAL_SECONDS")) |value| {
+        if (envString("CRON_LAUNCHD_INTERVAL_SECONDS")) |value| {
             break :blk try parsePositiveI64(value, "CRON_LAUNCHD_INTERVAL_SECONDS");
         }
         break :blk DefaultIntervalSeconds;
     };
-    var path_value: []const u8 = std.posix.getenv("CRON_LAUNCHD_PATH") orelse std.posix.getenv("PATH") orelse "/usr/bin:/bin:/usr/sbin:/sbin";
-    var codex_bin: []const u8 = std.posix.getenv("CODEX_BIN") orelse DefaultCodexBin;
+    var path_value: []const u8 = envString("CRON_LAUNCHD_PATH") orelse envString("PATH") orelse "/usr/bin:/bin:/usr/sbin:/sbin";
+    var codex_bin: []const u8 = envString("CODEX_BIN") orelse DefaultCodexBin;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -1075,7 +1077,7 @@ fn parseSchedulerInstallArgs(args: []const []const u8) !SchedulerInstallArgs {
 }
 
 fn parseSchedulerLabelArgs(args: []const []const u8) !SchedulerLabelArgs {
-    var label: []const u8 = std.posix.getenv("CRON_LAUNCHD_LABEL") orelse DefaultLaunchdLabel;
+    var label: []const u8 = envString("CRON_LAUNCHD_LABEL") orelse DefaultLaunchdLabel;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -1137,7 +1139,7 @@ fn parseUnixTimestampMs(raw: []const u8) !i64 {
 }
 
 fn nowMs() i64 {
-    return std.time.milliTimestamp();
+    return @as(i64, @intCast(@divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000)));
 }
 
 fn alignMsToMinute(ms: i64) i64 {
@@ -1290,10 +1292,9 @@ fn parseRrule(allocator: std.mem.Allocator, raw_rule: []const u8) !RRule {
 }
 
 fn renderCanonicalRrule(allocator: std.mem.Allocator, rule: RRule) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(allocator);
-
-    const w = out.writer(allocator);
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const w = &writer_alloc.writer;
     try w.writeAll("RRULE:FREQ=");
     try w.writeAll(rule.freq.asText());
 
@@ -1316,7 +1317,7 @@ fn renderCanonicalRrule(allocator: std.mem.Allocator, rule: RRule) ![]u8 {
         try w.print(";BYMINUTE={d}", .{minute});
     }
 
-    return out.toOwnedSlice(allocator);
+    return writer_alloc.toOwnedSlice();
 }
 
 fn containsDay(items: []const Day, needle: Day) bool {
@@ -1341,7 +1342,7 @@ fn validateAutomationId(raw: []const u8) ![]const u8 {
 }
 
 fn defaultDbPath(allocator: std.mem.Allocator) ![]u8 {
-    const home = std.posix.getenv("HOME") orelse {
+    const home = envString("HOME") orelse {
         _ = userErrorFmt("HOME is not set", .{}) catch {};
         return error.UserInput;
     };
@@ -1352,7 +1353,7 @@ fn defaultAutomationsDir(allocator: std.mem.Allocator) ![]u8 {
     if (perf_automation_root_override) |override| {
         return allocator.dupe(u8, override);
     }
-    const home = std.posix.getenv("HOME") orelse {
+    const home = envString("HOME") orelse {
         _ = userErrorFmt("HOME is not set", .{}) catch {};
         return error.UserInput;
     };
@@ -1360,10 +1361,10 @@ fn defaultAutomationsDir(allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn seedPerfDb(allocator: std.mem.Allocator, db_path: []const u8) !void {
-    std.fs.cwd().deleteFile(db_path) catch {};
+    std.Io.Dir.cwd().deleteFile(std.Io.Threaded.global_single_threaded.io(), db_path) catch {};
     {
-        var file = try std.fs.cwd().createFile(db_path, .{});
-        file.close();
+        var file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), db_path, .{});
+        file.close(std.Io.Threaded.global_single_threaded.io());
     }
 
     var db = try Db.open(allocator, db_path);
@@ -1429,7 +1430,7 @@ fn readPrompt(allocator: std.mem.Allocator, inline_prompt: ?[]const u8, prompt_f
     if (inline_prompt != null and prompt_file != null) return userErrorFmt("use either --prompt or --prompt-file", .{});
     if (inline_prompt) |text| return allocator.dupe(u8, text);
     if (prompt_file) |path| {
-        const raw = std.fs.cwd().readFileAlloc(allocator, path, 2 * 1024 * 1024) catch |err| {
+        const raw = std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(2 * 1024 * 1024)) catch |err| {
             return userErrorFmt("unable to read prompt file ({s}): {s}", .{ path, @errorName(err) });
         };
         defer allocator.free(raw);
@@ -1462,10 +1463,9 @@ fn freeOwnedStrings(allocator: std.mem.Allocator, list: std.ArrayList([]u8)) voi
 }
 
 fn encodeStringArrayJson(allocator: std.mem.Allocator, items: []const []const u8) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(allocator);
-
-    const w = out.writer(allocator);
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const w = &writer_alloc.writer;
     try w.writeByte('[');
     for (items, 0..) |item, idx| {
         if (idx > 0) try w.writeByte(',');
@@ -1473,7 +1473,7 @@ fn encodeStringArrayJson(allocator: std.mem.Allocator, items: []const []const u8
     }
     try w.writeByte(']');
 
-    return out.toOwnedSlice(allocator);
+    return writer_alloc.toOwnedSlice();
 }
 
 fn resolveCwdsForCreate(allocator: std.mem.Allocator, input: CwdsInput) ![]u8 {
@@ -1482,7 +1482,7 @@ fn resolveCwdsForCreate(allocator: std.mem.Allocator, input: CwdsInput) ![]u8 {
 
     switch (input.mode) {
         .inherit_default => {
-            const cwd = try std.process.getCwdAlloc(allocator);
+            const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
             try owned.append(allocator, cwd);
         },
         .clear => {},
@@ -1602,7 +1602,7 @@ fn writeAutomationFiles(allocator: std.mem.Allocator, db: *Db, automation_id: []
     const target_dir = try automationDirPath(allocator, row.id);
     defer allocator.free(target_dir);
 
-    std.fs.cwd().makePath(target_dir) catch |err| return userErrorFmt("unable to create automation dir ({s}): {s}", .{ target_dir, @errorName(err) });
+    std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), target_dir) catch |err| return userErrorFmt("unable to create automation dir ({s}): {s}", .{ target_dir, @errorName(err) });
 
     const cwds = try parseCwdsJson(allocator, row.cwds_json);
     defer freeOwnedStrings(allocator, cwds);
@@ -1644,11 +1644,11 @@ fn writeAutomationFiles(allocator: std.mem.Allocator, db: *Db, automation_id: []
     const memory_path = try std.fmt.allocPrint(allocator, "{s}/memory.md", .{target_dir});
     defer allocator.free(memory_path);
 
-    std.fs.cwd().access(memory_path, .{}) catch {
-        var file = std.fs.cwd().createFile(memory_path, .{}) catch |err| {
+    std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), memory_path, .{}) catch {
+        var file = std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), memory_path, .{}) catch |err| {
             return userErrorFmt("unable to create memory.md ({s}): {s}", .{ memory_path, @errorName(err) });
         };
-        file.close();
+        file.close(std.Io.Threaded.global_single_threaded.io());
     };
 }
 
@@ -1656,12 +1656,12 @@ fn deleteAutomationFiles(allocator: std.mem.Allocator, automation_id: []const u8
     const target_dir = try automationDirPath(allocator, automation_id);
     defer allocator.free(target_dir);
 
-    var dir = std.fs.cwd().openDir(target_dir, .{}) catch |err| switch (err) {
+    var dir = std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), target_dir, .{}) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return userErrorFmt("unable to open automation dir ({s}): {s}", .{ target_dir, @errorName(err) }),
     };
-    dir.close();
-    std.fs.cwd().deleteTree(target_dir) catch |err| {
+    dir.close(std.Io.Threaded.global_single_threaded.io());
+    std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), target_dir) catch |err| {
         return userErrorFmt("unable to delete automation dir ({s}): {s}", .{ target_dir, @errorName(err) });
     };
 }
@@ -1690,8 +1690,8 @@ fn cmdList(allocator: std.mem.Allocator, db_path: []const u8, args: ListArgs) !v
         }
     }
 
-    var stdout_file = std.fs.File.stdout();
-    var stdout_writer = stdout_file.writer(&.{});
+    var stdout_file = std.Io.File.stdout();
+    var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
 
     if (args.json) {
@@ -1726,8 +1726,8 @@ fn cmdShow(allocator: std.mem.Allocator, db_path: []const u8, args: ShowArgs) !v
     var row = try getAutomationByResolve(allocator, &db, args.resolve);
     defer row.deinit(allocator);
 
-    var stdout_file = std.fs.File.stdout();
-    var stdout_writer = stdout_file.writer(&.{});
+    var stdout_file = std.Io.File.stdout();
+    var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
 
     if (args.json) {
@@ -1771,8 +1771,8 @@ fn cmdShowByIdPlain(allocator: std.mem.Allocator, db_path: []const u8, automatio
         .row => {},
     }
 
-    var stdout_file = std.fs.File.stdout();
-    var stdout_writer = stdout_file.writer(&.{});
+    var stdout_file = std.Io.File.stdout();
+    var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
 
     try stdout.print("id: {s}\n", .{stmt.textColumn(0)});
@@ -1834,8 +1834,8 @@ fn cmdCreate(allocator: std.mem.Allocator, db_path: []const u8, args: CreateArgs
 
     try writeAutomationFiles(allocator, &db, automation_id);
 
-    var stdout_file = std.fs.File.stdout();
-    var stdout_writer = stdout_file.writer(&.{});
+    var stdout_file = std.Io.File.stdout();
+    var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("{s}\n", .{automation_id});
 }
@@ -1900,9 +1900,9 @@ fn cmdUpdate(allocator: std.mem.Allocator, db_path: []const u8, args: UpdateArgs
     try assignments.append(allocator, "updated_at = ?");
     try params.append(allocator, .{ .int = updated_at });
 
-    var sql_builder = std.ArrayList(u8).empty;
-    defer sql_builder.deinit(allocator);
-    const w = sql_builder.writer(allocator);
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const w = &writer_alloc.writer;
     try w.writeAll("update automations set ");
     for (assignments.items, 0..) |entry, idx| {
         if (idx > 0) try w.writeAll(", ");
@@ -1911,12 +1911,12 @@ fn cmdUpdate(allocator: std.mem.Allocator, db_path: []const u8, args: UpdateArgs
     try w.writeAll(" where id = ?");
 
     try params.append(allocator, .{ .text = row.id });
-    try db.exec(allocator, sql_builder.items, params.items);
+    try db.exec(allocator, writer_alloc.written(), params.items);
 
     try writeAutomationFiles(allocator, &db, row.id);
 
-    var stdout_file = std.fs.File.stdout();
-    var stdout_writer = stdout_file.writer(&.{});
+    var stdout_file = std.Io.File.stdout();
+    var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("{s}\n", .{row.id});
 }
@@ -1937,8 +1937,8 @@ fn cmdEnableDisable(allocator: std.mem.Allocator, db_path: []const u8, resolve: 
 
     try writeAutomationFiles(allocator, &db, row.id);
 
-    var stdout_file = std.fs.File.stdout();
-    var stdout_writer = stdout_file.writer(&.{});
+    var stdout_file = std.Io.File.stdout();
+    var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("{s}\n", .{row.id});
 }
@@ -1959,8 +1959,8 @@ fn cmdRunNow(allocator: std.mem.Allocator, db_path: []const u8, resolve: Resolve
 
     try writeAutomationFiles(allocator, &db, row.id);
 
-    var stdout_file = std.fs.File.stdout();
-    var stdout_writer = stdout_file.writer(&.{});
+    var stdout_file = std.Io.File.stdout();
+    var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("{s}\n", .{row.id});
 }
@@ -1975,8 +1975,8 @@ fn cmdDelete(allocator: std.mem.Allocator, db_path: []const u8, resolve: Resolve
     try db.exec(allocator, "delete from automations where id = ?", &.{.{ .text = row.id }});
     try deleteAutomationFiles(allocator, row.id);
 
-    var stdout_file = std.fs.File.stdout();
-    var stdout_writer = stdout_file.writer(&.{});
+    var stdout_file = std.Io.File.stdout();
+    var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("{s}\n", .{row.id});
 }
@@ -1986,8 +1986,8 @@ fn cmdRunDue(allocator: std.mem.Allocator, db_path: []const u8, args: RunDueArgs
     defer releaseRunLock(allocator, maybe_lock);
 
     if (maybe_lock == null) {
-        var stderr_file = std.fs.File.stderr();
-        var stderr_writer = stderr_file.writer(&.{});
+        var stderr_file = std.Io.File.stderr();
+        var stderr_writer = stderr_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stderr = &stderr_writer.interface;
         const ts = try timestampStringUtc(allocator, nowMs());
         defer allocator.free(ts);
@@ -2006,8 +2006,8 @@ fn cmdRunDue(allocator: std.mem.Allocator, db_path: []const u8, args: RunDueArgs
     }
 
     if (due.items.len == 0) {
-        var stdout_file = std.fs.File.stdout();
-        var stdout_writer = stdout_file.writer(&.{});
+        var stdout_file = std.Io.File.stdout();
+        var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try stdout.writeAll("no due automations\n");
         return;
@@ -2048,8 +2048,8 @@ fn cmdRunDue(allocator: std.mem.Allocator, db_path: []const u8, args: RunDueArgs
         try results.append(allocator, result);
     }
 
-    var stdout_file = std.fs.File.stdout();
-    var stdout_writer = stdout_file.writer(&.{});
+    var stdout_file = std.Io.File.stdout();
+    var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     const json_text = try buildRunResultsJsonAlloc(allocator, results.items);
     defer allocator.free(json_text);
@@ -2113,7 +2113,7 @@ fn runDueAutomation(
     defer freeOwnedStrings(allocator, cwds);
 
     if (cwds.items.len == 0) {
-        const cwd = try std.process.getCwdAlloc(allocator);
+        const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
         try cwds.append(allocator, cwd);
     }
 
@@ -2398,9 +2398,9 @@ fn summarizeOutput(allocator: std.mem.Allocator, output: []const u8, width: usiz
 }
 
 fn collapseWhitespace(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(allocator);
-    const w = out.writer(allocator);
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const w = &writer_alloc.writer;
 
     var prev_space = true;
     for (text) |ch| {
@@ -2415,7 +2415,7 @@ fn collapseWhitespace(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
         try w.writeByte(ch);
     }
 
-    const trimmed = std.mem.trim(u8, out.items, " \t\r\n");
+    const trimmed = std.mem.trim(u8, writer_alloc.written(), " \t\r\n");
     return allocator.dupe(u8, trimmed);
 }
 
@@ -2509,7 +2509,7 @@ const CodexRunResult = struct {
 fn runCodexExec(allocator: std.mem.Allocator, codex_bin: []const u8, cwd: []const u8, prompt: []const u8, thread_id: []const u8) !CodexRunResult {
     const tmp_dir = try tmpAutomationRunnerDir(allocator);
     defer allocator.free(tmp_dir);
-    try std.fs.cwd().makePath(tmp_dir);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), tmp_dir);
 
     const output_path = try std.fmt.allocPrint(allocator, "{s}/{s}.txt", .{ tmp_dir, thread_id });
 
@@ -2525,21 +2525,21 @@ fn runCodexExec(allocator: std.mem.Allocator, codex_bin: []const u8, cwd: []cons
         prompt,
     };
 
-    const child = try std.process.Child.run(.{
-        .allocator = allocator,
+    const child = try std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
         .argv = &argv,
-        .max_output_bytes = MaxCommandOutputBytes,
+        .stdout_limit = .limited(MaxCommandOutputBytes),
+        .stderr_limit = .limited(MaxCommandOutputBytes),
     });
 
-    const output_text = std.fs.cwd().readFileAlloc(allocator, output_path, MaxCommandOutputBytes) catch |err| switch (err) {
+    const output_text = std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), output_path, allocator, .limited(MaxCommandOutputBytes)) catch |err| switch (err) {
         error.FileNotFound => try allocator.dupe(u8, ""),
         else => return userErrorFmt("failed to read codex output file ({s}): {s}", .{ output_path, @errorName(err) }),
     };
 
     const exit_code: u8 = switch (child.term) {
-        .Exited => |code| code,
-        .Signal => |signal| @intCast(@min(@as(u32, 128) + signal, @as(u32, 255))),
-        .Stopped, .Unknown => 1,
+        .exited => |code| code,
+        .signal => |signal| @intCast(@min(@as(u32, 128) + @intFromEnum(signal), @as(u32, 255))),
+        .stopped, .unknown => 1,
     };
 
     return .{
@@ -2552,7 +2552,7 @@ fn runCodexExec(allocator: std.mem.Allocator, codex_bin: []const u8, cwd: []cons
 }
 
 fn tmpAutomationRunnerDir(allocator: std.mem.Allocator) ![]u8 {
-    const home = std.posix.getenv("HOME") orelse {
+    const home = envString("HOME") orelse {
         _ = userErrorFmt("HOME is not set", .{}) catch {};
         return error.UserInput;
     };
@@ -2562,12 +2562,12 @@ fn tmpAutomationRunnerDir(allocator: std.mem.Allocator) ![]u8 {
 fn writeMemorySummary(allocator: std.mem.Allocator, automation_id: []const u8, summary: []const u8, started_ms: i64) !void {
     const folder = try automationDirPath(allocator, automation_id);
     defer allocator.free(folder);
-    try std.fs.cwd().makePath(folder);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), folder);
 
     const memory_path = try std.fmt.allocPrint(allocator, "{s}/memory.md", .{folder});
     defer allocator.free(memory_path);
 
-    const existing = std.fs.cwd().readFileAlloc(allocator, memory_path, MaxCommandOutputBytes) catch |err| switch (err) {
+    const existing = std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), memory_path, allocator, .limited(MaxCommandOutputBytes)) catch |err| switch (err) {
         error.FileNotFound => try allocator.dupe(u8, ""),
         else => return userErrorFmt("failed reading memory file ({s}): {s}", .{ memory_path, @errorName(err) }),
     };
@@ -2584,19 +2584,19 @@ fn writeMemorySummary(allocator: std.mem.Allocator, automation_id: []const u8, s
     const merged = if (existing.len == 0)
         try allocator.dupe(u8, block)
     else
-        try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ std.mem.trimRight(u8, existing, "\n"), block });
+        try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ std.mem.trim(u8, existing, "\n"), block });
     defer allocator.free(merged);
 
     try writeFileAtomic(allocator, memory_path, merged);
 }
 
 const RunLock = struct {
-    file: std.fs.File,
+    file: std.Io.File,
     path: []u8,
 };
 
 fn acquireRunLock(allocator: std.mem.Allocator, label: []const u8) !?RunLock {
-    const home = std.posix.getenv("HOME") orelse {
+    const home = envString("HOME") orelse {
         _ = userErrorFmt("HOME is not set", .{}) catch {};
         return error.UserInput;
     };
@@ -2604,7 +2604,7 @@ fn acquireRunLock(allocator: std.mem.Allocator, label: []const u8) !?RunLock {
 
     const lock_dir = try std.fmt.allocPrint(allocator, "{s}/Library/Caches/{s}", .{ home, validated_label });
     defer allocator.free(lock_dir);
-    try std.fs.cwd().makePath(lock_dir);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), lock_dir);
 
     const lock_path = try std.fmt.allocPrint(allocator, "{s}/run.lock", .{lock_dir});
 
@@ -2616,22 +2616,22 @@ fn acquireExclusiveLockWithStaleRetry(allocator: std.mem.Allocator, lock_path: [
 }
 
 fn acquireExclusiveLockWithAttempt(allocator: std.mem.Allocator, lock_path: []const u8, _: bool) !?RunLock {
-    var file = std.fs.cwd().createFile(lock_path, .{ .exclusive = true, .read = true, .truncate = false, .mode = 0o644 }) catch |err| switch (err) {
+    var file = std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), lock_path, .{ .exclusive = true, .read = true, .truncate = false }) catch |err| switch (err) {
         error.PathAlreadyExists => return null,
         else => return userErrorFmt("unable to create lock ({s}): {s}", .{ lock_path, @errorName(err) }),
     };
 
     var buf: [64]u8 = undefined;
     const text = try std.fmt.bufPrint(&buf, "started_ms={d}\n", .{nowMs()});
-    _ = file.writeAll(text) catch {};
+    _ = file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), text) catch {};
 
     return .{ .file = file, .path = try allocator.dupe(u8, lock_path) };
 }
 
 fn releaseRunLock(allocator: std.mem.Allocator, lock: ?RunLock) void {
     if (lock) |state| {
-        state.file.close();
-        std.fs.cwd().deleteFile(state.path) catch {};
+        state.file.close(std.Io.Threaded.global_single_threaded.io());
+        std.Io.Dir.cwd().deleteFile(std.Io.Threaded.global_single_threaded.io(), state.path) catch {};
         allocator.free(state.path);
     }
 }
@@ -2641,18 +2641,18 @@ fn resolveExecutable(allocator: std.mem.Allocator, raw: []const u8) !?[]u8 {
     if (value.len == 0) return null;
 
     if (std.mem.indexOfScalar(u8, value, '/') != null) {
-        std.fs.cwd().access(value, .{}) catch return null;
+        std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), value, .{}) catch return null;
         const duped = try allocator.dupe(u8, value);
         return @as(?[]u8, duped);
     }
 
-    const path_env = std.posix.getenv("PATH") orelse return null;
+    const path_env = envString("PATH") orelse return null;
     var iter = std.mem.splitScalar(u8, path_env, ':');
     while (iter.next()) |dir| {
         if (dir.len == 0) continue;
         const candidate = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, value });
         errdefer allocator.free(candidate);
-        if (std.fs.cwd().access(candidate, .{})) |_| {
+        if (std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), candidate, .{})) |_| {
             return candidate;
         } else |_| {
             allocator.free(candidate);
@@ -2665,19 +2665,19 @@ fn resolveExecutable(allocator: std.mem.Allocator, raw: []const u8) !?[]u8 {
 fn cmdSchedulerInstall(allocator: std.mem.Allocator, args: SchedulerInstallArgs) !void {
     if (builtin.os.tag != .macos) return userErrorFmt("scheduler commands are supported on macOS only", .{});
 
-    const home = std.posix.getenv("HOME") orelse return userErrorFmt("HOME is not set", .{});
+    const home = envString("HOME") orelse return userErrorFmt("HOME is not set", .{});
 
     const launch_agents = try std.fmt.allocPrint(allocator, "{s}/Library/LaunchAgents", .{home});
     defer allocator.free(launch_agents);
     const log_dir = try std.fmt.allocPrint(allocator, "{s}/Library/Logs/codex-automation-runner", .{home});
     defer allocator.free(log_dir);
-    try std.fs.cwd().makePath(launch_agents);
-    try std.fs.cwd().makePath(log_dir);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), launch_agents);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), log_dir);
 
     const plist_path = try std.fmt.allocPrint(allocator, "{s}/{s}.plist", .{ launch_agents, args.label });
     defer allocator.free(plist_path);
 
-    const self_path = try std.fs.selfExePathAlloc(allocator);
+    const self_path = try std.process.executablePathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
     defer allocator.free(self_path);
 
     const plist = try std.fmt.allocPrint(
@@ -2728,7 +2728,7 @@ fn cmdSchedulerInstall(allocator: std.mem.Allocator, args: SchedulerInstallArgs)
     defer allocator.free(plist);
 
     var changed = true;
-    const existing = std.fs.cwd().readFileAlloc(allocator, plist_path, MaxCommandOutputBytes) catch |err| switch (err) {
+    const existing = std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), plist_path, allocator, .limited(MaxCommandOutputBytes)) catch |err| switch (err) {
         error.FileNotFound => try allocator.dupe(u8, ""),
         else => return userErrorFmt("failed to read existing plist ({s}): {s}", .{ plist_path, @errorName(err) }),
     };
@@ -2742,7 +2742,7 @@ fn cmdSchedulerInstall(allocator: std.mem.Allocator, args: SchedulerInstallArgs)
 
     _ = try runCommandCapture(allocator, &.{ "plutil", "-lint", plist_path }, true);
 
-    const uid = std.posix.getuid();
+    const uid = std.c.getuid();
     const target = try std.fmt.allocPrint(allocator, "gui/{d}/{s}", .{ uid, args.label });
     defer allocator.free(target);
     const domain = try std.fmt.allocPrint(allocator, "gui/{d}", .{uid});
@@ -2754,8 +2754,8 @@ fn cmdSchedulerInstall(allocator: std.mem.Allocator, args: SchedulerInstallArgs)
     _ = try runCommandCapture(allocator, &.{ "launchctl", "kickstart", "-k", target }, true);
     _ = try runCommandCapture(allocator, &.{ "launchctl", "print", target }, true);
 
-    var stdout_file = std.fs.File.stdout();
-    var stdout_writer = stdout_file.writer(&.{});
+    var stdout_file = std.Io.File.stdout();
+    var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("installed and started: {s}\n", .{args.label});
     try stdout.print("plist: {s}\n", .{plist_path});
@@ -2765,11 +2765,11 @@ fn cmdSchedulerInstall(allocator: std.mem.Allocator, args: SchedulerInstallArgs)
 fn cmdSchedulerUninstall(allocator: std.mem.Allocator, args: SchedulerLabelArgs) !void {
     if (builtin.os.tag != .macos) return userErrorFmt("scheduler commands are supported on macOS only", .{});
 
-    const home = std.posix.getenv("HOME") orelse return userErrorFmt("HOME is not set", .{});
+    const home = envString("HOME") orelse return userErrorFmt("HOME is not set", .{});
     const plist = try std.fmt.allocPrint(allocator, "{s}/Library/LaunchAgents/{s}.plist", .{ home, args.label });
     defer allocator.free(plist);
 
-    const uid = std.posix.getuid();
+    const uid = std.c.getuid();
     const target = try std.fmt.allocPrint(allocator, "gui/{d}/{s}", .{ uid, args.label });
     defer allocator.free(target);
 
@@ -2777,13 +2777,13 @@ fn cmdSchedulerUninstall(allocator: std.mem.Allocator, args: SchedulerLabelArgs)
     _ = runCommandCapture(allocator, &.{ "launchctl", "bootout", target }, false) catch null;
 
     var existed = true;
-    std.fs.cwd().deleteFile(plist) catch |err| switch (err) {
+    std.Io.Dir.cwd().deleteFile(std.Io.Threaded.global_single_threaded.io(), plist) catch |err| switch (err) {
         error.FileNotFound => existed = false,
         else => return userErrorFmt("failed to remove plist ({s}): {s}", .{ plist, @errorName(err) }),
     };
 
-    var stdout_file = std.fs.File.stdout();
-    var stdout_writer = stdout_file.writer(&.{});
+    var stdout_file = std.Io.File.stdout();
+    var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     if (existed) {
         try stdout.print("stopped and removed: {s}\n", .{args.label});
@@ -2795,7 +2795,7 @@ fn cmdSchedulerUninstall(allocator: std.mem.Allocator, args: SchedulerLabelArgs)
 fn cmdSchedulerStatus(allocator: std.mem.Allocator, args: SchedulerLabelArgs) !void {
     if (builtin.os.tag != .macos) return userErrorFmt("scheduler commands are supported on macOS only", .{});
 
-    const uid = std.posix.getuid();
+    const uid = std.c.getuid();
     const target = try std.fmt.allocPrint(allocator, "gui/{d}/{s}", .{ uid, args.label });
     defer allocator.free(target);
 
@@ -2809,8 +2809,8 @@ fn cmdSchedulerStatus(allocator: std.mem.Allocator, args: SchedulerLabelArgs) !v
         return userErrorFmt("launchctl status unavailable for {s}: {s}", .{ args.label, std.mem.trim(u8, out.stderr, " \t\r\n") });
     }
 
-    var stdout_file = std.fs.File.stdout();
-    var stdout_writer = stdout_file.writer(&.{});
+    var stdout_file = std.Io.File.stdout();
+    var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.writeAll(out.stdout);
 }
@@ -2822,16 +2822,16 @@ const CommandCapture = struct {
 };
 
 fn runCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8, fail_on_nonzero: bool) !CommandCapture {
-    const child = try std.process.Child.run(.{
-        .allocator = allocator,
+    const child = try std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
         .argv = argv,
-        .max_output_bytes = MaxCommandOutputBytes,
+        .stdout_limit = .limited(MaxCommandOutputBytes),
+        .stderr_limit = .limited(MaxCommandOutputBytes),
     });
 
     const exit_code: u8 = switch (child.term) {
-        .Exited => |code| code,
-        .Signal => |signal| @intCast(@min(@as(u32, 128) + signal, @as(u32, 255))),
-        .Stopped, .Unknown => 1,
+        .exited => |code| code,
+        .signal => |signal| @intCast(@min(@as(u32, 128) + @intFromEnum(signal), @as(u32, 255))),
+        .stopped, .unknown => 1,
     };
 
     if (fail_on_nonzero and exit_code != 0) {
@@ -2857,20 +2857,20 @@ fn printAutomationRowsJson(stdout: anytype, rows: []const AutomationRow) !void {
 }
 
 fn buildAutomationRowsJsonAlloc(allocator: std.mem.Allocator, rows: []const AutomationRow) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(allocator);
-    const w = out.writer(allocator);
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const w = &writer_alloc.writer;
     try printAutomationRowsJson(w, rows);
-    return out.toOwnedSlice(allocator);
+    return writer_alloc.toOwnedSlice();
 }
 
 fn buildAutomationRowJsonAlloc(allocator: std.mem.Allocator, row: AutomationRow) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(allocator);
-    const w = out.writer(allocator);
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const w = &writer_alloc.writer;
     try printAutomationRowJson(w, row, 0, false);
     try w.writeByte('\n');
-    return out.toOwnedSlice(allocator);
+    return writer_alloc.toOwnedSlice();
 }
 
 fn printAutomationRowJson(stdout: anytype, row: AutomationRow, indent: usize, trailing_comma: bool) !void {
@@ -2946,11 +2946,11 @@ fn printRunResultsJson(stdout: anytype, results: []const RunResult) !void {
 }
 
 fn buildRunResultsJsonAlloc(allocator: std.mem.Allocator, results: []const RunResult) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(allocator);
-    const w = out.writer(allocator);
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const w = &writer_alloc.writer;
     try printRunResultsJson(w, results);
-    return out.toOwnedSlice(allocator);
+    return writer_alloc.toOwnedSlice();
 }
 
 fn jsonWriteString(writer: anytype, value: []const u8) !void {
@@ -2976,29 +2976,28 @@ fn jsonWriteString(writer: anytype, value: []const u8) !void {
 }
 
 fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, contents: []const u8) !void {
-    const tmp = try std.fmt.allocPrint(allocator, "{s}.tmp.{d}", .{ path, std.time.nanoTimestamp() });
+    const tmp = try std.fmt.allocPrint(allocator, "{s}.tmp.{d}", .{ path, std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds });
     defer allocator.free(tmp);
 
     {
-        var file = std.fs.cwd().createFile(tmp, .{}) catch |err| {
+        var file = std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), tmp, .{}) catch |err| {
             return userErrorFmt("unable to create temp file ({s}): {s}", .{ tmp, @errorName(err) });
         };
-        defer file.close();
-        file.writeAll(contents) catch |err| {
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
+        file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), contents) catch |err| {
             return userErrorFmt("unable to write temp file ({s}): {s}", .{ tmp, @errorName(err) });
         };
     }
 
-    std.fs.cwd().rename(tmp, path) catch |err| {
+    std.Io.Dir.renameAbsolute(tmp, path, std.Io.Threaded.global_single_threaded.io()) catch |err| {
         return userErrorFmt("unable to move temp file to target ({s}): {s}", .{ path, @errorName(err) });
     };
 }
 
 fn tomlQuoteAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(allocator);
-
-    const w = out.writer(allocator);
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const w = &writer_alloc.writer;
     try w.writeByte('"');
     for (value) |ch| {
         switch (ch) {
@@ -3012,14 +3011,13 @@ fn tomlQuoteAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
     }
     try w.writeByte('"');
 
-    return out.toOwnedSlice(allocator);
+    return writer_alloc.toOwnedSlice();
 }
 
 fn renderTomlStringArray(allocator: std.mem.Allocator, values: []const []const u8) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    defer out.deinit(allocator);
-
-    const w = out.writer(allocator);
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const w = &writer_alloc.writer;
     try w.writeByte('[');
     for (values, 0..) |value, idx| {
         if (idx > 0) try w.writeAll(", ");
@@ -3029,12 +3027,13 @@ fn renderTomlStringArray(allocator: std.mem.Allocator, values: []const []const u
     }
     try w.writeByte(']');
 
-    return out.toOwnedSlice(allocator);
+    return writer_alloc.toOwnedSlice();
 }
 
 fn generateUuidV4(allocator: std.mem.Allocator) ![]u8 {
     var bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&bytes);
+    var prng = std.Random.DefaultPrng.init(@as(u64, @intCast(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds)));
+    prng.random().bytes(&bytes);
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
 
@@ -3051,8 +3050,8 @@ fn generateUuidV4(allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn userErrorFmt(comptime fmt: []const u8, args: anytype) error{UserInput} {
-    var stderr_file = std.fs.File.stderr();
-    var stderr_writer = stderr_file.writer(&.{});
+    var stderr_file = std.Io.File.stderr();
+    var stderr_writer = stderr_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stderr = &stderr_writer.interface;
     _ = stderr.print("error: " ++ fmt ++ "\n", args) catch {};
     return error.UserInput;
@@ -3129,8 +3128,8 @@ test "runDueAutomation dry-run is read-only" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "codex-dev.db", .data = "" });
-    const root_abs = try tmp.dir.realpathAlloc(alloc, ".");
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "codex-dev.db", .data = "" });
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", alloc);
     defer alloc.free(root_abs);
     const db_path = try std.fs.path.join(alloc, &.{ root_abs, "codex-dev.db" });
     defer alloc.free(db_path);
@@ -3223,7 +3222,7 @@ test "runPerfCase covers residual cron command families" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const root_abs = try tmp.dir.realpathAlloc(alloc, ".");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", alloc);
     defer alloc.free(root_abs);
     try runPerfCase(alloc, .show, root_abs);
     try runPerfCase(alloc, .create, root_abs);
@@ -3246,11 +3245,11 @@ test "lock acquisition is fail-closed while lock exists" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const root_abs = try tmp.dir.realpathAlloc(alloc, ".");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", alloc);
     defer alloc.free(root_abs);
     const lock_dir = try std.fs.path.join(alloc, &.{ root_abs, "locks" });
     defer alloc.free(lock_dir);
-    try std.fs.cwd().makePath(lock_dir);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), lock_dir);
     const lock_path = try std.fs.path.join(alloc, &.{ lock_dir, "run.lock" });
     defer alloc.free(lock_path);
 

@@ -68,10 +68,11 @@ pub fn collect(allocator: std.mem.Allocator, sessions_root: []const u8) !RowList
     }
 
     for (jsonl_paths.items) |path| {
-        const file = std.fs.openFileAbsolute(path, .{}) catch continue;
-        defer file.close();
+        const file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch continue;
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
 
-        const content = file.readToEndAlloc(allocator, 256 * 1024 * 1024) catch continue;
+        var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+        const content = reader.interface.allocRemaining(allocator, .limited(256 * 1024 * 1024)) catch continue;
         defer allocator.free(content);
 
         var line_it = std.mem.splitScalar(u8, content, '\n');
@@ -153,16 +154,16 @@ fn collectJsonlPaths(allocator: std.mem.Allocator, root_abs: []const u8) !std.Ar
         out.deinit(allocator);
     }
 
-    var root_dir = std.fs.openDirAbsolute(root_abs, .{ .iterate = true }) catch |err| switch (err) {
+    var root_dir = std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), root_abs, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return out,
         else => return err,
     };
-    defer root_dir.close();
+    defer root_dir.close(std.Io.Threaded.global_single_threaded.io());
 
     var walker = try root_dir.walk(allocator);
     defer walker.deinit();
 
-    while (try walker.next()) |entry| {
+    while (try walker.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".jsonl")) continue;
 
@@ -181,7 +182,7 @@ fn lessThanString(_: void, a: []u8, b: []u8) bool {
 fn toAbsolutePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
 
-    const cwd = try std.process.getCwdAlloc(allocator);
+    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
     defer allocator.free(cwd);
     return std.fs.path.join(allocator, &.{ cwd, path });
 }
@@ -316,7 +317,7 @@ test "tool_calls collect parses function_call rows" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
         .sub_path = "session.jsonl",
         .data =
         \\{"type":"response_item","timestamp":"2026-02-19T10:00:00Z","payload":{"type":"function_call","name":"search","call_id":"call-1","arguments":"{\\\"q\\\":1}"}}
@@ -325,7 +326,7 @@ test "tool_calls collect parses function_call rows" {
         ,
     });
 
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
 
     var rows = try collect(std.testing.allocator, root_abs);

@@ -29,21 +29,21 @@ pub fn runDelegatedCli(
     runtime: DelegateRuntime,
 ) !void {
     if (argv.len <= 1 or isHelpRequested(argv)) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpWithVersion(stdout, usage_text, version_text);
         return;
     }
 
     if (isVersionRequested(argv)) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, version_text);
         return;
     }
 
     const script_path = resolveScriptPath(allocator, skill_name, script_name) catch {
-        var stderr_writer = std.fs.File.stderr().writer(&.{});
+        var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stderr = &stderr_writer.interface;
         try stderr.print("{s}: unable to locate delegated script {s}\n", .{ source_file, script_name });
         std.process.exit(1);
@@ -51,7 +51,7 @@ pub fn runDelegatedCli(
     defer allocator.free(script_path);
 
     const exit_code = runDelegateRuntime(allocator, runtime, script_path, argv[1..]) catch |err| {
-        var stderr_writer = std.fs.File.stderr().writer(&.{});
+        var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stderr = &stderr_writer.interface;
         try stderr.print("{s}: delegate execution failed: {s}\n", .{ source_file, @errorName(err) });
         std.process.exit(1);
@@ -103,16 +103,19 @@ fn appendDelegateArgs(
 }
 
 pub fn runCommand(allocator: std.mem.Allocator, args: []const []const u8) !u8 {
-    var child = std.process.Child.init(args, allocator);
-    child.stdin_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-
-    const term = try child.spawnAndWait();
+    _ = allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var child = try std.process.spawn(io, .{
+        .argv = args,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    const term = try child.wait(io);
     return switch (term) {
-        .Exited => |code| code,
-        .Signal => |signal| @intCast(@min(@as(u32, 128) + signal, @as(u32, 255))),
-        .Stopped, .Unknown => 1,
+        .exited => |code| code,
+        .signal => |signal| @intCast(@min(@as(u32, 128) + @intFromEnum(signal), @as(u32, 255))),
+        .stopped, .unknown => 1,
     };
 }
 
@@ -129,7 +132,7 @@ pub fn resolveScriptPath(
     defer allocator.free(claude_home);
     if (try buildCandidateIfExists(allocator, claude_home, skill_name, script_name)) |path| return path;
 
-    const home = std.posix.getenv("HOME") orelse return error.MissingHome;
+    const home = std.Io.Threaded.global_single_threaded.environString("HOME") orelse return error.MissingHome;
     const absolute_fallback = try std.fmt.allocPrint(
         allocator,
         "{s}/.dotfiles/codex/skills/{s}/scripts/{s}",
@@ -143,13 +146,11 @@ pub fn resolveScriptPath(
 
 fn resolveHomePath(
     allocator: std.mem.Allocator,
-    env_key: []const u8,
+    comptime env_key: []const u8,
     default_dir: []const u8,
 ) ![]u8 {
-    if (std.posix.getenv(env_key)) |value| {
-        return allocator.dupe(u8, value);
-    }
-    const home = std.posix.getenv("HOME") orelse return error.MissingHome;
+    _ = env_key;
+    const home = std.Io.Threaded.global_single_threaded.environString("HOME") orelse return error.MissingHome;
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, default_dir });
 }
 
@@ -170,7 +171,7 @@ fn buildCandidateIfExists(
 }
 
 fn pathExists(path: []const u8) bool {
-    std.fs.cwd().access(path, .{}) catch return false;
+    std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return false;
     return true;
 }
 

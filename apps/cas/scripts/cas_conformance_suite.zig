@@ -145,13 +145,9 @@ const RetryOutcome = enum {
     }
 };
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
 
     const parsed = parseArgs(allocator, argv) catch |err| {
@@ -159,14 +155,14 @@ pub fn main() !void {
     };
 
     if (parsed.show_version) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, Version);
         return;
     }
 
     if (parsed.show_help) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
@@ -206,7 +202,7 @@ pub fn main() !void {
         if (!result.ok) overall_ok = false;
     }
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     if (parsed.json) {
         const payload = .{
@@ -352,7 +348,7 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
 fn resolveExecutable(allocator: std.mem.Allocator, explicit: ?[]const u8, fallback_name: []const u8) ![]const u8 {
     if (explicit) |path| return allocator.dupe(u8, path);
 
-    const exe_dir = std.fs.selfExeDirPathAlloc(allocator) catch null;
+    const exe_dir = std.process.executableDirPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator) catch null;
     if (exe_dir) |dir| {
         defer allocator.free(dir);
         const sibling = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, fallback_name });
@@ -365,34 +361,29 @@ fn resolveExecutable(allocator: std.mem.Allocator, explicit: ?[]const u8, fallba
 
 fn pathExists(path: []const u8) bool {
     if (std.fs.path.isAbsolute(path)) {
-        std.fs.accessAbsolute(path, .{}) catch return false;
+        std.Io.Dir.accessAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return false;
         return true;
     }
-    std.fs.cwd().access(path, .{}) catch return false;
+    std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return false;
     return true;
 }
 
 fn runCommandCapture(allocator: std.mem.Allocator, cwd: ?[]const u8, argv: []const []const u8) !CommandCapture {
-    var child = std.process.Child.init(argv, allocator);
-    child.cwd = cwd;
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    try child.spawn();
-
-    const stdout_data = try child.stdout.?.readToEndAlloc(allocator, MaxCommandOutputBytes);
-    const stderr_data = try child.stderr.?.readToEndAlloc(allocator, MaxCommandOutputBytes / 2);
-    const term = try child.wait();
+    const result = try std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
+        .argv = argv,
+        .cwd = if (cwd) |path| .{ .path = path } else .inherit,
+        .stdout_limit = .limited(MaxCommandOutputBytes),
+        .stderr_limit = .limited(MaxCommandOutputBytes / 2),
+    });
 
     return .{
-        .exit_code = switch (term) {
-            .Exited => |code| code,
-            .Signal => |signal| @intCast(@min(@as(u32, 128) + signal, @as(u32, 255))),
-            .Stopped, .Unknown => 1,
+        .exit_code = switch (result.term) {
+            .exited => |code| code,
+            .signal => |signal| @intCast(@min(@as(u32, 128) + @intFromEnum(signal), @as(u32, 255))),
+            .stopped, .unknown => 1,
         },
-        .stdout = stdout_data,
-        .stderr = stderr_data,
+        .stdout = result.stdout,
+        .stderr = result.stderr,
     };
 }
 
@@ -908,15 +899,15 @@ fn containsCaseInsensitive(haystack: []const u8, needle: []const u8) bool {
 }
 
 fn makeTempRoot(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8 {
-    const base = std.posix.getenv("TMPDIR") orelse "/tmp";
+    const base = "/tmp";
     var attempt: usize = 0;
     while (attempt < 32) : (attempt += 1) {
         const candidate = try std.fmt.allocPrint(
             allocator,
             "{s}/{s}-{d}-{d}",
-            .{ base, prefix, std.time.timestamp(), attempt },
+            .{ base, prefix, @divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000), attempt },
         );
-        std.fs.makeDirAbsolute(candidate) catch |err| switch (err) {
+        std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), candidate) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 allocator.free(candidate);
                 continue;
@@ -931,23 +922,23 @@ fn makeTempRoot(allocator: std.mem.Allocator, prefix: []const u8) ![]const u8 {
 fn deleteTreeAbsolute(path: []const u8) !void {
     const parent = std.fs.path.dirname(path) orelse return;
     const base = std.fs.path.basename(path);
-    var dir = try std.fs.openDirAbsolute(parent, .{});
-    defer dir.close();
-    try dir.deleteTree(base);
+    var dir = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), parent, .{});
+    defer dir.close(std.Io.Threaded.global_single_threaded.io());
+    try dir.deleteTree(std.Io.Threaded.global_single_threaded.io(), base);
 }
 
 fn writeTextFile(allocator: std.mem.Allocator, path: []const u8, text: []const u8) !void {
     try ensureParentPath(path);
     if (std.fs.path.isAbsolute(path)) {
-        var file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
-        defer file.close();
-        try file.writeAll(text);
+        var file = try std.Io.Dir.createFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{ .truncate = true });
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
+        try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), text);
         return;
     }
 
-    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(text);
+    var file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), path, .{ .truncate = true });
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), text);
     _ = allocator;
 }
 
@@ -956,15 +947,15 @@ fn ensureParentPath(path: []const u8) !void {
     if (parent.len == 0 or std.mem.eql(u8, parent, ".")) return;
 
     if (std.fs.path.isAbsolute(parent)) {
-        const rel = std.mem.trimLeft(u8, parent, "/");
+        const rel = std.mem.trim(u8, parent, "/");
         if (rel.len == 0) return;
-        var root = try std.fs.openDirAbsolute("/", .{});
-        defer root.close();
-        try root.makePath(rel);
+        var root = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), "/", .{});
+        defer root.close(std.Io.Threaded.global_single_threaded.io());
+        try root.createDirPath(std.Io.Threaded.global_single_threaded.io(), rel);
         return;
     }
 
-    try std.fs.cwd().makePath(parent);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), parent);
 }
 
 test "parseArgs accepts scenarios and retry knobs" {

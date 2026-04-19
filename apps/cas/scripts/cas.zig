@@ -34,21 +34,18 @@ const UsageText =
     \\  --version | version                 Show version.
 ;
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const argv = try std.process.argsAlloc(allocator);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (argv.len <= 1 or delegate.isHelpRequested(argv) or std.mem.eql(u8, argv[1], "help")) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
     }
 
     if (delegate.isVersionRequested(argv)) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, Version);
         return;
@@ -59,7 +56,7 @@ pub fn main() !void {
     };
 
     const target_exec = blk: {
-        const exe_dir = std.fs.selfExeDirPathAlloc(allocator) catch null;
+        const exe_dir = std.process.executableDirPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator) catch null;
         if (exe_dir) |dir| break :blk try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, target_name });
         break :blk try allocator.dupe(u8, target_name);
     };
@@ -70,7 +67,7 @@ pub fn main() !void {
     try child_argv.appendSlice(allocator, argv[2..]);
 
     const exit_code = delegate.runCommand(allocator, child_argv.items) catch |err| {
-        var stderr_writer = std.fs.File.stderr().writer(&.{});
+        var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stderr = &stderr_writer.interface;
         try stderr.print(
             "failed to launch {s}: {s}\ninstall or expose the full CAS binary set beside `cas` ({s}, cas_smoke_check, cas_instance_runner, cas_conformance_suite)\n",

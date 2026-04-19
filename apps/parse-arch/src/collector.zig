@@ -506,9 +506,9 @@ const SignalBuilder = struct {
 };
 
 pub fn collect(allocator: std.mem.Allocator, repo_path: []const u8, options: CollectOptions) !Payload {
-    const root_abs = try std.fs.cwd().realpathAlloc(allocator, repo_path);
-    var root_dir = try std.fs.openDirAbsolute(root_abs, .{ .iterate = true });
-    errdefer root_dir.close();
+    const root_abs = try std.Io.Dir.cwd().realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), repo_path, allocator);
+    var root_dir = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), root_abs, .{ .iterate = true });
+    errdefer root_dir.close(std.Io.Threaded.global_single_threaded.io());
 
     const file_scan = try collectFiles(allocator, root_abs, root_dir, options.read_limit);
     const top_level_dirs = try collectTopLevelDirs(allocator, root_dir);
@@ -607,14 +607,14 @@ const FileScanResult = struct {
 fn collectFiles(
     allocator: std.mem.Allocator,
     root_abs: []const u8,
-    root_dir: std.fs.Dir,
+    root_dir: std.Io.Dir,
     read_limit: usize,
 ) !FileScanResult {
     var all_files: std.ArrayList(FileRecord) = .empty;
     var walk = try root_dir.walk(allocator);
     defer walk.deinit();
 
-    while (try walk.next()) |entry| {
+    while (try walk.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
         if (entry.kind != .file) continue;
         if (shouldSkipEntry(entry.path)) continue;
         const rel_path = try allocator.dupe(u8, entry.path);
@@ -698,13 +698,14 @@ fn readLimitedFile(
     limit: usize,
     coverage: *ScanCoverage,
 ) ![]const u8 {
-    const file = std.fs.openFileAbsolute(abs_path, .{}) catch {
+    const file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), abs_path, .{}) catch {
         coverage.read_errors += 1;
         return "";
     };
-    defer file.close();
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
 
-    const bytes = file.readToEndAlloc(allocator, limit + 1) catch {
+    var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const bytes = reader.interface.allocRemaining(allocator, .limited(limit + 1)) catch {
         coverage.read_errors += 1;
         return "";
     };
@@ -715,10 +716,10 @@ fn readLimitedFile(
     return bytes;
 }
 
-fn collectTopLevelDirs(allocator: std.mem.Allocator, root_dir: std.fs.Dir) ![]const []const u8 {
+fn collectTopLevelDirs(allocator: std.mem.Allocator, root_dir: std.Io.Dir) ![]const []const u8 {
     var entries: std.ArrayList([]const u8) = .empty;
     var it = root_dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
         if (entry.kind != .directory) continue;
         if (ignoreDirsLike(entry.name)) continue;
         try entries.append(allocator, try allocator.dupe(u8, entry.name));
@@ -1282,11 +1283,11 @@ fn collectSubsystemHints(
     for (top_level_dirs) |dir_name| {
         if (!interesting_subsystem_markers.has(dir_name)) continue;
         const abs_path = try std.fs.path.join(allocator, &.{ root_abs, dir_name });
-        var dir = std.fs.openDirAbsolute(abs_path, .{ .iterate = true }) catch continue;
-        defer dir.close();
+        var dir = std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), abs_path, .{ .iterate = true }) catch continue;
+        defer dir.close(std.Io.Threaded.global_single_threaded.io());
         var children = std.ArrayList([]const u8).empty;
         var it = dir.iterate();
-        while (try it.next()) |entry| {
+        while (try it.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
             if (entry.kind != .directory) continue;
             if (ignoreDirsLike(entry.name)) continue;
             try children.append(allocator, try allocator.dupe(u8, entry.name));
@@ -1383,7 +1384,7 @@ fn collectFocusObservations(
 
     for (focus_paths) |raw_path| {
         const joined = try std.fs.path.join(allocator, &.{ root_abs, raw_path });
-        const resolved = std.fs.cwd().realpathAlloc(allocator, joined) catch {
+        const resolved = std.Io.Dir.cwd().realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), joined, allocator) catch {
             try observations.append(allocator, .{
                 .exists = false,
                 .path = raw_path,
@@ -1428,10 +1429,10 @@ fn collectFocusSignals(
     var focus_dirs = std.ArrayList([]const u8).empty;
 
     if (isDirectory(focus_abs)) {
-        var dir = try std.fs.openDirAbsolute(focus_abs, .{ .iterate = true });
-        defer dir.close();
+        var dir = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), focus_abs, .{ .iterate = true });
+        defer dir.close(std.Io.Threaded.global_single_threaded.io());
         var it = dir.iterate();
-        while (try it.next()) |entry| {
+        while (try it.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
             if (entry.kind != .directory) continue;
             if (ignoreDirsLike(entry.name)) continue;
             try focus_dirs.append(allocator, try allocator.dupe(u8, entry.name));
@@ -1450,7 +1451,7 @@ fn collectFocusSignals(
 }
 
 fn isDirectory(abs_path: []const u8) bool {
-    const stat = std.fs.cwd().statFile(abs_path) catch return false;
+    const stat = std.Io.Dir.cwd().statFile(std.Io.Threaded.global_single_threaded.io(), abs_path, .{}) catch return false;
     return stat.kind == .directory;
 }
 

@@ -33,20 +33,20 @@ pub fn collect(allocator: std.mem.Allocator, options: Options) !RowList {
     const root_abs = try resolveExtensionsRoot(allocator, options.extensions_root);
     defer allocator.free(root_abs);
 
-    var dir = std.fs.openDirAbsolute(root_abs, .{ .iterate = true }) catch |err| switch (err) {
+    var dir = std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), root_abs, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return rows,
         else => return err,
     };
-    defer dir.close();
+    defer dir.close(std.Io.Threaded.global_single_threaded.io());
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
         if (entry.kind != .directory) continue;
 
         const instructions_abs = try std.fs.path.join(allocator, &.{ root_abs, entry.name, "instructions.md" });
         defer allocator.free(instructions_abs);
 
-        const instructions_file = std.fs.openFileAbsolute(instructions_abs, .{}) catch |err| switch (err) {
+        const instructions_file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), instructions_abs, .{}) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => null,
             else => return err,
         };
@@ -58,8 +58,8 @@ pub fn collect(allocator: std.mem.Allocator, options: Options) !RowList {
         errdefer row.deinit(allocator);
 
         if (instructions_file) |file| {
-            defer file.close();
-            const stat = try file.stat();
+            defer file.close(std.Io.Threaded.global_single_threaded.io());
+            const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
             row.instructions_path = try allocator.dupe(u8, instructions_abs);
             row.modified_at = try std.fmt.allocPrint(allocator, "{d}", .{stat.mtime});
             row.size_bytes = stat.size;
@@ -75,8 +75,7 @@ pub fn collect(allocator: std.mem.Allocator, options: Options) !RowList {
 fn resolveExtensionsRoot(allocator: std.mem.Allocator, override_root: ?[]const u8) ![]u8 {
     if (override_root) |path| return toAbsolutePath(allocator, path);
 
-    const home = try std.process.getEnvVarOwned(allocator, "HOME");
-    defer allocator.free(home);
+    const home = std.Io.Threaded.global_single_threaded.environString("HOME") orelse return error.EnvironmentVariableNotFound;
     return std.fs.path.join(allocator, &.{ home, ".codex", "memories_extensions" });
 }
 
@@ -86,7 +85,7 @@ fn toAbsolutePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 
     if (std.fs.path.isAbsolute(expanded)) return allocator.dupe(u8, expanded);
 
-    const cwd = try std.process.getCwdAlloc(allocator);
+    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
     defer allocator.free(cwd);
     return std.fs.path.join(allocator, &.{ cwd, expanded });
 }
@@ -99,14 +98,14 @@ test "collect returns extension rows including missing instructions" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("harness");
-    try tmp.dir.makePath("empty");
-    try tmp.dir.writeFile(.{
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "harness");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "empty");
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
         .sub_path = "harness/instructions.md",
         .data = "# Harness\n",
     });
 
-    const root_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
 
     var rows = try collect(std.testing.allocator, .{ .extensions_root = root_abs });

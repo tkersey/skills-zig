@@ -99,35 +99,31 @@ const WindowEval = struct {
     strictness: i32 = 2,
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (try core_cli.handleDefaultHelpAndVersion(argv, UsageText, Version)) return;
 
     const parsed = try parseArgs(argv);
     if (parsed.show_version) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printVersion(stdout, Version);
         return;
     }
     if (parsed.show_help) {
-        var stdout_writer = std.fs.File.stdout().writer(&.{});
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try core_cli.printHelpWithVersion(stdout, UsageText, Version);
         return;
     }
 
-    const input = try std.fs.File.stdin().readToEndAlloc(allocator, 16 * 1024 * 1024);
+    const input = try std.Io.File.stdin().readToEndAlloc(allocator, 16 * 1024 * 1024);
     defer allocator.free(input);
 
     const out = try computeBudgetGovernorFromSlice(allocator, input, parsed.now_sec);
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     if (parsed.pretty) {
         std.json.Stringify.value(out, .{ .whitespace = .indent_2 }, stdout) catch |err| {
@@ -401,7 +397,7 @@ fn pickStricterWindow(primary: ?WindowEval, secondary: ?WindowEval, preferred_ki
 }
 
 fn computeBudgetGovernor(root: ObjectMap, now_sec_opt: ?i64) GovernorOut {
-    const now_sec = now_sec_opt orelse std.time.timestamp();
+    const now_sec = now_sec_opt orelse @as(i64, @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000)));
     const picked = pickBucket(root);
     if (picked.bucket == null) {
         return .{
@@ -514,7 +510,11 @@ test "allocation failures parse governor json" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, parseAndComputeWithAlloc, .{json});
 }
 
-fn fuzzGovernorTarget(_: void, input: []const u8) !void {
+fn fuzzGovernorTarget(_: void, smith: *std.testing.Smith) !void {
+    var storage: [512]u8 = undefined;
+    for (&storage) |*b| b.* = smith.value(u8);
+    const len = smith.value(usize) % (storage.len + 1);
+    const input = storage[0..len];
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 

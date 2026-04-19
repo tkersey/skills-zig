@@ -58,13 +58,9 @@ const CollectParseResult = union(enum) {
     err: CollectParseFailure,
 };
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const argv = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, argv);
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
     const command = resolveCommand(argv[1]) orelse return usageError("Unknown command", argv[1]);
@@ -99,7 +95,7 @@ fn cmdCollect(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 .focus_paths = parsed.focus_paths,
                 .read_limit = parsed.read_limit,
             });
-            var stdout_writer = std.fs.File.stdout().writer(&.{});
+            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             try collector.writeJson(&stdout_writer.interface, payload);
         },
     }
@@ -174,7 +170,7 @@ fn cmdEval(allocator: std.mem.Allocator, args: []const []const u8) !void {
         }
         return usageError("Unknown flag", arg);
     }
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const rc = try eval_suite.runEval(allocator, &stdout_writer.interface, .{ .suite_path = suite_path });
     if (rc != 0) std.process.exit(rc);
 }
@@ -201,7 +197,7 @@ fn cmdDoctor(allocator: std.mem.Allocator, args: []const []const u8) !void {
         return usageError("Unknown flag", arg);
     }
 
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     var failed = false;
 
@@ -226,7 +222,7 @@ fn cmdDoctor(allocator: std.mem.Allocator, args: []const []const u8) !void {
 }
 
 fn usageError(prefix: []const u8, value: []const u8) !void {
-    var stderr_writer = std.fs.File.stderr().writer(&.{});
+    var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stderr = &stderr_writer.interface;
     try stderr.print("{s}: {s}\n", .{ prefix, value });
     try core_cli.printHelpSurface(stderr, HelpSurface, Version);
@@ -234,7 +230,7 @@ fn usageError(prefix: []const u8, value: []const u8) !void {
 }
 
 fn printHelp() !void {
-    var stdout_writer = std.fs.File.stdout().writer(&.{});
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     try core_cli.printHelpSurface(&stdout_writer.interface, HelpSurface, Version);
 }
 
