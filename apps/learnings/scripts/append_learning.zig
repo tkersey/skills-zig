@@ -1012,9 +1012,8 @@ fn findDuplicateExistingIdAlloc(allocator: std.mem.Allocator, path: []const u8, 
 
 fn encodeRecordJsonAlloc(allocator: std.mem.Allocator, record: Record) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-
     var writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    defer writer_alloc.deinit();
     const writer = &writer_alloc.writer;
 
     try writer.writeByte('{');
@@ -1049,7 +1048,7 @@ fn encodeRecordJsonAlloc(allocator: std.mem.Allocator, record: Record) ![]u8 {
     }
 
     try writer.writeByte('}');
-    return out.toOwnedSlice(allocator);
+    return writer_alloc.toOwnedSlice();
 }
 
 fn writeObjectKey(writer: anytype, first: *bool, key: []const u8) !void {
@@ -1175,4 +1174,33 @@ test "isEphemeralPath recognizes temporary roots" {
     try std.testing.expect(isEphemeralPath("/tmp/work/repo"));
     try std.testing.expect(isEphemeralPath("/private/var/folders/abc/repo"));
     try std.testing.expect(!isEphemeralPath("/Users/example/work/repo"));
+}
+
+test "encodeRecordJsonAlloc returns a populated JSON object" {
+    const evidence = [_][]const u8{"zig build lint -- --max-warnings 0 passed"};
+    const paths = [_][]const u8{"build.zig"};
+    const tags = [_][]const u8{"zig"};
+
+    const encoded = try encodeRecordJsonAlloc(std.testing.allocator, .{
+        .id = "lrn-20260419T000000Z-deadbeef",
+        .captured_at = "2026-04-19T00:00:00Z",
+        .status = "do_more",
+        .learning = "When reproducing learnings writes, prefer raw byte inspection because blank-line appends can hide behind success output.",
+        .evidence = &evidence,
+        .application = "Use an isolated repo and inspect the encoded JSON before writing to disk.",
+        .repo = "tkersey/dotfiles",
+        .branch = "main",
+        .paths = &paths,
+        .source = "codex",
+        .fingerprint = "deadbeefcafebabe",
+        .tags = &tags,
+        .related_ids = &.{},
+        .supersedes_id = null,
+    });
+    defer std.testing.allocator.free(encoded);
+
+    try std.testing.expect(encoded.len > 0);
+    try std.testing.expectEqual(@as(u8, '{'), encoded[0]);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"learning\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"fingerprint\":\"deadbeefcafebabe\"") != null);
 }
