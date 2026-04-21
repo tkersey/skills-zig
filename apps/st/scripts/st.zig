@@ -5032,19 +5032,19 @@ fn requireNonEmptyString(allocator: std.mem.Allocator, raw: []const u8, field: [
     return allocator.dupe(u8, trimmed);
 }
 
+fn envTrimmed(name: []const u8) ?[]const u8 {
+    const environ = std.Io.Threaded.global_single_threaded.environ.process_environ;
+    if (std.process.Environ.getPosix(environ, name)) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len > 0) return trimmed;
+    }
+    return null;
+}
+
 fn defaultCommentAuthor() []const u8 {
-    if (std.c.getenv("ST_COMMENT_AUTHOR")) |v| {
-        const trimmed = std.mem.trim(u8, std.mem.span(v), " \t\r\n");
-        if (trimmed.len > 0) return trimmed;
-    }
-    if (std.c.getenv("USER")) |v| {
-        const trimmed = std.mem.trim(u8, std.mem.span(v), " \t\r\n");
-        if (trimmed.len > 0) return trimmed;
-    }
-    if (std.c.getenv("LOGNAME")) |v| {
-        const trimmed = std.mem.trim(u8, std.mem.span(v), " \t\r\n");
-        if (trimmed.len > 0) return trimmed;
-    }
+    if (envTrimmed("ST_COMMENT_AUTHOR")) |trimmed| return trimmed;
+    if (envTrimmed("USER")) |trimmed| return trimmed;
+    if (envTrimmed("LOGNAME")) |trimmed| return trimmed;
     return "unknown";
 }
 
@@ -5059,22 +5059,13 @@ fn currentProcessId() i64 {
 fn buildMutationMeta(allocator: std.mem.Allocator, allow_multiple: bool) MutationMeta {
     _ = allocator;
     const actor = blk: {
-        if (std.c.getenv("ST_ACTOR")) |v| {
-            const trimmed = std.mem.trim(u8, std.mem.span(v), " \t\r\n");
-            if (trimmed.len > 0) break :blk trimmed;
-        }
+        if (envTrimmed("ST_ACTOR")) |trimmed| break :blk trimmed;
         break :blk defaultCommentAuthor();
     };
 
     const session = blk: {
-        if (std.c.getenv("ST_SESSION_ID")) |v| {
-            const trimmed = std.mem.trim(u8, std.mem.span(v), " \t\r\n");
-            if (trimmed.len > 0) break :blk trimmed;
-        }
-        if (std.c.getenv("CODEX_THREAD_ID")) |v| {
-            const trimmed = std.mem.trim(u8, std.mem.span(v), " \t\r\n");
-            if (trimmed.len > 0) break :blk trimmed;
-        }
+        if (envTrimmed("ST_SESSION_ID")) |trimmed| break :blk trimmed;
+        if (envTrimmed("CODEX_THREAD_ID")) |trimmed| break :blk trimmed;
         break :blk null;
     };
 
@@ -5086,17 +5077,9 @@ fn buildMutationMeta(allocator: std.mem.Allocator, allow_multiple: bool) Mutatio
     };
 }
 
-fn trimmedEnvString(comptime name: [:0]const u8) ?[]const u8 {
-    if (std.c.getenv(name)) |raw| {
-        const trimmed = std.mem.trim(u8, std.mem.span(raw), " \t\r\n");
-        if (trimmed.len > 0) return trimmed;
-    }
-    return null;
-}
-
 fn resolveCodexHomeAlloc(allocator: std.mem.Allocator) ![]const u8 {
-    if (trimmedEnvString("CODEX_HOME")) |codex_home| return allocator.dupe(u8, codex_home);
-    const home = trimmedEnvString("HOME") orelse return error.MissingHomeEnv;
+    if (envTrimmed("CODEX_HOME")) |codex_home| return allocator.dupe(u8, codex_home);
+    const home = envTrimmed("HOME") orelse return error.MissingHomeEnv;
     return std.fs.path.join(allocator, &.{ home, ".codex" });
 }
 
@@ -5107,7 +5090,7 @@ fn sessionGuardPathAlloc(allocator: std.mem.Allocator, session_id: []const u8, g
     if (guard_root_override) |guard_root| {
         return std.fs.path.join(allocator, &.{ guard_root, filename });
     }
-    if (trimmedEnvString("ST_GUARD_ROOT")) |guard_root| {
+    if (envTrimmed("ST_GUARD_ROOT")) |guard_root| {
         return std.fs.path.join(allocator, &.{ guard_root, filename });
     }
 
