@@ -3018,12 +3018,22 @@ fn daysFromCivil(year_in: i64, month_in: i64, day: i64) i64 {
 }
 
 fn discoverRepoRootAlloc(allocator: std.mem.Allocator, start: []const u8) ![]u8 {
-    const out = try runGitAlloc(allocator, start, &.{ "rev-parse", "--show-toplevel" });
-    defer allocator.free(out);
+    const normalized_start = try normalizeRepoProbePathAlloc(allocator, start);
+    if (pathHasGitMarker(normalized_start)) return normalized_start;
 
-    const trimmed = std.mem.trim(u8, out, " \t\r\n");
-    if (trimmed.len == 0) return allocator.dupe(u8, start);
-    return allocator.dupe(u8, trimmed);
+    var current = try allocator.dupe(u8, normalized_start);
+    while (parentPathOrNull(current)) |parent| {
+        const next = try allocator.dupe(u8, parent);
+        allocator.free(current);
+        current = next;
+        if (pathHasGitMarker(current)) {
+            allocator.free(normalized_start);
+            return current;
+        }
+    }
+
+    allocator.free(current);
+    return normalized_start;
 }
 
 fn resolveJsonlPathAlloc(
@@ -3036,39 +3046,40 @@ fn resolveJsonlPathAlloc(
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ repo_root, effective });
 }
 
-fn runGitAlloc(
-    allocator: std.mem.Allocator,
-    cwd: []const u8,
-    args: []const []const u8,
-) ![]u8 {
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(allocator);
-
-    try argv.append(allocator, "git");
-    try argv.appendSlice(allocator, args);
-
-    const result = try std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
-        .argv = argv.items,
-        .cwd = .{ .path = cwd },
-        .stdout_limit = .limited(4 * 1024 * 1024),
-        .stderr_limit = .limited(1024 * 1024),
-    });
-    defer allocator.free(result.stderr);
-
-    switch (result.term) {
-        .exited => |code| {
-            if (code != 0) {
-                allocator.free(result.stdout);
-                return error.GitCommandFailed;
-            }
-        },
-        else => {
-            allocator.free(result.stdout);
-            return error.GitCommandFailed;
-        },
+fn normalizeRepoProbePathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const canonical = if (std.fs.path.isAbsolute(path))
+        std.Io.Dir.realPathFileAbsoluteAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator) catch null
+    else
+        std.Io.Dir.cwd().realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator) catch null;
+    if (canonical) |value| {
+        defer allocator.free(value);
+        return trimTrailingPathSeparatorsAlloc(allocator, value);
     }
+    return trimTrailingPathSeparatorsAlloc(allocator, path);
+}
 
-    return result.stdout;
+fn trimTrailingPathSeparatorsAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var end = path.len;
+    while (end > 1 and isPathSep(path[end - 1])) : (end -= 1) {}
+    return allocator.dupe(u8, path[0..end]);
+}
+
+fn parentPathOrNull(path: []const u8) ?[]const u8 {
+    const parent = std.fs.path.dirname(path) orelse return null;
+    if (parent.len == 0 or std.mem.eql(u8, parent, path)) return null;
+    return parent;
+}
+
+fn pathHasGitMarker(path: []const u8) bool {
+    if (!std.fs.path.isAbsolute(path)) return false;
+    var dir = std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return false;
+    defer dir.close(std.Io.Threaded.global_single_threaded.io());
+    dir.access(std.Io.Threaded.global_single_threaded.io(), ".git", .{}) catch return false;
+    return true;
+}
+
+fn isPathSep(c: u8) bool {
+    return c == std.fs.path.sep or c == std.fs.path.sep_windows;
 }
 
 fn toLowerAscii(c: u8) u8 {
@@ -3153,6 +3164,24 @@ test "parse args recall" {
     try std.testing.expect(parsed.command.? == .recall);
     try std.testing.expectEqualStrings(".learnings.jsonl", parsed.path);
     try std.testing.expectEqualStrings("zig", parsed.query.?);
+}
+
+test "discoverRepoRootAlloc walks to git ancestor" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), ".git");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "nested/deeper");
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+
+    const nested_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "nested/deeper", std.testing.allocator);
+    defer std.testing.allocator.free(nested_abs);
+
+    const resolved_nested = try discoverRepoRootAlloc(std.testing.allocator, nested_abs);
+    defer std.testing.allocator.free(resolved_nested);
+    try std.testing.expectEqualStrings(root_abs, resolved_nested);
 }
 
 test "parse args quality-audit" {

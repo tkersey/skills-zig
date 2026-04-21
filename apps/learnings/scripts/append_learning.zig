@@ -150,15 +150,15 @@ const Record = struct {
     captured_at: []const u8,
     status: []const u8,
     learning: []const u8,
-    evidence: []const []u8,
+    evidence: []const []const u8,
     application: []const u8,
     repo: []const u8,
     branch: []const u8,
-    paths: []const []u8,
+    paths: []const []const u8,
     source: []const u8,
     fingerprint: []const u8,
-    tags: []const []u8,
-    related_ids: []const []u8,
+    tags: []const []const u8,
+    related_ids: []const []const u8,
     supersedes_id: ?[]const u8,
 };
 
@@ -728,15 +728,22 @@ fn isRunNumberToken(token: []const u8) bool {
 }
 
 fn discoverRepoRootAlloc(allocator: std.mem.Allocator, start: []const u8) ![]u8 {
-    const root = try runGitAlloc(allocator, start, &.{ "rev-parse", "--show-toplevel" });
-    defer allocator.free(root);
+    const normalized_start = try normalizeRepoProbePathAlloc(allocator, start);
+    if (pathHasGitMarker(normalized_start)) return normalized_start;
 
-    if (root.len == 0) return allocator.dupe(u8, start);
+    var current = try allocator.dupe(u8, normalized_start);
+    while (parentPathOrNull(current)) |parent| {
+        const next = try allocator.dupe(u8, parent);
+        allocator.free(current);
+        current = next;
+        if (pathHasGitMarker(current)) {
+            allocator.free(normalized_start);
+            return current;
+        }
+    }
 
-    return if (std.fs.path.isAbsolute(root))
-        std.Io.Dir.realPathFileAbsoluteAlloc(std.Io.Threaded.global_single_threaded.io(), root, allocator) catch allocator.dupe(u8, root)
-    else
-        std.Io.Dir.cwd().realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), root, allocator) catch allocator.dupe(u8, root);
+    allocator.free(current);
+    return normalized_start;
 }
 
 fn inferRepoSlugAlloc(allocator: std.mem.Allocator, repo_root: []const u8) ![]u8 {
@@ -848,6 +855,42 @@ fn runGitAlloc(allocator: std.mem.Allocator, cwd: []const u8, args: []const []co
     const out = try allocator.dupe(u8, trimmed);
     allocator.free(raw_output);
     return out;
+}
+
+fn normalizeRepoProbePathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const canonical = if (std.fs.path.isAbsolute(path))
+        std.Io.Dir.realPathFileAbsoluteAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator) catch null
+    else
+        std.Io.Dir.cwd().realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator) catch null;
+    if (canonical) |value| {
+        defer allocator.free(value);
+        return trimTrailingPathSeparatorsAlloc(allocator, value);
+    }
+    return trimTrailingPathSeparatorsAlloc(allocator, path);
+}
+
+fn trimTrailingPathSeparatorsAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var end = path.len;
+    while (end > 1 and isPathSep(path[end - 1])) : (end -= 1) {}
+    return allocator.dupe(u8, path[0..end]);
+}
+
+fn parentPathOrNull(path: []const u8) ?[]const u8 {
+    const parent = std.fs.path.dirname(path) orelse return null;
+    if (parent.len == 0 or std.mem.eql(u8, parent, path)) return null;
+    return parent;
+}
+
+fn pathHasGitMarker(path: []const u8) bool {
+    if (!std.fs.path.isAbsolute(path)) return false;
+    var dir = std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return false;
+    defer dir.close(std.Io.Threaded.global_single_threaded.io());
+    dir.access(std.Io.Threaded.global_single_threaded.io(), ".git", .{}) catch return false;
+    return true;
+}
+
+fn isPathSep(c: u8) bool {
+    return c == std.fs.path.sep or c == std.fs.path.sep_windows;
 }
 
 fn nowUtcAlloc(allocator: std.mem.Allocator) ![]u8 {
@@ -1174,6 +1217,24 @@ test "isEphemeralPath recognizes temporary roots" {
     try std.testing.expect(isEphemeralPath("/tmp/work/repo"));
     try std.testing.expect(isEphemeralPath("/private/var/folders/abc/repo"));
     try std.testing.expect(!isEphemeralPath("/Users/example/work/repo"));
+}
+
+test "discoverRepoRootAlloc walks to git ancestor" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), ".git");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "nested/deeper");
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+
+    const nested_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "nested/deeper", std.testing.allocator);
+    defer std.testing.allocator.free(nested_abs);
+
+    const resolved_nested = try discoverRepoRootAlloc(std.testing.allocator, nested_abs);
+    defer std.testing.allocator.free(resolved_nested);
+    try std.testing.expectEqualStrings(root_abs, resolved_nested);
 }
 
 test "encodeRecordJsonAlloc returns a populated JSON object" {
