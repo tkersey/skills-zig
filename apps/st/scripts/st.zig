@@ -16,7 +16,7 @@ const UsageText =
     \\
     \\Manage dependency-aware JSONL v3 plan state.
     \\
-    \\usage: st {init,add,select,deselect,set-status,set-priority,set-deps,set-notes,add-comment,remove,show,ready,blocked,doctor,emit-plan-sync,emit-update-plan,import-update-plan,export,import-plan,import-orchplan,claim,heartbeat,set-runtime,set-proof,release,reclaim-stale,import-mesh-results} [options]
+    \\usage: st {init,add,select,deselect,set-status,set-priority,set-deps,set-notes,add-comment,remove,show,ready,blocked,doctor,emit-plan-sync,emit-update-plan,import-update-plan,guard-session-start,guard-pre-tool-use,export,import-plan,import-orchplan,claim,heartbeat,set-runtime,set-proof,release,reclaim-stale,import-mesh-results} [options]
     \\
     \\commands:
     \\  init              Initialize plan storage
@@ -36,6 +36,8 @@ const UsageText =
     \\  emit-plan-sync    Emit dual-runtime plan_sync payload JSON
     \\  emit-update-plan  Emit legacy update_plan payload JSON
     \\  import-update-plan  Import Codex update_plan payload or transcript into mirrored durable fields
+    \\  guard-session-start  Register expected SessionStart update_plan payload for a Codex session
+    \\  guard-pre-tool-use  Check whether a SessionStart guard has been satisfied for the current turn
     \\  export            Export snapshot JSON
     \\  import-plan       Import snapshot JSON
     \\  import-orchplan   Import OrchPlan tasks into the durable ledger
@@ -236,6 +238,16 @@ const MutationMeta = struct {
     session: ?[]const u8,
 };
 
+const SessionGuardStateVersion: i64 = 1;
+
+const SessionGuardState = struct {
+    version: i64 = SessionGuardStateVersion,
+    session_id: []const u8,
+    plan_file: []const u8,
+    expected_update_plan: []const u8,
+    cwd: []const u8,
+};
+
 const RepairMeta = struct {
     op: []const u8,
 };
@@ -306,6 +318,8 @@ pub const Command = enum {
     doctor,
     emit_plan_sync,
     emit_update_plan,
+    guard_pre_tool_use,
+    guard_session_start,
     heartbeat,
     import_update_plan,
     import_mesh_results,
@@ -349,6 +363,8 @@ const command_defs = [_]CommandDef{
     .{ .name = "emit-plan-sync", .command = .emit_plan_sync },
     .{ .name = "emit-update-plan", .command = .emit_update_plan },
     .{ .name = "import-update-plan", .command = .import_update_plan },
+    .{ .name = "guard-session-start", .command = .guard_session_start },
+    .{ .name = "guard-pre-tool-use", .command = .guard_pre_tool_use },
     .{ .name = "export", .command = .@"export" },
     .{ .name = "import-plan", .command = .import_plan },
     .{ .name = "import-orchplan", .command = .import_orchplan },
@@ -442,6 +458,8 @@ pub const Args = struct {
     reason: ?[]const u8 = null,
     now: ?[]const u8 = null,
     transcript_path: ?[]const u8 = null,
+    session_id: ?[]const u8 = null,
+    guard_root: ?[]const u8 = null,
 
     replace: bool = false,
     repair_seq: bool = false,
@@ -873,6 +891,42 @@ fn parseArgs(argv: []const []const u8) !Args {
             .emit_plan_sync, .emit_update_plan => {
                 return error.InvalidEmitArg;
             },
+            .guard_session_start => {
+                if (std.mem.eql(u8, token, "--session-id")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.session_id = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--guard-root")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.guard_root = argv[i];
+                    continue;
+                }
+                return error.InvalidEmitArg;
+            },
+            .guard_pre_tool_use => {
+                if (std.mem.eql(u8, token, "--session-id")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.session_id = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--transcript-path")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingInputValue;
+                    args.transcript_path = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--guard-root")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.guard_root = argv[i];
+                    continue;
+                }
+                return error.InvalidImportArg;
+            },
             .import_update_plan => {
                 if (std.mem.eql(u8, token, "--input")) {
                     i += 1;
@@ -1070,6 +1124,7 @@ fn parseArgs(argv: []const []const u8) !Args {
             if (args.input == null and args.transcript_path == null) return error.MissingInputValue;
             if (args.input != null and args.transcript_path != null) return error.InvalidImportArg;
         },
+        .guard_session_start, .guard_pre_tool_use => if (args.session_id == null) return error.MissingValue,
         .import_orchplan => if (args.input == null) return error.MissingInputValue,
         .claim => {
             if (args.executor == null) return error.MissingValue;
@@ -1129,6 +1184,8 @@ fn isMutatingCommand(command: Command) bool {
         .add_comment,
         .remove,
         .import_update_plan,
+        .guard_session_start,
+        .guard_pre_tool_use,
         .import_plan,
         .import_orchplan,
         .claim,
@@ -1335,6 +1392,8 @@ fn runCommand(allocator: std.mem.Allocator, args: Args) !u8 {
         .doctor => try cmdDoctor(allocator, args),
         .emit_plan_sync => try cmdEmitPlanSync(allocator, args),
         .emit_update_plan => try cmdEmitUpdatePlan(allocator, args),
+        .guard_session_start => try cmdGuardSessionStart(allocator, args),
+        .guard_pre_tool_use => try cmdGuardPreToolUse(allocator, args),
         .heartbeat => try cmdHeartbeat(allocator, args),
         .import_update_plan => try cmdImportUpdatePlan(allocator, args),
         .@"export" => try cmdExport(allocator, args),
@@ -1692,6 +1751,64 @@ fn cmdEmitUpdatePlan(allocator: std.mem.Allocator, args: Args) !u8 {
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try emitUpdatePlan(allocator, stdout, &state, args.allow_multiple_in_progress, false);
+    return 0;
+}
+
+fn cmdGuardSessionStart(allocator: std.mem.Allocator, args: Args) !u8 {
+    const loaded = try loadValidatedState(allocator, args.file, args.allow_multiple_in_progress);
+    var state = loaded.state;
+    defer state.deinit();
+
+    var payload_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer payload_writer.deinit();
+    try emitUpdatePlan(allocator, &payload_writer.writer, &state, args.allow_multiple_in_progress, false);
+    const raw_payload = try payload_writer.toOwnedSlice();
+    const payload = std.mem.trim(u8, raw_payload, "\n");
+    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
+
+    try writeSessionGuardState(allocator, .{
+        .session_id = args.session_id.?,
+        .plan_file = args.file,
+        .expected_update_plan = payload,
+        .cwd = cwd,
+    }, args.guard_root);
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll(payload);
+    try stdout.writeByte('\n');
+    return 0;
+}
+
+fn cmdGuardPreToolUse(allocator: std.mem.Allocator, args: Args) !u8 {
+    const maybe_guard = try readSessionGuardState(allocator, args.session_id.?, args.guard_root);
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+
+    if (maybe_guard == null) {
+        try stdout.writeAll("{\"status\":\"allow\"}\n");
+        return 0;
+    }
+
+    const guard = maybe_guard.?;
+    const transcript_path = args.transcript_path orelse {
+        try writeGuardDecision(stdout, "block", "SessionStart $st guard is pending and transcript_path is unavailable.");
+        return 0;
+    };
+
+    const latest_arguments = try latestUpdatePlanArgumentsFromTranscript(allocator, transcript_path);
+    if (latest_arguments) |arguments| {
+        const actual = std.mem.trim(u8, arguments, " \t\r\n");
+        const expected = std.mem.trim(u8, guard.expected_update_plan, " \t\r\n");
+        if (std.mem.eql(u8, actual, expected)) {
+            try deleteSessionGuardState(allocator, args.session_id.?, args.guard_root);
+            try stdout.writeAll("{\"status\":\"allow\"}\n");
+            return 0;
+        }
+    }
+
+    try writeGuardDecision(stdout, "block", "Run update_plan with the exact $st SessionStart payload before Bash commands.");
     return 0;
 }
 
@@ -3903,6 +4020,18 @@ fn parseUpdatePlanEntriesFromBytes(allocator: std.mem.Allocator, input_bytes: []
 }
 
 fn parseUpdatePlanEntriesFromTranscriptBytes(allocator: std.mem.Allocator, transcript_bytes: []const u8) ![]CodexPlanEntry {
+    const arguments = (try latestUpdatePlanArgumentsFromTranscriptBytes(allocator, transcript_bytes)) orelse
+        return error.MissingUpdatePlanInTranscript;
+    const parsed_arguments = try std.json.parseFromSlice(std.json.Value, allocator, arguments, .{});
+    return parseUpdatePlanEntries(allocator, parsed_arguments.value);
+}
+
+fn latestUpdatePlanArgumentsFromTranscript(allocator: std.mem.Allocator, transcript_path: []const u8) !?[]const u8 {
+    const bytes = try readFileAlloc(allocator, transcript_path, 64 * 1024 * 1024);
+    return latestUpdatePlanArgumentsFromTranscriptBytes(allocator, bytes);
+}
+
+fn latestUpdatePlanArgumentsFromTranscriptBytes(allocator: std.mem.Allocator, transcript_bytes: []const u8) !?[]const u8 {
     var last_turn_context_index: usize = 0;
     var seen_turn_context = false;
     var line_index: usize = 0;
@@ -3960,9 +4089,7 @@ fn parseUpdatePlanEntriesFromTranscriptBytes(allocator: std.mem.Allocator, trans
         line_index += 1;
     }
 
-    const arguments = latest_arguments orelse return error.MissingUpdatePlanInTranscript;
-    const parsed_arguments = try std.json.parseFromSlice(std.json.Value, allocator, arguments, .{});
-    return parseUpdatePlanEntries(allocator, parsed_arguments.value);
+    return latest_arguments;
 }
 
 fn parseUpdatePlanEntries(allocator: std.mem.Allocator, value: std.json.Value) ![]CodexPlanEntry {
@@ -4959,6 +5086,89 @@ fn buildMutationMeta(allocator: std.mem.Allocator, allow_multiple: bool) Mutatio
     };
 }
 
+fn trimmedEnvString(comptime name: [:0]const u8) ?[]const u8 {
+    if (std.c.getenv(name)) |raw| {
+        const trimmed = std.mem.trim(u8, std.mem.span(raw), " \t\r\n");
+        if (trimmed.len > 0) return trimmed;
+    }
+    return null;
+}
+
+fn resolveCodexHomeAlloc(allocator: std.mem.Allocator) ![]const u8 {
+    if (trimmedEnvString("CODEX_HOME")) |codex_home| return allocator.dupe(u8, codex_home);
+    const home = trimmedEnvString("HOME") orelse return error.MissingHomeEnv;
+    return std.fs.path.join(allocator, &.{ home, ".codex" });
+}
+
+fn sessionGuardPathAlloc(allocator: std.mem.Allocator, session_id: []const u8, guard_root_override: ?[]const u8) ![]const u8 {
+    const filename = try std.fmt.allocPrint(allocator, "{s}.json", .{session_id});
+    defer allocator.free(filename);
+
+    if (guard_root_override) |guard_root| {
+        return std.fs.path.join(allocator, &.{ guard_root, filename });
+    }
+    if (trimmedEnvString("ST_GUARD_ROOT")) |guard_root| {
+        return std.fs.path.join(allocator, &.{ guard_root, filename });
+    }
+
+    const codex_home = try resolveCodexHomeAlloc(allocator);
+    defer allocator.free(codex_home);
+    return std.fs.path.join(allocator, &.{ codex_home, "state", "st-session-guards", filename });
+}
+
+fn writeSessionGuardState(allocator: std.mem.Allocator, guard: SessionGuardState, guard_root_override: ?[]const u8) !void {
+    const path = try sessionGuardPathAlloc(allocator, guard.session_id, guard_root_override);
+    defer allocator.free(path);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(guard, .{}, &out.writer);
+    try out.writer.writeByte('\n');
+    const payload = try out.toOwnedSlice();
+    try writeTextAtomic(allocator, path, payload);
+}
+
+fn readSessionGuardState(allocator: std.mem.Allocator, session_id: []const u8, guard_root_override: ?[]const u8) !?SessionGuardState {
+    const path = try sessionGuardPathAlloc(allocator, session_id, guard_root_override);
+    defer allocator.free(path);
+    if (!fileExists(path)) return null;
+
+    const bytes = try readFileAlloc(allocator, path, 1024 * 1024);
+    const parsed = try std.json.parseFromSlice(SessionGuardState, allocator, bytes, .{});
+    if (parsed.value.version != SessionGuardStateVersion) return error.UnsupportedSchemaVersion;
+    return parsed.value;
+}
+
+fn deleteSessionGuardState(allocator: std.mem.Allocator, session_id: []const u8, guard_root_override: ?[]const u8) !void {
+    const path = try sessionGuardPathAlloc(allocator, session_id, guard_root_override);
+    defer allocator.free(path);
+    if (!fileExists(path)) return;
+
+    const base = std.fs.path.basename(path);
+    const parent = std.fs.path.dirname(path) orelse ".";
+
+    if (std.fs.path.isAbsolute(path)) {
+        var dir = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), parent, .{});
+        defer dir.close(std.Io.Threaded.global_single_threaded.io());
+        try dir.deleteFile(std.Io.Threaded.global_single_threaded.io(), base);
+        return;
+    }
+
+    var dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), parent, .{});
+    defer dir.close(std.Io.Threaded.global_single_threaded.io());
+    try dir.deleteFile(std.Io.Threaded.global_single_threaded.io(), base);
+}
+
+fn writeGuardDecision(writer: anytype, status: []const u8, reason: []const u8) !void {
+    try writer.writeAll("{\"status\":");
+    try std.json.Stringify.value(status, .{}, writer);
+    if (reason.len > 0) {
+        try writer.writeAll(",\"reason\":");
+        try std.json.Stringify.value(reason, .{}, writer);
+    }
+    try writer.writeAll("}\n");
+}
+
 fn nowUtcAlloc(allocator: std.mem.Allocator) ![]u8 {
     const now_sec: i64 = @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000));
     var days = @divFloor(now_sec, 86_400);
@@ -5210,6 +5420,8 @@ test "parseCommand and parseOutputFormat recognize known values" {
     try std.testing.expectEqual(Command.emit_plan_sync, parseCommand("emit-plan-sync").?);
     try std.testing.expectEqual(Command.emit_update_plan, parseCommand("emit-update-plan").?);
     try std.testing.expectEqual(Command.import_update_plan, parseCommand("import-update-plan").?);
+    try std.testing.expectEqual(Command.guard_session_start, parseCommand("guard-session-start").?);
+    try std.testing.expectEqual(Command.guard_pre_tool_use, parseCommand("guard-pre-tool-use").?);
     try std.testing.expect(parseCommand("unknown-cmd") == null);
 
     try std.testing.expectEqual(OutputFormat.markdown, parseOutputFormat("markdown").?);
@@ -5499,6 +5711,69 @@ test "importUpdatePlan transcript path uses latest turn boundary" {
     try std.testing.expectEqualStrings("Latest choice", loaded.state.items.items[0].step);
     try std.testing.expect(loaded.state.items.items[0].in_plan);
     try std.testing.expect(!loaded.state.items.items[1].in_plan);
+}
+
+test "session guard blocks until latest turn matches expected update_plan payload" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
+    const transcript_path = try std.fs.path.join(allocator, &.{ root, "session.jsonl" });
+    const guard_root = try std.fs.path.join(allocator, &.{ root, "guard-root" });
+
+    _ = try cmdInit(allocator, .{ .command = .init, .file = plan_path, .replace = true });
+    _ = try cmdAdd(allocator, .{
+        .command = .add,
+        .file = plan_path,
+        .id = "st-001",
+        .step = "First",
+        .priority = "medium",
+    });
+
+    _ = try cmdGuardSessionStart(allocator, .{
+        .command = .guard_session_start,
+        .file = plan_path,
+        .session_id = "session-1",
+        .guard_root = guard_root,
+    });
+
+    try writeTextAtomic(allocator, transcript_path,
+        \\{"type":"turn_context","payload":{"turn_id":"1"}}
+        \\{"type":"response_item","payload":{"type":"function_call","name":"update_plan","arguments":"{\"plan\":[{\"step\":\"wrong\",\"status\":\"pending\"}]}" }}
+    );
+    _ = try cmdGuardPreToolUse(allocator, .{
+        .command = .guard_pre_tool_use,
+        .session_id = "session-1",
+        .transcript_path = transcript_path,
+        .guard_root = guard_root,
+    });
+    try std.testing.expect((try readSessionGuardState(allocator, "session-1", guard_root)) != null);
+
+    const guard = (try readSessionGuardState(allocator, "session-1", guard_root)).?;
+    var transcript_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer transcript_writer.deinit();
+    try transcript_writer.writer.writeAll("{\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"1\"}}\n");
+    try transcript_writer.writer.writeAll("{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"update_plan\",\"arguments\":");
+    try std.json.Stringify.value(guard.expected_update_plan, .{}, &transcript_writer.writer);
+    try transcript_writer.writer.writeAll("}}\n");
+    const transcript_payload = try transcript_writer.toOwnedSlice();
+    try writeTextAtomic(allocator, transcript_path, transcript_payload);
+
+    _ = try cmdGuardPreToolUse(allocator, .{
+        .command = .guard_pre_tool_use,
+        .session_id = "session-1",
+        .transcript_path = transcript_path,
+        .guard_root = guard_root,
+    });
+    try std.testing.expect((try readSessionGuardState(allocator, "session-1", guard_root)) == null);
 }
 
 test "importUpdatePlan rejects malformed codex plan steps" {
