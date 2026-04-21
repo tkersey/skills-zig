@@ -1759,6 +1759,13 @@ fn cmdGuardSessionStart(allocator: std.mem.Allocator, args: Args) !u8 {
     var state = loaded.state;
     defer state.deinit();
 
+    const enriched = try enrichItems(allocator, &state);
+    defer allocator.free(enriched);
+    if (!hasMirroredPlanEntries(enriched)) {
+        try deleteSessionGuardState(allocator, args.session_id.?, args.guard_root);
+        return 0;
+    }
+
     var payload_writer: std.Io.Writer.Allocating = .init(allocator);
     defer payload_writer.deinit();
     try emitUpdatePlan(allocator, &payload_writer.writer, &state, args.allow_multiple_in_progress, false);
@@ -3852,6 +3859,13 @@ fn writeCodexPlan(allocator: std.mem.Allocator, writer: anytype, rows: []const E
     }
 }
 
+fn hasMirroredPlanEntries(rows: []const EnrichedItem) bool {
+    for (rows) |row| {
+        if (effectiveInPlan(row.item.*)) return true;
+    }
+    return false;
+}
+
 fn writeCodexPlanEntry(allocator: std.mem.Allocator, writer: anytype, row: EnrichedItem) !void {
     const step_text = try codexPlanStepAlloc(allocator, row.item.*);
     defer allocator.free(step_text);
@@ -5757,6 +5771,52 @@ test "session guard blocks until latest turn matches expected update_plan payloa
         .guard_root = guard_root,
     });
     try std.testing.expect((try readSessionGuardState(allocator, "session-1", guard_root)) == null);
+}
+
+test "session guard short-circuits when mirrored plan is empty or terminal-only" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
+    const guard_root = try std.fs.path.join(allocator, &.{ root, "guard-root" });
+
+    _ = try cmdInit(allocator, .{ .command = .init, .file = plan_path, .replace = true });
+    _ = try cmdGuardSessionStart(allocator, .{
+        .command = .guard_session_start,
+        .file = plan_path,
+        .session_id = "session-empty",
+        .guard_root = guard_root,
+    });
+    try std.testing.expect((try readSessionGuardState(allocator, "session-empty", guard_root)) == null);
+
+    _ = try cmdAdd(allocator, .{
+        .command = .add,
+        .file = plan_path,
+        .id = "st-001",
+        .step = "Done",
+        .priority = "medium",
+    });
+    _ = try cmdSetStatus(allocator, .{
+        .command = .set_status,
+        .file = plan_path,
+        .id = "st-001",
+        .status = "completed",
+    });
+    _ = try cmdGuardSessionStart(allocator, .{
+        .command = .guard_session_start,
+        .file = plan_path,
+        .session_id = "session-complete",
+        .guard_root = guard_root,
+    });
+    try std.testing.expect((try readSessionGuardState(allocator, "session-complete", guard_root)) == null);
 }
 
 test "importUpdatePlan rejects malformed codex plan steps" {
