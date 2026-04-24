@@ -17,12 +17,12 @@ const HelpSurface = core_cli.HelpSurface{
 const UsageText =
     \\learnings
     \\
-    \\usage: learnings [-h] [--path PATH] {append,datasets,dataset-schema,query,recent,recall,codify-candidates,quality-audit,value-report} ...
+    \\usage: learnings [-h] [--path PATH] {append,datasets,dataset-schema,query,recent,recall,codify-candidates,quality-audit,value-report,memory-digest} ...
     \\
     \\Mine, recall, and promote records from repo-root .learnings.jsonl.
     \\
     \\positional arguments:
-    \\  {append,datasets,dataset-schema,query,recent,recall,codify-candidates,quality-audit,value-report}
+    \\  {append,datasets,dataset-schema,query,recent,recall,codify-candidates,quality-audit,value-report,memory-digest}
     \\    append              Append a structured learning record
     \\    datasets            List datasets
     \\    dataset-schema      Show dataset schema
@@ -32,6 +32,7 @@ const UsageText =
     \\    codify-candidates   Suggest repeated/high-impact learnings to promote into durable docs
     \\    quality-audit       Summarize learning capture quality and contract health
     \\    value-report        Compare recall-loaded sessions against a non-recall comparator
+    \\    memory-digest       Generate a disposable cross-repo memory consolidation digest
     \\
     \\options:
     \\  -h, --help            show this help message and exit
@@ -222,6 +223,7 @@ const Command = enum {
     codify_candidates,
     quality_audit,
     value_report,
+    memory_digest,
 };
 
 const Args = struct {
@@ -241,6 +243,7 @@ const Args = struct {
     format: []const u8 = "table",
     drop_superseded: bool = false,
     min_count: usize = 3,
+    scan_root: []const u8 = "",
     append_args_start: usize = 0,
 };
 
@@ -317,6 +320,26 @@ const CohortStats = struct {
     recall_delta_median_min: ?f64 = null,
 };
 
+const DigestCandidate = struct {
+    score: f64,
+    theme: []u8,
+    indices: []usize,
+
+    fn deinit(self: *DigestCandidate, allocator: std.mem.Allocator) void {
+        allocator.free(self.theme);
+        allocator.free(self.indices);
+    }
+};
+
+const DigestGroupAccumulator = struct {
+    score: f64 = 0,
+    indices: std.ArrayList(usize) = .empty,
+
+    fn deinit(self: *DigestGroupAccumulator, allocator: std.mem.Allocator) void {
+        self.indices.deinit(allocator);
+    }
+};
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
@@ -340,13 +363,19 @@ pub fn main(init: std.process.Init) !void {
         try core_cli.printVersion(stdout, Version);
         return;
     }
+    if (std.mem.eql(u8, argv[1], "memory-digest") and argv.len >= 3 and core_cli.isHelpArg(argv[2])) {
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        const stdout = &stdout_writer.interface;
+        try core_cli.printHelpSurface(stdout, HelpSurface, Version);
+        return;
+    }
 
     const parsed = parseArgs(argv) catch |err| {
         printParseError(err, argv);
     };
 
     if ((parsed.command orelse unreachable) == .append) {
-        try cmdAppend(allocator, argv, parsed);
+        try cmdAppend(allocator, argv, parsed, init.environ_map.get("CODEX_HOME") orelse "");
         return;
     }
 
@@ -401,6 +430,16 @@ pub fn main(init: std.process.Init) !void {
             parsed.format,
             parsed.output,
         ),
+        .memory_digest => try cmdMemoryDigest(
+            allocator,
+            repo_root,
+            parsed.scan_root,
+            parsed.since,
+            if (parsed.limit == 0) 12 else parsed.limit,
+            parsed.output,
+            init.environ_map.get("CODEX_HOME") orelse "",
+            true,
+        ),
     }
 }
 
@@ -453,6 +492,10 @@ fn parseArgs(argv: []const []const u8) !Args {
         }
         if (std.mem.eql(u8, arg, "value-report")) {
             args.command = .value_report;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "memory-digest")) {
+            args.command = .memory_digest;
             continue;
         }
 
@@ -609,6 +652,33 @@ fn parseArgs(argv: []const []const u8) !Args {
                 }
                 return error.InvalidValueReportArg;
             },
+            .memory_digest => {
+                if (std.mem.eql(u8, arg, "--scan-root")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingScanRootValue;
+                    args.scan_root = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--since")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingSinceValue;
+                    args.since = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--limit-candidates")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingLimitValue;
+                    args.limit = try parsePositiveInt(argv[i]);
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--output")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingOutputValue;
+                    args.output = argv[i];
+                    continue;
+                }
+                return error.InvalidMemoryDigestArg;
+            },
             .datasets => return error.InvalidDatasetsArg,
         }
     }
@@ -672,6 +742,9 @@ fn printParseError(err: anyerror, argv: []const []const u8) noreturn {
         error.MissingOutputValue => {
             stderr.print("error: argument --output: expected one argument\n", .{}) catch {};
         },
+        error.MissingScanRootValue => {
+            stderr.print("error: argument --scan-root: expected one argument\n", .{}) catch {};
+        },
         error.InvalidPositiveInt => {
             stderr.print("error: expected non-negative integer\n", .{}) catch {};
         },
@@ -683,6 +756,7 @@ fn printParseError(err: anyerror, argv: []const []const u8) noreturn {
         error.InvalidCodifyArg,
         error.InvalidQualityAuditArg,
         error.InvalidValueReportArg,
+        error.InvalidMemoryDigestArg,
         error.ConflictingPathValue,
         => {
             stderr.print("error: invalid arguments\n", .{}) catch {};
@@ -696,7 +770,12 @@ fn printParseError(err: anyerror, argv: []const []const u8) noreturn {
     std.process.exit(2);
 }
 
-fn cmdAppend(allocator: std.mem.Allocator, argv: []const []const u8, args: Args) !void {
+fn cmdAppend(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    args: Args,
+    codex_home: []const u8,
+) !void {
     const append_args = mergeAppendArgsAlloc(allocator, args.path_explicit, args.path, argv[args.append_args_start..]) catch |err| switch (err) {
         error.MissingPathValue => exitAppendParseError("argument --path: expected one argument", .{}),
         error.ConflictingPathValue => exitAppendParseError("conflicting --path values before and after append", .{}),
@@ -704,6 +783,28 @@ fn cmdAppend(allocator: std.mem.Allocator, argv: []const []const u8, args: Args)
     };
     defer allocator.free(append_args);
     try append_learning_cli.runWithAllocator(allocator, append_args, append_learning_cli.subcommandSurface());
+
+    if (appendArgsRequestHelpOrVersion(append_args)) return;
+    runAutoMemoryDigest(allocator, codex_home) catch |err| {
+        var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        const stderr = &stderr_writer.interface;
+        try stderr.print("memory-digest warning: {s}\n", .{@errorName(err)});
+    };
+}
+
+fn appendArgsRequestHelpOrVersion(args: []const []const u8) bool {
+    for (args) |arg| {
+        if (core_cli.isHelpArg(arg) or core_cli.isVersionArg(arg) or core_cli.isVersionSubcommand(arg)) return true;
+    }
+    return false;
+}
+
+fn runAutoMemoryDigest(allocator: std.mem.Allocator, codex_home: []const u8) !void {
+    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
+    defer allocator.free(cwd);
+    const repo_root = try discoverRepoRootAlloc(allocator, cwd);
+    defer allocator.free(repo_root);
+    try cmdMemoryDigest(allocator, repo_root, "", "", 12, "", codex_home, false);
 }
 
 fn mergeAppendArgsAlloc(
@@ -1551,6 +1652,774 @@ fn cmdValueReport(
     const rendered = try query_output.render(allocator, format, out_rows.items, cols[0..]);
     defer allocator.free(rendered);
     try emitOutput(output_path, rendered);
+}
+
+fn cmdMemoryDigest(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    scan_root_raw: []const u8,
+    since: []const u8,
+    limit_candidates: usize,
+    output_path_raw: []const u8,
+    codex_home: []const u8,
+    emit_summary: bool,
+) !void {
+    var source_files = try collectLearningFiles(allocator, repo_root, scan_root_raw);
+    defer freeOwnedStringList(allocator, &source_files);
+
+    var rows: std.ArrayList(query_engine.Row) = .empty;
+    defer {
+        for (rows.items) |*row| row.deinit();
+        rows.deinit(allocator);
+    }
+
+    for (source_files.items) |path| {
+        var file_rows = try collectDigestRows(allocator, path);
+        defer file_rows.deinit(allocator);
+        try rows.appendSlice(allocator, file_rows.items);
+        file_rows.clearRetainingCapacity();
+    }
+
+    var candidates = try buildDigestCandidates(allocator, rows.items, since, if (limit_candidates == 0) 12 else limit_candidates);
+    defer {
+        for (candidates.items) |*candidate| candidate.deinit(allocator);
+        candidates.deinit(allocator);
+    }
+
+    const generated_at = try nowUtcAlloc(allocator);
+    defer allocator.free(generated_at);
+
+    const output_path = if (output_path_raw.len > 0)
+        try resolveDigestOutputPathAlloc(allocator, repo_root, output_path_raw)
+    else
+        try defaultDigestOutputPathAlloc(allocator, codex_home);
+    defer allocator.free(output_path);
+
+    const digest = try renderMemoryDigestAlloc(allocator, generated_at, source_files.items, rows.items, candidates.items);
+    defer allocator.free(digest);
+
+    try writeTextFile(output_path, digest);
+
+    if (emit_summary) {
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        const stdout = &stdout_writer.interface;
+        try stdout.print("memory-digest: wrote {s} candidates={d} sources={d}\n", .{ output_path, candidates.items.len, source_files.items.len });
+    }
+}
+
+fn collectLearningFiles(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    scan_root_raw: []const u8,
+) !std.ArrayList([]u8) {
+    var files: std.ArrayList([]u8) = .empty;
+    errdefer freeOwnedStringList(allocator, &files);
+
+    var seen = std.StringHashMap(void).init(allocator);
+    defer deinitOwnedStringSet(allocator, &seen);
+
+    if (scan_root_raw.len > 0) {
+        var parts = std.mem.splitScalar(u8, scan_root_raw, ',');
+        while (parts.next()) |raw_part| {
+            const trimmed = std.mem.trim(u8, raw_part, " \t\r\n");
+            if (trimmed.len == 0) continue;
+            const root_abs = try resolveDigestScanRootAlloc(allocator, repo_root, trimmed);
+            defer allocator.free(root_abs);
+            try collectLearningFilesUnder(allocator, &files, &seen, root_abs, 8);
+        }
+    } else {
+        const home = std.Io.Threaded.global_single_threaded.environString("HOME") orelse return error.MissingHomeEnv;
+        const workspace = try std.fmt.allocPrint(allocator, "{s}/workspace", .{home});
+        defer allocator.free(workspace);
+        try collectLearningFilesUnder(allocator, &files, &seen, workspace, 3);
+
+        const dotfiles = try std.fmt.allocPrint(allocator, "{s}/.dotfiles", .{home});
+        defer allocator.free(dotfiles);
+        try collectLearningFilesUnder(allocator, &files, &seen, dotfiles, 4);
+
+        try collectLearningFilesUnder(allocator, &files, &seen, repo_root, 4);
+    }
+
+    std.mem.sort([]u8, files.items, {}, lessStringAsc);
+    return files;
+}
+
+fn collectLearningFilesUnder(
+    allocator: std.mem.Allocator,
+    files: *std.ArrayList([]u8),
+    seen: *std.StringHashMap(void),
+    root_abs: []const u8,
+    max_depth: usize,
+) !void {
+    if (std.mem.endsWith(u8, root_abs, "/.learnings.jsonl")) {
+        try appendUniqueLearningFile(allocator, files, seen, root_abs);
+        return;
+    }
+
+    const direct_learning_file = try std.fs.path.join(allocator, &.{ root_abs, ".learnings.jsonl" });
+    defer allocator.free(direct_learning_file);
+    if (fileExistsAbsolute(direct_learning_file)) {
+        try appendUniqueLearningFile(allocator, files, seen, direct_learning_file);
+    }
+    if (pathHasGitMarker(root_abs)) return;
+
+    var dir = std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), root_abs, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir, error.AccessDenied => return,
+        else => return err,
+    };
+    defer dir.close(std.Io.Threaded.global_single_threaded.io());
+
+    var iter = dir.iterate();
+    while (try iter.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
+        if (entry.kind != .directory) continue;
+        if (max_depth == 0 or shouldSkipDigestScanDir(entry.name)) continue;
+
+        const child = try std.fs.path.join(allocator, &.{ root_abs, entry.name });
+        defer allocator.free(child);
+        try collectLearningFilesUnder(allocator, files, seen, child, max_depth - 1);
+    }
+}
+
+fn fileExistsAbsolute(path: []const u8) bool {
+    var file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return false;
+    file.close(std.Io.Threaded.global_single_threaded.io());
+    return true;
+}
+
+fn appendUniqueLearningFile(
+    allocator: std.mem.Allocator,
+    files: *std.ArrayList([]u8),
+    seen: *std.StringHashMap(void),
+    raw_path: []const u8,
+) !void {
+    const canonical = blk: {
+        const resolved = std.Io.Dir.realPathFileAbsoluteAlloc(std.Io.Threaded.global_single_threaded.io(), raw_path, allocator) catch null;
+        if (resolved) |value| {
+            defer allocator.free(value);
+            break :blk try allocator.dupe(u8, value);
+        }
+        break :blk try allocator.dupe(u8, raw_path);
+    };
+    errdefer allocator.free(canonical);
+
+    if (seen.contains(canonical)) {
+        allocator.free(canonical);
+        return;
+    }
+
+    const key = try allocator.dupe(u8, canonical);
+    errdefer allocator.free(key);
+    try seen.put(key, {});
+    try files.append(allocator, canonical);
+}
+
+fn shouldSkipDigestScanDir(name: []const u8) bool {
+    const skipped = [_][]const u8{
+        ".git",
+        ".hg",
+        ".svn",
+        ".zig-cache",
+        "zig-out",
+        "node_modules",
+        ".venv",
+        ".direnv",
+        ".cache",
+        "target",
+        "vendor",
+        "build",
+        "dist",
+        "Library",
+    };
+    for (skipped) |item| {
+        if (std.mem.eql(u8, name, item)) return true;
+    }
+    return false;
+}
+
+fn buildDigestCandidates(
+    allocator: std.mem.Allocator,
+    rows: []const query_engine.Row,
+    since: []const u8,
+    limit: usize,
+) !std.ArrayList(DigestCandidate) {
+    var groups = std.StringHashMap(DigestGroupAccumulator).init(allocator);
+    defer {
+        var it_groups = groups.iterator();
+        while (it_groups.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(allocator);
+        }
+        groups.deinit();
+    }
+
+    for (rows, 0..) |row, idx| {
+        if (!digestEligible(row)) continue;
+        if (!inDateWindow(rowString(row, "day"), since, "")) continue;
+
+        const theme = try computeThemeAlloc(allocator, rowString(row, "tags_text"), rowString(row, "learning"));
+        defer allocator.free(theme);
+        const theme_key = if (theme.len == 0) "(untagged)" else theme;
+
+        const gop = try groups.getOrPut(theme_key);
+        if (!gop.found_existing) {
+            const owned_key = try allocator.dupe(u8, theme_key);
+            errdefer allocator.free(owned_key);
+            gop.key_ptr.* = owned_key;
+            gop.value_ptr.* = .{};
+        }
+        gop.value_ptr.score += digestRowScore(row);
+        try gop.value_ptr.indices.append(allocator, idx);
+    }
+
+    var out: std.ArrayList(DigestCandidate) = .empty;
+    errdefer {
+        for (out.items) |*candidate| candidate.deinit(allocator);
+        out.deinit(allocator);
+    }
+
+    var it = groups.iterator();
+    while (it.next()) |entry| {
+        const source_indices = entry.value_ptr.indices.items;
+        const take = @min(source_indices.len, 8);
+        const indices = try allocator.dupe(usize, source_indices[0..take]);
+        errdefer allocator.free(indices);
+        try out.append(allocator, .{
+            .score = entry.value_ptr.score + @as(f64, @floatFromInt(source_indices.len)),
+            .theme = try allocator.dupe(u8, entry.key_ptr.*),
+            .indices = indices,
+        });
+    }
+
+    std.mem.sort(DigestCandidate, out.items, {}, lessDigestCandidate);
+    if (limit > 0 and out.items.len > limit) {
+        for (out.items[limit..]) |*candidate| candidate.deinit(allocator);
+        out.shrinkRetainingCapacity(limit);
+    }
+    return out;
+}
+
+fn digestEligible(row: query_engine.Row) bool {
+    const status = rowString(row, "status");
+    if (std.mem.eql(u8, status, "codify_now")) return true;
+    if (std.mem.eql(u8, status, "avoid_for_now")) return evidenceHasAnchor(rowString(row, "evidence_text"));
+    if (std.mem.eql(u8, status, "review_later")) {
+        return evidenceHasAnchor(rowString(row, "evidence_text")) or scalarAsInt(row.valueOrNull("paths_count")) > 0;
+    }
+    return false;
+}
+
+fn digestStatusMaybeEligible(status: []const u8) bool {
+    return std.mem.eql(u8, status, "codify_now") or
+        std.mem.eql(u8, status, "avoid_for_now") or
+        std.mem.eql(u8, status, "review_later");
+}
+
+fn digestRowScore(row: query_engine.Row) f64 {
+    var score = impactScore(rowString(row, "text"), rowString(row, "status"), rowString(row, "tags_text"));
+    if (std.mem.eql(u8, rowString(row, "status"), "codify_now")) score += 5.0;
+    if (std.mem.eql(u8, rowString(row, "status"), "avoid_for_now")) score += 3.0;
+    if (std.mem.eql(u8, rowString(row, "status"), "review_later")) score += 1.0;
+    if (evidenceHasAnchor(rowString(row, "evidence_text"))) score += 1.0;
+    score += @as(f64, @floatFromInt(scalarAsInt(row.valueOrNull("paths_count")))) * 0.05;
+    return score;
+}
+
+fn lessDigestCandidate(_: void, a: DigestCandidate, b: DigestCandidate) bool {
+    if (a.score != b.score) return a.score > b.score;
+    return std.mem.order(u8, a.theme, b.theme) == .lt;
+}
+
+fn renderMemoryDigestAlloc(
+    allocator: std.mem.Allocator,
+    generated_at: []const u8,
+    source_files: []const []u8,
+    rows: []const query_engine.Row,
+    candidates: []const DigestCandidate,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    try appendFmt(allocator, &out,
+        \\# Learnings Digest
+        \\
+        \\generated_at: {s}
+        \\generator: learnings memory-digest
+        \\source: .learnings.jsonl
+        \\source_repo: multiple
+        \\source_count: {d}
+        \\source_branch_policy: preserve per-entry branch; do not globalize branch-local guidance
+        \\digest_kind: candidate evidence for Codex Phase 2 memory consolidation
+        \\canonical: false
+        \\
+        \\This file is a generated, disposable resource for the `learnings` memory
+        \\extension. It is not durable memory. Promote only entries that pass the
+        \\decision-delta, evidence-anchor, scope, and actionability gates.
+        \\
+        \\Do not copy this file wholesale into MEMORY.md. Use it to decide which
+        \\repo-scoped memories, failure shields, verification routes, or skills deserve
+        \\promotion.
+        \\
+        \\## Selection policy used
+        \\
+        \\- Included `codify_now` entries.
+        \\- Included `avoid_for_now` and `review_later` entries only when they carry concrete evidence anchors or path scope.
+        \\- Clustered near-duplicates by task family.
+        \\- Compressed command/path evidence into the smallest discriminative anchors.
+        \\- Preserved repo and branch scope per entry.
+        \\
+        \\## Source files
+        \\
+    , .{ generated_at, source_files.len });
+
+    if (source_files.len == 0) {
+        try out.appendSlice(allocator, "- none\n");
+    } else {
+        for (source_files) |path| {
+            try appendFmt(allocator, &out, "- `{s}`\n", .{path});
+        }
+    }
+
+    try out.appendSlice(allocator, "\n## Promotion candidates\n\n");
+    if (candidates.len == 0) {
+        try out.appendSlice(allocator, "No promotion candidates matched this digest policy.\n");
+        return out.toOwnedSlice(allocator);
+    }
+
+    for (candidates, 0..) |candidate, idx| {
+        try renderDigestCandidate(allocator, &out, rows, candidate, idx + 1);
+    }
+
+    try out.appendSlice(allocator,
+        \\## Generator recommendations
+        \\
+        \\- Keep the digest disposable; promote only the condensed memory guidance.
+        \\- Re-run `learnings memory-digest` after append-heavy work before memory consolidation.
+        \\- Use `--scan-root` to narrow a consolidation pass when a repo family needs focused review.
+        \\
+    );
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn renderDigestCandidate(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    rows: []const query_engine.Row,
+    candidate: DigestCandidate,
+    ordinal: usize,
+) !void {
+    const rep = rows[candidate.indices[0]];
+    const title = try digestTitleAlloc(allocator, rep, candidate.theme);
+    defer allocator.free(title);
+
+    var repos: std.ArrayList([]u8) = .empty;
+    defer freeOwnedStringList(allocator, &repos);
+    var branches: std.ArrayList([]u8) = .empty;
+    defer freeOwnedStringList(allocator, &branches);
+    var statuses: std.ArrayList([]u8) = .empty;
+    defer freeOwnedStringList(allocator, &statuses);
+    var ids: std.ArrayList([]u8) = .empty;
+    defer freeOwnedStringList(allocator, &ids);
+    var anchors: std.ArrayList([]u8) = .empty;
+    defer freeOwnedStringList(allocator, &anchors);
+
+    for (candidate.indices) |idx| {
+        const row = rows[idx];
+        try appendUniqueTrimmed(allocator, &repos, rowString(row, "repo"));
+        try appendUniqueTrimmed(allocator, &branches, rowString(row, "branch"));
+        try appendUniqueTrimmed(allocator, &statuses, rowString(row, "status"));
+        try appendUniqueTrimmed(allocator, &ids, rowString(row, "id"));
+        try appendEvidenceAnchors(allocator, &anchors, rowString(row, "evidence_text"), rowString(row, "paths_text"), 5);
+    }
+
+    const priority = digestPriority(rows, candidate.indices);
+    const repo_scope = try joinOrFallbackAlloc(allocator, repos.items, "unknown");
+    defer allocator.free(repo_scope);
+    const branch_scope = try joinOrFallbackAlloc(allocator, branches.items, "unknown");
+    defer allocator.free(branch_scope);
+    const status_mix = try joinOrFallbackAlloc(allocator, statuses.items, "unknown");
+    defer allocator.free(status_mix);
+
+    try appendFmt(allocator, out,
+        \\### P{d}: {s}
+        \\
+        \\priority: {s}
+        \\suggested_target: MEMORY.md
+        \\scope: repo={s}; branch={s}
+        \\confidence: candidate
+        \\status_mix: {s}
+        \\supporting_learning_ids:
+        \\
+    , .{ ordinal, title, priority, repo_scope, branch_scope, status_mix });
+
+    for (ids.items) |id| {
+        try appendFmt(allocator, out, "- {s}\n", .{id});
+    }
+
+    try out.appendSlice(allocator, "\ndecision_delta:\n");
+    try appendDigestBulletsFromRows(allocator, out, rows, candidate.indices, "learning", 3, false);
+
+    try out.appendSlice(allocator, "\nevidence_anchors:\n");
+    if (anchors.items.len == 0) {
+        try out.appendSlice(allocator, "- none\n");
+    } else {
+        for (anchors.items) |anchor| {
+            try appendFmt(allocator, out, "- `{s}`\n", .{anchor});
+        }
+    }
+
+    try out.appendSlice(allocator, "\nproposed_memory_guidance:\n");
+    try appendDigestBulletsFromRows(allocator, out, rows, candidate.indices, "application", 3, false);
+
+    if (hasStatus(rows, candidate.indices, "review_later") or hasStatus(rows, candidate.indices, "avoid_for_now")) {
+        try out.appendSlice(allocator, "\nfailure_shields:\n");
+        try appendDigestBulletsFromRows(allocator, out, rows, candidate.indices, "learning", 2, true);
+    }
+
+    const summary = try shortenAlloc(allocator, rowString(rep, "learning"), 220);
+    defer allocator.free(summary);
+    try appendFmt(allocator, out,
+        \\
+        \\memory_summary_candidate:
+        \\- In {s}, {s}
+        \\
+        \\---
+        \\
+        \\
+    , .{ repo_scope, summary });
+}
+
+fn digestTitleAlloc(allocator: std.mem.Allocator, row: query_engine.Row, theme: []const u8) ![]u8 {
+    const learning = rowString(row, "learning");
+    if (learning.len > 0) return shortenAlloc(allocator, learning, 86);
+    if (theme.len > 0) return shortenAlloc(allocator, theme, 86);
+    return allocator.dupe(u8, "Untitled learning cluster");
+}
+
+fn digestPriority(rows: []const query_engine.Row, indices: []const usize) []const u8 {
+    if (hasStatus(rows, indices, "codify_now")) return "high";
+    if (hasStatus(rows, indices, "avoid_for_now")) return "medium-high";
+    if (indices.len >= 3) return "medium-high";
+    return "medium";
+}
+
+fn hasStatus(rows: []const query_engine.Row, indices: []const usize, status: []const u8) bool {
+    for (indices) |idx| {
+        if (std.mem.eql(u8, rowString(rows[idx], "status"), status)) return true;
+    }
+    return false;
+}
+
+fn appendDigestBulletsFromRows(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    rows: []const query_engine.Row,
+    indices: []const usize,
+    field: []const u8,
+    limit: usize,
+    failure_shield: bool,
+) !void {
+    var seen = std.StringHashMap(void).init(allocator);
+    defer deinitOwnedStringSet(allocator, &seen);
+
+    var emitted: usize = 0;
+    for (indices) |idx| {
+        if (limit > 0 and emitted >= limit) break;
+        const raw = std.mem.trim(u8, rowString(rows[idx], field), " \t\r\n");
+        if (raw.len == 0) continue;
+        const shortened = try shortenAlloc(allocator, raw, 260);
+        defer allocator.free(shortened);
+        if (seen.contains(shortened)) continue;
+        const key = try allocator.dupe(u8, shortened);
+        errdefer allocator.free(key);
+        try seen.put(key, {});
+        if (failure_shield) {
+            try appendFmt(allocator, out, "- If this recurs, preserve the scoped rule: {s}\n", .{shortened});
+        } else {
+            try appendFmt(allocator, out, "- {s}\n", .{shortened});
+        }
+        emitted += 1;
+    }
+
+    if (emitted == 0) try out.appendSlice(allocator, "- none\n");
+}
+
+fn appendEvidenceAnchors(
+    allocator: std.mem.Allocator,
+    anchors: *std.ArrayList([]u8),
+    evidence_text: []const u8,
+    paths_text: []const u8,
+    limit: usize,
+) !void {
+    var evidence_parts = std.mem.splitScalar(u8, evidence_text, '\n');
+    while (evidence_parts.next()) |part| {
+        if (limit > 0 and anchors.items.len >= limit) return;
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "none_provided")) continue;
+        if (!evidenceHasAnchor(trimmed)) continue;
+        const shortened = try sanitizeMarkdownCodeAlloc(allocator, trimmed, 120);
+        defer allocator.free(shortened);
+        try appendUniqueTrimmed(allocator, anchors, shortened);
+    }
+
+    var path_parts = std.mem.splitScalar(u8, paths_text, ',');
+    while (path_parts.next()) |part| {
+        if (limit > 0 and anchors.items.len >= limit) return;
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const shortened = try sanitizeMarkdownCodeAlloc(allocator, trimmed, 120);
+        defer allocator.free(shortened);
+        try appendUniqueTrimmed(allocator, anchors, shortened);
+    }
+}
+
+fn appendUniqueTrimmed(allocator: std.mem.Allocator, items: *std.ArrayList([]u8), raw: []const u8) !void {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return;
+    for (items.items) |existing| {
+        if (std.mem.eql(u8, existing, trimmed)) return;
+    }
+    try items.append(allocator, try allocator.dupe(u8, trimmed));
+}
+
+fn sanitizeMarkdownCodeAlloc(allocator: std.mem.Allocator, raw: []const u8, max_len: usize) ![]u8 {
+    const shortened = try shortenAlloc(allocator, raw, max_len);
+    defer allocator.free(shortened);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    for (shortened) |char| {
+        try out.append(allocator, if (char == '`') '\'' else char);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn joinOrFallbackAlloc(allocator: std.mem.Allocator, items: []const []u8, fallback: []const u8) ![]u8 {
+    if (items.len == 0) return allocator.dupe(u8, fallback);
+    return std.mem.join(allocator, ", ", items);
+}
+
+fn resolveDigestScanRootAlloc(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    raw_root: []const u8,
+) ![]u8 {
+    if (std.fs.path.isAbsolute(raw_root)) return allocator.dupe(u8, raw_root);
+    return std.fs.path.join(allocator, &.{ repo_root, raw_root });
+}
+
+fn resolveDigestOutputPathAlloc(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    raw_path: []const u8,
+) ![]u8 {
+    if (std.fs.path.isAbsolute(raw_path)) return allocator.dupe(u8, raw_path);
+    return std.fs.path.join(allocator, &.{ repo_root, raw_path });
+}
+
+fn defaultDigestOutputPathAlloc(allocator: std.mem.Allocator, codex_home_raw: []const u8) ![]u8 {
+    const codex_home = std.mem.trim(u8, codex_home_raw, " \t\r\n");
+    if (codex_home.len > 0) {
+        return std.fs.path.join(allocator, &.{ codex_home, "memories_extensions", "learnings", "resources", "latest_learnings_digest.md" });
+    }
+    const home = std.Io.Threaded.global_single_threaded.environString("HOME") orelse return error.MissingHomeEnv;
+    return std.fs.path.join(allocator, &.{ home, ".codex", "memories_extensions", "learnings", "resources", "latest_learnings_digest.md" });
+}
+
+fn appendFmt(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    comptime fmt: []const u8,
+    args: anytype,
+) !void {
+    const text = try std.fmt.allocPrint(allocator, fmt, args);
+    defer allocator.free(text);
+    try out.appendSlice(allocator, text);
+}
+
+fn writeTextFile(path: []const u8, text: []const u8) !void {
+    try ensureParentPath(path);
+    if (std.fs.path.isAbsolute(path)) {
+        var file = try std.Io.Dir.createFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{ .truncate = true });
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
+        try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), text);
+        return;
+    }
+    var file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), path, .{ .truncate = true });
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), text);
+}
+
+fn ensureParentPath(path: []const u8) !void {
+    const parent = std.fs.path.dirname(path) orelse return;
+    if (parent.len == 0) return;
+
+    if (std.fs.path.isAbsolute(parent)) {
+        const rel = std.mem.trim(u8, parent, "/");
+        if (rel.len == 0) return;
+        var root = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), "/", .{});
+        defer root.close(std.Io.Threaded.global_single_threaded.io());
+        try root.createDirPath(std.Io.Threaded.global_single_threaded.io(), rel);
+        return;
+    }
+
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), parent);
+}
+
+fn nowUtcAlloc(allocator: std.mem.Allocator) ![]u8 {
+    const now = std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io());
+    const seconds = @as(i64, @intCast(@divFloor(now.nanoseconds, 1_000_000_000)));
+    var days = @divFloor(seconds, 86_400);
+    var seconds_of_day = seconds - days * 86_400;
+    if (seconds_of_day < 0) {
+        seconds_of_day += 86_400;
+        days -= 1;
+    }
+
+    const date = civilFromDays(days);
+    const hour = @divFloor(seconds_of_day, 3600);
+    const minute = @divFloor(seconds_of_day - hour * 3600, 60);
+    const second = seconds_of_day - hour * 3600 - minute * 60;
+
+    const year: u32 = @intCast(date.year);
+    const month: u32 = @intCast(date.month);
+    const day: u32 = @intCast(date.day);
+    const hour_u: u32 = @intCast(hour);
+    const minute_u: u32 = @intCast(minute);
+    const second_u: u32 = @intCast(second);
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z",
+        .{ year, month, day, hour_u, minute_u, second_u },
+    );
+}
+
+const CivilDate = struct {
+    year: i64,
+    month: i64,
+    day: i64,
+};
+
+fn civilFromDays(days_since_unix_epoch: i64) CivilDate {
+    const z = days_since_unix_epoch + 719_468;
+    const era = @divFloor(if (z >= 0) z else z - 146_096, 146_097);
+    const doe = z - era * 146_097;
+    const yoe = @divFloor(doe - @divFloor(doe, 1_460) + @divFloor(doe, 36_524) - @divFloor(doe, 146_096), 365);
+    var y = yoe + era * 400;
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp = @divFloor(5 * doy + 2, 153);
+    const d = doy - @divFloor(153 * mp + 2, 5) + 1;
+    var m = mp + 3;
+    if (m > 12) m -= 12;
+    if (m <= 2) y += 1;
+    return .{ .year = y, .month = m, .day = d };
+}
+
+fn collectDigestRows(
+    allocator: std.mem.Allocator,
+    jsonl_path: []const u8,
+) !std.ArrayList(query_engine.Row) {
+    var rows: std.ArrayList(query_engine.Row) = .empty;
+
+    const file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), jsonl_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return rows,
+        else => return err,
+    };
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+
+    var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const data = try reader.interface.allocRemaining(allocator, .limited(64 * 1024 * 1024));
+    defer allocator.free(data);
+
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r\n");
+        if (line.len == 0) continue;
+        if (!rawLineDigestStatusMaybeEligible(line)) continue;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+        defer parsed.deinit();
+
+        const obj = switch (parsed.value) {
+            .object => |value| value,
+            else => continue,
+        };
+
+        const status = jsonObjectString(obj, "status");
+        if (!digestStatusMaybeEligible(status)) continue;
+
+        const evidence = jsonArrayStringsAlloc(allocator, obj.get("evidence"));
+        defer freeOwnedSlice(allocator, evidence);
+        const tags = jsonArrayStringsAlloc(allocator, obj.get("tags"));
+        defer freeOwnedSlice(allocator, tags);
+
+        var repo: []u8 = &.{};
+        var branch: []u8 = &.{};
+        var paths = std.ArrayList([]u8).empty;
+        defer freeOwnedStringList(allocator, &paths);
+
+        if (obj.get("context")) |context_value| {
+            if (context_value == .object) {
+                const context = context_value.object;
+                repo = try allocator.dupe(u8, jsonObjectString(context, "repo"));
+                branch = try allocator.dupe(u8, jsonObjectString(context, "branch"));
+                paths = jsonArrayStringsListAlloc(allocator, context.get("paths")) catch .empty;
+            }
+        }
+        defer allocator.free(repo);
+        defer allocator.free(branch);
+
+        const evidence_text = try joinLinesAlloc(allocator, evidence);
+        defer allocator.free(evidence_text);
+        const tags_text = try joinCsvAlloc(allocator, tags);
+        defer allocator.free(tags_text);
+        const paths_text = try joinCsvAlloc(allocator, paths.items);
+        defer allocator.free(paths_text);
+
+        const paths_count = paths.items.len;
+        if (std.mem.eql(u8, status, "review_later") and !evidenceHasAnchor(evidence_text) and paths_count == 0) continue;
+        if (std.mem.eql(u8, status, "avoid_for_now") and !evidenceHasAnchor(evidence_text)) continue;
+
+        const captured_at = jsonObjectString(obj, "captured_at");
+        const learning = jsonObjectString(obj, "learning");
+        const application = jsonObjectString(obj, "application");
+
+        var text_builder: std.ArrayList(u8) = .empty;
+        defer text_builder.deinit(allocator);
+        try appendJoinText(allocator, &text_builder, learning);
+        try appendJoinText(allocator, &text_builder, application);
+        try appendJoinText(allocator, &text_builder, evidence_text);
+        try appendJoinText(allocator, &text_builder, tags_text);
+
+        var row = query_engine.Row.init(allocator);
+        errdefer row.deinit();
+        try row.putOwnedKey("id", .{ .string = jsonObjectString(obj, "id") });
+        try row.putOwnedKey("captured_at", .{ .string = captured_at });
+        try row.putOwnedKey("day", .{ .string = dayLabel(captured_at) });
+        try row.putOwnedKey("status", .{ .string = status });
+        try row.putOwnedKey("learning", .{ .string = learning });
+        try row.putOwnedKey("application", .{ .string = application });
+        try row.putOwnedKey("source", .{ .string = jsonObjectString(obj, "source") });
+        try row.putOwnedKey("fingerprint", .{ .string = jsonObjectString(obj, "fingerprint") });
+        try row.putOwnedKey("repo", .{ .string = repo });
+        try row.putOwnedKey("branch", .{ .string = branch });
+        try row.putOwnedKey("tags_text", .{ .string = tags_text });
+        try row.putOwnedKey("paths_text", .{ .string = paths_text });
+        try row.putOwnedKey("paths_count", .{ .int = @intCast(paths_count) });
+        try row.putOwnedKey("evidence_text", .{ .string = evidence_text });
+        try row.putOwnedKey("evidence_count", .{ .int = @intCast(evidence.len) });
+        try row.putOwnedKey("text", .{ .string = text_builder.items });
+
+        try rows.append(allocator, row);
+    }
+
+    return rows;
+}
+
+fn rawLineDigestStatusMaybeEligible(line: []const u8) bool {
+    return std.mem.indexOf(u8, line, "\"status\":\"codify_now\"") != null or
+        std.mem.indexOf(u8, line, "\"status\":\"avoid_for_now\"") != null or
+        std.mem.indexOf(u8, line, "\"status\":\"review_later\"") != null;
 }
 
 fn parseComparator(text: []const u8) !Comparator {
@@ -3202,6 +4071,48 @@ test "parse args quality-audit" {
     try std.testing.expectEqualStrings("2026-02-14", parsed.since);
     try std.testing.expectEqualStrings("2026-03-05", parsed.until);
     try std.testing.expectEqualStrings("json", parsed.format);
+}
+
+test "parse args memory-digest" {
+    const argv = [_][]const u8{
+        ProgramName,
+        "memory-digest",
+        "--scan-root",
+        "/tmp/learnings",
+        "--since",
+        "2026-03-01",
+        "--limit-candidates",
+        "7",
+        "--output",
+        "digest.md",
+    };
+    const parsed = try parseArgs(&argv);
+    try std.testing.expect(parsed.command.? == .memory_digest);
+    try std.testing.expectEqualStrings("/tmp/learnings", parsed.scan_root);
+    try std.testing.expectEqualStrings("2026-03-01", parsed.since);
+    try std.testing.expectEqual(@as(usize, 7), parsed.limit);
+    try std.testing.expectEqualStrings("digest.md", parsed.output);
+}
+
+test "digest eligibility keeps codify and anchored review later" {
+    var codify = query_engine.Row.init(std.testing.allocator);
+    defer codify.deinit();
+    try codify.putOwnedKey("status", .{ .string = "codify_now" });
+    try codify.putOwnedKey("evidence_text", .{ .string = "" });
+    try std.testing.expect(digestEligible(codify));
+
+    var review = query_engine.Row.init(std.testing.allocator);
+    defer review.deinit();
+    try review.putOwnedKey("status", .{ .string = "review_later" });
+    try review.putOwnedKey("evidence_text", .{ .string = "zig build test-learnings passed" });
+    try std.testing.expect(digestEligible(review));
+
+    var weak = query_engine.Row.init(std.testing.allocator);
+    defer weak.deinit();
+    try weak.putOwnedKey("status", .{ .string = "review_later" });
+    try weak.putOwnedKey("evidence_text", .{ .string = "general note" });
+    try weak.putOwnedKey("paths_count", .{ .int = 0 });
+    try std.testing.expect(!digestEligible(weak));
 }
 
 test "parse args value-report" {
