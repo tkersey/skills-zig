@@ -5,7 +5,7 @@ const std = @import("std");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
 const SchemaVersion: i64 = 3;
-const PlanSyncVersion: i64 = 2;
+const PlanSyncVersion: i64 = 3;
 const HelpSurface = core_cli.HelpSurface{
     .executable_name = "st",
     .help_text = UsageText,
@@ -16,7 +16,7 @@ const UsageText =
     \\
     \\Manage dependency-aware JSONL v3 plan state.
     \\
-    \\usage: st {init,add,select,deselect,set-status,set-priority,set-deps,set-notes,add-comment,remove,show,ready,blocked,doctor,emit-plan-sync,emit-update-plan,import-update-plan,guard-session-start,guard-pre-tool-use,export,import-plan,import-orchplan,claim,heartbeat,set-runtime,set-proof,release,reclaim-stale,import-mesh-results} [options]
+    \\usage: st {init,add,select,deselect,set-status,set-priority,set-deps,set-notes,add-comment,remove,show,ready,blocked,doctor,prime,assert-projection,reconcile-codex,import-proposed-plan,guard-session-start,guard-pre-tool-use,export,import-plan,import-orchplan,claim,heartbeat,set-runtime,set-proof,release,reclaim-stale,import-mesh-results} [options]
     \\
     \\commands:
     \\  init              Initialize plan storage
@@ -33,9 +33,10 @@ const UsageText =
     \\  ready             Show ready pending items
     \\  blocked           Show blocked or waiting items
     \\  doctor            Inspect or repair seq contract integrity
-    \\  emit-plan-sync    Emit dual-runtime plan_sync payload JSON
-    \\  emit-update-plan  Emit legacy update_plan payload JSON
-    \\  import-update-plan  Import Codex update_plan payload or transcript into mirrored durable fields
+    \\  prime             Select/project the durable frontier and emit plan_sync v3
+    \\  assert-projection  Validate Codex/OpenCode projection invariants
+    \\  reconcile-codex   Reconcile Codex update_plan payload or transcript into mirrored durable fields
+    \\  import-proposed-plan  Import Plan Mode Markdown into durable backlog tasks
     \\  guard-session-start  Register expected SessionStart update_plan payload for a Codex session
     \\  guard-pre-tool-use  Check whether a SessionStart guard has been satisfied for the current turn
     \\  export            Export snapshot JSON
@@ -52,9 +53,14 @@ const UsageText =
     \\common options:
     \\  --file PATH                     Path to plan JSONL file (default: .step/st-plan.jsonl)
     \\  --allow-multiple-in-progress    Allow multiple in_progress items
-    \\  --format markdown|table|json    Output format for list/read commands
+    \\  --format markdown|table|json|plan-sync|text  Output format for commands that support formats
     \\  --surface plan|all|backlog      Surface for show/ready/blocked (default: plan)
     \\  --priority high|medium|low      Priority for add/set-priority (add default: medium)
+    \\  --limit N                       Projection limit for prime/assert-projection (default: 7)
+    \\  --target codex|opencode|all     Projection target for prime/assert-projection (default: all/codex)
+    \\  --mode selected|auto-top-up|replace-ready  Prime selection mode (default: selected)
+    \\  --preview                       Compute prime output without writing selection changes
+    \\  --hook-json                     Emit documented Codex hook JSON shapes
     \\  -h, --help                      Show help
     \\  -V, --version | version         Show version
 ;
@@ -245,7 +251,69 @@ const SessionGuardState = struct {
     session_id: []const u8,
     plan_file: []const u8,
     expected_update_plan: []const u8,
+    expected_selected_ids: []const []const u8 = &.{},
     cwd: []const u8,
+};
+
+const ProjectionTarget = enum {
+    codex,
+    opencode,
+    all,
+
+    fn asString(self: ProjectionTarget) []const u8 {
+        return switch (self) {
+            .codex => "codex",
+            .opencode => "opencode",
+            .all => "all",
+        };
+    }
+};
+
+const ProjectionMode = enum {
+    selected,
+    auto_top_up,
+    replace_ready,
+
+    fn asString(self: ProjectionMode) []const u8 {
+        return switch (self) {
+            .selected => "selected",
+            .auto_top_up => "auto-top-up",
+            .replace_ready => "replace-ready",
+        };
+    }
+};
+
+const ProjectionPolicy = struct {
+    target: ProjectionTarget = .all,
+    mode: ProjectionMode = .selected,
+    limit: usize = 7,
+    include_completed_context: bool = false,
+    include_waiting_pending: bool = true,
+    allow_opencode_parallel: bool = true,
+    source_file: []const u8 = ".step/st-plan.jsonl",
+    source_seq: i64 = 0,
+};
+
+const CodexPlanProjectionEntry = struct {
+    id: []const u8,
+    step: []const u8,
+    status: []const u8,
+};
+
+const OpencodeTodoProjectionEntry = struct {
+    id: []const u8,
+    content: []const u8,
+    status: []const u8,
+    priority: []const u8,
+};
+
+const ProjectionResult = struct {
+    rows: []const EnrichedItem,
+    codex_plan: []CodexPlanProjectionEntry,
+    opencode_todos: []OpencodeTodoProjectionEntry,
+    selected_ids: []const []const u8,
+    empty_reason: ?[]const u8,
+    warnings: []const []const u8,
 };
 
 const RepairMeta = struct {
@@ -312,22 +380,23 @@ pub const Command = enum {
     @"export",
     add,
     add_comment,
+    assert_projection,
     blocked,
     claim,
     deselect,
     doctor,
-    emit_plan_sync,
-    emit_update_plan,
     guard_pre_tool_use,
     guard_session_start,
     heartbeat,
-    import_update_plan,
     import_mesh_results,
     import_orchplan,
     import_plan,
+    import_proposed_plan,
     init,
+    prime,
     ready,
     reclaim_stale,
+    reconcile_codex,
     release,
     remove,
     select,
@@ -360,9 +429,10 @@ const command_defs = [_]CommandDef{
     .{ .name = "ready", .command = .ready },
     .{ .name = "blocked", .command = .blocked },
     .{ .name = "doctor", .command = .doctor },
-    .{ .name = "emit-plan-sync", .command = .emit_plan_sync },
-    .{ .name = "emit-update-plan", .command = .emit_update_plan },
-    .{ .name = "import-update-plan", .command = .import_update_plan },
+    .{ .name = "prime", .command = .prime },
+    .{ .name = "assert-projection", .command = .assert_projection },
+    .{ .name = "reconcile-codex", .command = .reconcile_codex },
+    .{ .name = "import-proposed-plan", .command = .import_proposed_plan },
     .{ .name = "guard-session-start", .command = .guard_session_start },
     .{ .name = "guard-pre-tool-use", .command = .guard_pre_tool_use },
     .{ .name = "export", .command = .@"export" },
@@ -392,7 +462,7 @@ pub const PerfCase = enum {
     ready,
     blocked,
     doctor,
-    emit_update_plan,
+    prime,
     import_plan,
 };
 
@@ -412,7 +482,7 @@ const perf_case_defs = [_]PerfCaseDef{
     .{ .name = "ready", .case = .ready },
     .{ .name = "blocked", .case = .blocked },
     .{ .name = "doctor", .case = .doctor },
-    .{ .name = "emit-update-plan", .case = .emit_update_plan },
+    .{ .name = "prime", .case = .prime },
     .{ .name = "import-plan", .case = .import_plan },
 };
 
@@ -423,7 +493,9 @@ pub fn perfCaseDefs() []const PerfCaseDef {
 const OutputFormat = enum {
     json,
     markdown,
+    plan_sync,
     table,
+    text,
 };
 
 pub const Args = struct {
@@ -432,6 +504,9 @@ pub const Args = struct {
     allow_multiple_in_progress: bool = false,
     format: OutputFormat = .markdown,
     surface: Surface = .plan,
+    target: ProjectionTarget = .all,
+    mode: ProjectionMode = .selected,
+    limit: usize = 7,
 
     id: ?[]const u8 = null,
     ids: []const u8 = "",
@@ -460,12 +535,22 @@ pub const Args = struct {
     transcript_path: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
     guard_root: ?[]const u8 = null,
+    id_prefix: []const u8 = "st",
+    start_at: ?[]const u8 = null,
 
     replace: bool = false,
     repair_seq: bool = false,
     output: ?[]const u8 = null,
     input: ?[]const u8 = null,
     backlog_only: bool = false,
+    preview: bool = false,
+    include_completed_context: bool = false,
+    include_waiting_pending_set: bool = false,
+    include_waiting_pending: bool = false,
+    hook_json: bool = false,
+    strict: bool = true,
+    select_ready: bool = false,
+    infer_linear_deps: bool = false,
 };
 
 pub fn runPerfCase(allocator: std.mem.Allocator, perf_case: PerfCase, base_dir: []const u8) !u8 {
@@ -553,10 +638,10 @@ pub fn runPerfCase(allocator: std.mem.Allocator, perf_case: PerfCase, base_dir: 
                 .file = plan_path,
             });
         },
-        .emit_update_plan => {
+        .prime => {
             try seedBasicPlan(allocator, plan_path);
-            return cmdEmitUpdatePlan(allocator, .{
-                .command = .emit_update_plan,
+            return cmdPrime(allocator, .{
+                .command = .prime,
                 .file = plan_path,
             });
         },
@@ -683,6 +768,27 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i >= argv.len) return error.MissingSurfaceValue;
             args.surface = parseSurface(argv[i]) orelse return error.InvalidSurface;
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--target")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.target = parseProjectionTarget(argv[i]) orelse return error.InvalidTarget;
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--limit")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.limit = try parsePositiveUsize(argv[i]);
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--include-completed-context")) {
+            args.include_completed_context = true;
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--include-waiting-pending")) {
+            args.include_waiting_pending_set = true;
+            args.include_waiting_pending = true;
             continue;
         }
 
@@ -888,8 +994,29 @@ fn parseArgs(argv: []const []const u8) !Args {
                 }
                 return error.InvalidHeartbeatArg;
             },
-            .emit_plan_sync, .emit_update_plan => {
-                return error.InvalidEmitArg;
+            .prime => {
+                if (std.mem.eql(u8, token, "--mode")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.mode = parseProjectionMode(argv[i]) orelse return error.InvalidProjectionMode;
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--preview")) {
+                    args.preview = true;
+                    continue;
+                }
+                return error.InvalidPrimeArg;
+            },
+            .assert_projection => {
+                if (std.mem.eql(u8, token, "--strict")) {
+                    args.strict = true;
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--no-strict")) {
+                    args.strict = false;
+                    continue;
+                }
+                return error.InvalidAssertProjectionArg;
             },
             .guard_session_start => {
                 if (std.mem.eql(u8, token, "--session-id")) {
@@ -902,6 +1029,10 @@ fn parseArgs(argv: []const []const u8) !Args {
                     i += 1;
                     if (i >= argv.len) return error.MissingValue;
                     args.guard_root = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--hook-json")) {
+                    args.hook_json = true;
                     continue;
                 }
                 return error.InvalidEmitArg;
@@ -925,9 +1056,13 @@ fn parseArgs(argv: []const []const u8) !Args {
                     args.guard_root = argv[i];
                     continue;
                 }
+                if (std.mem.eql(u8, token, "--hook-json")) {
+                    args.hook_json = true;
+                    continue;
+                }
                 return error.InvalidImportArg;
             },
-            .import_update_plan => {
+            .reconcile_codex => {
                 if (std.mem.eql(u8, token, "--input")) {
                     i += 1;
                     if (i >= argv.len) return error.MissingInputValue;
@@ -981,6 +1116,43 @@ fn parseArgs(argv: []const []const u8) !Args {
                 }
                 if (std.mem.eql(u8, token, "--backlog-only")) {
                     args.backlog_only = true;
+                    continue;
+                }
+                return error.InvalidImportArg;
+            },
+            .import_proposed_plan => {
+                if (std.mem.eql(u8, token, "--input")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingInputValue;
+                    args.input = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--replace")) {
+                    args.replace = true;
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--backlog-only")) {
+                    args.backlog_only = true;
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--select-ready")) {
+                    args.select_ready = true;
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--id-prefix")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.id_prefix = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--start-at")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.start_at = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--infer-linear-deps")) {
+                    args.infer_linear_deps = true;
                     continue;
                 }
                 return error.InvalidImportArg;
@@ -1120,12 +1292,13 @@ fn parseArgs(argv: []const []const u8) !Args {
         },
         .remove => if (args.id == null) return error.MissingIdValue,
         .import_plan => if (args.input == null) return error.MissingInputValue,
-        .import_update_plan => {
+        .reconcile_codex => {
             if (args.input == null and args.transcript_path == null) return error.MissingInputValue;
             if (args.input != null and args.transcript_path != null) return error.InvalidImportArg;
         },
         .guard_session_start, .guard_pre_tool_use => if (args.session_id == null) return error.MissingValue,
         .import_orchplan => if (args.input == null) return error.MissingInputValue,
+        .import_proposed_plan => if (args.input == null) return error.MissingInputValue,
         .claim => {
             if (args.executor == null) return error.MissingValue;
             if (args.wave == null and std.mem.trim(u8, args.ids, " \t\r\n").len == 0) {
@@ -1161,6 +1334,8 @@ fn parseOutputFormat(raw: []const u8) ?OutputFormat {
     if (std.mem.eql(u8, raw, "markdown")) return .markdown;
     if (std.mem.eql(u8, raw, "table")) return .table;
     if (std.mem.eql(u8, raw, "json")) return .json;
+    if (std.mem.eql(u8, raw, "plan-sync")) return .plan_sync;
+    if (std.mem.eql(u8, raw, "text")) return .text;
     return null;
 }
 
@@ -1169,6 +1344,29 @@ fn parseSurface(raw: []const u8) ?Surface {
     if (std.mem.eql(u8, raw, "all")) return .all;
     if (std.mem.eql(u8, raw, "backlog")) return .backlog;
     return null;
+}
+
+fn parseProjectionTarget(raw: []const u8) ?ProjectionTarget {
+    if (std.mem.eql(u8, raw, "codex")) return .codex;
+    if (std.mem.eql(u8, raw, "opencode")) return .opencode;
+    if (std.mem.eql(u8, raw, "all")) return .all;
+    return null;
+}
+
+fn parseProjectionMode(raw: []const u8) ?ProjectionMode {
+    if (std.mem.eql(u8, raw, "selected")) return .selected;
+    if (std.mem.eql(u8, raw, "auto-top-up")) return .auto_top_up;
+    if (std.mem.eql(u8, raw, "auto_top_up")) return .auto_top_up;
+    if (std.mem.eql(u8, raw, "replace-ready")) return .replace_ready;
+    if (std.mem.eql(u8, raw, "replace_ready")) return .replace_ready;
+    return null;
+}
+
+fn parsePositiveUsize(raw: []const u8) !usize {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const value = try std.fmt.parseInt(usize, trimmed, 10);
+    if (value == 0) return error.InvalidLimit;
+    return value;
 }
 
 fn isMutatingCommand(command: Command) bool {
@@ -1183,7 +1381,9 @@ fn isMutatingCommand(command: Command) bool {
         .set_notes,
         .add_comment,
         .remove,
-        .import_update_plan,
+        .prime,
+        .reconcile_codex,
+        .import_proposed_plan,
         .guard_session_start,
         .guard_pre_tool_use,
         .import_plan,
@@ -1354,6 +1554,89 @@ fn applySelectionChange(
     }
 }
 
+fn applyPrimeSelection(
+    allocator: std.mem.Allocator,
+    state: *ItemState,
+    mode: ProjectionMode,
+    limit: usize,
+) !bool {
+    var frontier = std.ArrayList([]const u8).empty;
+
+    if (findValidExistingInProgress(state)) |id| {
+        try frontier.append(allocator, id);
+    }
+
+    switch (mode) {
+        .selected => {},
+        .auto_top_up, .replace_ready => {
+            if (mode == .auto_top_up) {
+                for (state.items.items) |item| {
+                    if (frontier.items.len >= limit) break;
+                    if (!effectiveInPlan(item)) continue;
+                    if (item.status == .pending and try isReadyPendingItem(allocator, state, item)) {
+                        if (!containsString(frontier.items, item.id)) try frontier.append(allocator, item.id);
+                    }
+                }
+            }
+            const priorities = [_]Priority{ .high, .medium, .low };
+            for (priorities) |priority| {
+                for (state.items.items) |item| {
+                    if (frontier.items.len >= limit) break;
+                    if (effectiveInPlan(item) and mode == .auto_top_up) continue;
+                    if (item.priority != priority) continue;
+                    if (item.status != .pending) continue;
+                    if (!try isReadyPendingItem(allocator, state, item)) continue;
+                    if (!containsString(frontier.items, item.id)) try frontier.append(allocator, item.id);
+                }
+            }
+        },
+    }
+
+    var changed = false;
+    if (mode == .replace_ready) {
+        for (state.items.items) |*item| {
+            const should_select = containsString(frontier.items, item.id);
+            if (item.in_plan != should_select) {
+                item.in_plan = should_select;
+                changed = true;
+            }
+            normalizeItemPlanMembership(item);
+        }
+        return changed;
+    }
+    if (mode == .auto_top_up) {
+        for (frontier.items) |id| {
+            const item = state.get(id) orelse return error.UnknownItemId;
+            if (!item.in_plan) {
+                item.in_plan = true;
+                changed = true;
+            }
+        }
+    }
+    for (state.items.items) |*item| {
+        const before = item.in_plan;
+        normalizeItemPlanMembership(item);
+        if (item.in_plan != before) changed = true;
+    }
+    return changed;
+}
+
+fn findValidExistingInProgress(state: *const ItemState) ?[]const u8 {
+    for (state.items.items) |item| {
+        if (item.status == .in_progress and effectiveInPlan(item)) return item.id;
+    }
+    return null;
+}
+
+fn isReadyPendingItem(allocator: std.mem.Allocator, state: *const ItemState, item: Item) !bool {
+    if (item.status != .pending) return false;
+    if (item.claim) |claim| {
+        if (claim.state == .held or claim.state == .stale) return false;
+    }
+    const waiting = try unresolvedDependencyIds(allocator, item, state);
+    return waiting.len == 0;
+}
+
 fn collectSelectionClosure(
     allocator: std.mem.Allocator,
     state: *ItemState,
@@ -1390,15 +1673,16 @@ fn runCommand(allocator: std.mem.Allocator, args: Args) !u8 {
         .blocked => try cmdBlocked(allocator, args),
         .claim => try cmdClaim(allocator, args),
         .doctor => try cmdDoctor(allocator, args),
-        .emit_plan_sync => try cmdEmitPlanSync(allocator, args),
-        .emit_update_plan => try cmdEmitUpdatePlan(allocator, args),
+        .prime => try cmdPrime(allocator, args),
+        .assert_projection => try cmdAssertProjection(allocator, args),
         .guard_session_start => try cmdGuardSessionStart(allocator, args),
         .guard_pre_tool_use => try cmdGuardPreToolUse(allocator, args),
         .heartbeat => try cmdHeartbeat(allocator, args),
-        .import_update_plan => try cmdImportUpdatePlan(allocator, args),
+        .reconcile_codex => try cmdReconcileCodex(allocator, args),
         .@"export" => try cmdExport(allocator, args),
         .import_plan => try cmdImportPlan(allocator, args),
         .import_orchplan => try cmdImportOrchplan(allocator, args),
+        .import_proposed_plan => try cmdImportProposedPlan(allocator, args),
         .set_runtime => try cmdSetRuntime(allocator, args),
         .set_proof => try cmdSetProof(allocator, args),
         .release => try cmdRelease(allocator, args),
@@ -1480,7 +1764,7 @@ fn cmdAdd(allocator: std.mem.Allocator, args: Args) !u8 {
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("upserted {s}\n", .{item_id});
-    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, loaded.latest_seq + 1);
     return 0;
 }
 
@@ -1500,7 +1784,7 @@ fn cmdSelect(allocator: std.mem.Allocator, args: Args) !u8 {
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("selected {d} item(s)\n", .{target_ids.len});
-    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, loaded.latest_seq + 1);
     return 0;
 }
 
@@ -1520,7 +1804,7 @@ fn cmdDeselect(allocator: std.mem.Allocator, args: Args) !u8 {
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("deselected {d} item(s)\n", .{target_ids.len});
-    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, loaded.latest_seq + 1);
     return 0;
 }
 
@@ -1544,7 +1828,7 @@ fn cmdSetStatus(allocator: std.mem.Allocator, args: Args) !u8 {
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("updated {s} -> {s}\n", .{ item_id, status.asString() });
-    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, loaded.latest_seq + 1);
     return 0;
 }
 
@@ -1567,7 +1851,7 @@ fn cmdSetPriority(allocator: std.mem.Allocator, args: Args) !u8 {
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("updated {s} priority -> {s}\n", .{ item_id, priority.asString() });
-    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, loaded.latest_seq + 1);
     return 0;
 }
 
@@ -1603,7 +1887,7 @@ fn cmdSetDeps(allocator: std.mem.Allocator, args: Args) !u8 {
         }
         try stdout.writeByte('\n');
     }
-    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, loaded.latest_seq + 1);
     return 0;
 }
 
@@ -1626,7 +1910,7 @@ fn cmdSetNotes(allocator: std.mem.Allocator, args: Args) !u8 {
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("updated {s} notes\n", .{item_id});
-    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, loaded.latest_seq + 1);
     return 0;
 }
 
@@ -1656,7 +1940,7 @@ fn cmdAddComment(allocator: std.mem.Allocator, args: Args) !u8 {
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("added comment to {s}\n", .{item_id});
-    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, loaded.latest_seq + 1);
     return 0;
 }
 
@@ -1677,7 +1961,7 @@ fn cmdRemove(allocator: std.mem.Allocator, args: Args) !u8 {
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("removed {s}\n", .{item_id});
-    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, loaded.latest_seq + 1);
     return 0;
 }
 
@@ -1732,26 +2016,85 @@ fn cmdBlocked(allocator: std.mem.Allocator, args: Args) !u8 {
     return 0;
 }
 
-fn cmdEmitPlanSync(allocator: std.mem.Allocator, args: Args) !u8 {
+fn cmdPrime(allocator: std.mem.Allocator, args: Args) !u8 {
     const loaded = try loadValidatedState(allocator, args.file, args.allow_multiple_in_progress);
     var state = loaded.state;
     defer state.deinit();
 
+    const include_waiting = if (args.include_waiting_pending_set)
+        args.include_waiting_pending
+    else
+        args.mode == .selected;
+    const changed = try applyPrimeSelection(allocator, &state, args.mode, args.limit);
+    try validateState(&state, args.allow_multiple_in_progress);
+
+    var seq = loaded.latest_seq;
+    if (!args.preview and changed) {
+        seq = loaded.latest_seq + 1;
+        const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
+        const ts = try nowUtcAlloc(allocator);
+        try writeCanonicalRecords(args.file, &state, seq, ts, meta, null);
+    }
+
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
-    try emitPlanSync(allocator, stdout, &state, args.allow_multiple_in_progress, false);
+    const policy = ProjectionPolicy{
+        .target = args.target,
+        .mode = args.mode,
+        .limit = args.limit,
+        .include_completed_context = args.include_completed_context,
+        .include_waiting_pending = include_waiting,
+        .source_file = args.file,
+        .source_seq = seq,
+    };
+    if (args.format == .json) {
+        try emitPlanSyncWithPolicy(allocator, stdout, &state, policy, false);
+    } else {
+        try emitPlanSyncWithPolicy(allocator, stdout, &state, policy, true);
+    }
     return 0;
 }
 
-fn cmdEmitUpdatePlan(allocator: std.mem.Allocator, args: Args) !u8 {
+fn cmdAssertProjection(allocator: std.mem.Allocator, args: Args) !u8 {
     const loaded = try loadValidatedState(allocator, args.file, args.allow_multiple_in_progress);
     var state = loaded.state;
     defer state.deinit();
 
+    const include_waiting = if (args.include_waiting_pending_set)
+        args.include_waiting_pending
+    else
+        true;
+    const target = if (args.target == .all) .codex else args.target;
+    const policy = ProjectionPolicy{
+        .target = target,
+        .mode = args.mode,
+        .limit = args.limit,
+        .include_completed_context = args.include_completed_context,
+        .include_waiting_pending = include_waiting,
+        .source_file = args.file,
+        .source_seq = loaded.latest_seq,
+    };
+    const result = try computeProjectionResult(allocator, &state, policy);
+
+    var ok = true;
+    var failures = std.ArrayList([]const u8).empty;
+    try assertCodexProjectionResult(allocator, &state, result, &ok, &failures);
+
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
-    try emitUpdatePlan(allocator, stdout, &state, args.allow_multiple_in_progress, false);
-    return 0;
+    if (args.format == .json) {
+        try writerAssertProjectionJson(stdout, ok, result, failures.items);
+    } else if (ok) {
+        if (result.empty_reason) |reason| {
+            try stdout.print("projection ok: empty ({s})\n", .{reason});
+        } else {
+            try stdout.print("projection ok: {d} Codex row(s)\n", .{result.codex_plan.len});
+        }
+    } else {
+        try stdout.writeAll("projection invalid\n");
+        for (failures.items) |failure| try stdout.print("- {s}\n", .{failure});
+    }
+    return if (ok) 0 else 2;
 }
 
 fn cmdGuardSessionStart(allocator: std.mem.Allocator, args: Args) !u8 {
@@ -1759,16 +2102,21 @@ fn cmdGuardSessionStart(allocator: std.mem.Allocator, args: Args) !u8 {
     var state = loaded.state;
     defer state.deinit();
 
-    const enriched = try enrichItems(allocator, &state);
-    defer allocator.free(enriched);
-    if (!hasMirroredPlanEntries(enriched)) {
+    const policy = ProjectionPolicy{ .target = .codex, .source_file = args.file, .source_seq = loaded.latest_seq };
+    const result = try computeProjectionResult(allocator, &state, policy);
+    if (result.codex_plan.len == 0) {
         try deleteSessionGuardState(allocator, args.session_id.?, args.guard_root);
+        if (args.hook_json) {
+            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+            const stdout = &stdout_writer.interface;
+            try stdout.writeAll("{\"continue\":true}\n");
+        }
         return 0;
     }
 
     var payload_writer: std.Io.Writer.Allocating = .init(allocator);
     defer payload_writer.deinit();
-    try emitUpdatePlan(allocator, &payload_writer.writer, &state, args.allow_multiple_in_progress, false);
+    try writeCodexUpdatePlanPayload(&payload_writer.writer, result.codex_plan);
     const raw_payload = try payload_writer.toOwnedSlice();
     const payload = std.mem.trim(u8, raw_payload, "\n");
     const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
@@ -1777,13 +2125,25 @@ fn cmdGuardSessionStart(allocator: std.mem.Allocator, args: Args) !u8 {
         .session_id = args.session_id.?,
         .plan_file = args.file,
         .expected_update_plan = payload,
+        .expected_selected_ids = result.selected_ids,
         .cwd = cwd,
     }, args.guard_root);
 
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
-    try stdout.writeAll(payload);
-    try stdout.writeByte('\n');
+    if (args.hook_json) {
+        try stdout.writeAll("{\"continue\":true,\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":");
+        const context = try std.fmt.allocPrint(
+            allocator,
+            "st has a pending Codex update_plan mirror. Before Bash/apply_patch work, call update_plan with exactly this payload: {s}. update_plan is invalid while Codex is in Plan Mode.",
+            .{payload},
+        );
+        try std.json.Stringify.value(context, .{}, stdout);
+        try stdout.writeAll("}}\n");
+    } else {
+        try stdout.writeAll(payload);
+        try stdout.writeByte('\n');
+    }
     return 0;
 }
 
@@ -1794,32 +2154,38 @@ fn cmdGuardPreToolUse(allocator: std.mem.Allocator, args: Args) !u8 {
     const stdout = &stdout_writer.interface;
 
     if (maybe_guard == null) {
-        try stdout.writeAll("{\"status\":\"allow\"}\n");
+        if (args.hook_json) {
+            try stdout.writeAll("{\"continue\":true}\n");
+        } else {
+            try stdout.writeAll("{\"decision\":\"allow\"}\n");
+        }
         return 0;
     }
 
     const guard = maybe_guard.?;
     const transcript_path = args.transcript_path orelse {
-        try writeGuardDecision(stdout, "block", "SessionStart $st guard is pending and transcript_path is unavailable.");
+        try writeGuardDeny(stdout, args.hook_json, "SessionStart $st guard is pending and transcript_path is unavailable.");
         return 0;
     };
 
     const latest_arguments = try latestUpdatePlanArgumentsFromTranscript(allocator, transcript_path);
     if (latest_arguments) |arguments| {
-        const actual = std.mem.trim(u8, arguments, " \t\r\n");
-        const expected = std.mem.trim(u8, guard.expected_update_plan, " \t\r\n");
-        if (std.mem.eql(u8, actual, expected)) {
+        if (try updatePlanPayloadsSemanticallyEqual(allocator, arguments, guard.expected_update_plan)) {
             try deleteSessionGuardState(allocator, args.session_id.?, args.guard_root);
-            try stdout.writeAll("{\"status\":\"allow\"}\n");
+            if (args.hook_json) {
+                try stdout.writeAll("{\"continue\":true}\n");
+            } else {
+                try stdout.writeAll("{\"decision\":\"allow\"}\n");
+            }
             return 0;
         }
     }
 
-    try writeGuardDecision(stdout, "block", "Run update_plan with the exact $st SessionStart payload before Bash commands.");
+    try writeGuardDeny(stdout, args.hook_json, "Run update_plan with the exact $st SessionStart payload before mutating tool use.");
     return 0;
 }
 
-fn cmdImportUpdatePlan(allocator: std.mem.Allocator, args: Args) !u8 {
+fn cmdReconcileCodex(allocator: std.mem.Allocator, args: Args) !u8 {
     const imported_entries = if (args.transcript_path) |transcript_path|
         try parseUpdatePlanEntriesFromTranscript(allocator, transcript_path)
     else
@@ -1839,19 +2205,19 @@ fn cmdImportUpdatePlan(allocator: std.mem.Allocator, args: Args) !u8 {
         const ts = try nowUtcAlloc(allocator);
         try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, ts, meta, null);
         if (args.transcript_path) |transcript_path| {
-            try stdout.print("imported update_plan from transcript {s}\n", .{transcript_path});
+            try stdout.print("reconciled Codex plan from transcript {s}\n", .{transcript_path});
         } else {
-            try stdout.print("imported update_plan from {s}\n", .{args.input.?});
+            try stdout.print("reconciled Codex plan from {s}\n", .{args.input.?});
         }
     } else {
         if (args.transcript_path) |transcript_path| {
-            try stdout.print("update_plan already in sync with {s}\n", .{transcript_path});
+            try stdout.print("Codex plan already in sync with {s}\n", .{transcript_path});
         } else {
-            try stdout.print("update_plan already in sync with {s}\n", .{args.input.?});
+            try stdout.print("Codex plan already in sync with {s}\n", .{args.input.?});
         }
     }
 
-    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, if (changed) loaded.latest_seq + 1 else loaded.latest_seq);
     return 0;
 }
 
@@ -1922,7 +2288,7 @@ fn cmdImportPlan(allocator: std.mem.Allocator, args: Args) !u8 {
     } else {
         try stdout.print("imported {d} item(s) from {s}\n", .{ imported_items.len, input_path });
     }
-    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, loaded.latest_seq + bump);
     return 0;
 }
 
@@ -1956,7 +2322,46 @@ fn cmdImportOrchplan(allocator: std.mem.Allocator, args: Args) !u8 {
     } else {
         try stdout.print("imported {d} orchplan item(s) from {s}\n", .{ imported_items.len, input_path });
     }
-    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, loaded.latest_seq + bump);
+    return 0;
+}
+
+fn cmdImportProposedPlan(allocator: std.mem.Allocator, args: Args) !u8 {
+    const input_path = args.input.?;
+    const input_bytes = try readFileAlloc(allocator, input_path, 4 * 1024 * 1024);
+
+    const loaded = try loadValidatedState(allocator, args.file, args.allow_multiple_in_progress);
+    var state = loaded.state;
+    defer state.deinit();
+
+    if (args.replace) state.clear();
+    const start_at = if (args.start_at) |raw| try parsePositiveUsize(raw) else nextIdNumberWithPrefix(args.id_prefix, &state);
+    _ = args.backlog_only;
+    const backlog_only = true;
+    const imported = try parseProposedPlanItems(
+        allocator,
+        input_bytes,
+        input_path,
+        args.id_prefix,
+        start_at,
+        backlog_only,
+        args.infer_linear_deps,
+    );
+    for (imported) |item| try state.upsert(item);
+    if (args.select_ready) {
+        _ = try applyPrimeSelection(allocator, &state, .replace_ready, args.limit);
+    }
+    try validateState(&state, args.allow_multiple_in_progress);
+
+    const bump: i64 = @intCast(@max(imported.len, 1));
+    const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
+    const ts = try nowUtcAlloc(allocator);
+    try writeCanonicalRecords(args.file, &state, loaded.latest_seq + bump, ts, meta, null);
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.print("imported {d} proposed plan item(s) from {s}\n", .{ imported.len, input_path });
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, loaded.latest_seq + bump);
     return 0;
 }
 
@@ -2031,7 +2436,7 @@ fn cmdClaim(allocator: std.mem.Allocator, args: Args) !u8 {
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("claimed {d} item(s) in wave {s}\n", .{ target_ids.len, wave_id });
-    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, loaded.latest_seq + 1);
     return 0;
 }
 
@@ -2058,7 +2463,7 @@ fn cmdHeartbeat(allocator: std.mem.Allocator, args: Args) !u8 {
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("heartbeat refreshed for {s}\n", .{item_id});
-    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, loaded.latest_seq + 1);
     return 0;
 }
 
@@ -2098,7 +2503,7 @@ fn cmdSetRuntime(allocator: std.mem.Allocator, args: Args) !u8 {
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("attached runtime metadata to {s}\n", .{item_id});
-    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, loaded.latest_seq + 1);
     return 0;
 }
 
@@ -2126,7 +2531,7 @@ fn cmdSetProof(allocator: std.mem.Allocator, args: Args) !u8 {
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("updated proof for {s} -> {s}\n", .{ item_id, proof.state.asString() });
-    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, loaded.latest_seq + 1);
     return 0;
 }
 
@@ -2177,7 +2582,7 @@ fn cmdRelease(allocator: std.mem.Allocator, args: Args) !u8 {
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("released claim for {s}\n", .{item_id});
-    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, loaded.latest_seq + 1);
     return 0;
 }
 
@@ -2216,7 +2621,7 @@ fn cmdReclaimStale(allocator: std.mem.Allocator, args: Args) !u8 {
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("reclaimed {d} stale claim(s)\n", .{reclaimed});
-    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, loaded.latest_seq + 1);
     return 0;
 }
 
@@ -2313,7 +2718,7 @@ fn cmdImportMeshResults(allocator: std.mem.Allocator, args: Args) !u8 {
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
     try stdout.print("imported mesh results for {d} item(s) across {d} row(s)\n", .{ updated, rows_seen });
-    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress);
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, loaded.latest_seq + 1);
     return 0;
 }
 
@@ -2322,9 +2727,11 @@ fn emitSyncOutputs(
     writer: anytype,
     state: *const ItemState,
     allow_multiple_in_progress: bool,
+    source_file: []const u8,
+    source_seq: i64,
 ) !void {
-    try emitPlanSync(allocator, writer, state, allow_multiple_in_progress, true);
-    try emitUpdatePlan(allocator, writer, state, allow_multiple_in_progress, true);
+    _ = allow_multiple_in_progress;
+    try emitPlanSyncWithPolicy(allocator, writer, state, .{ .source_file = source_file, .source_seq = source_seq }, true);
 }
 
 fn cmdDoctor(allocator: std.mem.Allocator, args: Args) !u8 {
@@ -2662,6 +3069,140 @@ fn depsFromStringIds(allocator: std.mem.Allocator, ids: []const []const u8) ![]D
         try out.append(allocator, .{ .id = id, .type = "blocks" });
     }
     return try out.toOwnedSlice(allocator);
+}
+
+const ProposedStep = struct {
+    text: []const u8,
+    heading: []const u8,
+    ordinal: usize,
+};
+
+fn parseProposedPlanItems(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    locator: []const u8,
+    id_prefix: []const u8,
+    start_at: usize,
+    backlog_only: bool,
+    infer_linear_deps: bool,
+) ![]Item {
+    const steps = try parseProposedPlanSteps(allocator, bytes);
+    var items = std.ArrayList(Item).empty;
+    var previous_impl_id: []const u8 = "";
+    for (steps, 0..) |step, idx| {
+        const id = try std.fmt.allocPrint(allocator, "{s}-{d:0>3}", .{ id_prefix, start_at + idx });
+        var deps: []Dep = &.{};
+        if (infer_linear_deps and previous_impl_id.len > 0 and proposedHeadingIsImplementation(step.heading)) {
+            deps = try depsFromStringIds(allocator, &[_][]const u8{previous_impl_id});
+        }
+        var item = Item{
+            .id = id,
+            .step = step.text,
+            .status = .pending,
+            .priority = .medium,
+            .in_plan = !backlog_only,
+            .deps = deps,
+            .notes = "",
+            .comments = &.{},
+            .source = .{
+                .kind = "proposed_plan",
+                .locator = locator,
+                .source_task_id = try std.fmt.allocPrint(allocator, "{s}-{d}", .{ if (step.heading.len > 0) step.heading else "step", step.ordinal }),
+            },
+        };
+        normalizeItemPlanMembership(&item);
+        try items.append(allocator, item);
+        if (proposedHeadingIsImplementation(step.heading)) previous_impl_id = id;
+    }
+    return try items.toOwnedSlice(allocator);
+}
+
+fn parseProposedPlanSteps(allocator: std.mem.Allocator, bytes: []const u8) ![]ProposedStep {
+    var out = std.ArrayList(ProposedStep).empty;
+    var current_heading: []const u8 = "";
+    var accepted_section = false;
+    var ordinal: usize = 0;
+
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0) continue;
+        if (std.mem.startsWith(u8, line, "#")) {
+            var heading_start: usize = 0;
+            while (heading_start < line.len and line[heading_start] == '#') : (heading_start += 1) {}
+            const heading = std.mem.trim(u8, line[heading_start..], " \t\r");
+            current_heading = heading;
+            accepted_section = proposedHeadingAccepted(heading);
+            continue;
+        }
+        const maybe_step = proposedStepText(line, accepted_section) orelse continue;
+        const cleaned = try stripProposedStepLabel(allocator, maybe_step);
+        if (cleaned.len == 0) continue;
+        ordinal += 1;
+        try out.append(allocator, .{
+            .text = cleaned,
+            .heading = current_heading,
+            .ordinal = ordinal,
+        });
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn proposedStepText(line: []const u8, accepted_section: bool) ?[]const u8 {
+    if (std.mem.startsWith(u8, line, "- [ ]")) return std.mem.trim(u8, line[5..], " \t\r");
+    if (std.mem.startsWith(u8, line, "- [x]") or std.mem.startsWith(u8, line, "- [X]")) return null;
+    if (numberedListPayload(line)) |payload| return payload;
+    if (accepted_section and std.mem.startsWith(u8, line, "- ")) return std.mem.trim(u8, line[2..], " \t\r");
+    if (accepted_section and std.mem.startsWith(u8, line, "* ")) return std.mem.trim(u8, line[2..], " \t\r");
+    return null;
+}
+
+fn numberedListPayload(line: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < line.len and std.ascii.isDigit(line[i])) : (i += 1) {}
+    if (i == 0 or i >= line.len or line[i] != '.') return null;
+    return std.mem.trim(u8, line[i + 1 ..], " \t\r");
+}
+
+fn stripProposedStepLabel(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    var text = std.mem.trim(u8, raw, " \t\r");
+    inline for (&.{ "Step", "Task" }) |label| {
+        if (std.ascii.startsWithIgnoreCase(text, label)) {
+            var idx = label.len;
+            while (idx < text.len and text[idx] == ' ') : (idx += 1) {}
+            while (idx < text.len and std.ascii.isDigit(text[idx])) : (idx += 1) {}
+            if (idx < text.len and text[idx] == ':') {
+                text = std.mem.trim(u8, text[idx + 1 ..], " \t\r");
+            }
+        }
+    }
+    return allocator.dupe(u8, text);
+}
+
+fn proposedHeadingAccepted(heading: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(heading, "Implementation") or
+        std.ascii.eqlIgnoreCase(heading, "Key Changes") or
+        std.ascii.eqlIgnoreCase(heading, "Steps") or
+        std.ascii.eqlIgnoreCase(heading, "Tasks") or
+        std.ascii.eqlIgnoreCase(heading, "Test Plan");
+}
+
+fn proposedHeadingIsImplementation(heading: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(heading, "Implementation") or
+        std.ascii.eqlIgnoreCase(heading, "Key Changes") or
+        std.ascii.eqlIgnoreCase(heading, "Steps") or
+        std.ascii.eqlIgnoreCase(heading, "Tasks");
+}
+
+fn nextIdNumberWithPrefix(prefix: []const u8, state: *const ItemState) usize {
+    var max_seen: usize = 0;
+    for (state.items.items) |item| {
+        if (!std.mem.startsWith(u8, item.id, prefix)) continue;
+        if (item.id.len <= prefix.len or item.id[prefix.len] != '-') continue;
+        const parsed = std.fmt.parseInt(usize, item.id[prefix.len + 1 ..], 10) catch continue;
+        if (parsed > max_seen) max_seen = parsed;
+    }
+    return max_seen + 1;
 }
 
 fn parseOrchplanTasksFromJson(allocator: std.mem.Allocator, bytes: []const u8) ![]OrchTask {
@@ -3524,6 +4065,7 @@ fn renderShow(
             try writeEnrichedItemsJson(writer, filtered);
             try writer.writeByte('\n');
         },
+        .plan_sync, .text => return error.InvalidFormat,
     }
 }
 
@@ -3582,6 +4124,7 @@ fn renderItemRows(allocator: std.mem.Allocator, writer: anytype, rows: []const E
             try writeEnrichedItemsJson(writer, rows);
             try writer.writeByte('\n');
         },
+        .plan_sync, .text => return error.InvalidFormat,
     }
 }
 
@@ -3810,65 +4353,70 @@ fn emitPlanSync(
     prefixed: bool,
 ) !void {
     _ = allow_multiple_in_progress;
-    const enriched = try enrichItems(allocator, state);
+    const policy = ProjectionPolicy{};
+    try emitPlanSyncWithPolicy(allocator, writer, state, policy, prefixed);
+}
 
+fn emitPlanSyncWithPolicy(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    state: *const ItemState,
+    policy: ProjectionPolicy,
+    prefixed: bool,
+) !void {
+    const result = try computeProjectionResult(allocator, state, policy);
     if (prefixed) {
         try writer.writeAll("plan_sync: ");
     }
 
     try writer.writeAll("{\"version\":");
     try writer.print("{d}", .{PlanSyncVersion});
-    try writer.writeAll(",\"items\":[");
-    for (enriched, 0..) |row, idx| {
+    try writer.writeAll(",\"source\":{\"file\":");
+    try std.json.Stringify.value(policy.source_file, .{}, writer);
+    try writer.writeAll(",\"seq\":");
+    try writer.print("{d}", .{policy.source_seq});
+    try writer.writeAll("},\"explanation\":");
+    try std.json.Stringify.value("Primed from st selected frontier.", .{}, writer);
+    try writer.writeAll(",\"projection\":{\"target\":");
+    try std.json.Stringify.value(policy.target.asString(), .{}, writer);
+    try writer.writeAll(",\"mode\":");
+    try std.json.Stringify.value(policy.mode.asString(), .{}, writer);
+    try writer.writeAll(",\"limit\":");
+    try writer.print("{d}", .{policy.limit});
+    try writer.writeAll(",\"empty_reason\":");
+    if (result.empty_reason) |reason| {
+        try std.json.Stringify.value(reason, .{}, writer);
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"warnings\":");
+    try writeStringListArray(writer, result.warnings);
+    try writer.writeAll("},\"items\":[");
+    for (result.rows, 0..) |row, idx| {
         if (idx > 0) try writer.writeByte(',');
         try writeEnrichedItemObject(writer, row);
     }
     try writer.writeAll("],\"codex\":{\"plan\":[");
-    try writeCodexPlan(allocator, writer, enriched);
+    try writeCodexProjectionEntries(writer, result.codex_plan);
     try writer.writeAll("]},\"opencode\":{\"todos\":[");
-    try writeOpencodeTodos(writer, enriched);
+    try writeOpencodeProjectionEntries(writer, result.opencode_todos);
     try writer.writeAll("]}}\n");
 }
 
-fn emitUpdatePlan(
-    allocator: std.mem.Allocator,
-    writer: anytype,
-    state: *const ItemState,
-    allow_multiple_in_progress: bool,
-    prefixed: bool,
-) !void {
-    _ = allow_multiple_in_progress;
-    const enriched = try enrichItems(allocator, state);
-
-    if (prefixed) {
-        try writer.writeAll("update_plan: ");
-    }
-
-    try writer.writeAll("{\"plan\":[");
-    try writeCodexPlan(allocator, writer, enriched);
-    try writer.writeAll("]}\n");
-}
-
 fn writeCodexPlan(allocator: std.mem.Allocator, writer: anytype, rows: []const EnrichedItem) !void {
-    var wrote_any = false;
-    for (rows) |row| {
-        if (!effectiveInPlan(row.item.*)) continue;
-        if (wrote_any) try writer.writeByte(',');
-        try writeCodexPlanEntry(allocator, writer, row);
-        wrote_any = true;
-    }
+    const result = try computeProjectionResultFromRows(allocator, rows, .{ .target = .codex });
+    try writeCodexProjectionEntries(writer, result.codex_plan);
 }
 
 fn hasMirroredPlanEntries(rows: []const EnrichedItem) bool {
     for (rows) |row| {
-        if (effectiveInPlan(row.item.*)) return true;
+        if (isCodexProjectableRow(row, .{ .target = .codex }, null)) return true;
     }
     return false;
 }
 
 fn writeCodexPlanEntry(allocator: std.mem.Allocator, writer: anytype, row: EnrichedItem) !void {
     const step_text = try codexPlanStepAlloc(allocator, row.item.*);
-    defer allocator.free(step_text);
     try writer.writeAll("{\"step\":");
     try std.json.Stringify.value(step_text, .{}, writer);
     try writer.writeAll(",\"status\":");
@@ -3893,13 +4441,10 @@ fn codexPlanStatusForRow(row: EnrichedItem) []const u8 {
 }
 
 fn writeOpencodeTodos(writer: anytype, rows: []const EnrichedItem) !void {
-    var wrote_any = false;
-    for (rows) |row| {
-        if (!effectiveInPlan(row.item.*)) continue;
-        if (wrote_any) try writer.writeByte(',');
-        try writeOpencodeTodoEntry(writer, row);
-        wrote_any = true;
-    }
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const result = try computeProjectionResultFromRows(arena.allocator(), rows, .{ .target = .opencode });
+    try writeOpencodeProjectionEntries(writer, result.opencode_todos);
 }
 
 fn writeOpencodeTodoEntry(writer: anytype, row: EnrichedItem) !void {
@@ -3923,6 +4468,263 @@ fn opencodeTodoStatusForRow(row: EnrichedItem) []const u8 {
         mapped = "pending";
     }
     return mapped;
+}
+
+fn computeProjectionResult(
+    allocator: std.mem.Allocator,
+    state: *const ItemState,
+    policy: ProjectionPolicy,
+) !ProjectionResult {
+    const rows = try enrichItems(allocator, state);
+    return computeProjectionResultFromRows(allocator, rows, policy);
+}
+
+fn computeProjectionResultFromRows(
+    allocator: std.mem.Allocator,
+    rows: []const EnrichedItem,
+    policy: ProjectionPolicy,
+) !ProjectionResult {
+    const primary_id = choosePrimaryCodexInProgress(rows);
+    var warnings = std.ArrayList([]const u8).empty;
+    const active_count = countCodexEligibleInProgress(rows);
+    if (active_count > 1) {
+        try warnings.append(allocator, "multiple durable in_progress items projected with one Codex active row");
+    }
+
+    var codex = std.ArrayList(CodexPlanProjectionEntry).empty;
+    if (policy.target == .codex or policy.target == .all) {
+        try computeCodexPlanEntries(allocator, rows, policy, primary_id, &codex);
+    }
+
+    var opencode = std.ArrayList(OpencodeTodoProjectionEntry).empty;
+    if (policy.target == .opencode or policy.target == .all) {
+        try computeOpencodeTodos(allocator, rows, policy, &opencode);
+    }
+
+    var selected_ids = std.ArrayList([]const u8).empty;
+    for (rows) |row| {
+        if (effectiveInPlan(row.item.*)) try selected_ids.append(allocator, row.item.id);
+    }
+
+    const empty_reason: ?[]const u8 = if (codex.items.len == 0 and opencode.items.len == 0)
+        "no_projectable_frontier"
+    else
+        null;
+
+    return .{
+        .rows = rows,
+        .codex_plan = try codex.toOwnedSlice(allocator),
+        .opencode_todos = try opencode.toOwnedSlice(allocator),
+        .selected_ids = try selected_ids.toOwnedSlice(allocator),
+        .empty_reason = empty_reason,
+        .warnings = try warnings.toOwnedSlice(allocator),
+    };
+}
+
+fn computeCodexPlanEntries(
+    allocator: std.mem.Allocator,
+    rows: []const EnrichedItem,
+    policy: ProjectionPolicy,
+    primary_id: ?[]const u8,
+    out: *std.ArrayList(CodexPlanProjectionEntry),
+) !void {
+    var emitted: usize = 0;
+    for (rows) |row| {
+        if (emitted >= policy.limit) break;
+        if (!isCodexProjectableRow(row, policy, primary_id)) continue;
+        const status = codexProjectionStatusForRow(row, primary_id);
+        const step = try codexPlanStepAlloc(allocator, row.item.*);
+        try out.append(allocator, .{ .id = row.item.id, .step = step, .status = status });
+        emitted += 1;
+    }
+}
+
+fn computeOpencodeTodos(
+    allocator: std.mem.Allocator,
+    rows: []const EnrichedItem,
+    policy: ProjectionPolicy,
+    out: *std.ArrayList(OpencodeTodoProjectionEntry),
+) !void {
+    var emitted: usize = 0;
+    for (rows) |row| {
+        if (emitted >= policy.limit) break;
+        if (!effectiveInPlan(row.item.*)) continue;
+        if (isTerminalStatus(row.item.status) or row.item.status == .deferred or row.item.status == .canceled) continue;
+        if (row.claim_stale) continue;
+        if (!policy.include_waiting_pending and row.dep_state == .waiting_on_deps) continue;
+        if (row.item.status == .blocked) continue;
+        try out.append(allocator, .{
+            .id = row.item.id,
+            .content = row.item.step,
+            .status = opencodeTodoStatusForRow(row),
+            .priority = row.item.priority.asString(),
+        });
+        emitted += 1;
+    }
+}
+
+fn isCodexProjectableRow(row: EnrichedItem, policy: ProjectionPolicy, primary_id: ?[]const u8) bool {
+    _ = primary_id;
+    if (!effectiveInPlan(row.item.*)) return false;
+    if (row.item.status == .completed) return policy.include_completed_context;
+    if (row.item.status == .blocked or row.item.status == .deferred or row.item.status == .canceled) return false;
+    if (row.claim_stale) return false;
+    if (row.dep_state == .waiting_on_deps and !policy.include_waiting_pending) return false;
+    return row.item.status == .pending or row.item.status == .in_progress;
+}
+
+fn choosePrimaryCodexInProgress(rows: []const EnrichedItem) ?[]const u8 {
+    for (rows) |row| {
+        if (!eligibleCodexInProgress(row)) continue;
+        if (row.item.runtime) |runtime| {
+            if (std.mem.eql(u8, runtime.substrate, "local")) return row.item.id;
+        }
+    }
+    for (rows) |row| {
+        if (eligibleCodexInProgress(row) and !row.claim_stale) return row.item.id;
+    }
+    for (rows) |row| {
+        if (row.item.status == .in_progress and effectiveInPlan(row.item.*)) return row.item.id;
+    }
+    return null;
+}
+
+fn eligibleCodexInProgress(row: EnrichedItem) bool {
+    return row.item.status == .in_progress and
+        effectiveInPlan(row.item.*) and
+        row.dep_state == .ready and
+        !row.claim_stale and
+        row.item.status != .blocked;
+}
+
+fn countCodexEligibleInProgress(rows: []const EnrichedItem) usize {
+    var count: usize = 0;
+    for (rows) |row| {
+        if (eligibleCodexInProgress(row)) count += 1;
+    }
+    return count;
+}
+
+fn codexProjectionStatusForRow(row: EnrichedItem, primary_id: ?[]const u8) []const u8 {
+    if (row.item.status == .completed) return "completed";
+    if (row.item.status == .in_progress and primary_id != null and std.mem.eql(u8, primary_id.?, row.item.id) and row.dep_state == .ready and !row.claim_stale) {
+        return "in_progress";
+    }
+    return "pending";
+}
+
+fn writeCodexProjectionEntries(writer: anytype, entries: []const CodexPlanProjectionEntry) !void {
+    for (entries, 0..) |entry, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writer.writeAll("{\"step\":");
+        try std.json.Stringify.value(entry.step, .{}, writer);
+        try writer.writeAll(",\"status\":");
+        try std.json.Stringify.value(entry.status, .{}, writer);
+        try writer.writeByte('}');
+    }
+}
+
+fn writeCodexUpdatePlanPayload(writer: anytype, entries: []const CodexPlanProjectionEntry) !void {
+    try writer.writeAll("{\"plan\":[");
+    try writeCodexProjectionEntries(writer, entries);
+    try writer.writeAll("]}");
+}
+
+fn writeOpencodeProjectionEntries(writer: anytype, entries: []const OpencodeTodoProjectionEntry) !void {
+    for (entries, 0..) |entry, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writer.writeAll("{\"content\":");
+        try std.json.Stringify.value(entry.content, .{}, writer);
+        try writer.writeAll(",\"status\":");
+        try std.json.Stringify.value(entry.status, .{}, writer);
+        try writer.writeAll(",\"priority\":");
+        try std.json.Stringify.value(entry.priority, .{}, writer);
+        try writer.writeByte('}');
+    }
+}
+
+fn assertCodexProjectionResult(
+    allocator: std.mem.Allocator,
+    state: *const ItemState,
+    result: ProjectionResult,
+    ok: *bool,
+    failures: *std.ArrayList([]const u8),
+) !void {
+    var in_progress_count: usize = 0;
+    var seen = std.StringHashMap(void).init(allocator);
+    for (result.codex_plan) |entry| {
+        if (state.getConst(entry.id) == null) {
+            ok.* = false;
+            try failures.append(allocator, try std.fmt.allocPrint(allocator, "unknown projected id {s}", .{entry.id}));
+        }
+        if (!std.mem.startsWith(u8, entry.step, "[")) {
+            ok.* = false;
+            try failures.append(allocator, "Codex step is missing [st-id] prefix");
+        }
+        const expected_prefix = try std.fmt.allocPrint(allocator, "[{s}] ", .{entry.id});
+        if (!std.mem.startsWith(u8, entry.step, expected_prefix)) {
+            ok.* = false;
+            try failures.append(allocator, try std.fmt.allocPrint(allocator, "Codex step for {s} does not begin with its durable id", .{entry.id}));
+        }
+        if (!(std.mem.eql(u8, entry.status, "pending") or std.mem.eql(u8, entry.status, "in_progress") or std.mem.eql(u8, entry.status, "completed"))) {
+            ok.* = false;
+            try failures.append(allocator, try std.fmt.allocPrint(allocator, "unsupported Codex status for {s}", .{entry.id}));
+        }
+        if (std.mem.eql(u8, entry.status, "in_progress")) {
+            in_progress_count += 1;
+            const item = state.getConst(entry.id) orelse continue;
+            const waiting = try unresolvedDependencyIds(allocator, item.*, state);
+            if (waiting.len > 0 or item.status == .blocked or item.status == .deferred or item.status == .canceled) {
+                ok.* = false;
+                try failures.append(allocator, try std.fmt.allocPrint(allocator, "{s} is not eligible for Codex in_progress", .{entry.id}));
+            }
+            if (item.claim) |claim| {
+                if (claim.state == .stale) {
+                    ok.* = false;
+                    try failures.append(allocator, try std.fmt.allocPrint(allocator, "{s} has a stale claim but is projected in_progress", .{entry.id}));
+                }
+            }
+        }
+        if (seen.get(entry.id) != null) {
+            ok.* = false;
+            try failures.append(allocator, try std.fmt.allocPrint(allocator, "duplicate projected id {s}", .{entry.id}));
+        }
+        try seen.put(entry.id, {});
+    }
+    if (in_progress_count > 1) {
+        ok.* = false;
+        try failures.append(allocator, "Codex projection has more than one in_progress row");
+    }
+    for (state.items.items) |item| {
+        if (isTerminalStatus(item.status) and item.in_plan) {
+            ok.* = false;
+            try failures.append(allocator, try std.fmt.allocPrint(allocator, "terminal item {s} remains selected", .{item.id}));
+        }
+        if (!effectiveInPlan(item)) continue;
+        for (item.deps) |dep| {
+            const dep_item = state.getConst(dep.id) orelse continue;
+            if (dep_item.status != .completed and !effectiveInPlan(dep_item.*)) {
+                ok.* = false;
+                try failures.append(allocator, try std.fmt.allocPrint(allocator, "selected item {s} depends on unresolved backlog-only {s}", .{ item.id, dep.id }));
+            }
+        }
+    }
+}
+
+fn writerAssertProjectionJson(writer: anytype, ok: bool, result: ProjectionResult, failures: []const []const u8) !void {
+    try writer.writeAll("{\"ok\":");
+    try writer.writeAll(if (ok) "true" else "false");
+    try writer.writeAll(",\"empty_reason\":");
+    if (result.empty_reason) |reason| {
+        try std.json.Stringify.value(reason, .{}, writer);
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"failures\":");
+    try writeStringListArray(writer, failures);
+    try writer.writeAll(",\"codex\":{\"plan\":[");
+    try writeCodexProjectionEntries(writer, result.codex_plan);
+    try writer.writeAll("]}}\n");
 }
 
 fn enrichItems(allocator: std.mem.Allocator, state: *const ItemState) ![]EnrichedItem {
@@ -4098,6 +4900,18 @@ fn latestUpdatePlanArgumentsFromTranscriptBytes(allocator: std.mem.Allocator, tr
                         }
                     }
                 }
+            } else if (std.mem.eql(u8, line_type, "turn/plan/updated")) {
+                const payload = objectField(parsed.value, "payload") orelse parsed.value;
+                var out: std.Io.Writer.Allocating = .init(allocator);
+                defer out.deinit();
+                if (objectField(payload, "plan") != null) {
+                    try std.json.Stringify.value(payload, .{}, &out.writer);
+                } else {
+                    try out.writer.writeAll("{\"plan\":");
+                    try std.json.Stringify.value(payload, .{}, &out.writer);
+                    try out.writer.writeByte('}');
+                }
+                latest_arguments = try out.toOwnedSlice();
             }
         }
         line_index += 1;
@@ -4119,6 +4933,7 @@ fn parseUpdatePlanEntries(allocator: std.mem.Allocator, value: std.json.Value) !
 
     var out = std.ArrayList(CodexPlanEntry).empty;
     var seen = std.StringHashMap(void).init(allocator);
+    var in_progress_count: usize = 0;
 
     for (plan_items) |raw_entry| {
         const obj = switch (raw_entry) {
@@ -4130,10 +4945,15 @@ fn parseUpdatePlanEntries(allocator: std.mem.Allocator, value: std.json.Value) !
         const parsed_step = try parseCodexPlanStep(allocator, step_raw);
         if (seen.get(parsed_step.id) != null) return error.DuplicateItemId;
         try seen.put(parsed_step.id, {});
+        const status = try normalizeCodexPlanStatus(status_raw);
+        if (status == .in_progress) {
+            in_progress_count += 1;
+            if (in_progress_count > 1) return error.MultipleCodexInProgress;
+        }
         try out.append(allocator, .{
             .id = parsed_step.id,
             .step = parsed_step.step,
-            .status = try normalizeCodexPlanStatus(status_raw),
+            .status = status,
         });
     }
 
@@ -4155,6 +4975,7 @@ fn normalizeCodexPlanStatus(raw: []const u8) !Status {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (std.ascii.eqlIgnoreCase(trimmed, "pending")) return .pending;
     if (std.ascii.eqlIgnoreCase(trimmed, "in_progress")) return .in_progress;
+    if (std.ascii.eqlIgnoreCase(trimmed, "inProgress")) return .in_progress;
     if (std.ascii.eqlIgnoreCase(trimmed, "completed")) return .completed;
     return error.InvalidCodexPlanStatus;
 }
@@ -5166,6 +5987,30 @@ fn writeGuardDecision(writer: anytype, status: []const u8, reason: []const u8) !
     try writer.writeAll("}\n");
 }
 
+fn writeGuardDeny(writer: anytype, hook_json: bool, reason: []const u8) !void {
+    if (hook_json) {
+        try writer.writeAll("{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":");
+        try std.json.Stringify.value(reason, .{}, writer);
+        try writer.writeAll("}}\n");
+        return;
+    }
+    try writer.writeAll("{\"decision\":\"block\",\"reason\":");
+    try std.json.Stringify.value(reason, .{}, writer);
+    try writer.writeAll("}\n");
+}
+
+fn updatePlanPayloadsSemanticallyEqual(allocator: std.mem.Allocator, actual: []const u8, expected: []const u8) !bool {
+    const actual_entries = parseUpdatePlanEntriesFromBytes(allocator, actual) catch return false;
+    const expected_entries = parseUpdatePlanEntriesFromBytes(allocator, expected) catch return false;
+    if (actual_entries.len != expected_entries.len) return false;
+    for (actual_entries, expected_entries) |a, e| {
+        if (!std.mem.eql(u8, a.id, e.id)) return false;
+        if (!std.mem.eql(u8, a.step, e.step)) return false;
+        if (a.status != e.status) return false;
+    }
+    return true;
+}
+
 fn nowUtcAlloc(allocator: std.mem.Allocator) ![]u8 {
     const now_sec: i64 = @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000));
     var days = @divFloor(now_sec, 86_400);
@@ -5414,9 +6259,10 @@ test "parseCommand and parseOutputFormat recognize known values" {
     try std.testing.expectEqual(Command.set_runtime, parseCommand("set-runtime").?);
     try std.testing.expectEqual(Command.import_mesh_results, parseCommand("import-mesh-results").?);
     try std.testing.expectEqual(Command.set_priority, parseCommand("set-priority").?);
-    try std.testing.expectEqual(Command.emit_plan_sync, parseCommand("emit-plan-sync").?);
-    try std.testing.expectEqual(Command.emit_update_plan, parseCommand("emit-update-plan").?);
-    try std.testing.expectEqual(Command.import_update_plan, parseCommand("import-update-plan").?);
+    try std.testing.expectEqual(Command.prime, parseCommand("prime").?);
+    try std.testing.expectEqual(Command.assert_projection, parseCommand("assert-projection").?);
+    try std.testing.expectEqual(Command.reconcile_codex, parseCommand("reconcile-codex").?);
+    try std.testing.expectEqual(Command.import_proposed_plan, parseCommand("import-proposed-plan").?);
     try std.testing.expectEqual(Command.guard_session_start, parseCommand("guard-session-start").?);
     try std.testing.expectEqual(Command.guard_pre_tool_use, parseCommand("guard-pre-tool-use").?);
     try std.testing.expect(parseCommand("unknown-cmd") == null);
@@ -5549,12 +6395,12 @@ test "emitPlanSync keeps inventory while filtering mirrored plan projections" {
     const actual = try out.toOwnedSlice();
 
     try std.testing.expectEqualStrings(
-        "{\"version\":2,\"items\":[{\"id\":\"st-001\",\"step\":\"First step\",\"status\":\"pending\",\"priority\":\"high\",\"in_plan\":true,\"deps\":[],\"notes\":\"\",\"comments\":[],\"dep_state\":\"ready\",\"waiting_on\":[]},{\"id\":\"st-002\",\"step\":\"Canceled step\",\"status\":\"canceled\",\"priority\":\"low\",\"in_plan\":false,\"deps\":[],\"notes\":\"\",\"comments\":[],\"dep_state\":\"n/a\",\"waiting_on\":[]}],\"codex\":{\"plan\":[{\"step\":\"[st-001] First step\",\"status\":\"pending\"}]},\"opencode\":{\"todos\":[{\"content\":\"First step\",\"status\":\"pending\",\"priority\":\"high\"}]}}\n",
+        "{\"version\":3,\"source\":{\"file\":\".step/st-plan.jsonl\",\"seq\":0},\"explanation\":\"Primed from st selected frontier.\",\"projection\":{\"target\":\"all\",\"mode\":\"selected\",\"limit\":7,\"empty_reason\":null,\"warnings\":[]},\"items\":[{\"id\":\"st-001\",\"step\":\"First step\",\"status\":\"pending\",\"priority\":\"high\",\"in_plan\":true,\"deps\":[],\"notes\":\"\",\"comments\":[],\"dep_state\":\"ready\",\"waiting_on\":[]},{\"id\":\"st-002\",\"step\":\"Canceled step\",\"status\":\"canceled\",\"priority\":\"low\",\"in_plan\":false,\"deps\":[],\"notes\":\"\",\"comments\":[],\"dep_state\":\"n/a\",\"waiting_on\":[]}],\"codex\":{\"plan\":[{\"step\":\"[st-001] First step\",\"status\":\"pending\"}]},\"opencode\":{\"todos\":[{\"content\":\"First step\",\"status\":\"pending\",\"priority\":\"high\"}]}}\n",
         actual,
     );
 }
 
-test "emitUpdatePlan preserves legacy payload shape" {
+test "Codex projection payload contains only update_plan rows" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -5574,7 +6420,9 @@ test "emitUpdatePlan preserves legacy payload shape" {
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    try emitUpdatePlan(allocator, &out.writer, &state, false, false);
+    const result = try computeProjectionResult(allocator, &state, .{ .target = .codex });
+    try writeCodexUpdatePlanPayload(&out.writer, result.codex_plan);
+    try out.writer.writeByte('\n');
     const actual = try out.toOwnedSlice();
 
     try std.testing.expectEqualStrings(
@@ -5583,7 +6431,7 @@ test "emitUpdatePlan preserves legacy payload shape" {
     );
 }
 
-test "importUpdatePlan updates mirrored fields and preserves durable metadata" {
+test "reconcile-codex updates mirrored fields and preserves durable metadata" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5634,8 +6482,8 @@ test "importUpdatePlan updates mirrored fields and preserves durable metadata" {
         \\]}
     );
 
-    _ = try cmdImportUpdatePlan(allocator, .{
-        .command = .import_update_plan,
+    _ = try cmdReconcileCodex(allocator, .{
+        .command = .reconcile_codex,
         .file = plan_path,
         .input = update_plan_path,
     });
@@ -5656,7 +6504,7 @@ test "importUpdatePlan updates mirrored fields and preserves durable metadata" {
     try std.testing.expect(!loaded.state.items.items[1].in_plan);
 }
 
-test "importUpdatePlan transcript path uses latest turn boundary" {
+test "reconcile-codex transcript path uses latest turn boundary" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5695,8 +6543,8 @@ test "importUpdatePlan transcript path uses latest turn boundary" {
         \\{"type":"response_item","payload":{"type":"function_call","name":"update_plan","arguments":"{\"plan\":[{\"step\":\"[st-002] Latest choice\",\"status\":\"pending\"}]}" }}
     );
 
-    _ = try cmdImportUpdatePlan(allocator, .{
-        .command = .import_update_plan,
+    _ = try cmdReconcileCodex(allocator, .{
+        .command = .reconcile_codex,
         .file = plan_path,
         .transcript_path = transcript_path,
     });
@@ -5819,7 +6667,7 @@ test "session guard short-circuits when mirrored plan is empty or terminal-only"
     try std.testing.expect((try readSessionGuardState(allocator, "session-complete", guard_root)) == null);
 }
 
-test "importUpdatePlan rejects malformed codex plan steps" {
+test "reconcile-codex rejects malformed codex plan steps" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5847,14 +6695,14 @@ test "importUpdatePlan rejects malformed codex plan steps" {
         \\{"plan":[{"step":"Only step","status":"pending"}]}
     );
 
-    try std.testing.expectError(error.InvalidCodexPlanStep, cmdImportUpdatePlan(allocator, .{
-        .command = .import_update_plan,
+    try std.testing.expectError(error.InvalidCodexPlanStep, cmdReconcileCodex(allocator, .{
+        .command = .reconcile_codex,
         .file = plan_path,
         .input = update_plan_path,
     }));
 }
 
-test "importUpdatePlan no-op path avoids rewriting the durable plan" {
+test "reconcile-codex no-op path avoids rewriting the durable plan" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -5882,8 +6730,8 @@ test "importUpdatePlan no-op path avoids rewriting the durable plan" {
         \\{"plan":[{"step":"[st-001] Stable step","status":"pending"}]}
     );
 
-    _ = try cmdImportUpdatePlan(allocator, .{
-        .command = .import_update_plan,
+    _ = try cmdReconcileCodex(allocator, .{
+        .command = .reconcile_codex,
         .file = plan_path,
         .input = update_plan_path,
     });
@@ -5891,8 +6739,8 @@ test "importUpdatePlan no-op path avoids rewriting the durable plan" {
     const after_first = try readFileAlloc(allocator, plan_path, 1024 * 1024);
     const seq_after_first = (try readRecords(allocator, plan_path)).latest_seq;
 
-    _ = try cmdImportUpdatePlan(allocator, .{
-        .command = .import_update_plan,
+    _ = try cmdReconcileCodex(allocator, .{
+        .command = .reconcile_codex,
         .file = plan_path,
         .input = update_plan_path,
     });
@@ -5902,6 +6750,125 @@ test "importUpdatePlan no-op path avoids rewriting the durable plan" {
 
     try std.testing.expectEqual(seq_after_first, seq_after_second);
     try std.testing.expectEqualStrings(after_first, after_second);
+}
+
+test "prime auto-top-up selects ready backlog without selecting waiting children" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
+
+    _ = try cmdInit(allocator, .{ .command = .init, .file = plan_path, .replace = true });
+    _ = try cmdAdd(allocator, .{ .command = .add, .file = plan_path, .id = "st-001", .step = "Ready parent", .backlog_only = true });
+    _ = try cmdAdd(allocator, .{ .command = .add, .file = plan_path, .id = "st-002", .step = "Waiting child", .deps = "st-001", .backlog_only = true });
+
+    _ = try cmdPrime(allocator, .{ .command = .prime, .file = plan_path, .mode = .auto_top_up, .limit = 2 });
+
+    var loaded = try loadValidatedState(allocator, plan_path, false);
+    defer loaded.state.deinit();
+    try std.testing.expect(loaded.state.getConst("st-001").?.in_plan);
+    try std.testing.expect(!loaded.state.getConst("st-002").?.in_plan);
+}
+
+test "projection emits at most one Codex in_progress and warns on parallel active rows" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var state = ItemState.init(allocator);
+    defer state.deinit();
+    try state.upsert(.{ .id = "st-001", .step = "Local active", .status = .in_progress, .priority = .medium, .in_plan = true, .deps = &.{}, .notes = "", .comments = &.{}, .runtime = .{ .substrate = "local" } });
+    try state.upsert(.{ .id = "st-002", .step = "Parallel active", .status = .in_progress, .priority = .medium, .in_plan = true, .deps = &.{}, .notes = "", .comments = &.{} });
+
+    const result = try computeProjectionResult(allocator, &state, .{ .target = .codex });
+    var active_count: usize = 0;
+    for (result.codex_plan) |entry| {
+        if (std.mem.eql(u8, entry.status, "in_progress")) active_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), active_count);
+    try std.testing.expectEqualStrings("st-001", result.codex_plan[0].id);
+    try std.testing.expect(result.warnings.len >= 1);
+}
+
+test "reconcile-codex parses app-server plan events and inProgress status" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const transcript =
+        \\{"type":"turn_context","payload":{"turn_id":"1"}}
+        \\{"type":"turn/plan/updated","payload":{"plan":[{"step":"[st-001] Active","status":"inProgress"}]}}
+    ;
+    const entries = try parseUpdatePlanEntriesFromTranscriptBytes(allocator, transcript);
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqual(Status.in_progress, entries[0].status);
+    try std.testing.expectEqualStrings("Active", entries[0].step);
+}
+
+test "guard comparison is semantic across update_plan whitespace differences" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    try std.testing.expect(try updatePlanPayloadsSemanticallyEqual(
+        allocator,
+        "{ \"plan\" : [ { \"step\" : \"[st-001] Same\", \"status\" : \"pending\" } ] }",
+        "{\"plan\":[{\"step\":\"[st-001] Same\",\"status\":\"pending\"}]}",
+    ));
+    try std.testing.expect(!try updatePlanPayloadsSemanticallyEqual(
+        allocator,
+        "{\"plan\":[{\"step\":\"[st-001] Same\",\"status\":\"completed\"}]}",
+        "{\"plan\":[{\"step\":\"[st-001] Same\",\"status\":\"pending\"}]}",
+    ));
+}
+
+test "import-proposed-plan imports markdown as backlog and optional linear implementation deps" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
+    const proposed_path = try std.fs.path.join(allocator, &.{ root, "proposed.md" });
+    try writeTextAtomic(allocator, proposed_path,
+        \\# Implementation
+        \\1. Step 1: Reproduce failure
+        \\2. Task 2: Patch parser
+        \\
+        \\# Test Plan
+        \\- Add regression test
+    );
+
+    _ = try cmdInit(allocator, .{ .command = .init, .file = plan_path, .replace = true });
+    _ = try cmdImportProposedPlan(allocator, .{
+        .command = .import_proposed_plan,
+        .file = plan_path,
+        .input = proposed_path,
+        .infer_linear_deps = true,
+    });
+
+    var loaded = try loadValidatedState(allocator, plan_path, true);
+    defer loaded.state.deinit();
+    try std.testing.expectEqual(@as(usize, 3), loaded.state.items.items.len);
+    try std.testing.expect(!loaded.state.getConst("st-001").?.in_plan);
+    try std.testing.expectEqualStrings("Reproduce failure", loaded.state.getConst("st-001").?.step);
+    try std.testing.expectEqualStrings("st-001", loaded.state.getConst("st-002").?.deps[0].id);
+    try std.testing.expectEqual(@as(usize, 0), loaded.state.getConst("st-003").?.deps.len);
+    try std.testing.expectEqualStrings("proposed_plan", loaded.state.getConst("st-003").?.source.?.kind);
 }
 
 test "select auto-includes dependency closure and deselect rejects stranded dependents" {
@@ -6122,7 +7089,7 @@ test "runPerfCase covers representative Wave B seams" {
         .init,
         .set_status,
         .set_deps,
-        .emit_update_plan,
+        .prime,
         .import_plan,
     };
 
