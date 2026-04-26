@@ -139,7 +139,7 @@ const DeepSetup = enum {
     st_ready,
     st_blocked,
     st_doctor,
-    st_emit_update_plan,
+    st_prime,
     st_import_plan,
 };
 
@@ -208,7 +208,7 @@ const StCases = [_]perf_contract.CaseDescriptor{
     .{ .case_id = "st-ready-deep", .binary = "st", .family = "ready", .case_kind = .driver, .measurement_mode = .latency_alloc },
     .{ .case_id = "st-blocked-deep", .binary = "st", .family = "blocked", .case_kind = .driver, .measurement_mode = .latency_alloc },
     .{ .case_id = "st-doctor-deep", .binary = "st", .family = "doctor", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "st-emit-update-plan-deep", .binary = "st", .family = "emit-update-plan", .case_kind = .driver, .measurement_mode = .latency_alloc },
+    .{ .case_id = "st-prime-deep", .binary = "st", .family = "prime", .case_kind = .driver, .measurement_mode = .latency_alloc },
     .{ .case_id = "st-import-plan-deep", .binary = "st", .family = "import-plan", .case_kind = .driver, .measurement_mode = .latency_alloc },
 };
 
@@ -324,7 +324,7 @@ const DeepCases = [_]DeepCase{
     .{ .descriptor = StCases[10], .setup = .st_ready, .tolerance_pct = 300.0 },
     .{ .descriptor = StCases[11], .setup = .st_blocked, .tolerance_pct = 300.0 },
     .{ .descriptor = StCases[12], .setup = .st_doctor, .tolerance_pct = 300.0 },
-    .{ .descriptor = StCases[13], .setup = .st_emit_update_plan, .tolerance_pct = 300.0 },
+    .{ .descriptor = StCases[13], .setup = .st_prime, .tolerance_pct = 300.0 },
     .{ .descriptor = StCases[14], .setup = .st_import_plan, .tolerance_pct = 300.0 },
 };
 
@@ -555,7 +555,8 @@ fn cmdDoctor(allocator: std.mem.Allocator, target: ?[]const u8) !void {
     for (CompatCases) |case_cfg| {
         if (!matchesTarget(case_cfg.descriptor.case_id, case_cfg.descriptor.binary, target)) continue;
         count += 1;
-        _ = resolveBinaryPath(allocator, case_cfg) catch return error.InvalidData;
+        const binary_path = resolveBinaryPath(allocator, case_cfg) catch return error.InvalidData;
+        allocator.free(binary_path);
     }
     for (DeepCases) |case_cfg| {
         if (!matchesTarget(case_cfg.descriptor.case_id, case_cfg.descriptor.binary, target)) continue;
@@ -870,6 +871,7 @@ fn compatBaselinePath(allocator: std.mem.Allocator, machine_dir: []const u8, bin
 fn runDriverCase(allocator: std.mem.Allocator, case_cfg: CompatCase, capture: bool, _: ?std.json.Value) ![]u8 {
     const temp_root = try makeTempRoot(allocator, case_cfg.descriptor.case_id);
     defer cleanupTempRoot(temp_root);
+    defer allocator.free(temp_root);
     const artifact_path = try std.fs.path.join(allocator, &.{ temp_root, "artifact.json" });
     defer allocator.free(artifact_path);
     const binary_path = try resolveBinaryPath(allocator, case_cfg);
@@ -909,6 +911,7 @@ fn runDriverCase(allocator: std.mem.Allocator, case_cfg: CompatCase, capture: bo
 fn runMeasuredCase(allocator: std.mem.Allocator, case_cfg: CompatCase) !Metrics {
     const temp_root = try makeTempRoot(allocator, case_cfg.descriptor.case_id);
     defer cleanupTempRoot(temp_root);
+    defer allocator.free(temp_root);
     var samples: std.ArrayList(u64) = .empty;
     var alloc_samples: std.ArrayList(u64) = .empty;
     try samples.ensureTotalCapacity(allocator, case_cfg.samples);
@@ -966,6 +969,7 @@ fn runMeasuredCase(allocator: std.mem.Allocator, case_cfg: CompatCase) !Metrics 
 fn runDeepMeasuredCase(allocator: std.mem.Allocator, case_cfg: DeepCase) !Metrics {
     const temp_root = try makeTempRoot(allocator, case_cfg.descriptor.case_id);
     defer cleanupTempRoot(temp_root);
+    defer allocator.free(temp_root);
     var samples: std.ArrayList(u64) = .empty;
     var alloc_samples: std.ArrayList(u64) = .empty;
     try samples.ensureTotalCapacity(allocator, case_cfg.samples);
@@ -1037,7 +1041,7 @@ fn executeDeepCase(allocator: std.mem.Allocator, setup: DeepSetup, temp_root: []
         .st_ready => _ = try st_cli.runPerfCase(allocator, .ready, temp_root),
         .st_blocked => _ = try st_cli.runPerfCase(allocator, .blocked, temp_root),
         .st_doctor => _ = try st_cli.runPerfCase(allocator, .doctor, temp_root),
-        .st_emit_update_plan => _ = try st_cli.runPerfCase(allocator, .emit_update_plan, temp_root),
+        .st_prime => _ = try st_cli.runPerfCase(allocator, .prime, temp_root),
         .st_import_plan => _ = try st_cli.runPerfCase(allocator, .import_plan, temp_root),
     }
 }
@@ -1121,10 +1125,9 @@ fn compareUpperBoundField(allocator: std.mem.Allocator, current: std.json.Value,
 }
 
 fn writeMetricsArtifact(allocator: std.mem.Allocator, path: []const u8, case_cfg: CompatCase, metrics: Metrics, compare_status: []const u8, compare_detail: []const u8) !void {
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-    const writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
-    var writer = writer_alloc.writer;
+    var writer_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
     const machine_name = try currentMachineDirName(allocator);
     defer allocator.free(machine_name);
     const sha = try gitShaAlloc(allocator);
@@ -1142,16 +1145,15 @@ fn writeMetricsArtifact(allocator: std.mem.Allocator, path: []const u8, case_cfg
         try writer.print(",\"p50_alloc_calls\":{d}", .{metrics.p50_alloc_calls});
     }
     try writer.print("}},\"compare_status\":\"{s}\",\"compare_detail\":", .{compare_status});
-    try writeJsonString(&writer, compare_detail);
+    try writeJsonString(writer, compare_detail);
     try writer.writeAll("}\n");
-    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = path, .data = out.items });
+    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = path, .data = writer_alloc.written() });
 }
 
 fn writeDriverArtifact(allocator: std.mem.Allocator, path: []const u8, case_cfg: CompatCase, raw_json: []const u8, compare_status: []const u8, compare_detail: []const u8) !void {
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-    const writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
-    var writer = writer_alloc.writer;
+    var writer_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
     const machine_name = try currentMachineDirName(allocator);
     defer allocator.free(machine_name);
     const sha = try gitShaAlloc(allocator);
@@ -1162,9 +1164,9 @@ fn writeDriverArtifact(allocator: std.mem.Allocator, path: []const u8, case_cfg:
     );
     try writer.writeAll(raw_json);
     try writer.print(",\"compare_status\":\"{s}\",\"compare_detail\":", .{compare_status});
-    try writeJsonString(&writer, compare_detail);
+    try writeJsonString(writer, compare_detail);
     try writer.writeAll("}\n");
-    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = path, .data = out.items });
+    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = path, .data = writer_alloc.written() });
 }
 
 fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root: []const u8) !CommandRun {
@@ -1560,14 +1562,39 @@ fn inferBinary(case_id: []const u8) []const u8 {
 }
 
 fn gitShaAlloc(allocator: std.mem.Allocator) ![]u8 {
-    const result = try std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
-        .argv = &.{ "git", "rev-parse", "--short", "HEAD" },
-        .stdout_limit = .limited(256),
-        .stderr_limit = .limited(0),
-    });
-    defer allocator.free(result.stderr);
-    defer allocator.free(result.stdout);
-    return allocator.dupe(u8, std.mem.trim(u8, result.stdout, " \t\r\n"));
+    const head_data = std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".git/HEAD", allocator, .limited(1024)) catch {
+        return allocator.dupe(u8, "unknown");
+    };
+    defer allocator.free(head_data);
+    const head = std.mem.trim(u8, head_data, " \t\r\n");
+    if (std.mem.startsWith(u8, head, "ref: ")) {
+        const ref_path = std.mem.trim(u8, head["ref: ".len..], " \t\r\n");
+        const loose_path = try std.fs.path.join(allocator, &.{ ".git", ref_path });
+        defer allocator.free(loose_path);
+        if (std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), loose_path, allocator, .limited(1024))) |ref_data| {
+            defer allocator.free(ref_data);
+            return shortShaAlloc(allocator, std.mem.trim(u8, ref_data, " \t\r\n"));
+        } else |_| {}
+
+        if (std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".git/packed-refs", allocator, .limited(1024 * 1024))) |packed_data| {
+            defer allocator.free(packed_data);
+            var lines = std.mem.splitScalar(u8, packed_data, '\n');
+            while (lines.next()) |line_raw| {
+                const line = std.mem.trim(u8, line_raw, " \t\r\n");
+                if (line.len == 0 or line[0] == '#' or line[0] == '^') continue;
+                var parts = std.mem.splitScalar(u8, line, ' ');
+                const sha = parts.next() orelse continue;
+                const name = parts.next() orelse continue;
+                if (std.mem.eql(u8, name, ref_path)) return shortShaAlloc(allocator, sha);
+            }
+        } else |_| {}
+        return allocator.dupe(u8, "unknown");
+    }
+    return shortShaAlloc(allocator, head);
+}
+
+fn shortShaAlloc(allocator: std.mem.Allocator, sha: []const u8) ![]u8 {
+    return allocator.dupe(u8, sha[0..@min(sha.len, 12)]);
 }
 
 fn nowTagAlloc(allocator: std.mem.Allocator) ![]u8 {
@@ -1626,10 +1653,9 @@ fn writeLatestReport(
     row_keys: []const []const u8,
     totals: std.StringHashMap(ReportCounts),
 ) !void {
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-    const writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
-    var writer = writer_alloc.writer;
+    var writer_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
     try writer.writeAll("{\"rows\":[");
     for (row_keys, 0..) |key, idx| {
         const counts = totals.get(key).?;
@@ -1637,7 +1663,7 @@ fn writeLatestReport(
         try writer.print("{{\"binary\":\"{s}\",\"pass\":{d},\"fail\":{d}}}", .{ key, counts.pass, counts.fail });
     }
     try writer.writeAll("]}\n");
-    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = path, .data = out.items });
+    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = path, .data = writer_alloc.written() });
 }
 
 fn writeCutoverStatus(allocator: std.mem.Allocator, path: []const u8, rows: std.json.Array) !void {
@@ -1687,10 +1713,9 @@ fn writeCutoverStatus(allocator: std.mem.Allocator, path: []const u8, rows: std.
         }
     }
 
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-    const writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
-    var writer = writer_alloc.writer;
+    var writer_alloc: std.Io.Writer.Allocating = .init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
     try writer.print(
         "{{\"native_public_ownership\":true,\"preserved_matrix_parity\":{s},\"seq_surface_integrated\":{s},\"cron_deep_driver_status\":\"{s}\",\"st_deep_driver_status\":\"{s}\",\"wave_b_residuals\":[",
         .{
@@ -1702,10 +1727,10 @@ fn writeCutoverStatus(allocator: std.mem.Allocator, path: []const u8, rows: std.
     );
     for (residuals.items, 0..) |item, idx| {
         if (idx > 0) try writer.writeByte(',');
-        try writeJsonString(&writer, item);
+        try writeJsonString(writer, item);
     }
     try writer.writeAll("]}\n");
-    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = path, .data = out.items });
+    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = path, .data = writer_alloc.written() });
 }
 
 fn coverageStatusFor(binary: []const u8) []const u8 {

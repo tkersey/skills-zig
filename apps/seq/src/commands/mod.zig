@@ -330,6 +330,7 @@ const Options = struct {
     help: bool = false,
     current: bool = false,
     summary: bool = false,
+    audit: bool = false,
     next_actions: bool = false,
     latest: bool = false,
     fail_on_floor: bool = false,
@@ -514,13 +515,14 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\usage: seq section-audit --sections <csv> [--since <iso>] [--until <iso>]
         ,
         .token_usage =>
-        \\usage: seq token-usage [--since <iso>] [--until <iso>] [--path <jsonl>|--session-id <id>] [--group-by day|path] [--tz utc|local|+HH:MM|-HH:MM] [--summary] [--top N] [--format table|json|csv|jsonl]
+        \\usage: seq token-usage [--since <iso>] [--until <iso>] [--path <jsonl>|--session-id <id>] [--group-by day|path] [--tz utc|local|+HH:MM|-HH:MM] [--summary] [--audit] [--top N] [--format table|json|csv|jsonl]
         \\extra options:
         \\  --path <path>              Restrict the report to one rollout/session JSONL file
         \\  --session-id <id>          Restrict the report to one session file by session id substring
         \\  --group-by <name>          day (default) | path
         \\  --tz <name>                utc (default) | local | +HH:MM | -HH:MM
         \\  --summary                  Emit one summary row with totals and averages
+        \\  --audit                    Emit self-auditing token accounting proof fields
         ,
         .routing_gap =>
         \\usage: seq routing-gap --cue-spec <json|@path> [--discovery-skills <csv>] [--format table|json|csv|jsonl]
@@ -616,6 +618,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .session_tooling, .query_diagnose, .token_usage => true,
         else => false,
     };
+    const supports_audit = cmd == .token_usage;
     const supports_next_actions = cmd == .query_diagnose;
     const supports_latest = switch (cmd) {
         .opencode_prompts, .opencode_events => true,
@@ -770,6 +773,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.strip_skill_blocks, supports_strip_skill_blocks, "--strip-skill-blocks", cmd);
     try ensureOptionAllowed(opts.no_dedupe_exact, supports_no_dedupe_exact, "--no-dedupe-exact", cmd);
     try ensureOptionAllowed(opts.summary, supports_summary, "--summary", cmd);
+    try ensureOptionAllowed(opts.audit, supports_audit, "--audit", cmd);
     try ensureOptionAllowed(opts.next_actions, supports_next_actions, "--next-actions", cmd);
     try ensureOptionAllowed(opts.latest, supports_latest, "--latest", cmd);
     try ensureOptionAllowed(opts.floor_threshold != 3, supports_floor_threshold, "--floor-threshold", cmd);
@@ -4687,6 +4691,52 @@ const TokenUsageBucket = struct {
     rows: i64 = 0,
 };
 
+const TokenUsageAudit = struct {
+    files_scanned: i64 = 0,
+    raw_token_count_events: i64 = 0,
+    raw_token_count_info_null_events: i64 = 0,
+    raw_token_count_without_total_events: i64 = 0,
+    duplicate_total_events: i64 = 0,
+    duplicate_total_nonzero_last_events: i64 = 0,
+    duplicate_last_tokens_excluded: i64 = 0,
+    reset_events: i64 = 0,
+    naive_last_total_tokens: i64 = 0,
+
+    fn observeEvents(self: *TokenUsageAudit, events: []const datasets.token_events.Row, since_ms: ?i64, until_ms: ?i64, timezone: time_utils.TimeZone) void {
+        var prev_total_tokens: ?i64 = null;
+        for (events) |event| {
+            const ts_ms = tokenUsageEventTimestampMillis(event) orelse continue;
+            if (!timestampMillisSatisfiesBounds(ts_ms, since_ms, until_ms, timezone)) continue;
+
+            if (event.info_is_null) {
+                self.raw_token_count_info_null_events += 1;
+                continue;
+            }
+
+            self.raw_token_count_events += 1;
+            if (event.last_total_tokens) |last| self.naive_last_total_tokens += last;
+
+            const total = event.total_total_tokens orelse {
+                self.raw_token_count_without_total_events += 1;
+                continue;
+            };
+
+            if (prev_total_tokens) |prev| {
+                if (total == prev) {
+                    self.duplicate_total_events += 1;
+                    if ((event.last_total_tokens orelse 0) != 0) {
+                        self.duplicate_total_nonzero_last_events += 1;
+                        self.duplicate_last_tokens_excluded += event.last_total_tokens.?;
+                    }
+                } else if (total < prev) {
+                    self.reset_events += 1;
+                }
+            }
+            prev_total_tokens = total;
+        }
+    }
+};
+
 fn cmdTokenUsage(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
     const group_by = try TokenUsageGroupBy.parse(opts.group_by_text);
     const timezone = try time_utils.parseTimeZone(opts.timezone_text);
@@ -4696,7 +4746,8 @@ fn cmdTokenUsage(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
     const since_ms = try parseTokenUsageBoundMillis(opts.since, "--since");
     const until_ms = try parseTokenUsageBoundMillis(opts.until, "--until");
 
-    var paths = try resolveSessionPromptInputPaths(allocator, sessions_root, opts, null);
+    const day_filter = deriveSessionDayPathFilterFromOptions(opts);
+    var paths = try resolveSessionPromptInputPaths(allocator, sessions_root, opts, day_filter);
     defer freePathList(allocator, &paths);
 
     var buckets: std.ArrayList(TokenUsageBucket) = .empty;
@@ -4709,6 +4760,7 @@ fn cmdTokenUsage(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
     var included_paths: std.StringHashMap(void) = .init(allocator);
     defer deinitStringSet(allocator, &included_paths);
 
+    var audit = TokenUsageAudit{ .files_scanned = @intCast(paths.items.len) };
     var total_tokens: i64 = 0;
     var total_rows: i64 = 0;
     var min_day_buf: [10]u8 = undefined;
@@ -4716,15 +4768,20 @@ fn cmdTokenUsage(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
     var have_day_bounds = false;
 
     for (paths.items) |path| {
-        var events = try datasets.token_events.parseTokenEventsFile(allocator, path, true);
+        var events = try datasets.token_events.parseTokenEventsFileWithOptions(allocator, path, .{
+            .dedupe = !opts.audit,
+            .derive_timestamp_fields = true,
+            .include_null_info = opts.audit,
+        });
         defer events.deinit(allocator);
+        if (opts.audit) audit.observeEvents(events.items, since_ms, until_ms, timezone);
         var deltas = try datasets.token_deltas.buildDeltas(allocator, events.items, .{});
         defer deltas.deinit(allocator);
 
         for (deltas.items) |row| {
             const ts_text = row.timestamp orelse continue;
             const ts_ms = time_utils.parseIsoTimestampMillis(ts_text.slice()) orelse continue;
-            if (!timestampMillisSatisfiesBounds(ts_ms, since_ms, until_ms)) continue;
+            if (!timestampMillisSatisfiesBounds(ts_ms, since_ms, until_ms, timezone)) continue;
 
             const delta_total = row.delta_total_tokens orelse continue;
 
@@ -4778,8 +4835,9 @@ fn cmdTokenUsage(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
             since_ms,
             until_ms,
             timezone,
+            if (opts.audit) audit else null,
         );
-        const cols = [_][]const u8{
+        const summary_cols = [_][]const u8{
             "scope_kind",
             "scope_target",
             "group_by",
@@ -4796,12 +4854,50 @@ fn cmdTokenUsage(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
             "path_count",
             "rows",
         };
-        try output.writeOutput(allocator, opts.format, out_rows.items, cols[0..], opts.out_path);
+        const summary_audit_cols = [_][]const u8{
+            "row_kind",
+            "scope_kind",
+            "scope_target",
+            "group_by",
+            "tz",
+            "total_tokens",
+            "calendar_days",
+            "active_days",
+            "average_tokens_per_calendar_day",
+            "average_tokens_per_active_day",
+            "median_tokens_per_active_day",
+            "first_day",
+            "last_day",
+            "partial_current_day",
+            "path_count",
+            "rows",
+            "audit_version",
+            "audit_method",
+            "files_scanned",
+            "files_with_counted_tokens",
+            "raw_token_count_events",
+            "raw_token_count_info_null_events",
+            "raw_token_count_without_total_events",
+            "counted_delta_rows",
+            "duplicate_total_events",
+            "duplicate_total_nonzero_last_events",
+            "duplicate_last_tokens_excluded",
+            "reset_events",
+            "audit_total_tokens",
+            "naive_last_total_tokens",
+            "naive_overcount_tokens",
+            "requested_span_days",
+            "observed_span_days",
+            "bucket_days",
+        };
+        const cols = if (opts.audit) summary_audit_cols[0..] else summary_cols[0..];
+        try output.writeOutput(allocator, opts.format, out_rows.items, cols, opts.out_path);
         return;
     }
 
     for (buckets.items) |bucket| {
         var qrow = query.Row.init(allocator);
+        if (opts.audit) try qrow.putOwnedKey("row_kind", .{ .string = "bucket" });
         try qrow.putOwnedKey(group_by.fieldName(), .{ .string = bucket.key });
         try qrow.putOwnedKey("total_tokens", .{ .int = bucket.total_tokens });
         try qrow.putOwnedKey("rows", .{ .int = bucket.rows });
@@ -4813,10 +4909,83 @@ fn cmdTokenUsage(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
     }
 
     trimQueryRows(&out_rows, opts.limit);
+    if (opts.audit) {
+        try appendTokenUsageAuditRow(
+            allocator,
+            &out_rows,
+            group_by,
+            timezone_label,
+            total_tokens,
+            total_rows,
+            included_paths.count(),
+            daily_buckets.items,
+            if (have_day_bounds) min_day_buf[0..] else null,
+            if (have_day_bounds) max_day_buf[0..] else null,
+            since_ms,
+            until_ms,
+            timezone,
+            audit,
+        );
+    }
     const day_cols_extended = [_][]const u8{ "day", "total_tokens", "rows", "tz", "scope_kind" };
     const day_cols_legacy = [_][]const u8{ "day", "rows", "total_tokens" };
     const path_cols = [_][]const u8{ "path", "total_tokens", "rows", "tz", "scope_kind" };
-    const cols: []const []const u8 = switch (group_by) {
+    const day_audit_cols = [_][]const u8{
+        "row_kind",
+        "day",
+        "total_tokens",
+        "rows",
+        "tz",
+        "scope_kind",
+        "audit_version",
+        "audit_method",
+        "files_scanned",
+        "files_with_counted_tokens",
+        "raw_token_count_events",
+        "raw_token_count_info_null_events",
+        "raw_token_count_without_total_events",
+        "counted_delta_rows",
+        "duplicate_total_events",
+        "duplicate_total_nonzero_last_events",
+        "duplicate_last_tokens_excluded",
+        "reset_events",
+        "audit_total_tokens",
+        "naive_last_total_tokens",
+        "naive_overcount_tokens",
+        "requested_span_days",
+        "observed_span_days",
+        "bucket_days",
+    };
+    const path_audit_cols = [_][]const u8{
+        "row_kind",
+        "path",
+        "total_tokens",
+        "rows",
+        "tz",
+        "scope_kind",
+        "audit_version",
+        "audit_method",
+        "files_scanned",
+        "files_with_counted_tokens",
+        "raw_token_count_events",
+        "raw_token_count_info_null_events",
+        "raw_token_count_without_total_events",
+        "counted_delta_rows",
+        "duplicate_total_events",
+        "duplicate_total_nonzero_last_events",
+        "duplicate_last_tokens_excluded",
+        "reset_events",
+        "audit_total_tokens",
+        "naive_last_total_tokens",
+        "naive_overcount_tokens",
+        "requested_span_days",
+        "observed_span_days",
+        "bucket_days",
+    };
+    const cols: []const []const u8 = if (opts.audit) switch (group_by) {
+        .day => day_audit_cols[0..],
+        .path => path_audit_cols[0..],
+    } else switch (group_by) {
         .day => if (opts.timezone_text != null) day_cols_extended[0..] else day_cols_legacy[0..],
         .path => path_cols[0..],
     };
@@ -4831,11 +5000,20 @@ fn parseTokenUsageBoundMillis(raw_opt: ?[]const u8, flag_name: []const u8) !?i64
     };
 }
 
-fn timestampMillisSatisfiesBounds(ts_ms: i64, since_ms: ?i64, until_ms: ?i64) bool {
+fn tokenUsageEventTimestampMillis(event: datasets.token_events.Row) ?i64 {
+    const timestamp = event.timestamp orelse return null;
+    return time_utils.parseIsoTimestampMillis(timestamp.slice());
+}
+
+fn timestampMillisSatisfiesBounds(ts_ms: i64, since_ms: ?i64, until_ms: ?i64, timezone: time_utils.TimeZone) bool {
     if (since_ms) |value| {
         if (ts_ms < value) return false;
     }
     if (until_ms) |value| {
+        if (tokenUsageIsLocalDayBoundary(value, timezone)) {
+            if (ts_ms >= value) return false;
+            return true;
+        }
         if (ts_ms > value) return false;
     }
     return true;
@@ -4845,6 +5023,30 @@ fn tokenUsageDayKeyFromMillis(ts_ms: i64, timezone: time_utils.TimeZone, out: *[
     const date = time_utils.dateFromTimestampMillis(ts_ms, timezone) orelse return null;
     time_utils.formatDateInto(date, out);
     return out[0..];
+}
+
+fn tokenUsageRequestedSpanDays(since_ms: ?i64, until_ms: ?i64, timezone: time_utils.TimeZone) ?i64 {
+    const start_ms = since_ms orelse return null;
+    const end_ms = until_ms orelse return null;
+    const start_date = time_utils.dateFromTimestampMillis(start_ms, timezone) orelse return null;
+    const end_date = time_utils.dateFromTimestampMillis(end_ms, timezone) orelse return null;
+    var days = time_utils.daysBetweenInclusive(start_date, end_date);
+    if (days > 0 and tokenUsageIsLocalDayBoundary(end_ms, timezone)) days -= 1;
+    return @max(days, 0);
+}
+
+fn tokenUsageIsLocalDayBoundary(ts_ms: i64, timezone: time_utils.TimeZone) bool {
+    const current = time_utils.dateFromTimestampMillis(ts_ms, timezone) orelse return false;
+    const prior = time_utils.dateFromTimestampMillis(ts_ms - 1, timezone) orelse return false;
+    return current.year != prior.year or current.month != prior.month or current.day != prior.day;
+}
+
+fn tokenUsageObservedSpanDays(min_day: ?[]const u8, max_day: ?[]const u8) ?i64 {
+    const start_text = min_day orelse return null;
+    const end_text = max_day orelse return null;
+    const start_date = time_utils.parseDayLiteral(start_text) orelse return null;
+    const end_date = time_utils.parseDayLiteral(end_text) orelse return null;
+    return time_utils.daysBetweenInclusive(start_date, end_date);
 }
 
 fn addTokenUsageBucket(
@@ -4923,10 +5125,12 @@ fn appendTokenUsageSummaryRow(
     since_ms: ?i64,
     until_ms: ?i64,
     timezone: time_utils.TimeZone,
+    audit: ?TokenUsageAudit,
 ) !void {
     _ = have_day_bounds;
     var row = query.Row.init(allocator);
 
+    if (audit != null) try row.putOwnedKey("row_kind", .{ .string = "summary" });
     const scope_kind = tokenUsageScopeKind(opts, group_by);
     try row.putOwnedKey("scope_kind", .{ .string = scope_kind });
     try row.putOwnedKey("scope_target", .{ .string = tokenUsageScopeTarget(opts, sessions_root) });
@@ -4938,7 +5142,7 @@ fn appendTokenUsageSummaryRow(
 
     const start_day = try tokenUsageSummaryBoundaryDayAlloc(allocator, since_ms, timezone, min_day);
     defer if (start_day) |value| allocator.free(value);
-    const end_day = try tokenUsageSummaryBoundaryDayAlloc(allocator, until_ms, timezone, max_day);
+    const end_day = try tokenUsageSummaryEndBoundaryDayAlloc(allocator, until_ms, timezone, max_day);
     defer if (end_day) |value| allocator.free(value);
 
     if (start_day) |value| try row.putOwnedKey("first_day", .{ .string = value });
@@ -4975,7 +5179,108 @@ fn appendTokenUsageSummaryRow(
         false;
     try row.putOwnedKey("partial_current_day", .{ .bool = partial_current_day });
 
+    if (audit) |audit_value| {
+        try putTokenUsageAuditFields(
+            allocator,
+            &row,
+            audit_value,
+            total_tokens,
+            total_rows,
+            @intCast(path_count),
+            daily_buckets,
+            min_day,
+            max_day,
+            since_ms,
+            until_ms,
+            timezone,
+        );
+    }
+
     try out_rows.append(allocator, row);
+}
+
+fn appendTokenUsageAuditRow(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    group_by: TokenUsageGroupBy,
+    timezone_label: []const u8,
+    total_tokens: i64,
+    total_rows: i64,
+    path_count: usize,
+    daily_buckets: []const TokenUsageBucket,
+    min_day: ?[]const u8,
+    max_day: ?[]const u8,
+    since_ms: ?i64,
+    until_ms: ?i64,
+    timezone: time_utils.TimeZone,
+    audit: TokenUsageAudit,
+) !void {
+    var row = query.Row.init(allocator);
+    try row.putOwnedKey("row_kind", .{ .string = "audit" });
+    try row.putOwnedKey(group_by.fieldName(), .null);
+    try row.putOwnedKey("total_tokens", .{ .int = total_tokens });
+    try row.putOwnedKey("rows", .{ .int = total_rows });
+    try row.putOwnedKey("tz", .{ .string = timezone_label });
+    try row.putOwnedKey("scope_kind", .{ .string = "audit" });
+    try putTokenUsageAuditFields(
+        allocator,
+        &row,
+        audit,
+        total_tokens,
+        total_rows,
+        @intCast(path_count),
+        daily_buckets,
+        min_day,
+        max_day,
+        since_ms,
+        until_ms,
+        timezone,
+    );
+    try out_rows.append(allocator, row);
+}
+
+fn putTokenUsageAuditFields(
+    allocator: std.mem.Allocator,
+    row: *query.Row,
+    audit: TokenUsageAudit,
+    total_tokens: i64,
+    total_rows: i64,
+    path_count: i64,
+    daily_buckets: []const TokenUsageBucket,
+    min_day: ?[]const u8,
+    max_day: ?[]const u8,
+    since_ms: ?i64,
+    until_ms: ?i64,
+    timezone: time_utils.TimeZone,
+) !void {
+    const naive_overcount = if (audit.naive_last_total_tokens > total_tokens) audit.naive_last_total_tokens - total_tokens else 0;
+    try row.putOwnedKey("audit_version", .{ .int = 1 });
+    try row.putOwnedKey("audit_method", .{ .string = "monotonic_total_token_usage_deltas" });
+    try row.putOwnedKey("files_scanned", .{ .int = audit.files_scanned });
+    try row.putOwnedKey("files_with_counted_tokens", .{ .int = path_count });
+    try row.putOwnedKey("raw_token_count_events", .{ .int = audit.raw_token_count_events + audit.raw_token_count_info_null_events });
+    try row.putOwnedKey("raw_token_count_info_null_events", .{ .int = audit.raw_token_count_info_null_events });
+    try row.putOwnedKey("raw_token_count_without_total_events", .{ .int = audit.raw_token_count_without_total_events });
+    try row.putOwnedKey("counted_delta_rows", .{ .int = total_rows });
+    try row.putOwnedKey("duplicate_total_events", .{ .int = audit.duplicate_total_events });
+    try row.putOwnedKey("duplicate_total_nonzero_last_events", .{ .int = audit.duplicate_total_nonzero_last_events });
+    try row.putOwnedKey("duplicate_last_tokens_excluded", .{ .int = audit.duplicate_last_tokens_excluded });
+    try row.putOwnedKey("reset_events", .{ .int = audit.reset_events });
+    try row.putOwnedKey("audit_total_tokens", .{ .int = total_tokens });
+    try row.putOwnedKey("naive_last_total_tokens", .{ .int = audit.naive_last_total_tokens });
+    try row.putOwnedKey("naive_overcount_tokens", .{ .int = naive_overcount });
+    if (tokenUsageRequestedSpanDays(since_ms, until_ms, timezone)) |days| {
+        try row.putOwnedKey("requested_span_days", .{ .int = days });
+    } else {
+        try row.putOwnedKey("requested_span_days", .null);
+    }
+    if (tokenUsageObservedSpanDays(min_day, max_day)) |days| {
+        try row.putOwnedKey("observed_span_days", .{ .int = days });
+    } else {
+        try row.putOwnedKey("observed_span_days", .null);
+    }
+    try row.putOwnedKey("bucket_days", .{ .int = @intCast(daily_buckets.len) });
+    _ = allocator;
 }
 
 fn tokenUsageSummaryBoundaryDayAlloc(
@@ -4986,6 +5291,23 @@ fn tokenUsageSummaryBoundaryDayAlloc(
 ) !?[]u8 {
     if (bound_ms) |value| {
         const date = time_utils.dateFromTimestampMillis(value, timezone) orelse return null;
+        var buf: [10]u8 = undefined;
+        time_utils.formatDateInto(date, &buf);
+        return try allocator.dupe(u8, buf[0..]);
+    }
+    const fallback = fallback_day orelse return null;
+    return try allocator.dupe(u8, fallback);
+}
+
+fn tokenUsageSummaryEndBoundaryDayAlloc(
+    allocator: std.mem.Allocator,
+    bound_ms: ?i64,
+    timezone: time_utils.TimeZone,
+    fallback_day: ?[]const u8,
+) !?[]u8 {
+    if (bound_ms) |value| {
+        const effective_ms = if (tokenUsageIsLocalDayBoundary(value, timezone)) value - 1 else value;
+        const date = time_utils.dateFromTimestampMillis(effective_ms, timezone) orelse return null;
         var buf: [10]u8 = undefined;
         time_utils.formatDateInto(date, &buf);
         return try allocator.dupe(u8, buf[0..]);
@@ -7263,6 +7585,8 @@ fn parseOptions(args: []const []const u8) !Options {
             opts.no_dedupe_exact = true;
         } else if (std.mem.eql(u8, arg, "--summary")) {
             opts.summary = true;
+        } else if (std.mem.eql(u8, arg, "--audit")) {
+            opts.audit = true;
         } else if (std.mem.eql(u8, arg, "--next-actions")) {
             opts.next_actions = true;
         } else if (std.mem.eql(u8, arg, "--latest")) {
@@ -7912,6 +8236,7 @@ test "parse options supports common flags" {
         "--strip-skill-blocks",
         "--no-dedupe-exact",
         "--summary",
+        "--audit",
         "--next-actions",
         "--current",
         "--latest",
@@ -7959,6 +8284,7 @@ test "parse options supports common flags" {
     try std.testing.expect(opts.strip_skill_blocks);
     try std.testing.expect(opts.no_dedupe_exact);
     try std.testing.expect(opts.summary);
+    try std.testing.expect(opts.audit);
     try std.testing.expect(opts.next_actions);
     try std.testing.expect(opts.current);
     try std.testing.expect(opts.latest);
@@ -8013,6 +8339,92 @@ test "token-usage summary rebuckets by timezone and computes averages from exact
     try std.testing.expect(std.mem.indexOf(u8, got, "\"partial_current_day\": false") != null);
 }
 
+test "token-usage audit summary reports duplicate/reset/null/missing-total proof fields" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/03/26");
+    const session_rel = "2026/03/26/rollout-2026-03-26T00-00-00-019c0000-0000-7000-8000-000000000100.jsonl";
+    const session_content =
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-26T07:00:00Z\",\"payload\":{\"type\":\"token_count\",\"info\":null}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-26T07:10:00Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":10},\"last_token_usage\":{\"total_tokens\":10}}}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-26T07:11:00Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":10},\"last_token_usage\":{\"total_tokens\":7}}}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-26T07:12:00Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"total_tokens\":4}}}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-26T07:13:00Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":25},\"last_token_usage\":{\"total_tokens\":15}}}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-26T07:14:00Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":5},\"last_token_usage\":{\"total_tokens\":5}}}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = session_rel, .data = session_content });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "token-usage-audit-summary.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const args = [_][]const u8{
+        "--root", root_abs,
+        "--since", "2026-03-26T00:00:00-07:00",
+        "--until", "2026-03-27T00:00:00-07:00",
+        "--tz", "-07:00",
+        "--summary",
+        "--audit",
+        "--format", "json",
+    };
+    const got = try runCommandWithOutput(std.testing.allocator, .token_usage, args[0..], output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"row_kind\": \"summary\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"total_tokens\": 30") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"calendar_days\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"last_day\": \"2026-03-26\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"rows\": 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"raw_token_count_events\": 6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"raw_token_count_info_null_events\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"raw_token_count_without_total_events\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"duplicate_total_events\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"duplicate_total_nonzero_last_events\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"duplicate_last_tokens_excluded\": 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"reset_events\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"audit_total_tokens\": 30") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"naive_last_total_tokens\": 41") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"naive_overcount_tokens\": 11") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"requested_span_days\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"observed_span_days\": 1") != null);
+}
+
+test "token-usage audit grouped output appends aggregate audit row after trimming buckets" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/03/26");
+    const session_rel = "2026/03/26/rollout-2026-03-26T00-00-00-019c0000-0000-7000-8000-000000000101.jsonl";
+    const session_content =
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-26T07:10:00Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":10},\"last_token_usage\":{\"total_tokens\":10}}}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-26T07:11:00Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":10},\"last_token_usage\":{\"total_tokens\":7}}}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-26T07:13:00Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":25},\"last_token_usage\":{\"total_tokens\":15}}}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = session_rel, .data = session_content });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "token-usage-audit-grouped.jsonl" });
+    defer std.testing.allocator.free(output_path);
+
+    const args = [_][]const u8{
+        "--root", root_abs,
+        "--since", "2026-03-26T00:00:00-07:00",
+        "--until", "2026-03-27T00:00:00-07:00",
+        "--tz", "-07:00",
+        "--audit",
+        "--top", "1",
+        "--format", "jsonl",
+    };
+    const got = try runCommandWithOutput(std.testing.allocator, .token_usage, args[0..], output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"row_kind\":\"bucket\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"row_kind\":\"audit\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"audit_total_tokens\":25") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"duplicate_last_tokens_excluded\":7") != null);
+}
+
 test "parseOptions rejects unknown option" {
     const args = [_][]const u8{"--bogus"};
     try std.testing.expectError(error.UnknownArgument, parseOptions(args[0..]));
@@ -8020,6 +8432,11 @@ test "parseOptions rejects unknown option" {
 
 test "validateCommandOptions rejects unsupported path on skill-report" {
     const opts = Options{ .path = "/tmp/session.jsonl" };
+    try std.testing.expectError(error.UnsupportedOption, validateCommandOptions(.skill_report, opts));
+}
+
+test "validateCommandOptions rejects unsupported audit on skill-report" {
+    const opts = Options{ .audit = true };
     try std.testing.expectError(error.UnsupportedOption, validateCommandOptions(.skill_report, opts));
 }
 

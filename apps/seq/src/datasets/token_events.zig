@@ -37,6 +37,7 @@ pub const Row = struct {
     day: ?SmallText = null,
     week: ?SmallText = null,
     month: ?SmallText = null,
+    info_is_null: bool = false,
     model_context_window: ?i64 = null,
     total_input_tokens: ?i64 = null,
     total_cached_input_tokens: ?i64 = null,
@@ -53,6 +54,7 @@ pub const Row = struct {
 pub const ParseOptions = struct {
     dedupe: bool = true,
     derive_timestamp_fields: bool = true,
+    include_null_info: bool = false,
 };
 
 const FieldEntry = struct {
@@ -173,7 +175,7 @@ fn appendParsedLine(
     prev_total_tokens: *?i64,
     line: []const u8,
 ) !void {
-    const maybe_row = try parseTokenCountLineWithOptions(line, path, options.derive_timestamp_fields);
+    const maybe_row = try parseTokenCountLineWithOptions(line, path, options);
     const row = maybe_row orelse return;
 
     if (options.dedupe and
@@ -189,13 +191,13 @@ fn appendParsedLine(
 }
 
 pub fn parseTokenCountLine(line: []const u8, path: []const u8) !?Row {
-    return parseTokenCountLineWithOptions(line, path, true);
+    return parseTokenCountLineWithOptions(line, path, .{});
 }
 
 fn parseTokenCountLineWithOptions(
     line: []const u8,
     path: []const u8,
-    derive_timestamp_fields: bool,
+    options: ParseOptions,
 ) !?Row {
     const trimmed = trimLine(line);
     if (trimmed.len == 0) return null;
@@ -219,15 +221,9 @@ fn parseTokenCountLineWithOptions(
     const payload_type = lookupIndexedField(payload_fields, "type") orelse return null;
     if (!valueEqString(payload_type, "token_count")) return null;
 
-    const info_value = lookupIndexedField(payload_fields, "info") orelse return null;
-    const info = jsonObjectSlice(info_value) orelse return null;
-
-    var info_storage: [max_info_field_entries]FieldEntry = undefined;
-    const info_fields = indexObjectFields(info, info_storage[0..]) orelse return null;
-
     var row = Row{ .path = path };
 
-    if (derive_timestamp_fields) {
+    if (options.derive_timestamp_fields) {
         if (lookupIndexedField(root_fields, "timestamp")) |timestamp_json| {
             if (jsonStringSlice(timestamp_json)) |ts_raw| {
                 var ts_buf: [64]u8 = undefined;
@@ -241,6 +237,18 @@ fn parseTokenCountLineWithOptions(
             }
         }
     }
+
+    const info_value = lookupIndexedField(payload_fields, "info") orelse return null;
+    if (valueEqLiteral(info_value, "null")) {
+        if (!options.include_null_info) return null;
+        row.info_is_null = true;
+        return row;
+    }
+
+    const info = jsonObjectSlice(info_value) orelse return null;
+
+    var info_storage: [max_info_field_entries]FieldEntry = undefined;
+    const info_fields = indexObjectFields(info, info_storage[0..]) orelse return null;
 
     if (lookupIndexedField(info_fields, "model_context_window")) |model_context_window_value| {
         row.model_context_window = jsonInt(model_context_window_value);
@@ -400,6 +408,11 @@ fn lookupIndexedField(fields: []const FieldEntry, key: []const u8) ?[]const u8 {
 fn valueEqString(value_text: []const u8, expected: []const u8) bool {
     const str = jsonStringSlice(value_text) orelse return false;
     return jsonStringContentEquals(str, expected);
+}
+
+fn valueEqLiteral(value_text: []const u8, expected: []const u8) bool {
+    const trimmed = trimLine(value_text);
+    return std.mem.eql(u8, trimmed, expected);
 }
 
 fn usageKeyIndexFromRaw(raw_key: []const u8) ?usize {
@@ -782,6 +795,7 @@ fn expectRowsEqual(got: Row, want: Row) !void {
     try expectOptionalSmallTextEqual(got.day, want.day);
     try expectOptionalSmallTextEqual(got.week, want.week);
     try expectOptionalSmallTextEqual(got.month, want.month);
+    try std.testing.expectEqual(want.info_is_null, got.info_is_null);
     try std.testing.expectEqual(want.model_context_window, got.model_context_window);
     try std.testing.expectEqual(want.total_input_tokens, got.total_input_tokens);
     try std.testing.expectEqual(want.total_cached_input_tokens, got.total_cached_input_tokens);

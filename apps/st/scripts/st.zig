@@ -4403,58 +4403,8 @@ fn emitPlanSyncWithPolicy(
     try writer.writeAll("]}}\n");
 }
 
-fn writeCodexPlan(allocator: std.mem.Allocator, writer: anytype, rows: []const EnrichedItem) !void {
-    const result = try computeProjectionResultFromRows(allocator, rows, .{ .target = .codex });
-    try writeCodexProjectionEntries(writer, result.codex_plan);
-}
-
-fn hasMirroredPlanEntries(rows: []const EnrichedItem) bool {
-    for (rows) |row| {
-        if (isCodexProjectableRow(row, .{ .target = .codex }, null)) return true;
-    }
-    return false;
-}
-
-fn writeCodexPlanEntry(allocator: std.mem.Allocator, writer: anytype, row: EnrichedItem) !void {
-    const step_text = try codexPlanStepAlloc(allocator, row.item.*);
-    try writer.writeAll("{\"step\":");
-    try std.json.Stringify.value(step_text, .{}, writer);
-    try writer.writeAll(",\"status\":");
-    try std.json.Stringify.value(codexPlanStatusForRow(row), .{}, writer);
-    try writer.writeByte('}');
-}
-
 fn codexPlanStepAlloc(allocator: std.mem.Allocator, item: Item) ![]const u8 {
     return try std.fmt.allocPrint(allocator, "[{s}] {s}", .{ item.id, item.step });
-}
-
-fn codexPlanStatusForRow(row: EnrichedItem) []const u8 {
-    var mapped = switch (row.item.status) {
-        .in_progress => "in_progress",
-        .completed => "completed",
-        .pending, .blocked, .deferred, .canceled => "pending",
-    };
-    if (row.dep_state == .waiting_on_deps and std.mem.eql(u8, mapped, "in_progress")) {
-        mapped = "pending";
-    }
-    return mapped;
-}
-
-fn writeOpencodeTodos(writer: anytype, rows: []const EnrichedItem) !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const result = try computeProjectionResultFromRows(arena.allocator(), rows, .{ .target = .opencode });
-    try writeOpencodeProjectionEntries(writer, result.opencode_todos);
-}
-
-fn writeOpencodeTodoEntry(writer: anytype, row: EnrichedItem) !void {
-    try writer.writeAll("{\"content\":");
-    try std.json.Stringify.value(row.item.step, .{}, writer);
-    try writer.writeAll(",\"status\":");
-    try std.json.Stringify.value(opencodeTodoStatusForRow(row), .{}, writer);
-    try writer.writeAll(",\"priority\":");
-    try std.json.Stringify.value(row.item.priority.asString(), .{}, writer);
-    try writer.writeByte('}');
 }
 
 fn opencodeTodoStatusForRow(row: EnrichedItem) []const u8 {
@@ -5975,16 +5925,6 @@ fn deleteSessionGuardState(allocator: std.mem.Allocator, session_id: []const u8,
     var dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), parent, .{});
     defer dir.close(std.Io.Threaded.global_single_threaded.io());
     try dir.deleteFile(std.Io.Threaded.global_single_threaded.io(), base);
-}
-
-fn writeGuardDecision(writer: anytype, status: []const u8, reason: []const u8) !void {
-    try writer.writeAll("{\"status\":");
-    try std.json.Stringify.value(status, .{}, writer);
-    if (reason.len > 0) {
-        try writer.writeAll(",\"reason\":");
-        try std.json.Stringify.value(reason, .{}, writer);
-    }
-    try writer.writeAll("}\n");
 }
 
 fn writeGuardDeny(writer: anytype, hook_json: bool, reason: []const u8) !void {
