@@ -462,10 +462,14 @@ pub const Payload = struct {
     manifests: []const ManifestHint,
     repo_kind_hints: []const RepoKindHint,
     repo_path: []const u8,
+    read_depth_verdict: []const u8,
     requested_focus_paths: []const []const u8,
     runtime_boundary_hints: []const RuntimeHint,
     scan_coverage: ScanCoverage,
+    suggested_focus_paths: []const []const u8,
     subsystem_hints: []const SubsystemHint,
+    thin_signal_classes: []const []const u8,
+    followup_hint: []const u8,
     top_level_dirs: []const []const u8,
 };
 
@@ -503,6 +507,13 @@ const SignalBuilder = struct {
     fn appendEvidence(self: *SignalBuilder, allocator: std.mem.Allocator, value: []const u8) !void {
         try self.evidence.append(allocator, value);
     }
+};
+
+const ReadDepthDiagnostics = struct {
+    verdict: []const u8,
+    thin_signal_classes: []const []const u8,
+    suggested_focus_paths: []const []const u8,
+    followup_hint: []const u8,
 };
 
 pub fn collect(allocator: std.mem.Allocator, repo_path: []const u8, options: CollectOptions) !Payload {
@@ -553,6 +564,26 @@ pub fn collect(allocator: std.mem.Allocator, repo_path: []const u8, options: Col
 
     const confidence_gaps = try uniqueSortedStrings(allocator, confidence_gaps_list.items);
     const requested_focus_paths = try cloneStringSlice(allocator, options.focus_paths);
+    const evidence_summary = EvidenceSummary{
+        .dependency_direction_hints = dependency_hints.len,
+        .docs_claims = docs_claims.len,
+        .entrypoint_hints = entrypoint_hints.len,
+        .focus_path_observations = focus_observations.len,
+        .manifests = manifests.len,
+        .runtime_boundary_hints = runtime_hints.len,
+        .subsystem_hints = subsystem_hints.len,
+    };
+    const read_depth = try computeReadDepthDiagnostics(
+        allocator,
+        root_abs,
+        top_level_dirs,
+        manifests,
+        repo_kind_hints,
+        architecture_signals,
+        evidence_summary,
+        file_scan.coverage,
+        options.focus_paths,
+    );
 
     return .{
         .architecture_signals = architecture_signals,
@@ -560,19 +591,12 @@ pub fn collect(allocator: std.mem.Allocator, repo_path: []const u8, options: Col
         .dependency_direction_hints = dependency_hints,
         .docs_claims = docs_claims,
         .entrypoint_hints = entrypoint_hints,
-        .evidence_summary = .{
-            .dependency_direction_hints = dependency_hints.len,
-            .docs_claims = docs_claims.len,
-            .entrypoint_hints = entrypoint_hints.len,
-            .focus_path_observations = focus_observations.len,
-            .manifests = manifests.len,
-            .runtime_boundary_hints = runtime_hints.len,
-            .subsystem_hints = subsystem_hints.len,
-        },
+        .evidence_summary = evidence_summary,
         .focus_path_observations = focus_observations,
         .manifests = manifests,
         .repo_kind_hints = repo_kind_hints,
         .repo_path = root_abs,
+        .read_depth_verdict = read_depth.verdict,
         .requested_focus_paths = requested_focus_paths,
         .runtime_boundary_hints = runtime_hints,
         .scan_coverage = .{
@@ -584,7 +608,10 @@ pub fn collect(allocator: std.mem.Allocator, repo_path: []const u8, options: Col
             .total_text_files_seen = file_scan.coverage.total_text_files_seen,
             .truncated_reads = file_scan.coverage.truncated_reads,
         },
+        .suggested_focus_paths = read_depth.suggested_focus_paths,
         .subsystem_hints = subsystem_hints,
+        .thin_signal_classes = read_depth.thin_signal_classes,
+        .followup_hint = read_depth.followup_hint,
         .top_level_dirs = top_level_dirs,
     };
 }
@@ -596,6 +623,191 @@ pub fn writeJson(writer: anytype, payload: Payload) !void {
         .escape_unicode = true,
     })});
     try writer.writeByte('\n');
+}
+
+fn computeReadDepthDiagnostics(
+    allocator: std.mem.Allocator,
+    root_abs: []const u8,
+    top_level_dirs: []const []const u8,
+    manifests: []const ManifestHint,
+    repo_kind_hints: []const RepoKindHint,
+    architecture_signals: []const SignalEntry,
+    evidence_summary: EvidenceSummary,
+    coverage: ScanCoverage,
+    focus_paths: []const []const u8,
+) !ReadDepthDiagnostics {
+    var thin_classes = std.ArrayList([]const u8).empty;
+    var evidence_surfaces: usize = 0;
+
+    if (repo_kind_hints.len > 0) {
+        evidence_surfaces += 1;
+    } else {
+        try thin_classes.append(allocator, "repo_kind_hints");
+    }
+
+    if (evidence_summary.manifests > 0) {
+        evidence_surfaces += 1;
+    } else {
+        try thin_classes.append(allocator, "manifests");
+    }
+    if (evidence_summary.docs_claims > 0) {
+        evidence_surfaces += 1;
+    } else {
+        try thin_classes.append(allocator, "docs_claims");
+    }
+    if (evidence_summary.entrypoint_hints > 0) {
+        evidence_surfaces += 1;
+    } else {
+        try thin_classes.append(allocator, "entrypoint_hints");
+    }
+    if (evidence_summary.dependency_direction_hints > 0) {
+        evidence_surfaces += 1;
+    } else {
+        try thin_classes.append(allocator, "dependency_direction_hints");
+    }
+    if (evidence_summary.runtime_boundary_hints > 0) {
+        evidence_surfaces += 1;
+    } else {
+        try thin_classes.append(allocator, "runtime_boundary_hints");
+    }
+    if (evidence_summary.subsystem_hints > 0) {
+        evidence_surfaces += 1;
+    } else {
+        try thin_classes.append(allocator, "subsystem_hints");
+    }
+
+    const top_score = if (architecture_signals.len > 0) architecture_signals[0].score else 0;
+    if (top_score >= 4) {
+        evidence_surfaces += 1;
+    } else {
+        try thin_classes.append(allocator, "top_architecture_signal");
+    }
+    if (architecture_signals.len == 0) try thin_classes.append(allocator, "architecture_signals");
+    if (coverage.total_files_seen > coverage.files_considered) try thin_classes.append(allocator, "file_scan_cap");
+    if (coverage.total_text_files_seen > coverage.text_files_considered) try thin_classes.append(allocator, "text_scan_cap");
+    if (coverage.read_errors > 0) try thin_classes.append(allocator, "read_errors");
+    if (coverage.truncated_reads > 0) try thin_classes.append(allocator, "truncated_reads");
+
+    const unique_thin_classes = try uniqueSortedStrings(allocator, thin_classes.items);
+    if (focus_paths.len > 0) {
+        return .{
+            .verdict = "focused",
+            .thin_signal_classes = unique_thin_classes,
+            .suggested_focus_paths = &.{},
+            .followup_hint = "",
+        };
+    }
+
+    const thin_repo_wide = architecture_signals.len == 0 or
+        evidence_surfaces < 3 or
+        (repo_kind_hints.len == 0 and top_score <= 2);
+
+    const suggested_focus_paths = if (thin_repo_wide)
+        try suggestFocusPaths(allocator, root_abs, top_level_dirs, manifests)
+    else
+        &.{};
+
+    return .{
+        .verdict = if (thin_repo_wide) "thin_repo_wide" else "repo_wide_ok",
+        .thin_signal_classes = unique_thin_classes,
+        .suggested_focus_paths = suggested_focus_paths,
+        .followup_hint = if (thin_repo_wide and suggested_focus_paths.len > 0)
+            "Repo-wide signals are thin. Rerun collect with the suggested focus paths before broader manual inspection."
+        else
+            "",
+    };
+}
+
+fn suggestFocusPaths(
+    allocator: std.mem.Allocator,
+    root_abs: []const u8,
+    top_level_dirs: []const []const u8,
+    manifests: []const ManifestHint,
+) ![]const []const u8 {
+    var paths = std.ArrayList([]const u8).empty;
+    for (manifests) |manifest| try appendUniquePath(allocator, &paths, manifest.path);
+
+    const preferred_dirs = [_][]const u8{
+        "src",
+        "app",
+        "apps",
+        "packages",
+        "cmd",
+        "cli",
+        "lib",
+        "internal",
+        "core",
+        "services",
+        "modules",
+        "plugins",
+        "providers",
+        "hooks",
+        "pipelines",
+        "workflows",
+        "dags",
+        "jobs",
+        "etl",
+        "infra",
+        "terraform",
+        "helm",
+        "k8s",
+        "ops",
+        "tools",
+        "codex",
+        "nvim",
+        ".config",
+        ".github",
+        "docs",
+        "test",
+        "tests",
+        "examples",
+        "bench",
+        "benches",
+    };
+    for (preferred_dirs) |candidate| {
+        if (containsString(top_level_dirs, candidate)) try appendUniquePath(allocator, &paths, candidate);
+    }
+
+    const preferred_files = [_][]const u8{
+        "README.md",
+        "README",
+        "ARCHITECTURE.md",
+        "FORMAL_CORE.md",
+        "AGENTS.md",
+        "docs/ARCHITECTURE.md",
+        "docs/research_decision.md",
+    };
+    for (preferred_files) |candidate| {
+        if (repoPathExists(root_abs, candidate)) try appendUniquePath(allocator, &paths, candidate);
+    }
+
+    return try paths.toOwnedSlice(allocator);
+}
+
+fn appendUniquePath(
+    allocator: std.mem.Allocator,
+    paths: *std.ArrayList([]const u8),
+    candidate: []const u8,
+) !void {
+    if (candidate.len == 0) return;
+    for (paths.items) |existing| {
+        if (std.mem.eql(u8, existing, candidate)) return;
+    }
+    try paths.append(allocator, try allocator.dupe(u8, candidate));
+}
+
+fn containsString(items: []const []const u8, target: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item, target)) return true;
+    }
+    return false;
+}
+
+fn repoPathExists(root_abs: []const u8, rel_path: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), root_abs, .{}) catch return false;
+    defer dir.close(std.Io.Threaded.global_single_threaded.io());
+    _ = dir.statFile(std.Io.Threaded.global_single_threaded.io(), rel_path, .{}) catch return false;
+    return true;
 }
 
 const FileScanResult = struct {

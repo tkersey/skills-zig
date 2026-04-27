@@ -16,9 +16,13 @@ const FocusExpectation = struct {
 const Case = struct {
     expected_docs_claim_regex: ?[]const u8 = null,
     expected_repo_kind: ?[]const u8 = null,
+    expected_read_depth_verdict: ?[]const u8 = null,
+    expected_suggested_focus_paths: []const []const u8 = &.{},
+    expected_thin_signal_classes: []const []const u8 = &.{},
     expected_top_signal: ?[]const u8 = null,
     focus_expectations: []const FocusExpectation = &.{},
     focus_paths: []const []const u8 = &.{},
+    forbidden_suggested_focus_paths: []const []const u8 = &.{},
     forbidden_top_signals: []const []const u8 = &.{},
     id: []const u8,
     min_dependency_hint_count: ?usize = null,
@@ -65,7 +69,7 @@ fn parseSuiteYaml(allocator: std.mem.Allocator, bytes: []const u8) !Suite {
     var version: ?usize = null;
     var cases = std.ArrayList(Case).empty;
     var current: ?Case = null;
-    var active_list: enum { none, focus_paths, forbidden, focus_expectations } = .none;
+    var active_list: enum { none, focus_paths, forbidden, focus_expectations, expected_thin_classes, expected_suggestions, forbidden_suggestions } = .none;
     var pending_focus: ?FocusExpectation = null;
 
     var lines = std.mem.splitScalar(u8, bytes, '\n');
@@ -116,6 +120,24 @@ fn parseSuiteYaml(allocator: std.mem.Allocator, bytes: []const u8) !Suite {
                     try list.append(allocator, item);
                     current.?.forbidden_top_signals = try list.toOwnedSlice(allocator);
                 },
+                .expected_thin_classes => {
+                    var list = std.ArrayList([]const u8).empty;
+                    try list.appendSlice(allocator, current.?.expected_thin_signal_classes);
+                    try list.append(allocator, item);
+                    current.?.expected_thin_signal_classes = try list.toOwnedSlice(allocator);
+                },
+                .expected_suggestions => {
+                    var list = std.ArrayList([]const u8).empty;
+                    try list.appendSlice(allocator, current.?.expected_suggested_focus_paths);
+                    try list.append(allocator, item);
+                    current.?.expected_suggested_focus_paths = try list.toOwnedSlice(allocator);
+                },
+                .forbidden_suggestions => {
+                    var list = std.ArrayList([]const u8).empty;
+                    try list.appendSlice(allocator, current.?.forbidden_suggested_focus_paths);
+                    try list.append(allocator, item);
+                    current.?.forbidden_suggested_focus_paths = try list.toOwnedSlice(allocator);
+                },
                 else => {},
             }
             continue;
@@ -150,6 +172,11 @@ fn parseSuiteYaml(allocator: std.mem.Allocator, bytes: []const u8) !Suite {
             active_list = .none;
             continue;
         }
+        if (std.mem.eql(u8, key, "expected_read_depth_verdict")) {
+            current.?.expected_read_depth_verdict = try allocator.dupe(u8, parseScalar(raw_value));
+            active_list = .none;
+            continue;
+        }
         if (std.mem.eql(u8, key, "expected_docs_claim_regex")) {
             current.?.expected_docs_claim_regex = try allocator.dupe(u8, parseScalar(raw_value));
             active_list = .none;
@@ -176,6 +203,18 @@ fn parseSuiteYaml(allocator: std.mem.Allocator, bytes: []const u8) !Suite {
         }
         if (std.mem.eql(u8, key, "forbidden_top_signals")) {
             active_list = .forbidden;
+            continue;
+        }
+        if (std.mem.eql(u8, key, "expected_thin_signal_classes")) {
+            active_list = .expected_thin_classes;
+            continue;
+        }
+        if (std.mem.eql(u8, key, "expected_suggested_focus_paths")) {
+            active_list = .expected_suggestions;
+            continue;
+        }
+        if (std.mem.eql(u8, key, "forbidden_suggested_focus_paths")) {
+            active_list = .forbidden_suggestions;
             continue;
         }
         if (std.mem.eql(u8, key, "focus_expectations")) {
@@ -220,6 +259,26 @@ fn validateCase(allocator: std.mem.Allocator, case: Case, payload: collector.Pay
     if (case.expected_docs_claim_regex) |pattern| {
         if (!docsClaimsContain(payload.docs_claims, pattern)) {
             try failures.append(allocator, try std.fmt.allocPrint(allocator, "docs claim regex did not match: '{s}'", .{pattern}));
+        }
+    }
+    if (case.expected_read_depth_verdict) |expected| {
+        if (!std.mem.eql(u8, payload.read_depth_verdict, expected)) {
+            try failures.append(allocator, try std.fmt.allocPrint(allocator, "expected read_depth_verdict '{s}', got '{s}'", .{ expected, payload.read_depth_verdict }));
+        }
+    }
+    for (case.expected_thin_signal_classes) |expected| {
+        if (!stringSliceContains(payload.thin_signal_classes, expected)) {
+            try failures.append(allocator, try std.fmt.allocPrint(allocator, "expected thin_signal_classes to contain '{s}'", .{expected}));
+        }
+    }
+    for (case.expected_suggested_focus_paths) |expected| {
+        if (!stringSliceContains(payload.suggested_focus_paths, expected)) {
+            try failures.append(allocator, try std.fmt.allocPrint(allocator, "expected suggested_focus_paths to contain '{s}'", .{expected}));
+        }
+    }
+    for (case.forbidden_suggested_focus_paths) |forbidden| {
+        if (stringSliceContains(payload.suggested_focus_paths, forbidden)) {
+            try failures.append(allocator, try std.fmt.allocPrint(allocator, "forbidden suggested_focus_path '{s}' was emitted", .{forbidden}));
         }
     }
     if (case.min_runtime_hint_count) |minimum| {
@@ -276,6 +335,13 @@ fn findObservation(observations: []const collector.FocusObservation, path: []con
         if (std.mem.eql(u8, observation.path, path)) return observation;
     }
     return null;
+}
+
+fn stringSliceContains(items: []const []const u8, expected: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item, expected)) return true;
+    }
+    return false;
 }
 
 fn joinRepoKinds(allocator: std.mem.Allocator, hints: []const collector.RepoKindHint) ![]const u8 {

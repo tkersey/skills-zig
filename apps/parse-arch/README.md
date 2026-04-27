@@ -11,6 +11,8 @@ Native Zig CLI for repository architecture signal collection.
 - No Python runtime or shell delegation in shipped command paths.
 - `collect` accepts a positional `repo_path` plus the observed compatibility aliases `--repo-path`, `--repo`, `--json`, and `--format json`.
 - `collect` still uses repeatable `--focus-path` and `--read-limit`, and always emits JSON.
+- `collect` always emits read-depth diagnostics: `read_depth_verdict`, `thin_signal_classes`, `suggested_focus_paths`, and `followup_hint`.
+- `read_depth_verdict` is `repo_wide_ok`, `thin_repo_wide`, or `focused`; focused runs never emit follow-up suggestions.
 - `collect` is fail-closed when repo selectors are mixed in one invocation or when `--format` is given any non-`json` value.
 - `eval` owns the YAML fixture suite under `apps/parse-arch/references/eval`.
 - `doctor` is fail-closed and exits non-zero when suite loading or collector readiness fails.

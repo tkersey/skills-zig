@@ -1,0 +1,5 @@
+[ui]
+theme = "solid"
+
+[plugins]
+enabled = ["example"]
