@@ -1,0 +1,13 @@
+{"type":"session_meta","timestamp":"2026-04-01T12:00:00Z","payload":{"id":"tools","cwd":"/tools","model":"gpt-5"}}
+{"type":"event_msg","timestamp":"2026-04-01T12:00:01Z","payload":{"type":"task_started","turn_id":"tools-turn"}}
+{"type":"response_item","timestamp":"2026-04-01T12:00:02Z","payload":{"type":"function_call","name":"exec_command","call_id":"exec-ok","arguments":"{\"cmd\":\"true\",\"cwd\":\"/tools\"}"}}
+{"type":"event_msg","timestamp":"2026-04-01T12:00:03Z","payload":{"type":"exec_command_end","turn_id":"tools-turn","call_id":"exec-ok","command":"true","cwd":"/tools","exit_code":0,"duration_ms":5,"stdout":"","status":"completed"}}
+{"type":"response_item","timestamp":"2026-04-01T12:00:04Z","payload":{"type":"function_call","name":"exec_command","call_id":"exec-fail","arguments":"{\"cmd\":\"false\",\"cwd\":\"/tools\"}"}}
+{"type":"event_msg","timestamp":"2026-04-01T12:00:05Z","payload":{"type":"exec_command_end","turn_id":"tools-turn","call_id":"exec-fail","command":"false","cwd":"/tools","exit_code":1,"duration_ms":6,"stderr":"failed","status":"failed"}}
+{"type":"response_item","timestamp":"2026-04-01T12:00:06Z","payload":{"type":"function_call","name":"mcp__srv__lookup","call_id":"mcp-1","arguments":"{\"q\":\"x\"}"}}
+{"type":"event_msg","timestamp":"2026-04-01T12:00:07Z","payload":{"type":"mcp_tool_call_end","turn_id":"tools-turn","call_id":"mcp-1","invocation":{"server":"srv","tool":"lookup"},"duration_ms":7,"success":true}}
+{"type":"response_item","timestamp":"2026-04-01T12:00:08Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-1","arguments":"{}"}}
+{"type":"event_msg","timestamp":"2026-04-01T12:00:09Z","payload":{"type":"patch_apply_end","turn_id":"tools-turn","call_id":"patch-1","success":true,"changes":{"files":1}}}
+{"type":"event_msg","timestamp":"2026-04-01T12:00:10Z","payload":{"type":"web_search_end","turn_id":"tools-turn","call_id":"web-1","query":"codex trace","action":{"url":"https://example.invalid"}}}
+{"type":"event_msg","timestamp":"2026-04-01T12:00:11Z","payload":{"type":"collab_agent_spawn_end","turn_id":"tools-turn","call_id":"spawn-1","new_thread_id":"worker","agent_nickname":"worker","agent_role":"explorer","model":"gpt-5","reasoning_effort":"medium","prompt":"inspect trace"}}
+{"type":"response_item","timestamp":"2026-04-01T12:00:12Z","payload":{"type":"function_call","name":"exec_command","call_id":"pending-1","arguments":"{\"cmd\":\"sleep\"}"}}

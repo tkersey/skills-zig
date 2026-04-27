@@ -1,0 +1,11 @@
+{"type":"session_meta","timestamp":"2026-04-01T10:00:00Z","payload":{"id":"new-session","cwd":"/repo","originator":"codex_cli","cli_version":"0.44.0","model":"gpt-5","model_provider":"openai","git":{"branch":"main","commit_hash":"abc123","repository_url":"https://example.invalid/repo.git"}}}
+{"type":"event_msg","timestamp":"2026-04-01T10:00:01Z","payload":{"type":"task_started","turn_id":"turn-a"}}
+{"type":"turn_context","timestamp":"2026-04-01T10:00:01Z","payload":{"model":"gpt-5","cwd":"/repo","reasoning_effort":"high"}}
+{"type":"event_msg","timestamp":"2026-04-01T10:00:02Z","payload":{"type":"user_message","turn_id":"turn-a","message":"List files"}}
+{"type":"response_item","timestamp":"2026-04-01T10:00:03Z","payload":{"type":"function_call","name":"exec_command","call_id":"call-exec","arguments":"{\"cmd\":\"ls\",\"cwd\":\"/repo\"}"}}
+{"type":"event_msg","timestamp":"2026-04-01T10:00:04Z","payload":{"type":"exec_command_end","turn_id":"turn-a","call_id":"call-exec","command":"ls","cwd":"/repo","exit_code":0,"duration_ms":25,"stdout":"README.md","aggregated_output":"README.md","status":"completed"}}
+{"type":"event_msg","timestamp":"2026-04-01T10:00:05Z","payload":{"type":"token_count","turn_id":"turn-a","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":5,"reasoning_output_tokens":1,"total_tokens":15}}}}
+{"type":"event_msg","timestamp":"2026-04-01T10:00:06Z","payload":{"type":"thread_name_updated","thread_name":"Trace Fixtures"}}
+{"type":"compacted","timestamp":"2026-04-01T10:00:07Z","payload":{}}
+{"type":"event_msg","timestamp":"2026-04-01T10:00:08Z","payload":{"type":"agent_message","turn_id":"turn-a","message":"README.md"}}
+{"type":"event_msg","timestamp":"2026-04-01T10:00:09Z","payload":{"type":"task_complete","turn_id":"turn-a","duration_ms":8000}}

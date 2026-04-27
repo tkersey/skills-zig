@@ -6,6 +6,7 @@ const query = @import("../query/engine.zig");
 const spec = @import("../types/spec.zig");
 const output = @import("../output/mod.zig");
 const time_utils = @import("../time_utils.zig");
+const canonical_trace = @import("../canonical_trace.zig");
 
 fn defaultIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
@@ -171,6 +172,26 @@ pub const dataset_meta = [_]DatasetMeta{
         },
     },
     .{
+        .name = "sessions",
+        .description = "Canonical Codex session traces",
+        .fields = &.{ "session_id", "path", "date_group", "start_time", "end_time", "cwd", "git_branch", "git_commit_hash", "git_repository_url", "originator", "cli_version", "model", "model_provider", "thread_name", "turn_count", "total_tokens", "input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "is_ongoing", "status_reason", "is_external_worker", "is_inline_worker", "spawned_worker_count" },
+    },
+    .{
+        .name = "turns",
+        .description = "Canonical Codex turn traces",
+        .fields = &.{ "session_id", "path", "turn_id", "turn_index", "started_at", "completed_at", "duration_ms", "status", "status_reason", "user_message", "user_preview", "final_answer", "assistant_preview", "model", "cwd", "reasoning_effort", "input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens", "tool_count", "has_compaction", "thread_name", "error", "aborted_reason", "spawned_worker_count" },
+    },
+    .{
+        .name = "tool_lifecycle",
+        .description = "Canonical Codex tool lifecycle records",
+        .fields = &.{ "session_id", "path", "turn_id", "turn_index", "call_id", "kind", "tool_name", "namespace", "arguments_json", "input_text", "output_text", "command_text", "cwd", "exit_code", "duration_ms", "mcp_server", "mcp_tool", "patch_success", "patch_changes_json", "web_query", "web_url", "image_prompt", "lifecycle_status", "declared_line", "finalized_line" },
+    },
+    .{
+        .name = "session_graph_edges",
+        .description = "Canonical Codex worker/session graph edges",
+        .fields = &.{ "parent_session_id", "worker_session_id", "parent_path", "worker_path", "call_id", "agent_nickname", "agent_role", "model", "reasoning_effort", "spawned_at", "prompt_preview", "worker_status" },
+    },
+    .{
         .name = "memory_files",
         .description = "File-based memories under ~/.codex/memories",
         .fields = &.{ "path", "relative_path", "name", "category", "extension", "size_bytes", "modified_at", "preview" },
@@ -333,6 +354,10 @@ const Options = struct {
     audit: bool = false,
     next_actions: bool = false,
     latest: bool = false,
+    ongoing: bool = false,
+    completed: bool = false,
+    include_tools: bool = false,
+    once: bool = false,
     fail_on_floor: bool = false,
     fail_on_mesh_truth: bool = false,
     fail_on_hang: bool = false,
@@ -360,6 +385,8 @@ const Options = struct {
     workdir_text: ?[]const u8 = null,
     repo_text: ?[]const u8 = null,
     status: ?[]const u8 = null,
+    worker_kind_text: ?[]const u8 = null,
+    events_text: ?[]const u8 = null,
     mode: ?[]const u8 = null,
     part_type: ?[]const u8 = null,
     timezone_text: ?[]const u8 = null,
@@ -388,6 +415,8 @@ const Options = struct {
     limit: usize = 0,
     floor_threshold: i64 = 3,
     threshold_ms: i64 = 10_000,
+    poll_ms: i64 = 500,
+    debounce_ms: i64 = 300,
 };
 
 pub fn run(
@@ -433,6 +462,12 @@ pub fn run(
         .memory_history => try cmdMemoryHistory(allocator, opts),
         .opencode_prompts => try cmdOpencodePrompts(allocator, sessions_root, opts),
         .opencode_events => try cmdOpencodeEvents(allocator, sessions_root, opts),
+        .sessions => try cmdTraceSessions(allocator, sessions_root, opts),
+        .turns => try cmdTraceTurns(allocator, sessions_root, opts),
+        .session_detail => try cmdTraceSessionDetail(allocator, sessions_root, opts),
+        .tool_lifecycle => try cmdTraceToolLifecycle(allocator, sessions_root, opts),
+        .session_graph => try cmdTraceSessionGraph(allocator, sessions_root, opts),
+        .tail => try cmdTraceTail(allocator, sessions_root, opts),
         .unknown => return error.InvalidCommand,
     }
 }
@@ -557,6 +592,24 @@ fn printCommandHelp(cmd: lib.Command) !void {
         .opencode_events =>
         \\usage: seq opencode-events [--spec <json|@path>] [--contains <text>] [--regex <expr>] [--session <id|slug>] [--since <epoch-ms|iso>] [--until <epoch-ms|iso>] [--latest] [--role <name>] [--mode <name>] [--part-type <name>] [--tool <name>] [--status <name>] [--group-by <csv>] [--metric <csv>] [--select <csv>] [--sort <csv>] [--source auto|db|jsonl] [--opencode-db-path <path>] [--opencode-path <path>] [--include-raw] [--limit N] [--format table|json|csv|jsonl]
         ,
+        .sessions =>
+        \\usage: seq sessions [--root <path>] [--since <iso>] [--until <iso>] [--repo <path>] [--contains <text>] [--ongoing|--completed] [--worker-kind all|none|inline|external] [--limit N] [--format table|json|jsonl]
+        ,
+        .turns =>
+        \\usage: seq turns [--path <jsonl>|--session-id <id>|--root <path>] [--since <iso>] [--until <iso>] [--status complete|aborted|ongoing|error] [--contains <text>] [--include-tools] [--limit N] [--format table|json|jsonl]
+        ,
+        .session_detail =>
+        \\usage: seq session-detail (--path <jsonl>|--session-id <id>) [--include-tools] [--format json|markdown]
+        ,
+        .tool_lifecycle =>
+        \\usage: seq tool-lifecycle (--path <jsonl>|--session-id <id>) [--include-raw] [--format table|json|jsonl]
+        ,
+        .session_graph =>
+        \\usage: seq session-graph --session-id <id> [--root <path>] [--include-tools] [--format table|json|dot]
+        ,
+        .tail =>
+        \\usage: seq tail (--current|--path <jsonl>|--session-id <id>) [--events raw,turns,tools,tokens,status] [--poll-ms N] [--debounce-ms N] [--once] [--format table|jsonl]
+        ,
         .unknown =>
         \\usage: seq <command> --help
         ,
@@ -588,29 +641,41 @@ fn ensureOptionAllowed(flag_set: bool, allowed: bool, option: []const u8, cmd: l
 fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
     switch (cmd) {
         .skills_rank, .skill_trend, .skill_report, .role_breakdown, .report_bundle, .section_audit, .datasets, .dataset_schema => {
-            if (fmt == .jsonl) return error.InvalidFormatForCommand;
+            if (fmt == .jsonl or fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
         .skill_blocks => {
             if (fmt != .json and fmt != .jsonl) return error.InvalidFormatForCommand;
         },
         .occurrence_export => {
-            if (fmt == .table) return error.InvalidFormatForCommand;
+            if (fmt == .table or fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
-        .artifact_search, .orchestration_concurrency, .find_session, .plan_search, .reply_latency, .session_prompts, .query, .token_usage, .routing_gap, .session_tooling, .query_diagnose, .memory_provenance, .memory_map, .memory_history, .opencode_prompts, .opencode_events => {},
+        .session_detail => {
+            if (fmt != .json and fmt != .markdown) return error.InvalidFormatForCommand;
+        },
+        .session_graph => {
+            if (fmt == .csv or fmt == .markdown) return error.InvalidFormatForCommand;
+        },
+        .sessions, .turns, .tool_lifecycle, .tail => {
+            if (fmt == .csv or fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
+        },
+        .query => {},
+        .artifact_search, .orchestration_concurrency, .find_session, .plan_search, .reply_latency, .session_prompts, .token_usage, .routing_gap, .session_tooling, .query_diagnose, .memory_provenance, .memory_map, .memory_history, .opencode_prompts, .opencode_events => {
+            if (fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
+        },
         .unknown => return error.InvalidCommand,
     }
 }
 
 fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_path = switch (cmd) {
-        .artifact_search, .orchestration_concurrency, .plan_search, .reply_latency, .session_prompts, .session_tooling, .query_diagnose, .skill_blocks, .token_usage => true,
+        .artifact_search, .orchestration_concurrency, .plan_search, .reply_latency, .session_prompts, .session_tooling, .query_diagnose, .skill_blocks, .token_usage, .turns, .session_detail, .tool_lifecycle, .session_graph, .tail => true,
         else => false,
     };
     const supports_session_id = switch (cmd) {
-        .artifact_search, .orchestration_concurrency, .plan_search, .reply_latency, .session_prompts, .session_tooling, .skill_blocks, .token_usage => true,
+        .artifact_search, .orchestration_concurrency, .plan_search, .reply_latency, .session_prompts, .session_tooling, .skill_blocks, .token_usage, .turns, .session_detail, .tool_lifecycle, .session_graph, .tail => true,
         else => false,
     };
-    const supports_current = cmd == .session_prompts or cmd == .reply_latency or cmd == .skill_blocks;
+    const supports_current = cmd == .session_prompts or cmd == .reply_latency or cmd == .skill_blocks or cmd == .tail;
     const supports_roles_csv = cmd == .session_prompts or cmd == .artifact_search;
     const supports_strip_skill_blocks = cmd == .session_prompts or cmd == .artifact_search;
     const supports_no_dedupe_exact = cmd == .session_prompts or cmd == .artifact_search;
@@ -646,7 +711,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         else => false,
     };
     const supports_contains = switch (cmd) {
-        .artifact_search, .plan_search, .memory_map, .memory_history, .opencode_prompts, .opencode_events => true,
+        .artifact_search, .plan_search, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .sessions, .turns => true,
         else => false,
     };
     const supports_regex = switch (cmd) {
@@ -656,8 +721,8 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_role = cmd == .opencode_events;
     const supports_tool = cmd == .opencode_events or cmd == .artifact_search;
     const supports_workdir = cmd == .artifact_search;
-    const supports_repo = cmd == .plan_search;
-    const supports_status = cmd == .opencode_events;
+    const supports_repo = cmd == .plan_search or cmd == .sessions;
+    const supports_status = cmd == .opencode_events or cmd == .turns;
     const supports_mode = switch (cmd) {
         .opencode_prompts, .opencode_events, .reply_latency => true,
         else => false,
@@ -692,6 +757,8 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .skill_blocks,
         .opencode_prompts,
         .opencode_events,
+        .sessions,
+        .turns,
         => true,
         else => false,
     };
@@ -716,6 +783,8 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .skill_blocks,
         .opencode_prompts,
         .opencode_events,
+        .sessions,
+        .turns,
         => true,
         else => false,
     };
@@ -756,7 +825,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         else => false,
     };
     const supports_include_raw = switch (cmd) {
-        .opencode_prompts, .opencode_events => true,
+        .opencode_prompts, .opencode_events, .session_detail, .tool_lifecycle, .tail => true,
         else => false,
     };
     const supports_thread_id = cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history;
@@ -817,12 +886,801 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.opencode_path != null, supports_opencode_path, "--opencode-path", cmd);
     try ensureOptionAllowed(opts.opencode_source_text != null, supports_opencode_source, "--source", cmd);
     try ensureOptionAllowed(opts.include_raw, supports_include_raw, "--include-raw", cmd);
+    try ensureOptionAllowed(opts.ongoing, cmd == .sessions, "--ongoing", cmd);
+    try ensureOptionAllowed(opts.completed, cmd == .sessions, "--completed", cmd);
+    try ensureOptionAllowed(opts.include_tools, cmd == .turns or cmd == .session_detail, "--include-tools", cmd);
+    try ensureOptionAllowed(opts.once, cmd == .tail, "--once", cmd);
+    try ensureOptionAllowed(opts.worker_kind_text != null, cmd == .sessions, "--worker-kind", cmd);
+    try ensureOptionAllowed(opts.events_text != null, cmd == .tail, "--events", cmd);
+    try ensureOptionAllowed(opts.poll_ms != 500, cmd == .tail, "--poll-ms", cmd);
+    try ensureOptionAllowed(opts.debounce_ms != 300, cmd == .tail, "--debounce-ms", cmd);
     try ensureOptionAllowed(opts.thread_id != null, supports_thread_id, "--thread-id", cmd);
     try ensureOptionAllowed(opts.rollout_summary_file != null, supports_rollout_summary_file, "--rollout-summary-file", cmd);
     try ensureOptionAllowed(opts.trace_text != null, supports_trace, "--trace", cmd);
     try ensureOptionAllowed(opts.state_db_path != null, supports_state_db_path, "--state-db-path", cmd);
     try ensureOptionAllowed(opts.memory_root_text != null, supports_memory_root, "--memory-root", cmd);
     try ensureOptionAllowed(opts.extensions_root_text != null, supports_extensions_root, "--extensions-root", cmd);
+
+    if (opts.ongoing and opts.completed) return error.InvalidModeArg;
+    if (opts.worker_kind_text) |text| {
+        if (!isValidTraceWorkerKind(text)) return error.InvalidModeArg;
+    }
+    if (cmd == .turns) {
+        if (opts.status) |text| {
+            if (!isValidTraceTurnStatus(text)) return error.InvalidModeArg;
+        }
+    }
+    if (opts.events_text) |text| _ = try parseTailEventMask(text);
+}
+
+const trace_session_columns = [_][]const u8{ "start_time", "end_time", "status", "session_id", "thread_name", "cwd", "git_branch", "model", "turn_count", "total_tokens", "worker_kind", "spawned_worker_count", "path" };
+const trace_turn_columns = [_][]const u8{ "started_at", "duration_ms", "status", "turn_index", "user_preview", "assistant_preview", "model", "tool_count", "total_tokens", "path" };
+const trace_turn_tool_columns = [_][]const u8{ "started_at", "duration_ms", "status", "turn_index", "user_preview", "assistant_preview", "model", "tool_count", "total_tokens", "tools_json", "path" };
+const trace_tool_columns = [_][]const u8{ "turn_index", "kind", "tool_name", "lifecycle_status", "exit_code", "duration_ms", "cwd", "command_text", "mcp_server", "mcp_tool", "call_id" };
+const trace_graph_columns = [_][]const u8{ "parent_session_id", "worker_session_id", "agent_nickname", "agent_role", "model", "worker_status", "spawned_at", "worker_path" };
+const trace_tail_columns = [_][]const u8{ "event", "session_id", "turn_id", "turn_index", "kind", "lifecycle_status", "duration_ms", "total_tokens", "path", "line_number", "entry_type", "event_type", "status_reason" };
+
+const TailEventMask = struct {
+    raw: bool = false,
+    turns: bool = false,
+    tools: bool = false,
+    tokens: bool = false,
+    status: bool = false,
+
+    fn default() TailEventMask {
+        return .{ .turns = true, .tools = true, .tokens = true, .status = true };
+    }
+};
+
+fn isValidTraceWorkerKind(text: []const u8) bool {
+    return std.mem.eql(u8, text, "all") or
+        std.mem.eql(u8, text, "none") or
+        std.mem.eql(u8, text, "inline") or
+        std.mem.eql(u8, text, "external");
+}
+
+fn isValidTraceTurnStatus(text: []const u8) bool {
+    return std.mem.eql(u8, text, "complete") or
+        std.mem.eql(u8, text, "aborted") or
+        std.mem.eql(u8, text, "ongoing") or
+        std.mem.eql(u8, text, "error");
+}
+
+fn parseTailEventMask(raw_opt: ?[]const u8) !TailEventMask {
+    const raw = raw_opt orelse return TailEventMask.default();
+    var mask = TailEventMask{};
+    var split = std.mem.splitScalar(u8, raw, ',');
+    while (split.next()) |part_raw| {
+        const part = std.mem.trim(u8, part_raw, " \t\r\n");
+        if (part.len == 0) continue;
+        if (std.mem.eql(u8, part, "raw")) {
+            mask.raw = true;
+        } else if (std.mem.eql(u8, part, "turns")) {
+            mask.turns = true;
+        } else if (std.mem.eql(u8, part, "tools")) {
+            mask.tools = true;
+        } else if (std.mem.eql(u8, part, "tokens")) {
+            mask.tokens = true;
+        } else if (std.mem.eql(u8, part, "status")) {
+            mask.status = true;
+        } else {
+            return error.InvalidModeArg;
+        }
+    }
+    return mask;
+}
+
+fn traceParseOptions(opts: Options) canonical_trace.TraceParseOptions {
+    return .{ .include_raw = opts.include_raw };
+}
+
+fn collectTraceRolloutPaths(allocator: std.mem.Allocator, sessions_root: []const u8) !std.ArrayList([]u8) {
+    var paths = try collectJsonlPaths(allocator, sessions_root, null);
+    errdefer freePathList(allocator, &paths);
+
+    var write_idx: usize = 0;
+    for (paths.items) |path| {
+        const base = std.fs.path.basename(path);
+        if (std.mem.startsWith(u8, base, "rollout-") and std.mem.endsWith(u8, base, ".jsonl")) {
+            paths.items[write_idx] = path;
+            write_idx += 1;
+        } else {
+            allocator.free(path);
+        }
+    }
+    paths.items.len = write_idx;
+    return paths;
+}
+
+fn resolveTraceTargetPaths(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    opts: Options,
+    require_single: bool,
+) !std.ArrayList([]u8) {
+    if (opts.path) |single_path| {
+        var out: std.ArrayList([]u8) = .empty;
+        errdefer freePathList(allocator, &out);
+        try out.append(allocator, try toAbsolutePath(allocator, single_path));
+        return out;
+    }
+
+    var paths = try collectTraceRolloutPaths(allocator, sessions_root);
+    errdefer freePathList(allocator, &paths);
+
+    if (opts.current) {
+        var best_index: ?usize = null;
+        var best_ts: ?[]u8 = null;
+        defer if (best_ts) |ts| allocator.free(ts);
+        var best_ongoing = false;
+        for (paths.items, 0..) |path, idx| {
+            var parsed = canonical_trace.parseSessionTrace(allocator, path, traceParseOptions(opts)) catch continue;
+            defer parsed.deinit(allocator);
+            const ts = parsed.session.start_time orelse parsed.session.end_time orelse "";
+            const better = best_index == null or
+                (parsed.session.is_ongoing and !best_ongoing) or
+                (parsed.session.is_ongoing == best_ongoing and (best_ts == null or compareNormalizedTimestamp(ts, best_ts.?) == .gt));
+            if (better) {
+                best_index = idx;
+                if (best_ts) |old| allocator.free(old);
+                best_ts = try allocator.dupe(u8, ts);
+                best_ongoing = parsed.session.is_ongoing;
+            }
+        }
+        const keep = best_index orelse return error.SessionNotFound;
+        var out: std.ArrayList([]u8) = .empty;
+        errdefer freePathList(allocator, &out);
+        for (paths.items, 0..) |path, idx| {
+            if (idx == keep) {
+                try out.append(allocator, try allocator.dupe(u8, path));
+            }
+        }
+        freePathList(allocator, &paths);
+        return out;
+    }
+
+    if (opts.session_id) |wanted| {
+        var write_idx: usize = 0;
+        for (paths.items) |path| {
+            var parsed = canonical_trace.parseSessionTrace(allocator, path, traceParseOptions(opts)) catch {
+                allocator.free(path);
+                continue;
+            };
+            defer parsed.deinit(allocator);
+            const matches = if (parsed.session.session_id) |id|
+                std.mem.containsAtLeast(u8, id, 1, wanted)
+            else
+                std.mem.containsAtLeast(u8, path, 1, wanted);
+            if (matches) {
+                paths.items[write_idx] = path;
+                write_idx += 1;
+            } else {
+                allocator.free(path);
+            }
+        }
+        paths.items.len = write_idx;
+    }
+
+    if (require_single) {
+        if (paths.items.len == 0) return error.SessionNotFound;
+        if (paths.items.len > 1) {
+            printCliError("error: trace selector matched more than one session file\n", .{});
+            return error.AmbiguousSessionTarget;
+        }
+    }
+    return paths;
+}
+
+fn traceContains(haystack_opt: ?[]const u8, needle: []const u8) bool {
+    const haystack = haystack_opt orelse return false;
+    return containsIgnoreCaseAscii(haystack, needle);
+}
+
+fn traceTextContainsAnySession(session: canonical_trace.SessionRecord, needle: []const u8) bool {
+    return traceContains(session.session_id, needle) or
+        traceContains(session.thread_name, needle) or
+        traceContains(session.cwd, needle) or
+        traceContains(session.git_branch, needle) or
+        traceContains(session.model, needle) or
+        traceContains(session.path, needle);
+}
+
+fn traceTextContainsAnyTurn(turn: canonical_trace.TurnRecord, needle: []const u8) bool {
+    return traceContains(turn.user_message, needle) or
+        traceContains(turn.user_preview, needle) or
+        traceContains(turn.final_answer, needle) or
+        traceContains(turn.assistant_preview, needle) or
+        traceContains(turn.model, needle) or
+        traceContains(turn.path, needle);
+}
+
+fn traceSessionPassesOptions(session: canonical_trace.SessionRecord, opts: Options) bool {
+    const ts = session.start_time orelse session.end_time;
+    if ((opts.since != null or opts.until != null) and !timestampSatisfiesBounds(ts, opts)) return false;
+    if (opts.repo_text) |repo| {
+        const cwd = session.cwd orelse return false;
+        if (!std.mem.eql(u8, cwd, repo) and !std.mem.startsWith(u8, cwd, repo)) return false;
+    }
+    if (opts.contains) |needle| {
+        if (!traceTextContainsAnySession(session, needle)) return false;
+    }
+    if (opts.ongoing and !session.is_ongoing) return false;
+    if (opts.completed and session.is_ongoing) return false;
+    if (opts.worker_kind_text) |worker_kind| {
+        if (std.mem.eql(u8, worker_kind, "all")) return true;
+        if (std.mem.eql(u8, worker_kind, "none")) return !session.is_inline_worker and !session.is_external_worker;
+        if (std.mem.eql(u8, worker_kind, "inline")) return session.is_inline_worker;
+        if (std.mem.eql(u8, worker_kind, "external")) return session.is_external_worker;
+        return false;
+    }
+    return true;
+}
+
+fn traceTurnPassesOptions(turn: canonical_trace.TurnRecord, opts: Options) bool {
+    const ts = turn.started_at orelse turn.completed_at;
+    if ((opts.since != null or opts.until != null) and !timestampSatisfiesBounds(ts, opts)) return false;
+    if (opts.status) |status| {
+        if (!std.mem.eql(u8, @tagName(turn.status), status)) return false;
+    }
+    if (opts.contains) |needle| {
+        if (!traceTextContainsAnyTurn(turn, needle)) return false;
+    }
+    return true;
+}
+
+fn putOptionalBool(row: *query.Row, field: []const u8, value: ?bool) !void {
+    if (value) |v| {
+        try row.putOwnedKey(field, .{ .bool = v });
+    } else {
+        try row.putOwnedKey(field, .null);
+    }
+}
+
+fn appendTraceSessionRow(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    session: canonical_trace.SessionRecord,
+) !void {
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+
+    try putOptionalString(&row, "session_id", session.session_id);
+    try row.putOwnedKey("path", .{ .string = session.path });
+    try putOptionalString(&row, "date_group", session.date_group);
+    try putOptionalString(&row, "start_time", session.start_time);
+    try putOptionalString(&row, "end_time", session.end_time);
+    try putOptionalString(&row, "cwd", session.cwd);
+    try putOptionalString(&row, "git_branch", session.git_branch);
+    try putOptionalString(&row, "git_commit_hash", session.git_commit_hash);
+    try putOptionalString(&row, "git_repository_url", session.git_repository_url);
+    try putOptionalString(&row, "originator", session.originator);
+    try putOptionalString(&row, "cli_version", session.cli_version);
+    try putOptionalString(&row, "model", session.model);
+    try putOptionalString(&row, "model_provider", session.model_provider);
+    try putOptionalString(&row, "thread_name", session.thread_name);
+    try row.putOwnedKey("turn_count", .{ .int = session.turn_count });
+    try putOptionalInt(&row, "total_tokens", session.total_tokens);
+    try putOptionalInt(&row, "input_tokens", session.input_tokens);
+    try putOptionalInt(&row, "cached_input_tokens", session.cached_input_tokens);
+    try putOptionalInt(&row, "output_tokens", session.output_tokens);
+    try putOptionalInt(&row, "reasoning_output_tokens", session.reasoning_output_tokens);
+    try row.putOwnedKey("is_ongoing", .{ .bool = session.is_ongoing });
+    try putOptionalString(&row, "status_reason", session.status_reason);
+    try row.putOwnedKey("status", .{ .string = if (session.is_ongoing) "ongoing" else "completed" });
+    try row.putOwnedKey("is_external_worker", .{ .bool = session.is_external_worker });
+    try row.putOwnedKey("is_inline_worker", .{ .bool = session.is_inline_worker });
+    try row.putOwnedKey("worker_kind", .{ .string = if (session.is_external_worker) "external" else if (session.is_inline_worker) "inline" else "none" });
+    try row.putOwnedKey("spawned_worker_count", .{ .int = session.spawned_worker_count });
+    try out_rows.append(allocator, row);
+}
+
+fn appendTraceTurnRow(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    turn: canonical_trace.TurnRecord,
+) !void {
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    try putOptionalString(&row, "session_id", turn.session_id);
+    try row.putOwnedKey("path", .{ .string = turn.path });
+    try row.putOwnedKey("turn_id", .{ .string = turn.turn_id });
+    try row.putOwnedKey("turn_index", .{ .int = turn.turn_index });
+    try putOptionalString(&row, "started_at", turn.started_at);
+    try putOptionalString(&row, "completed_at", turn.completed_at);
+    try putOptionalInt(&row, "duration_ms", turn.duration_ms);
+    try row.putOwnedKey("status", .{ .string = @tagName(turn.status) });
+    try putOptionalString(&row, "status_reason", turn.status_reason);
+    try putOptionalString(&row, "user_message", turn.user_message);
+    try putOptionalString(&row, "user_preview", turn.user_preview);
+    try putOptionalString(&row, "final_answer", turn.final_answer);
+    try putOptionalString(&row, "assistant_preview", turn.assistant_preview);
+    try putOptionalString(&row, "model", turn.model);
+    try putOptionalString(&row, "cwd", turn.cwd);
+    try putOptionalString(&row, "reasoning_effort", turn.reasoning_effort);
+    try putOptionalInt(&row, "input_tokens", turn.input_tokens);
+    try putOptionalInt(&row, "cached_input_tokens", turn.cached_input_tokens);
+    try putOptionalInt(&row, "output_tokens", turn.output_tokens);
+    try putOptionalInt(&row, "reasoning_output_tokens", turn.reasoning_output_tokens);
+    try putOptionalInt(&row, "total_tokens", turn.total_tokens);
+    try row.putOwnedKey("tool_count", .{ .int = turn.tool_count });
+    try row.putOwnedKey("has_compaction", .{ .bool = turn.has_compaction });
+    try putOptionalString(&row, "thread_name", turn.thread_name);
+    try putOptionalString(&row, "error", turn.@"error");
+    try putOptionalString(&row, "aborted_reason", turn.aborted_reason);
+    try row.putOwnedKey("spawned_worker_count", .{ .int = turn.spawned_worker_count });
+    try out_rows.append(allocator, row);
+}
+
+fn traceToolsJsonForTurn(
+    allocator: std.mem.Allocator,
+    tools: []const canonical_trace.ToolLifecycleRecord,
+    turn_index: i64,
+) ![]u8 {
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+    try writer.writeByte('[');
+    var emitted: usize = 0;
+    for (tools) |tool| {
+        if (tool.turn_index == null or tool.turn_index.? != turn_index) continue;
+        if (emitted > 0) try writer.writeByte(',');
+        try writer.writeByte('{');
+        try output.writeJsonString(writer, "call_id");
+        try writer.writeByte(':');
+        if (tool.call_id) |value| try output.writeJsonString(writer, value) else try writer.writeAll("null");
+        try writer.writeByte(',');
+        try output.writeJsonString(writer, "kind");
+        try writer.writeByte(':');
+        try output.writeJsonString(writer, @tagName(tool.kind));
+        try writer.writeByte(',');
+        try output.writeJsonString(writer, "tool_name");
+        try writer.writeByte(':');
+        if (tool.tool_name) |value| try output.writeJsonString(writer, value) else try writer.writeAll("null");
+        try writer.writeByte(',');
+        try output.writeJsonString(writer, "lifecycle_status");
+        try writer.writeByte(':');
+        try output.writeJsonString(writer, @tagName(tool.lifecycle_status));
+        try writer.writeByte('}');
+        emitted += 1;
+    }
+    try writer.writeByte(']');
+    return writer_alloc.toOwnedSlice();
+}
+
+fn appendTraceToolRow(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    tool: canonical_trace.ToolLifecycleRecord,
+) !void {
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    try putOptionalString(&row, "session_id", tool.session_id);
+    try row.putOwnedKey("path", .{ .string = tool.path });
+    try putOptionalString(&row, "turn_id", tool.turn_id);
+    try putOptionalInt(&row, "turn_index", tool.turn_index);
+    try putOptionalString(&row, "call_id", tool.call_id);
+    try row.putOwnedKey("kind", .{ .string = @tagName(tool.kind) });
+    try putOptionalString(&row, "tool_name", tool.tool_name);
+    try putOptionalString(&row, "namespace", tool.namespace);
+    try putOptionalString(&row, "arguments_json", tool.arguments_json);
+    try putOptionalString(&row, "input_text", tool.input_text);
+    try putOptionalString(&row, "output_text", tool.output_text);
+    try putOptionalString(&row, "command_text", tool.command_text);
+    try putOptionalString(&row, "cwd", tool.cwd);
+    try putOptionalInt(&row, "exit_code", tool.exit_code);
+    try putOptionalInt(&row, "duration_ms", tool.duration_ms);
+    try putOptionalString(&row, "mcp_server", tool.mcp_server);
+    try putOptionalString(&row, "mcp_tool", tool.mcp_tool);
+    try putOptionalBool(&row, "patch_success", tool.patch_success);
+    try putOptionalString(&row, "patch_changes_json", tool.patch_changes_json);
+    try putOptionalString(&row, "web_query", tool.web_query);
+    try putOptionalString(&row, "web_url", tool.web_url);
+    try putOptionalString(&row, "image_prompt", tool.image_prompt);
+    try row.putOwnedKey("lifecycle_status", .{ .string = @tagName(tool.lifecycle_status) });
+    try putOptionalInt(&row, "declared_line", tool.declared_line);
+    try putOptionalInt(&row, "finalized_line", tool.finalized_line);
+    try out_rows.append(allocator, row);
+}
+
+fn appendTraceGraphRow(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    edge: canonical_trace.SessionGraphEdge,
+) !void {
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    try putOptionalString(&row, "parent_session_id", edge.parent_session_id);
+    try putOptionalString(&row, "worker_session_id", edge.worker_session_id);
+    try row.putOwnedKey("parent_path", .{ .string = edge.parent_path });
+    try putOptionalString(&row, "worker_path", edge.worker_path);
+    try putOptionalString(&row, "call_id", edge.call_id);
+    try putOptionalString(&row, "agent_nickname", edge.agent_nickname);
+    try putOptionalString(&row, "agent_role", edge.agent_role);
+    try putOptionalString(&row, "model", edge.model);
+    try putOptionalString(&row, "reasoning_effort", edge.reasoning_effort);
+    try putOptionalString(&row, "spawned_at", edge.spawned_at);
+    try putOptionalString(&row, "prompt_preview", edge.prompt_preview);
+    try putOptionalString(&row, "worker_status", edge.worker_status);
+    try out_rows.append(allocator, row);
+}
+
+fn collectTraceDatasetRowsWithOptions(
+    allocator: std.mem.Allocator,
+    dataset_name: []const u8,
+    sessions_root: []const u8,
+    opts: Options,
+) !std.ArrayList(query.Row) {
+    var rows: std.ArrayList(query.Row) = .empty;
+    errdefer deinitQueryRows(allocator, &rows);
+    var paths = try resolveTraceTargetPaths(allocator, sessions_root, opts, false);
+    defer freePathList(allocator, &paths);
+
+    var inline_worker_ids = std.StringHashMap(void).init(allocator);
+    defer {
+        var id_it = inline_worker_ids.keyIterator();
+        while (id_it.next()) |key| allocator.free(key.*);
+        inline_worker_ids.deinit();
+    }
+
+    if (std.mem.eql(u8, dataset_name, "sessions")) {
+        for (paths.items) |path| {
+            var parsed = canonical_trace.parseSessionTrace(allocator, path, traceParseOptions(opts)) catch continue;
+            defer parsed.deinit(allocator);
+            for (parsed.graph_edges.items) |edge| {
+                if (edge.worker_session_id) |id| {
+                    if (!inline_worker_ids.contains(id)) {
+                        try inline_worker_ids.put(try allocator.dupe(u8, id), {});
+                    }
+                }
+            }
+        }
+    }
+
+    for (paths.items) |path| {
+        var parsed = canonical_trace.parseSessionTrace(allocator, path, traceParseOptions(opts)) catch continue;
+        defer parsed.deinit(allocator);
+
+        if (std.mem.eql(u8, dataset_name, "sessions")) {
+            if (parsed.session.session_id) |id| {
+                if (inline_worker_ids.contains(id)) parsed.session.is_inline_worker = true;
+            }
+            if (traceSessionPassesOptions(parsed.session, opts)) try appendTraceSessionRow(allocator, &rows, parsed.session);
+        } else if (std.mem.eql(u8, dataset_name, "turns")) {
+            for (parsed.turns.items) |turn| {
+                if (traceTurnPassesOptions(turn, opts)) {
+                    try appendTraceTurnRow(allocator, &rows, turn);
+                    if (opts.include_tools) {
+                        const tools_json = try traceToolsJsonForTurn(allocator, parsed.tools.items, turn.turn_index);
+                        defer allocator.free(tools_json);
+                        try rows.items[rows.items.len - 1].putOwnedKey("tools_json", .{ .string = tools_json });
+                    }
+                }
+            }
+        } else if (std.mem.eql(u8, dataset_name, "tool_lifecycle")) {
+            for (parsed.tools.items) |tool| try appendTraceToolRow(allocator, &rows, tool);
+        } else if (std.mem.eql(u8, dataset_name, "session_graph_edges")) {
+            for (parsed.graph_edges.items) |edge| try appendTraceGraphRow(allocator, &rows, edge);
+        } else {
+            return error.UnknownDataset;
+        }
+    }
+    return rows;
+}
+
+fn collectTraceDatasetRowsFromParams(
+    allocator: std.mem.Allocator,
+    dataset_name: []const u8,
+    sessions_root: []const u8,
+    query_params: []const spec.ParamSpec,
+) !std.ArrayList(query.Row) {
+    var opts = Options{};
+    if (paramString(query_params, "root")) |root| {
+        const resolved = try resolveSessionsRoot(allocator, root);
+        defer allocator.free(resolved);
+        return collectTraceDatasetRowsWithOptions(allocator, dataset_name, resolved, opts);
+    }
+    if (paramString(query_params, "path")) |path| opts.path = path;
+    if (paramString(query_params, "session_id")) |id| opts.session_id = id;
+    if (paramBool(query_params, "include_raw")) |flag| opts.include_raw = flag;
+    return collectTraceDatasetRowsWithOptions(allocator, dataset_name, sessions_root, opts);
+}
+
+fn runTraceRows(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayList(query.Row),
+    opts: Options,
+    default_sort_field: []const u8,
+    columns: []const []const u8,
+) !void {
+    const sort = [_]spec.SortSpec{.{ .field = default_sort_field, .descending = true }};
+    const query_spec = spec.QuerySpec{
+        .sort = sort[0..],
+        .limit = opts.limit,
+    };
+    var result = try query.execute(allocator, rows.items, query_spec);
+    defer result.deinit(allocator);
+    try output.writeOutput(allocator, opts.format, result.rows.items, columns, opts.out_path);
+}
+
+fn cmdTraceSessions(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    var rows = try collectTraceDatasetRowsWithOptions(allocator, "sessions", sessions_root, opts);
+    defer deinitQueryRows(allocator, &rows);
+    try runTraceRows(allocator, &rows, opts, "start_time", trace_session_columns[0..]);
+}
+
+fn cmdTraceTurns(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    var rows = try collectTraceDatasetRowsWithOptions(allocator, "turns", sessions_root, opts);
+    defer deinitQueryRows(allocator, &rows);
+    const columns = if (opts.include_tools) trace_turn_tool_columns[0..] else trace_turn_columns[0..];
+    try runTraceRows(allocator, &rows, opts, "started_at", columns);
+}
+
+fn cmdTraceToolLifecycle(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    var rows = try collectTraceDatasetRowsWithOptions(allocator, "tool_lifecycle", sessions_root, opts);
+    defer deinitQueryRows(allocator, &rows);
+    try runTraceRows(allocator, &rows, opts, "turn_index", trace_tool_columns[0..]);
+}
+
+fn writeTextOutput(text: []const u8, out_path: ?[]const u8) !void {
+    if (out_path) |path| {
+        try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = path, .data = text });
+        return;
+    }
+    var stdout = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    try stdout.interface.writeAll(text);
+}
+
+fn writeTraceGraphDotRows(allocator: std.mem.Allocator, rows: []const query.Row, out_path: ?[]const u8) !void {
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+    try writer.writeAll("digraph codex_sessions {\n");
+    for (rows) |row| {
+        const parent = switch (row.valueOrNull("parent_session_id")) {
+            .string => |s| s,
+            else => "",
+        };
+        const worker = switch (row.valueOrNull("worker_session_id")) {
+            .string => |s| s,
+            else => "",
+        };
+        if (parent.len == 0 or worker.len == 0) continue;
+        try writer.writeAll("  ");
+        try output.writeJsonString(writer, parent);
+        try writer.writeAll(" -> ");
+        try output.writeJsonString(writer, worker);
+        try writer.writeAll(" [label=");
+        const nickname = switch (row.valueOrNull("agent_nickname")) {
+            .string => |s| s,
+            else => "",
+        };
+        const role = switch (row.valueOrNull("agent_role")) {
+            .string => |s| s,
+            else => "",
+        };
+        const label = try std.fmt.allocPrint(allocator, "{s} / {s}", .{ nickname, role });
+        defer allocator.free(label);
+        try output.writeJsonString(writer, label);
+        try writer.writeAll("];\n");
+    }
+    try writer.writeAll("}\n");
+    const rendered = try writer_alloc.toOwnedSlice();
+    defer allocator.free(rendered);
+    try writeTextOutput(rendered, out_path);
+}
+
+fn writeRowsJsonArray(writer: anytype, rows: []const query.Row, columns: []const []const u8, pretty_indent: []const u8) !void {
+    try writer.writeAll("[");
+    for (rows, 0..) |row, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writer.writeByte('\n');
+        try writer.writeAll(pretty_indent);
+        try output.writeJsonObject(writer, row, columns, true, "    ");
+    }
+    if (rows.len > 0) try writer.writeByte('\n');
+    try writer.writeAll("  ]");
+}
+
+fn cmdTraceSessionDetail(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    var paths = try resolveTraceTargetPaths(allocator, sessions_root, opts, true);
+    defer freePathList(allocator, &paths);
+
+    var parsed = try canonical_trace.parseSessionTrace(allocator, paths.items[0], traceParseOptions(opts));
+    defer parsed.deinit(allocator);
+
+    if (opts.format == .markdown) {
+        var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+        defer writer_alloc.deinit();
+        const writer = &writer_alloc.writer;
+        try writer.print("# {s}\n\n", .{parsed.session.thread_name orelse parsed.session.session_id orelse "Codex session"});
+        try writer.print("- session_id: {s}\n- path: {s}\n- status: {s}\n- turns: {d}\n- total_tokens: {d}\n\n", .{
+            parsed.session.session_id orelse "",
+            parsed.session.path,
+            parsed.session.status_reason orelse "",
+            parsed.turns.items.len,
+            parsed.session.total_tokens orelse 0,
+        });
+        for (parsed.turns.items) |turn| {
+            try writer.print("## Turn {d} ({s})\n\n", .{ turn.turn_index, @tagName(turn.status) });
+            if (turn.user_preview) |text| try writer.print("- user: {s}\n", .{text});
+            if (turn.assistant_preview) |text| try writer.print("- assistant: {s}\n", .{text});
+            if (turn.total_tokens) |tokens| try writer.print("- tokens: {d}\n", .{tokens});
+            try writer.print("- tools: {d}\n\n", .{turn.tool_count});
+            if (opts.include_tools and turn.tool_count > 0) {
+                for (parsed.tools.items) |tool| {
+                    if (tool.turn_index == null or tool.turn_index.? != turn.turn_index) continue;
+                    try writer.print("  - {s} {s}", .{ @tagName(tool.kind), @tagName(tool.lifecycle_status) });
+                    if (tool.tool_name) |name| try writer.print(" `{s}`", .{name});
+                    if (tool.call_id) |call_id| try writer.print(" ({s})", .{call_id});
+                    try writer.writeByte('\n');
+                }
+                try writer.writeByte('\n');
+            }
+        }
+        const rendered = try writer_alloc.toOwnedSlice();
+        defer allocator.free(rendered);
+        try writeTextOutput(rendered, opts.out_path);
+        return;
+    }
+
+    var session_rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &session_rows);
+    var turn_rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &turn_rows);
+    var tool_rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &tool_rows);
+    var graph_rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &graph_rows);
+    try appendTraceSessionRow(allocator, &session_rows, parsed.session);
+    for (parsed.turns.items) |turn| try appendTraceTurnRow(allocator, &turn_rows, turn);
+    for (parsed.tools.items) |tool| try appendTraceToolRow(allocator, &tool_rows, tool);
+    for (parsed.graph_edges.items) |edge| try appendTraceGraphRow(allocator, &graph_rows, edge);
+
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+    try writer.writeAll("{\n  \"session\": ");
+    try output.writeJsonObject(writer, session_rows.items[0], findDatasetMeta("sessions").?.fields, true, "    ");
+    try writer.writeAll(",\n  \"turns\": ");
+    try writeRowsJsonArray(writer, turn_rows.items, findDatasetMeta("turns").?.fields, "    ");
+    try writer.writeAll(",\n  \"tools\": ");
+    try writeRowsJsonArray(writer, tool_rows.items, findDatasetMeta("tool_lifecycle").?.fields, "    ");
+    try writer.writeAll(",\n  \"graph_edges\": ");
+    try writeRowsJsonArray(writer, graph_rows.items, findDatasetMeta("session_graph_edges").?.fields, "    ");
+    try writer.writeAll(",\n  \"warnings\": [");
+    for (parsed.warnings.items, 0..) |warning, idx| {
+        if (idx > 0) try writer.writeAll(", ");
+        try output.writeJsonString(writer, warning);
+    }
+    try writer.writeAll("]\n}\n");
+    const rendered = try writer_alloc.toOwnedSlice();
+    defer allocator.free(rendered);
+    try writeTextOutput(rendered, opts.out_path);
+}
+
+fn cmdTraceSessionGraph(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    var rows = try collectTraceDatasetRowsWithOptions(allocator, "session_graph_edges", sessions_root, opts);
+    defer deinitQueryRows(allocator, &rows);
+    if (opts.format == .dot) {
+        try writeTraceGraphDotRows(allocator, rows.items, opts.out_path);
+        return;
+    }
+    try runTraceRows(allocator, &rows, opts, "spawned_at", trace_graph_columns[0..]);
+}
+
+fn appendTailStatusRows(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    parsed: canonical_trace.CanonicalSessionTrace,
+    mask: TailEventMask,
+    turn_start: usize,
+    tool_start: usize,
+    emit_status: bool,
+) !void {
+    if (mask.status and emit_status) {
+        var status_row = query.Row.init(allocator);
+        errdefer status_row.deinit();
+        try status_row.putOwnedKey("event", .{ .string = "status" });
+        try putOptionalString(&status_row, "session_id", parsed.session.session_id);
+        try status_row.putOwnedKey("path", .{ .string = parsed.session.path });
+        try status_row.putOwnedKey("is_ongoing", .{ .bool = parsed.session.is_ongoing });
+        try putOptionalString(&status_row, "status_reason", parsed.session.status_reason);
+        try out_rows.append(allocator, status_row);
+    }
+
+    for (parsed.turns.items[turn_start..]) |turn| {
+        if (!mask.turns and !(mask.tokens and turn.total_tokens != null)) continue;
+        var row = query.Row.init(allocator);
+        errdefer row.deinit();
+        const event_name = if (mask.tokens and !mask.turns and turn.total_tokens != null)
+            "token_count"
+        else if (turn.status == .complete)
+            "turn_complete"
+        else
+            "turn_status";
+        try row.putOwnedKey("event", .{ .string = event_name });
+        try putOptionalString(&row, "session_id", turn.session_id);
+        try row.putOwnedKey("turn_id", .{ .string = turn.turn_id });
+        try row.putOwnedKey("turn_index", .{ .int = turn.turn_index });
+        try row.putOwnedKey("path", .{ .string = turn.path });
+        try putOptionalInt(&row, "duration_ms", turn.duration_ms);
+        try putOptionalInt(&row, "total_tokens", turn.total_tokens);
+        try putOptionalString(&row, "status_reason", turn.status_reason);
+        try out_rows.append(allocator, row);
+    }
+
+    if (!mask.tools) return;
+    for (parsed.tools.items[tool_start..]) |tool| {
+        var row = query.Row.init(allocator);
+        errdefer row.deinit();
+        try row.putOwnedKey("event", .{ .string = if (tool.lifecycle_status == .completed or tool.lifecycle_status == .failed) "tool_complete" else "tool_status" });
+        try putOptionalString(&row, "session_id", tool.session_id);
+        try putOptionalString(&row, "turn_id", tool.turn_id);
+        try putOptionalInt(&row, "turn_index", tool.turn_index);
+        try row.putOwnedKey("path", .{ .string = tool.path });
+        try row.putOwnedKey("kind", .{ .string = @tagName(tool.kind) });
+        try row.putOwnedKey("lifecycle_status", .{ .string = @tagName(tool.lifecycle_status) });
+        try putOptionalInt(&row, "duration_ms", tool.duration_ms);
+        try out_rows.append(allocator, row);
+    }
+}
+
+fn appendTailRawRows(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    path: []const u8,
+    start_line_exclusive: usize,
+) !usize {
+    const content = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(256 * 1024 * 1024));
+    defer allocator.free(content);
+    var last_seen = start_line_exclusive;
+    var line_it = std.mem.splitScalar(u8, content, '\n');
+    var line_number: usize = 0;
+    while (line_it.next()) |line| {
+        line_number += 1;
+        if (line_number <= start_line_exclusive) continue;
+        var event = try canonical_trace.parseRawTraceEvent(allocator, path, line_number, line) orelse continue;
+        defer event.deinit(allocator);
+        last_seen = line_number;
+        var row = query.Row.init(allocator);
+        errdefer row.deinit();
+        try row.putOwnedKey("event", .{ .string = "raw" });
+        try row.putOwnedKey("path", .{ .string = event.path });
+        try row.putOwnedKey("line_number", .{ .int = @intCast(event.line_number) });
+        try row.putOwnedKey("entry_type", .{ .string = event.entry_type });
+        try putOptionalString(&row, "event_type", event.event_type);
+        try putOptionalString(&row, "timestamp", event.timestamp);
+        try out_rows.append(allocator, row);
+    }
+    return last_seen;
+}
+
+fn cmdTraceTail(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    var paths = try resolveTraceTargetPaths(allocator, sessions_root, opts, true);
+    defer freePathList(allocator, &paths);
+    const mask = try parseTailEventMask(opts.events_text);
+
+    var last_raw_line: usize = 0;
+    var last_turn_count: usize = 0;
+    var last_tool_count: usize = 0;
+    var emitted_status = false;
+    while (true) {
+        var rows: std.ArrayList(query.Row) = .empty;
+        defer deinitQueryRows(allocator, &rows);
+
+        if (mask.raw) last_raw_line = try appendTailRawRows(allocator, &rows, paths.items[0], last_raw_line);
+
+        var parsed = try canonical_trace.parseSessionTrace(allocator, paths.items[0], traceParseOptions(opts));
+        defer parsed.deinit(allocator);
+        try appendTailStatusRows(allocator, &rows, parsed, mask, last_turn_count, last_tool_count, !emitted_status);
+        last_turn_count = parsed.turns.items.len;
+        last_tool_count = parsed.tools.items.len;
+        emitted_status = true;
+
+        if (rows.items.len > 0) try output.writeOutput(allocator, opts.format, rows.items, trace_tail_columns[0..], opts.out_path);
+        if (opts.once) break;
+        try std.Io.sleep(defaultIo(), std.Io.Duration.fromMilliseconds(@max(opts.poll_ms, 1)), .awake);
+    }
 }
 
 fn cmdDatasets(allocator: std.mem.Allocator, opts: Options) !void {
@@ -903,6 +1761,11 @@ fn cmdQuery(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Optio
     defer result.deinit(allocator);
 
     const cols_opt: ?[]const []const u8 = if (query_spec.select.len > 0) query_spec.select else null;
+    if (fmt == .dot and std.mem.eql(u8, dataset_name, "session_graph_edges")) {
+        try writeTraceGraphDotRows(allocator, result.rows.items, opts.out_path);
+        return;
+    }
+    if (fmt == .dot or fmt == .markdown) return error.InvalidFormatForCommand;
     try output.writeOutput(allocator, fmt, result.rows.items, cols_opt, opts.out_path);
 }
 
@@ -5632,7 +6495,11 @@ fn isSessionFileDataset(dataset_name: []const u8) bool {
         std.mem.eql(u8, dataset_name, "token_sessions") or
         std.mem.eql(u8, dataset_name, "tool_calls") or
         std.mem.eql(u8, dataset_name, "tool_invocations") or
-        std.mem.eql(u8, dataset_name, "tool_call_args");
+        std.mem.eql(u8, dataset_name, "tool_call_args") or
+        std.mem.eql(u8, dataset_name, "sessions") or
+        std.mem.eql(u8, dataset_name, "turns") or
+        std.mem.eql(u8, dataset_name, "tool_lifecycle") or
+        std.mem.eql(u8, dataset_name, "session_graph_edges");
 }
 
 fn isValidDayLiteral(text: []const u8) bool {
@@ -5964,6 +6831,13 @@ fn collectDatasetRows(
         try collectToolInvocationRows(allocator, sessions_root, day_filter, &rows);
     } else if (std.mem.eql(u8, dataset_name, "tool_call_args")) {
         try collectToolCallArgRows(allocator, sessions_root, day_filter, &rows);
+    } else if (std.mem.eql(u8, dataset_name, "sessions") or
+        std.mem.eql(u8, dataset_name, "turns") or
+        std.mem.eql(u8, dataset_name, "tool_lifecycle") or
+        std.mem.eql(u8, dataset_name, "session_graph_edges"))
+    {
+        const derived = try collectTraceDatasetRowsFromParams(allocator, dataset_name, sessions_root, query_params);
+        rows = derived;
     } else if (std.mem.eql(u8, dataset_name, "memory_files")) {
         try collectMemoryFilesRows(allocator, query_params, &rows);
     } else if (std.mem.eql(u8, dataset_name, "memory_blocks")) {
@@ -7591,6 +8465,14 @@ fn parseOptions(args: []const []const u8) !Options {
             opts.next_actions = true;
         } else if (std.mem.eql(u8, arg, "--latest")) {
             opts.latest = true;
+        } else if (std.mem.eql(u8, arg, "--ongoing")) {
+            opts.ongoing = true;
+        } else if (std.mem.eql(u8, arg, "--completed")) {
+            opts.completed = true;
+        } else if (std.mem.eql(u8, arg, "--include-tools")) {
+            opts.include_tools = true;
+        } else if (std.mem.eql(u8, arg, "--once")) {
+            opts.once = true;
         } else if (std.mem.eql(u8, arg, "--strict-hang")) {
             opts.strict_hang = true;
         } else if (std.mem.eql(u8, arg, "--no-strict-hang")) {
@@ -7625,6 +8507,26 @@ fn parseOptions(args: []const []const u8) !Options {
             const n = try std.fmt.parseInt(i64, args[i], 10);
             if (n < 1) return error.InvalidLimit;
             opts.threshold_ms = n;
+        } else if (std.mem.eql(u8, arg, "--worker-kind")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.worker_kind_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--events")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.events_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--poll-ms")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            const n = try std.fmt.parseInt(i64, args[i], 10);
+            if (n < 1) return error.InvalidLimit;
+            opts.poll_ms = n;
+        } else if (std.mem.eql(u8, arg, "--debounce-ms")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            const n = try std.fmt.parseInt(i64, args[i], 10);
+            if (n < 1) return error.InvalidLimit;
+            opts.debounce_ms = n;
         } else if (std.mem.eql(u8, arg, "--limit") or std.mem.eql(u8, arg, "--max") or std.mem.eql(u8, arg, "--top")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -8360,13 +9262,12 @@ test "token-usage audit summary reports duplicate/reset/null/missing-total proof
     defer std.testing.allocator.free(output_path);
 
     const args = [_][]const u8{
-        "--root", root_abs,
-        "--since", "2026-03-26T00:00:00-07:00",
-        "--until", "2026-03-27T00:00:00-07:00",
-        "--tz", "-07:00",
-        "--summary",
-        "--audit",
-        "--format", "json",
+        "--root",    root_abs,
+        "--since",   "2026-03-26T00:00:00-07:00",
+        "--until",   "2026-03-27T00:00:00-07:00",
+        "--tz",      "-07:00",
+        "--summary", "--audit",
+        "--format",  "json",
     };
     const got = try runCommandWithOutput(std.testing.allocator, .token_usage, args[0..], output_path);
     defer std.testing.allocator.free(got);
@@ -8408,13 +9309,13 @@ test "token-usage audit grouped output appends aggregate audit row after trimmin
     defer std.testing.allocator.free(output_path);
 
     const args = [_][]const u8{
-        "--root", root_abs,
+        "--root",  root_abs,
         "--since", "2026-03-26T00:00:00-07:00",
         "--until", "2026-03-27T00:00:00-07:00",
-        "--tz", "-07:00",
-        "--audit",
-        "--top", "1",
-        "--format", "jsonl",
+        "--tz",    "-07:00",
+        "--audit", "--top",
+        "1",       "--format",
+        "jsonl",
     };
     const got = try runCommandWithOutput(std.testing.allocator, .token_usage, args[0..], output_path);
     defer std.testing.allocator.free(got);

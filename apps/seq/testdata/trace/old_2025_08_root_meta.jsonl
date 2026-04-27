@@ -1,0 +1,7 @@
+{"id":"old-session","timestamp":"2025-08-01T10:00:00Z","cwd":"/old","model":"gpt-4.1"}
+{"timestamp":"2025-08-01T10:00:01Z","role":"user","content":[{"type":"input_text","text":"first"}]}
+{"timestamp":"2025-08-01T10:00:02Z","role":"assistant","content":[{"type":"output_text","text":"first answer"}]}
+{"timestamp":"2025-08-01T10:01:01Z","role":"user","content":[{"type":"input_text","text":"second"}]}
+{"timestamp":"2025-08-01T10:01:02Z","call_id":"old-call","name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"}
+{"timestamp":"2025-08-01T10:01:03Z","call_id":"old-call","output":"Process exited with code 0\nOutput:\n/old"}
+{"timestamp":"2025-08-01T10:01:04Z","role":"assistant","content":[{"type":"output_text","text":"second answer"}]}

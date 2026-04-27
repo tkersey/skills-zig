@@ -8,6 +8,7 @@ comptime {
     _ = @import("query/engine.zig");
     _ = @import("output/mod.zig");
     _ = @import("commands/mod.zig");
+    _ = @import("canonical_trace.zig");
     _ = @import("datasets/mod.zig");
     _ = @import("plan_blocks.zig");
     _ = @import("datasets/messages.zig");

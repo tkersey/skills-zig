@@ -71,6 +71,62 @@ Binary output:
 
 `query.where.op` supports `contains_any` and `regex_any` in addition to `contains` and `regex`.
 `regex` uses a fast regex-like subset (`^`, `$`, `|`) and fails fast on unsupported constructs.
+
+## Trace-native session surfaces
+
+`seq` can parse Codex rollout JSONL into canonical sessions, turns, tool lifecycle rows, and worker graph edges. These commands preserve the existing local-first flow: they read local `rollout-*.jsonl` files under `~/.codex/sessions` or an explicit `--path`.
+
+Trace inventory:
+```bash
+seq sessions --root ~/.codex/sessions --format table
+seq sessions --root ~/.codex/sessions --ongoing --format jsonl
+seq sessions --root ~/.codex/sessions --repo /path/to/repo --since 2026-04-01T00:00:00Z --format table
+```
+
+Canonical turns:
+```bash
+seq turns --path /absolute/rollout.jsonl --format table
+seq turns --session-id <id> --root ~/.codex/sessions --status error --format jsonl
+```
+
+Full per-session proof:
+```bash
+seq session-detail --path /absolute/rollout.jsonl --format json
+seq session-detail --session-id <id> --root ~/.codex/sessions --format markdown
+```
+
+Tool lifecycle completeness:
+```bash
+seq tool-lifecycle --path /absolute/rollout.jsonl --format table
+seq tool-lifecycle --session-id <id> --root ~/.codex/sessions --include-raw --format json
+```
+
+Worker/session graph:
+```bash
+seq session-graph --session-id <id> --root ~/.codex/sessions --format table
+seq session-graph --session-id <id> --root ~/.codex/sessions --format dot
+```
+
+Live or one-shot tailing:
+```bash
+seq tail --current --root ~/.codex/sessions --format table
+seq tail --path /absolute/rollout.jsonl --events raw,turns,tools --once --format jsonl
+```
+
+Trace datasets are available through `seq query`:
+- `sessions`
+- `turns`
+- `tool_lifecycle`
+- `session_graph_edges`
+
+Examples:
+```bash
+seq query --root ~/.codex/sessions --spec '{"dataset":"sessions","select":["start_time","session_id","thread_name","turn_count","total_tokens"],"sort":["-start_time"],"limit":10,"format":"table"}'
+seq query --root ~/.codex/sessions --spec '{"dataset":"turns","where":[{"field":"status","op":"eq","value":"error"}],"select":["started_at","session_id","turn_index","error","path"],"sort":["-started_at"],"limit":20,"format":"table"}'
+seq query --root ~/.codex/sessions --spec '{"dataset":"tool_lifecycle","where":[{"field":"lifecycle_status","op":"eq","value":"unresolved"}],"select":["path","turn_index","tool_name","call_id"],"limit":20,"format":"jsonl"}'
+seq query --root ~/.codex/sessions --spec '{"dataset":"session_graph_edges","select":["parent_session_id","worker_session_id","agent_role","worker_path"],"format":"table"}'
+```
+
 `plan-search` is the strict finalized-plan surface:
 - searches assistant messages for complete `<proposed_plan> ... </proposed_plan>` blocks only
 - matches by repo (`--repo`), session (`--session-id` / `--path`), time (`--since` / `--until`), and title/body text (`--contains` / `--regex`)

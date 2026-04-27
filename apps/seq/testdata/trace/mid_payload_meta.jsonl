@@ -1,0 +1,2 @@
+{"timestamp":"2026-04-01T11:00:00Z","payload":{"type":"session_meta","id":"mid-session","cwd":"/repo-mid","model":"gpt-5-mini"}}
+{"timestamp":"2026-04-01T11:00:01Z","payload":{"type":"task_started","turn_id":"mid-turn"}}

@@ -7,12 +7,16 @@ pub const Format = enum {
     json,
     csv,
     jsonl,
+    markdown,
+    dot,
 
     pub fn parse(text: []const u8) !Format {
         if (std.ascii.eqlIgnoreCase(text, "table")) return .table;
         if (std.ascii.eqlIgnoreCase(text, "json")) return .json;
         if (std.ascii.eqlIgnoreCase(text, "csv")) return .csv;
         if (std.ascii.eqlIgnoreCase(text, "jsonl")) return .jsonl;
+        if (std.ascii.eqlIgnoreCase(text, "markdown")) return .markdown;
+        if (std.ascii.eqlIgnoreCase(text, "dot")) return .dot;
         return error.InvalidFormat;
     }
 };
@@ -55,6 +59,7 @@ pub fn render(
         .json => formatJson(allocator, rows, columns, true),
         .csv => formatCsv(allocator, rows, columns),
         .jsonl => formatJsonl(allocator, rows, columns),
+        .markdown, .dot => error.UnsupportedGenericFormat,
     };
 }
 
@@ -210,7 +215,7 @@ pub fn formatJsonl(
     return writer_alloc.toOwnedSlice();
 }
 
-fn writeJsonObject(
+pub fn writeJsonObject(
     writer: anytype,
     row: query.Row,
     columns: []const []const u8,
@@ -236,7 +241,7 @@ fn writeJsonObject(
     try writer.writeByte('}');
 }
 
-fn writeScalarJson(writer: anytype, value: spec.Scalar) !void {
+pub fn writeScalarJson(writer: anytype, value: spec.Scalar) !void {
     switch (value) {
         .null => try writer.writeAll("null"),
         .bool => |v| try writer.writeAll(if (v) "true" else "false"),
@@ -268,7 +273,7 @@ fn writeCsvCell(writer: anytype, text: []const u8) !void {
     try writer.writeByte('"');
 }
 
-fn writeJsonString(writer: anytype, text: []const u8) !void {
+pub fn writeJsonString(writer: anytype, text: []const u8) !void {
     try writer.writeByte('"');
     for (text) |c| {
         switch (c) {

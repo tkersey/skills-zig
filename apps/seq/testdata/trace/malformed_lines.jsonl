@@ -1,0 +1,2 @@
+not-json
+{"type":"event_msg","timestamp":"2026-04-01T12:00:00Z","payload":{"type":"task_started","turn_id":"ok"}}
