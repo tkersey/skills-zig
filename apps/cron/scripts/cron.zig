@@ -118,14 +118,14 @@ pub fn runPerfCase(allocator: std.mem.Allocator, case: PerfCase, temp_root: []co
     defer restoreStdout(stdout_guard);
 
     switch (case) {
-        .show => try run(allocator, &.{ "--db", db_path, "show", "--id", "cron-001" }),
-        .create => try run(allocator, &.{ "--db", db_path, "create", "--name", "Created Perf", "--prompt", "noop prompt", "--rrule", "RRULE:FREQ=DAILY;BYHOUR=9;BYMINUTE=15" }),
-        .update => try run(allocator, &.{ "--db", db_path, "update", "--id", "cron-001", "--new-name", "Updated Perf" }),
-        .enable => try run(allocator, &.{ "--db", db_path, "enable", "--id", "cron-001" }),
-        .disable => try run(allocator, &.{ "--db", db_path, "disable", "--id", "cron-001" }),
-        .run_now => try run(allocator, &.{ "--db", db_path, "run-now", "--id", "cron-001" }),
-        .delete => try run(allocator, &.{ "--db", db_path, "delete", "--id", "cron-001" }),
-        .run_due => try run(allocator, &.{ "--db", db_path, "run-due", "--id", "cron-001", "--dry-run" }),
+        .show => try run(allocator, std.Io.Threaded.global_single_threaded.io(), &.{ "--db", db_path, "show", "--id", "cron-001" }),
+        .create => try run(allocator, std.Io.Threaded.global_single_threaded.io(), &.{ "--db", db_path, "create", "--name", "Created Perf", "--prompt", "noop prompt", "--rrule", "RRULE:FREQ=DAILY;BYHOUR=9;BYMINUTE=15" }),
+        .update => try run(allocator, std.Io.Threaded.global_single_threaded.io(), &.{ "--db", db_path, "update", "--id", "cron-001", "--new-name", "Updated Perf" }),
+        .enable => try run(allocator, std.Io.Threaded.global_single_threaded.io(), &.{ "--db", db_path, "enable", "--id", "cron-001" }),
+        .disable => try run(allocator, std.Io.Threaded.global_single_threaded.io(), &.{ "--db", db_path, "disable", "--id", "cron-001" }),
+        .run_now => try run(allocator, std.Io.Threaded.global_single_threaded.io(), &.{ "--db", db_path, "run-now", "--id", "cron-001" }),
+        .delete => try run(allocator, std.Io.Threaded.global_single_threaded.io(), &.{ "--db", db_path, "delete", "--id", "cron-001" }),
+        .run_due => try run(allocator, std.Io.Threaded.global_single_threaded.io(), &.{ "--db", db_path, "run-due", "--id", "cron-001", "--dry-run" }),
     }
 }
 
@@ -512,7 +512,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    run(allocator, argv[1..]) catch |err| {
+    run(allocator, init.io, argv[1..]) catch |err| {
         if (err == error.UserInput) std.process.exit(1);
 
         var stderr_file = std.Io.File.stderr();
@@ -523,7 +523,7 @@ pub fn main(init: std.process.Init) !void {
     };
 }
 
-fn run(allocator: std.mem.Allocator, raw_args: []const []const u8) !void {
+fn run(allocator: std.mem.Allocator, io: std.Io, raw_args: []const []const u8) !void {
     var global = try parseGlobalArgs(allocator, raw_args);
     defer allocator.free(global.db_path);
     defer allocator.free(global.args);
@@ -585,11 +585,11 @@ fn run(allocator: std.mem.Allocator, raw_args: []const []const u8) !void {
         },
         .run_due => {
             const args = try parseRunDueArgs(global.args[1..]);
-            try cmdRunDue(allocator, global.db_path, args);
+            try cmdRunDue(allocator, io, global.db_path, args);
             return;
         },
         .scheduler => {
-            try cmdScheduler(allocator, global.args[1..]);
+            try cmdScheduler(allocator, io, global.args[1..]);
             return;
         },
         .unknown => {},
@@ -993,7 +993,7 @@ fn parseRunDueArgs(args: []const []const u8) !RunDueArgs {
     };
 }
 
-fn cmdScheduler(allocator: std.mem.Allocator, args: []const []const u8) !void {
+fn cmdScheduler(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     if (args.len == 0) return userErrorFmt("scheduler requires one of: install, uninstall, status", .{});
     if (isHelpArg(args[0])) {
         try printUsage();
@@ -1007,17 +1007,17 @@ fn cmdScheduler(allocator: std.mem.Allocator, args: []const []const u8) !void {
     switch (parseSchedulerCommand(args[0])) {
         .install => {
             const parsed = try parseSchedulerInstallArgs(args[1..]);
-            try cmdSchedulerInstall(allocator, parsed);
+            try cmdSchedulerInstall(allocator, io, parsed);
             return;
         },
         .uninstall => {
             const parsed = try parseSchedulerLabelArgs(args[1..]);
-            try cmdSchedulerUninstall(allocator, parsed);
+            try cmdSchedulerUninstall(allocator, io, parsed);
             return;
         },
         .status => {
             const parsed = try parseSchedulerLabelArgs(args[1..]);
-            try cmdSchedulerStatus(allocator, parsed);
+            try cmdSchedulerStatus(allocator, io, parsed);
             return;
         },
         .unknown => {},
@@ -1462,6 +1462,12 @@ fn freeOwnedStrings(allocator: std.mem.Allocator, list: std.ArrayList([]u8)) voi
     mutable.deinit(allocator);
 }
 
+fn currentPathOwned(allocator: std.mem.Allocator) ![]u8 {
+    const cwd_z = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
+    defer allocator.free(cwd_z);
+    return allocator.dupe(u8, cwd_z);
+}
+
 fn encodeStringArrayJson(allocator: std.mem.Allocator, items: []const []const u8) ![]u8 {
     var writer_alloc = std.Io.Writer.Allocating.init(allocator);
     defer writer_alloc.deinit();
@@ -1482,7 +1488,7 @@ fn resolveCwdsForCreate(allocator: std.mem.Allocator, input: CwdsInput) ![]u8 {
 
     switch (input.mode) {
         .inherit_default => {
-            const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
+            const cwd = try currentPathOwned(allocator);
             try owned.append(allocator, cwd);
         },
         .clear => {},
@@ -1613,6 +1619,17 @@ fn writeAutomationFiles(allocator: std.mem.Allocator, db: *Db, automation_id: []
     const cwds_toml = try renderTomlStringArray(allocator, cwds_view.items);
     defer allocator.free(cwds_toml);
 
+    const id_toml = try tomlQuoteAlloc(allocator, row.id);
+    defer allocator.free(id_toml);
+    const name_toml = try tomlQuoteAlloc(allocator, row.name);
+    defer allocator.free(name_toml);
+    const prompt_toml = try tomlQuoteAlloc(allocator, row.prompt);
+    defer allocator.free(prompt_toml);
+    const status_toml = try tomlQuoteAlloc(allocator, row.status);
+    defer allocator.free(status_toml);
+    const rrule_toml = try tomlQuoteAlloc(allocator, row.rrule);
+    defer allocator.free(rrule_toml);
+
     const toml_text = try std.fmt.allocPrint(
         allocator,
         "version = 1\n" ++
@@ -1625,11 +1642,11 @@ fn writeAutomationFiles(allocator: std.mem.Allocator, db: *Db, automation_id: []
             "created_at = {d}\n" ++
             "updated_at = {d}\n",
         .{
-            try tomlQuoteAlloc(allocator, row.id),
-            try tomlQuoteAlloc(allocator, row.name),
-            try tomlQuoteAlloc(allocator, row.prompt),
-            try tomlQuoteAlloc(allocator, row.status),
-            try tomlQuoteAlloc(allocator, row.rrule),
+            id_toml,
+            name_toml,
+            prompt_toml,
+            status_toml,
+            rrule_toml,
             cwds_toml,
             row.created_at,
             row.updated_at,
@@ -1857,11 +1874,12 @@ fn cmdUpdate(allocator: std.mem.Allocator, db_path: []const u8, args: UpdateArgs
         try params.append(allocator, .{ .text = name });
     }
 
+    var prompt_storage: ?[]u8 = null;
+    defer if (prompt_storage) |value| allocator.free(value);
     if (args.prompt != null or args.prompt_file != null) {
-        const prompt = try readPrompt(allocator, args.prompt, args.prompt_file);
-        defer allocator.free(prompt);
+        prompt_storage = try readPrompt(allocator, args.prompt, args.prompt_file);
         try assignments.append(allocator, "prompt = ?");
-        try params.append(allocator, .{ .text = prompt });
+        try params.append(allocator, .{ .text = prompt_storage.? });
     }
 
     var canonical_rrule_storage: ?[]u8 = null;
@@ -1981,7 +1999,7 @@ fn cmdDelete(allocator: std.mem.Allocator, db_path: []const u8, resolve: Resolve
     try stdout.print("{s}\n", .{row.id});
 }
 
-fn cmdRunDue(allocator: std.mem.Allocator, db_path: []const u8, args: RunDueArgs) !void {
+fn cmdRunDue(allocator: std.mem.Allocator, io: std.Io, db_path: []const u8, args: RunDueArgs) !void {
     const maybe_lock = try acquireRunLock(allocator, args.lock_label);
     defer releaseRunLock(allocator, maybe_lock);
 
@@ -2028,7 +2046,7 @@ fn cmdRunDue(allocator: std.mem.Allocator, db_path: []const u8, args: RunDueArgs
     }
 
     for (due.items) |*row| {
-        const result = runDueAutomation(allocator, &db, row, codex_exe orelse "", args.dry_run) catch |err| {
+        const result = runDueAutomation(allocator, io, &db, row, codex_exe orelse "", args.dry_run) catch |err| {
             const err_text = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
             const empty_thread = try allocator.dupe(u8, "");
             errdefer allocator.free(empty_thread);
@@ -2097,6 +2115,7 @@ fn selectDueAutomations(
 
 fn runDueAutomation(
     allocator: std.mem.Allocator,
+    io: std.Io,
     db: *Db,
     row: *AutomationRow,
     codex_bin: []const u8,
@@ -2113,7 +2132,7 @@ fn runDueAutomation(
     defer freeOwnedStrings(allocator, cwds);
 
     if (cwds.items.len == 0) {
-        const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
+        const cwd = try currentPathOwned(allocator);
         try cwds.append(allocator, cwd);
     }
 
@@ -2142,7 +2161,20 @@ fn runDueAutomation(
 
         try insertRunRow(allocator, db, row, thread_id, cwd, started);
 
-        const exec_result = try runCodexExec(allocator, codex_bin, cwd, row.prompt, thread_id);
+        const exec_result = runCodexExec(allocator, io, codex_bin, cwd, row.prompt, thread_id) catch |err| {
+            const summary = try std.fmt.allocPrint(allocator, "Command failed before completion: {s}", .{@errorName(err)});
+            defer allocator.free(summary);
+            try updateRunRow(allocator, db, thread_id, row, "FAILED", summary, summary, nowMs());
+
+            allocator.free(final_thread_id);
+            allocator.free(final_cwd);
+            final_thread_id = try allocator.dupe(u8, thread_id);
+            final_cwd = try allocator.dupe(u8, cwd);
+
+            const msg = try std.fmt.allocPrint(allocator, "{s} ({s})", .{ cwd, @errorName(err) });
+            try failures.append(allocator, msg);
+            continue;
+        };
         defer {
             allocator.free(exec_result.stdout);
             allocator.free(exec_result.stderr);
@@ -2506,7 +2538,7 @@ const CodexRunResult = struct {
     output_path: []u8,
 };
 
-fn runCodexExec(allocator: std.mem.Allocator, codex_bin: []const u8, cwd: []const u8, prompt: []const u8, thread_id: []const u8) !CodexRunResult {
+fn runCodexExec(allocator: std.mem.Allocator, io: std.Io, codex_bin: []const u8, cwd: []const u8, prompt: []const u8, thread_id: []const u8) !CodexRunResult {
     const tmp_dir = try tmpAutomationRunnerDir(allocator);
     defer allocator.free(tmp_dir);
     try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), tmp_dir);
@@ -2525,7 +2557,7 @@ fn runCodexExec(allocator: std.mem.Allocator, codex_bin: []const u8, cwd: []cons
         prompt,
     };
 
-    const child = try std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
+    const child = try std.process.run(allocator, io, .{
         .argv = &argv,
         .stdout_limit = .limited(MaxCommandOutputBytes),
         .stderr_limit = .limited(MaxCommandOutputBytes),
@@ -2662,7 +2694,7 @@ fn resolveExecutable(allocator: std.mem.Allocator, raw: []const u8) !?[]u8 {
     return null;
 }
 
-fn cmdSchedulerInstall(allocator: std.mem.Allocator, args: SchedulerInstallArgs) !void {
+fn cmdSchedulerInstall(allocator: std.mem.Allocator, io: std.Io, args: SchedulerInstallArgs) !void {
     if (builtin.os.tag != .macos) return userErrorFmt("scheduler commands are supported on macOS only", .{});
 
     const home = envString("HOME") orelse return userErrorFmt("HOME is not set", .{});
@@ -2679,6 +2711,19 @@ fn cmdSchedulerInstall(allocator: std.mem.Allocator, args: SchedulerInstallArgs)
 
     const self_path = try std.process.executablePathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
     defer allocator.free(self_path);
+
+    const label_xml = try xmlEscapeAlloc(allocator, args.label);
+    defer allocator.free(label_xml);
+    const self_path_xml = try xmlEscapeAlloc(allocator, self_path);
+    defer allocator.free(self_path_xml);
+    const home_xml = try xmlEscapeAlloc(allocator, home);
+    defer allocator.free(home_xml);
+    const log_dir_xml = try xmlEscapeAlloc(allocator, log_dir);
+    defer allocator.free(log_dir_xml);
+    const path_xml = try xmlEscapeAlloc(allocator, args.path_value);
+    defer allocator.free(path_xml);
+    const codex_bin_xml = try xmlEscapeAlloc(allocator, args.codex_bin);
+    defer allocator.free(codex_bin_xml);
 
     const plist = try std.fmt.allocPrint(
         allocator,
@@ -2723,7 +2768,7 @@ fn cmdSchedulerInstall(allocator: std.mem.Allocator, args: SchedulerInstallArgs)
             "  </dict>\n" ++
             "</dict>\n" ++
             "</plist>\n",
-        .{ args.label, self_path, home, args.interval_seconds, log_dir, log_dir, args.path_value, args.label, args.codex_bin },
+        .{ label_xml, self_path_xml, home_xml, args.interval_seconds, log_dir_xml, log_dir_xml, path_xml, label_xml, codex_bin_xml },
     );
     defer allocator.free(plist);
 
@@ -2740,7 +2785,7 @@ fn cmdSchedulerInstall(allocator: std.mem.Allocator, args: SchedulerInstallArgs)
         try writeFileAtomic(allocator, plist_path, plist);
     }
 
-    _ = try runCommandCapture(allocator, &.{ "plutil", "-lint", plist_path }, true);
+    _ = try runCommandCapture(allocator, io, &.{ "plutil", "-lint", plist_path }, true);
 
     const uid = std.c.getuid();
     const target = try std.fmt.allocPrint(allocator, "gui/{d}/{s}", .{ uid, args.label });
@@ -2748,11 +2793,11 @@ fn cmdSchedulerInstall(allocator: std.mem.Allocator, args: SchedulerInstallArgs)
     const domain = try std.fmt.allocPrint(allocator, "gui/{d}", .{uid});
     defer allocator.free(domain);
 
-    _ = runCommandCapture(allocator, &.{ "launchctl", "bootout", target }, false) catch null;
-    _ = try runCommandCapture(allocator, &.{ "launchctl", "bootstrap", domain, plist_path }, true);
-    _ = runCommandCapture(allocator, &.{ "launchctl", "enable", target }, false) catch null;
-    _ = try runCommandCapture(allocator, &.{ "launchctl", "kickstart", "-k", target }, true);
-    _ = try runCommandCapture(allocator, &.{ "launchctl", "print", target }, true);
+    _ = runCommandCapture(allocator, io, &.{ "launchctl", "bootout", target }, false) catch null;
+    _ = try runCommandCapture(allocator, io, &.{ "launchctl", "bootstrap", domain, plist_path }, true);
+    _ = runCommandCapture(allocator, io, &.{ "launchctl", "enable", target }, false) catch null;
+    _ = try runCommandCapture(allocator, io, &.{ "launchctl", "kickstart", "-k", target }, true);
+    _ = try runCommandCapture(allocator, io, &.{ "launchctl", "print", target }, true);
 
     var stdout_file = std.Io.File.stdout();
     var stdout_writer = stdout_file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
@@ -2762,7 +2807,7 @@ fn cmdSchedulerInstall(allocator: std.mem.Allocator, args: SchedulerInstallArgs)
     try stdout.print("logs: {s}\n", .{log_dir});
 }
 
-fn cmdSchedulerUninstall(allocator: std.mem.Allocator, args: SchedulerLabelArgs) !void {
+fn cmdSchedulerUninstall(allocator: std.mem.Allocator, io: std.Io, args: SchedulerLabelArgs) !void {
     if (builtin.os.tag != .macos) return userErrorFmt("scheduler commands are supported on macOS only", .{});
 
     const home = envString("HOME") orelse return userErrorFmt("HOME is not set", .{});
@@ -2773,8 +2818,8 @@ fn cmdSchedulerUninstall(allocator: std.mem.Allocator, args: SchedulerLabelArgs)
     const target = try std.fmt.allocPrint(allocator, "gui/{d}/{s}", .{ uid, args.label });
     defer allocator.free(target);
 
-    _ = runCommandCapture(allocator, &.{ "launchctl", "disable", target }, false) catch null;
-    _ = runCommandCapture(allocator, &.{ "launchctl", "bootout", target }, false) catch null;
+    _ = runCommandCapture(allocator, io, &.{ "launchctl", "disable", target }, false) catch null;
+    _ = runCommandCapture(allocator, io, &.{ "launchctl", "bootout", target }, false) catch null;
 
     var existed = true;
     std.Io.Dir.cwd().deleteFile(std.Io.Threaded.global_single_threaded.io(), plist) catch |err| switch (err) {
@@ -2792,14 +2837,14 @@ fn cmdSchedulerUninstall(allocator: std.mem.Allocator, args: SchedulerLabelArgs)
     }
 }
 
-fn cmdSchedulerStatus(allocator: std.mem.Allocator, args: SchedulerLabelArgs) !void {
+fn cmdSchedulerStatus(allocator: std.mem.Allocator, io: std.Io, args: SchedulerLabelArgs) !void {
     if (builtin.os.tag != .macos) return userErrorFmt("scheduler commands are supported on macOS only", .{});
 
     const uid = std.c.getuid();
     const target = try std.fmt.allocPrint(allocator, "gui/{d}/{s}", .{ uid, args.label });
     defer allocator.free(target);
 
-    const out = try runCommandCapture(allocator, &.{ "launchctl", "print", target }, false);
+    const out = try runCommandCapture(allocator, io, &.{ "launchctl", "print", target }, false);
     defer {
         allocator.free(out.stdout);
         allocator.free(out.stderr);
@@ -2821,8 +2866,8 @@ const CommandCapture = struct {
     stderr: []u8,
 };
 
-fn runCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8, fail_on_nonzero: bool) !CommandCapture {
-    const child = try std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
+fn runCommandCapture(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8, fail_on_nonzero: bool) !CommandCapture {
+    const child = try std.process.run(allocator, io, .{
         .argv = argv,
         .stdout_limit = .limited(MaxCommandOutputBytes),
         .stderr_limit = .limited(MaxCommandOutputBytes),
@@ -2846,7 +2891,7 @@ fn runCommandCapture(allocator: std.mem.Allocator, argv: []const []const u8, fai
 fn printAutomationRowsJson(stdout: anytype, rows: []const AutomationRow) !void {
     try stdout.writeAll("[\n");
     for (rows, 0..) |row, idx| {
-        try printAutomationRowJson(stdout, row, 2, idx + 1 != rows.len);
+        try printAutomationRowJson(stdout, row, 2, false);
         if (idx + 1 != rows.len) {
             try stdout.writeAll(",\n");
         } else {
@@ -2975,6 +3020,25 @@ fn jsonWriteString(writer: anytype, value: []const u8) !void {
     try out.writeByte('\"');
 }
 
+fn xmlEscapeAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const w = &writer_alloc.writer;
+
+    for (value) |ch| {
+        switch (ch) {
+            '&' => try w.writeAll("&amp;"),
+            '<' => try w.writeAll("&lt;"),
+            '>' => try w.writeAll("&gt;"),
+            '\"' => try w.writeAll("&quot;"),
+            '\'' => try w.writeAll("&apos;"),
+            else => try w.writeByte(ch),
+        }
+    }
+
+    return writer_alloc.toOwnedSlice();
+}
+
 fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, contents: []const u8) !void {
     const tmp = try std.fmt.allocPrint(allocator, "{s}.tmp.{d}", .{ path, std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds });
     defer allocator.free(tmp);
@@ -3057,6 +3121,50 @@ fn userErrorFmt(comptime fmt: []const u8, args: anytype) error{UserInput} {
     return error.UserInput;
 }
 
+fn createTestSchema(allocator: std.mem.Allocator, db: *Db) !void {
+    try db.exec(allocator,
+        \\create table automations (
+        \\  id text primary key,
+        \\  name text not null,
+        \\  prompt text not null,
+        \\  status text not null,
+        \\  next_run_at integer,
+        \\  last_run_at integer,
+        \\  cwds text not null,
+        \\  rrule text not null,
+        \\  created_at integer not null,
+        \\  updated_at integer not null
+        \\)
+    , &.{});
+    try db.exec(allocator,
+        \\create table automation_runs (
+        \\  thread_id text primary key,
+        \\  automation_id text not null,
+        \\  status text not null,
+        \\  read_at integer,
+        \\  thread_title text,
+        \\  source_cwd text,
+        \\  inbox_title text,
+        \\  inbox_summary text,
+        \\  created_at integer not null,
+        \\  updated_at integer not null,
+        \\  archived_user_message text,
+        \\  archived_assistant_message text,
+        \\  archived_reason text
+        \\)
+    , &.{});
+    try db.exec(allocator,
+        \\create table inbox_items (
+        \\  id text primary key,
+        \\  title text,
+        \\  description text,
+        \\  thread_id text,
+        \\  read_at integer,
+        \\  created_at integer
+        \\)
+    , &.{});
+}
+
 test "parseAndCanonicalizeRrule canonicalizes prefix and key order" {
     const alloc = std.testing.allocator;
     const rule = try parseAndCanonicalizeRrule(alloc, "freq=weekly;byday=mo,we,fr;byhour=9;byminute=0");
@@ -3121,6 +3229,111 @@ test "computeNextRunAt accepts legacy non-prefixed rrule" {
     const anchor: i64 = 1_772_470_000_000;
     const next = try computeNextRunAt(alloc, &row, anchor);
     try std.testing.expect(next > anchor);
+}
+
+test "automation rows json uses valid separators for multiple rows" {
+    const alloc = std.testing.allocator;
+    var rows = [_]AutomationRow{
+        .{
+            .id = try alloc.dupe(u8, "row-1"),
+            .name = try alloc.dupe(u8, "First"),
+            .prompt = try alloc.dupe(u8, "line one\nline two"),
+            .status = try alloc.dupe(u8, "ACTIVE"),
+            .next_run_at = null,
+            .last_run_at = null,
+            .cwds_json = try alloc.dupe(u8, "[]"),
+            .rrule = try alloc.dupe(u8, "RRULE:FREQ=DAILY;BYHOUR=9;BYMINUTE=0"),
+            .created_at = 1,
+            .updated_at = 1,
+        },
+        .{
+            .id = try alloc.dupe(u8, "row-2"),
+            .name = try alloc.dupe(u8, "Second"),
+            .prompt = try alloc.dupe(u8, "prompt"),
+            .status = try alloc.dupe(u8, "ACTIVE"),
+            .next_run_at = null,
+            .last_run_at = null,
+            .cwds_json = try alloc.dupe(u8, "[]"),
+            .rrule = try alloc.dupe(u8, "RRULE:FREQ=DAILY;BYHOUR=10;BYMINUTE=0"),
+            .created_at = 2,
+            .updated_at = 2,
+        },
+    };
+    defer for (&rows) |*row| row.deinit(alloc);
+
+    const json_text = try buildAutomationRowsJsonAlloc(alloc, rows[0..]);
+    defer alloc.free(json_text);
+    try std.testing.expect(std.mem.indexOf(u8, json_text, "},,") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json_text, "},\n  {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_text, "\"prompt\": \"line one\\nline two\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_text, "\"prompt\": \"line one\nline two\"") == null);
+}
+
+test "cmdUpdate preserves prompt text until sqlite step" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "codex-dev.db", .data = "" });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "prompt.md", .data = "file prompt\n" });
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", alloc);
+    defer alloc.free(root_abs);
+    const db_path = try std.fs.path.join(alloc, &.{ root_abs, "codex-dev.db" });
+    defer alloc.free(db_path);
+    const prompt_path = try std.fs.path.join(alloc, &.{ root_abs, "prompt.md" });
+    defer alloc.free(prompt_path);
+
+    var db = try Db.open(alloc, db_path);
+    defer db.close();
+    try createTestSchema(alloc, &db);
+    const created_at: i64 = 1_772_469_600_000;
+    try db.exec(
+        alloc,
+        "insert into automations (id, name, prompt, status, next_run_at, last_run_at, cwds, rrule, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &.{
+            .{ .text = "prompt-update-id" },
+            .{ .text = "Prompt Update" },
+            .{ .text = "initial prompt" },
+            .{ .text = "ACTIVE" },
+            .null,
+            .null,
+            .{ .text = "[]" },
+            .{ .text = "RRULE:FREQ=DAILY;BYHOUR=9;BYMINUTE=0" },
+            .{ .int = created_at },
+            .{ .int = created_at },
+        },
+    );
+
+    var inline_args = try parseUpdateArgs(alloc, &.{ "--id", "prompt-update-id", "--prompt", "inline prompt" });
+    defer inline_args.cwds.deinit(alloc);
+    {
+        const stdout_guard = try silenceStdout();
+        defer restoreStdout(stdout_guard);
+        try cmdUpdate(alloc, db_path, inline_args);
+    }
+
+    var inline_row = try getAutomationById(alloc, &db, "prompt-update-id");
+    defer inline_row.deinit(alloc);
+    try std.testing.expectEqualStrings("inline prompt", inline_row.prompt);
+
+    var file_args = try parseUpdateArgs(alloc, &.{ "--id", "prompt-update-id", "--prompt-file", prompt_path });
+    defer file_args.cwds.deinit(alloc);
+    {
+        const stdout_guard = try silenceStdout();
+        defer restoreStdout(stdout_guard);
+        try cmdUpdate(alloc, db_path, file_args);
+    }
+
+    var file_row = try getAutomationById(alloc, &db, "prompt-update-id");
+    defer file_row.deinit(alloc);
+    try std.testing.expectEqualStrings("file prompt", file_row.prompt);
+}
+
+test "xmlEscapeAlloc escapes plist string metacharacters" {
+    const alloc = std.testing.allocator;
+    const escaped = try xmlEscapeAlloc(alloc, "a&b<c>d\"e'f");
+    defer alloc.free(escaped);
+    try std.testing.expectEqualStrings("a&amp;b&lt;c&gt;d&quot;e&apos;f", escaped);
 }
 
 test "runDueAutomation dry-run is read-only" {
@@ -3192,7 +3405,7 @@ test "runDueAutomation dry-run is read-only" {
     const before_last = row.last_run_at;
     const before_next = row.next_run_at;
 
-    const result = try runDueAutomation(alloc, &db, &row, "codex", true);
+    const result = try runDueAutomation(alloc, std.Io.Threaded.global_single_threaded.io(), &db, &row, "codex", true);
     defer alloc.free(result.thread_id);
     defer alloc.free(result.cwd);
     if (result.err) |err_text| alloc.free(err_text);
@@ -3213,6 +3426,60 @@ test "runDueAutomation dry-run is read-only" {
     defer after.deinit(alloc);
     try std.testing.expectEqual(before_last, after.last_run_at);
     try std.testing.expectEqual(before_next, after.next_run_at);
+}
+
+test "runDueAutomation non-dry-run finalizes run row with provided io" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "codex-dev.db", .data = "" });
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", alloc);
+    defer alloc.free(root_abs);
+    const db_path = try std.fs.path.join(alloc, &.{ root_abs, "codex-dev.db" });
+    defer alloc.free(db_path);
+
+    var db = try Db.open(alloc, db_path);
+    defer db.close();
+    try createTestSchema(alloc, &db);
+
+    const created_at: i64 = 1_772_469_600_000;
+    try db.exec(
+        alloc,
+        "insert into automations (id, name, prompt, status, next_run_at, last_run_at, cwds, rrule, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &.{
+            .{ .text = "run-due-id" },
+            .{ .text = "Run Due" },
+            .{ .text = "noop prompt" },
+            .{ .text = "ACTIVE" },
+            .null,
+            .null,
+            .{ .text = "[]" },
+            .{ .text = "RRULE:FREQ=DAILY;BYHOUR=9;BYMINUTE=0" },
+            .{ .int = created_at },
+            .{ .int = created_at },
+        },
+    );
+
+    var row = try getAutomationById(alloc, &db, "run-due-id");
+    defer row.deinit(alloc);
+
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const result = try runDueAutomation(alloc, threaded.io(), &db, &row, "/bin/echo", false);
+    defer alloc.free(result.thread_id);
+    defer alloc.free(result.cwd);
+    if (result.err) |err_text| alloc.free(err_text);
+
+    try std.testing.expectEqualStrings("ok", result.status);
+
+    var runs_stmt = try db.prepare(alloc, "select status from automation_runs where automation_id = ?");
+    defer runs_stmt.deinit();
+    try runs_stmt.bindAll(&.{.{ .text = "run-due-id" }});
+    switch (try runs_stmt.step()) {
+        .row => try std.testing.expectEqualStrings("PENDING_REVIEW", runs_stmt.textColumn(0)),
+        .done => unreachable,
+    }
 }
 
 test "runPerfCase covers residual cron command families" {
