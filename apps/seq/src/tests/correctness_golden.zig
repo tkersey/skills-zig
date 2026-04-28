@@ -20,7 +20,20 @@ fn runAndReadOutput(
 }
 
 fn readExpected(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(1 * 1024 * 1024));
+    const raw = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(1 * 1024 * 1024));
+    errdefer allocator.free(raw);
+
+    const fixture_root = "/Users/tk/workspace/tk/skills-zig/apps/seq";
+    if (std.mem.indexOf(u8, raw, fixture_root) == null) return raw;
+
+    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
+    defer allocator.free(cwd);
+
+    const normalized_len = std.mem.replacementSize(u8, raw, fixture_root, cwd);
+    const normalized = try allocator.alloc(u8, normalized_len);
+    _ = std.mem.replace(u8, raw, fixture_root, cwd, normalized);
+    allocator.free(raw);
+    return normalized;
 }
 
 test "golden role-breakdown json" {

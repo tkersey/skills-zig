@@ -74,6 +74,9 @@ pub fn writeOutput(
     defer allocator.free(rendered);
 
     if (out_path) |path| {
+        if (std.fs.path.dirname(path)) |dir| {
+            if (dir.len > 0) try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), dir);
+        }
         try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{
             .sub_path = path,
             .data = rendered,

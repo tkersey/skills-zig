@@ -573,11 +573,6 @@ fn nestedObject(root: std.json.ObjectMap, a: []const u8, b: []const u8) ?std.jso
     return objectField(first, b);
 }
 
-fn nestedString(root: std.json.ObjectMap, a: []const u8, b: []const u8) ?[]const u8 {
-    const first = objectField(root, a) orelse return null;
-    return stringField(first, b);
-}
-
 fn dupOpt(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
     return if (value) |v| try allocator.dupe(u8, v) else null;
 }

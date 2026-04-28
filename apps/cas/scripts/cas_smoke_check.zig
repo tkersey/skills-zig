@@ -511,13 +511,6 @@ fn errorSummary(allocator: std.mem.Allocator, client: *cas.Client, err: anyerror
     return std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
 }
 
-fn hasCapturedHookNotification(allocator: std.mem.Allocator, lines: []const []u8) bool {
-    for (lines) |line| {
-        if (cas.hooks.isHookNotificationLine(allocator, line)) return true;
-    }
-    return false;
-}
-
 fn hasCapturedCompletedHookNotification(allocator: std.mem.Allocator, lines: []const []u8) bool {
     for (lines) |line| {
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
