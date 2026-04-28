@@ -48,6 +48,7 @@ const UsageText =
     \\  --dynamic-tool-response-json JSON
     \\                                   Exact result payload for item/tool/call.
     \\  --read-only                      Decline exec + file approvals.
+    \\  --hooks MODE                     Hook policy: inherit|off|require-observed (default: inherit).
     \\  --fallback MODE                  none|native-review (default: none).
     \\
     \\Status/wait/interrupt options:
@@ -153,6 +154,7 @@ const ParsedArgs = struct {
     elicitation_content_json: ?[]const u8 = null,
     dynamic_tool_response_json: ?[]const u8 = null,
     read_only: bool = false,
+    hook_policy: cas.hooks.HookPolicy = .inherit,
     fallback_mode: FallbackMode = .none,
     show_help: bool = false,
     show_version: bool = false,
@@ -192,6 +194,8 @@ const SessionRecord = struct {
     terminal_fallback_exit_code: ?u8 = null,
     terminal_fallback_output_text: ?[]const u8 = null,
     terminal_fallback_error_text: ?[]const u8 = null,
+    hook_policy: ?[]const u8 = null,
+    hook_log_path: ?[]const u8 = null,
 };
 
 const OutputReceipt = struct {
@@ -205,6 +209,8 @@ const OutputReceipt = struct {
     managed_server_listen_url: ?[]const u8 = null,
     managed_server_stderr_log_path: ?[]const u8 = null,
     orphan_ttl_seconds: ?u32 = null,
+    hook_policy: cas.hooks.HookPolicy = .inherit,
+    hook_log_path: ?[]const u8 = null,
 };
 
 const FailureInfo = struct {
@@ -327,10 +333,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     switch (parsed.action.?) {
-        .start => try cmdStart(allocator, parsed),
-        .status => try cmdStatus(allocator, parsed),
-        .wait => try cmdWait(allocator, parsed),
-        .interrupt => try cmdInterrupt(allocator, parsed),
+        .start => try cmdStart(allocator, init.io, parsed),
+        .status => try cmdStatus(allocator, init.io, parsed),
+        .wait => try cmdWait(allocator, init.io, parsed),
+        .interrupt => try cmdInterrupt(allocator, init.io, parsed),
     }
 }
 
@@ -457,6 +463,10 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             out.dynamic_tool_response_json = value;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--hooks")) {
+            out.hook_policy = cas.hooks.HookPolicy.parse(value) orelse return error.InvalidHooksPolicy;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--fallback")) {
             out.fallback_mode = FallbackMode.parse(value) orelse return error.InvalidFallbackMode;
             continue;
@@ -494,7 +504,7 @@ fn loadCustomInstructionsAlloc(allocator: std.mem.Allocator, raw: []const u8) ![
     return allocator.dupe(u8, raw);
 }
 
-fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
+fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     const cwd = parsed.cwd.?;
     const resolved_codex_path = cas.resolveExecutableAlloc(allocator, "codex") catch {
         try renderErrorAndExit(
@@ -533,9 +543,10 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
         .selected_transport = "websocket",
         .selection_reason = "detached_review_requires_cross_process_truth",
         .orphan_ttl_seconds = managed_server_orphan_ttl_seconds,
+        .hook_policy = parsed.hook_policy,
     };
 
-    var managed_server = startManagedWebsocketServer(allocator, cwd, resolved_codex_path) catch |err| {
+    var managed_server = startManagedWebsocketServer(allocator, cwd, resolved_codex_path, parsed.hook_policy, io) catch |err| {
         try renderErrorAndExit(
             parsed.json,
             "start",
@@ -559,6 +570,7 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
         codex_version,
         "websocket",
         managed_server_listen_url,
+        io,
         parsed,
     ) catch |err| {
         managed_server.kill();
@@ -799,6 +811,8 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
         .managed_server_listen_url = managed_server_listen_url,
         .managed_server_stderr_log_path = null,
         .orphan_ttl_seconds = managed_server_orphan_ttl_seconds,
+        .hook_policy = parsed.hook_policy.asString(),
+        .hook_log_path = event_log_path,
     };
     try writeSessionRecord(allocator, record_path, record);
 
@@ -1011,7 +1025,7 @@ fn cmdStart(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
     }
 }
 
-fn cmdStatus(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
+fn cmdStatus(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     const loaded = try loadSessionRecord(allocator, parsed.review_thread_id.?);
     const record = loaded.record;
 
@@ -1071,6 +1085,7 @@ fn cmdStatus(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
         record.codex_version,
         record.transport_kind,
         record.managed_server_listen_url,
+        io,
         parsed,
     );
     defer {
@@ -1124,7 +1139,7 @@ fn cmdStatus(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
     }
 }
 
-fn cmdWait(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
+fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     const loaded = try loadSessionRecord(allocator, parsed.review_thread_id.?);
     var record = loaded.record;
     if (record.terminal_fallback_transport != null and record.terminal_review_result_json != null) {
@@ -1174,6 +1189,7 @@ fn cmdWait(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
         record.codex_version,
         record.transport_kind,
         record.managed_server_listen_url,
+        io,
         parsed,
     ) catch |err| {
         if (parsed.fallback_mode == .native_review) {
@@ -1367,7 +1383,7 @@ fn cmdWait(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
     }
 }
 
-fn cmdInterrupt(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
+fn cmdInterrupt(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     const loaded = try loadSessionRecord(allocator, parsed.review_thread_id.?);
     var record = loaded.record;
 
@@ -1396,6 +1412,7 @@ fn cmdInterrupt(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
         record.codex_version,
         record.transport_kind,
         record.managed_server_listen_url,
+        io,
         parsed,
     );
     defer {
@@ -2142,8 +2159,10 @@ fn startManagedWebsocketServer(
     allocator: std.mem.Allocator,
     cwd: []const u8,
     codex_path: []const u8,
+    hook_policy: cas.hooks.HookPolicy,
+    io: std.Io,
 ) !cas_websocket.ManagedServer {
-    return cas_websocket.startManagedLoopbackServer(allocator, cwd, codex_path);
+    return cas_websocket.startManagedLoopbackServer(allocator, cwd, codex_path, hook_policy, io);
 }
 
 fn connectReviewClient(
@@ -2153,11 +2172,13 @@ fn connectReviewClient(
     codex_version: []const u8,
     transport_kind: ?[]const u8,
     websocket_url: ?[]const u8,
+    io: std.Io,
     parsed: ParsedArgs,
 ) !cas.Client {
     _ = codex_version;
     return cas.Client.start(allocator, .{
         .cwd = cwd,
+        .io = io,
         .codex_path = codex_path,
         .client_name = "cas-review-session",
         .client_title = "CAS Review Session",
@@ -2170,6 +2191,7 @@ fn connectReviewClient(
         .elicitation_content_json = parsed.elicitation_content_json,
         .dynamic_tool_response_json = parsed.dynamic_tool_response_json,
         .read_only = parsed.read_only,
+        .hook_policy = parsed.hook_policy,
         .websocket_url = if (transport_kind != null and std.mem.eql(u8, transport_kind.?, "websocket")) websocket_url else null,
     });
 }
@@ -2575,6 +2597,8 @@ fn printStatusJson(
         if (value) "true" else "false"
     else
         "null";
+    const hook_summary = try hookSummaryFromEventLog(allocator, receipt.hook_policy, receipt.hook_log_path orelse event_log_path);
+    const hook_summary_json = try stringifyAnyAlloc(allocator, hook_summary);
 
     try stdout.print(
         "{{\"demo\":\"cas-review-session\",\"action\":\"{s}\",\"cwd\":{s},\"parentThreadId\":{s},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"threadStatus\":{s},\"turnStatus\":{s},\"turnCount\":{d},\"materialized\":{s},\"rolloutPath\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"resolvedCodexPath\":{s},\"resolvedCodexVersion\":{s},\"compatibilityVerdict\":{s},\"selectedTransport\":{s},\"selectionReason\":{s},\"degradedFallback\":{s},\"managedServerPid\":{s},\"managedServerListenUrl\":{s},\"managedServerStderrLogPath\":{s},\"orphanTtlSeconds\":{s}",
@@ -2604,7 +2628,7 @@ fn printStatusJson(
         },
     );
     try stdout.print(
-        ",\"timeoutMs\":{s},\"timedOut\":{s},\"failureCode\":{s},\"failureHint\":{s},\"fallbackUsed\":{s},\"fallbackTransport\":{s},\"fallbackExitCode\":{s},\"fallbackOutputText\":{s},\"fallbackErrorText\":{s},\"reviewResultAvailable\":{s},\"reviewResultSource\":{s},\"reviewResult\":{s}}}\n",
+        ",\"timeoutMs\":{s},\"timedOut\":{s},\"failureCode\":{s},\"failureHint\":{s},\"fallbackUsed\":{s},\"fallbackTransport\":{s},\"fallbackExitCode\":{s},\"fallbackOutputText\":{s},\"fallbackErrorText\":{s},\"hookSummary\":{s},\"reviewResultAvailable\":{s},\"reviewResultSource\":{s},\"reviewResult\":{s}}}\n",
         .{
             timeout_json,
             timed_out_json,
@@ -2615,6 +2639,7 @@ fn printStatusJson(
             fallback_exit_code_json,
             fallback_stdout_json,
             fallback_stderr_json,
+            hook_summary_json,
             if (status.review_result_available) "true" else "false",
             review_result_source_json,
             review_result_json,
@@ -2693,6 +2718,8 @@ fn printStartJson(
         if (value.stderr_text) |text| try quoteJsonStringAlloc(allocator, text) else "null"
     else
         "null";
+    const hook_summary = try hookSummaryFromEventLog(allocator, receipt.hook_policy, receipt.hook_log_path orelse event_log_path);
+    const hook_summary_json = try stringifyAnyAlloc(allocator, hook_summary);
 
     try stdout.print(
         "{{\"demo\":\"cas-review-session\",\"action\":\"start\",\"cwd\":{s},\"parentThreadId\":{s},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"delivery\":\"detached\",\"target\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"codexVersion\":{s},\"resolvedCodexPath\":{s},\"resolvedCodexVersion\":{s},\"compatibilityVerdict\":{s},\"selectedTransport\":{s},\"selectionReason\":{s},\"degradedFallback\":{s},\"managedServerPid\":{s},\"managedServerListenUrl\":{s},\"managedServerStderrLogPath\":{s},\"orphanTtlSeconds\":{s},\"waited\":{s},\"timedOut\":{s},\"threadStatus\":{s},\"turnStatus\":{s}",
@@ -2722,7 +2749,7 @@ fn printStartJson(
         },
     );
     try stdout.print(
-        ",\"turnCount\":{d},\"materialized\":{s},\"rolloutPath\":{s},\"failureCode\":{s},\"failureHint\":{s},\"fallbackUsed\":{s},\"fallbackTransport\":{s},\"fallbackExitCode\":{s},\"fallbackOutputText\":{s},\"fallbackErrorText\":{s},\"reviewResultAvailable\":{s},\"reviewResultSource\":{s},\"reviewResult\":{s}}}\n",
+        ",\"turnCount\":{d},\"materialized\":{s},\"rolloutPath\":{s},\"failureCode\":{s},\"failureHint\":{s},\"fallbackUsed\":{s},\"fallbackTransport\":{s},\"fallbackExitCode\":{s},\"fallbackOutputText\":{s},\"fallbackErrorText\":{s},\"hookSummary\":{s},\"reviewResultAvailable\":{s},\"reviewResultSource\":{s},\"reviewResult\":{s}}}\n",
         .{
             turn_count,
             materialized_json,
@@ -2734,11 +2761,52 @@ fn printStartJson(
             fallback_exit_code_json,
             fallback_stdout_json,
             fallback_stderr_json,
+            hook_summary_json,
             review_result_available_json,
             review_result_source_json,
             review_result_json,
         },
     );
+}
+
+fn hookSummaryFromEventLog(
+    allocator: std.mem.Allocator,
+    policy: cas.hooks.HookPolicy,
+    event_log_path: []const u8,
+) !cas.hooks.HookSummary {
+    var accumulator = cas.hooks.HookAccumulator.init(policy, null);
+    const file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), event_log_path, .{}) catch {
+        var summary = accumulator.summary();
+        summary.hookLogPath = event_log_path;
+        return summary;
+    };
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+
+    var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const bytes = reader.interface.allocRemaining(allocator, .limited(8 * 1024 * 1024)) catch {
+        var summary = accumulator.summary();
+        summary.hookLogPath = event_log_path;
+        return summary;
+    };
+    defer allocator.free(bytes);
+
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch continue;
+        defer parsed.deinit();
+        const root = switch (parsed.value) {
+            .object => |obj| obj,
+            else => continue,
+        };
+        const payload = core_json.stringField(root, "payload") orelse continue;
+        try accumulator.absorbLine(allocator, payload);
+    }
+
+    var summary = accumulator.summary();
+    summary.hookLogPath = event_log_path;
+    return summary;
 }
 
 fn failureInfoForReviewStart(raw_message: []const u8, created_parent_thread: bool) ?FailureInfo {
@@ -2971,6 +3039,8 @@ test "parseArgs captures parent mode approvals and fallback" {
         "{\"success\":true,\"contentItems\":[]}",
         "--fallback",
         "native-review",
+        "--hooks",
+        "require-observed",
         "--json",
     };
 
@@ -2981,6 +3051,7 @@ test "parseArgs captures parent mode approvals and fallback" {
     try std.testing.expectEqualStrings("decline", parsed.exec_approval.?);
     try std.testing.expectEqualStrings("acceptForSession", parsed.file_approval.?);
     try std.testing.expectEqualStrings("grant-session", parsed.permissions_approval.?);
+    try std.testing.expectEqual(cas.hooks.HookPolicy.require_observed, parsed.hook_policy);
 }
 
 test "parseReviewStatusAlloc handles materialized and pending states" {

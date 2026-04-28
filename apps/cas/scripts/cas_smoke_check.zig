@@ -24,6 +24,7 @@ const UsageText =
     \\  --thread-id THREAD_ID            Existing thread id to reuse (optional).
     \\  --request-timeout-ms N           Timeout per request (accepted for parity).
     \\  --opt-out-notification-method M  Suppress notification method (repeatable).
+    \\  --hooks MODE                     Hook policy: inherit|off|require-observed (default: inherit).
     \\  --json                           Emit machine-readable JSON report.
     \\  --help                           Show this help.
     \\  --version                        Show version.
@@ -41,6 +42,7 @@ const ParsedArgs = struct {
     thread_id: ?[]const u8 = null,
     request_timeout_ms: u32 = 15_000,
     opt_out_methods: []const []const u8 = &.{},
+    hook_policy: cas.hooks.HookPolicy = .inherit,
     json: bool = false,
     show_help: bool = false,
     show_version: bool = false,
@@ -76,10 +78,25 @@ pub fn main(init: std.process.Init) !void {
     var checks: std.ArrayList(CheckResult) = .empty;
     defer checks.deinit(allocator);
 
+    const hook_log_path = if (parsed.hook_policy.shouldCaptureNotifications())
+        try cas.hooks.defaultHookLogPathAlloc(allocator, "cas-smoke-check")
+    else
+        null;
+    defer if (hook_log_path) |path| allocator.free(path);
+
+    var captured_notifications: std.ArrayList([]u8) = .empty;
+    defer {
+        for (captured_notifications.items) |line| allocator.free(line);
+        captured_notifications.deinit(allocator);
+    }
+    const notification_capture: ?*std.ArrayList([]u8) = if (parsed.hook_policy.shouldCaptureNotifications()) &captured_notifications else null;
+
     var thread_id = parsed.thread_id;
     var client = try cas.Client.start(allocator, .{
         .cwd = cwd,
+        .io = init.io,
         .opt_out_notification_methods = parsed.opt_out_methods,
+        .hook_policy = parsed.hook_policy,
     });
     defer {
         client.close();
@@ -90,7 +107,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Check 1: experimentalFeature/list succeeds.
     {
-        const maybe_result = client.requestJson("experimentalFeature/list", "{\"cursor\":null,\"limit\":1}") catch |err| blk: {
+        const maybe_result = client.requestJsonCaptureNotifications("experimentalFeature/list", "{\"cursor\":null,\"limit\":1}", notification_capture) catch |err| blk: {
             try checks.append(allocator, .{
                 .name = "experimentalFeature/list",
                 .ok = false,
@@ -123,7 +140,7 @@ pub fn main(init: std.process.Init) !void {
                     .experimentalRawEvents = false,
                 });
                 defer allocator.free(start_params);
-                const start_json = client.requestJson("thread/start", start_params) catch |err| {
+                const start_json = client.requestJsonCaptureNotifications("thread/start", start_params, notification_capture) catch |err| {
                     const summary = try errorSummary(allocator, &client, err);
                     if (isMethodUnavailableError(summary)) {
                         thread_resume_ok = false;
@@ -148,7 +165,7 @@ pub fn main(init: std.process.Init) !void {
             });
             defer allocator.free(resume_params);
 
-            const resume_json = client.requestJson("thread/resume", resume_params) catch |err| {
+            const resume_json = client.requestJsonCaptureNotifications("thread/resume", resume_params, notification_capture) catch |err| {
                 const summary = try errorSummary(allocator, &client, err);
                 if (isMethodUnavailableError(summary)) {
                     thread_resume_ok = false;
@@ -201,7 +218,7 @@ pub fn main(init: std.process.Init) !void {
             });
             defer allocator.free(turn_start_params);
 
-            const turn_start_json = client.requestJson("turn/start", turn_start_params) catch |err| blk: {
+            const turn_start_json = client.requestJsonCaptureNotifications("turn/start", turn_start_params, notification_capture) catch |err| blk: {
                 const summary = try errorSummary(allocator, &client, err);
                 if (isMethodUnavailableError(summary)) {
                     turn_start_ok = false;
@@ -228,6 +245,24 @@ pub fn main(init: std.process.Init) !void {
             .detail = turn_start_detail,
         });
 
+        if (parsed.hook_policy == .require_observed) {
+            if (notification_capture) |captured| {
+                if (thread_id != null) {
+                    const drain_params = try stringifyAnyAlloc(allocator, .{
+                        .threadId = thread_id.?,
+                        .includeTurns = false,
+                    });
+                    defer allocator.free(drain_params);
+                    var attempts: usize = 0;
+                    while (attempts < 12 and !hasCapturedCompletedHookNotification(allocator, captured.items)) : (attempts += 1) {
+                        std.Io.sleep(std.Io.Threaded.global_single_threaded.io(), .fromSeconds(1), .awake) catch {};
+                        const drain_json = client.requestJsonCaptureNotifications("thread/read", drain_params, captured) catch null;
+                        if (drain_json) |json| allocator.free(json);
+                    }
+                }
+            }
+        }
+
         // Check 4: turn/interrupt method is wired; race/precondition failures are acceptable.
         var interrupt_ok = true;
         var interrupt_detail: []const u8 = "ok";
@@ -242,7 +277,7 @@ pub fn main(init: std.process.Init) !void {
             });
             defer allocator.free(interrupt_params);
 
-            const maybe_interrupt_json = client.requestJson("turn/interrupt", interrupt_params) catch |err| blk: {
+            const maybe_interrupt_json = client.requestJsonCaptureNotifications("turn/interrupt", interrupt_params, notification_capture) catch |err| blk: {
                 const summary = try errorSummary(allocator, &client, err);
                 if (isMethodUnavailableError(summary)) {
                     interrupt_ok = false;
@@ -291,7 +326,7 @@ pub fn main(init: std.process.Init) !void {
             });
             defer allocator.free(steer_params);
 
-            const maybe_steer_json = client.requestJson("turn/steer", steer_params) catch |err| blk: {
+            const maybe_steer_json = client.requestJsonCaptureNotifications("turn/steer", steer_params, notification_capture) catch |err| blk: {
                 const summary = try errorSummary(allocator, &client, err);
                 if (isMethodUnavailableError(summary)) {
                     steer_ok = false;
@@ -315,6 +350,10 @@ pub fn main(init: std.process.Init) !void {
     for (checks.items) |check| {
         if (!check.ok) overall_ok = false;
     }
+    var hook_accumulator = cas.hooks.HookAccumulator.init(parsed.hook_policy, hook_log_path);
+    try hook_accumulator.absorbLines(allocator, captured_notifications.items);
+    const hook_summary = hook_accumulator.summary();
+    if (hook_summary.failureCode != null) overall_ok = false;
 
     if (parsed.json) {
         const report = .{
@@ -322,6 +361,7 @@ pub fn main(init: std.process.Init) !void {
             .cwd = cwd,
             .threadId = thread_id,
             .ok = overall_ok,
+            .hookSummary = hook_summary,
             .checks = checks.items,
         };
         var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
@@ -335,6 +375,11 @@ pub fn main(init: std.process.Init) !void {
         try stdout.print("cwd: {s}\n", .{cwd});
         try stdout.print("threadId: {s}\n", .{thread_id orelse "n/a"});
         try stdout.print("overall: {s}\n", .{if (overall_ok) "pass" else "fail"});
+        try stdout.print("hooks: policy={s} observed={any} failure={s}\n", .{
+            hook_summary.policy,
+            hook_summary.observed,
+            hook_summary.failureCode orelse "none",
+        });
         for (checks.items) |check| {
             try stdout.print("- {s}: {s} ({s})\n", .{
                 check.name,
@@ -387,6 +432,10 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
         }
         if (std.mem.eql(u8, arg, "--opt-out-notification-method")) {
             try methods.append(allocator, value);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--hooks")) {
+            out.hook_policy = cas.hooks.HookPolicy.parse(value) orelse return error.InvalidHooksPolicy;
             continue;
         }
         return error.UnknownArg;
@@ -462,6 +511,28 @@ fn errorSummary(allocator: std.mem.Allocator, client: *cas.Client, err: anyerror
     return std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
 }
 
+fn hasCapturedHookNotification(allocator: std.mem.Allocator, lines: []const []u8) bool {
+    for (lines) |line| {
+        if (cas.hooks.isHookNotificationLine(allocator, line)) return true;
+    }
+    return false;
+}
+
+fn hasCapturedCompletedHookNotification(allocator: std.mem.Allocator, lines: []const []u8) bool {
+    for (lines) |line| {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+        defer parsed.deinit();
+        const root = switch (parsed.value) {
+            .object => |obj| obj,
+            else => continue,
+        };
+        if (cas.stringField(root, "method")) |method| {
+            if (std.mem.eql(u8, method, "hook/completed")) return true;
+        }
+    }
+    return false;
+}
+
 fn isMethodUnavailableError(text: []const u8) bool {
     var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, text, .{}) catch null;
     defer if (parsed) |*p| p.deinit();
@@ -505,6 +576,8 @@ test "parseArgs accepts core options and collects opt-out methods" {
         "45000",
         "--opt-out-notification-method",
         "thread/item/stream",
+        "--hooks",
+        "require-observed",
         "--json",
     };
 
@@ -517,6 +590,7 @@ test "parseArgs accepts core options and collects opt-out methods" {
     try std.testing.expect(parsed.json);
     try std.testing.expectEqual(@as(usize, 1), parsed.opt_out_methods.len);
     try std.testing.expectEqualStrings("thread/item/stream", parsed.opt_out_methods[0]);
+    try std.testing.expectEqual(cas.hooks.HookPolicy.require_observed, parsed.hook_policy);
 }
 
 test "extractTurnId reads nested turn id" {

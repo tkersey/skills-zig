@@ -39,6 +39,7 @@ const UsageText =
     \\  --dynamic-tool-response-json JSON   Exact result payload for item/tool/call.
     \\  --read-only                         Decline exec + file approvals.
     \\  --opt-out-notification-method M     Suppress notification method (repeatable).
+    \\  --hooks MODE                        Hook policy: inherit|off|require-observed (default: inherit).
     \\  --client-prefix NAME                Instance client prefix (default: cas-instance).
     \\  --sample N                          Sample count in output (default: 3).
     \\  --json                              Emit JSON.
@@ -70,6 +71,7 @@ const ParsedArgs = struct {
     dynamic_tool_response_json: ?[]const u8 = null,
     read_only: bool = false,
     opt_out_methods: []const []const u8 = &.{},
+    hook_policy: cas.hooks.HookPolicy = .inherit,
     client_prefix: []const u8 = "cas-instance",
     sample: usize = 3,
     json: bool = false,
@@ -134,6 +136,18 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(params);
     _ = opts.request_timeout_ms;
     const resolved_codex_path = cas.resolveExecutableAlloc(allocator, "codex") catch "codex";
+    const hook_log_path = if (opts.hook_policy.shouldCaptureNotifications())
+        try cas.hooks.defaultHookLogPathAlloc(allocator, "cas-instance-runner")
+    else
+        null;
+    defer if (hook_log_path) |path| allocator.free(path);
+
+    var captured_notifications: std.ArrayList([]u8) = .empty;
+    defer {
+        for (captured_notifications.items) |line| allocator.free(line);
+        captured_notifications.deinit(allocator);
+    }
+    const notification_capture: ?*std.ArrayList([]u8) = if (opts.hook_policy.shouldCaptureNotifications()) &captured_notifications else null;
 
     var slots = try allocator.alloc(?InstanceSlot, opts.instances);
     defer allocator.free(slots);
@@ -164,11 +178,14 @@ pub fn main(init: std.process.Init) !void {
             allocator,
             cwd,
             resolved_codex_path,
+            opts.hook_policy,
+            init.io,
         ) catch null;
 
         const client = if (managed_server) |server|
             cas.Client.start(allocator, .{
                 .cwd = cwd,
+                .io = init.io,
                 .state_file = state_file,
                 .client_name = client_name,
                 .server_request_timeout_ms = opts.server_request_timeout_ms,
@@ -181,6 +198,7 @@ pub fn main(init: std.process.Init) !void {
                 .dynamic_tool_response_json = opts.dynamic_tool_response_json,
                 .read_only = opts.read_only,
                 .opt_out_notification_methods = opts.opt_out_methods,
+                .hook_policy = opts.hook_policy,
                 .websocket_url = server.listen_url,
             }) catch blk: {
                 var owned_server = server;
@@ -188,6 +206,7 @@ pub fn main(init: std.process.Init) !void {
                 managed_server = null;
                 break :blk cas.Client.start(allocator, .{
                     .cwd = cwd,
+                    .io = init.io,
                     .state_file = state_file,
                     .client_name = client_name,
                     .server_request_timeout_ms = opts.server_request_timeout_ms,
@@ -200,6 +219,7 @@ pub fn main(init: std.process.Init) !void {
                     .dynamic_tool_response_json = opts.dynamic_tool_response_json,
                     .read_only = opts.read_only,
                     .opt_out_notification_methods = opts.opt_out_methods,
+                    .hook_policy = opts.hook_policy,
                 }) catch |err| {
                     const msg = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
                     try start_failures.append(allocator, .{
@@ -217,6 +237,7 @@ pub fn main(init: std.process.Init) !void {
         else
             cas.Client.start(allocator, .{
                 .cwd = cwd,
+                .io = init.io,
                 .state_file = state_file,
                 .client_name = client_name,
                 .server_request_timeout_ms = opts.server_request_timeout_ms,
@@ -229,6 +250,7 @@ pub fn main(init: std.process.Init) !void {
                 .dynamic_tool_response_json = opts.dynamic_tool_response_json,
                 .read_only = opts.read_only,
                 .opt_out_notification_methods = opts.opt_out_methods,
+                .hook_policy = opts.hook_policy,
             }) catch |err| {
                 const msg = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
                 try start_failures.append(allocator, .{
@@ -271,7 +293,7 @@ pub fn main(init: std.process.Init) !void {
             slots[i] = null;
         }
 
-        const result_json = client.requestJson(opts.method, params) catch |err| {
+        const result_json = client.requestJsonCaptureNotifications(opts.method, params, notification_capture) catch |err| {
             const summary = if (client.lastError()) |detail|
                 try allocator.dupe(u8, detail)
             else
@@ -312,6 +334,9 @@ pub fn main(init: std.process.Init) !void {
     const stdio_count = countTransport(request_results.items, "stdio");
     const instances_started = request_results.items.len;
     const sample_results = request_results.items[0..@min(opts.sample, request_results.items.len)];
+    var hook_accumulator = cas.hooks.HookAccumulator.init(opts.hook_policy, hook_log_path);
+    try hook_accumulator.absorbLines(allocator, captured_notifications.items);
+    const hook_summary = hook_accumulator.summary();
 
     const payload = .{
         .demo = "cas-instance-runner",
@@ -328,6 +353,7 @@ pub fn main(init: std.process.Init) !void {
             .websocket = websocket_count,
             .stdio = stdio_count,
         },
+        .hookSummary = hook_summary,
         .timing_ms = .{
             .start_all_clients = after_start - started_at,
             .run_all_requests = after_requests - after_start,
@@ -352,6 +378,11 @@ pub fn main(init: std.process.Init) !void {
         try stdout.print("requests ok:      {d}\n", .{requests_ok});
         try stdout.print("requests failed:  {d}\n", .{requests_failed});
         try stdout.print("transport counts: websocket={d}, stdio={d}\n", .{ websocket_count, stdio_count });
+        try stdout.print("hooks: policy={s} observed={any} failure={s}\n", .{
+            hook_summary.policy,
+            hook_summary.observed,
+            hook_summary.failureCode orelse "none",
+        });
         try stdout.print("timing ms: start={d}, request={d}, total={d}\n", .{
             after_start - started_at,
             after_requests - after_start,
@@ -377,7 +408,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    const ok = requests_failed == 0 and start_failures.items.len == 0;
+    const ok = requests_failed == 0 and start_failures.items.len == 0 and hook_summary.failureCode == null;
     std.process.exit(if (ok) 0 else 1);
 }
 
@@ -487,6 +518,10 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
         }
         if (std.mem.eql(u8, arg, "--opt-out-notification-method")) {
             try methods.append(allocator, value);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--hooks")) {
+            out.hook_policy = cas.hooks.HookPolicy.parse(value) orelse return error.InvalidHooksPolicy;
             continue;
         }
         if (std.mem.eql(u8, arg, "--client-prefix")) {
@@ -680,6 +715,8 @@ test "parseArgs accepts core options and collects opt-out methods" {
         "thread/read",
         "--opt-out-notification-method",
         "thread/item/stream",
+        "--hooks",
+        "off",
         "--json",
     };
 
@@ -692,6 +729,7 @@ test "parseArgs accepts core options and collects opt-out methods" {
     try std.testing.expect(parsed.json);
     try std.testing.expectEqual(@as(usize, 1), parsed.opt_out_methods.len);
     try std.testing.expectEqualStrings("thread/item/stream", parsed.opt_out_methods[0]);
+    try std.testing.expectEqual(cas.hooks.HookPolicy.off, parsed.hook_policy);
 }
 
 test "parseArgs accepts extended server request controls" {

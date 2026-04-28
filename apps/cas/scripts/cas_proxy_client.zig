@@ -1,4 +1,5 @@
 const core_json = @import("core_json");
+pub const hooks = @import("cas_hook_policy.zig");
 const std = @import("std");
 const websocket_transport = @import("cas_websocket_transport.zig");
 
@@ -9,6 +10,7 @@ pub const TransportKind = enum {
 
 pub const ClientOptions = struct {
     cwd: []const u8,
+    io: std.Io = std.Io.Threaded.global_single_threaded.io(),
     // Kept for API compatibility with prior Node-backed client.
     proxy_script: ?[]const u8 = null,
     state_file: ?[]const u8 = null,
@@ -26,12 +28,14 @@ pub const ClientOptions = struct {
     dynamic_tool_response_json: ?[]const u8 = null,
     read_only: bool = false,
     opt_out_notification_methods: []const []const u8 = &.{},
+    hook_policy: hooks.HookPolicy = .inherit,
     websocket_url: ?[]const u8 = null,
     websocket_connect_timeout_ms: u32 = 10_000,
 };
 
 pub const Client = struct {
     allocator: std.mem.Allocator,
+    io: std.Io = std.Io.Threaded.global_single_threaded.io(),
     transport_kind: TransportKind,
     child: ?std.process.Child,
     stdin_file: ?std.Io.File,
@@ -63,11 +67,12 @@ pub const Client = struct {
 
         const resolved_codex_path = try resolveExecutableAlloc(allocator, opts.codex_path);
         defer allocator.free(resolved_codex_path);
+        try hooks.ensureLaunchSupportsPolicy(allocator, opts.io, resolved_codex_path, opts.cwd, opts.hook_policy);
 
         try argv.append(allocator, resolved_codex_path);
-        try argv.append(allocator, "app-server");
+        try hooks.appendAppServerArgs(allocator, &argv, opts.hook_policy, null);
 
-        const io = std.Io.Threaded.global_single_threaded.io();
+        const io = opts.io;
         const child = try std.process.spawn(io, .{
             .argv = argv.items,
             .cwd = .{ .path = opts.cwd },
@@ -81,6 +86,7 @@ pub const Client = struct {
 
         var client = Client{
             .allocator = allocator,
+            .io = io,
             .transport_kind = .stdio,
             .child = child,
             .stdin_file = stdin_file,
@@ -111,6 +117,7 @@ pub const Client = struct {
 
         var client = Client{
             .allocator = allocator,
+            .io = opts.io,
             .transport_kind = .websocket,
             .child = null,
             .stdin_file = null,
@@ -142,7 +149,7 @@ pub const Client = struct {
     pub fn close(self: *Client) void {
         if (self.websocket) |*websocket| websocket.close();
         if (self.child) |*child| {
-            child.kill(std.Io.Threaded.global_single_threaded.io());
+            child.kill(self.io);
         }
     }
 
@@ -351,9 +358,8 @@ pub const Client = struct {
         const payload = payload_writer.written();
         switch (self.transport_kind) {
             .stdio => {
-                const io = std.Io.Threaded.global_single_threaded.io();
-                try self.stdin_file.?.writeStreamingAll(io, payload);
-                try self.stdin_file.?.writeStreamingAll(io, "\n");
+                try self.stdin_file.?.writeStreamingAll(self.io, payload);
+                try self.stdin_file.?.writeStreamingAll(self.io, "\n");
             },
             .websocket => try self.websocket.?.sendText(payload),
         }
@@ -455,9 +461,8 @@ pub const Client = struct {
         const payload = payload_writer.written();
         switch (self.transport_kind) {
             .stdio => {
-                const io = std.Io.Threaded.global_single_threaded.io();
-                try self.stdin_file.?.writeStreamingAll(io, payload);
-                try self.stdin_file.?.writeStreamingAll(io, "\n");
+                try self.stdin_file.?.writeStreamingAll(self.io, payload);
+                try self.stdin_file.?.writeStreamingAll(self.io, "\n");
             },
             .websocket => try self.websocket.?.sendText(payload),
         }
@@ -712,8 +717,8 @@ pub const Client = struct {
                 return line;
             }
 
-            var tmp: [4096]u8 = undefined;
-            var reader = self.stdout_file.?.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+            var tmp: [1]u8 = undefined;
+            var reader = self.stdout_file.?.reader(self.io, &.{});
             const n = try reader.interface.readSliceShort(tmp[0..]);
             if (n == 0) {
                 if (self.line_buf.items.len == 0) return null;

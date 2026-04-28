@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const builtin = @import("builtin");
+const hooks = @import("cas_hook_policy.zig");
 const mem = std.mem;
 
 const websocket_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -160,12 +161,15 @@ pub fn startManagedLoopbackServer(
     allocator: std.mem.Allocator,
     cwd: []const u8,
     codex_path: []const u8,
+    hook_policy: hooks.HookPolicy,
+    io: std.Io,
 ) !ManagedServer {
+    try hooks.ensureLaunchSupportsPolicy(allocator, io, codex_path, cwd, hook_policy);
+
     var address = try std.Io.net.IpAddress.parse(loopback_host, 0);
-    const io = std.Io.Threaded.global_single_threaded.io();
     var listener = try address.listen(io, .{ .mode = .stream });
-    defer listener.deinit(io);
     const port = listener.socket.address.getPort();
+    listener.deinit(io);
 
     const listen_url = try std.fmt.allocPrint(allocator, "ws://{s}:{d}", .{ loopback_host, port });
     errdefer allocator.free(listen_url);
@@ -173,9 +177,7 @@ pub fn startManagedLoopbackServer(
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.append(allocator, codex_path);
-    try argv.append(allocator, "app-server");
-    try argv.append(allocator, "--listen");
-    try argv.append(allocator, listen_url);
+    try hooks.appendAppServerArgs(allocator, &argv, hook_policy, listen_url);
 
     const child = try std.process.spawn(io, .{
         .argv = argv.items,
@@ -259,12 +261,13 @@ fn handshakeClient(
     const io = std.Io.Threaded.global_single_threaded.io();
     var stream_writer = stream.writer(io, &.{});
     try stream_writer.interface.writeAll(request);
+    try stream_writer.interface.flush();
 
     var response_buf: std.ArrayList(u8) = .empty;
     defer response_buf.deinit(allocator);
-    var stream_reader = stream.reader(io, &.{});
     while (mem.indexOf(u8, response_buf.items, "\r\n\r\n") == null) {
-        var tmp: [1024]u8 = undefined;
+        var tmp: [1]u8 = undefined;
+        var stream_reader = stream.reader(io, &.{});
         const n = try stream_reader.interface.readSliceShort(tmp[0..]);
         if (n == 0) return error.WebSocketHandshakeClosed;
         try response_buf.appendSlice(allocator, tmp[0..n]);
@@ -327,11 +330,15 @@ fn writeClientFrame(self: *Connection, opcode: u8, payload: []const u8) !void {
 
     var stream_writer = self.stream.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     try stream_writer.interface.writeAll(header[0..header_len]);
-    if (payload_len == 0) return;
+    if (payload_len == 0) {
+        try stream_writer.interface.flush();
+        return;
+    }
     const masked = try self.allocator.dupe(u8, payload);
     defer self.allocator.free(masked);
     applyMask(&mask, masked);
     try stream_writer.interface.writeAll(masked);
+    try stream_writer.interface.flush();
 }
 
 fn applyMask(mask: *const [4]u8, payload: []u8) void {

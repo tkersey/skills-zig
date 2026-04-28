@@ -18,6 +18,8 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - `cas_conformance_suite` verifies claim-safe wave handling, stale-claim reclaim, mesh result accountability, and bounded overload retry behavior.
 - `cas_smoke_check` verifies the native v2 handshake plus `experimentalFeature/list`, `thread/start`, `thread/resume`, `turn/start`, `turn/interrupt`, and `turn/steer`.
 - `cas_instance_runner` executes one app-server method per isolated instance and now prefers a CAS-managed loopback websocket app-server per instance, falling back to stdio when websocket bootstrap or handshake fails. Result rows and summaries now report the selected transport.
+- `cas_smoke_check`, `cas_instance_runner`, `cas_review_session`, and `cas_conformance_suite` accept `--hooks inherit|off|require-observed`. `inherit` is the default, `off` starts CAS-owned app-servers with `--disable codex_hooks`, and `require-observed` fails with `hook_not_observed` when no `hook/started` or `hook/completed` notifications were captured.
+- JSON outputs include `hookSummary` on hook-aware lanes. Bad observed hook statuses fail closed with precedence `hook_blocked`, then `hook_failed`, then `hook_stopped`; unsupported hook-capable runtime surfaces fail with `hooks_unsupported`.
 - `cas_instance_runner` supports native responses for:
   - `item/commandExecution/requestApproval`
   - `item/fileChange/requestApproval`
@@ -74,6 +76,12 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 
 # Run one conformance scenario with JSON output.
 ./zig-out/bin/cas conformance --cwd /path/to/workspace --scenario mesh_row_accountability --json
+
+# Require proof that Codex hook notifications were observed during a smoke lane.
+./zig-out/bin/cas smoke_check \
+  --cwd /path/to/workspace \
+  --hooks require-observed \
+  --json
 
 # Filter thread/list by title substring.
 ./zig-out/bin/cas instance_runner \

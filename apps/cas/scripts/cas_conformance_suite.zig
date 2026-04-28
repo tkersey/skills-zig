@@ -1,4 +1,5 @@
 const app_meta = @import("app_meta");
+const cas_hooks = @import("cas_hook_policy.zig");
 const core_cli = @import("core_cli");
 const core_json = @import("core_json");
 const std = @import("std");
@@ -27,6 +28,7 @@ const UsageText =
     \\  --keep-temp                       Keep per-scenario temp roots even on success.
     \\  --st-binary PATH                  Override st binary path.
     \\  --smoke-binary PATH               Override cas_smoke_check binary path.
+    \\  --hooks MODE                      Hook policy for smoke preflight: inherit|off|require-observed (default: inherit).
     \\  --backoff-base-ms N               Base retry delay for overload policy checks (default: 250).
     \\  --max-retries N                   Max overload retries before failure (default: 4).
     \\  --overload-script TOKENS          Comma-separated synthetic outcomes (default: overload,overload,success).
@@ -85,6 +87,7 @@ const ParsedArgs = struct {
     keep_temp: bool = false,
     st_binary: ?[]const u8 = null,
     smoke_binary: ?[]const u8 = null,
+    hook_policy: cas_hooks.HookPolicy = .inherit,
     backoff_base_ms: u32 = DefaultBackoffBaseMs,
     max_retries: u32 = DefaultMaxRetries,
     overload_script: []const []const u8 = &.{},
@@ -97,6 +100,7 @@ const Context = struct {
     cwd: []const u8,
     st_binary: []const u8,
     smoke_binary: []const u8,
+    hook_policy: cas_hooks.HookPolicy,
     keep_temp: bool,
     backoff_base_ms: u32,
     max_retries: u32,
@@ -176,6 +180,7 @@ pub fn main(init: std.process.Init) !void {
         .cwd = cwd,
         .st_binary = try resolveExecutable(allocator, parsed.st_binary, "st"),
         .smoke_binary = try resolveExecutable(allocator, parsed.smoke_binary, "cas_smoke_check"),
+        .hook_policy = parsed.hook_policy,
         .keep_temp = parsed.keep_temp,
         .backoff_base_ms = parsed.backoff_base_ms,
         .max_retries = parsed.max_retries,
@@ -308,6 +313,10 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             out.smoke_binary = value;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--hooks")) {
+            out.hook_policy = cas_hooks.HookPolicy.parse(value) orelse return error.InvalidHooksPolicy;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--backoff-base-ms")) {
             const parsed = try std.fmt.parseInt(i64, value, 10);
             if (parsed <= 0) return error.InvalidBackoffBase;
@@ -388,7 +397,7 @@ fn runCommandCapture(allocator: std.mem.Allocator, cwd: ?[]const u8, argv: []con
 }
 
 fn runSmokePreflight(allocator: std.mem.Allocator, ctx: Context) !SmokePreflightResult {
-    const argv = [_][]const u8{ ctx.smoke_binary, "--cwd", ctx.cwd, "--json" };
+    const argv = [_][]const u8{ ctx.smoke_binary, "--cwd", ctx.cwd, "--hooks", ctx.hook_policy.asString(), "--json" };
     const capture = runCommandCapture(allocator, null, &argv) catch |err| {
         return .{
             .status = "fail",
@@ -975,6 +984,8 @@ test "parseArgs accepts scenarios and retry knobs" {
         "7",
         "--overload-script",
         "overload,success",
+        "--hooks",
+        "off",
         "--json",
     };
 
@@ -989,6 +1000,7 @@ test "parseArgs accepts scenarios and retry knobs" {
     try std.testing.expect(parsed.skip_smoke_check);
     try std.testing.expect(parsed.keep_temp);
     try std.testing.expect(parsed.json);
+    try std.testing.expectEqual(cas_hooks.HookPolicy.off, parsed.hook_policy);
     try std.testing.expectEqual(@as(u32, 500), parsed.backoff_base_ms);
     try std.testing.expectEqual(@as(u32, 7), parsed.max_retries);
     try std.testing.expectEqual(@as(usize, 2), parsed.overload_script.len);
