@@ -40,6 +40,26 @@ if ! "$BIN_PATH" --help | rg -q '^- artifact-search$'; then
   echo "required command missing: artifact-search" >&2
   exit 1
 fi
+if ! "$BIN_PATH" --help | rg -q '^- skill-audit$'; then
+  echo "required command missing: skill-audit" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" --help | rg -q '^- tool-audit$'; then
+  echo "required command missing: tool-audit" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" --help | rg -q '^- memory-inventory$'; then
+  echo "required command missing: memory-inventory" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" --help | rg -q '^- message-search$'; then
+  echo "required command missing: message-search" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" --help | rg -q '^- workdir-report$'; then
+  echo "required command missing: workdir-report" >&2
+  exit 1
+fi
 if ! "$BIN_PATH" --help | rg -q '^- memory-provenance$'; then
   echo "required command missing: memory-provenance" >&2
   exit 1

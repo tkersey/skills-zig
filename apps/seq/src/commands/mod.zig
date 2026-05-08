@@ -379,9 +379,12 @@ const Options = struct {
     follow_text: ?[]const u8 = null,
     roles_csv: ?[]const u8 = null,
     contains: ?[]const u8 = null,
+    contains_any_text: ?[]const u8 = null,
+    contains_all_text: ?[]const u8 = null,
     regex: ?[]const u8 = null,
     role: ?[]const u8 = null,
     tool: ?[]const u8 = null,
+    executable_text: ?[]const u8 = null,
     workdir_text: ?[]const u8 = null,
     repo_text: ?[]const u8 = null,
     status: ?[]const u8 = null,
@@ -439,8 +442,13 @@ pub fn run(
         .skills_rank => try cmdSkillsRank(allocator, sessions_root, opts),
         .skill_trend => try cmdSkillTrend(allocator, sessions_root, opts),
         .skill_report => try cmdSkillReport(allocator, sessions_root, opts),
+        .skill_audit => try QueryLiftCommands.cmdSkillAudit(allocator, sessions_root, opts),
         .skill_blocks => try cmdSkillBlocks(allocator, sessions_root, opts),
         .artifact_search => try cmdArtifactSearch(allocator, sessions_root, opts),
+        .tool_audit => try QueryLiftCommands.cmdToolAudit(allocator, sessions_root, opts),
+        .memory_inventory => try QueryLiftCommands.cmdMemoryInventory(allocator, sessions_root, opts),
+        .message_search => try QueryLiftCommands.cmdMessageSearch(allocator, sessions_root, opts),
+        .workdir_report => try QueryLiftCommands.cmdWorkdirReport(allocator, sessions_root, opts),
         .role_breakdown => try cmdRoleBreakdown(allocator, sessions_root, opts),
         .occurrence_export => try cmdOccurrenceExport(allocator, sessions_root, opts),
         .orchestration_concurrency => try cmdOrchestrationConcurrency(allocator, sessions_root, opts),
@@ -494,11 +502,26 @@ fn printCommandHelp(cmd: lib.Command) !void {
         .skill_report =>
         \\usage: seq skill-report --skill <name> [--since <iso>] [--until <iso>]
         ,
+        .skill_audit =>
+        \\usage: seq skill-audit [--skill <name>] [--mode summary|mentions|trend] [--roles <csv>] [--since <iso>] [--until <iso>] [--limit N] [--format table|json|csv|jsonl]
+        ,
         .skill_blocks =>
         \\usage: seq skill-blocks --skill <name> [--history <distinct|all|latest>] [--session-id <id>|--path <jsonl>|--current] [--since <iso>] [--until <iso>] [--limit N] [--format json|jsonl]
         ,
         .artifact_search =>
         \\usage: seq artifact-search [--contains <text>|--regex <expr>] [--kind <auto|session|memory|orchestration|tooling|prompt>] [--surface <auto|messages|tool_calls|memory_blocks>] [--roles <csv>] [--tool <name>] [--workdir <path>] [--session-id <id>|--path <jsonl>] [--since <iso>] [--until <iso>] [--follow <none|auto>] [--strip-skill-blocks] [--no-dedupe-exact] [--stats] [--limit N] [--format table|json|csv|jsonl]
+        ,
+        .tool_audit =>
+        \\usage: seq tool-audit [--mode summary|rows|args|unresolved] [--group-by executable|tool|session|workdir|command] [--tool <name>] [--executable <name>] [--workdir <path>] [--contains <text>] [--since <iso>] [--until <iso>] [--limit N] [--format table|json|csv|jsonl]
+        ,
+        .memory_inventory =>
+        \\usage: seq memory-inventory [--mode categories|files|blocks|stage1|extensions] [--memory-root <path>] [--extensions-root <path>] [--state-db-path <path>] [--contains <text>|--regex <expr>] [--limit N] [--format table|json|csv|jsonl]
+        ,
+        .message_search =>
+        \\usage: seq message-search [--contains <text>|--regex <expr>|--contains-any <csv>|--contains-all <csv>] [--roles <csv>] [--since <iso>] [--until <iso>] [--limit N] [--format table|json|csv|jsonl]
+        ,
+        .workdir_report =>
+        \\usage: seq workdir-report [--workdir <path>] [--mode summary|sessions] [--contains <text>] [--contains-any <csv>] [--since <iso>] [--until <iso>] [--limit N] [--format table|json|csv|jsonl]
         ,
         .role_breakdown =>
         \\usage: seq role-breakdown [--since <iso>] [--until <iso>] [--format table|json|csv] [--max N]
@@ -659,7 +682,7 @@ fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
             if (fmt == .csv or fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
         .query => {},
-        .artifact_search, .orchestration_concurrency, .find_session, .plan_search, .reply_latency, .session_prompts, .token_usage, .routing_gap, .session_tooling, .query_diagnose, .memory_provenance, .memory_map, .memory_history, .opencode_prompts, .opencode_events => {
+        .artifact_search, .tool_audit, .memory_inventory, .message_search, .workdir_report, .orchestration_concurrency, .find_session, .plan_search, .reply_latency, .session_prompts, .token_usage, .routing_gap, .session_tooling, .query_diagnose, .memory_provenance, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .skill_audit => {
             if (fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
         .unknown => return error.InvalidCommand,
@@ -676,7 +699,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         else => false,
     };
     const supports_current = cmd == .session_prompts or cmd == .reply_latency or cmd == .skill_blocks or cmd == .tail;
-    const supports_roles_csv = cmd == .session_prompts or cmd == .artifact_search;
+    const supports_roles_csv = cmd == .session_prompts or cmd == .artifact_search or cmd == .skill_audit or cmd == .message_search;
     const supports_strip_skill_blocks = cmd == .session_prompts or cmd == .artifact_search;
     const supports_no_dedupe_exact = cmd == .session_prompts or cmd == .artifact_search;
     const supports_summary = switch (cmd) {
@@ -696,7 +719,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_threshold_ms = cmd == .query_diagnose;
     const supports_strict_hang = cmd == .query_diagnose;
     const supports_skill = switch (cmd) {
-        .skill_trend, .skill_report, .occurrence_export, .skill_blocks => true,
+        .skill_trend, .skill_report, .skill_audit, .occurrence_export, .skill_blocks => true,
         else => false,
     };
     const supports_history = cmd == .skill_blocks;
@@ -711,20 +734,23 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         else => false,
     };
     const supports_contains = switch (cmd) {
-        .artifact_search, .plan_search, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .sessions, .turns => true,
+        .artifact_search, .tool_audit, .memory_inventory, .message_search, .workdir_report, .plan_search, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .sessions, .turns => true,
         else => false,
     };
+    const supports_contains_any = cmd == .message_search or cmd == .workdir_report;
+    const supports_contains_all = cmd == .message_search;
     const supports_regex = switch (cmd) {
-        .artifact_search, .plan_search, .memory_map, .memory_history, .opencode_prompts, .opencode_events => true,
+        .artifact_search, .memory_inventory, .message_search, .plan_search, .memory_map, .memory_history, .opencode_prompts, .opencode_events => true,
         else => false,
     };
     const supports_role = cmd == .opencode_events;
-    const supports_tool = cmd == .opencode_events or cmd == .artifact_search;
-    const supports_workdir = cmd == .artifact_search;
+    const supports_tool = cmd == .opencode_events or cmd == .artifact_search or cmd == .tool_audit;
+    const supports_executable = cmd == .tool_audit;
+    const supports_workdir = cmd == .artifact_search or cmd == .tool_audit or cmd == .workdir_report;
     const supports_repo = cmd == .plan_search or cmd == .sessions;
     const supports_status = cmd == .opencode_events or cmd == .turns;
     const supports_mode = switch (cmd) {
-        .opencode_prompts, .opencode_events, .reply_latency => true,
+        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .tool_audit, .memory_inventory, .workdir_report => true,
         else => false,
     };
     const supports_kind = cmd == .artifact_search;
@@ -740,10 +766,14 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .skills_rank,
         .skill_trend,
         .skill_report,
+        .skill_audit,
         .role_breakdown,
         .occurrence_export,
         .find_session,
         .artifact_search,
+        .tool_audit,
+        .message_search,
+        .workdir_report,
         .plan_search,
         .reply_latency,
         .session_prompts,
@@ -766,10 +796,14 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .skills_rank,
         .skill_trend,
         .skill_report,
+        .skill_audit,
         .role_breakdown,
         .occurrence_export,
         .find_session,
         .artifact_search,
+        .tool_audit,
+        .message_search,
+        .workdir_report,
         .plan_search,
         .reply_latency,
         .session_prompts,
@@ -793,7 +827,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         else => false,
     };
     const supports_group_by = switch (cmd) {
-        .session_tooling, .opencode_prompts, .opencode_events, .token_usage => true,
+        .session_tooling, .tool_audit, .opencode_prompts, .opencode_events, .token_usage => true,
         else => false,
     };
     const supports_timezone = switch (cmd) {
@@ -831,9 +865,9 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_thread_id = cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history;
     const supports_rollout_summary_file = cmd == .memory_provenance;
     const supports_trace = cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history;
-    const supports_state_db_path = cmd == .memory_provenance or cmd == .memory_history;
-    const supports_memory_root = cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history;
-    const supports_extensions_root = cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history;
+    const supports_state_db_path = cmd == .memory_provenance or cmd == .memory_history or cmd == .memory_inventory;
+    const supports_memory_root = cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history or cmd == .memory_inventory;
+    const supports_extensions_root = cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history or cmd == .memory_inventory;
 
     try ensureOptionAllowed(opts.path != null, supports_path, "--path", cmd);
     try ensureOptionAllowed(opts.session_id != null, supports_session_id, "--session-id", cmd);
@@ -861,9 +895,12 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.dataset != null, supports_dataset, "--dataset", cmd);
     try ensureOptionAllowed(opts.spec_text != null, supports_spec_text, "--spec", cmd);
     try ensureOptionAllowed(opts.contains != null, supports_contains, "--contains", cmd);
+    try ensureOptionAllowed(opts.contains_any_text != null, supports_contains_any, "--contains-any", cmd);
+    try ensureOptionAllowed(opts.contains_all_text != null, supports_contains_all, "--contains-all", cmd);
     try ensureOptionAllowed(opts.regex != null, supports_regex, "--regex", cmd);
     try ensureOptionAllowed(opts.role != null, supports_role, "--role", cmd);
     try ensureOptionAllowed(opts.tool != null, supports_tool, "--tool", cmd);
+    try ensureOptionAllowed(opts.executable_text != null, supports_executable, "--executable", cmd);
     try ensureOptionAllowed(opts.workdir_text != null, supports_workdir, "--workdir", cmd);
     try ensureOptionAllowed(opts.repo_text != null, supports_repo, "--repo", cmd);
     try ensureOptionAllowed(opts.status != null, supports_status, "--status", cmd);
@@ -910,6 +947,29 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
             if (!isValidTraceTurnStatus(text)) return error.InvalidModeArg;
         }
     }
+    if (cmd == .skill_audit) {
+        if (opts.mode) |text| {
+            if (!isValidSkillAuditMode(text)) return error.InvalidModeArg;
+        }
+    }
+    if (cmd == .tool_audit) {
+        if (opts.mode) |text| {
+            if (!isValidToolAuditMode(text)) return error.InvalidModeArg;
+        }
+        if (opts.group_by_text) |text| {
+            if (!isValidToolAuditGroupBy(text)) return error.InvalidModeArg;
+        }
+    }
+    if (cmd == .memory_inventory) {
+        if (opts.mode) |text| {
+            if (!isValidMemoryInventoryMode(text)) return error.InvalidModeArg;
+        }
+    }
+    if (cmd == .workdir_report) {
+        if (opts.mode) |text| {
+            if (!isValidWorkdirReportMode(text)) return error.InvalidModeArg;
+        }
+    }
     if (opts.events_text) |text| _ = try parseTailEventMask(text);
 }
 
@@ -944,6 +1004,40 @@ fn isValidTraceTurnStatus(text: []const u8) bool {
         std.mem.eql(u8, text, "aborted") or
         std.mem.eql(u8, text, "ongoing") or
         std.mem.eql(u8, text, "error");
+}
+
+fn isValidSkillAuditMode(text: []const u8) bool {
+    return std.mem.eql(u8, text, "summary") or
+        std.mem.eql(u8, text, "mentions") or
+        std.mem.eql(u8, text, "trend");
+}
+
+fn isValidToolAuditMode(text: []const u8) bool {
+    return std.mem.eql(u8, text, "summary") or
+        std.mem.eql(u8, text, "rows") or
+        std.mem.eql(u8, text, "args") or
+        std.mem.eql(u8, text, "unresolved");
+}
+
+fn isValidToolAuditGroupBy(text: []const u8) bool {
+    return std.mem.eql(u8, text, "executable") or
+        std.mem.eql(u8, text, "tool") or
+        std.mem.eql(u8, text, "session") or
+        std.mem.eql(u8, text, "workdir") or
+        std.mem.eql(u8, text, "command");
+}
+
+fn isValidMemoryInventoryMode(text: []const u8) bool {
+    return std.mem.eql(u8, text, "categories") or
+        std.mem.eql(u8, text, "files") or
+        std.mem.eql(u8, text, "blocks") or
+        std.mem.eql(u8, text, "stage1") or
+        std.mem.eql(u8, text, "extensions");
+}
+
+fn isValidWorkdirReportMode(text: []const u8) bool {
+    return std.mem.eql(u8, text, "summary") or
+        std.mem.eql(u8, text, "sessions");
 }
 
 fn parseTailEventMask(raw_opt: ?[]const u8) !TailEventMask {
@@ -1768,6 +1862,450 @@ fn cmdQuery(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Optio
     if (fmt == .dot or fmt == .markdown) return error.InvalidFormatForCommand;
     try output.writeOutput(allocator, fmt, result.rows.items, cols_opt, opts.out_path);
 }
+
+const QueryLiftCommands = struct {
+    const skill_audit_summary_columns = [_][]const u8{ "skill", "mentions", "sessions", "first_seen", "last_seen" };
+    const skill_audit_mentions_columns = [_][]const u8{ "timestamp", "role", "skill", "types", "snippet", "path" };
+    const skill_audit_trend_columns = [_][]const u8{ "day", "mentions", "sessions" };
+    const tool_audit_summary_columns = [_][]const u8{ "tool_name", "calls", "sessions", "avg_wall_ms", "max_wall_ms" };
+    const tool_audit_row_columns = [_][]const u8{ "timestamp", "tool_name", "primary_executable", "workdir", "exit_code", "wall_time_ms", "command_text", "path" };
+    const tool_audit_arg_columns = [_][]const u8{ "tool_name", "arg_path", "count" };
+    const memory_inventory_category_columns = [_][]const u8{ "category", "extension", "files", "bytes", "latest_modified" };
+    const memory_inventory_file_columns = [_][]const u8{ "relative_path", "category", "extension", "size_bytes", "modified_at", "preview" };
+    const memory_inventory_block_columns = [_][]const u8{ "doc_kind", "title", "updated_at", "thread_id", "relative_path", "preview" };
+    const memory_inventory_stage1_columns = [_][]const u8{ "generated_at", "last_usage", "cwd", "title", "thread_id", "rollout_path" };
+    const memory_inventory_extension_columns = [_][]const u8{ "extension_name", "has_instructions", "modified_at", "size_bytes", "instructions_path" };
+    const message_search_columns = [_][]const u8{ "timestamp", "role", "text", "path" };
+    const workdir_report_summary_columns = [_][]const u8{ "cwd", "sessions", "turns", "total_tokens", "first_seen", "last_seen" };
+    const workdir_report_session_columns = [_][]const u8{ "start_time", "end_time", "cwd", "model", "total_tokens", "path" };
+
+    fn appendTimeBoundsForField(
+        allocator: std.mem.Allocator,
+        where_out: *std.ArrayList(spec.WhereClause),
+        field: []const u8,
+        opts: Options,
+    ) !void {
+        if (opts.since) |value| try where_out.append(allocator, .{
+            .field = field,
+            .op = .gte,
+            .value = .{ .scalar = .{ .string = value } },
+        });
+        if (opts.until) |value| try where_out.append(allocator, .{
+            .field = field,
+            .op = .lte,
+            .value = .{ .scalar = .{ .string = value } },
+        });
+    }
+
+    fn appendOptionalStringEq(
+        allocator: std.mem.Allocator,
+        where_out: *std.ArrayList(spec.WhereClause),
+        field: []const u8,
+        value_opt: ?[]const u8,
+    ) !void {
+        if (value_opt) |value| try where_out.append(allocator, .{
+            .field = field,
+            .op = .eq,
+            .value = .{ .scalar = .{ .string = value } },
+        });
+    }
+
+    fn appendOptionalContains(
+        allocator: std.mem.Allocator,
+        where_out: *std.ArrayList(spec.WhereClause),
+        field: []const u8,
+        value_opt: ?[]const u8,
+    ) !void {
+        if (value_opt) |value| try where_out.append(allocator, .{
+            .field = field,
+            .op = .contains,
+            .value = .{ .scalar = .{ .string = value } },
+            .case_insensitive = true,
+        });
+    }
+
+    fn appendOptionalRegex(
+        allocator: std.mem.Allocator,
+        where_out: *std.ArrayList(spec.WhereClause),
+        field: []const u8,
+        value_opt: ?[]const u8,
+    ) !void {
+        if (value_opt) |value| try where_out.append(allocator, .{
+            .field = field,
+            .op = .regex,
+            .value = .{ .scalar = .{ .string = value } },
+            .case_insensitive = true,
+        });
+    }
+
+    fn appendCsvContainsAny(
+        allocator: std.mem.Allocator,
+        where_out: *std.ArrayList(spec.WhereClause),
+        field: []const u8,
+        raw_opt: ?[]const u8,
+    ) !?[]spec.Scalar {
+        const raw = raw_opt orelse return null;
+        var values: std.ArrayList(spec.Scalar) = .empty;
+        defer values.deinit(allocator);
+
+        var split = std.mem.splitScalar(u8, raw, ',');
+        while (split.next()) |part_raw| {
+            const part = std.mem.trim(u8, part_raw, " \t\r\n");
+            if (part.len == 0) continue;
+            try values.append(allocator, .{ .string = part });
+        }
+        if (values.items.len == 0) return error.InvalidModeArg;
+        const owned = try values.toOwnedSlice(allocator);
+        try where_out.append(allocator, .{
+            .field = field,
+            .op = .contains_any,
+            .value = .{ .list = owned },
+            .case_insensitive = true,
+        });
+        return owned;
+    }
+
+    fn appendCsvContainsAll(
+        allocator: std.mem.Allocator,
+        where_out: *std.ArrayList(spec.WhereClause),
+        field: []const u8,
+        raw_opt: ?[]const u8,
+    ) !void {
+        const raw = raw_opt orelse return;
+        var added = false;
+        var split = std.mem.splitScalar(u8, raw, ',');
+        while (split.next()) |part_raw| {
+            const part = std.mem.trim(u8, part_raw, " \t\r\n");
+            if (part.len == 0) continue;
+            added = true;
+            try where_out.append(allocator, .{
+                .field = field,
+                .op = .contains,
+                .value = .{ .scalar = .{ .string = part } },
+                .case_insensitive = true,
+            });
+        }
+        if (!added) return error.InvalidModeArg;
+    }
+
+    fn appendRolesWhere(
+        allocator: std.mem.Allocator,
+        where_out: *std.ArrayList(spec.WhereClause),
+        raw_opt: ?[]const u8,
+    ) !?[]spec.Scalar {
+        const raw = raw_opt orelse return null;
+        var values: std.ArrayList(spec.Scalar) = .empty;
+        defer values.deinit(allocator);
+
+        var split = std.mem.splitScalar(u8, raw, ',');
+        while (split.next()) |part_raw| {
+            const part = std.mem.trim(u8, part_raw, " \t\r\n");
+            if (part.len == 0) continue;
+            if (!std.mem.eql(u8, part, "user") and !std.mem.eql(u8, part, "assistant")) {
+                printCliError("error: invalid --roles value {s}\n", .{part});
+                return error.InvalidModeArg;
+            }
+            try values.append(allocator, .{ .string = part });
+        }
+        if (values.items.len == 0) return error.InvalidModeArg;
+        const owned = try values.toOwnedSlice(allocator);
+        try where_out.append(allocator, .{
+            .field = "role",
+            .op = .in,
+            .value = .{ .list = owned },
+        });
+        return owned;
+    }
+
+    fn queryLimit(opts: Options, default_limit: usize) usize {
+        return if (opts.limit == 0) default_limit else opts.limit;
+    }
+
+    fn cmdSkillAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+        const mode = opts.mode orelse "summary";
+        var where: std.ArrayList(spec.WhereClause) = .empty;
+        defer where.deinit(allocator);
+        try appendOptionalStringEq(allocator, &where, "skill", opts.skill);
+        try appendSessionTimeBounds(allocator, &where, opts);
+        const role_values = try appendRolesWhere(allocator, &where, opts.roles_csv);
+        defer if (role_values) |values| allocator.free(values);
+
+        if (std.mem.eql(u8, mode, "summary")) {
+            const query_spec = spec.QuerySpec{
+                .where = where.items,
+                .group_by = &.{"skill"},
+                .metrics = &.{
+                    .{ .op = .count, .alias = "mentions" },
+                    .{ .op = .count_distinct, .field = "path", .alias = "sessions" },
+                    .{ .op = .min, .field = "timestamp", .alias = "first_seen" },
+                    .{ .op = .max, .field = "timestamp", .alias = "last_seen" },
+                },
+                .sort = &.{.{ .field = "mentions", .descending = true }},
+                .limit = queryLimit(opts, 20),
+            };
+            return runDatasetQuery(allocator, "skill_mentions", sessions_root, query_spec, opts.format, opts.out_path, skill_audit_summary_columns[0..]);
+        }
+
+        if (std.mem.eql(u8, mode, "mentions")) {
+            const query_spec = spec.QuerySpec{
+                .where = where.items,
+                .select = skill_audit_mentions_columns[0..],
+                .sort = &.{.{ .field = "timestamp", .descending = true }},
+                .limit = queryLimit(opts, 50),
+            };
+            return runDatasetQuery(allocator, "skill_mentions", sessions_root, query_spec, opts.format, opts.out_path, skill_audit_mentions_columns[0..]);
+        }
+
+        if (std.mem.eql(u8, mode, "trend")) {
+            if (opts.skill == null) return error.MissingSkillArg;
+            const query_spec = spec.QuerySpec{
+                .where = where.items,
+                .group_by = &.{"day"},
+                .metrics = &.{
+                    .{ .op = .count, .alias = "mentions" },
+                    .{ .op = .count_distinct, .field = "path", .alias = "sessions" },
+                },
+                .sort = &.{.{ .field = "day", .descending = false }},
+                .limit = opts.limit,
+            };
+            return runDatasetQuery(allocator, "skill_mentions", sessions_root, query_spec, opts.format, opts.out_path, skill_audit_trend_columns[0..]);
+        }
+
+        return error.InvalidModeArg;
+    }
+
+    fn toolAuditGroupField(raw_opt: ?[]const u8) ![]const u8 {
+        const raw = raw_opt orelse "tool";
+        if (std.mem.eql(u8, raw, "tool")) return "tool_name";
+        if (std.mem.eql(u8, raw, "executable")) return "primary_executable";
+        if (std.mem.eql(u8, raw, "session")) return "session_id";
+        if (std.mem.eql(u8, raw, "workdir")) return "workdir";
+        if (std.mem.eql(u8, raw, "command")) return "command_text";
+        return error.InvalidModeArg;
+    }
+
+    fn cmdToolAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+        const mode = opts.mode orelse "summary";
+        var where: std.ArrayList(spec.WhereClause) = .empty;
+        defer where.deinit(allocator);
+        try appendTimeBoundsForField(allocator, &where, "timestamp", opts);
+        try appendOptionalStringEq(allocator, &where, "tool_name", opts.tool);
+        try appendOptionalStringEq(allocator, &where, "primary_executable", opts.executable_text);
+        try appendOptionalStringEq(allocator, &where, "workdir", opts.workdir_text);
+        try appendOptionalContains(allocator, &where, "command_text", opts.contains);
+
+        if (std.mem.eql(u8, mode, "summary")) {
+            const group_field = try toolAuditGroupField(opts.group_by_text);
+            const group_by = [_][]const u8{group_field};
+            var columns = [_][]const u8{ group_field, "calls", "sessions", "avg_wall_ms", "max_wall_ms" };
+            const query_spec = spec.QuerySpec{
+                .where = where.items,
+                .group_by = group_by[0..],
+                .metrics = &.{
+                    .{ .op = .count, .alias = "calls" },
+                    .{ .op = .count_distinct, .field = "session_id", .alias = "sessions" },
+                    .{ .op = .avg, .field = "wall_time_ms", .alias = "avg_wall_ms" },
+                    .{ .op = .max, .field = "wall_time_ms", .alias = "max_wall_ms" },
+                },
+                .sort = &.{.{ .field = "calls", .descending = true }},
+                .limit = queryLimit(opts, 20),
+            };
+            return runDatasetQuery(allocator, "tool_invocations", sessions_root, query_spec, opts.format, opts.out_path, columns[0..]);
+        }
+
+        if (std.mem.eql(u8, mode, "rows") or std.mem.eql(u8, mode, "unresolved")) {
+            if (std.mem.eql(u8, mode, "unresolved")) {
+                try where.append(allocator, .{ .field = "unresolved", .op = .eq, .value = .{ .scalar = .{ .bool = true } } });
+            }
+            const query_spec = spec.QuerySpec{
+                .where = where.items,
+                .select = tool_audit_row_columns[0..],
+                .sort = &.{.{ .field = "timestamp", .descending = true }},
+                .limit = queryLimit(opts, 50),
+            };
+            return runDatasetQuery(allocator, "tool_invocations", sessions_root, query_spec, opts.format, opts.out_path, tool_audit_row_columns[0..]);
+        }
+
+        if (std.mem.eql(u8, mode, "args")) {
+            var arg_where: std.ArrayList(spec.WhereClause) = .empty;
+            defer arg_where.deinit(allocator);
+            try appendTimeBoundsForField(allocator, &arg_where, "timestamp", opts);
+            try appendOptionalStringEq(allocator, &arg_where, "tool_name", opts.tool);
+            try appendOptionalContains(allocator, &arg_where, "value_text", opts.contains);
+            const query_spec = spec.QuerySpec{
+                .where = arg_where.items,
+                .group_by = &.{ "tool_name", "arg_path" },
+                .metrics = &.{.{ .op = .count, .alias = "count" }},
+                .sort = &.{.{ .field = "count", .descending = true }},
+                .limit = queryLimit(opts, 50),
+            };
+            return runDatasetQuery(allocator, "tool_call_args", sessions_root, query_spec, opts.format, opts.out_path, tool_audit_arg_columns[0..]);
+        }
+
+        return error.InvalidModeArg;
+    }
+
+    fn appendMemoryParams(
+        allocator: std.mem.Allocator,
+        params: *std.ArrayList(spec.ParamSpec),
+        opts: Options,
+        include_preview: bool,
+    ) !void {
+        if (opts.memory_root_text) |memory_root| try params.append(allocator, .{ .key = "memory_root", .value = .{ .string = memory_root } });
+        if (opts.state_db_path) |state_db_path| try params.append(allocator, .{ .key = "state_db_path", .value = .{ .string = state_db_path } });
+        if (opts.extensions_root_text) |extensions_root| try params.append(allocator, .{ .key = "extensions_root", .value = .{ .string = extensions_root } });
+        if (include_preview) try params.append(allocator, .{ .key = "include_preview", .value = .{ .bool = true } });
+    }
+
+    fn cmdMemoryInventory(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+        const mode = opts.mode orelse "categories";
+        var where: std.ArrayList(spec.WhereClause) = .empty;
+        defer where.deinit(allocator);
+        var params: std.ArrayList(spec.ParamSpec) = .empty;
+        defer params.deinit(allocator);
+
+        if (std.mem.eql(u8, mode, "categories")) {
+            try appendMemoryParams(allocator, &params, opts, false);
+            try appendOptionalContains(allocator, &where, "relative_path", opts.contains);
+            try appendOptionalRegex(allocator, &where, "relative_path", opts.regex);
+            const query_spec = spec.QuerySpec{
+                .where = where.items,
+                .params = params.items,
+                .group_by = &.{ "category", "extension" },
+                .metrics = &.{
+                    .{ .op = .count, .alias = "files" },
+                    .{ .op = .sum, .field = "size_bytes", .alias = "bytes" },
+                    .{ .op = .max, .field = "modified_at", .alias = "latest_modified" },
+                },
+                .sort = &.{.{ .field = "files", .descending = true }},
+                .limit = opts.limit,
+            };
+            return runDatasetQuery(allocator, "memory_files", sessions_root, query_spec, opts.format, opts.out_path, memory_inventory_category_columns[0..]);
+        }
+
+        if (std.mem.eql(u8, mode, "files")) {
+            try appendMemoryParams(allocator, &params, opts, true);
+            try appendOptionalContains(allocator, &where, "relative_path", opts.contains);
+            try appendOptionalRegex(allocator, &where, "relative_path", opts.regex);
+            const query_spec = spec.QuerySpec{
+                .where = where.items,
+                .params = params.items,
+                .select = memory_inventory_file_columns[0..],
+                .sort = &.{.{ .field = "modified_at", .descending = true }},
+                .limit = queryLimit(opts, 100),
+            };
+            return runDatasetQuery(allocator, "memory_files", sessions_root, query_spec, opts.format, opts.out_path, memory_inventory_file_columns[0..]);
+        }
+
+        if (std.mem.eql(u8, mode, "blocks")) {
+            try appendMemoryParams(allocator, &params, opts, false);
+            try appendOptionalContains(allocator, &where, "body", opts.contains);
+            try appendOptionalRegex(allocator, &where, "body", opts.regex);
+            const query_spec = spec.QuerySpec{
+                .where = where.items,
+                .params = params.items,
+                .select = memory_inventory_block_columns[0..],
+                .sort = &.{.{ .field = "updated_at", .descending = true }},
+                .limit = queryLimit(opts, 50),
+            };
+            return runDatasetQuery(allocator, "memory_blocks", sessions_root, query_spec, opts.format, opts.out_path, memory_inventory_block_columns[0..]);
+        }
+
+        if (std.mem.eql(u8, mode, "stage1")) {
+            try appendMemoryParams(allocator, &params, opts, false);
+            try appendOptionalContains(allocator, &where, "title", opts.contains);
+            try appendOptionalRegex(allocator, &where, "title", opts.regex);
+            const query_spec = spec.QuerySpec{
+                .where = where.items,
+                .params = params.items,
+                .select = memory_inventory_stage1_columns[0..],
+                .sort = &.{.{ .field = "generated_at", .descending = true }},
+                .limit = queryLimit(opts, 50),
+            };
+            return runDatasetQuery(allocator, "memory_stage1_outputs", sessions_root, query_spec, opts.format, opts.out_path, memory_inventory_stage1_columns[0..]);
+        }
+
+        if (std.mem.eql(u8, mode, "extensions")) {
+            try appendMemoryParams(allocator, &params, opts, false);
+            try appendOptionalContains(allocator, &where, "extension_name", opts.contains);
+            try appendOptionalRegex(allocator, &where, "extension_name", opts.regex);
+            const query_spec = spec.QuerySpec{
+                .where = where.items,
+                .params = params.items,
+                .select = memory_inventory_extension_columns[0..],
+                .sort = &.{.{ .field = "extension_name", .descending = false }},
+                .limit = opts.limit,
+            };
+            return runDatasetQuery(allocator, "memory_extensions", sessions_root, query_spec, opts.format, opts.out_path, memory_inventory_extension_columns[0..]);
+        }
+
+        return error.InvalidModeArg;
+    }
+
+    fn cmdMessageSearch(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+        if (opts.contains == null and opts.regex == null and opts.contains_any_text == null and opts.contains_all_text == null) {
+            return error.MissingContainsArg;
+        }
+        var where: std.ArrayList(spec.WhereClause) = .empty;
+        defer where.deinit(allocator);
+        try appendSessionTimeBounds(allocator, &where, opts);
+        const role_values = try appendRolesWhere(allocator, &where, opts.roles_csv);
+        defer if (role_values) |values| allocator.free(values);
+        try appendOptionalContains(allocator, &where, "text", opts.contains);
+        const contains_any_values = try appendCsvContainsAny(allocator, &where, "text", opts.contains_any_text);
+        defer if (contains_any_values) |values| allocator.free(values);
+        try appendCsvContainsAll(allocator, &where, "text", opts.contains_all_text);
+        try appendOptionalRegex(allocator, &where, "text", opts.regex);
+
+        const query_spec = spec.QuerySpec{
+            .where = where.items,
+            .select = message_search_columns[0..],
+            .sort = &.{.{ .field = "timestamp", .descending = true }},
+            .limit = queryLimit(opts, 50),
+        };
+        try runDatasetQuery(allocator, "messages", sessions_root, query_spec, opts.format, opts.out_path, message_search_columns[0..]);
+    }
+
+    fn cmdWorkdirReport(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+        const mode = opts.mode orelse "summary";
+        var where: std.ArrayList(spec.WhereClause) = .empty;
+        defer where.deinit(allocator);
+        try appendTimeBoundsForField(allocator, &where, "start_time", opts);
+        try appendOptionalStringEq(allocator, &where, "cwd", opts.workdir_text);
+        try appendOptionalContains(allocator, &where, "cwd", opts.contains);
+        const contains_any_values = try appendCsvContainsAny(allocator, &where, "cwd", opts.contains_any_text);
+        defer if (contains_any_values) |values| allocator.free(values);
+
+        if (std.mem.eql(u8, mode, "summary")) {
+            const query_spec = spec.QuerySpec{
+                .where = where.items,
+                .group_by = &.{"cwd"},
+                .metrics = &.{
+                    .{ .op = .count, .alias = "sessions" },
+                    .{ .op = .sum, .field = "turn_count", .alias = "turns" },
+                    .{ .op = .sum, .field = "total_tokens", .alias = "total_tokens" },
+                    .{ .op = .min, .field = "start_time", .alias = "first_seen" },
+                    .{ .op = .max, .field = "start_time", .alias = "last_seen" },
+                },
+                .sort = &.{.{ .field = "sessions", .descending = true }},
+                .limit = queryLimit(opts, 50),
+            };
+            return runDatasetQuery(allocator, "sessions", sessions_root, query_spec, opts.format, opts.out_path, workdir_report_summary_columns[0..]);
+        }
+
+        if (std.mem.eql(u8, mode, "sessions")) {
+            const query_spec = spec.QuerySpec{
+                .where = where.items,
+                .select = workdir_report_session_columns[0..],
+                .sort = &.{.{ .field = "start_time", .descending = true }},
+                .limit = queryLimit(opts, 50),
+            };
+            return runDatasetQuery(allocator, "sessions", sessions_root, query_spec, opts.format, opts.out_path, workdir_report_session_columns[0..]);
+        }
+
+        return error.InvalidModeArg;
+    }
+};
 
 const ArtifactKind = enum {
     auto,
@@ -3089,7 +3627,6 @@ fn cmdSkillReport(allocator: std.mem.Allocator, sessions_root: []const u8, opts:
     };
     try runDatasetQuery(allocator, "skill_mentions", sessions_root, query_spec, opts.format, opts.out_path, select[0..]);
 }
-
 const SkillBlockHistory = enum {
     distinct,
     all,
@@ -8353,6 +8890,14 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.contains = args[i];
+        } else if (std.mem.eql(u8, arg, "--contains-any")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.contains_any_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--contains-all")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.contains_all_text = args[i];
         } else if (std.mem.eql(u8, arg, "--regex")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -8365,6 +8910,10 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.tool = args[i];
+        } else if (std.mem.eql(u8, arg, "--executable")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.executable_text = args[i];
         } else if (std.mem.eql(u8, arg, "--workdir")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -9365,6 +9914,69 @@ fn runCommandWithOutput(
     return reader.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024));
 }
 
+test "query-lift commands run over session fixtures" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/01");
+    const session_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-01T10:00:00Z\",\"payload\":{\"id\":\"lift-session\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-01T10:00:01Z\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn-1\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-01T10:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Need $seq release workflow\"}]}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-01T10:00:03Z\",\"payload\":{\"type\":\"agent_message\",\"message\":\"Use $zig too\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-01T10:00:04Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"exec-1\",\"arguments\":\"{\\\"cmd\\\":\\\"zig build test-seq\\\",\\\"cwd\\\":\\\"/repo\\\"}\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-01T10:00:05Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"turn-1\",\"call_id\":\"exec-1\",\"command\":\"zig build test-seq\",\"cwd\":\"/repo\",\"exit_code\":0,\"duration_ms\":12,\"stdout\":\"ok\",\"status\":\"completed\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-01T10:00:06Z\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"turn-1\",\"duration_ms\":4000}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "sessions/2026/05/01/rollout-lift-session.jsonl",
+        .data = session_content,
+    });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "query-lift.jsonl" });
+    defer std.testing.allocator.free(output_path);
+
+    {
+        const got = try runCommandWithOutput(std.testing.allocator, .skill_audit, &.{ "--root", root_abs, "--skill", "seq", "--format", "jsonl" }, output_path);
+        defer std.testing.allocator.free(got);
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"skill\":\"seq\"") != null);
+    }
+    {
+        const got = try runCommandWithOutput(std.testing.allocator, .message_search, &.{ "--root", root_abs, "--contains", "release workflow", "--format", "jsonl" }, output_path);
+        defer std.testing.allocator.free(got);
+        try std.testing.expect(std.mem.indexOf(u8, got, "release workflow") != null);
+    }
+    {
+        const got = try runCommandWithOutput(std.testing.allocator, .tool_audit, &.{ "--root", root_abs, "--tool", "exec_command", "--format", "jsonl" }, output_path);
+        defer std.testing.allocator.free(got);
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"tool_name\":\"exec_command\"") != null);
+    }
+    {
+        const got = try runCommandWithOutput(std.testing.allocator, .workdir_report, &.{ "--root", root_abs, "--workdir", "/repo", "--format", "jsonl" }, output_path);
+        defer std.testing.allocator.free(got);
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"cwd\":\"/repo\"") != null);
+    }
+}
+
+test "memory-inventory summarizes memory file categories" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "mem/rollout_summaries");
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "mem/MEMORY.md", .data = "# Memory\n" });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "mem/rollout_summaries/example.md", .data = "# Summary\n" });
+
+    const memory_root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "mem", std.testing.allocator);
+    defer std.testing.allocator.free(memory_root);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ memory_root, "memory-inventory.jsonl" });
+    defer std.testing.allocator.free(output_path);
+
+    const got = try runCommandWithOutput(std.testing.allocator, .memory_inventory, &.{ "--memory-root", memory_root, "--format", "jsonl" }, output_path);
+    defer std.testing.allocator.free(got);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"category\":\"rollout_summaries\"") != null);
+}
+
 test "session-prompts resolves a single targeted file and supports role filters" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -9790,6 +10402,79 @@ test "query-diagnose flags strict hangs and supports fail-on-hang" {
         output_path,
     };
     try std.testing.expectError(error.QueryHangDetected, run(std.testing.allocator, .query_diagnose, fail_args[0..]));
+}
+
+test "query-lift commands run representative dataset wrappers" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/03/05");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "memories/rollout_summaries");
+    const session_content =
+        "{\"timestamp\":\"2026-03-05T09:59:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019c0000-0000-7000-8000-000000000101\",\"cwd\":\"/tmp/query-lift-repo\",\"model\":\"gpt-test\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Find this query lift needle\\n<skill>\\n<name>seq</name>\\n</skill>\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Using seq\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:00:02Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"q1\",\"arguments\":\"{\\\"cmd\\\":\\\"seq query --spec @spec.json\\\",\\\"workdir\\\":\\\"/tmp/query-lift-repo\\\"}\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:00:03Z\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"q1\",\"output\":\"Chunk ID: aa\\nWall time: 0.120 seconds\\nProcess exited with code 0\\nOutput:\\n\"}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "sessions/2026/03/05/rollout-2026-03-05T00-00-00-019c0000-0000-7000-8000-000000000101.jsonl",
+        .data = session_content,
+    });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "memories/MEMORY.md",
+        .data = "# Query Lift\n\nReusable seq command notes.\n",
+    });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "memories/rollout_summaries/query-lift.md",
+        .data = "# Query Lift Rollout\n\nrollout_path=/tmp/query-lift.jsonl\n",
+    });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const sessions_abs = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "sessions" });
+    defer std.testing.allocator.free(sessions_abs);
+    const memories_abs = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "memories" });
+    defer std.testing.allocator.free(memories_abs);
+
+    const skill_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "skill-audit.json" });
+    defer std.testing.allocator.free(skill_out);
+    const skill_args = [_][]const u8{ "--root", sessions_abs, "--skill", "seq", "--format", "json" };
+    const skill_got = try runCommandWithOutput(std.testing.allocator, .skill_audit, skill_args[0..], skill_out);
+    defer std.testing.allocator.free(skill_got);
+    try std.testing.expect(std.mem.indexOf(u8, skill_got, "\"skill\": \"seq\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skill_got, "\"mentions\": 1") != null);
+
+    const tool_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "tool-audit.json" });
+    defer std.testing.allocator.free(tool_out);
+    const tool_args = [_][]const u8{ "--root", sessions_abs, "--tool", "exec_command", "--group-by", "executable", "--format", "json" };
+    const tool_got = try runCommandWithOutput(std.testing.allocator, .tool_audit, tool_args[0..], tool_out);
+    defer std.testing.allocator.free(tool_got);
+    try std.testing.expect(std.mem.indexOf(u8, tool_got, "\"primary_executable\": \"seq\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tool_got, "\"calls\": 1") != null);
+
+    const memory_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "memory-inventory.json" });
+    defer std.testing.allocator.free(memory_out);
+    const memory_args = [_][]const u8{ "--memory-root", memories_abs, "--format", "json" };
+    const memory_got = try runCommandWithOutput(std.testing.allocator, .memory_inventory, memory_args[0..], memory_out);
+    defer std.testing.allocator.free(memory_got);
+    try std.testing.expect(std.mem.indexOf(u8, memory_got, "\"category\": \"root\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, memory_got, "\"category\": \"rollout_summaries\"") != null);
+
+    const message_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "message-search.json" });
+    defer std.testing.allocator.free(message_out);
+    const message_args = [_][]const u8{ "--root", sessions_abs, "--contains", "query lift needle", "--roles", "user", "--format", "json" };
+    const message_got = try runCommandWithOutput(std.testing.allocator, .message_search, message_args[0..], message_out);
+    defer std.testing.allocator.free(message_got);
+    try std.testing.expect(std.mem.indexOf(u8, message_got, "query lift needle") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message_got, "\"role\": \"assistant\"") == null);
+
+    const workdir_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "workdir-report.json" });
+    defer std.testing.allocator.free(workdir_out);
+    const workdir_args = [_][]const u8{ "--root", sessions_abs, "--workdir", "/tmp/query-lift-repo", "--format", "json" };
+    const workdir_got = try runCommandWithOutput(std.testing.allocator, .workdir_report, workdir_args[0..], workdir_out);
+    defer std.testing.allocator.free(workdir_got);
+    try std.testing.expect(std.mem.indexOf(u8, workdir_got, "\"cwd\": \"/tmp/query-lift-repo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, workdir_got, "\"sessions\": 1") != null);
 }
 
 test "skill-blocks distinct returns one aggregated version with metadata" {

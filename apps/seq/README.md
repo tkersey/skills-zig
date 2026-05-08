@@ -1,6 +1,6 @@
 # seq
 
-`seq` is a Zig 0.15.2 CLI for mining Codex session and memory artifacts.
+`seq` is a Zig 0.16.0 CLI for mining Codex session and memory artifacts.
 
 ## Install (Homebrew)
 
@@ -49,6 +49,11 @@ Binary output:
 ./zig-out/bin/seq query-diagnose --path /absolute/path/to/rollout.jsonl --threshold-ms 10000 --next-actions --format json
 ./zig-out/bin/seq artifact-search --contains "spawn_agent" --kind orchestration --since 2026-03-01T00:00:00Z --limit 10 --format table
 ./zig-out/bin/seq artifact-search --contains "MEMORY.md" --kind memory --stats --format table
+./zig-out/bin/seq skill-audit --skill seq --mode trend --since 2026-04-01T00:00:00Z --format table
+./zig-out/bin/seq tool-audit --group-by executable --since 2026-04-01T00:00:00Z --limit 20 --format table
+./zig-out/bin/seq memory-inventory --mode categories --memory-root ~/.codex/memories --format table
+./zig-out/bin/seq message-search --contains "release workflow" --roles user,assistant --limit 20 --format table
+./zig-out/bin/seq workdir-report --workdir /Users/tk/workspace/tk/skills-zig --mode sessions --format table
 ./zig-out/bin/seq memory-provenance --thread-id 019bae5d-7d12-7b01-9cb5-b8bb6046b85b --format table
 ./zig-out/bin/seq memory-provenance --rollout-summary-file rollout_summaries/2026-01-11T18-42-01-jpEf-resolve_merge_pr_11_squash_cleanup.md --format json
 ./zig-out/bin/seq memory-map --thread-id 019bae5d-7d12-7b01-9cb5-b8bb6046b85b --format table
@@ -144,6 +149,13 @@ seq query --root ~/.codex/sessions --spec '{"dataset":"session_graph_edges","sel
 - accepts `--surface auto|messages|tool_calls|memory_blocks` when you need to pin the substrate
 - emits `next_action_kind` / `next_action` suggestions for follow-up commands
 - `--stats` adds scan counters (`surfaces_scanned`, `candidate_files`, `files_opened`, `rows_examined`, `rows_emitted`, `duration_ms`)
+
+Query-lift commands provide top-level shortcuts for common `seq query` shapes:
+- `skill-audit` summarizes `skill_mentions` by skill, emits mention rows, or produces a daily trend for one skill.
+- `tool-audit` summarizes `tool_invocations` by tool, executable, session, workdir, or command, with row and unresolved modes for drilling down.
+- `memory-inventory` summarizes file-backed memory categories and can switch to file, block, stage1, or extension inventory modes.
+- `message-search` searches session message text with `--contains`, `--regex`, `--contains-any`, or `--contains-all`.
+- `workdir-report` summarizes canonical session rows by `cwd` and can list matching sessions.
 
 `memory-provenance` answers the targeted origin question for one memory thread or rollout summary:
 - accepts `--thread-id` or `--rollout-summary-file`
