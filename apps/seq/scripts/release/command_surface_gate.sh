@@ -80,5 +80,11 @@ if ! "$BIN_PATH" --help | rg -q '^- reply-latency$'; then
   echo "required command missing: reply-latency" >&2
   exit 1
 fi
+for cmd in skill-audit tool-audit memory-inventory message-search workdir-report; do
+  if ! "$BIN_PATH" --help | rg -q "^- ${cmd}$"; then
+    echo "required command missing: ${cmd}" >&2
+    exit 1
+  fi
+done
 
 echo "command-surface gate passed for $BIN_PATH"
