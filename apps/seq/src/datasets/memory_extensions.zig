@@ -76,7 +76,7 @@ fn resolveExtensionsRoot(allocator: std.mem.Allocator, override_root: ?[]const u
     if (override_root) |path| return toAbsolutePath(allocator, path);
 
     const home = std.Io.Threaded.global_single_threaded.environString("HOME") orelse return error.EnvironmentVariableNotFound;
-    return std.fs.path.join(allocator, &.{ home, ".codex", "memories_extensions" });
+    return std.fs.path.join(allocator, &.{ home, ".codex", "memories", "extensions" });
 }
 
 fn toAbsolutePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -118,4 +118,11 @@ test "collect returns extension rows including missing instructions" {
     try std.testing.expectEqualStrings("harness", rows.items[1].extension_name);
     try std.testing.expect(rows.items[1].has_instructions);
     try std.testing.expect(rows.items[1].instructions_path != null);
+}
+
+test "default root points at Codex memories extensions" {
+    const root = try resolveExtensionsRoot(std.testing.allocator, null);
+    defer std.testing.allocator.free(root);
+
+    try std.testing.expect(std.mem.endsWith(u8, root, "/.codex/memories/extensions"));
 }

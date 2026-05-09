@@ -180,7 +180,7 @@ Query-lift commands provide top-level shortcuts for common `seq query` shapes:
 - one row per `stage1_outputs` entry joined to the owning `threads` row
 - exposes `selected_for_phase2`, `usage_count`, `last_usage`, `rollout_path`, `cwd`, and `memory_mode`
 
-`memory_extensions` inventories the live `~/.codex/memories_extensions` tree:
+`memory_extensions` inventories the live `~/.codex/memories/extensions` tree:
 - one row per extension directory
 - exposes whether `instructions.md` is present and where it lives
 

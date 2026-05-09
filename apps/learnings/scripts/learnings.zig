@@ -2219,10 +2219,10 @@ fn resolveDigestOutputPathAlloc(
 fn defaultDigestOutputPathAlloc(allocator: std.mem.Allocator, codex_home_raw: []const u8) ![]u8 {
     const codex_home = std.mem.trim(u8, codex_home_raw, " \t\r\n");
     if (codex_home.len > 0) {
-        return std.fs.path.join(allocator, &.{ codex_home, "memories_extensions", "learnings", "resources", "latest_learnings_digest.md" });
+        return std.fs.path.join(allocator, &.{ codex_home, "memories", "extensions", "learnings", "resources", "latest_learnings_digest.md" });
     }
     const home = std.Io.Threaded.global_single_threaded.environString("HOME") orelse return error.MissingHomeEnv;
-    return std.fs.path.join(allocator, &.{ home, ".codex", "memories_extensions", "learnings", "resources", "latest_learnings_digest.md" });
+    return std.fs.path.join(allocator, &.{ home, ".codex", "memories", "extensions", "learnings", "resources", "latest_learnings_digest.md" });
 }
 
 fn appendFmt(
@@ -4092,6 +4092,16 @@ test "parse args memory-digest" {
     try std.testing.expectEqualStrings("2026-03-01", parsed.since);
     try std.testing.expectEqual(@as(usize, 7), parsed.limit);
     try std.testing.expectEqualStrings("digest.md", parsed.output);
+}
+
+test "default memory digest path uses Codex memories extensions root" {
+    const path = try defaultDigestOutputPathAlloc(std.testing.allocator, "/tmp/codex-home");
+    defer std.testing.allocator.free(path);
+
+    try std.testing.expectEqualStrings(
+        "/tmp/codex-home/memories/extensions/learnings/resources/latest_learnings_digest.md",
+        path,
+    );
 }
 
 test "digest eligibility keeps codify and anchored review later" {

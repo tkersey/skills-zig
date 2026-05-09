@@ -208,7 +208,7 @@ pub const dataset_meta = [_]DatasetMeta{
     },
     .{
         .name = "memory_extensions",
-        .description = "Live memory extension directories under ~/.codex/memories_extensions",
+        .description = "Live memory extension directories under ~/.codex/memories/extensions",
         .fields = &.{ "extension_name", "instructions_path", "has_instructions", "modified_at", "size_bytes" },
     },
     .{
