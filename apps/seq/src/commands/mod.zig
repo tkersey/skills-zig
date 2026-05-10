@@ -192,6 +192,11 @@ pub const dataset_meta = [_]DatasetMeta{
         .fields = &.{ "parent_session_id", "worker_session_id", "parent_path", "worker_path", "call_id", "agent_nickname", "agent_role", "model", "reasoning_effort", "spawned_at", "prompt_preview", "worker_status" },
     },
     .{
+        .name = "workflow_signals",
+        .description = "Session-derived workflow, skill, agent, tool, and outcome signals with source provenance",
+        .fields = &.{ "path", "session_id", "timestamp", "role", "source_kind", "signal_kind", "name", "outcome_kind", "snippet", "contamination_flags" },
+    },
+    .{
         .name = "memory_files",
         .description = "File-based memories under ~/.codex/memories",
         .fields = &.{ "path", "relative_path", "name", "category", "extension", "size_bytes", "modified_at", "preview" },
@@ -371,6 +376,7 @@ const Options = struct {
     dataset: ?[]const u8 = null,
     spec_text: ?[]const u8 = null,
     skill: ?[]const u8 = null,
+    workflow: ?[]const u8 = null,
     history_text: ?[]const u8 = null,
     bucket: ?[]const u8 = null,
     prompt: ?[]const u8 = null,
@@ -463,6 +469,7 @@ pub fn run(
         .datasets => try cmdDatasets(allocator, opts),
         .dataset_schema => try cmdDatasetSchema(allocator, opts),
         .query => try cmdQuery(allocator, sessions_root, opts),
+        .workflow_audit => try cmdWorkflowAudit(allocator, sessions_root, opts),
         .session_tooling => try cmdSessionTooling(allocator, sessions_root, opts),
         .query_diagnose => try cmdQueryDiagnose(allocator, sessions_root, opts),
         .memory_provenance => try cmdMemoryProvenance(allocator, opts),
@@ -594,6 +601,9 @@ fn printCommandHelp(cmd: lib.Command) !void {
         .query =>
         \\usage: seq query --spec <json|@path>
         ,
+        .workflow_audit =>
+        \\usage: seq workflow-audit --workflow <name> [--mode summary|signals|outcomes|sessions|report] [--since <iso>] [--until <iso>] [--workdir <path>] [--limit N] [--format table|json|markdown]
+        ,
         .session_tooling =>
         \\usage: seq session-tooling [--session-id <id>|--path <jsonl>] [--since <iso>] [--until <iso>] [--group-by executable|command|tool] [--summary] [--limit N] [--format table|json|csv|jsonl]
         ,
@@ -678,6 +688,9 @@ fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
         .session_graph => {
             if (fmt == .csv or fmt == .markdown) return error.InvalidFormatForCommand;
         },
+        .workflow_audit => {
+            if (fmt == .csv or fmt == .jsonl or fmt == .dot) return error.InvalidFormatForCommand;
+        },
         .sessions, .turns, .tool_lifecycle, .tail => {
             if (fmt == .csv or fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
@@ -722,6 +735,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .skill_trend, .skill_report, .skill_audit, .occurrence_export, .skill_blocks => true,
         else => false,
     };
+    const supports_workflow = cmd == .workflow_audit;
     const supports_history = cmd == .skill_blocks;
     const supports_bucket = cmd == .skill_trend;
     const supports_prompt = cmd == .find_session;
@@ -746,11 +760,11 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_role = cmd == .opencode_events;
     const supports_tool = cmd == .opencode_events or cmd == .artifact_search or cmd == .tool_audit;
     const supports_executable = cmd == .tool_audit;
-    const supports_workdir = cmd == .artifact_search or cmd == .tool_audit or cmd == .workdir_report;
+    const supports_workdir = cmd == .artifact_search or cmd == .tool_audit or cmd == .workdir_report or cmd == .workflow_audit;
     const supports_repo = cmd == .plan_search or cmd == .sessions;
     const supports_status = cmd == .opencode_events or cmd == .turns;
     const supports_mode = switch (cmd) {
-        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .tool_audit, .memory_inventory, .workdir_report => true,
+        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .tool_audit, .memory_inventory, .workdir_report, .workflow_audit => true,
         else => false,
     };
     const supports_kind = cmd == .artifact_search;
@@ -782,6 +796,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .token_usage,
         .session_tooling,
         .query_diagnose,
+        .workflow_audit,
         .memory_map,
         .memory_history,
         .skill_blocks,
@@ -812,6 +827,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .token_usage,
         .session_tooling,
         .query_diagnose,
+        .workflow_audit,
         .memory_map,
         .memory_history,
         .skill_blocks,
@@ -886,6 +902,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.threshold_ms != 10_000, supports_threshold_ms, "--threshold-ms", cmd);
     try ensureOptionAllowed(!opts.strict_hang, supports_strict_hang, "--no-strict-hang", cmd);
     try ensureOptionAllowed(opts.skill != null, supports_skill, "--skill", cmd);
+    try ensureOptionAllowed(opts.workflow != null, supports_workflow, "--workflow", cmd);
     try ensureOptionAllowed(opts.history_text != null, supports_history, "--history", cmd);
     try ensureOptionAllowed(opts.bucket != null, supports_bucket, "--bucket", cmd);
     try ensureOptionAllowed(opts.prompt != null, supports_prompt, "--prompt", cmd);
@@ -970,6 +987,11 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
             if (!isValidWorkdirReportMode(text)) return error.InvalidModeArg;
         }
     }
+    if (cmd == .workflow_audit) {
+        if (opts.mode) |text| {
+            if (!isValidWorkflowAuditMode(text)) return error.InvalidModeArg;
+        }
+    }
     if (opts.events_text) |text| _ = try parseTailEventMask(text);
 }
 
@@ -1038,6 +1060,14 @@ fn isValidMemoryInventoryMode(text: []const u8) bool {
 fn isValidWorkdirReportMode(text: []const u8) bool {
     return std.mem.eql(u8, text, "summary") or
         std.mem.eql(u8, text, "sessions");
+}
+
+fn isValidWorkflowAuditMode(text: []const u8) bool {
+    return std.mem.eql(u8, text, "summary") or
+        std.mem.eql(u8, text, "signals") or
+        std.mem.eql(u8, text, "outcomes") or
+        std.mem.eql(u8, text, "sessions") or
+        std.mem.eql(u8, text, "report");
 }
 
 fn parseTailEventMask(raw_opt: ?[]const u8) !TailEventMask {
@@ -1861,6 +1891,336 @@ fn cmdQuery(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Optio
     }
     if (fmt == .dot or fmt == .markdown) return error.InvalidFormatForCommand;
     try output.writeOutput(allocator, fmt, result.rows.items, cols_opt, opts.out_path);
+}
+
+const workflow_audit_summary_columns = [_][]const u8{ "source_kind", "signal_kind", "name", "outcome_kind", "mentions", "sessions" };
+const workflow_audit_signal_columns = [_][]const u8{ "timestamp", "path", "source_kind", "signal_kind", "name", "outcome_kind", "snippet", "contamination_flags" };
+const workflow_audit_outcome_columns = [_][]const u8{ "outcome_kind", "mentions", "sessions" };
+const workflow_audit_session_columns = [_][]const u8{ "path", "signals", "first_seen", "last_seen" };
+
+const StringSet = struct {
+    allocator: std.mem.Allocator,
+    map: std.StringHashMap(void),
+
+    fn init(allocator: std.mem.Allocator) StringSet {
+        return .{
+            .allocator = allocator,
+            .map = std.StringHashMap(void).init(allocator),
+        };
+    }
+
+    fn deinit(self: *StringSet) void {
+        var it = self.map.keyIterator();
+        while (it.next()) |key| self.allocator.free(key.*);
+        self.map.deinit();
+    }
+
+    fn put(self: *StringSet, text: []const u8) !void {
+        if (self.map.contains(text)) return;
+        const copy = try self.allocator.dupe(u8, text);
+        errdefer self.allocator.free(copy);
+        try self.map.put(copy, {});
+    }
+
+    fn contains(self: *const StringSet, text: []const u8) bool {
+        return self.map.contains(text);
+    }
+
+    fn count(self: *const StringSet) usize {
+        return self.map.count();
+    }
+};
+
+fn cmdWorkflowAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    const workflow = opts.workflow orelse return error.MissingWorkflowArg;
+    const mode = opts.mode orelse "summary";
+    const fmt = if (opts.format_set)
+        opts.format
+    else if (std.mem.eql(u8, mode, "report"))
+        output.Format.markdown
+    else
+        output.Format.table;
+
+    var rows = try collectWorkflowAuditRows(allocator, sessions_root, opts);
+    defer deinitQueryRows(allocator, &rows);
+
+    if (fmt == .markdown) {
+        try writeWorkflowAuditMarkdown(allocator, workflow, rows.items, opts.out_path);
+        return;
+    }
+
+    const query_spec = try workflowAuditQueryForMode(mode, opts.limit);
+    var result = try query.execute(allocator, rows.items, query_spec);
+    defer result.deinit(allocator);
+
+    try output.writeOutput(allocator, fmt, result.rows.items, workflowAuditColumnsForMode(mode), opts.out_path);
+}
+
+fn workflowAuditQueryForMode(mode: []const u8, limit: usize) !spec.QuerySpec {
+    if (std.mem.eql(u8, mode, "summary")) {
+        return .{
+            .group_by = workflow_audit_summary_columns[0..4],
+            .metrics = &.{
+                .{ .op = .count, .alias = "mentions" },
+                .{ .op = .count_distinct, .field = "path", .alias = "sessions" },
+            },
+            .sort = &.{.{ .field = "mentions", .descending = true }},
+            .limit = if (limit > 0) limit else 50,
+        };
+    }
+
+    if (std.mem.eql(u8, mode, "signals")) {
+        return .{
+            .select = workflow_audit_signal_columns[0..],
+            .sort = &.{.{ .field = "timestamp", .descending = true }},
+            .limit = if (limit > 0) limit else 100,
+        };
+    }
+
+    if (std.mem.eql(u8, mode, "outcomes")) {
+        return .{
+            .where = &.{.{
+                .field = "signal_kind",
+                .op = .eq,
+                .value = .{ .scalar = .{ .string = "outcome" } },
+            }},
+            .group_by = &.{"outcome_kind"},
+            .metrics = &.{
+                .{ .op = .count, .alias = "mentions" },
+                .{ .op = .count_distinct, .field = "path", .alias = "sessions" },
+            },
+            .sort = &.{.{ .field = "mentions", .descending = true }},
+            .limit = if (limit > 0) limit else 20,
+        };
+    }
+
+    if (std.mem.eql(u8, mode, "sessions")) {
+        return .{
+            .group_by = &.{"path"},
+            .metrics = &.{
+                .{ .op = .count, .alias = "signals" },
+                .{ .op = .min, .field = "timestamp", .alias = "first_seen" },
+                .{ .op = .max, .field = "timestamp", .alias = "last_seen" },
+            },
+            .sort = &.{.{ .field = "signals", .descending = true }},
+            .limit = if (limit > 0) limit else 50,
+        };
+    }
+
+    if (std.mem.eql(u8, mode, "report")) {
+        return .{
+            .select = workflow_audit_signal_columns[0..],
+            .sort = &.{.{ .field = "timestamp", .descending = true }},
+            .limit = if (limit > 0) limit else 100,
+        };
+    }
+
+    return error.InvalidModeArg;
+}
+
+fn workflowAuditColumnsForMode(mode: []const u8) ?[]const []const u8 {
+    if (std.mem.eql(u8, mode, "summary")) return workflow_audit_summary_columns[0..];
+    if (std.mem.eql(u8, mode, "signals")) return workflow_audit_signal_columns[0..];
+    if (std.mem.eql(u8, mode, "outcomes")) return workflow_audit_outcome_columns[0..];
+    if (std.mem.eql(u8, mode, "sessions")) return workflow_audit_session_columns[0..];
+    if (std.mem.eql(u8, mode, "report")) return workflow_audit_signal_columns[0..];
+    return null;
+}
+
+fn collectWorkflowAuditRows(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    opts: Options,
+) !std.ArrayList(query.Row) {
+    const workflow = opts.workflow orelse return error.MissingWorkflowArg;
+
+    var where: std.ArrayList(spec.WhereClause) = .empty;
+    defer where.deinit(allocator);
+    try appendSessionTimeBounds(allocator, &where, opts);
+
+    const signal_query = spec.QuerySpec{ .where = where.items };
+    var collected = try collectDatasetRowsForSpec(allocator, "workflow_signals", sessions_root, signal_query);
+    defer deinitQueryRows(allocator, &collected);
+
+    var filtered = try query.execute(allocator, collected.items, signal_query);
+    defer filtered.deinit(allocator);
+
+    var workdir_paths = StringSet.init(allocator);
+    var has_workdir_filter = false;
+    defer if (has_workdir_filter) workdir_paths.deinit();
+    if (opts.workdir_text != null) {
+        has_workdir_filter = true;
+        try collectWorkdirSessionPaths(allocator, sessions_root, opts, &workdir_paths);
+    }
+
+    var cohort_paths = StringSet.init(allocator);
+    defer cohort_paths.deinit();
+    for (filtered.rows.items) |row| {
+        const path = scalarString(row.valueOrNull("path")) orelse continue;
+        if (has_workdir_filter and !workdir_paths.contains(path)) continue;
+        if (!isWorkflowCohortSignal(row, workflow)) continue;
+        try cohort_paths.put(path);
+    }
+
+    var out: std.ArrayList(query.Row) = .empty;
+    errdefer deinitQueryRows(allocator, &out);
+    for (filtered.rows.items) |row| {
+        const path = scalarString(row.valueOrNull("path")) orelse continue;
+        if (!cohort_paths.contains(path)) continue;
+        if (has_workdir_filter and !workdir_paths.contains(path)) continue;
+        try out.append(allocator, try row.cloneAll(allocator));
+    }
+
+    return out;
+}
+
+fn collectWorkdirSessionPaths(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    opts: Options,
+    out: *StringSet,
+) !void {
+    var where: std.ArrayList(spec.WhereClause) = .empty;
+    defer where.deinit(allocator);
+
+    if (opts.workdir_text) |value| try where.append(allocator, .{
+        .field = "cwd",
+        .op = .eq,
+        .value = .{ .scalar = .{ .string = value } },
+    });
+    if (opts.since) |value| try where.append(allocator, .{
+        .field = "start_time",
+        .op = .gte,
+        .value = .{ .scalar = .{ .string = value } },
+    });
+    if (opts.until) |value| try where.append(allocator, .{
+        .field = "start_time",
+        .op = .lte,
+        .value = .{ .scalar = .{ .string = value } },
+    });
+
+    const session_query = spec.QuerySpec{ .where = where.items };
+    var collected = try collectDatasetRowsForSpec(allocator, "sessions", sessions_root, session_query);
+    defer deinitQueryRows(allocator, &collected);
+
+    var filtered = try query.execute(allocator, collected.items, session_query);
+    defer filtered.deinit(allocator);
+
+    for (filtered.rows.items) |row| {
+        const path = scalarString(row.valueOrNull("path")) orelse continue;
+        try out.put(path);
+    }
+}
+
+fn isWorkflowCohortSignal(row: query.Row, workflow: []const u8) bool {
+    const name = scalarString(row.valueOrNull("name")) orelse return false;
+    if (!std.mem.eql(u8, name, workflow)) return false;
+    const signal_kind = scalarString(row.valueOrNull("signal_kind")) orelse return false;
+    return std.mem.eql(u8, signal_kind, "workflow_mention") or
+        std.mem.eql(u8, signal_kind, "skill_mention");
+}
+
+fn writeWorkflowAuditMarkdown(
+    allocator: std.mem.Allocator,
+    workflow: []const u8,
+    rows: []const query.Row,
+    out_path: ?[]const u8,
+) !void {
+    var sessions = StringSet.init(allocator);
+    defer sessions.deinit();
+    for (rows) |row| {
+        if (scalarString(row.valueOrNull("path"))) |path| try sessions.put(path);
+    }
+
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+
+    try writer.print("# seq workflow-audit: {s}\n\n", .{workflow});
+    try writer.print("- cohort_sessions: {d}\n", .{sessions.count()});
+    try writer.print("- cohort_signals: {d}\n\n", .{rows.len});
+
+    try writer.writeAll("## Signal Summary\n\n");
+    try writeWorkflowAuditMarkdownSection(allocator, writer, rows, "summary");
+
+    try writer.writeAll("\n## Outcomes\n\n");
+    try writeWorkflowAuditMarkdownSection(allocator, writer, rows, "outcomes");
+
+    try writer.writeAll("\n## Sessions\n\n");
+    try writeWorkflowAuditMarkdownSection(allocator, writer, rows, "sessions");
+
+    const rendered = try writer_alloc.toOwnedSlice();
+    defer allocator.free(rendered);
+    try writeTextOutput(rendered, out_path);
+}
+
+fn writeWorkflowAuditMarkdownSection(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    rows: []const query.Row,
+    mode: []const u8,
+) !void {
+    const query_spec = try workflowAuditQueryForMode(mode, 10);
+    var result = try query.execute(allocator, rows, query_spec);
+    defer result.deinit(allocator);
+
+    try writeMarkdownTable(writer, result.rows.items, workflowAuditColumnsForMode(mode) orelse &.{});
+}
+
+fn writeMarkdownTable(writer: anytype, rows: []const query.Row, columns: []const []const u8) !void {
+    if (columns.len == 0) {
+        try writer.writeAll("(no columns)\n");
+        return;
+    }
+    if (rows.len == 0) {
+        try writer.writeAll("(no results)\n");
+        return;
+    }
+
+    try writer.writeAll("|");
+    for (columns) |column| {
+        try writer.writeByte(' ');
+        try writeEscapedMarkdownCell(writer, column);
+        try writer.writeAll(" |");
+    }
+    try writer.writeByte('\n');
+
+    try writer.writeAll("|");
+    for (columns) |_| try writer.writeAll(" --- |");
+    try writer.writeByte('\n');
+
+    for (rows) |row| {
+        try writer.writeAll("|");
+        for (columns) |column| {
+            try writer.writeByte(' ');
+            try writeMarkdownScalar(writer, row.valueOrNull(column));
+            try writer.writeAll(" |");
+        }
+        try writer.writeByte('\n');
+    }
+}
+
+fn writeMarkdownScalar(writer: anytype, value: spec.Scalar) !void {
+    switch (value) {
+        .null => {},
+        .bool => |flag| try writer.print("{}", .{flag}),
+        .int => |number| try writer.print("{d}", .{number}),
+        .float => |number| try writer.print("{d}", .{number}),
+        .string => |text| try writeEscapedMarkdownCell(writer, text),
+    }
+}
+
+fn writeEscapedMarkdownCell(writer: anytype, text: []const u8) !void {
+    for (text) |ch| {
+        switch (ch) {
+            '|', '\\' => {
+                try writer.writeByte('\\');
+                try writer.writeByte(ch);
+            },
+            '\n', '\r' => try writer.writeByte(' '),
+            else => try writer.writeByte(ch),
+        }
+    }
 }
 
 const QueryLiftCommands = struct {
@@ -7036,7 +7396,8 @@ fn isSessionFileDataset(dataset_name: []const u8) bool {
         std.mem.eql(u8, dataset_name, "sessions") or
         std.mem.eql(u8, dataset_name, "turns") or
         std.mem.eql(u8, dataset_name, "tool_lifecycle") or
-        std.mem.eql(u8, dataset_name, "session_graph_edges");
+        std.mem.eql(u8, dataset_name, "session_graph_edges") or
+        std.mem.eql(u8, dataset_name, "workflow_signals");
 }
 
 fn isValidDayLiteral(text: []const u8) bool {
@@ -7325,6 +7686,25 @@ fn collectDatasetRowsForSpec(
     sessions_root: []const u8,
     query_spec: spec.QuerySpec,
 ) !std.ArrayList(query.Row) {
+    if (query_spec.joins.len > 0) {
+        var rows = try collectDatasetRows(allocator, dataset_name, sessions_root, query_spec.params, query_spec.where);
+        errdefer deinitQueryRows(allocator, &rows);
+
+        for (query_spec.joins) |join_spec| {
+            var right_rows = try collectRowsForJoin(allocator, rows.items, join_spec, sessions_root);
+            defer deinitQueryRows(allocator, &right_rows);
+
+            var filtered_right = try query.execute(allocator, right_rows.items, .{ .where = join_spec.where });
+            defer filtered_right.deinit(allocator);
+
+            const joined = try joinQueryRows(allocator, rows.items, filtered_right.rows.items, join_spec);
+            deinitQueryRows(allocator, &rows);
+            rows = joined;
+        }
+
+        return rows;
+    }
+
     if (std.mem.eql(u8, dataset_name, "opencode_prompts")) {
         return collectOpencodePromptRowsFromSpec(allocator, query_spec);
     }
@@ -7338,6 +7718,141 @@ fn collectDatasetRowsForSpec(
         return collectOpencodeSessionRowsFromSpec(allocator, query_spec);
     }
     return collectDatasetRows(allocator, dataset_name, sessions_root, query_spec.params, query_spec.where);
+}
+
+fn collectRowsForJoin(
+    allocator: std.mem.Allocator,
+    left_rows: []const query.Row,
+    join_spec: spec.JoinSpec,
+    sessions_root: []const u8,
+) !std.ArrayList(query.Row) {
+    if (canCollectJoinByLeftPaths(join_spec)) {
+        return collectJoinRowsByLeftPaths(allocator, left_rows, join_spec, sessions_root);
+    }
+    return collectDatasetRows(allocator, join_spec.dataset, sessions_root, join_spec.params, join_spec.where);
+}
+
+fn canCollectJoinByLeftPaths(join_spec: spec.JoinSpec) bool {
+    if (!std.mem.eql(u8, join_spec.dataset, "sessions")) return false;
+    if (!std.mem.eql(u8, join_spec.right, "path")) return false;
+    for (join_spec.params) |param| {
+        if (std.mem.eql(u8, param.key, "path") or
+            std.mem.eql(u8, param.key, "session_id") or
+            std.mem.eql(u8, param.key, "root"))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn collectJoinRowsByLeftPaths(
+    allocator: std.mem.Allocator,
+    left_rows: []const query.Row,
+    join_spec: spec.JoinSpec,
+    sessions_root: []const u8,
+) !std.ArrayList(query.Row) {
+    var paths = StringSet.init(allocator);
+    defer paths.deinit();
+    for (left_rows) |row| {
+        const path = scalarString(row.valueOrNull(join_spec.left)) orelse continue;
+        if (path.len > 0) try paths.put(path);
+    }
+
+    var out: std.ArrayList(query.Row) = .empty;
+    errdefer deinitQueryRows(allocator, &out);
+
+    var it = paths.map.keyIterator();
+    while (it.next()) |path| {
+        var params: std.ArrayList(spec.ParamSpec) = .empty;
+        defer params.deinit(allocator);
+        try params.appendSlice(allocator, join_spec.params);
+        try params.append(allocator, .{ .key = "path", .value = .{ .string = path.* } });
+
+        var collected = try collectDatasetRows(allocator, join_spec.dataset, sessions_root, params.items, join_spec.where);
+        defer deinitQueryRows(allocator, &collected);
+        for (collected.items) |row| {
+            try out.append(allocator, try row.cloneAll(allocator));
+        }
+    }
+
+    return out;
+}
+
+fn joinQueryRows(
+    allocator: std.mem.Allocator,
+    left_rows: []const query.Row,
+    right_rows: []const query.Row,
+    join_spec: spec.JoinSpec,
+) !std.ArrayList(query.Row) {
+    var right_index = std.StringHashMap(std.ArrayList(usize)).init(allocator);
+    defer {
+        var it = right_index.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(allocator);
+        }
+        right_index.deinit();
+    }
+
+    for (right_rows, 0..) |row, idx| {
+        const key = try scalarJoinKey(allocator, row.valueOrNull(join_spec.right));
+        const gop = try right_index.getOrPut(key);
+        if (gop.found_existing) {
+            allocator.free(key);
+        } else {
+            gop.value_ptr.* = .empty;
+        }
+        try gop.value_ptr.append(allocator, idx);
+    }
+
+    var out: std.ArrayList(query.Row) = .empty;
+    errdefer deinitQueryRows(allocator, &out);
+
+    for (left_rows) |left| {
+        const key = try scalarJoinKey(allocator, left.valueOrNull(join_spec.left));
+        defer allocator.free(key);
+
+        if (right_index.get(key)) |matches| {
+            for (matches.items) |right_idx| {
+                var joined = try left.cloneAll(allocator);
+                errdefer joined.deinit();
+                try appendPrefixedFields(allocator, &joined, right_rows[right_idx], join_spec.prefix orelse join_spec.dataset);
+                try out.append(allocator, joined);
+            }
+            continue;
+        }
+
+        if (join_spec.type == .left) {
+            try out.append(allocator, try left.cloneAll(allocator));
+        }
+    }
+
+    return out;
+}
+
+fn appendPrefixedFields(
+    allocator: std.mem.Allocator,
+    row: *query.Row,
+    source: query.Row,
+    prefix: []const u8,
+) !void {
+    var it = source.fields.iterator();
+    while (it.next()) |entry| {
+        const key = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ prefix, entry.key_ptr.* });
+        defer allocator.free(key);
+        try row.putOwnedKey(key, entry.value_ptr.*);
+    }
+}
+
+fn scalarJoinKey(allocator: std.mem.Allocator, value: spec.Scalar) ![]u8 {
+    return switch (value) {
+        .null => allocator.dupe(u8, "n:"),
+        .bool => |flag| std.fmt.allocPrint(allocator, "b:{}", .{flag}),
+        .int => |number| std.fmt.allocPrint(allocator, "i:{d}", .{number}),
+        .float => |number| std.fmt.allocPrint(allocator, "f:{d}", .{number}),
+        .string => |text| std.fmt.allocPrint(allocator, "s:{s}", .{text}),
+    };
 }
 
 fn collectDatasetRows(
@@ -7375,6 +7890,8 @@ fn collectDatasetRows(
     {
         const derived = try collectTraceDatasetRowsFromParams(allocator, dataset_name, sessions_root, query_params);
         rows = derived;
+    } else if (std.mem.eql(u8, dataset_name, "workflow_signals")) {
+        try collectWorkflowSignalRows(allocator, sessions_root, day_filter, &rows);
     } else if (std.mem.eql(u8, dataset_name, "memory_files")) {
         try collectMemoryFilesRows(allocator, query_params, &rows);
     } else if (std.mem.eql(u8, dataset_name, "memory_blocks")) {
@@ -7465,6 +7982,220 @@ fn collectSkillMentionsRows(
             try out_rows.append(allocator, qrow);
         }
     }
+}
+
+fn collectWorkflowSignalRows(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    day_filter: ?SessionDayPathFilter,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    var paths = try collectJsonlPaths(allocator, sessions_root, day_filter);
+    defer freePathList(allocator, &paths);
+
+    for (paths.items) |path| {
+        const content = try readFileAllocOrSkip(allocator, path);
+        if (content == null) continue;
+        defer allocator.free(content.?);
+
+        const messages = try datasets.messages.parseJsonl(allocator, path, content.?, .{
+            .strip_skill_blocks = true,
+            .dedupe_by_role_and_text = true,
+        });
+        defer datasets.messages.freeRows(allocator, messages);
+
+        for (messages) |row| {
+            try appendDollarWorkflowSignals(allocator, out_rows, row);
+            try appendOutcomeSignals(allocator, out_rows, row);
+        }
+
+        const mentions = try datasets.skill_mentions.parseJsonl(allocator, path, content.?, .{
+            .include_blocks = false,
+            .include_dollars = true,
+            .skip_dollar_in_skill_block = true,
+            .dedupe_adjacent = true,
+        });
+        defer datasets.skill_mentions.freeRows(allocator, mentions);
+
+        for (mentions) |row| {
+            try appendWorkflowSignalRow(
+                allocator,
+                out_rows,
+                row.path,
+                null,
+                row.timestamp,
+                row.role,
+                sourceKindForRole(row.role),
+                "skill_mention",
+                row.skill,
+                null,
+                row.snippet,
+                "cleaned",
+            );
+        }
+    }
+
+    var tool_rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &tool_rows);
+    try collectToolInvocationRows(allocator, sessions_root, day_filter, &tool_rows);
+    for (tool_rows.items) |row| {
+        const tool_name = scalarString(row.valueOrNull("tool_name")) orelse continue;
+        try appendWorkflowSignalRow(
+            allocator,
+            out_rows,
+            scalarString(row.valueOrNull("path")) orelse "",
+            scalarString(row.valueOrNull("session_id")),
+            scalarString(row.valueOrNull("timestamp")),
+            null,
+            "tool_trace",
+            "tool_call",
+            tool_name,
+            null,
+            scalarString(row.valueOrNull("command_text")) orelse tool_name,
+            "none",
+        );
+    }
+
+    for (paths.items) |path| {
+        const graph_params = [_]spec.ParamSpec{.{ .key = "path", .value = .{ .string = path } }};
+        var graph_rows = try collectTraceDatasetRowsFromParams(allocator, "session_graph_edges", sessions_root, graph_params[0..]);
+        defer deinitQueryRows(allocator, &graph_rows);
+        for (graph_rows.items) |row| {
+            const role = scalarString(row.valueOrNull("agent_role")) orelse continue;
+            try appendWorkflowSignalRow(
+                allocator,
+                out_rows,
+                scalarString(row.valueOrNull("parent_path")) orelse "",
+                scalarString(row.valueOrNull("parent_session_id")),
+                scalarString(row.valueOrNull("spawned_at")),
+                null,
+                "session_graph",
+                "agent_role",
+                role,
+                null,
+                scalarString(row.valueOrNull("prompt_preview")) orelse role,
+                "none",
+            );
+        }
+    }
+}
+
+fn appendDollarWorkflowSignals(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    row: datasets.messages.MessageRow,
+) !void {
+    var pos: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, row.text, pos, '$')) |dollar| {
+        var end = dollar + 1;
+        while (end < row.text.len and isSignalNameChar(row.text[end])) : (end += 1) {}
+        defer pos = end;
+        if (end == dollar + 1) continue;
+        const name = row.text[dollar + 1 .. end];
+        try appendWorkflowSignalRow(
+            allocator,
+            out_rows,
+            row.path,
+            null,
+            row.timestamp,
+            row.role,
+            sourceKindForRole(row.role),
+            "workflow_mention",
+            name,
+            null,
+            row.text,
+            "cleaned",
+        );
+    }
+}
+
+fn appendOutcomeSignals(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    row: datasets.messages.MessageRow,
+) !void {
+    const outcomes = [_]struct {
+        kind: []const u8,
+        needles: []const []const u8,
+    }{
+        .{ .kind = "test", .needles = &.{ "zig build test", "tests pass", "test passed" } },
+        .{ .kind = "proof", .needles = &.{ "proof", "validated", "validation" } },
+        .{ .kind = "commit", .needles = &.{ "commit ", "committed", "pushed" } },
+        .{ .kind = "pr", .needles = &.{ "PR #", "pull request", "gh pr" } },
+        .{ .kind = "blocked", .needles = &.{ "blocked", "failed", "error:" } },
+        .{ .kind = "closure", .needles = &.{ "closure", "fixed point", "fixed-point" } },
+    };
+
+    for (outcomes) |outcome| {
+        var matched = false;
+        for (outcome.needles) |needle| {
+            if (containsIgnoreCaseAscii(row.text, needle)) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) continue;
+        try appendWorkflowSignalRow(
+            allocator,
+            out_rows,
+            row.path,
+            null,
+            row.timestamp,
+            row.role,
+            sourceKindForRole(row.role),
+            "outcome",
+            outcome.kind,
+            outcome.kind,
+            row.text,
+            "cleaned",
+        );
+    }
+}
+
+fn appendWorkflowSignalRow(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    path: []const u8,
+    session_id: ?[]const u8,
+    timestamp: ?[]const u8,
+    role: ?[]const u8,
+    source_kind: []const u8,
+    signal_kind: []const u8,
+    name: []const u8,
+    outcome_kind: ?[]const u8,
+    snippet: []const u8,
+    contamination_flags: []const u8,
+) !void {
+    var qrow = query.Row.init(allocator);
+    errdefer qrow.deinit();
+    try qrow.putOwnedKey("path", .{ .string = path });
+    try putOptionalString(&qrow, "session_id", session_id);
+    try putOptionalString(&qrow, "timestamp", timestamp);
+    try putOptionalString(&qrow, "role", role);
+    try qrow.putOwnedKey("source_kind", .{ .string = source_kind });
+    try qrow.putOwnedKey("signal_kind", .{ .string = signal_kind });
+    try qrow.putOwnedKey("name", .{ .string = name });
+    try putOptionalString(&qrow, "outcome_kind", outcome_kind);
+    try qrow.putOwnedKey("snippet", .{ .string = snippet[0..@min(snippet.len, 240)] });
+    try qrow.putOwnedKey("contamination_flags", .{ .string = contamination_flags });
+    try out_rows.append(allocator, qrow);
+}
+
+fn sourceKindForRole(role: []const u8) []const u8 {
+    if (std.mem.eql(u8, role, "user")) return "user_prompt";
+    if (std.mem.eql(u8, role, "assistant")) return "assistant_text";
+    return "text";
+}
+
+fn isSignalNameChar(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_';
+}
+
+fn scalarString(value: spec.Scalar) ?[]const u8 {
+    return switch (value) {
+        .string => |text| text,
+        else => null,
+    };
 }
 
 fn collectTokenEventsRows(
@@ -8858,6 +9589,10 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.skill = args[i];
+        } else if (std.mem.eql(u8, arg, "--workflow")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.workflow = args[i];
         } else if (std.mem.eql(u8, arg, "--history")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -9956,6 +10691,120 @@ test "query-lift commands run over session fixtures" {
         const got = try runCommandWithOutput(std.testing.allocator, .workdir_report, &.{ "--root", root_abs, "--workdir", "/repo", "--format", "jsonl" }, output_path);
         defer std.testing.allocator.free(got);
         try std.testing.expect(std.mem.indexOf(u8, got, "\"cwd\":\"/repo\"") != null);
+    }
+}
+
+test "query joins session datasets by path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/02");
+    const session_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-02T10:00:00Z\",\"payload\":{\"id\":\"join-session\",\"cwd\":\"/repo/seq\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-02T10:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"workflow needle for joins\"}]}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "sessions/2026/05/02/rollout-join-session.jsonl",
+        .data = session_content,
+    });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "query-join.jsonl" });
+    defer std.testing.allocator.free(output_path);
+
+    const join_spec =
+        \\{"dataset":"messages","joins":[{"dataset":"sessions","left":"path","right":"path","type":"left","prefix":"session"}],"where":[{"field":"text","op":"contains","value":"workflow needle"}],"select":["role","session.cwd","text"],"format":"jsonl"}
+    ;
+    const got = try runCommandWithOutput(std.testing.allocator, .query, &.{ "--root", root_abs, "--spec", join_spec }, output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"session.cwd\":\"/repo/seq\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "workflow needle for joins") != null);
+}
+
+test "workflow_signals strips skill blocks and preserves source kinds" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/03");
+    const session_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-03T10:00:00Z\",\"payload\":{\"id\":\"signal-session\",\"cwd\":\"/repo/seq\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-03T10:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Use $seq for this audit\\n<skill>\\n<name>fixed-point-driver</name>\\n</skill>\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-03T10:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Validation proof: zig build test passed\"}]}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "sessions/2026/05/03/rollout-signal-session.jsonl",
+        .data = session_content,
+    });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "workflow-signals.jsonl" });
+    defer std.testing.allocator.free(output_path);
+
+    const signal_spec =
+        \\{"dataset":"workflow_signals","select":["source_kind","signal_kind","name","outcome_kind","contamination_flags"],"sort":["signal_kind","name"],"format":"jsonl"}
+    ;
+    const got = try runCommandWithOutput(std.testing.allocator, .query, &.{ "--root", root_abs, "--spec", signal_spec }, output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"source_kind\":\"user_prompt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"signal_kind\":\"workflow_mention\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"name\":\"seq\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"signal_kind\":\"outcome\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"outcome_kind\":\"test\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "fixed-point-driver") == null);
+}
+
+test "workflow-audit reports a workflow cohort without cross-session contamination" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/04");
+    const target_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-04T10:00:00Z\",\"payload\":{\"id\":\"workflow-target\",\"cwd\":\"/repo/target\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-04T10:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Use $fixed-point-driver with $seq\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-04T10:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Validation proof: zig build test passed\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-04T10:00:03Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"exec-1\",\"arguments\":\"{\\\"cmd\\\":\\\"zig build test-seq\\\",\\\"cwd\\\":\\\"/repo/target\\\"}\"}}\n";
+    const other_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-04T11:00:00Z\",\"payload\":{\"id\":\"workflow-other\",\"cwd\":\"/repo/other\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-04T11:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Use $seq only\"}]}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "sessions/2026/05/04/rollout-workflow-target.jsonl",
+        .data = target_content,
+    });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "sessions/2026/05/04/rollout-workflow-other.jsonl",
+        .data = other_content,
+    });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "workflow-audit.out" });
+    defer std.testing.allocator.free(output_path);
+
+    {
+        const got = try runCommandWithOutput(std.testing.allocator, .workflow_audit, &.{ "--root", root_abs, "--workflow", "fixed-point-driver", "--mode", "signals", "--workdir", "/repo/target", "--format", "json" }, output_path);
+        defer std.testing.allocator.free(got);
+        try std.testing.expect(std.mem.indexOf(u8, got, "workflow-target") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "workflow-other") == null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"signal_kind\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"outcome\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"tool_trace\"") != null);
+    }
+
+    {
+        const got = try runCommandWithOutput(std.testing.allocator, .workflow_audit, &.{ "--root", root_abs, "--workflow", "fixed-point-driver", "--mode", "report" }, output_path);
+        defer std.testing.allocator.free(got);
+        try std.testing.expect(std.mem.indexOf(u8, got, "# seq workflow-audit: fixed-point-driver") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "## Signal Summary") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "cohort_sessions: 1") != null);
+    }
+
+    {
+        const got = try runCommandWithOutput(std.testing.allocator, .workflow_audit, &.{ "--root", root_abs, "--workflow", "fixed-point-driver", "--mode", "report", "--format", "json", "--limit", "1" }, output_path);
+        defer std.testing.allocator.free(got);
+        const first_timestamp = std.mem.indexOf(u8, got, "\"timestamp\"") orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.indexOfPos(u8, got, first_timestamp + 1, "\"timestamp\"") == null);
     }
 }
 

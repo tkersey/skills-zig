@@ -92,6 +92,27 @@ pub const SortSpec = struct {
     descending: bool = false,
 };
 
+pub const JoinType = enum {
+    inner,
+    left,
+
+    pub fn parse(text: []const u8) !JoinType {
+        if (std.ascii.eqlIgnoreCase(text, "inner")) return .inner;
+        if (std.ascii.eqlIgnoreCase(text, "left")) return .left;
+        return error.InvalidJoinType;
+    }
+};
+
+pub const JoinSpec = struct {
+    dataset: []const u8,
+    left: []const u8,
+    right: []const u8,
+    type: JoinType = .inner,
+    prefix: ?[]const u8 = null,
+    where: []const WhereClause = &.{},
+    params: []const ParamSpec = &.{},
+};
+
 pub const ParamSpec = struct {
     key: []const u8,
     value: Scalar,
@@ -103,6 +124,7 @@ pub const QuerySpec = struct {
     metrics: []const MetricSpec = &.{},
     select: []const []const u8 = &.{},
     sort: []const SortSpec = &.{},
+    joins: []const JoinSpec = &.{},
     params: []const ParamSpec = &.{},
     limit: usize = 0,
 };
@@ -140,6 +162,7 @@ pub fn parseQuerySpecValue(allocator: std.mem.Allocator, value: std.json.Value) 
     const metrics = try parseMetrics(allocator, root.get("metrics"));
     const select = try parseStringList(allocator, root.get("select"));
     const sort = try parseSort(allocator, root.get("sort"));
+    const joins = try parseJoins(allocator, root.get("joins"));
     const params = try parseParams(allocator, root.get("params"));
     const limit = try parseLimit(root.get("limit"));
 
@@ -149,6 +172,7 @@ pub fn parseQuerySpecValue(allocator: std.mem.Allocator, value: std.json.Value) 
         .metrics = metrics,
         .select = select,
         .sort = sort,
+        .joins = joins,
         .params = params,
         .limit = limit,
     };
@@ -290,6 +314,48 @@ fn parseSortEntry(allocator: std.mem.Allocator, entry: []const u8) !SortSpec {
         .field = try dupString(allocator, field_text),
         .descending = descending,
     };
+}
+
+fn parseJoins(allocator: std.mem.Allocator, value_opt: ?std.json.Value) ![]const JoinSpec {
+    const value = value_opt orelse return &.{};
+    const arr = switch (value) {
+        .array => |items| items,
+        else => return error.InvalidJoins,
+    };
+
+    var out: std.ArrayList(JoinSpec) = .empty;
+    defer out.deinit(allocator);
+
+    for (arr.items) |item| {
+        const obj = switch (item) {
+            .object => |v| v,
+            else => return error.InvalidJoin,
+        };
+
+        const dataset = try dupRequiredString(allocator, obj.get("dataset"), error.InvalidJoinDataset);
+        const left = try dupRequiredString(allocator, obj.get("left"), error.InvalidJoinLeft);
+        const right = try dupRequiredString(allocator, obj.get("right"), error.InvalidJoinRight);
+        const join_type = if (obj.get("type")) |type_val|
+            try JoinType.parse(try asString(type_val, error.InvalidJoinType))
+        else
+            JoinType.inner;
+        const prefix = if (obj.get("prefix")) |prefix_val|
+            try dupString(allocator, try asString(prefix_val, error.InvalidJoinPrefix))
+        else
+            dataset;
+
+        try out.append(allocator, .{
+            .dataset = dataset,
+            .left = left,
+            .right = right,
+            .type = join_type,
+            .prefix = prefix,
+            .where = try parseWhere(allocator, obj.get("where")),
+            .params = try parseParams(allocator, obj.get("params")),
+        });
+    }
+
+    return out.toOwnedSlice(allocator);
 }
 
 fn parseParams(allocator: std.mem.Allocator, value_opt: ?std.json.Value) ![]const ParamSpec {
@@ -459,4 +525,35 @@ test "parse query spec json supports params" {
     try std.testing.expectEqualStrings("~/tmp/mem", memory_root.string);
     try std.testing.expect(include_preview == .bool);
     try std.testing.expect(include_preview.bool);
+}
+
+test "parse query spec json supports joins" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const query = try parseQuerySpecJson(arena.allocator(),
+        \\{
+        \\  "dataset": "messages",
+        \\  "joins": [
+        \\    {
+        \\      "dataset": "sessions",
+        \\      "left": "path",
+        \\      "right": "path",
+        \\      "type": "left",
+        \\      "prefix": "session",
+        \\      "where": [{"field":"cwd","op":"contains","value":"skills-zig"}],
+        \\      "params": {"include_worker": true}
+        \\    }
+        \\  ]
+        \\}
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), query.joins.len);
+    try std.testing.expectEqualStrings("sessions", query.joins[0].dataset);
+    try std.testing.expectEqualStrings("path", query.joins[0].left);
+    try std.testing.expectEqualStrings("path", query.joins[0].right);
+    try std.testing.expectEqual(JoinType.left, query.joins[0].type);
+    try std.testing.expectEqualStrings("session", query.joins[0].prefix.?);
+    try std.testing.expectEqual(@as(usize, 1), query.joins[0].where.len);
+    try std.testing.expectEqual(@as(usize, 1), query.joins[0].params.len);
 }

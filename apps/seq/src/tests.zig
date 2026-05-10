@@ -59,6 +59,7 @@ test "bootstrap parse coverage" {
     try std.testing.expectEqual(lib.Command.datasets, lib.parseCommand("datasets"));
     try std.testing.expectEqual(lib.Command.dataset_schema, lib.parseCommand("dataset-schema"));
     try std.testing.expectEqual(lib.Command.query, lib.parseCommand("query"));
+    try std.testing.expectEqual(lib.Command.workflow_audit, lib.parseCommand("workflow-audit"));
     try std.testing.expectEqual(lib.Command.session_tooling, lib.parseCommand("session-tooling"));
     try std.testing.expectEqual(lib.Command.query_diagnose, lib.parseCommand("query-diagnose"));
     try std.testing.expectEqual(lib.Command.memory_provenance, lib.parseCommand("memory-provenance"));
