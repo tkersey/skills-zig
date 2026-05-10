@@ -13,6 +13,7 @@ on:
 
 env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 permissions:
   contents: write
@@ -29,11 +30,13 @@ jobs:
         include:
           - target: linux-x86_64
             runs_on: ubuntu-latest
+            zig_archive: zig-x86_64-linux-0.16.0.tar.xz
           - target: darwin-arm64
             runs_on: macos-14
+            zig_archive: zig-aarch64-macos-0.16.0.tar.xz
     runs-on: ${{ matrix.runs_on }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: refs/tags/${{ env.RELEASE_TAG }}
       - name: Validate tag matches apps/seq/VERSION
@@ -46,9 +49,14 @@ jobs:
           fi
       - name: Set tarball name
         run: echo "TAR_NAME=${RELEASE_TAG}-${{ matrix.target }}.tar.gz" >> "$GITHUB_ENV"
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
+      - name: Install Zig 0.16.0
+        run: |
+          set -euo pipefail
+          archive="${{ matrix.zig_archive }}"
+          curl -fsSLO "https://ziglang.org/download/0.16.0/${archive}"
+          tar -xf "${archive}"
+          zig_dir="${archive%.tar.xz}"
+          echo "${PWD}/${zig_dir}" >> "$GITHUB_PATH"
       - name: Build seq binary
         working-directory: apps/seq
         run: zig build -Doptimize=ReleaseFast
@@ -58,7 +66,7 @@ jobs:
           cp apps/seq/zig-out/bin/seq dist/seq/seq
           tar -czf "${TAR_NAME}" -C dist/seq seq
       - name: Upload seq workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.TAR_NAME }}
           path: ${{ env.TAR_NAME }}
@@ -68,24 +76,31 @@ jobs:
   publish:
     needs: release
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Download seq release artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ${{ env.RELEASE_TAG }}-*.tar.gz
-          path: release-assets
-          merge-multiple: true
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          gh run download "${{ github.run_id }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir release-assets \
+            --pattern "${RELEASE_TAG}-*.tar.gz"
       - name: Verify seq artifact set
         run: |
           set -euo pipefail
-          count="$(find release-assets -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d '[:space:]')"
+          count="$(find release-assets -type f -name '*.tar.gz' | wc -l | tr -d '[:space:]')"
           if [ "${count}" -ne 2 ]; then
             echo "Expected 2 release archives, got ${count}" >&2
             exit 1
           fi
       - name: Publish seq release assets
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          fail_on_unmatched_files: true
-          files: release-assets/*.tar.gz
+        run: |
+          set -euo pipefail
+          mapfile -d '' assets < <(find release-assets -type f -name '*.tar.gz' -print0 | sort -z)
+          if gh release view "${RELEASE_TAG}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "${RELEASE_TAG}" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --verify-tag --title "${RELEASE_TAG}"
+          fi
