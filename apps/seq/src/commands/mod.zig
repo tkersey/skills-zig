@@ -376,7 +376,6 @@ const Options = struct {
     dataset: ?[]const u8 = null,
     spec_text: ?[]const u8 = null,
     skill: ?[]const u8 = null,
-    workflow: ?[]const u8 = null,
     history_text: ?[]const u8 = null,
     bucket: ?[]const u8 = null,
     prompt: ?[]const u8 = null,
@@ -426,6 +425,7 @@ const Options = struct {
     threshold_ms: i64 = 10_000,
     poll_ms: i64 = 500,
     debounce_ms: i64 = 300,
+    workflow: ?[]const u8 = null,
 };
 
 pub fn run(
