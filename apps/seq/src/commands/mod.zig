@@ -703,14 +703,6 @@ fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
 }
 
 fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
-    const supports_path = switch (cmd) {
-        .artifact_search, .orchestration_concurrency, .plan_search, .reply_latency, .session_prompts, .session_tooling, .query_diagnose, .skill_blocks, .token_usage, .turns, .session_detail, .tool_lifecycle, .session_graph, .tail => true,
-        else => false,
-    };
-    const supports_session_id = switch (cmd) {
-        .artifact_search, .orchestration_concurrency, .plan_search, .reply_latency, .session_prompts, .session_tooling, .skill_blocks, .token_usage, .turns, .session_detail, .tool_lifecycle, .session_graph, .tail => true,
-        else => false,
-    };
     const supports_current = cmd == .session_prompts or cmd == .reply_latency or cmd == .skill_blocks or cmd == .tail;
     const supports_roles_csv = cmd == .session_prompts or cmd == .artifact_search or cmd == .skill_audit or cmd == .message_search;
     const supports_strip_skill_blocks = cmd == .session_prompts or cmd == .artifact_search;
@@ -881,12 +873,9 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_thread_id = cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history;
     const supports_rollout_summary_file = cmd == .memory_provenance;
     const supports_trace = cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history;
-    const supports_state_db_path = cmd == .memory_provenance or cmd == .memory_history or cmd == .memory_inventory;
-    const supports_memory_root = cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history or cmd == .memory_inventory;
-    const supports_extensions_root = cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history or cmd == .memory_inventory;
 
-    try ensureOptionAllowed(opts.path != null, supports_path, "--path", cmd);
-    try ensureOptionAllowed(opts.session_id != null, supports_session_id, "--session-id", cmd);
+    try ensureOptionAllowed(opts.path != null, commandSupportsPath(cmd), "--path", cmd);
+    try ensureOptionAllowed(opts.session_id != null, commandSupportsSessionId(cmd), "--session-id", cmd);
     try ensureOptionAllowed(opts.current, supports_current, "--current", cmd);
     try ensureOptionAllowed(opts.roles_csv != null, supports_roles_csv, "--roles", cmd);
     try ensureOptionAllowed(opts.strip_skill_blocks, supports_strip_skill_blocks, "--strip-skill-blocks", cmd);
@@ -951,9 +940,9 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.thread_id != null, supports_thread_id, "--thread-id", cmd);
     try ensureOptionAllowed(opts.rollout_summary_file != null, supports_rollout_summary_file, "--rollout-summary-file", cmd);
     try ensureOptionAllowed(opts.trace_text != null, supports_trace, "--trace", cmd);
-    try ensureOptionAllowed(opts.state_db_path != null, supports_state_db_path, "--state-db-path", cmd);
-    try ensureOptionAllowed(opts.memory_root_text != null, supports_memory_root, "--memory-root", cmd);
-    try ensureOptionAllowed(opts.extensions_root_text != null, supports_extensions_root, "--extensions-root", cmd);
+    try ensureOptionAllowed(opts.state_db_path != null, commandSupportsStateDbPath(cmd), "--state-db-path", cmd);
+    try ensureOptionAllowed(opts.memory_root_text != null, commandSupportsMemoryRoot(cmd), "--memory-root", cmd);
+    try ensureOptionAllowed(opts.extensions_root_text != null, commandSupportsExtensionsRoot(cmd), "--extensions-root", cmd);
 
     if (opts.ongoing and opts.completed) return error.InvalidModeArg;
     if (opts.worker_kind_text) |text| {
@@ -993,6 +982,59 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         }
     }
     if (opts.events_text) |text| _ = try parseTailEventMask(text);
+}
+
+fn commandSupportsPath(cmd: lib.Command) bool {
+    return switch (cmd) {
+        .artifact_search,
+        .orchestration_concurrency,
+        .plan_search,
+        .reply_latency,
+        .session_prompts,
+        .session_tooling,
+        .query_diagnose,
+        .skill_blocks,
+        .token_usage,
+        .turns,
+        .session_detail,
+        .tool_lifecycle,
+        .session_graph,
+        .tail,
+        => true,
+        else => false,
+    };
+}
+
+fn commandSupportsSessionId(cmd: lib.Command) bool {
+    return switch (cmd) {
+        .artifact_search,
+        .orchestration_concurrency,
+        .plan_search,
+        .reply_latency,
+        .session_prompts,
+        .session_tooling,
+        .skill_blocks,
+        .token_usage,
+        .turns,
+        .session_detail,
+        .tool_lifecycle,
+        .session_graph,
+        .tail,
+        => true,
+        else => false,
+    };
+}
+
+fn commandSupportsStateDbPath(cmd: lib.Command) bool {
+    return cmd == .memory_provenance or cmd == .memory_history or cmd == .memory_inventory;
+}
+
+fn commandSupportsMemoryRoot(cmd: lib.Command) bool {
+    return cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history or cmd == .memory_inventory;
+}
+
+fn commandSupportsExtensionsRoot(cmd: lib.Command) bool {
+    return cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history or cmd == .memory_inventory;
 }
 
 const trace_session_columns = [_][]const u8{ "start_time", "end_time", "status", "session_id", "thread_name", "cwd", "git_branch", "model", "turn_count", "total_tokens", "worker_kind", "spawned_worker_count", "path" };
