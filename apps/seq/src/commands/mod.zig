@@ -7764,19 +7764,29 @@ fn collectJoinRowsByLeftPaths(
 
     var it = paths.map.keyIterator();
     while (it.next()) |path| {
-        var params: std.ArrayList(spec.ParamSpec) = .empty;
-        defer params.deinit(allocator);
-        try params.appendSlice(allocator, join_spec.params);
-        try params.append(allocator, .{ .key = "path", .value = .{ .string = path.* } });
-
-        var collected = try collectDatasetRows(allocator, join_spec.dataset, sessions_root, params.items, join_spec.where);
-        defer deinitQueryRows(allocator, &collected);
-        for (collected.items) |row| {
-            try out.append(allocator, try row.cloneAll(allocator));
-        }
+        try appendJoinRowsForPath(allocator, &out, join_spec, sessions_root, path.*);
     }
 
     return out;
+}
+
+fn appendJoinRowsForPath(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(query.Row),
+    join_spec: spec.JoinSpec,
+    sessions_root: []const u8,
+    path: []const u8,
+) !void {
+    var params: std.ArrayList(spec.ParamSpec) = .empty;
+    defer params.deinit(allocator);
+    try params.appendSlice(allocator, join_spec.params);
+    try params.append(allocator, .{ .key = "path", .value = .{ .string = path } });
+
+    var collected = try collectDatasetRows(allocator, join_spec.dataset, sessions_root, params.items, join_spec.where);
+    defer deinitQueryRows(allocator, &collected);
+    for (collected.items) |row| {
+        try out.append(allocator, try row.cloneAll(allocator));
+    }
 }
 
 fn joinQueryRows(
@@ -8057,26 +8067,35 @@ fn collectWorkflowSignalRows(
     }
 
     for (paths.items) |path| {
-        const graph_params = [_]spec.ParamSpec{.{ .key = "path", .value = .{ .string = path } }};
-        var graph_rows = try collectTraceDatasetRowsFromParams(allocator, "session_graph_edges", sessions_root, graph_params[0..]);
-        defer deinitQueryRows(allocator, &graph_rows);
-        for (graph_rows.items) |row| {
-            const role = scalarString(row.valueOrNull("agent_role")) orelse continue;
-            try appendWorkflowSignalRow(
-                allocator,
-                out_rows,
-                scalarString(row.valueOrNull("parent_path")) orelse "",
-                scalarString(row.valueOrNull("parent_session_id")),
-                scalarString(row.valueOrNull("spawned_at")),
-                null,
-                "session_graph",
-                "agent_role",
-                role,
-                null,
-                scalarString(row.valueOrNull("prompt_preview")) orelse role,
-                "none",
-            );
-        }
+        try appendWorkflowGraphSignalsForPath(allocator, sessions_root, path, out_rows);
+    }
+}
+
+fn appendWorkflowGraphSignalsForPath(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    path: []const u8,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    const graph_params = [_]spec.ParamSpec{.{ .key = "path", .value = .{ .string = path } }};
+    var graph_rows = try collectTraceDatasetRowsFromParams(allocator, "session_graph_edges", sessions_root, graph_params[0..]);
+    defer deinitQueryRows(allocator, &graph_rows);
+    for (graph_rows.items) |row| {
+        const role = scalarString(row.valueOrNull("agent_role")) orelse continue;
+        try appendWorkflowSignalRow(
+            allocator,
+            out_rows,
+            scalarString(row.valueOrNull("parent_path")) orelse "",
+            scalarString(row.valueOrNull("parent_session_id")),
+            scalarString(row.valueOrNull("spawned_at")),
+            null,
+            "session_graph",
+            "agent_role",
+            role,
+            null,
+            scalarString(row.valueOrNull("prompt_preview")) orelse role,
+            "none",
+        );
     }
 }
 
