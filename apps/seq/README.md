@@ -56,6 +56,11 @@ Binary output:
 ./zig-out/bin/seq tool-audit --group-by executable --since 2026-04-01T00:00:00Z --limit 20 --format table
 ./zig-out/bin/seq memory-inventory --mode categories --memory-root ~/.codex/memories --format table
 ./zig-out/bin/seq message-search --contains "release workflow" --roles user,assistant --limit 20 --format table
+./zig-out/bin/seq message-audit --contains-any "jq,seq query" --roles user,assistant --exclude-current --limit 20 --format table
+./zig-out/bin/seq skill-cohort --skill seq --since 2026-04-01T00:00:00Z --exclude-current --format table
+./zig-out/bin/seq tool-search --contains "seq query" --group-by executable --mode summary --exclude-current --format table
+./zig-out/bin/seq memory-extension-audit --extensions-root ~/.codex/memories/extensions --format table
+./zig-out/bin/seq token-window --window-hours 24 --since 2026-04-01T00:00:00Z --exclude-current --format table
 ./zig-out/bin/seq workdir-report --workdir /Users/tk/workspace/tk/skills-zig --mode sessions --format table
 ./zig-out/bin/seq memory-provenance --thread-id 019bae5d-7d12-7b01-9cb5-b8bb6046b85b --format table
 ./zig-out/bin/seq memory-provenance --rollout-summary-file rollout_summaries/2026-01-11T18-42-01-jpEf-resolve_merge_pr_11_squash_cleanup.md --format json
@@ -177,6 +182,11 @@ Query-lift commands provide top-level shortcuts for common `seq query` shapes:
 - `tool-audit` summarizes `tool_invocations` by tool, executable, session, workdir, or command, with row and unresolved modes for drilling down.
 - `memory-inventory` summarizes file-backed memory categories and can switch to file, block, stage1, or extension inventory modes.
 - `message-search` searches session message text with `--contains`, `--regex`, `--contains-any`, or `--contains-all`.
+- `message-audit` summarizes message hits by role, emits matching rows, or groups matching sessions; use `--exclude-current` when mining an active Codex run and `--show-query` to print the generated `query` spec.
+- `skill-cohort` reports skills seen in the same session cohort as `--skill <name>`, or can fall back to summary/mention modes over `skill_mentions`.
+- `tool-search` searches lifecycle-enriched tool invocations and flattened tool arguments without shell `jq` post-processing.
+- `memory-extension-audit` inventories live memory extensions and labels results as `inventory_only` with `causality_claimed=false` so read/config evidence is not overclaimed.
+- `token-window` computes the max rolling token window from timestamp-sorted `token_deltas` rows and can emit the contributing rows.
 - `workdir-report` summarizes canonical session rows by `cwd` and can list matching sessions.
 
 `memory-provenance` answers the targeted origin question for one memory thread or rollout summary:

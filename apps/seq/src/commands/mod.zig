@@ -357,6 +357,8 @@ const Options = struct {
     current: bool = false,
     summary: bool = false,
     audit: bool = false,
+    show_query: bool = false,
+    exclude_current: bool = false,
     next_actions: bool = false,
     latest: bool = false,
     ongoing: bool = false,
@@ -423,6 +425,7 @@ const Options = struct {
     limit: usize = 0,
     floor_threshold: i64 = 3,
     threshold_ms: i64 = 10_000,
+    window_hours: i64 = 24,
     poll_ms: i64 = 500,
     debounce_ms: i64 = 300,
     workflow: ?[]const u8 = null,
@@ -454,6 +457,11 @@ pub fn run(
         .tool_audit => try QueryLiftCommands.cmdToolAudit(allocator, sessions_root, opts),
         .memory_inventory => try QueryLiftCommands.cmdMemoryInventory(allocator, sessions_root, opts),
         .message_search => try QueryLiftCommands.cmdMessageSearch(allocator, sessions_root, opts),
+        .message_audit => try QueryLiftCommands.cmdMessageAudit(allocator, sessions_root, opts),
+        .skill_cohort => try QueryLiftCommands.cmdSkillCohort(allocator, sessions_root, opts),
+        .tool_search => try QueryLiftCommands.cmdToolSearch(allocator, sessions_root, opts),
+        .memory_extension_audit => try QueryLiftCommands.cmdMemoryExtensionAudit(allocator, sessions_root, opts),
+        .token_window => try QueryLiftCommands.cmdTokenWindow(allocator, sessions_root, opts),
         .workdir_report => try QueryLiftCommands.cmdWorkdirReport(allocator, sessions_root, opts),
         .role_breakdown => try cmdRoleBreakdown(allocator, sessions_root, opts),
         .occurrence_export => try cmdOccurrenceExport(allocator, sessions_root, opts),
@@ -526,6 +534,21 @@ fn printCommandHelp(cmd: lib.Command) !void {
         ,
         .message_search =>
         \\usage: seq message-search [--contains <text>|--regex <expr>|--contains-any <csv>|--contains-all <csv>] [--roles <csv>] [--since <iso>] [--until <iso>] [--limit N] [--format table|json|csv|jsonl]
+        ,
+        .message_audit =>
+        \\usage: seq message-audit [--mode summary|rows|sessions] [--contains <text>|--regex <expr>|--contains-any <csv>|--contains-all <csv>] [--roles <csv>] [--since <iso>] [--until <iso>] [--exclude-current] [--show-query] [--limit N] [--format table|json|csv|jsonl]
+        ,
+        .skill_cohort =>
+        \\usage: seq skill-cohort [--skill <name>] [--mode summary|cohort|mentions] [--roles <csv>] [--contains <text>|--regex <expr>|--contains-any <csv>] [--since <iso>] [--until <iso>] [--exclude-current] [--show-query] [--limit N] [--format table|json|csv|jsonl]
+        ,
+        .tool_search =>
+        \\usage: seq tool-search [--mode rows|summary|args] [--group-by executable|tool|session|workdir|command] [--tool <name>] [--executable <name>] [--workdir <path>] [--contains <text>|--regex <expr>] [--since <iso>] [--until <iso>] [--exclude-current] [--show-query] [--limit N] [--format table|json|csv|jsonl]
+        ,
+        .memory_extension_audit =>
+        \\usage: seq memory-extension-audit [--mode summary|rows] [--extensions-root <path>] [--contains <text>|--regex <expr>] [--show-query] [--limit N] [--format table|json|csv|jsonl]
+        ,
+        .token_window =>
+        \\usage: seq token-window [--mode summary|rows] [--window-hours N] [--since <iso>] [--until <iso>] [--path <jsonl>] [--exclude-current] [--show-query] [--format table|json|csv|jsonl]
         ,
         .workdir_report =>
         \\usage: seq workdir-report [--workdir <path>] [--mode summary|sessions] [--contains <text>] [--contains-any <csv>] [--since <iso>] [--until <iso>] [--limit N] [--format table|json|csv|jsonl]
@@ -695,7 +718,7 @@ fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
             if (fmt == .csv or fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
         .query => {},
-        .artifact_search, .tool_audit, .memory_inventory, .message_search, .workdir_report, .orchestration_concurrency, .find_session, .plan_search, .reply_latency, .session_prompts, .token_usage, .routing_gap, .session_tooling, .query_diagnose, .memory_provenance, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .skill_audit => {
+        .artifact_search, .tool_audit, .memory_inventory, .message_search, .message_audit, .skill_cohort, .tool_search, .memory_extension_audit, .token_window, .workdir_report, .orchestration_concurrency, .find_session, .plan_search, .reply_latency, .session_prompts, .token_usage, .routing_gap, .session_tooling, .query_diagnose, .memory_provenance, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .skill_audit => {
             if (fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
         .unknown => return error.InvalidCommand,
@@ -704,7 +727,7 @@ fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
 
 fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_current = cmd == .session_prompts or cmd == .reply_latency or cmd == .skill_blocks or cmd == .tail;
-    const supports_roles_csv = cmd == .session_prompts or cmd == .artifact_search or cmd == .skill_audit or cmd == .message_search;
+    const supports_roles_csv = cmd == .session_prompts or cmd == .artifact_search or cmd == .skill_audit or cmd == .message_search or cmd == .message_audit or cmd == .skill_cohort;
     const supports_strip_skill_blocks = cmd == .session_prompts or cmd == .artifact_search;
     const supports_no_dedupe_exact = cmd == .session_prompts or cmd == .artifact_search;
     const supports_summary = switch (cmd) {
@@ -724,7 +747,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_threshold_ms = cmd == .query_diagnose;
     const supports_strict_hang = cmd == .query_diagnose;
     const supports_skill = switch (cmd) {
-        .skill_trend, .skill_report, .skill_audit, .occurrence_export, .skill_blocks => true,
+        .skill_trend, .skill_report, .skill_audit, .skill_cohort, .occurrence_export, .skill_blocks => true,
         else => false,
     };
     const supports_workflow = cmd == .workflow_audit;
@@ -740,23 +763,23 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         else => false,
     };
     const supports_contains = switch (cmd) {
-        .artifact_search, .tool_audit, .memory_inventory, .message_search, .workdir_report, .plan_search, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .sessions, .turns => true,
+        .artifact_search, .tool_audit, .memory_inventory, .message_search, .message_audit, .skill_cohort, .tool_search, .memory_extension_audit, .workdir_report, .plan_search, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .sessions, .turns => true,
         else => false,
     };
-    const supports_contains_any = cmd == .message_search or cmd == .workdir_report;
-    const supports_contains_all = cmd == .message_search;
+    const supports_contains_any = cmd == .message_search or cmd == .message_audit or cmd == .skill_cohort or cmd == .workdir_report;
+    const supports_contains_all = cmd == .message_search or cmd == .message_audit;
     const supports_regex = switch (cmd) {
-        .artifact_search, .memory_inventory, .message_search, .plan_search, .memory_map, .memory_history, .opencode_prompts, .opencode_events => true,
+        .artifact_search, .memory_inventory, .message_search, .message_audit, .skill_cohort, .tool_search, .memory_extension_audit, .plan_search, .memory_map, .memory_history, .opencode_prompts, .opencode_events => true,
         else => false,
     };
     const supports_role = cmd == .opencode_events;
-    const supports_tool = cmd == .opencode_events or cmd == .artifact_search or cmd == .tool_audit;
-    const supports_executable = cmd == .tool_audit;
-    const supports_workdir = cmd == .artifact_search or cmd == .tool_audit or cmd == .workdir_report or cmd == .workflow_audit;
+    const supports_tool = cmd == .opencode_events or cmd == .artifact_search or cmd == .tool_audit or cmd == .tool_search;
+    const supports_executable = cmd == .tool_audit or cmd == .tool_search;
+    const supports_workdir = cmd == .artifact_search or cmd == .tool_audit or cmd == .tool_search or cmd == .workdir_report or cmd == .workflow_audit;
     const supports_repo = cmd == .plan_search or cmd == .sessions;
     const supports_status = cmd == .opencode_events or cmd == .turns;
     const supports_mode = switch (cmd) {
-        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .tool_audit, .memory_inventory, .workdir_report, .workflow_audit => true,
+        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit => true,
         else => false,
     };
     const supports_kind = cmd == .artifact_search;
@@ -779,6 +802,9 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .artifact_search,
         .tool_audit,
         .message_search,
+        .message_audit,
+        .skill_cohort,
+        .tool_search,
         .workdir_report,
         .plan_search,
         .reply_latency,
@@ -786,6 +812,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .report_bundle,
         .section_audit,
         .token_usage,
+        .token_window,
         .session_tooling,
         .query_diagnose,
         .workflow_audit,
@@ -810,6 +837,9 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .artifact_search,
         .tool_audit,
         .message_search,
+        .message_audit,
+        .skill_cohort,
+        .tool_search,
         .workdir_report,
         .plan_search,
         .reply_latency,
@@ -817,6 +847,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .report_bundle,
         .section_audit,
         .token_usage,
+        .token_window,
         .session_tooling,
         .query_diagnose,
         .workflow_audit,
@@ -835,7 +866,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         else => false,
     };
     const supports_group_by = switch (cmd) {
-        .session_tooling, .tool_audit, .opencode_prompts, .opencode_events, .token_usage => true,
+        .session_tooling, .tool_audit, .tool_search, .opencode_prompts, .opencode_events, .token_usage => true,
         else => false,
     };
     const supports_timezone = switch (cmd) {
@@ -873,6 +904,25 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_thread_id = cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history;
     const supports_rollout_summary_file = cmd == .memory_provenance;
     const supports_trace = cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history;
+    const supports_show_query = switch (cmd) {
+        .skill_audit,
+        .tool_audit,
+        .memory_inventory,
+        .message_search,
+        .message_audit,
+        .skill_cohort,
+        .tool_search,
+        .memory_extension_audit,
+        .token_window,
+        .workdir_report,
+        => true,
+        else => false,
+    };
+    const supports_exclude_current = switch (cmd) {
+        .message_audit, .skill_cohort, .tool_search, .token_window => true,
+        else => false,
+    };
+    const supports_window_hours = cmd == .token_window;
 
     try ensureOptionAllowed(opts.path != null, commandSupportsPath(cmd), "--path", cmd);
     try ensureOptionAllowed(opts.session_id != null, commandSupportsSessionId(cmd), "--session-id", cmd);
@@ -882,6 +932,8 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.no_dedupe_exact, supports_no_dedupe_exact, "--no-dedupe-exact", cmd);
     try ensureOptionAllowed(opts.summary, supports_summary, "--summary", cmd);
     try ensureOptionAllowed(opts.audit, supports_audit, "--audit", cmd);
+    try ensureOptionAllowed(opts.show_query, supports_show_query, "--show-query", cmd);
+    try ensureOptionAllowed(opts.exclude_current, supports_exclude_current, "--exclude-current", cmd);
     try ensureOptionAllowed(opts.next_actions, supports_next_actions, "--next-actions", cmd);
     try ensureOptionAllowed(opts.latest, supports_latest, "--latest", cmd);
     try ensureOptionAllowed(opts.floor_threshold != 3, supports_floor_threshold, "--floor-threshold", cmd);
@@ -889,6 +941,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.fail_on_mesh_truth, supports_fail_on_mesh_truth, "--fail-on-mesh-truth", cmd);
     try ensureOptionAllowed(opts.fail_on_hang, supports_fail_on_hang, "--fail-on-hang", cmd);
     try ensureOptionAllowed(opts.threshold_ms != 10_000, supports_threshold_ms, "--threshold-ms", cmd);
+    try ensureOptionAllowed(opts.window_hours != 24, supports_window_hours, "--window-hours", cmd);
     try ensureOptionAllowed(!opts.strict_hang, supports_strict_hang, "--no-strict-hang", cmd);
     try ensureOptionAllowed(opts.skill != null, supports_skill, "--skill", cmd);
     try ensureOptionAllowed(opts.workflow != null, supports_workflow, "--workflow", cmd);
@@ -958,6 +1011,16 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
             if (!isValidSkillAuditMode(text)) return error.InvalidModeArg;
         }
     }
+    if (cmd == .message_audit) {
+        if (opts.mode) |text| {
+            if (!isValidMessageAuditMode(text)) return error.InvalidModeArg;
+        }
+    }
+    if (cmd == .skill_cohort) {
+        if (opts.mode) |text| {
+            if (!isValidSkillCohortMode(text)) return error.InvalidModeArg;
+        }
+    }
     if (cmd == .tool_audit) {
         if (opts.mode) |text| {
             if (!isValidToolAuditMode(text)) return error.InvalidModeArg;
@@ -966,9 +1029,27 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
             if (!isValidToolAuditGroupBy(text)) return error.InvalidModeArg;
         }
     }
+    if (cmd == .tool_search) {
+        if (opts.mode) |text| {
+            if (!isValidToolSearchMode(text)) return error.InvalidModeArg;
+        }
+        if (opts.group_by_text) |text| {
+            if (!isValidToolAuditGroupBy(text)) return error.InvalidModeArg;
+        }
+    }
     if (cmd == .memory_inventory) {
         if (opts.mode) |text| {
             if (!isValidMemoryInventoryMode(text)) return error.InvalidModeArg;
+        }
+    }
+    if (cmd == .memory_extension_audit) {
+        if (opts.mode) |text| {
+            if (!isValidMemoryExtensionAuditMode(text)) return error.InvalidModeArg;
+        }
+    }
+    if (cmd == .token_window) {
+        if (opts.mode) |text| {
+            if (!isValidTokenWindowMode(text)) return error.InvalidModeArg;
         }
     }
     if (cmd == .workdir_report) {
@@ -995,6 +1076,7 @@ fn commandSupportsPath(cmd: lib.Command) bool {
         .query_diagnose,
         .skill_blocks,
         .token_usage,
+        .token_window,
         .turns,
         .session_detail,
         .tool_lifecycle,
@@ -1034,7 +1116,7 @@ fn commandSupportsMemoryRoot(cmd: lib.Command) bool {
 }
 
 fn commandSupportsExtensionsRoot(cmd: lib.Command) bool {
-    return cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history or cmd == .memory_inventory;
+    return cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history or cmd == .memory_inventory or cmd == .memory_extension_audit;
 }
 
 const trace_session_columns = [_][]const u8{ "start_time", "end_time", "status", "session_id", "thread_name", "cwd", "git_branch", "model", "turn_count", "total_tokens", "worker_kind", "spawned_worker_count", "path" };
@@ -1076,11 +1158,29 @@ fn isValidSkillAuditMode(text: []const u8) bool {
         std.mem.eql(u8, text, "trend");
 }
 
+fn isValidMessageAuditMode(text: []const u8) bool {
+    return std.mem.eql(u8, text, "summary") or
+        std.mem.eql(u8, text, "rows") or
+        std.mem.eql(u8, text, "sessions");
+}
+
+fn isValidSkillCohortMode(text: []const u8) bool {
+    return std.mem.eql(u8, text, "summary") or
+        std.mem.eql(u8, text, "cohort") or
+        std.mem.eql(u8, text, "mentions");
+}
+
 fn isValidToolAuditMode(text: []const u8) bool {
     return std.mem.eql(u8, text, "summary") or
         std.mem.eql(u8, text, "rows") or
         std.mem.eql(u8, text, "args") or
         std.mem.eql(u8, text, "unresolved");
+}
+
+fn isValidToolSearchMode(text: []const u8) bool {
+    return std.mem.eql(u8, text, "rows") or
+        std.mem.eql(u8, text, "summary") or
+        std.mem.eql(u8, text, "args");
 }
 
 fn isValidToolAuditGroupBy(text: []const u8) bool {
@@ -1097,6 +1197,16 @@ fn isValidMemoryInventoryMode(text: []const u8) bool {
         std.mem.eql(u8, text, "blocks") or
         std.mem.eql(u8, text, "stage1") or
         std.mem.eql(u8, text, "extensions");
+}
+
+fn isValidMemoryExtensionAuditMode(text: []const u8) bool {
+    return std.mem.eql(u8, text, "summary") or
+        std.mem.eql(u8, text, "rows");
+}
+
+fn isValidTokenWindowMode(text: []const u8) bool {
+    return std.mem.eql(u8, text, "summary") or
+        std.mem.eql(u8, text, "rows");
 }
 
 fn isValidWorkdirReportMode(text: []const u8) bool {
@@ -2303,6 +2413,19 @@ const QueryLiftCommands = struct {
     const memory_inventory_stage1_columns = [_][]const u8{ "generated_at", "last_usage", "cwd", "title", "thread_id", "rollout_path" };
     const memory_inventory_extension_columns = [_][]const u8{ "extension_name", "has_instructions", "modified_at", "size_bytes", "instructions_path" };
     const message_search_columns = [_][]const u8{ "timestamp", "role", "text", "path" };
+    const message_audit_summary_columns = [_][]const u8{ "role", "messages", "sessions", "chars", "first_seen", "last_seen" };
+    const message_audit_row_columns = [_][]const u8{ "timestamp", "role", "text_len", "text", "path" };
+    const message_audit_session_columns = [_][]const u8{ "path", "messages", "chars", "first_seen", "last_seen" };
+    const skill_cohort_summary_columns = [_][]const u8{ "skill", "mentions", "sessions", "first_seen", "last_seen" };
+    const skill_cohort_mention_columns = [_][]const u8{ "timestamp", "role", "skill", "types", "snippet", "path" };
+    const skill_cohort_columns = [_][]const u8{ "cohort_skill", "skill", "mentions", "sessions", "cohort_sessions", "first_seen", "last_seen" };
+    const tool_search_row_columns = [_][]const u8{ "timestamp", "tool_name", "primary_executable", "workdir", "exit_code", "wall_time_ms", "command_text", "arguments_text", "input_text", "path" };
+    const tool_search_summary_columns = [_][]const u8{ "primary_executable", "calls", "sessions", "avg_wall_ms", "max_wall_ms" };
+    const tool_search_arg_columns = [_][]const u8{ "tool_name", "arg_path", "value_kind", "value_text", "count" };
+    const memory_extension_summary_columns = [_][]const u8{ "row_kind", "extensions", "with_instructions", "without_instructions", "total_bytes", "provenance_status", "causality_claimed" };
+    const memory_extension_row_columns = [_][]const u8{ "extension_name", "has_instructions", "modified_at", "size_bytes", "instructions_path", "provenance_status", "causality_claimed" };
+    const token_window_summary_columns = [_][]const u8{ "window_hours", "window_start", "window_end", "observed_end", "total_tokens", "rows", "path_count", "source_dataset", "sorted_by", "since", "until" };
+    const token_window_row_columns = [_][]const u8{ "timestamp", "delta_total_tokens", "path", "segment", "model_context_window" };
     const workdir_report_summary_columns = [_][]const u8{ "cwd", "sessions", "turns", "total_tokens", "first_seen", "last_seen" };
     const workdir_report_session_columns = [_][]const u8{ "start_time", "end_time", "cwd", "model", "total_tokens", "path" };
 
@@ -2448,6 +2571,194 @@ const QueryLiftCommands = struct {
         return if (opts.limit == 0) default_limit else opts.limit;
     }
 
+    fn runQueryLiftDataset(
+        allocator: std.mem.Allocator,
+        dataset_name: []const u8,
+        sessions_root: []const u8,
+        query_spec: spec.QuerySpec,
+        opts: Options,
+        columns: []const []const u8,
+    ) !void {
+        if (opts.show_query) return writeGeneratedQuerySpec(allocator, dataset_name, query_spec, opts.out_path);
+        return runDatasetQuery(allocator, dataset_name, sessions_root, query_spec, opts.format, opts.out_path, columns);
+    }
+
+    fn appendCurrentSessionExclusion(
+        allocator: std.mem.Allocator,
+        sessions_root: []const u8,
+        where_out: *std.ArrayList(spec.WhereClause),
+        opts: Options,
+    ) !?[]u8 {
+        if (!opts.exclude_current) return null;
+        const path = try resolveCurrentSessionPathForExclusion(allocator, sessions_root);
+        errdefer allocator.free(path);
+        try where_out.append(allocator, .{
+            .field = "path",
+            .op = .neq,
+            .value = .{ .scalar = .{ .string = path } },
+        });
+        return path;
+    }
+
+    fn resolveCurrentSessionPathForExclusion(allocator: std.mem.Allocator, sessions_root: []const u8) ![]u8 {
+        const thread_id = getEnvVarOwned(allocator, "CODEX_THREAD_ID") catch {
+            printCliError("error: --exclude-current requires CODEX_THREAD_ID in the environment\n", .{});
+            return error.CurrentSessionUnavailable;
+        };
+        defer allocator.free(thread_id);
+
+        var paths = try collectTraceRolloutPaths(allocator, sessions_root);
+        defer freePathList(allocator, &paths);
+
+        for (paths.items) |path| {
+            var parsed = canonical_trace.parseSessionTrace(allocator, path, .{}) catch continue;
+            defer parsed.deinit(allocator);
+            if (parsed.session.session_id) |id| {
+                if (std.mem.eql(u8, id, thread_id) or std.mem.containsAtLeast(u8, id, 1, thread_id)) {
+                    return allocator.dupe(u8, path);
+                }
+            }
+            if (std.mem.containsAtLeast(u8, path, 1, thread_id)) {
+                return allocator.dupe(u8, path);
+            }
+        }
+
+        printCliError("error: --exclude-current could not resolve CODEX_THREAD_ID {s} under sessions root {s}\n", .{ thread_id, sessions_root });
+        return error.CurrentSessionUnavailable;
+    }
+
+    fn writeGeneratedQuerySpec(
+        allocator: std.mem.Allocator,
+        dataset_name: []const u8,
+        query_spec: spec.QuerySpec,
+        out_path: ?[]const u8,
+    ) !void {
+        var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+        defer writer_alloc.deinit();
+        const writer = &writer_alloc.writer;
+
+        try writer.writeAll("{\n  \"dataset\": ");
+        try output.writeJsonString(writer, dataset_name);
+        try writer.writeAll(",\n  \"where\": ");
+        try writeWhereJson(writer, query_spec.where);
+        try writer.writeAll(",\n  \"group_by\": ");
+        try writeStringArrayJson(writer, query_spec.group_by);
+        try writer.writeAll(",\n  \"metrics\": ");
+        try writeMetricsJson(writer, query_spec.metrics);
+        try writer.writeAll(",\n  \"select\": ");
+        try writeStringArrayJson(writer, query_spec.select);
+        try writer.writeAll(",\n  \"sort\": ");
+        try writeSortJson(writer, query_spec.sort);
+        try writer.writeAll(",\n  \"params\": ");
+        try writeParamsJson(writer, query_spec.params);
+        try writer.print(",\n  \"limit\": {d}\n}}\n", .{query_spec.limit});
+
+        const rendered = try writer_alloc.toOwnedSlice();
+        defer allocator.free(rendered);
+        if (out_path) |path| {
+            if (std.fs.path.dirname(path)) |dir| {
+                if (dir.len > 0) try std.Io.Dir.cwd().createDirPath(defaultIo(), dir);
+            }
+            try std.Io.Dir.cwd().writeFile(defaultIo(), .{ .sub_path = path, .data = rendered });
+            return;
+        }
+
+        var stdout = std.Io.File.stdout().writer(defaultIo(), &.{});
+        try stdout.interface.writeAll(rendered);
+    }
+
+    fn writeWhereJson(writer: anytype, clauses: []const spec.WhereClause) !void {
+        try writer.writeByte('[');
+        for (clauses, 0..) |clause, i| {
+            if (i > 0) try writer.writeAll(", ");
+            try writer.writeAll("{\"field\":");
+            try output.writeJsonString(writer, clause.field);
+            try writer.writeAll(",\"op\":");
+            try output.writeJsonString(writer, @tagName(clause.op));
+            if (clause.value) |value| {
+                try writer.writeAll(",\"value\":");
+                try writeWhereValueJson(writer, value);
+            }
+            if (clause.case_insensitive) try writer.writeAll(",\"case_insensitive\":true");
+            try writer.writeByte('}');
+        }
+        try writer.writeByte(']');
+    }
+
+    fn writeWhereValueJson(writer: anytype, value: spec.WhereValue) !void {
+        switch (value) {
+            .scalar => |scalar| try output.writeScalarJson(writer, scalar),
+            .list => |items| try writeScalarArrayJson(writer, items),
+        }
+    }
+
+    fn writeScalarArrayJson(writer: anytype, items: []const spec.Scalar) !void {
+        try writer.writeByte('[');
+        for (items, 0..) |item, i| {
+            if (i > 0) try writer.writeAll(", ");
+            try output.writeScalarJson(writer, item);
+        }
+        try writer.writeByte(']');
+    }
+
+    fn writeStringArrayJson(writer: anytype, items: []const []const u8) !void {
+        try writer.writeByte('[');
+        for (items, 0..) |item, i| {
+            if (i > 0) try writer.writeAll(", ");
+            try output.writeJsonString(writer, item);
+        }
+        try writer.writeByte(']');
+    }
+
+    fn writeMetricsJson(writer: anytype, metrics: []const spec.MetricSpec) !void {
+        try writer.writeByte('[');
+        for (metrics, 0..) |metric, i| {
+            if (i > 0) try writer.writeAll(", ");
+            try writer.writeAll("{\"op\":");
+            try output.writeJsonString(writer, @tagName(metric.op));
+            if (metric.field) |field| {
+                try writer.writeAll(",\"field\":");
+                try output.writeJsonString(writer, field);
+            }
+            if (metric.alias) |alias| {
+                try writer.writeAll(",\"as\":");
+                try output.writeJsonString(writer, alias);
+            }
+            try writer.writeByte('}');
+        }
+        try writer.writeByte(']');
+    }
+
+    fn writeSortJson(writer: anytype, sort_items: []const spec.SortSpec) !void {
+        try writer.writeByte('[');
+        for (sort_items, 0..) |sort_item, i| {
+            if (i > 0) try writer.writeAll(", ");
+            if (sort_item.descending) {
+                try writer.writeByte('"');
+                try writer.writeByte('-');
+                for (sort_item.field) |c| {
+                    if (c == '"' or c == '\\') try writer.writeByte('\\');
+                    try writer.writeByte(c);
+                }
+                try writer.writeByte('"');
+            } else {
+                try output.writeJsonString(writer, sort_item.field);
+            }
+        }
+        try writer.writeByte(']');
+    }
+
+    fn writeParamsJson(writer: anytype, params: []const spec.ParamSpec) !void {
+        try writer.writeByte('{');
+        for (params, 0..) |param, i| {
+            if (i > 0) try writer.writeAll(", ");
+            try output.writeJsonString(writer, param.key);
+            try writer.writeByte(':');
+            try output.writeScalarJson(writer, param.value);
+        }
+        try writer.writeByte('}');
+    }
+
     fn cmdSkillAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
         const mode = opts.mode orelse "summary";
         var where: std.ArrayList(spec.WhereClause) = .empty;
@@ -2470,7 +2781,7 @@ const QueryLiftCommands = struct {
                 .sort = &.{.{ .field = "mentions", .descending = true }},
                 .limit = queryLimit(opts, 20),
             };
-            return runDatasetQuery(allocator, "skill_mentions", sessions_root, query_spec, opts.format, opts.out_path, skill_audit_summary_columns[0..]);
+            return runQueryLiftDataset(allocator, "skill_mentions", sessions_root, query_spec, opts, skill_audit_summary_columns[0..]);
         }
 
         if (std.mem.eql(u8, mode, "mentions")) {
@@ -2480,7 +2791,7 @@ const QueryLiftCommands = struct {
                 .sort = &.{.{ .field = "timestamp", .descending = true }},
                 .limit = queryLimit(opts, 50),
             };
-            return runDatasetQuery(allocator, "skill_mentions", sessions_root, query_spec, opts.format, opts.out_path, skill_audit_mentions_columns[0..]);
+            return runQueryLiftDataset(allocator, "skill_mentions", sessions_root, query_spec, opts, skill_audit_mentions_columns[0..]);
         }
 
         if (std.mem.eql(u8, mode, "trend")) {
@@ -2495,7 +2806,7 @@ const QueryLiftCommands = struct {
                 .sort = &.{.{ .field = "day", .descending = false }},
                 .limit = opts.limit,
             };
-            return runDatasetQuery(allocator, "skill_mentions", sessions_root, query_spec, opts.format, opts.out_path, skill_audit_trend_columns[0..]);
+            return runQueryLiftDataset(allocator, "skill_mentions", sessions_root, query_spec, opts, skill_audit_trend_columns[0..]);
         }
 
         return error.InvalidModeArg;
@@ -2537,7 +2848,7 @@ const QueryLiftCommands = struct {
                 .sort = &.{.{ .field = "calls", .descending = true }},
                 .limit = queryLimit(opts, 20),
             };
-            return runDatasetQuery(allocator, "tool_invocations", sessions_root, query_spec, opts.format, opts.out_path, columns[0..]);
+            return runQueryLiftDataset(allocator, "tool_invocations", sessions_root, query_spec, opts, columns[0..]);
         }
 
         if (std.mem.eql(u8, mode, "rows") or std.mem.eql(u8, mode, "unresolved")) {
@@ -2550,7 +2861,7 @@ const QueryLiftCommands = struct {
                 .sort = &.{.{ .field = "timestamp", .descending = true }},
                 .limit = queryLimit(opts, 50),
             };
-            return runDatasetQuery(allocator, "tool_invocations", sessions_root, query_spec, opts.format, opts.out_path, tool_audit_row_columns[0..]);
+            return runQueryLiftDataset(allocator, "tool_invocations", sessions_root, query_spec, opts, tool_audit_row_columns[0..]);
         }
 
         if (std.mem.eql(u8, mode, "args")) {
@@ -2566,7 +2877,7 @@ const QueryLiftCommands = struct {
                 .sort = &.{.{ .field = "count", .descending = true }},
                 .limit = queryLimit(opts, 50),
             };
-            return runDatasetQuery(allocator, "tool_call_args", sessions_root, query_spec, opts.format, opts.out_path, tool_audit_arg_columns[0..]);
+            return runQueryLiftDataset(allocator, "tool_call_args", sessions_root, query_spec, opts, tool_audit_arg_columns[0..]);
         }
 
         return error.InvalidModeArg;
@@ -2607,7 +2918,7 @@ const QueryLiftCommands = struct {
                 .sort = &.{.{ .field = "files", .descending = true }},
                 .limit = opts.limit,
             };
-            return runDatasetQuery(allocator, "memory_files", sessions_root, query_spec, opts.format, opts.out_path, memory_inventory_category_columns[0..]);
+            return runQueryLiftDataset(allocator, "memory_files", sessions_root, query_spec, opts, memory_inventory_category_columns[0..]);
         }
 
         if (std.mem.eql(u8, mode, "files")) {
@@ -2621,7 +2932,7 @@ const QueryLiftCommands = struct {
                 .sort = &.{.{ .field = "modified_at", .descending = true }},
                 .limit = queryLimit(opts, 100),
             };
-            return runDatasetQuery(allocator, "memory_files", sessions_root, query_spec, opts.format, opts.out_path, memory_inventory_file_columns[0..]);
+            return runQueryLiftDataset(allocator, "memory_files", sessions_root, query_spec, opts, memory_inventory_file_columns[0..]);
         }
 
         if (std.mem.eql(u8, mode, "blocks")) {
@@ -2635,7 +2946,7 @@ const QueryLiftCommands = struct {
                 .sort = &.{.{ .field = "updated_at", .descending = true }},
                 .limit = queryLimit(opts, 50),
             };
-            return runDatasetQuery(allocator, "memory_blocks", sessions_root, query_spec, opts.format, opts.out_path, memory_inventory_block_columns[0..]);
+            return runQueryLiftDataset(allocator, "memory_blocks", sessions_root, query_spec, opts, memory_inventory_block_columns[0..]);
         }
 
         if (std.mem.eql(u8, mode, "stage1")) {
@@ -2649,7 +2960,7 @@ const QueryLiftCommands = struct {
                 .sort = &.{.{ .field = "generated_at", .descending = true }},
                 .limit = queryLimit(opts, 50),
             };
-            return runDatasetQuery(allocator, "memory_stage1_outputs", sessions_root, query_spec, opts.format, opts.out_path, memory_inventory_stage1_columns[0..]);
+            return runQueryLiftDataset(allocator, "memory_stage1_outputs", sessions_root, query_spec, opts, memory_inventory_stage1_columns[0..]);
         }
 
         if (std.mem.eql(u8, mode, "extensions")) {
@@ -2663,7 +2974,7 @@ const QueryLiftCommands = struct {
                 .sort = &.{.{ .field = "extension_name", .descending = false }},
                 .limit = opts.limit,
             };
-            return runDatasetQuery(allocator, "memory_extensions", sessions_root, query_spec, opts.format, opts.out_path, memory_inventory_extension_columns[0..]);
+            return runQueryLiftDataset(allocator, "memory_extensions", sessions_root, query_spec, opts, memory_inventory_extension_columns[0..]);
         }
 
         return error.InvalidModeArg;
@@ -2690,7 +3001,561 @@ const QueryLiftCommands = struct {
             .sort = &.{.{ .field = "timestamp", .descending = true }},
             .limit = queryLimit(opts, 50),
         };
-        try runDatasetQuery(allocator, "messages", sessions_root, query_spec, opts.format, opts.out_path, message_search_columns[0..]);
+        try runQueryLiftDataset(allocator, "messages", sessions_root, query_spec, opts, message_search_columns[0..]);
+    }
+
+    fn appendMessageAuditFilters(
+        allocator: std.mem.Allocator,
+        sessions_root: []const u8,
+        where: *std.ArrayList(spec.WhereClause),
+        opts: Options,
+    ) !?[]u8 {
+        try appendSessionTimeBounds(allocator, where, opts);
+        const exclude_path = try appendCurrentSessionExclusion(allocator, sessions_root, where, opts);
+        errdefer if (exclude_path) |path| allocator.free(path);
+        const role_values = try appendRolesWhere(allocator, where, opts.roles_csv);
+        defer if (role_values) |values| allocator.free(values);
+        try appendOptionalContains(allocator, where, "text", opts.contains);
+        const contains_any_values = try appendCsvContainsAny(allocator, where, "text", opts.contains_any_text);
+        defer if (contains_any_values) |values| allocator.free(values);
+        try appendCsvContainsAll(allocator, where, "text", opts.contains_all_text);
+        try appendOptionalRegex(allocator, where, "text", opts.regex);
+        return exclude_path;
+    }
+
+    fn cmdMessageAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+        const mode = opts.mode orelse "summary";
+        var where: std.ArrayList(spec.WhereClause) = .empty;
+        defer where.deinit(allocator);
+        const exclude_path = try appendMessageAuditFilters(allocator, sessions_root, &where, opts);
+        defer if (exclude_path) |path| allocator.free(path);
+
+        if (std.mem.eql(u8, mode, "summary")) {
+            const query_spec = spec.QuerySpec{
+                .where = where.items,
+                .group_by = &.{"role"},
+                .metrics = &.{
+                    .{ .op = .count, .alias = "messages" },
+                    .{ .op = .count_distinct, .field = "path", .alias = "sessions" },
+                    .{ .op = .sum, .field = "text_len", .alias = "chars" },
+                    .{ .op = .min, .field = "timestamp", .alias = "first_seen" },
+                    .{ .op = .max, .field = "timestamp", .alias = "last_seen" },
+                },
+                .sort = &.{.{ .field = "messages", .descending = true }},
+                .limit = queryLimit(opts, 20),
+            };
+            return runQueryLiftDataset(allocator, "messages", sessions_root, query_spec, opts, message_audit_summary_columns[0..]);
+        }
+
+        if (std.mem.eql(u8, mode, "rows")) {
+            const query_spec = spec.QuerySpec{
+                .where = where.items,
+                .select = message_audit_row_columns[0..],
+                .sort = &.{.{ .field = "timestamp", .descending = true }},
+                .limit = queryLimit(opts, 50),
+            };
+            return runQueryLiftDataset(allocator, "messages", sessions_root, query_spec, opts, message_audit_row_columns[0..]);
+        }
+
+        if (std.mem.eql(u8, mode, "sessions")) {
+            const query_spec = spec.QuerySpec{
+                .where = where.items,
+                .group_by = &.{"path"},
+                .metrics = &.{
+                    .{ .op = .count, .alias = "messages" },
+                    .{ .op = .sum, .field = "text_len", .alias = "chars" },
+                    .{ .op = .min, .field = "timestamp", .alias = "first_seen" },
+                    .{ .op = .max, .field = "timestamp", .alias = "last_seen" },
+                },
+                .sort = &.{.{ .field = "messages", .descending = true }},
+                .limit = queryLimit(opts, 50),
+            };
+            return runQueryLiftDataset(allocator, "messages", sessions_root, query_spec, opts, message_audit_session_columns[0..]);
+        }
+
+        return error.InvalidModeArg;
+    }
+
+    fn appendSkillCohortFilters(
+        allocator: std.mem.Allocator,
+        sessions_root: []const u8,
+        where: *std.ArrayList(spec.WhereClause),
+        opts: Options,
+        include_exact_skill: bool,
+    ) !?[]u8 {
+        try appendSessionTimeBounds(allocator, where, opts);
+        const exclude_path = try appendCurrentSessionExclusion(allocator, sessions_root, where, opts);
+        errdefer if (exclude_path) |path| allocator.free(path);
+        const role_values = try appendRolesWhere(allocator, where, opts.roles_csv);
+        defer if (role_values) |values| allocator.free(values);
+        if (include_exact_skill) try appendOptionalStringEq(allocator, where, "skill", opts.skill);
+        const contains_any_values = try appendCsvContainsAny(allocator, where, "skill", opts.contains_any_text);
+        defer if (contains_any_values) |values| allocator.free(values);
+        try appendOptionalContains(allocator, where, "snippet", opts.contains);
+        try appendOptionalRegex(allocator, where, "snippet", opts.regex);
+        return exclude_path;
+    }
+
+    fn cmdSkillCohort(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+        const mode = opts.mode orelse "cohort";
+        if (std.mem.eql(u8, mode, "cohort")) return cmdSkillCohortCohortMode(allocator, sessions_root, opts);
+
+        var where: std.ArrayList(spec.WhereClause) = .empty;
+        defer where.deinit(allocator);
+        const exclude_path = try appendSkillCohortFilters(allocator, sessions_root, &where, opts, true);
+        defer if (exclude_path) |path| allocator.free(path);
+
+        if (std.mem.eql(u8, mode, "summary")) {
+            const query_spec = spec.QuerySpec{
+                .where = where.items,
+                .group_by = &.{"skill"},
+                .metrics = &.{
+                    .{ .op = .count, .alias = "mentions" },
+                    .{ .op = .count_distinct, .field = "path", .alias = "sessions" },
+                    .{ .op = .min, .field = "timestamp", .alias = "first_seen" },
+                    .{ .op = .max, .field = "timestamp", .alias = "last_seen" },
+                },
+                .sort = &.{.{ .field = "mentions", .descending = true }},
+                .limit = queryLimit(opts, 20),
+            };
+            return runQueryLiftDataset(allocator, "skill_mentions", sessions_root, query_spec, opts, skill_cohort_summary_columns[0..]);
+        }
+
+        if (std.mem.eql(u8, mode, "mentions")) {
+            const query_spec = spec.QuerySpec{
+                .where = where.items,
+                .select = skill_cohort_mention_columns[0..],
+                .sort = &.{.{ .field = "timestamp", .descending = true }},
+                .limit = queryLimit(opts, 50),
+            };
+            return runQueryLiftDataset(allocator, "skill_mentions", sessions_root, query_spec, opts, skill_cohort_mention_columns[0..]);
+        }
+
+        return error.InvalidModeArg;
+    }
+
+    const SkillCohortAggregate = struct {
+        mentions: i64 = 0,
+        sessions: StringSet,
+        first_seen: ?[]u8 = null,
+        last_seen: ?[]u8 = null,
+
+        fn init(allocator: std.mem.Allocator) SkillCohortAggregate {
+            return .{ .sessions = StringSet.init(allocator) };
+        }
+
+        fn deinit(self: *SkillCohortAggregate, allocator: std.mem.Allocator) void {
+            self.sessions.deinit();
+            if (self.first_seen) |value| allocator.free(value);
+            if (self.last_seen) |value| allocator.free(value);
+        }
+    };
+
+    fn updateSkillCohortTimestamp(
+        allocator: std.mem.Allocator,
+        aggregate: *SkillCohortAggregate,
+        timestamp: []const u8,
+    ) !void {
+        if (aggregate.first_seen == null or compareNormalizedTimestamp(timestamp, aggregate.first_seen.?) == .lt) {
+            if (aggregate.first_seen) |old| allocator.free(old);
+            aggregate.first_seen = try allocator.dupe(u8, timestamp);
+        }
+        if (aggregate.last_seen == null or compareNormalizedTimestamp(timestamp, aggregate.last_seen.?) == .gt) {
+            if (aggregate.last_seen) |old| allocator.free(old);
+            aggregate.last_seen = try allocator.dupe(u8, timestamp);
+        }
+    }
+
+    fn cmdSkillCohortCohortMode(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+        const cohort_skill = opts.skill orelse return error.MissingSkillArg;
+        var where: std.ArrayList(spec.WhereClause) = .empty;
+        defer where.deinit(allocator);
+        const exclude_path = try appendSkillCohortFilters(allocator, sessions_root, &where, opts, false);
+        defer if (exclude_path) |path| allocator.free(path);
+        const base_query = spec.QuerySpec{
+            .where = where.items,
+            .select = skill_cohort_mention_columns[0..],
+            .sort = &.{.{ .field = "timestamp", .descending = false }},
+        };
+        if (opts.show_query) return writeGeneratedQuerySpec(allocator, "skill_mentions", base_query, opts.out_path);
+
+        var rows = try collectDatasetRowsForSpec(allocator, "skill_mentions", sessions_root, base_query);
+        defer deinitQueryRows(allocator, &rows);
+
+        var target_paths = StringSet.init(allocator);
+        defer target_paths.deinit();
+        for (rows.items) |row| {
+            const skill = scalarString(row.valueOrNull("skill")) orelse continue;
+            if (!std.mem.eql(u8, skill, cohort_skill)) continue;
+            const path = scalarString(row.valueOrNull("path")) orelse continue;
+            try target_paths.put(path);
+        }
+
+        var aggregates = std.StringHashMap(SkillCohortAggregate).init(allocator);
+        defer {
+            var it = aggregates.iterator();
+            while (it.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                entry.value_ptr.deinit(allocator);
+            }
+            aggregates.deinit();
+        }
+
+        for (rows.items) |row| {
+            const path = scalarString(row.valueOrNull("path")) orelse continue;
+            if (!target_paths.contains(path)) continue;
+            const skill = scalarString(row.valueOrNull("skill")) orelse continue;
+            const key = try allocator.dupe(u8, skill);
+            const gop = try aggregates.getOrPut(key);
+            if (gop.found_existing) {
+                allocator.free(key);
+            } else {
+                gop.value_ptr.* = SkillCohortAggregate.init(allocator);
+            }
+            gop.value_ptr.mentions += 1;
+            try gop.value_ptr.sessions.put(path);
+            if (scalarString(row.valueOrNull("timestamp"))) |timestamp| {
+                try updateSkillCohortTimestamp(allocator, gop.value_ptr, timestamp);
+            }
+        }
+
+        var out_rows: std.ArrayList(query.Row) = .empty;
+        defer deinitQueryRows(allocator, &out_rows);
+
+        var it = aggregates.iterator();
+        while (it.next()) |entry| {
+            var out = query.Row.init(allocator);
+            try out.putOwnedKey("cohort_skill", .{ .string = cohort_skill });
+            try out.putOwnedKey("skill", .{ .string = entry.key_ptr.* });
+            try out.putOwnedKey("mentions", .{ .int = entry.value_ptr.mentions });
+            try out.putOwnedKey("sessions", .{ .int = @intCast(entry.value_ptr.sessions.count()) });
+            try out.putOwnedKey("cohort_sessions", .{ .int = @intCast(target_paths.count()) });
+            if (entry.value_ptr.first_seen) |value| {
+                try out.putOwnedKey("first_seen", .{ .string = value });
+            } else {
+                try out.putOwnedKey("first_seen", .null);
+            }
+            if (entry.value_ptr.last_seen) |value| {
+                try out.putOwnedKey("last_seen", .{ .string = value });
+            } else {
+                try out.putOwnedKey("last_seen", .null);
+            }
+            try out_rows.append(allocator, out);
+        }
+
+        var result = try query.execute(allocator, out_rows.items, .{
+            .sort = &.{.{ .field = "mentions", .descending = true }},
+            .limit = queryLimit(opts, 50),
+        });
+        defer result.deinit(allocator);
+        try output.writeOutput(allocator, opts.format, result.rows.items, skill_cohort_columns[0..], opts.out_path);
+    }
+
+    fn cmdToolSearch(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+        const mode = opts.mode orelse "rows";
+        var where: std.ArrayList(spec.WhereClause) = .empty;
+        defer where.deinit(allocator);
+        try appendTimeBoundsForField(allocator, &where, "timestamp", opts);
+        const exclude_path = try appendCurrentSessionExclusion(allocator, sessions_root, &where, opts);
+        defer if (exclude_path) |path| allocator.free(path);
+        try appendOptionalStringEq(allocator, &where, "tool_name", opts.tool);
+        try appendOptionalStringEq(allocator, &where, "primary_executable", opts.executable_text);
+        try appendOptionalStringEq(allocator, &where, "workdir", opts.workdir_text);
+        try appendOptionalContains(allocator, &where, "command_text", opts.contains);
+        try appendOptionalRegex(allocator, &where, "command_text", opts.regex);
+
+        if (std.mem.eql(u8, mode, "rows")) {
+            const query_spec = spec.QuerySpec{
+                .where = where.items,
+                .select = tool_search_row_columns[0..],
+                .sort = &.{.{ .field = "timestamp", .descending = true }},
+                .limit = queryLimit(opts, 50),
+            };
+            return runQueryLiftDataset(allocator, "tool_invocations", sessions_root, query_spec, opts, tool_search_row_columns[0..]);
+        }
+
+        if (std.mem.eql(u8, mode, "summary")) {
+            const group_field = try toolAuditGroupField(opts.group_by_text);
+            const group_by = [_][]const u8{group_field};
+            var columns = [_][]const u8{ group_field, "calls", "sessions", "avg_wall_ms", "max_wall_ms" };
+            const query_spec = spec.QuerySpec{
+                .where = where.items,
+                .group_by = group_by[0..],
+                .metrics = &.{
+                    .{ .op = .count, .alias = "calls" },
+                    .{ .op = .count_distinct, .field = "session_id", .alias = "sessions" },
+                    .{ .op = .avg, .field = "wall_time_ms", .alias = "avg_wall_ms" },
+                    .{ .op = .max, .field = "wall_time_ms", .alias = "max_wall_ms" },
+                },
+                .sort = &.{.{ .field = "calls", .descending = true }},
+                .limit = queryLimit(opts, 20),
+            };
+            return runQueryLiftDataset(allocator, "tool_invocations", sessions_root, query_spec, opts, columns[0..]);
+        }
+
+        if (std.mem.eql(u8, mode, "args")) {
+            var arg_where: std.ArrayList(spec.WhereClause) = .empty;
+            defer arg_where.deinit(allocator);
+            try appendTimeBoundsForField(allocator, &arg_where, "timestamp", opts);
+            const arg_exclude_path = try appendCurrentSessionExclusion(allocator, sessions_root, &arg_where, opts);
+            defer if (arg_exclude_path) |path| allocator.free(path);
+            try appendOptionalStringEq(allocator, &arg_where, "tool_name", opts.tool);
+            try appendOptionalContains(allocator, &arg_where, "value_text", opts.contains);
+            try appendOptionalRegex(allocator, &arg_where, "value_text", opts.regex);
+            const query_spec = spec.QuerySpec{
+                .where = arg_where.items,
+                .group_by = &.{ "tool_name", "arg_path", "value_kind", "value_text" },
+                .metrics = &.{.{ .op = .count, .alias = "count" }},
+                .sort = &.{.{ .field = "count", .descending = true }},
+                .limit = queryLimit(opts, 50),
+            };
+            return runQueryLiftDataset(allocator, "tool_call_args", sessions_root, query_spec, opts, tool_search_arg_columns[0..]);
+        }
+
+        return error.InvalidModeArg;
+    }
+
+    fn buildMemoryExtensionQuery(
+        allocator: std.mem.Allocator,
+        opts: Options,
+        mode: []const u8,
+        where: *std.ArrayList(spec.WhereClause),
+        params: *std.ArrayList(spec.ParamSpec),
+    ) !spec.QuerySpec {
+        try appendMemoryParams(allocator, params, opts, false);
+        try appendOptionalContains(allocator, where, "extension_name", opts.contains);
+        try appendOptionalRegex(allocator, where, "extension_name", opts.regex);
+        if (std.mem.eql(u8, mode, "rows")) {
+            return .{
+                .where = where.items,
+                .params = params.items,
+                .select = memory_inventory_extension_columns[0..],
+                .sort = &.{.{ .field = "extension_name", .descending = false }},
+                .limit = queryLimit(opts, 100),
+            };
+        }
+        return .{
+            .where = where.items,
+            .params = params.items,
+            .select = memory_inventory_extension_columns[0..],
+            .sort = &.{.{ .field = "extension_name", .descending = false }},
+        };
+    }
+
+    fn cmdMemoryExtensionAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+        const mode = opts.mode orelse "rows";
+        var where: std.ArrayList(spec.WhereClause) = .empty;
+        defer where.deinit(allocator);
+        var params: std.ArrayList(spec.ParamSpec) = .empty;
+        defer params.deinit(allocator);
+        const query_spec = try buildMemoryExtensionQuery(allocator, opts, mode, &where, &params);
+        if (opts.show_query) return writeGeneratedQuerySpec(allocator, "memory_extensions", query_spec, opts.out_path);
+
+        var collected = try collectDatasetRowsForSpec(allocator, "memory_extensions", sessions_root, query_spec);
+        defer deinitQueryRows(allocator, &collected);
+
+        var result = try query.execute(allocator, collected.items, query_spec);
+        defer result.deinit(allocator);
+
+        if (std.mem.eql(u8, mode, "rows")) {
+            var out_rows: std.ArrayList(query.Row) = .empty;
+            defer deinitQueryRows(allocator, &out_rows);
+            for (result.rows.items) |row| {
+                var out = try row.cloneSelected(allocator, memory_inventory_extension_columns[0..]);
+                errdefer out.deinit();
+                try out.putOwnedKey("provenance_status", .{ .string = "inventory_only" });
+                try out.putOwnedKey("causality_claimed", .{ .bool = false });
+                try out_rows.append(allocator, out);
+            }
+            return output.writeOutput(allocator, opts.format, out_rows.items, memory_extension_row_columns[0..], opts.out_path);
+        }
+
+        if (std.mem.eql(u8, mode, "summary")) {
+            var extensions: i64 = 0;
+            var with_instructions: i64 = 0;
+            var total_bytes: i64 = 0;
+            for (result.rows.items) |row| {
+                extensions += 1;
+                switch (row.valueOrNull("has_instructions")) {
+                    .bool => |flag| {
+                        if (flag) with_instructions += 1;
+                    },
+                    else => {},
+                }
+                switch (row.valueOrNull("size_bytes")) {
+                    .int => |n| total_bytes += n,
+                    else => {},
+                }
+            }
+            var out_rows: std.ArrayList(query.Row) = .empty;
+            defer deinitQueryRows(allocator, &out_rows);
+            var out = query.Row.init(allocator);
+            try out.putOwnedKey("row_kind", .{ .string = "summary" });
+            try out.putOwnedKey("extensions", .{ .int = extensions });
+            try out.putOwnedKey("with_instructions", .{ .int = with_instructions });
+            try out.putOwnedKey("without_instructions", .{ .int = extensions - with_instructions });
+            try out.putOwnedKey("total_bytes", .{ .int = total_bytes });
+            try out.putOwnedKey("provenance_status", .{ .string = "inventory_only" });
+            try out.putOwnedKey("causality_claimed", .{ .bool = false });
+            try out_rows.append(allocator, out);
+            return output.writeOutput(allocator, opts.format, out_rows.items, memory_extension_summary_columns[0..], opts.out_path);
+        }
+
+        return error.InvalidModeArg;
+    }
+
+    const TokenWindowPoint = struct {
+        row_index: usize,
+        timestamp: []const u8,
+        timestamp_ms: i64,
+        delta_total_tokens: i64,
+        path: []const u8,
+    };
+
+    fn tokenWindowPointLess(_: void, lhs: TokenWindowPoint, rhs: TokenWindowPoint) bool {
+        if (lhs.timestamp_ms == rhs.timestamp_ms) return std.mem.order(u8, lhs.path, rhs.path) == .lt;
+        return lhs.timestamp_ms < rhs.timestamp_ms;
+    }
+
+    const TokenWindowBest = struct {
+        left: usize = 0,
+        right: usize = 0,
+        total_tokens: i64 = 0,
+        rows: usize = 0,
+    };
+
+    fn computeBestTokenWindow(points: []const TokenWindowPoint, window_ms: i64) TokenWindowBest {
+        var best = TokenWindowBest{};
+        if (points.len == 0) return best;
+        var left: usize = 0;
+        var total: i64 = 0;
+        for (points, 0..) |point, right| {
+            total += point.delta_total_tokens;
+            while (left <= right and point.timestamp_ms - points[left].timestamp_ms >= window_ms) {
+                total -= points[left].delta_total_tokens;
+                left += 1;
+            }
+            const row_count = right - left + 1;
+            if (row_count > 0 and (best.rows == 0 or total > best.total_tokens)) {
+                best = .{
+                    .left = left,
+                    .right = right,
+                    .total_tokens = total,
+                    .rows = row_count,
+                };
+            }
+        }
+        return best;
+    }
+
+    fn tokenWindowPathCount(allocator: std.mem.Allocator, points: []const TokenWindowPoint, best: TokenWindowBest) !usize {
+        if (best.rows == 0) return 0;
+        var paths = StringSet.init(allocator);
+        defer paths.deinit();
+        var idx = best.left;
+        while (idx <= best.right) : (idx += 1) {
+            try paths.put(points[idx].path);
+        }
+        return paths.count();
+    }
+
+    fn cmdTokenWindow(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+        const mode = opts.mode orelse "summary";
+        if (opts.window_hours > @divFloor(std.math.maxInt(i64), 3_600_000)) return error.InvalidLimit;
+        const window_ms = opts.window_hours * 3_600_000;
+
+        var where: std.ArrayList(spec.WhereClause) = .empty;
+        defer where.deinit(allocator);
+        try appendTimeBoundsForField(allocator, &where, "timestamp", opts);
+        const path_filter = if (opts.path) |path| try toAbsolutePath(allocator, path) else null;
+        defer if (path_filter) |path| allocator.free(path);
+        try appendOptionalStringEq(allocator, &where, "path", path_filter);
+        const exclude_path = try appendCurrentSessionExclusion(allocator, sessions_root, &where, opts);
+        defer if (exclude_path) |path| allocator.free(path);
+        const query_spec = spec.QuerySpec{
+            .where = where.items,
+            .select = token_window_row_columns[0..],
+            .sort = &.{.{ .field = "timestamp", .descending = false }},
+        };
+        if (opts.show_query) return writeGeneratedQuerySpec(allocator, "token_deltas", query_spec, opts.out_path);
+
+        var collected = try collectDatasetRowsForSpec(allocator, "token_deltas", sessions_root, query_spec);
+        defer deinitQueryRows(allocator, &collected);
+
+        var filtered = try query.execute(allocator, collected.items, query_spec);
+        defer filtered.deinit(allocator);
+
+        var points: std.ArrayList(TokenWindowPoint) = .empty;
+        defer points.deinit(allocator);
+        for (filtered.rows.items, 0..) |row, idx| {
+            const timestamp = scalarString(row.valueOrNull("timestamp")) orelse continue;
+            const timestamp_ms = time_utils.parseIsoTimestampMillis(timestamp) orelse continue;
+            const delta = switch (row.valueOrNull("delta_total_tokens")) {
+                .int => |value| value,
+                else => continue,
+            };
+            const path = scalarString(row.valueOrNull("path")) orelse "";
+            try points.append(allocator, .{
+                .row_index = idx,
+                .timestamp = timestamp,
+                .timestamp_ms = timestamp_ms,
+                .delta_total_tokens = delta,
+                .path = path,
+            });
+        }
+        std.mem.sort(TokenWindowPoint, points.items, {}, tokenWindowPointLess);
+        const best = computeBestTokenWindow(points.items, window_ms);
+
+        if (std.mem.eql(u8, mode, "rows")) {
+            var out_rows: std.ArrayList(query.Row) = .empty;
+            defer deinitQueryRows(allocator, &out_rows);
+            if (best.rows > 0) {
+                var idx = best.left;
+                while (idx <= best.right) : (idx += 1) {
+                    const source = filtered.rows.items[points.items[idx].row_index];
+                    try out_rows.append(allocator, try source.cloneSelected(allocator, token_window_row_columns[0..]));
+                }
+            }
+            return output.writeOutput(allocator, opts.format, out_rows.items, token_window_row_columns[0..], opts.out_path);
+        }
+
+        if (std.mem.eql(u8, mode, "summary")) {
+            const path_count = try tokenWindowPathCount(allocator, points.items, best);
+            var out_rows: std.ArrayList(query.Row) = .empty;
+            defer deinitQueryRows(allocator, &out_rows);
+            var out = query.Row.init(allocator);
+            try out.putOwnedKey("window_hours", .{ .int = opts.window_hours });
+            if (best.rows > 0) {
+                const start = points.items[best.left].timestamp;
+                const observed_end = points.items[best.right].timestamp;
+                try out.putOwnedKey("window_start", .{ .string = start });
+                try out.putOwnedKey("window_end", .{ .string = observed_end });
+                try out.putOwnedKey("observed_end", .{ .string = observed_end });
+            } else {
+                try out.putOwnedKey("window_start", .null);
+                try out.putOwnedKey("window_end", .null);
+                try out.putOwnedKey("observed_end", .null);
+            }
+            try out.putOwnedKey("total_tokens", .{ .int = best.total_tokens });
+            try out.putOwnedKey("rows", .{ .int = @intCast(best.rows) });
+            try out.putOwnedKey("path_count", .{ .int = @intCast(path_count) });
+            try out.putOwnedKey("source_dataset", .{ .string = "token_deltas" });
+            try out.putOwnedKey("sorted_by", .{ .string = "timestamp_ascending" });
+            if (opts.since) |value| {
+                try out.putOwnedKey("since", .{ .string = value });
+            } else {
+                try out.putOwnedKey("since", .null);
+            }
+            if (opts.until) |value| {
+                try out.putOwnedKey("until", .{ .string = value });
+            } else {
+                try out.putOwnedKey("until", .null);
+            }
+            try out_rows.append(allocator, out);
+            return output.writeOutput(allocator, opts.format, out_rows.items, token_window_summary_columns[0..], opts.out_path);
+        }
+
+        return error.InvalidModeArg;
     }
 
     fn cmdWorkdirReport(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
@@ -2717,7 +3582,7 @@ const QueryLiftCommands = struct {
                 .sort = &.{.{ .field = "sessions", .descending = true }},
                 .limit = queryLimit(opts, 50),
             };
-            return runDatasetQuery(allocator, "sessions", sessions_root, query_spec, opts.format, opts.out_path, workdir_report_summary_columns[0..]);
+            return runQueryLiftDataset(allocator, "sessions", sessions_root, query_spec, opts, workdir_report_summary_columns[0..]);
         }
 
         if (std.mem.eql(u8, mode, "sessions")) {
@@ -2727,7 +3592,7 @@ const QueryLiftCommands = struct {
                 .sort = &.{.{ .field = "start_time", .descending = true }},
                 .limit = queryLimit(opts, 50),
             };
-            return runDatasetQuery(allocator, "sessions", sessions_root, query_spec, opts.format, opts.out_path, workdir_report_session_columns[0..]);
+            return runQueryLiftDataset(allocator, "sessions", sessions_root, query_spec, opts, workdir_report_session_columns[0..]);
         }
 
         return error.InvalidModeArg;
@@ -9831,6 +10696,10 @@ fn parseOptions(args: []const []const u8) !Options {
             opts.summary = true;
         } else if (std.mem.eql(u8, arg, "--audit")) {
             opts.audit = true;
+        } else if (std.mem.eql(u8, arg, "--show-query")) {
+            opts.show_query = true;
+        } else if (std.mem.eql(u8, arg, "--exclude-current")) {
+            opts.exclude_current = true;
         } else if (std.mem.eql(u8, arg, "--next-actions")) {
             opts.next_actions = true;
         } else if (std.mem.eql(u8, arg, "--latest")) {
@@ -9877,6 +10746,12 @@ fn parseOptions(args: []const []const u8) !Options {
             const n = try std.fmt.parseInt(i64, args[i], 10);
             if (n < 1) return error.InvalidLimit;
             opts.threshold_ms = n;
+        } else if (std.mem.eql(u8, arg, "--window-hours")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            const n = try std.fmt.parseInt(i64, args[i], 10);
+            if (n < 1) return error.InvalidLimit;
+            opts.window_hours = n;
         } else if (std.mem.eql(u8, arg, "--worker-kind")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -10509,12 +11384,16 @@ test "parse options supports common flags" {
         "--no-dedupe-exact",
         "--summary",
         "--audit",
+        "--show-query",
+        "--exclude-current",
         "--next-actions",
         "--current",
         "--latest",
         "--strict-hang",
         "--threshold-ms",
         "12000",
+        "--window-hours",
+        "6",
         "--fail-on-hang",
         "--help",
     };
@@ -10557,11 +11436,14 @@ test "parse options supports common flags" {
     try std.testing.expect(opts.no_dedupe_exact);
     try std.testing.expect(opts.summary);
     try std.testing.expect(opts.audit);
+    try std.testing.expect(opts.show_query);
+    try std.testing.expect(opts.exclude_current);
     try std.testing.expect(opts.next_actions);
     try std.testing.expect(opts.current);
     try std.testing.expect(opts.latest);
     try std.testing.expect(opts.strict_hang);
     try std.testing.expectEqual(@as(i64, 12000), opts.threshold_ms);
+    try std.testing.expectEqual(@as(i64, 6), opts.window_hours);
     try std.testing.expect(opts.fail_on_hang);
     try std.testing.expect(opts.help);
 }
@@ -11354,12 +12236,15 @@ test "query-lift commands run representative dataset wrappers" {
 
     try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/03/05");
     try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "memories/rollout_summaries");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "memories/extensions/querylift");
     const session_content =
         "{\"timestamp\":\"2026-03-05T09:59:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019c0000-0000-7000-8000-000000000101\",\"cwd\":\"/tmp/query-lift-repo\",\"model\":\"gpt-test\"}}\n" ++
-        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Find this query lift needle\\n<skill>\\n<name>seq</name>\\n</skill>\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Find this query lift needle with $plan\\n<skill>\\n<name>seq</name>\\n</skill>\"}]}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Using seq\"}]}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:00:02Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"q1\",\"arguments\":\"{\\\"cmd\\\":\\\"seq query --spec @spec.json\\\",\\\"workdir\\\":\\\"/tmp/query-lift-repo\\\"}\"}}\n" ++
-        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:00:03Z\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"q1\",\"output\":\"Chunk ID: aa\\nWall time: 0.120 seconds\\nProcess exited with code 0\\nOutput:\\n\"}}\n";
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:00:03Z\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"q1\",\"output\":\"Chunk ID: aa\\nWall time: 0.120 seconds\\nProcess exited with code 0\\nOutput:\\n\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-05T10:00:04Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":10}}}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-05T10:30:04Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":25}}}}\n";
     try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
         .sub_path = "sessions/2026/03/05/rollout-2026-03-05T00-00-00-019c0000-0000-7000-8000-000000000101.jsonl",
         .data = session_content,
@@ -11371,6 +12256,10 @@ test "query-lift commands run representative dataset wrappers" {
     try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
         .sub_path = "memories/rollout_summaries/query-lift.md",
         .data = "# Query Lift Rollout\n\nrollout_path=/tmp/query-lift.jsonl\n",
+    });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "memories/extensions/querylift/instructions.md",
+        .data = "# Query Lift Extension\n",
     });
 
     const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
@@ -11419,6 +12308,55 @@ test "query-lift commands run representative dataset wrappers" {
     defer std.testing.allocator.free(workdir_got);
     try std.testing.expect(std.mem.indexOf(u8, workdir_got, "\"cwd\": \"/tmp/query-lift-repo\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, workdir_got, "\"sessions\": 1") != null);
+
+    const message_audit_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "message-audit.json" });
+    defer std.testing.allocator.free(message_audit_out);
+    const message_audit_args = [_][]const u8{ "--root", sessions_abs, "--contains", "query lift needle", "--format", "json" };
+    const message_audit_got = try runCommandWithOutput(std.testing.allocator, .message_audit, message_audit_args[0..], message_audit_out);
+    defer std.testing.allocator.free(message_audit_got);
+    try std.testing.expect(std.mem.indexOf(u8, message_audit_got, "\"messages\": 1") != null);
+
+    const skill_cohort_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "skill-cohort.json" });
+    defer std.testing.allocator.free(skill_cohort_out);
+    const skill_cohort_args = [_][]const u8{ "--root", sessions_abs, "--skill", "seq", "--format", "json" };
+    const skill_cohort_got = try runCommandWithOutput(std.testing.allocator, .skill_cohort, skill_cohort_args[0..], skill_cohort_out);
+    defer std.testing.allocator.free(skill_cohort_got);
+    try std.testing.expect(std.mem.indexOf(u8, skill_cohort_got, "\"cohort_skill\": \"seq\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skill_cohort_got, "\"skill\": \"seq\"") != null);
+
+    const tool_search_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "tool-search.json" });
+    defer std.testing.allocator.free(tool_search_out);
+    const tool_search_args = [_][]const u8{ "--root", sessions_abs, "--contains", "seq query", "--format", "json" };
+    const tool_search_got = try runCommandWithOutput(std.testing.allocator, .tool_search, tool_search_args[0..], tool_search_out);
+    defer std.testing.allocator.free(tool_search_got);
+    try std.testing.expect(std.mem.indexOf(u8, tool_search_got, "\"primary_executable\": \"seq\"") != null);
+
+    const extension_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "memory-extension-audit.json" });
+    defer std.testing.allocator.free(extension_out);
+    const extensions_abs = try std.fs.path.join(std.testing.allocator, &.{ memories_abs, "extensions" });
+    defer std.testing.allocator.free(extensions_abs);
+    const extension_args = [_][]const u8{ "--extensions-root", extensions_abs, "--mode", "rows", "--format", "json" };
+    const extension_got = try runCommandWithOutput(std.testing.allocator, .memory_extension_audit, extension_args[0..], extension_out);
+    defer std.testing.allocator.free(extension_got);
+    try std.testing.expect(std.mem.indexOf(u8, extension_got, "\"extension_name\": \"querylift\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, extension_got, "\"provenance_status\": \"inventory_only\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, extension_got, "\"causality_claimed\": false") != null);
+
+    const token_window_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "token-window.json" });
+    defer std.testing.allocator.free(token_window_out);
+    const token_window_args = [_][]const u8{ "--root", sessions_abs, "--window-hours", "1", "--format", "json" };
+    const token_window_got = try runCommandWithOutput(std.testing.allocator, .token_window, token_window_args[0..], token_window_out);
+    defer std.testing.allocator.free(token_window_got);
+    try std.testing.expect(std.mem.indexOf(u8, token_window_got, "\"source_dataset\": \"token_deltas\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, token_window_got, "\"total_tokens\": 25") != null);
+
+    const show_query_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "show-query.json" });
+    defer std.testing.allocator.free(show_query_out);
+    const show_query_args = [_][]const u8{ "--root", sessions_abs, "--contains", "query lift needle", "--show-query", "--format", "json" };
+    const show_query_got = try runCommandWithOutput(std.testing.allocator, .message_audit, show_query_args[0..], show_query_out);
+    defer std.testing.allocator.free(show_query_got);
+    try std.testing.expect(std.mem.indexOf(u8, show_query_got, "\"dataset\": \"messages\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, show_query_got, "\"field\":\"text\"") != null);
 }
 
 test "skill-blocks distinct returns one aggregated version with metadata" {
