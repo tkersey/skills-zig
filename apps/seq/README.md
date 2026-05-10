@@ -35,10 +35,13 @@ Binary output:
 ./zig-out/bin/seq dataset-schema --dataset opencode_sessions
 ./zig-out/bin/seq dataset-schema --dataset tool_invocations
 ./zig-out/bin/seq dataset-schema --dataset tool_call_args
+./zig-out/bin/seq dataset-schema --dataset workflow_signals
 ./zig-out/bin/seq role-breakdown --root ~/.codex/sessions --since 2026-03-01T00:00:00Z --format table
 ./zig-out/bin/seq query --spec '{"dataset":"tool_calls","group_by":["tool"],"metrics":[{"op":"count","as":"count"}],"sort":["-count"],"limit":10,"format":"json"}'
 ./zig-out/bin/seq query --root ~/.codex/sessions --spec '{"dataset":"tool_invocations","where":[{"field":"command_text","op":"contains","value":"learnings recall"}],"select":["path","tool_name","command_text","workdir"],"sort":["timestamp"],"limit":5,"format":"table"}'
 ./zig-out/bin/seq query --root ~/.codex/sessions --spec '{"dataset":"tool_call_args","where":[{"field":"tool_name","op":"eq","value":"exec_command"},{"field":"arg_path","op":"eq","value":"workdir"}],"select":["path","arg_path","value_text"],"sort":["timestamp"],"limit":5,"format":"table"}'
+./zig-out/bin/seq workflow-audit --workflow fixed-point-driver --since 2026-04-01T00:00:00Z --format table
+./zig-out/bin/seq workflow-audit --workflow fixed-point-driver --mode report --format markdown
 ./zig-out/bin/seq find-session --root ~/.codex/sessions --prompt "learnings recall" --since 2026-03-08T00:00:00Z --until 2026-03-10T23:59:59Z --limit 5 --format table
 ./zig-out/bin/seq plan-search --root ~/.codex/sessions --repo /Users/tk/workspace/tk/shift --since 2026-03-01T00:00:00Z --format table
 ./zig-out/bin/seq plan-search --root ~/.codex/sessions --repo /Users/tk/workspace/tk/shift --contains "PromptMode" --stats --format jsonl
@@ -76,6 +79,24 @@ Binary output:
 
 `query.where.op` supports `contains_any` and `regex_any` in addition to `contains` and `regex`.
 `regex` uses a fast regex-like subset (`^`, `$`, `|`) and fails fast on unsupported constructs.
+`query.joins` supports session-local enrichment without shell/Python post-processing. Each join entry names a `dataset`, `left` field, `right` field, optional `type` (`inner` or `left`), optional `prefix`, optional `where`, and optional `params`.
+
+Example join:
+```bash
+seq query --root ~/.codex/sessions --spec '{"dataset":"messages","joins":[{"dataset":"sessions","left":"path","right":"path","type":"left","prefix":"session"}],"where":[{"field":"text","op":"contains","value":"fixed-point-driver"}],"select":["timestamp","role","session.cwd","text"],"limit":20,"format":"table"}'
+```
+
+`workflow-audit` is the high-level surface for workflow utilization reports:
+- selects sessions by exact `$workflow` / skill mention after stripping injected skill blocks
+- preserves signal source breakdown (`user_prompt`, `assistant_text`, `tool_trace`, `session_graph`)
+- emits `summary`, `signals`, `outcomes`, `sessions`, or `report` modes
+- supports `--since`, `--until`, `--workdir`, `--limit`, and `--format table|json|markdown`
+
+Examples:
+```bash
+seq workflow-audit --root ~/.codex/sessions --workflow fixed-point-driver --mode summary --since 2026-04-01T00:00:00Z --format table
+seq workflow-audit --root ~/.codex/sessions --workflow fixed-point-driver --mode report --since 2026-04-01T00:00:00Z --format markdown
+```
 
 ## Trace-native session surfaces
 
@@ -152,6 +173,7 @@ seq query --root ~/.codex/sessions --spec '{"dataset":"session_graph_edges","sel
 
 Query-lift commands provide top-level shortcuts for common `seq query` shapes:
 - `skill-audit` summarizes `skill_mentions` by skill, emits mention rows, or produces a daily trend for one skill.
+- `workflow-audit` summarizes workflow cohorts across session text, skill mentions, tool traces, session graph roles, and outcome signals.
 - `tool-audit` summarizes `tool_invocations` by tool, executable, session, workdir, or command, with row and unresolved modes for drilling down.
 - `memory-inventory` summarizes file-backed memory categories and can switch to file, block, stage1, or extension inventory modes.
 - `message-search` searches session message text with `--contains`, `--regex`, `--contains-any`, or `--contains-all`.
@@ -237,6 +259,13 @@ Floor flags:
 `tool_calls` remains the compatibility dataset:
 - existing fields stay intact
 - additive fields now include raw argument/input text plus high-value derived fields such as `command_text`, `primary_executable`, and `workdir`
+
+`workflow_signals` is the normalized workflow-analysis dataset:
+- text-derived workflow mentions from `$name` tokens after injected skill blocks are stripped
+- skill mentions from the same cleaned session text path
+- outcome signals for tests, proof, commits, PRs, blocked/error states, and closure language
+- tool-call signals from lifecycle-enriched invocations
+- agent-role signals from the session graph
 
 `session-tooling` summarizes shell/tool invocation behavior from rollout JSONL:
 - raw mode (default) emits per-invocation rows with `command_text`, `primary_executable`, `workdir`, call lifecycle, and runtime markers
