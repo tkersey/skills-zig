@@ -1986,7 +1986,7 @@ fn cmdWorkflowAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opt
     var rows = try collectWorkflowAuditRows(allocator, sessions_root, opts);
     defer deinitQueryRows(allocator, &rows);
 
-    if (fmt == .markdown) {
+    if (fmt == .markdown and std.mem.eql(u8, mode, "report")) {
         try writeWorkflowAuditMarkdown(allocator, workflow, rows.items, opts.out_path);
         return;
     }
@@ -1994,6 +1994,11 @@ fn cmdWorkflowAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opt
     const query_spec = try workflowAuditQueryForMode(mode, opts.limit);
     var result = try query.execute(allocator, rows.items, query_spec);
     defer result.deinit(allocator);
+
+    if (fmt == .markdown) {
+        try writeWorkflowAuditModeMarkdown(allocator, workflow, mode, result.rows.items, workflowAuditColumnsForMode(mode) orelse return error.InvalidModeArg, opts.out_path);
+        return;
+    }
 
     try output.writeOutput(allocator, fmt, result.rows.items, workflowAuditColumnsForMode(mode), opts.out_path);
 }
@@ -2207,6 +2212,26 @@ fn writeWorkflowAuditMarkdownSection(
     defer result.deinit(allocator);
 
     try writeMarkdownTable(writer, result.rows.items, workflowAuditColumnsForMode(mode) orelse &.{});
+}
+
+fn writeWorkflowAuditModeMarkdown(
+    allocator: std.mem.Allocator,
+    workflow: []const u8,
+    mode: []const u8,
+    rows: []const query.Row,
+    columns: []const []const u8,
+    out_path: ?[]const u8,
+) !void {
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+
+    try writer.print("# seq workflow-audit: {s} ({s})\n\n", .{ workflow, mode });
+    try writeMarkdownTable(writer, rows, columns);
+
+    const rendered = try writer_alloc.toOwnedSlice();
+    defer allocator.free(rendered);
+    try writeTextOutput(rendered, out_path);
 }
 
 fn writeMarkdownTable(writer: anytype, rows: []const query.Row, columns: []const []const u8) !void {
@@ -10866,6 +10891,15 @@ test "workflow-audit reports a workflow cohort without cross-session contaminati
         defer std.testing.allocator.free(got);
         const first_timestamp = std.mem.indexOf(u8, got, "\"timestamp\"") orelse return error.TestUnexpectedResult;
         try std.testing.expect(std.mem.indexOfPos(u8, got, first_timestamp + 1, "\"timestamp\"") == null);
+    }
+
+    {
+        const got = try runCommandWithOutput(std.testing.allocator, .workflow_audit, &.{ "--root", root_abs, "--workflow", "fixed-point-driver", "--mode", "signals", "--format", "markdown", "--limit", "1" }, output_path);
+        defer std.testing.allocator.free(got);
+        try std.testing.expect(std.mem.indexOf(u8, got, "# seq workflow-audit: fixed-point-driver (signals)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "## Outcomes") == null);
+        const first_row = std.mem.indexOf(u8, got, "| 2026-") orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.indexOfPos(u8, got, first_row + 1, "| 2026-") == null);
     }
 }
 
