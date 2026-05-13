@@ -36,6 +36,10 @@ if ! "$BIN_PATH" --help | rg -q '^- query-diagnose$'; then
   echo "required command missing: query-diagnose" >&2
   exit 1
 fi
+if ! "$BIN_PATH" --help | rg -q '^- goal-audit$'; then
+  echo "required command missing: goal-audit" >&2
+  exit 1
+fi
 if ! "$BIN_PATH" --help | rg -q '^- artifact-search$'; then
   echo "required command missing: artifact-search" >&2
   exit 1

@@ -44,6 +44,7 @@ pub const Command = enum {
     memory_history,
     opencode_prompts,
     opencode_events,
+    goal_audit,
     unknown,
 };
 
@@ -82,6 +83,7 @@ const command_defs = [_]CommandDef{
     .{ .name = "datasets", .cmd = .datasets },
     .{ .name = "dataset-schema", .cmd = .dataset_schema },
     .{ .name = "query", .cmd = .query },
+    .{ .name = "goal-audit", .cmd = .goal_audit },
     .{ .name = "workflow-audit", .cmd = .workflow_audit },
     .{ .name = "session-tooling", .cmd = .session_tooling },
     .{ .name = "query-diagnose", .cmd = .query_diagnose },
