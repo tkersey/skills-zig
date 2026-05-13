@@ -17,6 +17,7 @@ comptime {
     _ = @import("datasets/token_events.zig");
     _ = @import("datasets/token_deltas.zig");
     _ = @import("datasets/token_sessions.zig");
+    _ = @import("token_cost.zig");
     _ = @import("datasets/tool_calls.zig");
     _ = @import("datasets/memory_files.zig");
     _ = @import("datasets/memory_blocks.zig");
@@ -60,6 +61,7 @@ test "bootstrap parse coverage" {
     try std.testing.expectEqual(lib.Command.report_bundle, lib.parseCommand("report-bundle"));
     try std.testing.expectEqual(lib.Command.section_audit, lib.parseCommand("section-audit"));
     try std.testing.expectEqual(lib.Command.token_usage, lib.parseCommand("token-usage"));
+    try std.testing.expectEqual(lib.Command.token_cost, lib.parseCommand("token-cost"));
     try std.testing.expectEqual(lib.Command.routing_gap, lib.parseCommand("routing-gap"));
     try std.testing.expectEqual(lib.Command.datasets, lib.parseCommand("datasets"));
     try std.testing.expectEqual(lib.Command.dataset_schema, lib.parseCommand("dataset-schema"));
