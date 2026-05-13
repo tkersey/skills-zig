@@ -197,6 +197,34 @@ pub const dataset_meta = [_]DatasetMeta{
         .fields = &.{ "path", "session_id", "timestamp", "role", "source_kind", "signal_kind", "name", "outcome_kind", "snippet", "contamination_flags" },
     },
     .{
+        .name = "goal_runs",
+        .description = "One row per Codex /goal run observed through goal tool outputs",
+        .fields = &.{
+            "path",
+            "session_id",
+            "thread_id",
+            "timestamp",
+            "day",
+            "week",
+            "month",
+            "objective",
+            "objective_kind",
+            "status",
+            "created_at",
+            "updated_at",
+            "time_used_seconds",
+            "tokens_used",
+            "remaining_tokens",
+            "completion_budget_report",
+            "review_invocation_count",
+            "has_review_objective",
+            "has_resolve_objective",
+            "missing_duration",
+            "parse_error",
+            "contamination_flags",
+        },
+    },
+    .{
         .name = "memory_files",
         .description = "File-based memories under ~/.codex/memories",
         .fields = &.{ "path", "relative_path", "name", "category", "extension", "size_bytes", "modified_at", "preview" },
@@ -426,6 +454,7 @@ const Options = struct {
     floor_threshold: i64 = 3,
     threshold_ms: i64 = 10_000,
     window_hours: i64 = 24,
+    duration_gte_seconds: ?i64 = null,
     poll_ms: i64 = 500,
     debounce_ms: i64 = 300,
     workflow: ?[]const u8 = null,
@@ -477,6 +506,7 @@ pub fn run(
         .datasets => try cmdDatasets(allocator, opts),
         .dataset_schema => try cmdDatasetSchema(allocator, opts),
         .query => try cmdQuery(allocator, sessions_root, opts),
+        .goal_audit => try QueryLiftCommands.cmdGoalAudit(allocator, sessions_root, opts),
         .workflow_audit => try cmdWorkflowAudit(allocator, sessions_root, opts),
         .session_tooling => try cmdSessionTooling(allocator, sessions_root, opts),
         .query_diagnose => try cmdQueryDiagnose(allocator, sessions_root, opts),
@@ -624,6 +654,9 @@ fn printCommandHelp(cmd: lib.Command) !void {
         .query =>
         \\usage: seq query --spec <json|@path>
         ,
+        .goal_audit =>
+        \\usage: seq goal-audit [--mode summary|rows] [--workflow review|resolve|review,resolve] [--duration-gte <seconds|minutes|hours>] [--status <name>] [--contains <text>] [--since <iso>] [--until <iso>] [--path <jsonl>|--session-id <id>] [--exclude-current] [--show-query] [--limit N] [--format table|json|csv|jsonl]
+        ,
         .workflow_audit =>
         \\usage: seq workflow-audit --workflow <name> [--mode summary|signals|outcomes|sessions|report] [--since <iso>] [--until <iso>] [--workdir <path>] [--limit N] [--format table|json|markdown]
         ,
@@ -694,6 +727,14 @@ fn ensureOptionAllowed(flag_set: bool, allowed: bool, option: []const u8, cmd: l
     }
 }
 
+fn commandSupportsSummary(cmd: lib.Command) bool {
+    const name = @tagName(cmd);
+    return std.mem.eql(u8, name, "session_tooling") or
+        std.mem.eql(u8, name, "query_diagnose") or
+        std.mem.eql(u8, name, "token_usage") or
+        std.mem.eql(u8, name, "goal_audit");
+}
+
 fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
     switch (cmd) {
         .skills_rank, .skill_trend, .skill_report, .role_breakdown, .report_bundle, .section_audit, .datasets, .dataset_schema => {
@@ -718,7 +759,7 @@ fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
             if (fmt == .csv or fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
         .query => {},
-        .artifact_search, .tool_audit, .memory_inventory, .message_search, .message_audit, .skill_cohort, .tool_search, .memory_extension_audit, .token_window, .workdir_report, .orchestration_concurrency, .find_session, .plan_search, .reply_latency, .session_prompts, .token_usage, .routing_gap, .session_tooling, .query_diagnose, .memory_provenance, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .skill_audit => {
+        .artifact_search, .tool_audit, .memory_inventory, .message_search, .message_audit, .skill_cohort, .tool_search, .memory_extension_audit, .token_window, .workdir_report, .orchestration_concurrency, .find_session, .plan_search, .reply_latency, .session_prompts, .token_usage, .routing_gap, .session_tooling, .query_diagnose, .memory_provenance, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .skill_audit, .goal_audit => {
             if (fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
         .unknown => return error.InvalidCommand,
@@ -730,10 +771,6 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_roles_csv = cmd == .session_prompts or cmd == .artifact_search or cmd == .skill_audit or cmd == .message_search or cmd == .message_audit or cmd == .skill_cohort;
     const supports_strip_skill_blocks = cmd == .session_prompts or cmd == .artifact_search;
     const supports_no_dedupe_exact = cmd == .session_prompts or cmd == .artifact_search;
-    const supports_summary = switch (cmd) {
-        .session_tooling, .query_diagnose, .token_usage => true,
-        else => false,
-    };
     const supports_audit = cmd == .token_usage;
     const supports_next_actions = cmd == .query_diagnose;
     const supports_latest = switch (cmd) {
@@ -750,7 +787,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .skill_trend, .skill_report, .skill_audit, .skill_cohort, .occurrence_export, .skill_blocks => true,
         else => false,
     };
-    const supports_workflow = cmd == .workflow_audit;
+    const supports_workflow = cmd == .workflow_audit or cmd == .goal_audit;
     const supports_history = cmd == .skill_blocks;
     const supports_bucket = cmd == .skill_trend;
     const supports_prompt = cmd == .find_session;
@@ -763,7 +800,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         else => false,
     };
     const supports_contains = switch (cmd) {
-        .artifact_search, .tool_audit, .memory_inventory, .message_search, .message_audit, .skill_cohort, .tool_search, .memory_extension_audit, .workdir_report, .plan_search, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .sessions, .turns => true,
+        .artifact_search, .tool_audit, .memory_inventory, .message_search, .message_audit, .skill_cohort, .tool_search, .memory_extension_audit, .workdir_report, .plan_search, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .sessions, .turns, .goal_audit => true,
         else => false,
     };
     const supports_contains_any = cmd == .message_search or cmd == .message_audit or cmd == .skill_cohort or cmd == .workdir_report;
@@ -777,9 +814,9 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_executable = cmd == .tool_audit or cmd == .tool_search;
     const supports_workdir = cmd == .artifact_search or cmd == .tool_audit or cmd == .tool_search or cmd == .workdir_report or cmd == .workflow_audit;
     const supports_repo = cmd == .plan_search or cmd == .sessions;
-    const supports_status = cmd == .opencode_events or cmd == .turns;
+    const supports_status = cmd == .opencode_events or cmd == .turns or cmd == .goal_audit;
     const supports_mode = switch (cmd) {
-        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit => true,
+        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit, .goal_audit => true,
         else => false,
     };
     const supports_kind = cmd == .artifact_search;
@@ -816,6 +853,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .session_tooling,
         .query_diagnose,
         .workflow_audit,
+        .goal_audit,
         .memory_map,
         .memory_history,
         .skill_blocks,
@@ -851,6 +889,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .session_tooling,
         .query_diagnose,
         .workflow_audit,
+        .goal_audit,
         .memory_map,
         .memory_history,
         .skill_blocks,
@@ -915,14 +954,16 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .memory_extension_audit,
         .token_window,
         .workdir_report,
+        .goal_audit,
         => true,
         else => false,
     };
     const supports_exclude_current = switch (cmd) {
-        .message_audit, .skill_cohort, .tool_search, .token_window => true,
+        .message_audit, .skill_cohort, .tool_search, .token_window, .goal_audit => true,
         else => false,
     };
     const supports_window_hours = cmd == .token_window;
+    const supports_duration_gte = cmd == .goal_audit;
 
     try ensureOptionAllowed(opts.path != null, commandSupportsPath(cmd), "--path", cmd);
     try ensureOptionAllowed(opts.session_id != null, commandSupportsSessionId(cmd), "--session-id", cmd);
@@ -930,7 +971,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.roles_csv != null, supports_roles_csv, "--roles", cmd);
     try ensureOptionAllowed(opts.strip_skill_blocks, supports_strip_skill_blocks, "--strip-skill-blocks", cmd);
     try ensureOptionAllowed(opts.no_dedupe_exact, supports_no_dedupe_exact, "--no-dedupe-exact", cmd);
-    try ensureOptionAllowed(opts.summary, supports_summary, "--summary", cmd);
+    try ensureOptionAllowed(opts.summary, commandSupportsSummary(cmd), "--summary", cmd);
     try ensureOptionAllowed(opts.audit, supports_audit, "--audit", cmd);
     try ensureOptionAllowed(opts.show_query, supports_show_query, "--show-query", cmd);
     try ensureOptionAllowed(opts.exclude_current, supports_exclude_current, "--exclude-current", cmd);
@@ -942,6 +983,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.fail_on_hang, supports_fail_on_hang, "--fail-on-hang", cmd);
     try ensureOptionAllowed(opts.threshold_ms != 10_000, supports_threshold_ms, "--threshold-ms", cmd);
     try ensureOptionAllowed(opts.window_hours != 24, supports_window_hours, "--window-hours", cmd);
+    try ensureOptionAllowed(opts.duration_gte_seconds != null, supports_duration_gte, "--duration-gte", cmd);
     try ensureOptionAllowed(!opts.strict_hang, supports_strict_hang, "--no-strict-hang", cmd);
     try ensureOptionAllowed(opts.skill != null, supports_skill, "--skill", cmd);
     try ensureOptionAllowed(opts.workflow != null, supports_workflow, "--workflow", cmd);
@@ -1062,6 +1104,14 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
             if (!isValidWorkflowAuditMode(text)) return error.InvalidModeArg;
         }
     }
+    if (cmd == .goal_audit) {
+        if (opts.mode) |text| {
+            if (!isValidGoalAuditMode(text)) return error.InvalidModeArg;
+        }
+        if (opts.workflow) |text| {
+            if (!isValidGoalAuditWorkflowCsv(text)) return error.InvalidModeArg;
+        }
+    }
     if (opts.events_text) |text| _ = try parseTailEventMask(text);
 }
 
@@ -1077,6 +1127,7 @@ fn commandSupportsPath(cmd: lib.Command) bool {
         .skill_blocks,
         .token_usage,
         .token_window,
+        .goal_audit,
         .turns,
         .session_detail,
         .tool_lifecycle,
@@ -1097,6 +1148,7 @@ fn commandSupportsSessionId(cmd: lib.Command) bool {
         .session_tooling,
         .skill_blocks,
         .token_usage,
+        .goal_audit,
         .turns,
         .session_detail,
         .tool_lifecycle,
@@ -1220,6 +1272,25 @@ fn isValidWorkflowAuditMode(text: []const u8) bool {
         std.mem.eql(u8, text, "outcomes") or
         std.mem.eql(u8, text, "sessions") or
         std.mem.eql(u8, text, "report");
+}
+
+fn isValidGoalAuditMode(text: []const u8) bool {
+    return std.mem.eql(u8, text, "summary") or
+        std.mem.eql(u8, text, "rows");
+}
+
+fn isValidGoalAuditWorkflowCsv(text: []const u8) bool {
+    var split = std.mem.splitScalar(u8, text, ',');
+    var seen = false;
+    while (split.next()) |part_raw| {
+        const part = std.mem.trim(u8, part_raw, " \t\r\n");
+        if (part.len == 0) return false;
+        if (!std.mem.eql(u8, part, "review") and
+            !std.mem.eql(u8, part, "resolve") and
+            !std.mem.eql(u8, part, "other")) return false;
+        seen = true;
+    }
+    return seen;
 }
 
 fn parseTailEventMask(raw_opt: ?[]const u8) !TailEventMask {
@@ -2428,6 +2499,21 @@ const QueryLiftCommands = struct {
     const token_window_row_columns = [_][]const u8{ "timestamp", "delta_total_tokens", "path", "segment", "model_context_window" };
     const workdir_report_summary_columns = [_][]const u8{ "cwd", "sessions", "turns", "total_tokens", "first_seen", "last_seen" };
     const workdir_report_session_columns = [_][]const u8{ "start_time", "end_time", "cwd", "model", "total_tokens", "path" };
+    const goal_audit_row_columns = [_][]const u8{
+        "timestamp",
+        "objective_kind",
+        "status",
+        "time_used_seconds",
+        "tokens_used",
+        "review_invocation_count",
+        "objective",
+        "thread_id",
+        "session_id",
+        "path",
+        "missing_duration",
+        "contamination_flags",
+    };
+    const goal_audit_summary_columns = [_][]const u8{ "objective_kind", "runs", "sessions", "review_invocations", "max_time_used_seconds" };
 
     fn appendTimeBoundsForField(
         allocator: std.mem.Allocator,
@@ -3310,6 +3396,84 @@ const QueryLiftCommands = struct {
                 .limit = queryLimit(opts, 50),
             };
             return runQueryLiftDataset(allocator, "tool_call_args", sessions_root, query_spec, opts, tool_search_arg_columns[0..]);
+        }
+
+        return error.InvalidModeArg;
+    }
+
+    fn appendGoalWorkflowWhere(
+        allocator: std.mem.Allocator,
+        where_out: *std.ArrayList(spec.WhereClause),
+        raw_opt: ?[]const u8,
+    ) !?[]spec.Scalar {
+        const raw = raw_opt orelse return null;
+        var values: std.ArrayList(spec.Scalar) = .empty;
+        defer values.deinit(allocator);
+
+        var split = std.mem.splitScalar(u8, raw, ',');
+        while (split.next()) |part_raw| {
+            const part = std.mem.trim(u8, part_raw, " \t\r\n");
+            if (part.len == 0) continue;
+            try values.append(allocator, .{ .string = part });
+        }
+        if (values.items.len == 0) return error.InvalidModeArg;
+        const owned = try values.toOwnedSlice(allocator);
+        try where_out.append(allocator, .{
+            .field = "objective_kind",
+            .op = .in,
+            .value = .{ .list = owned },
+        });
+        return owned;
+    }
+
+    fn cmdGoalAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+        const mode = if (opts.summary) "summary" else opts.mode orelse "summary";
+        var where: std.ArrayList(spec.WhereClause) = .empty;
+        defer where.deinit(allocator);
+
+        try appendTimeBoundsForField(allocator, &where, "timestamp", opts);
+        const path_filter = if (opts.path) |path| try toAbsolutePath(allocator, path) else null;
+        defer if (path_filter) |path| allocator.free(path);
+        try appendOptionalStringEq(allocator, &where, "path", path_filter);
+        try appendOptionalContains(allocator, &where, "path", opts.session_id);
+        const workflow_values = try appendGoalWorkflowWhere(allocator, &where, opts.workflow);
+        defer if (workflow_values) |values| allocator.free(values);
+        try appendOptionalStringEq(allocator, &where, "status", opts.status);
+        try appendOptionalContains(allocator, &where, "objective", opts.contains);
+        if (opts.duration_gte_seconds) |seconds| {
+            try where.append(allocator, .{
+                .field = "time_used_seconds",
+                .op = .gte,
+                .value = .{ .scalar = .{ .int = seconds } },
+            });
+        }
+        const exclude_path = try appendCurrentSessionExclusion(allocator, sessions_root, &where, opts);
+        defer if (exclude_path) |path| allocator.free(path);
+
+        if (std.mem.eql(u8, mode, "rows")) {
+            const query_spec = spec.QuerySpec{
+                .where = where.items,
+                .select = goal_audit_row_columns[0..],
+                .sort = &.{.{ .field = "timestamp", .descending = true }},
+                .limit = queryLimit(opts, 50),
+            };
+            return runQueryLiftDataset(allocator, "goal_runs", sessions_root, query_spec, opts, goal_audit_row_columns[0..]);
+        }
+
+        if (std.mem.eql(u8, mode, "summary")) {
+            const query_spec = spec.QuerySpec{
+                .where = where.items,
+                .group_by = &.{"objective_kind"},
+                .metrics = &.{
+                    .{ .op = .count, .alias = "runs" },
+                    .{ .op = .count_distinct, .field = "session_id", .alias = "sessions" },
+                    .{ .op = .sum, .field = "review_invocation_count", .alias = "review_invocations" },
+                    .{ .op = .max, .field = "time_used_seconds", .alias = "max_time_used_seconds" },
+                },
+                .sort = &.{.{ .field = "runs", .descending = true }},
+                .limit = queryLimit(opts, 20),
+            };
+            return runQueryLiftDataset(allocator, "goal_runs", sessions_root, query_spec, opts, goal_audit_summary_columns[0..]);
         }
 
         return error.InvalidModeArg;
@@ -5805,6 +5969,80 @@ const OutputMarkers = struct {
     pty_session_id: ?i64 = null,
     exit_code: ?i64 = null,
     wall_time_ms: ?i64 = null,
+};
+
+const GoalToolCall = struct {
+    name: []u8,
+    timestamp: ?[]u8 = null,
+
+    fn deinit(self: *GoalToolCall, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        if (self.timestamp) |value| allocator.free(value);
+    }
+};
+
+const GoalAggregate = struct {
+    path: []u8,
+    session_id: []u8,
+    thread_id: ?[]u8 = null,
+    timestamp: ?[]u8 = null,
+    objective: ?[]u8 = null,
+    status: ?[]u8 = null,
+    created_at: ?i64 = null,
+    updated_at: ?i64 = null,
+    time_used_seconds: ?i64 = null,
+    tokens_used: ?i64 = null,
+    remaining_tokens: ?i64 = null,
+    completion_budget_report: ?[]u8 = null,
+    review_invocation_count: i64 = 0,
+    parse_error: bool = false,
+
+    fn init(allocator: std.mem.Allocator, path: []const u8) !GoalAggregate {
+        return .{
+            .path = try allocator.dupe(u8, path),
+            .session_id = try allocator.dupe(u8, inferSessionIdFromPath(path)),
+        };
+    }
+
+    fn deinit(self: *GoalAggregate, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.session_id);
+        if (self.thread_id) |value| allocator.free(value);
+        if (self.timestamp) |value| allocator.free(value);
+        if (self.objective) |value| allocator.free(value);
+        if (self.status) |value| allocator.free(value);
+        if (self.completion_budget_report) |value| allocator.free(value);
+    }
+
+    fn updateString(
+        self: *GoalAggregate,
+        allocator: std.mem.Allocator,
+        comptime field_name: []const u8,
+        value_opt: ?[]const u8,
+    ) !void {
+        const value = value_opt orelse return;
+        if (std.mem.eql(u8, field_name, "thread_id")) {
+            if (self.thread_id) |old| allocator.free(old);
+            self.thread_id = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, field_name, "objective")) {
+            if (self.objective) |old| allocator.free(old);
+            self.objective = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, field_name, "status")) {
+            if (self.status) |old| allocator.free(old);
+            self.status = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, field_name, "completion_budget_report")) {
+            if (self.completion_budget_report) |old| allocator.free(old);
+            self.completion_budget_report = try allocator.dupe(u8, value);
+        }
+    }
+
+    fn observeTimestamp(self: *GoalAggregate, allocator: std.mem.Allocator, timestamp_opt: ?[]const u8) !void {
+        const timestamp = timestamp_opt orelse return;
+        if (self.timestamp == null or compareNormalizedTimestamp(timestamp, self.timestamp.?) == .lt) {
+            if (self.timestamp) |old| allocator.free(old);
+            self.timestamp = try allocator.dupe(u8, timestamp);
+        }
+    }
 };
 
 const ToolingGroupMode = enum {
@@ -8325,6 +8563,7 @@ fn isSessionFileDataset(dataset_name: []const u8) bool {
         std.mem.eql(u8, dataset_name, "tool_calls") or
         std.mem.eql(u8, dataset_name, "tool_invocations") or
         std.mem.eql(u8, dataset_name, "tool_call_args") or
+        std.mem.eql(u8, dataset_name, "goal_runs") or
         std.mem.eql(u8, dataset_name, "sessions") or
         std.mem.eql(u8, dataset_name, "turns") or
         std.mem.eql(u8, dataset_name, "tool_lifecycle") or
@@ -8825,6 +9064,8 @@ fn collectDatasetRows(
         try collectToolInvocationRows(allocator, sessions_root, day_filter, &rows);
     } else if (std.mem.eql(u8, dataset_name, "tool_call_args")) {
         try collectToolCallArgRows(allocator, sessions_root, day_filter, &rows);
+    } else if (std.mem.eql(u8, dataset_name, "goal_runs")) {
+        try collectGoalRunRows(allocator, sessions_root, day_filter, &rows);
     } else if (std.mem.eql(u8, dataset_name, "sessions") or
         std.mem.eql(u8, dataset_name, "turns") or
         std.mem.eql(u8, dataset_name, "tool_lifecycle") or
@@ -9334,6 +9575,330 @@ fn collectToolInvocationRows(
         try qrow.putOwnedKey("parse_error", .{ .bool = record.parse_error });
         try out_rows.append(allocator, qrow);
     }
+}
+
+fn collectGoalRunRows(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    day_filter: ?SessionDayPathFilter,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    var paths = try collectJsonlPaths(allocator, sessions_root, day_filter);
+    defer freePathList(allocator, &paths);
+
+    for (paths.items) |path| {
+        try collectGoalRunRowsFromSession(allocator, path, out_rows);
+    }
+}
+
+fn collectGoalRunRowsFromSession(
+    allocator: std.mem.Allocator,
+    session_path: []const u8,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    const content_opt = try readFileAllocOrSkip(allocator, session_path);
+    if (content_opt == null) return;
+    defer allocator.free(content_opt.?);
+
+    var goal_calls = std.StringHashMap(GoalToolCall).init(allocator);
+    defer {
+        var it = goal_calls.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(allocator);
+        }
+        goal_calls.deinit();
+    }
+
+    var aggregates = std.StringHashMap(GoalAggregate).init(allocator);
+    defer {
+        var it = aggregates.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(allocator);
+        }
+        aggregates.deinit();
+    }
+
+    var review_invocation_count: i64 = 0;
+
+    var lines = std.mem.splitScalar(u8, content_opt.?, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (trimmed.len == 0 or trimmed[0] != '{') continue;
+        if (!std.mem.containsAtLeast(u8, trimmed, 1, "\"type\":\"response_item\"")) continue;
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), trimmed, .{}) catch continue;
+        defer parsed.deinit();
+        const root = switch (parsed.value) {
+            .object => |obj| obj,
+            else => continue,
+        };
+        if (!stdJsonFieldEq(root, "type", "response_item")) continue;
+
+        const payload = stdJsonObjectField(root, "payload") orelse continue;
+        const payload_type = stdJsonStringField(payload, "type") orelse continue;
+        const timestamp = stdJsonStringField(root, "timestamp");
+
+        if (std.mem.eql(u8, payload_type, "function_call")) {
+            const tool_name = stdJsonStringField(payload, "name") orelse continue;
+            if (std.mem.eql(u8, tool_name, "get_goal") or
+                std.mem.eql(u8, tool_name, "update_goal") or
+                std.mem.eql(u8, tool_name, "create_goal"))
+            {
+                const call_id = stdJsonStringField(payload, "call_id") orelse continue;
+                const key = try allocator.dupe(u8, call_id);
+                errdefer allocator.free(key);
+                var call = GoalToolCall{
+                    .name = try allocator.dupe(u8, tool_name),
+                    .timestamp = if (timestamp) |value| try allocator.dupe(u8, value) else null,
+                };
+                errdefer call.deinit(allocator);
+                const gop = try goal_calls.getOrPut(key);
+                if (gop.found_existing) {
+                    allocator.free(key);
+                    gop.value_ptr.deinit(allocator);
+                }
+                gop.value_ptr.* = call;
+                continue;
+            }
+
+            if (std.mem.eql(u8, tool_name, "exec_command")) {
+                if (stdJsonStringField(payload, "arguments")) |arguments_text| {
+                    if (try functionCallArgumentsContainCodexReview(allocator, arguments_text)) {
+                        review_invocation_count += 1;
+                    }
+                }
+            }
+            continue;
+        }
+
+        if (!std.mem.eql(u8, payload_type, "function_call_output")) continue;
+        const call_id = stdJsonStringField(payload, "call_id") orelse continue;
+        const call = goal_calls.get(call_id) orelse continue;
+        const output_text = stdJsonStringField(payload, "output") orelse continue;
+        const goal_timestamp: ?[]const u8 = if (call.timestamp) |value| value else timestamp;
+        try applyGoalToolOutput(allocator, &aggregates, session_path, goal_timestamp, output_text);
+    }
+
+    const review_invocation_key = goalAggregateReviewInvocationKey(&aggregates);
+
+    var it = aggregates.iterator();
+    while (it.next()) |entry| {
+        entry.value_ptr.review_invocation_count = if (review_invocation_key) |key|
+            if (std.mem.eql(u8, entry.key_ptr.*, key)) review_invocation_count else 0
+        else
+            0;
+        try appendGoalAggregateRow(allocator, out_rows, entry.value_ptr.*);
+    }
+}
+
+fn goalAggregateReviewInvocationKey(aggregates: *std.StringHashMap(GoalAggregate)) ?[]const u8 {
+    var selected_key: ?[]const u8 = null;
+    var selected_rank: u8 = 0;
+
+    var it = aggregates.iterator();
+    while (it.next()) |entry| {
+        const objective_kind = classifyGoalObjective(entry.value_ptr.objective);
+        const rank: u8 = if (!entry.value_ptr.parse_error and
+            (std.mem.eql(u8, objective_kind, "review") or std.mem.eql(u8, objective_kind, "resolve")))
+            3
+        else if (!entry.value_ptr.parse_error)
+            2
+        else
+            1;
+        if (rank > selected_rank) {
+            selected_rank = rank;
+            selected_key = entry.key_ptr.*;
+        }
+    }
+
+    return selected_key;
+}
+
+fn goalAggregateForKey(
+    allocator: std.mem.Allocator,
+    aggregates: *std.StringHashMap(GoalAggregate),
+    key_text: []const u8,
+    session_path: []const u8,
+) !*GoalAggregate {
+    const key = try allocator.dupe(u8, key_text);
+    errdefer allocator.free(key);
+    const gop = try aggregates.getOrPut(key);
+    if (gop.found_existing) {
+        allocator.free(key);
+    } else {
+        gop.value_ptr.* = try GoalAggregate.init(allocator, session_path);
+    }
+    return gop.value_ptr;
+}
+
+fn applyGoalToolOutput(
+    allocator: std.mem.Allocator,
+    aggregates: *std.StringHashMap(GoalAggregate),
+    session_path: []const u8,
+    timestamp: ?[]const u8,
+    output_text: []const u8,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), output_text, .{}) catch {
+        var aggregate = try goalAggregateForKey(allocator, aggregates, session_path, session_path);
+        aggregate.parse_error = true;
+        try aggregate.observeTimestamp(allocator, timestamp);
+        return;
+    };
+    defer parsed.deinit();
+
+    const root = switch (parsed.value) {
+        .object => |obj| obj,
+        else => {
+            var aggregate = try goalAggregateForKey(allocator, aggregates, session_path, session_path);
+            aggregate.parse_error = true;
+            try aggregate.observeTimestamp(allocator, timestamp);
+            return;
+        },
+    };
+    const goal = stdJsonObjectField(root, "goal") orelse {
+        var aggregate = try goalAggregateForKey(allocator, aggregates, session_path, session_path);
+        aggregate.parse_error = true;
+        try aggregate.observeTimestamp(allocator, timestamp);
+        return;
+    };
+
+    const thread_id = stdJsonStringField(goal, "threadId");
+    var aggregate = try goalAggregateForKey(allocator, aggregates, thread_id orelse session_path, session_path);
+    try aggregate.observeTimestamp(allocator, timestamp);
+    try aggregate.updateString(allocator, "thread_id", thread_id);
+    try aggregate.updateString(allocator, "objective", stdJsonStringField(goal, "objective"));
+    try aggregate.updateString(allocator, "status", stdJsonStringField(goal, "status"));
+    if (stdJsonIntField(goal, "createdAt")) |value| {
+        if (aggregate.created_at == null or value < aggregate.created_at.?) aggregate.created_at = value;
+    }
+    if (stdJsonIntField(goal, "updatedAt")) |value| {
+        if (aggregate.updated_at == null or value > aggregate.updated_at.?) aggregate.updated_at = value;
+    }
+    if (stdJsonIntField(goal, "timeUsedSeconds")) |value| {
+        if (aggregate.time_used_seconds == null or value > aggregate.time_used_seconds.?) aggregate.time_used_seconds = value;
+    }
+    if (stdJsonIntField(goal, "tokensUsed")) |value| {
+        if (aggregate.tokens_used == null or value > aggregate.tokens_used.?) aggregate.tokens_used = value;
+    }
+    aggregate.remaining_tokens = stdJsonIntField(root, "remainingTokens");
+    try aggregate.updateString(allocator, "completion_budget_report", stdJsonStringField(root, "completionBudgetReport"));
+}
+
+fn appendGoalAggregateRow(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    aggregate: GoalAggregate,
+) !void {
+    var qrow = query.Row.init(allocator);
+    const week = try timestampWeekAlloc(allocator, aggregate.timestamp);
+    defer if (week) |value| allocator.free(value);
+    const objective_kind = classifyGoalObjective(aggregate.objective);
+    const contamination_flags = goalContaminationFlags(aggregate, objective_kind);
+
+    try qrow.putOwnedKey("path", .{ .string = aggregate.path });
+    try qrow.putOwnedKey("session_id", .{ .string = aggregate.session_id });
+    try putOptionalString(&qrow, "thread_id", aggregate.thread_id);
+    try putOptionalString(&qrow, "timestamp", aggregate.timestamp);
+    try putOptionalString(&qrow, "day", timestampDaySlice(aggregate.timestamp));
+    try putOptionalString(&qrow, "week", week);
+    try putOptionalString(&qrow, "month", timestampMonthSlice(aggregate.timestamp));
+    try putOptionalString(&qrow, "objective", aggregate.objective);
+    try qrow.putOwnedKey("objective_kind", .{ .string = objective_kind });
+    try putOptionalString(&qrow, "status", aggregate.status);
+    try putOptionalInt(&qrow, "created_at", aggregate.created_at);
+    try putOptionalInt(&qrow, "updated_at", aggregate.updated_at);
+    try putOptionalInt(&qrow, "time_used_seconds", aggregate.time_used_seconds);
+    try putOptionalInt(&qrow, "tokens_used", aggregate.tokens_used);
+    try putOptionalInt(&qrow, "remaining_tokens", aggregate.remaining_tokens);
+    try putOptionalString(&qrow, "completion_budget_report", aggregate.completion_budget_report);
+    try qrow.putOwnedKey("review_invocation_count", .{ .int = aggregate.review_invocation_count });
+    try qrow.putOwnedKey("has_review_objective", .{ .bool = std.mem.eql(u8, objective_kind, "review") });
+    try qrow.putOwnedKey("has_resolve_objective", .{ .bool = std.mem.eql(u8, objective_kind, "resolve") });
+    try qrow.putOwnedKey("missing_duration", .{ .bool = aggregate.time_used_seconds == null });
+    try qrow.putOwnedKey("parse_error", .{ .bool = aggregate.parse_error });
+    try qrow.putOwnedKey("contamination_flags", .{ .string = contamination_flags });
+    try out_rows.append(allocator, qrow);
+}
+
+fn classifyGoalObjective(objective_opt: ?[]const u8) []const u8 {
+    const objective = objective_opt orelse return "other";
+    if (containsIgnoreCaseAscii(objective, "$resolve")) return "resolve";
+    if (containsIgnoreCaseAscii(objective, "codex review") or
+        containsIgnoreCaseAscii(objective, "review loop") or
+        containsIgnoreCaseAscii(objective, "native review") or
+        containsIgnoreCaseAscii(objective, "review driver") or
+        containsIgnoreCaseAscii(objective, "clean review"))
+    {
+        return "review";
+    }
+    return "other";
+}
+
+fn goalContaminationFlags(aggregate: GoalAggregate, objective_kind: []const u8) []const u8 {
+    if (aggregate.parse_error) return "parse_error";
+    if (std.mem.eql(u8, objective_kind, "review") and aggregate.review_invocation_count == 0) {
+        return "review_objective_without_invocation";
+    }
+    if (std.mem.eql(u8, objective_kind, "other") and aggregate.review_invocation_count > 0) {
+        return "review_invocations_without_review_objective";
+    }
+    return "none";
+}
+
+fn functionCallArgumentsContainCodexReview(allocator: std.mem.Allocator, arguments_text: []const u8) !bool {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), arguments_text, .{}) catch return false;
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |value| value,
+        else => return false,
+    };
+    const cmd_text = stdJsonStringField(obj, "cmd") orelse return false;
+    return isCodexReviewInvocation(allocator, cmd_text);
+}
+
+fn isCodexReviewInvocation(allocator: std.mem.Allocator, command_text: []const u8) !bool {
+    const primary = try extractPrimaryExecutable(allocator, command_text);
+    defer if (primary) |value| allocator.free(value);
+    if (primary) |exe| {
+        const blocked = [_][]const u8{ "rg", "grep", "git", "jq", "seq", "sed", "awk", "python", "python3" };
+        for (blocked) |blocked_exe| {
+            if (std.mem.eql(u8, exe, blocked_exe)) return false;
+        }
+    }
+
+    var saw_codex = false;
+    var saw_review = false;
+    var saw_help = false;
+    var it = std.mem.tokenizeAny(u8, command_text, " \t\r\n;|&(){}");
+    while (it.next()) |token_raw| {
+        const token = std.mem.trim(u8, token_raw, " \t\r\n\"'");
+        if (token.len == 0) continue;
+        const basename = if (std.mem.lastIndexOfScalar(u8, token, '/')) |idx|
+            if (idx + 1 < token.len) token[idx + 1 ..] else token
+        else
+            token;
+        if (!saw_codex) {
+            if (std.mem.eql(u8, basename, "codex")) saw_codex = true;
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--help") or std.mem.eql(u8, token, "-h") or std.mem.eql(u8, token, "help")) {
+            saw_help = true;
+        } else if (std.mem.eql(u8, token, "review")) {
+            saw_review = true;
+        }
+    }
+    return saw_codex and saw_review and !saw_help;
 }
 
 fn collectToolCallArgRows(
@@ -10752,6 +11317,10 @@ fn parseOptions(args: []const []const u8) !Options {
             const n = try std.fmt.parseInt(i64, args[i], 10);
             if (n < 1) return error.InvalidLimit;
             opts.window_hours = n;
+        } else if (std.mem.eql(u8, arg, "--duration-gte")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.duration_gte_seconds = try parseDurationSeconds(args[i]);
         } else if (std.mem.eql(u8, arg, "--worker-kind")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -10784,6 +11353,22 @@ fn parseOptions(args: []const []const u8) !Options {
         }
     }
     return opts;
+}
+
+fn parseDurationSeconds(raw: []const u8) !i64 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidLimit;
+    const unit = trimmed[trimmed.len - 1];
+    const has_unit = unit == 's' or unit == 'm' or unit == 'h';
+    const number_text = if (has_unit) trimmed[0 .. trimmed.len - 1] else trimmed;
+    if (number_text.len == 0) return error.InvalidLimit;
+    const value = try std.fmt.parseInt(i64, number_text, 10);
+    if (value < 1) return error.InvalidLimit;
+    return switch (unit) {
+        'h' => std.math.mul(i64, value, 3600) catch return error.InvalidLimit,
+        'm' => std.math.mul(i64, value, 60) catch return error.InvalidLimit,
+        else => value,
+    };
 }
 
 fn findDatasetMeta(name: []const u8) ?DatasetMeta {
@@ -11394,6 +11979,8 @@ test "parse options supports common flags" {
         "12000",
         "--window-hours",
         "6",
+        "--duration-gte",
+        "2h",
         "--fail-on-hang",
         "--help",
     };
@@ -11444,6 +12031,7 @@ test "parse options supports common flags" {
     try std.testing.expect(opts.strict_hang);
     try std.testing.expectEqual(@as(i64, 12000), opts.threshold_ms);
     try std.testing.expectEqual(@as(i64, 6), opts.window_hours);
+    try std.testing.expectEqual(@as(i64, 7200), opts.duration_gte_seconds.?);
     try std.testing.expect(opts.fail_on_hang);
     try std.testing.expect(opts.help);
 }
@@ -12179,6 +12767,72 @@ test "session-tooling summary groups by primary executable" {
     try std.testing.expect(std.mem.indexOf(u8, got, "\"group_key\": \"rg\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"group_key\": \"jq\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"error_count\": 1") != null);
+}
+
+test "goal_runs aggregates goal outputs and excludes review search contamination" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/05/12");
+    const session_content =
+        "{\"timestamp\":\"2026-05-12T13:31:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"019e1c61-d92f-7dd2-b39f-976f70452d2a\",\"cwd\":\"/repo\",\"model\":\"gpt-test\"}}\n" ++
+        "{\"timestamp\":\"2026-05-12T13:31:06Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"get_goal\",\"arguments\":\"{}\",\"call_id\":\"goal-1\"}}\n" ++
+        "{\"timestamp\":\"2026-05-12T13:31:07Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"goal-1\",\"output\":\"{\\\"goal\\\":{\\\"threadId\\\":\\\"019e1c61-d92f-7dd2-b39f-976f70452d2a\\\",\\\"objective\\\":\\\"Run codex review until clean\\\",\\\"status\\\":\\\"active\\\",\\\"tokensUsed\\\":100,\\\"timeUsedSeconds\\\":12,\\\"createdAt\\\":1778592653,\\\"updatedAt\\\":1778592666},\\\"remainingTokens\\\":null,\\\"completionBudgetReport\\\":null}\"}}\n" ++
+        "{\"timestamp\":\"2026-05-12T13:32:06Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"get_goal\",\"arguments\":\"{}\",\"call_id\":\"goal-other\"}}\n" ++
+        "{\"timestamp\":\"2026-05-12T13:32:07Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"goal-other\",\"output\":\"{\\\"goal\\\":{\\\"threadId\\\":\\\"other-goal-thread\\\",\\\"objective\\\":\\\"Draft release notes\\\",\\\"status\\\":\\\"active\\\",\\\"tokensUsed\\\":40,\\\"timeUsedSeconds\\\":60,\\\"createdAt\\\":1778592700,\\\"updatedAt\\\":1778592760},\\\"remainingTokens\\\":null,\\\"completionBudgetReport\\\":null}\"}}\n" ++
+        "{\"timestamp\":\"2026-05-12T13:35:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"review-1\",\"arguments\":\"{\\\"cmd\\\":\\\"codex review --base main\\\",\\\"workdir\\\":\\\"/repo\\\"}\"}}\n" ++
+        "{\"timestamp\":\"2026-05-12T13:35:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"review-1\",\"output\":\"Chunk ID: aa\\nWall time: 1.000 seconds\\nProcess exited with code 0\\nOutput:\\n\"}}\n" ++
+        "{\"timestamp\":\"2026-05-12T13:36:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"search-1\",\"arguments\":\"{\\\"cmd\\\":\\\"rg -n \\\\\\\"codex review\\\\\\\" .\\\",\\\"workdir\\\":\\\"/repo\\\"}\"}}\n" ++
+        "{\"timestamp\":\"2026-05-12T13:37:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"help-1\",\"arguments\":\"{\\\"cmd\\\":\\\"codex review --help\\\",\\\"workdir\\\":\\\"/repo\\\"}\"}}\n" ++
+        "{\"timestamp\":\"2026-05-12T15:31:06Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"update_goal\",\"arguments\":\"{\\\"status\\\":\\\"complete\\\"}\",\"call_id\":\"goal-2\"}}\n" ++
+        "{\"timestamp\":\"2026-05-12T15:31:07Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"goal-2\",\"output\":\"{\\\"goal\\\":{\\\"threadId\\\":\\\"019e1c61-d92f-7dd2-b39f-976f70452d2a\\\",\\\"objective\\\":\\\"Run codex review until clean\\\",\\\"status\\\":\\\"complete\\\",\\\"tokensUsed\\\":200,\\\"timeUsedSeconds\\\":7200,\\\"createdAt\\\":1778592653,\\\"updatedAt\\\":1778599866},\\\"remainingTokens\\\":321,\\\"completionBudgetReport\\\":\\\"Goal achieved.\\\"}\"}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "2026/05/12/rollout-2026-05-12T06-30-35-019e1c61-d92f-7dd2-b39f-976f70452d2a.jsonl",
+        .data = session_content,
+    });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+
+    var rows = try collectDatasetRows(std.testing.allocator, "goal_runs", root_abs, &.{}, &.{});
+    defer deinitQueryRows(std.testing.allocator, &rows);
+    try std.testing.expectEqual(@as(usize, 2), rows.items.len);
+    var found_review_row = false;
+    var found_other_row = false;
+    for (rows.items) |row| {
+        if (scalarStringEq(row.valueOrNull("objective_kind"), "review")) {
+            found_review_row = true;
+            try std.testing.expect(scalarStringEq(row.valueOrNull("status"), "complete"));
+            try std.testing.expectEqual(@as(i64, 7200), scalarAsInt(row.valueOrNull("time_used_seconds")).?);
+            try std.testing.expectEqual(@as(i64, 1), scalarAsInt(row.valueOrNull("review_invocation_count")).?);
+            try std.testing.expect(scalarStringEq(row.valueOrNull("contamination_flags"), "none"));
+        } else if (scalarStringEq(row.valueOrNull("objective_kind"), "other")) {
+            found_other_row = true;
+            try std.testing.expectEqual(@as(i64, 0), scalarAsInt(row.valueOrNull("review_invocation_count")).?);
+            try std.testing.expect(scalarStringEq(row.valueOrNull("contamination_flags"), "none"));
+        }
+    }
+    try std.testing.expect(found_review_row);
+    try std.testing.expect(found_other_row);
+
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "goal-audit.json" });
+    defer std.testing.allocator.free(output_path);
+    const args = [_][]const u8{
+        "--root",
+        root_abs,
+        "--workflow",
+        "review,resolve",
+        "--duration-gte",
+        "2h",
+        "--summary",
+        "--format",
+        "json",
+    };
+    const got = try runCommandWithOutput(std.testing.allocator, .goal_audit, args[0..], output_path);
+    defer std.testing.allocator.free(got);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"objective_kind\": \"review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"runs\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"review_invocations\": 1") != null);
 }
 
 test "query-diagnose flags strict hangs and supports fail-on-hang" {

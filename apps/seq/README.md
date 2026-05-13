@@ -35,6 +35,7 @@ Binary output:
 ./zig-out/bin/seq dataset-schema --dataset opencode_sessions
 ./zig-out/bin/seq dataset-schema --dataset tool_invocations
 ./zig-out/bin/seq dataset-schema --dataset tool_call_args
+./zig-out/bin/seq dataset-schema --dataset goal_runs
 ./zig-out/bin/seq dataset-schema --dataset workflow_signals
 ./zig-out/bin/seq role-breakdown --root ~/.codex/sessions --since 2026-03-01T00:00:00Z --format table
 ./zig-out/bin/seq query --spec '{"dataset":"tool_calls","group_by":["tool"],"metrics":[{"op":"count","as":"count"}],"sort":["-count"],"limit":10,"format":"json"}'
@@ -61,6 +62,7 @@ Binary output:
 ./zig-out/bin/seq tool-search --contains "seq query" --group-by executable --mode summary --exclude-current --format table
 ./zig-out/bin/seq memory-extension-audit --extensions-root ~/.codex/memories/extensions --format table
 ./zig-out/bin/seq token-window --window-hours 24 --since 2026-04-01T00:00:00Z --exclude-current --format table
+./zig-out/bin/seq goal-audit --root ~/.codex/sessions --workflow review,resolve --duration-gte 2h --summary --format table
 ./zig-out/bin/seq workdir-report --workdir /Users/tk/workspace/tk/skills-zig --mode sessions --format table
 ./zig-out/bin/seq memory-provenance --thread-id 019bae5d-7d12-7b01-9cb5-b8bb6046b85b --format table
 ./zig-out/bin/seq memory-provenance --rollout-summary-file rollout_summaries/2026-01-11T18-42-01-jpEf-resolve_merge_pr_11_squash_cleanup.md --format json
@@ -187,6 +189,7 @@ Query-lift commands provide top-level shortcuts for common `seq query` shapes:
 - `tool-search` searches lifecycle-enriched tool invocations and flattened tool arguments without shell `jq` post-processing.
 - `memory-extension-audit` inventories live memory extensions and labels results as `inventory_only` with `causality_claimed=false` so read/config evidence is not overclaimed.
 - `token-window` computes the max rolling token window from timestamp-sorted `token_deltas` rows and can emit the contributing rows.
+- `goal-audit` summarizes `/goal` runs from `get_goal` / `update_goal` / `create_goal` outputs, with workflow filters for `review` and `resolve` and duration thresholds like `--duration-gte 2h`.
 - `workdir-report` summarizes canonical session rows by `cwd` and can list matching sessions.
 
 `memory-provenance` answers the targeted origin question for one memory thread or rollout summary:
@@ -265,6 +268,12 @@ Floor flags:
 `tool_call_args` is the flattened argument-leaf dataset:
 - one row per parsed JSON leaf from function-call `arguments` or JSON-shaped custom-tool `input`
 - use it when you need generic argument search without column explosion in `tool_calls`
+
+`goal_runs` is the queryable `/goal` dataset:
+- one row per session goal aggregate keyed by `thread_id` when available, falling back to session path
+- derives objective, status, duration, token usage, and completion budget from goal tool outputs
+- classifies `objective_kind` as `review`, `resolve`, or `other`
+- counts actual `codex review` invocations in the same session while excluding search/help command contamination
 
 `tool_calls` remains the compatibility dataset:
 - existing fields stay intact
