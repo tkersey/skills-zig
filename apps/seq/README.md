@@ -299,6 +299,14 @@ Floor flags:
 - `--next-actions` emits deterministic follow-up `seq` command suggestions
 - session-backed time windows now accept `--since` and `--until`
 
+`token-cost` estimates Codex token cost from local `token_count` traces:
+- reuses monotonic `total_token_usage` deltas and keeps cached input separate from uncached input
+- groups by `day`, `path`, `model`, or `fast_mode`; `--summary` emits one aggregate row
+- applies OpenAI Codex credit rates with explicit fast-mode evidence only; missing fast evidence is reported as `standard_assumption`
+- converts to USD only when `--usd-per-credit <amount>` is supplied
+- accepts `--pricing-file <json>` for pinned rates and `--refresh-pricing` to refresh current official pricing into the user cache, not the repo
+- `--force-fast` and `--force-standard` are what-if overrides and are marked as override-sourced in output
+
 ## Validation
 
 ```bash

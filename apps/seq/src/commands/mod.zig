@@ -7,6 +7,7 @@ const spec = @import("../types/spec.zig");
 const output = @import("../output/mod.zig");
 const time_utils = @import("../time_utils.zig");
 const canonical_trace = @import("../canonical_trace.zig");
+const token_cost = @import("../token_cost.zig");
 
 fn defaultIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
@@ -435,6 +436,8 @@ const Options = struct {
     sort_text: ?[]const u8 = null,
     group_by_text: ?[]const u8 = null,
     metric_text: ?[]const u8 = null,
+    pricing_file: ?[]const u8 = null,
+    usd_per_credit_text: ?[]const u8 = null,
     trace_text: ?[]const u8 = null,
     state_db_path: ?[]const u8 = null,
     memory_root_text: ?[]const u8 = null,
@@ -445,6 +448,10 @@ const Options = struct {
     include_raw: bool = false,
     include_body: bool = false,
     stats: bool = false,
+    refresh_pricing: bool = false,
+    offline: bool = false,
+    force_fast: bool = false,
+    force_standard: bool = false,
     strip_skill_blocks: bool = false,
     no_dedupe_exact: bool = false,
     sections: ?[]const u8 = null,
@@ -502,6 +509,7 @@ pub fn run(
         .report_bundle => try cmdReportBundle(allocator, sessions_root, opts),
         .section_audit => try cmdSectionAudit(allocator, sessions_root, opts),
         .token_usage => try cmdTokenUsage(allocator, sessions_root, opts),
+        .token_cost => try cmdTokenCost(allocator, sessions_root, opts),
         .routing_gap => try cmdRoutingGap(allocator, sessions_root, opts),
         .datasets => try cmdDatasets(allocator, opts),
         .dataset_schema => try cmdDatasetSchema(allocator, opts),
@@ -642,6 +650,16 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\  --summary                  Emit one summary row with totals and averages
         \\  --audit                    Emit self-auditing token accounting proof fields
         ,
+        .token_cost =>
+        \\usage: seq token-cost [--since <iso>] [--until <iso>] [--path <jsonl>|--session-id <id>] [--group-by day|path|model|fast_mode] [--tz utc|local|+HH:MM|-HH:MM] [--summary] [--audit] [--pricing-file <json>] [--refresh-pricing] [--offline] [--usd-per-credit <amount>] [--force-fast|--force-standard] [--format table|json|csv|jsonl]
+        \\extra options:
+        \\  --pricing-file <json>       Load credit rates from an explicit JSON pricing file
+        \\  --refresh-pricing           Refresh current OpenAI Codex pricing into the user cache
+        \\  --offline                   Do not use network refresh; require explicit/bundled pricing
+        \\  --usd-per-credit <amount>   Convert estimated credits to USD using this user-supplied rate
+        \\  --force-fast                Price all supported rows with fast-mode multipliers and mark source override
+        \\  --force-standard            Price all rows at standard rate and mark source override
+        ,
         .routing_gap =>
         \\usage: seq routing-gap --cue-spec <json|@path> [--discovery-skills <csv>] [--format table|json|csv|jsonl]
         ,
@@ -732,6 +750,7 @@ fn commandSupportsSummary(cmd: lib.Command) bool {
     return std.mem.eql(u8, name, "session_tooling") or
         std.mem.eql(u8, name, "query_diagnose") or
         std.mem.eql(u8, name, "token_usage") or
+        std.mem.eql(u8, name, "token_cost") or
         std.mem.eql(u8, name, "goal_audit");
 }
 
@@ -759,7 +778,7 @@ fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
             if (fmt == .csv or fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
         .query => {},
-        .artifact_search, .tool_audit, .memory_inventory, .message_search, .message_audit, .skill_cohort, .tool_search, .memory_extension_audit, .token_window, .workdir_report, .orchestration_concurrency, .find_session, .plan_search, .reply_latency, .session_prompts, .token_usage, .routing_gap, .session_tooling, .query_diagnose, .memory_provenance, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .skill_audit, .goal_audit => {
+        .artifact_search, .tool_audit, .memory_inventory, .message_search, .message_audit, .skill_cohort, .tool_search, .memory_extension_audit, .token_window, .workdir_report, .orchestration_concurrency, .find_session, .plan_search, .reply_latency, .session_prompts, .token_usage, .token_cost, .routing_gap, .session_tooling, .query_diagnose, .memory_provenance, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .skill_audit, .goal_audit => {
             if (fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
         .unknown => return error.InvalidCommand,
@@ -771,7 +790,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_roles_csv = cmd == .session_prompts or cmd == .artifact_search or cmd == .skill_audit or cmd == .message_search or cmd == .message_audit or cmd == .skill_cohort;
     const supports_strip_skill_blocks = cmd == .session_prompts or cmd == .artifact_search;
     const supports_no_dedupe_exact = cmd == .session_prompts or cmd == .artifact_search;
-    const supports_audit = cmd == .token_usage;
+    const supports_audit = cmd == .token_usage or cmd == .token_cost;
     const supports_next_actions = cmd == .query_diagnose;
     const supports_latest = switch (cmd) {
         .opencode_prompts, .opencode_events => true,
@@ -849,6 +868,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .report_bundle,
         .section_audit,
         .token_usage,
+        .token_cost,
         .token_window,
         .session_tooling,
         .query_diagnose,
@@ -885,6 +905,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .report_bundle,
         .section_audit,
         .token_usage,
+        .token_cost,
         .token_window,
         .session_tooling,
         .query_diagnose,
@@ -905,11 +926,11 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         else => false,
     };
     const supports_group_by = switch (cmd) {
-        .session_tooling, .tool_audit, .tool_search, .opencode_prompts, .opencode_events, .token_usage => true,
+        .session_tooling, .tool_audit, .tool_search, .opencode_prompts, .opencode_events, .token_usage, .token_cost => true,
         else => false,
     };
     const supports_timezone = switch (cmd) {
-        .token_usage => true,
+        .token_usage, .token_cost => true,
         else => false,
     };
     const supports_metric = switch (cmd) {
@@ -964,6 +985,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     };
     const supports_window_hours = cmd == .token_window;
     const supports_duration_gte = cmd == .goal_audit;
+    const supports_token_cost_options = cmd == .token_cost;
 
     try ensureOptionAllowed(opts.path != null, commandSupportsPath(cmd), "--path", cmd);
     try ensureOptionAllowed(opts.session_id != null, commandSupportsSessionId(cmd), "--session-id", cmd);
@@ -1038,8 +1060,15 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.state_db_path != null, commandSupportsStateDbPath(cmd), "--state-db-path", cmd);
     try ensureOptionAllowed(opts.memory_root_text != null, commandSupportsMemoryRoot(cmd), "--memory-root", cmd);
     try ensureOptionAllowed(opts.extensions_root_text != null, commandSupportsExtensionsRoot(cmd), "--extensions-root", cmd);
+    try ensureOptionAllowed(opts.pricing_file != null, supports_token_cost_options, "--pricing-file", cmd);
+    try ensureOptionAllowed(opts.usd_per_credit_text != null, supports_token_cost_options, "--usd-per-credit", cmd);
+    try ensureOptionAllowed(opts.refresh_pricing, supports_token_cost_options, "--refresh-pricing", cmd);
+    try ensureOptionAllowed(opts.offline, supports_token_cost_options, "--offline", cmd);
+    try ensureOptionAllowed(opts.force_fast, supports_token_cost_options, "--force-fast", cmd);
+    try ensureOptionAllowed(opts.force_standard, supports_token_cost_options, "--force-standard", cmd);
 
     if (opts.ongoing and opts.completed) return error.InvalidModeArg;
+    if (opts.force_fast and opts.force_standard) return error.InvalidModeArg;
     if (opts.worker_kind_text) |text| {
         if (!isValidTraceWorkerKind(text)) return error.InvalidModeArg;
     }
@@ -1126,6 +1155,7 @@ fn commandSupportsPath(cmd: lib.Command) bool {
         .query_diagnose,
         .skill_blocks,
         .token_usage,
+        .token_cost,
         .token_window,
         .goal_audit,
         .turns,
@@ -1148,6 +1178,7 @@ fn commandSupportsSessionId(cmd: lib.Command) bool {
         .session_tooling,
         .skill_blocks,
         .token_usage,
+        .token_cost,
         .goal_audit,
         .turns,
         .session_detail,
@@ -7922,6 +7953,432 @@ fn cmdTokenUsage(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
     try output.writeOutput(allocator, opts.format, out_rows.items, cols[0..], opts.out_path);
 }
 
+const TokenCostGroupBy = enum {
+    day,
+    path,
+    model,
+    fast_mode,
+
+    fn parse(raw_opt: ?[]const u8) !TokenCostGroupBy {
+        const raw = raw_opt orelse return .day;
+        if (std.mem.eql(u8, raw, "day")) return .day;
+        if (std.mem.eql(u8, raw, "path")) return .path;
+        if (std.mem.eql(u8, raw, "model")) return .model;
+        if (std.mem.eql(u8, raw, "fast_mode")) return .fast_mode;
+        printCliError("error: token-cost --group-by must be day, path, model, or fast_mode\n", .{});
+        return error.InvalidGroupByArg;
+    }
+
+    fn fieldName(self: TokenCostGroupBy) []const u8 {
+        return switch (self) {
+            .day => "day",
+            .path => "path",
+            .model => "model",
+            .fast_mode => "fast_mode",
+        };
+    }
+};
+
+const TokenCostBucket = struct {
+    key: []u8,
+    rows: i64 = 0,
+    priced_rows: i64 = 0,
+    unpriced_rows: i64 = 0,
+    input_tokens: i64 = 0,
+    cached_input_tokens: i64 = 0,
+    output_tokens: i64 = 0,
+    reasoning_output_tokens: i64 = 0,
+    total_tokens: i64 = 0,
+    credits: f64 = 0,
+    unpriced_tokens: i64 = 0,
+    priced_fast_credits: f64 = 0,
+    priced_standard_credits: f64 = 0,
+    priced_standard_assumption_credits: f64 = 0,
+    fast_mode_label: []const u8 = "",
+    fast_mode_source: []const u8 = "",
+    cost_confidence: []const u8 = "",
+};
+
+const TokenCostTraceMeta = struct {
+    model: ?[]u8 = null,
+    fast_mode: token_cost.FastMode = .unknown,
+
+    fn deinit(self: TokenCostTraceMeta, allocator: std.mem.Allocator) void {
+        if (self.model) |value| allocator.free(value);
+    }
+};
+
+fn cmdTokenCost(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    const group_by = try TokenCostGroupBy.parse(opts.group_by_text);
+    const timezone = try time_utils.parseTimeZone(opts.timezone_text);
+    const timezone_label = try time_utils.timeZoneLabelAlloc(allocator, timezone);
+    defer allocator.free(timezone_label);
+    const since_ms = try parseTokenUsageBoundMillis(opts.since, "--since");
+    const until_ms = try parseTokenUsageBoundMillis(opts.until, "--until");
+    const usd_per_credit = try parseUsdPerCredit(opts.usd_per_credit_text);
+    const pricing = try loadTokenCostPricing(allocator, opts);
+    defer token_cost.deinitPricing(allocator, pricing);
+
+    const day_filter = deriveSessionDayPathFilterFromOptions(opts);
+    var paths = try resolveSessionPromptInputPaths(allocator, sessions_root, opts, day_filter);
+    defer freePathList(allocator, &paths);
+
+    var buckets: std.ArrayList(TokenCostBucket) = .empty;
+    var bucket_index: std.StringHashMap(usize) = .init(allocator);
+    defer deinitTokenCostBuckets(allocator, &buckets, &bucket_index);
+
+    var total = TokenCostBucket{ .key = undefined };
+
+    for (paths.items) |path| {
+        const meta = try loadTokenCostTraceMeta(allocator, path, opts);
+        defer meta.deinit(allocator);
+        var events = try datasets.token_events.parseTokenEventsFileWithOptions(allocator, path, .{
+            .dedupe = !opts.audit,
+            .derive_timestamp_fields = true,
+            .include_null_info = opts.audit,
+        });
+        defer events.deinit(allocator);
+        var deltas = try datasets.token_deltas.buildDeltas(allocator, events.items, .{});
+        defer deltas.deinit(allocator);
+
+        for (deltas.items) |row| {
+            const ts_text = row.timestamp orelse continue;
+            const ts_ms = time_utils.parseIsoTimestampMillis(ts_text.slice()) orelse continue;
+            if (!timestampMillisSatisfiesBounds(ts_ms, since_ms, until_ms, timezone)) continue;
+
+            var day_buf: [10]u8 = undefined;
+            const local_day = tokenUsageDayKeyFromMillis(ts_ms, timezone, &day_buf) orelse continue;
+            const usage = token_cost.Usage{
+                .input_tokens = row.delta_input_tokens orelse 0,
+                .cached_input_tokens = row.delta_cached_input_tokens orelse 0,
+                .output_tokens = row.delta_output_tokens orelse 0,
+            };
+            const estimate = token_cost.estimate(pricing, meta.model, usage, meta.fast_mode);
+
+            const key = switch (group_by) {
+                .day => local_day,
+                .path => path,
+                .model => meta.model orelse "unknown",
+                .fast_mode => meta.fast_mode.label(),
+            };
+            try addTokenCostBucket(allocator, &bucket_index, &buckets, key, row, estimate, meta.fast_mode);
+            addTokenCostTotals(&total, row, estimate, meta.fast_mode);
+        }
+    }
+
+    switch (group_by) {
+        .day => std.mem.sort(TokenCostBucket, buckets.items, {}, tokenCostBucketLessKeyAsc),
+        .path, .model, .fast_mode => std.mem.sort(TokenCostBucket, buckets.items, {}, tokenCostBucketLessCreditsDesc),
+    }
+
+    var out_rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &out_rows);
+
+    if (opts.summary) {
+        var qrow = query.Row.init(allocator);
+        try putTokenCostCommonFields(allocator, &qrow, total, usd_per_credit, pricing, opts, group_by, timezone_label);
+        try qrow.putOwnedKey("row_kind", .{ .string = "summary" });
+        try qrow.putOwnedKey("scope_kind", .{ .string = tokenCostScopeKind(opts, group_by) });
+        try qrow.putOwnedKey("scope_target", .{ .string = tokenUsageScopeTarget(opts, sessions_root) });
+        try out_rows.append(allocator, qrow);
+        const cols = [_][]const u8{
+            "row_kind",
+            "scope_kind",
+            "scope_target",
+            "group_by",
+            "tz",
+            "credits_estimate",
+            "usd_estimate",
+            "rows",
+            "priced_rows",
+            "unpriced_rows",
+            "input_tokens",
+            "cached_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+            "total_tokens",
+            "fast_mode",
+            "fast_mode_source",
+            "cost_confidence",
+            "priced_fast_credits",
+            "priced_standard_credits",
+            "priced_standard_assumption_credits",
+            "unpriced_tokens",
+            "pricing_source_url",
+            "pricing_fetched_at",
+            "usd_per_credit",
+        };
+        try output.writeOutput(allocator, opts.format, out_rows.items, cols[0..], opts.out_path);
+        return;
+    }
+
+    for (buckets.items) |bucket| {
+        var qrow = query.Row.init(allocator);
+        try qrow.putOwnedKey(group_by.fieldName(), .{ .string = bucket.key });
+        try putTokenCostCommonFields(allocator, &qrow, bucket, usd_per_credit, pricing, opts, group_by, timezone_label);
+        try out_rows.append(allocator, qrow);
+    }
+    trimQueryRows(&out_rows, opts.limit);
+    const cols = [_][]const u8{
+        group_by.fieldName(),
+        "credits_estimate",
+        "usd_estimate",
+        "rows",
+        "priced_rows",
+        "unpriced_rows",
+        "input_tokens",
+        "cached_input_tokens",
+        "output_tokens",
+        "reasoning_output_tokens",
+        "total_tokens",
+        "fast_mode",
+        "fast_mode_source",
+        "cost_confidence",
+        "unpriced_tokens",
+        "pricing_source_url",
+        "pricing_fetched_at",
+        "usd_per_credit",
+        "group_by",
+        "tz",
+    };
+    try output.writeOutput(allocator, opts.format, out_rows.items, cols[0..], opts.out_path);
+}
+
+fn parseUsdPerCredit(raw_opt: ?[]const u8) !?f64 {
+    const raw = raw_opt orelse return null;
+    const value = try std.fmt.parseFloat(f64, raw);
+    if (value <= 0) return error.InvalidLimit;
+    return value;
+}
+
+fn loadTokenCostPricing(allocator: std.mem.Allocator, opts: Options) !token_cost.Pricing {
+    if (opts.pricing_file) |path| return token_cost.loadPricingFile(allocator, path);
+    if (opts.refresh_pricing) {
+        if (opts.offline) return error.InvalidModeArg;
+        return refreshTokenCostPricing(allocator);
+    }
+    return token_cost.bundledPricing();
+}
+
+fn refreshTokenCostPricing(allocator: std.mem.Allocator) !token_cost.Pricing {
+    const capture_allocator = std.heap.page_allocator;
+    var client = std.http.Client{ .allocator = capture_allocator, .io = defaultIo() };
+    defer client.deinit();
+    var body = std.Io.Writer.Allocating.init(capture_allocator);
+    defer body.deinit();
+    var redirect_buffer: [8 * 1024]u8 = undefined;
+    const result = try client.fetch(.{
+        .location = .{ .url = token_cost.OfficialRateCardUrl },
+        .response_writer = &body.writer,
+        .redirect_buffer = redirect_buffer[0..],
+    });
+    if (result.status != .ok) {
+        return error.PricingRefreshFailed;
+    }
+    const rate_card_text = try body.toOwnedSlice();
+    defer capture_allocator.free(rate_card_text);
+    const pricing = try token_cost.parseOfficialRateCardText(allocator, rate_card_text, "refreshed");
+    try writeTokenCostPricingCache(allocator, pricing);
+    return pricing;
+}
+
+fn writeTokenCostPricingCache(allocator: std.mem.Allocator, pricing: token_cost.Pricing) !void {
+    const cache_path = try tokenCostCachePath(allocator);
+    defer allocator.free(cache_path);
+    var rendered = std.Io.Writer.Allocating.init(allocator);
+    defer rendered.deinit();
+    const writer = &rendered.writer;
+    try writer.print("{{\"source_url\":\"{s}\",\"fetched_at\":\"{s}\",\"models\":[", .{ pricing.source_url, pricing.fetched_at });
+    for (pricing.rates, 0..) |rate, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writer.print("{{\"model\":\"{s}\",\"input_credits_per_million\":{d},\"cached_input_credits_per_million\":{d},\"output_credits_per_million\":{d}", .{
+            rate.model,
+            rate.input_credits_per_million,
+            rate.cached_input_credits_per_million,
+            rate.output_credits_per_million,
+        });
+        if (rate.fast_multiplier) |mult| try writer.print(",\"fast_multiplier\":{d}", .{mult});
+        try writer.writeByte('}');
+    }
+    try writer.writeAll("]}");
+    const bytes = try rendered.toOwnedSlice();
+    defer allocator.free(bytes);
+    if (std.fs.path.dirname(cache_path)) |dir| try std.Io.Dir.cwd().createDirPath(defaultIo(), dir);
+    try std.Io.Dir.cwd().writeFile(defaultIo(), .{ .sub_path = cache_path, .data = bytes });
+}
+
+fn tokenCostCachePath(allocator: std.mem.Allocator) ![]u8 {
+    if (std.c.getenv("XDG_CACHE_HOME")) |value| {
+        return std.fs.path.join(allocator, &.{ std.mem.span(value), "seq", "pricing", "codex-pricing.json" });
+    }
+    const home = std.c.getenv("HOME") orelse return error.EnvironmentVariableNotFound;
+    const root = try std.fs.path.join(allocator, &.{ std.mem.span(home), ".cache" });
+    defer allocator.free(root);
+    return std.fs.path.join(allocator, &.{ root, "seq", "pricing", "codex-pricing.json" });
+}
+
+fn loadTokenCostTraceMeta(allocator: std.mem.Allocator, path: []const u8, opts: Options) !TokenCostTraceMeta {
+    var out = TokenCostTraceMeta{};
+    if (opts.force_fast) out.fast_mode = .override_fast;
+    if (opts.force_standard) out.fast_mode = .override_standard;
+    var trace = canonical_trace.parseSessionTrace(allocator, path, .{}) catch null;
+    if (trace) |*parsed| {
+        defer parsed.deinit(allocator);
+        if (parsed.session.model) |model| out.model = try allocator.dupe(u8, model);
+    }
+    if (opts.force_fast or opts.force_standard) return out;
+    const content_opt = try readFileAllocOrSkip(allocator, path);
+    defer if (content_opt) |content| allocator.free(content);
+    const content = content_opt orelse return out;
+    out.fast_mode = detectFastModeEvidence(content);
+    return out;
+}
+
+fn detectFastModeEvidence(content: []const u8) token_cost.FastMode {
+    if (std.mem.containsAtLeast(u8, content, 1, "\"fast_mode\":true") or
+        std.mem.containsAtLeast(u8, content, 1, "\"fast_mode\": true") or
+        std.mem.containsAtLeast(u8, content, 1, "\"service_tier\":\"fast\"") or
+        std.mem.containsAtLeast(u8, content, 1, "\"service_tier\": \"fast\""))
+    {
+        return .explicit_fast;
+    }
+    if (std.mem.containsAtLeast(u8, content, 1, "\"fast_mode\":false") or
+        std.mem.containsAtLeast(u8, content, 1, "\"fast_mode\": false") or
+        std.mem.containsAtLeast(u8, content, 1, "\"service_tier\":\"standard\"") or
+        std.mem.containsAtLeast(u8, content, 1, "\"service_tier\": \"standard\""))
+    {
+        return .explicit_standard;
+    }
+    return .unknown;
+}
+
+fn addTokenCostBucket(
+    allocator: std.mem.Allocator,
+    index: *std.StringHashMap(usize),
+    buckets: *std.ArrayList(TokenCostBucket),
+    key: []const u8,
+    row: datasets.token_deltas.Row,
+    estimate: token_cost.Estimate,
+    fast_mode: token_cost.FastMode,
+) !void {
+    if (index.get(key)) |existing_idx| {
+        addTokenCostTotals(&buckets.items[existing_idx], row, estimate, fast_mode);
+        return;
+    }
+    const owned_key = try allocator.dupe(u8, key);
+    errdefer allocator.free(owned_key);
+    try buckets.append(allocator, .{ .key = owned_key });
+    errdefer {
+        const popped = buckets.pop().?;
+        allocator.free(popped.key);
+    }
+    try index.put(owned_key, buckets.items.len - 1);
+    addTokenCostTotals(&buckets.items[buckets.items.len - 1], row, estimate, fast_mode);
+}
+
+fn addTokenCostTotals(bucket: *TokenCostBucket, row: datasets.token_deltas.Row, estimate: token_cost.Estimate, fast_mode: token_cost.FastMode) void {
+    bucket.rows += 1;
+    bucket.input_tokens += row.delta_input_tokens orelse 0;
+    bucket.cached_input_tokens += row.delta_cached_input_tokens orelse 0;
+    bucket.output_tokens += row.delta_output_tokens orelse 0;
+    bucket.reasoning_output_tokens += row.delta_reasoning_output_tokens orelse 0;
+    const delta_total = row.delta_total_tokens orelse 0;
+    bucket.total_tokens += delta_total;
+    mergeTokenCostLabel(&bucket.fast_mode_label, fast_mode.label());
+    mergeTokenCostLabel(&bucket.fast_mode_source, fast_mode.source());
+    mergeTokenCostLabel(&bucket.cost_confidence, estimate.confidence);
+    if (estimate.priced) {
+        bucket.priced_rows += 1;
+        bucket.credits += estimate.credits;
+        switch (fast_mode) {
+            .explicit_fast, .override_fast => bucket.priced_fast_credits += estimate.credits,
+            .unknown => bucket.priced_standard_assumption_credits += estimate.credits,
+            .explicit_standard, .override_standard => bucket.priced_standard_credits += estimate.credits,
+        }
+    } else {
+        bucket.unpriced_rows += 1;
+        if (delta_total > 0) bucket.unpriced_tokens += delta_total;
+    }
+}
+
+fn mergeTokenCostLabel(field: *[]const u8, value: []const u8) void {
+    if (field.*.len == 0) {
+        field.* = value;
+    } else if (!std.mem.eql(u8, field.*, value)) {
+        field.* = "mixed";
+    }
+}
+
+fn putTokenCostCommonFields(
+    allocator: std.mem.Allocator,
+    row: *query.Row,
+    bucket: TokenCostBucket,
+    usd_per_credit: ?f64,
+    pricing: token_cost.Pricing,
+    opts: Options,
+    group_by: TokenCostGroupBy,
+    timezone_label: []const u8,
+) !void {
+    _ = allocator;
+    try row.putOwnedKey("credits_estimate", .{ .float = bucket.credits });
+    if (usd_per_credit) |rate| {
+        try row.putOwnedKey("usd_estimate", .{ .float = bucket.credits * rate });
+        try row.putOwnedKey("usd_per_credit", .{ .float = rate });
+    } else {
+        try row.putOwnedKey("usd_estimate", .null);
+        try row.putOwnedKey("usd_per_credit", .null);
+    }
+    try row.putOwnedKey("rows", .{ .int = bucket.rows });
+    try row.putOwnedKey("priced_rows", .{ .int = bucket.priced_rows });
+    try row.putOwnedKey("unpriced_rows", .{ .int = bucket.unpriced_rows });
+    try row.putOwnedKey("input_tokens", .{ .int = bucket.input_tokens });
+    try row.putOwnedKey("cached_input_tokens", .{ .int = bucket.cached_input_tokens });
+    try row.putOwnedKey("output_tokens", .{ .int = bucket.output_tokens });
+    try row.putOwnedKey("reasoning_output_tokens", .{ .int = bucket.reasoning_output_tokens });
+    try row.putOwnedKey("total_tokens", .{ .int = bucket.total_tokens });
+    try row.putOwnedKey("unpriced_tokens", .{ .int = bucket.unpriced_tokens });
+    try row.putOwnedKey("pricing_source_url", .{ .string = pricing.source_url });
+    try row.putOwnedKey("pricing_fetched_at", .{ .string = pricing.fetched_at });
+    try row.putOwnedKey("fast_mode", .{ .string = if (bucket.fast_mode_label.len == 0) "n/a" else bucket.fast_mode_label });
+    try row.putOwnedKey("fast_mode_source", .{ .string = if (bucket.fast_mode_source.len == 0) "n/a" else bucket.fast_mode_source });
+    try row.putOwnedKey("cost_confidence", .{ .string = if (bucket.cost_confidence.len == 0) "n/a" else bucket.cost_confidence });
+    try row.putOwnedKey("group_by", .{ .string = group_by.fieldName() });
+    try row.putOwnedKey("tz", .{ .string = timezone_label });
+    if (opts.audit or opts.summary) {
+        try row.putOwnedKey("priced_fast_credits", .{ .float = bucket.priced_fast_credits });
+        try row.putOwnedKey("priced_standard_credits", .{ .float = bucket.priced_standard_credits });
+        try row.putOwnedKey("priced_standard_assumption_credits", .{ .float = bucket.priced_standard_assumption_credits });
+    }
+}
+
+fn deinitTokenCostBuckets(
+    allocator: std.mem.Allocator,
+    buckets: *std.ArrayList(TokenCostBucket),
+    index: *std.StringHashMap(usize),
+) void {
+    for (buckets.items) |bucket| allocator.free(bucket.key);
+    buckets.deinit(allocator);
+    index.deinit();
+}
+
+fn tokenCostBucketLessKeyAsc(_: void, lhs: TokenCostBucket, rhs: TokenCostBucket) bool {
+    return std.mem.order(u8, lhs.key, rhs.key) == .lt;
+}
+
+fn tokenCostBucketLessCreditsDesc(_: void, lhs: TokenCostBucket, rhs: TokenCostBucket) bool {
+    if (lhs.credits != rhs.credits) return lhs.credits > rhs.credits;
+    return std.mem.order(u8, lhs.key, rhs.key) == .lt;
+}
+
+fn tokenCostScopeKind(opts: Options, group_by: TokenCostGroupBy) []const u8 {
+    if (group_by == .path) return "grouped_paths";
+    if (group_by == .model) return "grouped_models";
+    if (group_by == .fast_mode) return "grouped_fast_modes";
+    if (opts.path != null) return "path";
+    if (opts.session_id != null) return "session";
+    return "corpus";
+}
+
 fn parseTokenUsageBoundMillis(raw_opt: ?[]const u8, flag_name: []const u8) !?i64 {
     const raw = raw_opt orelse return null;
     return time_utils.parseIsoTimestampMillis(raw) orelse blk: {
@@ -11209,6 +11666,14 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.metric_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--pricing-file")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.pricing_file = args[i];
+        } else if (std.mem.eql(u8, arg, "--usd-per-credit")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.usd_per_credit_text = args[i];
         } else if (std.mem.eql(u8, arg, "--select")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -11253,6 +11718,14 @@ fn parseOptions(args: []const []const u8) !Options {
             opts.include_body = true;
         } else if (std.mem.eql(u8, arg, "--stats")) {
             opts.stats = true;
+        } else if (std.mem.eql(u8, arg, "--refresh-pricing")) {
+            opts.refresh_pricing = true;
+        } else if (std.mem.eql(u8, arg, "--offline")) {
+            opts.offline = true;
+        } else if (std.mem.eql(u8, arg, "--force-fast")) {
+            opts.force_fast = true;
+        } else if (std.mem.eql(u8, arg, "--force-standard")) {
+            opts.force_standard = true;
         } else if (std.mem.eql(u8, arg, "--strip-skill-blocks")) {
             opts.strip_skill_blocks = true;
         } else if (std.mem.eql(u8, arg, "--no-dedupe-exact")) {
@@ -12164,6 +12637,100 @@ test "token-usage audit grouped output appends aggregate audit row after trimmin
     try std.testing.expect(std.mem.indexOf(u8, got, "\"row_kind\":\"audit\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"audit_total_tokens\":25") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"duplicate_last_tokens_excluded\":7") != null);
+}
+
+test "token-cost summary applies explicit fast multiplier and user USD conversion" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/05/13");
+    const session_rel = "2026/05/13/rollout-token-cost-fast.jsonl";
+    const session_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-13T10:00:00Z\",\"payload\":{\"model\":\"gpt-5.4\"}}\n" ++
+        "{\"type\":\"turn_context\",\"timestamp\":\"2026-05-13T10:00:01Z\",\"payload\":{\"model\":\"gpt-5.4\",\"service_tier\":\"fast\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T10:00:02Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":1000000,\"cached_input_tokens\":250000,\"output_tokens\":100000,\"reasoning_output_tokens\":0,\"total_tokens\":1100000}}}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = session_rel, .data = session_content });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "token-cost-fast.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const args = [_][]const u8{
+        "--root",    root_abs,
+        "--summary", "--usd-per-credit",
+        "0.01",      "--format",
+        "json",
+    };
+    const got = try runCommandWithOutput(std.testing.allocator, .token_cost, args[0..], output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"credits_estimate\": 171.875") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"usd_estimate\": 1.71875") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"fast_mode\": \"fast\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"fast_mode_source\": \"trace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"cost_confidence\": \"trace_fast\"") != null);
+}
+
+test "token-cost marks missing fast evidence as standard assumption" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/05/13");
+    const session_rel = "2026/05/13/rollout-token-cost-unknown.jsonl";
+    const session_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-13T10:00:00Z\",\"payload\":{\"model\":\"gpt-5.5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T10:00:02Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":1000,\"cached_input_tokens\":100,\"output_tokens\":100,\"total_tokens\":1200}}}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = session_rel, .data = session_content });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "token-cost-unknown.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const args = [_][]const u8{
+        "--root",    root_abs,
+        "--summary", "--format",
+        "json",
+    };
+    const got = try runCommandWithOutput(std.testing.allocator, .token_cost, args[0..], output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"usd_estimate\": null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"fast_mode\": \"unknown\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"fast_mode_source\": \"missing\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"cost_confidence\": \"standard_assumption\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"priced_standard_assumption_credits\": 0.18875") != null);
+}
+
+test "token-cost summary counts unpriced tokens once" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/05/13");
+    const session_rel = "2026/05/13/rollout-token-cost-unpriced.jsonl";
+    const session_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-13T10:00:00Z\",\"payload\":{\"model\":\"unknown-model\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T10:00:02Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":1000,\"cached_input_tokens\":100,\"output_tokens\":100,\"total_tokens\":1200}}}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = session_rel, .data = session_content });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "token-cost-unpriced.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const args = [_][]const u8{
+        "--root",    root_abs,
+        "--summary", "--format",
+        "json",
+    };
+    const got = try runCommandWithOutput(std.testing.allocator, .token_cost, args[0..], output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"priced_rows\": 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"unpriced_rows\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"unpriced_tokens\": 1200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"unpriced_tokens\": 2400") == null);
 }
 
 test "parseOptions rejects unknown option" {
