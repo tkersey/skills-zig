@@ -164,11 +164,20 @@ pub fn parsePricingJson(allocator: std.mem.Allocator, data: []const u8, source: 
             .fast_multiplier = jsonNumber(obj, "fast_multiplier") catch null,
         });
     }
+    const owned_rates = try rates.toOwnedSlice(allocator);
+    errdefer {
+        for (owned_rates) |rate| allocator.free(rate.model);
+        allocator.free(owned_rates);
+    }
+    const source_url = try allocator.dupe(u8, jsonString(root, "source_url") orelse OfficialRateCardUrl);
+    errdefer allocator.free(source_url);
+    const fetched_at = try allocator.dupe(u8, jsonString(root, "fetched_at") orelse "unknown");
+    errdefer allocator.free(fetched_at);
     return .{
-        .rates = try rates.toOwnedSlice(allocator),
+        .rates = owned_rates,
         .source = source,
-        .source_url = if (jsonString(root, "source_url")) |v| try allocator.dupe(u8, v) else OfficialRateCardUrl,
-        .fetched_at = if (jsonString(root, "fetched_at")) |v| try allocator.dupe(u8, v) else "unknown",
+        .source_url = source_url,
+        .fetched_at = fetched_at,
     };
 }
 
@@ -289,6 +298,16 @@ test "pricing file overrides bundled rates" {
     const got = estimate(pricing, "fixture-model", .{ .input_tokens = 1_000_000 }, .override_fast);
     try std.testing.expect(got.priced);
     try std.testing.expectApproxEqAbs(@as(f64, 30), got.credits, 0.0001);
+}
+
+test "pricing file fallback metadata is allocator-owned" {
+    const data =
+        \\{"models":[{"model":"fixture-model","input_credits_per_million":10,"cached_input_credits_per_million":1,"output_credits_per_million":20}]}
+    ;
+    const pricing = try parsePricingJson(std.testing.allocator, data, .file);
+    defer deinitPricing(std.testing.allocator, pricing);
+    try std.testing.expectEqualStrings(OfficialRateCardUrl, pricing.source_url);
+    try std.testing.expectEqualStrings("unknown", pricing.fetched_at);
 }
 
 test "official rate-card text parser extracts current token rates" {

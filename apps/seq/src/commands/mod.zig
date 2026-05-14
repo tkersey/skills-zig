@@ -8048,7 +8048,6 @@ fn cmdTokenCost(allocator: std.mem.Allocator, sessions_root: []const u8, opts: O
 
             var day_buf: [10]u8 = undefined;
             const local_day = tokenUsageDayKeyFromMillis(ts_ms, timezone, &day_buf) orelse continue;
-            const delta_total = row.delta_total_tokens orelse 0;
             const usage = token_cost.Usage{
                 .input_tokens = row.delta_input_tokens orelse 0,
                 .cached_input_tokens = row.delta_cached_input_tokens orelse 0,
@@ -8064,7 +8063,6 @@ fn cmdTokenCost(allocator: std.mem.Allocator, sessions_root: []const u8, opts: O
             };
             try addTokenCostBucket(allocator, &bucket_index, &buckets, key, row, estimate, meta.fast_mode);
             addTokenCostTotals(&total, row, estimate, meta.fast_mode);
-            if (!estimate.priced and delta_total > 0) total.unpriced_tokens += delta_total;
         }
     }
 
@@ -12703,6 +12701,36 @@ test "token-cost marks missing fast evidence as standard assumption" {
     try std.testing.expect(std.mem.indexOf(u8, got, "\"fast_mode_source\": \"missing\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"cost_confidence\": \"standard_assumption\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"priced_standard_assumption_credits\": 0.18875") != null);
+}
+
+test "token-cost summary counts unpriced tokens once" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/05/13");
+    const session_rel = "2026/05/13/rollout-token-cost-unpriced.jsonl";
+    const session_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-13T10:00:00Z\",\"payload\":{\"model\":\"unknown-model\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T10:00:02Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":1000,\"cached_input_tokens\":100,\"output_tokens\":100,\"total_tokens\":1200}}}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = session_rel, .data = session_content });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "token-cost-unpriced.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const args = [_][]const u8{
+        "--root",    root_abs,
+        "--summary", "--format",
+        "json",
+    };
+    const got = try runCommandWithOutput(std.testing.allocator, .token_cost, args[0..], output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"priced_rows\": 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"unpriced_rows\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"unpriced_tokens\": 1200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"unpriced_tokens\": 2400") == null);
 }
 
 test "parseOptions rejects unknown option" {
