@@ -200,7 +200,7 @@ pub fn processAlive(process_id: u64) bool {
         .wasi => false,
         else => blk: {
             const pid: std.posix.pid_t = @intCast(process_id);
-            std.posix.kill(pid, 0) catch |err| switch (err) {
+            std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
                 error.ProcessNotFound => break :blk false,
                 else => break :blk true,
             };

@@ -18,13 +18,20 @@ const UsageText =
     \\Control detached Codex review sessions via the app-server.
     \\
     \\Usage:
-    \\  cas_review_session <start|status|wait|interrupt> [options]
+    \\  cas_review_session <start|status|wait|interrupt|lane> [options]
     \\
     \\Actions:
     \\  start      Start a detached review session and persist its handle.
     \\  status     Read the persisted session and report current review status.
     \\  wait       Poll the persisted session until the review turn reaches a terminal status.
     \\  interrupt  Interrupt the persisted detached review turn.
+    \\  lane       Reuse one managed app-server for multiple fresh-parent reviews.
+    \\
+    \\Lane actions:
+    \\  lane start   Start a reusable review lane.
+    \\  lane review  Run one fresh-parent review through the lane and archive review threads.
+    \\  lane status  Report whether the lane app-server process is still alive.
+    \\  lane stop    Stop the lane app-server process.
     \\
     \\Start options:
     \\  --cwd DIR                        Workspace for the app-server.
@@ -54,6 +61,10 @@ const UsageText =
     \\Status/wait/interrupt options:
     \\  --review-thread-id THREAD_ID     Detached review thread id handle.
     \\
+    \\Lane options:
+    \\  --lane-id LANE_ID                Lane handle for lane review/status/stop.
+    \\  --no-archive                     Do not best-effort archive lane review threads.
+    \\
     \\Common options:
     \\  --json                           Emit machine-readable JSON.
     \\  --timeout-ms N                   Wait timeout for `wait` (default: 300000).
@@ -69,6 +80,9 @@ const UsageText =
     \\  cas review_session status --review-thread-id thr_123 --json
     \\  cas review_session wait --review-thread-id thr_123 --timeout-ms 300000 --json
     \\  cas review_session interrupt --review-thread-id thr_123 --json
+    \\  cas review_session lane start --cwd /path/to/repo --json
+    \\  cas review_session lane review --lane-id lane_123 --base main --json
+    \\  cas review_session lane stop --lane-id lane_123 --json
 ;
 
 const Action = enum {
@@ -76,12 +90,29 @@ const Action = enum {
     status,
     wait,
     interrupt,
+    lane,
 
     fn parse(raw: []const u8) ?Action {
         if (std.mem.eql(u8, raw, "start")) return .start;
         if (std.mem.eql(u8, raw, "status")) return .status;
         if (std.mem.eql(u8, raw, "wait")) return .wait;
         if (std.mem.eql(u8, raw, "interrupt")) return .interrupt;
+        if (std.mem.eql(u8, raw, "lane")) return .lane;
+        return null;
+    }
+};
+
+const LaneAction = enum {
+    start,
+    review,
+    status,
+    stop,
+
+    fn parse(raw: []const u8) ?LaneAction {
+        if (std.mem.eql(u8, raw, "start")) return .start;
+        if (std.mem.eql(u8, raw, "review")) return .review;
+        if (std.mem.eql(u8, raw, "status")) return .status;
+        if (std.mem.eql(u8, raw, "stop")) return .stop;
         return null;
     }
 };
@@ -137,12 +168,15 @@ const TargetConfig = struct {
 
 const ParsedArgs = struct {
     action: ?Action = null,
+    lane_action: ?LaneAction = null,
     cwd: ?[]const u8 = null,
+    lane_id: ?[]const u8 = null,
     parent_thread_id: ?[]const u8 = null,
     parent_mode: ParentMode = .auto,
     review_thread_id: ?[]const u8 = null,
     target: ?TargetConfig = null,
     wait_after_start: bool = false,
+    archive_lane_threads: bool = true,
     json: bool = false,
     timeout_ms: u32 = 300_000,
     poll_interval_ms: u32 = 250,
@@ -198,6 +232,33 @@ const SessionRecord = struct {
     hook_log_path: ?[]const u8 = null,
 };
 
+const LaneRecord = struct {
+    schema_version: u32 = 1,
+    lane_id: []const u8,
+    cwd: []const u8,
+    created_at_unix_s: i64,
+    last_used_at_unix_s: i64,
+    status: []const u8,
+    review_count: u32 = 0,
+    codex_version: []const u8,
+    resolved_codex_path: []const u8,
+    transport_kind: []const u8 = "websocket",
+    transport_selection_reason: []const u8 = "persistent_review_lane",
+    managed_server_pid: u64,
+    managed_server_listen_url: []const u8,
+    orphan_ttl_seconds: u32 = managed_server_orphan_ttl_seconds,
+    hook_policy: []const u8,
+    last_review_thread_id: ?[]const u8 = null,
+    last_review_turn_id: ?[]const u8 = null,
+    last_record_path: ?[]const u8 = null,
+    last_event_log_path: ?[]const u8 = null,
+    last_target_fingerprint: ?[]const u8 = null,
+    last_head_sha: ?[]const u8 = null,
+    last_base_sha: ?[]const u8 = null,
+    last_dual_parse_verdict: ?[]const u8 = null,
+    last_archive_status: ?[]const u8 = null,
+};
+
 const OutputReceipt = struct {
     resolved_codex_path: ?[]const u8 = null,
     resolved_codex_version: ?[]const u8 = null,
@@ -242,6 +303,7 @@ const ReviewStatus = struct {
     review_result_available: bool,
     review_result_source: ?[]const u8,
     review_result_json: ?[]const u8,
+    review_text: ?[]const u8 = null,
     raw_response_json: []const u8,
 
     fn deinit(self: ReviewStatus, allocator: std.mem.Allocator) void {
@@ -251,6 +313,7 @@ const ReviewStatus = struct {
         if (self.rollout_path) |path| allocator.free(path);
         if (self.turn_error_message) |message| allocator.free(message);
         if (self.review_result_json) |json| allocator.free(json);
+        if (self.review_text) |text| allocator.free(text);
         allocator.free(self.raw_response_json);
     }
 };
@@ -264,6 +327,29 @@ const NativeFallbackResult = struct {
     fn deinit(self: NativeFallbackResult, allocator: std.mem.Allocator) void {
         if (self.stdout_text) |value| allocator.free(value);
         if (self.stderr_text) |value| allocator.free(value);
+    }
+};
+
+const TargetIdentity = struct {
+    head_sha: ?[]const u8,
+    base_sha: ?[]const u8,
+    fingerprint: []const u8,
+
+    fn deinit(self: TargetIdentity, allocator: std.mem.Allocator) void {
+        if (self.head_sha) |value| allocator.free(value);
+        if (self.base_sha) |value| allocator.free(value);
+        allocator.free(self.fingerprint);
+    }
+};
+
+const DualParseVerdict = struct {
+    verdict: []const u8,
+    structured_findings: usize,
+    raw_findings: ?usize,
+    raw_review_text_available: bool,
+
+    fn deinit(self: DualParseVerdict, allocator: std.mem.Allocator) void {
+        allocator.free(self.verdict);
     }
 };
 
@@ -337,6 +423,7 @@ pub fn main(init: std.process.Init) !void {
         .status => try cmdStatus(allocator, init.io, parsed),
         .wait => try cmdWait(allocator, init.io, parsed),
         .interrupt => try cmdInterrupt(allocator, init.io, parsed),
+        .lane => try cmdLane(allocator, init.io, parsed),
     }
 }
 
@@ -357,6 +444,11 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
 
     out.action = Action.parse(first) orelse return error.UnknownAction;
     i += 1;
+    if (out.action.? == .lane) {
+        if (i >= argv.len) return error.MissingLaneAction;
+        out.lane_action = LaneAction.parse(argv[i]) orelse return error.UnknownLaneAction;
+        i += 1;
+    }
 
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
@@ -380,6 +472,10 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             out.wait_after_start = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--no-archive")) {
+            out.archive_lane_threads = false;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--uncommitted")) {
             setTarget(&out, .{ .kind = .uncommitted });
             continue;
@@ -391,6 +487,10 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
 
         if (std.mem.eql(u8, arg, "--cwd")) {
             out.cwd = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--lane-id")) {
+            out.lane_id = value;
             continue;
         }
         if (std.mem.eql(u8, arg, "--parent-thread-id")) {
@@ -484,6 +584,18 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
         .status, .wait, .interrupt => {
             if (out.review_thread_id == null) return error.MissingReviewThreadId;
         },
+        .lane => switch (out.lane_action orelse return error.MissingLaneAction) {
+            .start => {
+                if (out.cwd == null) return error.MissingCwd;
+            },
+            .review => {
+                if (out.lane_id == null) return error.MissingLaneId;
+                if (out.target == null) return error.MissingTarget;
+            },
+            .status, .stop => {
+                if (out.lane_id == null) return error.MissingLaneId;
+            },
+        },
     }
 
     return out;
@@ -520,7 +632,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             },
         );
     };
-    const codex_version = readCodexVersionAlloc(allocator, cwd, resolved_codex_path) catch {
+    const codex_version = readCodexVersionAlloc(allocator, io, cwd, resolved_codex_path) catch {
         try renderErrorAndExit(
             parsed.json,
             "start",
@@ -1535,6 +1647,565 @@ fn cmdInterrupt(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !v
     }
 }
 
+fn cmdLane(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
+    switch (parsed.lane_action.?) {
+        .start => try cmdLaneStart(allocator, io, parsed),
+        .review => try cmdLaneReview(allocator, io, parsed),
+        .status => try cmdLaneStatus(allocator, parsed),
+        .stop => try cmdLaneStop(allocator, parsed),
+    }
+}
+
+fn cmdLaneStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
+    const cwd = parsed.cwd.?;
+    const resolved_codex_path = cas.resolveExecutableAlloc(allocator, "codex") catch {
+        try renderErrorAndExit(
+            parsed.json,
+            "lane-start",
+            "app-server/start",
+            "codex binary could not be resolved for review_session lane",
+            cwd,
+            .{},
+            .{
+                .code = "missing_codex_binary",
+                .hint = "install or expose a compatible codex binary on PATH before starting a CAS review lane",
+            },
+        );
+    };
+    const codex_version = try readCodexVersionAlloc(allocator, io, cwd, resolved_codex_path);
+    var managed_server = startManagedWebsocketServer(allocator, cwd, resolved_codex_path, parsed.hook_policy, io) catch |err| {
+        try renderErrorAndExit(
+            parsed.json,
+            "lane-start",
+            "app-server/start",
+            @errorName(err),
+            cwd,
+            .{
+                .resolved_codex_path = resolved_codex_path,
+                .resolved_codex_version = codex_version,
+                .compatibility_verdict = "compatible",
+                .selected_transport = "websocket",
+                .selection_reason = "persistent_review_lane",
+                .orphan_ttl_seconds = managed_server_orphan_ttl_seconds,
+            },
+            .{
+                .code = "websocket_bootstrap_failed",
+                .hint = "CAS could not start the managed websocket app-server for the persistent review lane",
+            },
+        );
+    };
+    const lane_id = try laneIdAlloc(allocator, managed_server.processId());
+
+    var client = connectReviewClient(
+        allocator,
+        cwd,
+        resolved_codex_path,
+        codex_version,
+        "websocket",
+        managed_server.listen_url,
+        io,
+        parsed,
+    ) catch |err| {
+        managed_server.kill();
+        managed_server.deinit(allocator);
+        try renderErrorAndExit(
+            parsed.json,
+            "lane-start",
+            "app-server/connect",
+            @errorName(err),
+            cwd,
+            .{
+                .resolved_codex_path = resolved_codex_path,
+                .resolved_codex_version = codex_version,
+                .compatibility_verdict = "compatible",
+                .selected_transport = "websocket",
+                .selection_reason = "persistent_review_lane",
+                .managed_server_pid = managed_server.processId(),
+                .managed_server_listen_url = managed_server.listen_url,
+                .orphan_ttl_seconds = managed_server_orphan_ttl_seconds,
+            },
+            .{
+                .code = "websocket_bootstrap_failed",
+                .hint = "CAS started the managed websocket app-server but could not complete the lane websocket client handshake",
+            },
+        );
+    };
+    defer {
+        client.close();
+        client.deinit();
+    }
+
+    const now_s = unixSeconds();
+    const lane = LaneRecord{
+        .lane_id = lane_id,
+        .cwd = cwd,
+        .created_at_unix_s = now_s,
+        .last_used_at_unix_s = now_s,
+        .status = "running",
+        .codex_version = codex_version,
+        .resolved_codex_path = resolved_codex_path,
+        .managed_server_pid = managed_server.processId(),
+        .managed_server_listen_url = managed_server.listen_url,
+        .hook_policy = parsed.hook_policy.asString(),
+    };
+    const path = try laneRecordPathAlloc(allocator, lane_id);
+    try writeLaneRecord(allocator, path, lane);
+
+    if (parsed.json) {
+        try printJson(.{
+            .demo = "cas-review-session",
+            .action = "lane-start",
+            .laneId = lane.lane_id,
+            .cwd = lane.cwd,
+            .recordPath = path,
+            .resolvedCodexPath = lane.resolved_codex_path,
+            .resolvedCodexVersion = lane.codex_version,
+            .selectedTransport = lane.transport_kind,
+            .selectionReason = lane.transport_selection_reason,
+            .managedServerPid = lane.managed_server_pid,
+            .managedServerListenUrl = lane.managed_server_listen_url,
+            .orphanTtlSeconds = lane.orphan_ttl_seconds,
+            .hookPolicy = lane.hook_policy,
+        });
+    } else {
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        const stdout = &stdout_writer.interface;
+        try stdout.print("cas_review_session lane start\nlane: {s}\ncwd: {s}\nmanaged server pid: {d}\nrecord: {s}\n", .{
+            lane.lane_id,
+            lane.cwd,
+            lane.managed_server_pid,
+            path,
+        });
+    }
+}
+
+fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
+    var loaded = try loadLaneRecord(allocator, parsed.lane_id.?);
+    defer loaded.deinit(allocator);
+    var lane = loaded.record;
+    const target = parsed.target.?;
+    const target_record = targetToRecord(target);
+    var identity = try computeTargetIdentityAlloc(allocator, io, lane.cwd, target_record);
+    defer identity.deinit(allocator);
+
+    if (!cas_websocket.processAlive(lane.managed_server_pid)) {
+        if (parsed.fallback_mode == .native_review) {
+            var fallback = try runNativeReviewFallbackAlloc(allocator, lane.cwd, lane.resolved_codex_path, target_record);
+            defer fallback.deinit(allocator);
+            try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, .{
+                .code = "lane_transport_lost",
+                .hint = "persistent CAS lane app-server is not alive; returned explicit native-review fallback",
+            });
+            std.process.exit(if (fallback.ok) 0 else 1);
+        }
+        try renderErrorAndExit(
+            parsed.json,
+            "lane-review",
+            "review/start",
+            "persistent CAS lane app-server is not alive",
+            lane.cwd,
+            .{
+                .resolved_codex_path = lane.resolved_codex_path,
+                .resolved_codex_version = lane.codex_version,
+                .compatibility_verdict = "compatible",
+                .selected_transport = "websocket",
+                .selection_reason = "persistent_review_lane",
+                .managed_server_pid = lane.managed_server_pid,
+                .managed_server_listen_url = lane.managed_server_listen_url,
+                .orphan_ttl_seconds = lane.orphan_ttl_seconds,
+            },
+            .{
+                .code = "lane_transport_lost",
+                .hint = "restart the CAS review lane or pass --fallback native-review for explicit degraded transport",
+            },
+        );
+    }
+
+    var client = connectReviewClient(
+        allocator,
+        lane.cwd,
+        lane.resolved_codex_path,
+        lane.codex_version,
+        lane.transport_kind,
+        lane.managed_server_listen_url,
+        io,
+        parsed,
+    ) catch |err| {
+        if (parsed.fallback_mode == .native_review) {
+            var fallback = try runNativeReviewFallbackAlloc(allocator, lane.cwd, lane.resolved_codex_path, target_record);
+            defer fallback.deinit(allocator);
+            try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, .{
+                .code = "lane_transport_lost",
+                .hint = "persistent CAS lane websocket could not be reconnected; returned explicit native-review fallback",
+            });
+            std.process.exit(if (fallback.ok) 0 else 1);
+        }
+        try renderErrorAndExit(
+            parsed.json,
+            "lane-review",
+            "review/start",
+            @errorName(err),
+            lane.cwd,
+            .{
+                .resolved_codex_path = lane.resolved_codex_path,
+                .resolved_codex_version = lane.codex_version,
+                .compatibility_verdict = "compatible",
+                .selected_transport = "websocket",
+                .selection_reason = "persistent_review_lane",
+                .managed_server_pid = lane.managed_server_pid,
+                .managed_server_listen_url = lane.managed_server_listen_url,
+                .orphan_ttl_seconds = lane.orphan_ttl_seconds,
+            },
+            .{
+                .code = "lane_transport_lost",
+                .hint = "persistent CAS lane websocket could not be reconnected; restart the lane or pass --fallback native-review",
+            },
+        );
+    };
+    defer {
+        client.close();
+        client.deinit();
+    }
+
+    const session_dir = try sessionDirAlloc(allocator);
+    const parent_thread_id = startParentThreadAlloc(allocator, &client, lane.cwd, session_dir) catch |err| {
+        if (parsed.fallback_mode == .native_review and isTransportLossError(err)) {
+            var fallback = try runNativeReviewFallbackAlloc(allocator, lane.cwd, lane.resolved_codex_path, target_record);
+            defer fallback.deinit(allocator);
+            try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, .{
+                .code = "lane_transport_lost",
+                .hint = "persistent CAS lane websocket was lost while starting a fresh parent; returned explicit native-review fallback",
+            });
+            std.process.exit(if (fallback.ok) 0 else 1);
+        }
+        if (isTransportLossError(err)) {
+            try renderErrorAndExit(
+                parsed.json,
+                "lane-review",
+                "thread/start",
+                @errorName(err),
+                lane.cwd,
+                .{
+                    .resolved_codex_path = lane.resolved_codex_path,
+                    .resolved_codex_version = lane.codex_version,
+                    .compatibility_verdict = "compatible",
+                    .selected_transport = "websocket",
+                    .selection_reason = "persistent_review_lane",
+                    .managed_server_pid = lane.managed_server_pid,
+                    .managed_server_listen_url = lane.managed_server_listen_url,
+                    .orphan_ttl_seconds = lane.orphan_ttl_seconds,
+                },
+                .{
+                    .code = "lane_transport_lost",
+                    .hint = "persistent CAS lane websocket was lost while starting a fresh parent; retry, restart the lane, or pass --fallback native-review",
+                },
+            );
+        }
+        return err;
+    };
+    const parent_event_log_path = try parentEventLogPathAlloc(allocator, session_dir, parent_thread_id);
+    defer allocator.free(parent_event_log_path);
+    if (shouldPreMaterializeDetachedReviewParent(.auto, lane.codex_version)) {
+        materializeParentThreadTurn(
+            allocator,
+            &client,
+            parent_thread_id,
+            parent_event_log_path,
+            parsed.timeout_ms,
+            parsed.poll_interval_ms,
+        ) catch |err| {
+            if (parsed.fallback_mode == .native_review and isTransportLossError(err)) {
+                var fallback = try runNativeReviewFallbackAlloc(allocator, lane.cwd, lane.resolved_codex_path, target_record);
+                defer fallback.deinit(allocator);
+                try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, .{
+                    .code = "lane_transport_lost",
+                    .hint = "persistent CAS lane websocket was lost while materializing a fresh parent; returned explicit native-review fallback",
+                });
+                std.process.exit(if (fallback.ok) 0 else 1);
+            }
+            if (isTransportLossError(err)) {
+                try renderErrorAndExit(
+                    parsed.json,
+                    "lane-review",
+                    "turn/start",
+                    @errorName(err),
+                    lane.cwd,
+                    .{
+                        .resolved_codex_path = lane.resolved_codex_path,
+                        .resolved_codex_version = lane.codex_version,
+                        .compatibility_verdict = "compatible",
+                        .selected_transport = "websocket",
+                        .selection_reason = "persistent_review_lane",
+                        .managed_server_pid = lane.managed_server_pid,
+                        .managed_server_listen_url = lane.managed_server_listen_url,
+                        .orphan_ttl_seconds = lane.orphan_ttl_seconds,
+                    },
+                    .{
+                        .code = "lane_transport_lost",
+                        .hint = "persistent CAS lane websocket was lost while materializing a fresh parent; retry, restart the lane, or pass --fallback native-review",
+                    },
+                );
+            }
+            return err;
+        };
+    }
+
+    const review_params_json = try buildReviewStartParamsJson(allocator, parent_thread_id, target);
+    defer allocator.free(review_params_json);
+    const review_result_json = client.requestJson("review/start", review_params_json) catch |err| {
+        if (parsed.fallback_mode == .native_review) {
+            var fallback = try runNativeReviewFallbackAlloc(allocator, lane.cwd, lane.resolved_codex_path, target_record);
+            defer fallback.deinit(allocator);
+            try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, .{
+                .code = "review_failed",
+                .hint = "lane review startup failed; returned explicit native-review fallback",
+            });
+            std.process.exit(if (fallback.ok) 0 else 1);
+        }
+        return err;
+    };
+    defer allocator.free(review_result_json);
+
+    const review_thread_id = try extractReviewThreadIdAlloc(allocator, review_result_json);
+    const review_turn_id = try extractReviewTurnIdAlloc(allocator, review_result_json);
+    const event_log_path = try std.fmt.allocPrint(allocator, "{s}/{s}.events.ndjson", .{ session_dir, review_thread_id });
+    const record_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ session_dir, review_thread_id });
+    try appendLogRecord(allocator, event_log_path, "review/start", "request", review_params_json);
+    try appendLogRecord(allocator, event_log_path, "review/start", "response", review_result_json);
+
+    var record = SessionRecord{
+        .cwd = lane.cwd,
+        .parent_thread_id = parent_thread_id,
+        .review_thread_id = review_thread_id,
+        .review_turn_id = review_turn_id,
+        .delivery = "detached",
+        .target = target_record,
+        .event_log_path = event_log_path,
+        .created_at_unix_s = unixSeconds(),
+        .last_observed_status = "inProgress",
+        .codex_version = lane.codex_version,
+        .resolved_codex_path = lane.resolved_codex_path,
+        .compatibility_verdict = "compatible",
+        .transport_kind = lane.transport_kind,
+        .transport_selection_reason = "persistent_review_lane",
+        .managed_server_pid = lane.managed_server_pid,
+        .managed_server_listen_url = lane.managed_server_listen_url,
+        .managed_server_stderr_log_path = null,
+        .orphan_ttl_seconds = lane.orphan_ttl_seconds,
+        .hook_policy = lane.hook_policy,
+        .hook_log_path = event_log_path,
+    };
+    try writeSessionRecord(allocator, record_path, record);
+
+    const latest = waitForReviewCompletion(
+        allocator,
+        &client,
+        review_thread_id,
+        review_turn_id,
+        event_log_path,
+        parsed.timeout_ms,
+        parsed.poll_interval_ms,
+    ) catch |err| switch (err) {
+        error.WaitTimedOut => {
+            record.last_observed_status = "timeout";
+            try writeSessionRecord(allocator, record_path, record);
+            try renderErrorAndExit(
+                parsed.json,
+                "lane-review",
+                "review/wait",
+                "lane review timed out",
+                lane.cwd,
+                .{
+                    .resolved_codex_path = lane.resolved_codex_path,
+                    .resolved_codex_version = lane.codex_version,
+                    .compatibility_verdict = "compatible",
+                    .selected_transport = "websocket",
+                    .selection_reason = "persistent_review_lane",
+                    .managed_server_pid = lane.managed_server_pid,
+                    .managed_server_listen_url = lane.managed_server_listen_url,
+                    .orphan_ttl_seconds = lane.orphan_ttl_seconds,
+                },
+                .{
+                    .code = "wait_timed_out",
+                    .hint = "retry the same target through the lane or increase --timeout-ms",
+                },
+            );
+        },
+        else => {
+            if (parsed.fallback_mode == .native_review and isTransportLossError(err)) {
+                var fallback = try runNativeReviewFallbackAlloc(allocator, lane.cwd, lane.resolved_codex_path, target_record);
+                defer fallback.deinit(allocator);
+                try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, .{
+                    .code = "lane_transport_lost",
+                    .hint = "persistent CAS lane websocket was lost while waiting; returned explicit native-review fallback",
+                });
+                std.process.exit(if (fallback.ok) 0 else 1);
+            }
+            if (isTransportLossError(err)) {
+                try renderErrorAndExit(
+                    parsed.json,
+                    "lane-review",
+                    "review/wait",
+                    @errorName(err),
+                    lane.cwd,
+                    .{
+                        .resolved_codex_path = lane.resolved_codex_path,
+                        .resolved_codex_version = lane.codex_version,
+                        .compatibility_verdict = "compatible",
+                        .selected_transport = "websocket",
+                        .selection_reason = "persistent_review_lane",
+                        .managed_server_pid = lane.managed_server_pid,
+                        .managed_server_listen_url = lane.managed_server_listen_url,
+                        .orphan_ttl_seconds = lane.orphan_ttl_seconds,
+                    },
+                    .{
+                        .code = "lane_transport_lost",
+                        .hint = "persistent CAS lane websocket was lost while waiting; retry, restart the lane, or pass --fallback native-review",
+                    },
+                );
+            }
+            return err;
+        },
+    };
+    defer latest.deinit(allocator);
+
+    record.last_observed_status = latest.turn_status;
+    try writeSessionRecord(allocator, record_path, record);
+
+    const dual_parse = try dualParseVerdictAlloc(allocator, latest);
+    defer dual_parse.deinit(allocator);
+    const archive_status = if (parsed.archive_lane_threads)
+        try archiveLaneThreadsBestEffort(allocator, &client, parent_thread_id, review_thread_id, event_log_path)
+    else
+        try allocator.dupe(u8, "skipped");
+    defer allocator.free(archive_status);
+
+    lane.review_count += 1;
+    lane.last_used_at_unix_s = unixSeconds();
+    lane.last_review_thread_id = review_thread_id;
+    lane.last_review_turn_id = review_turn_id;
+    lane.last_record_path = record_path;
+    lane.last_event_log_path = event_log_path;
+    lane.last_target_fingerprint = identity.fingerprint;
+    lane.last_head_sha = identity.head_sha;
+    lane.last_base_sha = identity.base_sha;
+    lane.last_dual_parse_verdict = dual_parse.verdict;
+    lane.last_archive_status = archive_status;
+    try writeLaneRecord(allocator, loaded.record_path, lane);
+
+    const trusted_structured_result = latest.review_result_available and
+        latest.review_result_source != null and
+        std.mem.eql(u8, latest.review_result_source.?, "rollout_exited_review_mode");
+    const lane_failure: ?FailureInfo = if (!latest.review_result_available)
+        .{
+            .code = "review_output_missing",
+            .hint = "lane review reached terminal status without a materialized reviewResult",
+        }
+    else if (!trusted_structured_result)
+        .{
+            .code = "review_untrusted_source",
+            .hint = "lane review only has notification-rendered review text; a clean receipt requires rollout-backed structured review output",
+        }
+    else if (std.mem.eql(u8, dual_parse.verdict, "mismatch"))
+        .{
+            .code = "review_parse_mismatch",
+            .hint = "lane review structured findings disagree with the raw rendered review parse",
+        }
+    else
+        null;
+
+    if (lane_failure != null) {
+        if (parsed.fallback_mode == .native_review) {
+            var fallback = try runNativeReviewFallbackAlloc(allocator, lane.cwd, lane.resolved_codex_path, target_record);
+            defer fallback.deinit(allocator);
+            try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, lane_failure.?);
+            std.process.exit(if (fallback.ok) 0 else 1);
+        }
+    }
+
+    const finding_count = try reviewFindingCount(allocator, latest.review_result_json);
+    const clean = lane_failure == null and finding_count == 0;
+    try printLaneReviewJson(
+        allocator,
+        lane,
+        loaded.record_path,
+        target_record,
+        identity,
+        review_thread_id,
+        review_turn_id,
+        record_path,
+        event_log_path,
+        latest,
+        dual_parse,
+        archive_status,
+        clean,
+        lane_failure,
+    );
+    if (!clean) std.process.exit(1);
+}
+
+fn cmdLaneStatus(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
+    var loaded = try loadLaneRecord(allocator, parsed.lane_id.?);
+    defer loaded.deinit(allocator);
+    const lane = loaded.record;
+    const alive = cas_websocket.processAlive(lane.managed_server_pid);
+    if (parsed.json) {
+        try printJson(.{
+            .demo = "cas-review-session",
+            .action = "lane-status",
+            .laneId = lane.lane_id,
+            .cwd = lane.cwd,
+            .recordPath = loaded.record_path,
+            .status = lane.status,
+            .alive = alive,
+            .managedServerPid = lane.managed_server_pid,
+            .managedServerListenUrl = lane.managed_server_listen_url,
+            .reviewCount = lane.review_count,
+            .lastReviewThreadId = lane.last_review_thread_id,
+            .lastTargetFingerprint = lane.last_target_fingerprint,
+        });
+    } else {
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        const stdout = &stdout_writer.interface;
+        try stdout.print("cas_review_session lane status\nlane: {s}\nalive: {s}\nreview count: {d}\nrecord: {s}\n", .{
+            lane.lane_id,
+            if (alive) "yes" else "no",
+            lane.review_count,
+            loaded.record_path,
+        });
+    }
+}
+
+fn cmdLaneStop(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
+    var loaded = try loadLaneRecord(allocator, parsed.lane_id.?);
+    defer loaded.deinit(allocator);
+    var lane = loaded.record;
+    const was_alive = cas_websocket.processAlive(lane.managed_server_pid);
+    if (was_alive) cas_websocket.terminateProcess(lane.managed_server_pid);
+    lane.status = "stopped";
+    lane.last_used_at_unix_s = unixSeconds();
+    try writeLaneRecord(allocator, loaded.record_path, lane);
+    if (parsed.json) {
+        try printJson(.{
+            .demo = "cas-review-session",
+            .action = "lane-stop",
+            .laneId = lane.lane_id,
+            .recordPath = loaded.record_path,
+            .managedServerPid = lane.managed_server_pid,
+            .wasAlive = was_alive,
+            .status = lane.status,
+        });
+    } else {
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        const stdout = &stdout_writer.interface;
+        try stdout.print("cas_review_session lane stop\nlane: {s}\nwas alive: {s}\nrecord: {s}\n", .{
+            lane.lane_id,
+            if (was_alive) "yes" else "no",
+            loaded.record_path,
+        });
+    }
+}
+
 fn fetchReviewStatus(
     allocator: std.mem.Allocator,
     client: *cas.Client,
@@ -1693,6 +2364,7 @@ fn parseReviewStatusAlloc(allocator: std.mem.Allocator, raw_json: []const u8, ma
         .review_result_available = false,
         .review_result_source = null,
         .review_result_json = null,
+        .review_text = null,
         .raw_response_json = try allocator.dupe(u8, raw_json),
     };
 }
@@ -1802,6 +2474,9 @@ fn populateReviewResultFromLiveNotifications(
         }
     }
     const review_text = state.review_text orelse return;
+    if (status.review_text == null) {
+        status.review_text = try allocator.dupe(u8, review_text);
+    }
     if (!isTerminalTurnStatus(status.turn_status)) return;
     if (status.review_result_available) return;
     if (!std.mem.eql(u8, status.turn_status, "completed")) return;
@@ -1926,6 +2601,59 @@ fn materializeParentThreadTurn(
     {
         return error.ParentMaterializationFailed;
     }
+}
+
+fn gitOutputAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    argv_tail: []const []const u8,
+) ![]const u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, "git");
+    for (argv_tail) |arg| try argv.append(allocator, arg);
+    const result = try std.process.run(allocator, io, .{
+        .argv = argv.items,
+        .cwd = .{ .path = cwd },
+        .stdout_limit = .limited(16 * 1024),
+        .stderr_limit = .limited(16 * 1024),
+    });
+    defer allocator.free(result.stderr);
+    defer allocator.free(result.stdout);
+    const ok = switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!ok) return error.GitCommandFailed;
+    return allocator.dupe(u8, std.mem.trim(u8, result.stdout, " \t\r\n"));
+}
+
+fn computeTargetIdentityAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cwd: []const u8,
+    target: TargetRecord,
+) !TargetIdentity {
+    const head_sha = gitOutputAlloc(allocator, io, cwd, &.{ "rev-parse", "HEAD" }) catch null;
+    const base_sha = if (std.mem.eql(u8, target.type, "baseBranch") and target.branch != null)
+        gitOutputAlloc(allocator, io, cwd, &.{ "merge-base", "HEAD", target.branch.? }) catch null
+    else if (std.mem.eql(u8, target.type, "commit") and target.sha != null)
+        try allocator.dupe(u8, target.sha.?)
+    else
+        null;
+    const target_json = try stringifyAnyAlloc(allocator, target);
+    defer allocator.free(target_json);
+    const fingerprint = try std.fmt.allocPrint(allocator, "target={s};head={s};base={s}", .{
+        target_json,
+        head_sha orelse "unknown",
+        base_sha orelse "unknown",
+    });
+    return .{
+        .head_sha = head_sha,
+        .base_sha = base_sha,
+        .fingerprint = fingerprint,
+    };
 }
 
 fn appendNativeReviewArgs(allocator: std.mem.Allocator, args: *std.ArrayList([]const u8), target: TargetRecord) !void {
@@ -2147,6 +2875,64 @@ fn sessionDirAlloc(allocator: std.mem.Allocator) ![]const u8 {
     return base;
 }
 
+fn laneIdAlloc(allocator: std.mem.Allocator, process_id: u64) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "lane_{d}_{d}", .{
+        process_id,
+        std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds,
+    });
+}
+
+fn laneRecordPathAlloc(allocator: std.mem.Allocator, lane_id: []const u8) ![]const u8 {
+    const session_dir = try sessionDirAlloc(allocator);
+    defer allocator.free(session_dir);
+    return std.fmt.allocPrint(allocator, "{s}/{s}.lane.json", .{ session_dir, lane_id });
+}
+
+const LoadedLaneRecord = struct {
+    record_path: []const u8,
+    raw: []u8,
+    parsed: std.json.Parsed(LaneRecord),
+    record: LaneRecord,
+
+    fn deinit(self: *LoadedLaneRecord, allocator: std.mem.Allocator) void {
+        self.parsed.deinit();
+        allocator.free(self.raw);
+        allocator.free(self.record_path);
+    }
+};
+
+fn loadLaneRecord(allocator: std.mem.Allocator, lane_id: []const u8) !LoadedLaneRecord {
+    const record_path = try laneRecordPathAlloc(allocator, lane_id);
+    const file = try std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), record_path, .{});
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const raw = try reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
+    const parsed = try std.json.parseFromSlice(LaneRecord, allocator, raw, .{});
+    return .{
+        .record_path = record_path,
+        .raw = raw,
+        .parsed = parsed,
+        .record = parsed.value,
+    };
+}
+
+fn writeLaneRecord(allocator: std.mem.Allocator, path: []const u8, record: LaneRecord) !void {
+    try ensureParentPath(path);
+    const json = try stringifyAnyAlloc(allocator, record);
+    defer allocator.free(json);
+    const temp_path = try std.fmt.allocPrint(allocator, "{s}.tmp-{d}", .{ path, std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds });
+    defer allocator.free(temp_path);
+    var file = try std.Io.Dir.createFileAbsolute(std.Io.Threaded.global_single_threaded.io(), temp_path, .{ .truncate = true });
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), json);
+    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), "\n");
+    try std.Io.Dir.renameAbsolute(temp_path, path, std.Io.Threaded.global_single_threaded.io());
+}
+
+fn unixSeconds() i64 {
+    return @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000));
+}
+
 fn parentEventLogPathAlloc(
     allocator: std.mem.Allocator,
     session_dir: []const u8,
@@ -2210,6 +2996,7 @@ fn makeStoredFallbackStatus(allocator: std.mem.Allocator, record: SessionRecord)
         .review_result_available = record.terminal_review_result_json != null,
         .review_result_source = if (record.terminal_review_result_source) |value| try allocator.dupe(u8, value) else null,
         .review_result_json = if (record.terminal_review_result_json) |value| try allocator.dupe(u8, value) else null,
+        .review_text = null,
         .raw_response_json = try allocator.dupe(u8, "{}"),
     };
 }
@@ -2459,12 +3246,12 @@ fn maybeRunNativeFallbackAndExitWait(
     std.process.exit(if (fallback.ok) 0 else 1);
 }
 
-fn readCodexVersionAlloc(allocator: std.mem.Allocator, cwd: []const u8, codex_path: []const u8) ![]const u8 {
-    const result = try std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
+fn readCodexVersionAlloc(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, codex_path: []const u8) ![]const u8 {
+    const result = try std.process.run(allocator, io, .{
         .argv = &.{ codex_path, "--version" },
         .cwd = .{ .path = cwd },
         .stdout_limit = .limited(4096),
-        .stderr_limit = .limited(0),
+        .stderr_limit = .limited(64 * 1024),
     });
     defer allocator.free(result.stderr);
     defer allocator.free(result.stdout);
@@ -2966,6 +3753,171 @@ fn buildReviewResultJsonFromRenderedTextAlloc(allocator: std.mem.Allocator, revi
     return stringifyAnyAlloc(allocator, payload);
 }
 
+fn reviewFindingCount(allocator: std.mem.Allocator, review_result_json: ?[]const u8) !usize {
+    const raw = review_result_json orelse return 0;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const root_obj = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return 0,
+    };
+    const findings_val = root_obj.get("findings") orelse return 0;
+    return switch (findings_val) {
+        .array => |arr| arr.items.len,
+        else => 0,
+    };
+}
+
+fn dualParseVerdictAlloc(allocator: std.mem.Allocator, status: ReviewStatus) !DualParseVerdict {
+    const structured_findings = try reviewFindingCount(allocator, status.review_result_json);
+    const review_text = status.review_text orelse {
+        return .{
+            .verdict = try allocator.dupe(u8, "raw_unavailable"),
+            .structured_findings = structured_findings,
+            .raw_findings = null,
+            .raw_review_text_available = false,
+        };
+    };
+    const raw_json = try buildReviewResultJsonFromRenderedTextAlloc(allocator, review_text);
+    defer allocator.free(raw_json);
+    const raw_findings = try reviewFindingCount(allocator, raw_json);
+    return .{
+        .verdict = try allocator.dupe(u8, if (structured_findings == raw_findings) "match" else "mismatch"),
+        .structured_findings = structured_findings,
+        .raw_findings = raw_findings,
+        .raw_review_text_available = true,
+    };
+}
+
+fn archiveThreadBestEffort(
+    allocator: std.mem.Allocator,
+    client: *cas.Client,
+    thread_id: []const u8,
+    event_log_path: []const u8,
+    label: []const u8,
+) !bool {
+    const params_json = try stringifyAnyAlloc(allocator, .{ .threadId = thread_id });
+    defer allocator.free(params_json);
+    const result_json = client.requestJson("thread/archive", params_json) catch |err| {
+        const note = try std.fmt.allocPrint(allocator, "{{\"label\":{s},\"threadId\":{s},\"error\":{s}}}", .{
+            try quoteJsonStringAlloc(allocator, label),
+            try quoteJsonStringAlloc(allocator, thread_id),
+            try quoteJsonStringAlloc(allocator, client.lastError() orelse @errorName(err)),
+        });
+        defer allocator.free(note);
+        appendLogRecord(allocator, event_log_path, "thread/archive", "warning", note) catch {};
+        return false;
+    };
+    defer allocator.free(result_json);
+    try appendLogRecord(allocator, event_log_path, "thread/archive", "request", params_json);
+    try appendLogRecord(allocator, event_log_path, "thread/archive", "response", result_json);
+    return true;
+}
+
+fn archiveLaneThreadsBestEffort(
+    allocator: std.mem.Allocator,
+    client: *cas.Client,
+    parent_thread_id: []const u8,
+    review_thread_id: []const u8,
+    event_log_path: []const u8,
+) ![]const u8 {
+    const parent_ok = try archiveThreadBestEffort(allocator, client, parent_thread_id, event_log_path, "parent");
+    const review_ok = try archiveThreadBestEffort(allocator, client, review_thread_id, event_log_path, "review");
+    if (parent_ok and review_ok) return allocator.dupe(u8, "ok");
+    if (parent_ok or review_ok) return allocator.dupe(u8, "partial");
+    return allocator.dupe(u8, "failed");
+}
+
+fn printLaneFallbackJson(
+    allocator: std.mem.Allocator,
+    lane: LaneRecord,
+    lane_record_path: []const u8,
+    target: TargetRecord,
+    identity: TargetIdentity,
+    fallback: NativeFallbackResult,
+    failure: FailureInfo,
+) !void {
+    const target_json = try stringifyAnyAlloc(allocator, target);
+    const fallback_stdout_json = if (fallback.stdout_text) |text| try quoteJsonStringAlloc(allocator, text) else "null";
+    const fallback_stderr_json = if (fallback.stderr_text) |text| try quoteJsonStringAlloc(allocator, text) else "null";
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.print(
+        "{{\"demo\":\"cas-review-session\",\"action\":\"lane-review\",\"laneId\":{s},\"cwd\":{s},\"laneRecordPath\":{s},\"target\":{s},\"targetFingerprint\":{s},\"headSha\":{s},\"baseSha\":{s},\"selectedTransport\":\"native-review\",\"fallbackUsed\":true,\"fallbackTransport\":\"native-review\",\"fallbackExitCode\":{d},\"fallbackOutputText\":{s},\"fallbackErrorText\":{s},\"failureCode\":{s},\"failureHint\":{s}}}\n",
+        .{
+            try quoteJsonStringAlloc(allocator, lane.lane_id),
+            try quoteJsonStringAlloc(allocator, lane.cwd),
+            try quoteJsonStringAlloc(allocator, lane_record_path),
+            target_json,
+            try quoteJsonStringAlloc(allocator, identity.fingerprint),
+            if (identity.head_sha) |value| try quoteJsonStringAlloc(allocator, value) else "null",
+            if (identity.base_sha) |value| try quoteJsonStringAlloc(allocator, value) else "null",
+            fallback.exit_code,
+            fallback_stdout_json,
+            fallback_stderr_json,
+            try quoteJsonStringAlloc(allocator, failure.code),
+            try quoteJsonStringAlloc(allocator, failure.hint),
+        },
+    );
+}
+
+fn printLaneReviewJson(
+    allocator: std.mem.Allocator,
+    lane: LaneRecord,
+    lane_record_path: []const u8,
+    target: TargetRecord,
+    identity: TargetIdentity,
+    review_thread_id: []const u8,
+    review_turn_id: []const u8,
+    record_path: []const u8,
+    event_log_path: []const u8,
+    status: ReviewStatus,
+    dual_parse: DualParseVerdict,
+    archive_status: []const u8,
+    clean: bool,
+    failure: ?FailureInfo,
+) !void {
+    const target_json = try stringifyAnyAlloc(allocator, target);
+    const review_result_json = status.review_result_json orelse "null";
+    const review_text_json = if (status.review_text) |text| try quoteJsonStringAlloc(allocator, text) else "null";
+    const raw_findings_json = if (dual_parse.raw_findings) |value| try std.fmt.allocPrint(allocator, "{d}", .{value}) else "null";
+    const failure_code_json = if (failure) |value| try quoteJsonStringAlloc(allocator, value.code) else "null";
+    const failure_hint_json = if (failure) |value| try quoteJsonStringAlloc(allocator, value.hint) else "null";
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.print(
+        "{{\"demo\":\"cas-review-session\",\"action\":\"lane-review\",\"laneId\":{s},\"cwd\":{s},\"laneRecordPath\":{s},\"reviewCount\":{d},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"target\":{s},\"targetFingerprint\":{s},\"headSha\":{s},\"baseSha\":{s},\"selectedTransport\":\"websocket\",\"fallbackUsed\":false,\"managedServerPid\":{d},\"managedServerListenUrl\":{s},\"turnStatus\":{s},\"reviewResultAvailable\":{s},\"reviewResultSource\":{s},\"reviewResult\":{s},\"rawReviewText\":{s},\"dualParseVerdict\":{s},\"structuredFindingCount\":{d},\"rawFindingCount\":{s},\"archiveStatus\":{s},\"failureCode\":{s},\"failureHint\":{s},\"clean\":{s}}}\n",
+        .{
+            try quoteJsonStringAlloc(allocator, lane.lane_id),
+            try quoteJsonStringAlloc(allocator, lane.cwd),
+            try quoteJsonStringAlloc(allocator, lane_record_path),
+            lane.review_count,
+            try quoteJsonStringAlloc(allocator, review_thread_id),
+            try quoteJsonStringAlloc(allocator, review_turn_id),
+            try quoteJsonStringAlloc(allocator, record_path),
+            try quoteJsonStringAlloc(allocator, event_log_path),
+            target_json,
+            try quoteJsonStringAlloc(allocator, identity.fingerprint),
+            if (identity.head_sha) |value| try quoteJsonStringAlloc(allocator, value) else "null",
+            if (identity.base_sha) |value| try quoteJsonStringAlloc(allocator, value) else "null",
+            lane.managed_server_pid,
+            try quoteJsonStringAlloc(allocator, lane.managed_server_listen_url),
+            try quoteJsonStringAlloc(allocator, status.turn_status),
+            if (status.review_result_available) "true" else "false",
+            if (status.review_result_source) |value| try quoteJsonStringAlloc(allocator, value) else "null",
+            review_result_json,
+            review_text_json,
+            try quoteJsonStringAlloc(allocator, dual_parse.verdict),
+            dual_parse.structured_findings,
+            raw_findings_json,
+            try quoteJsonStringAlloc(allocator, archive_status),
+            failure_code_json,
+            failure_hint_json,
+            if (clean) "true" else "false",
+        },
+    );
+}
+
 fn floatField(obj: std.json.ObjectMap, key: []const u8) ?f32 {
     const value = obj.get(key) orelse return null;
     return switch (value) {
@@ -3052,6 +4004,86 @@ test "parseArgs captures parent mode approvals and fallback" {
     try std.testing.expectEqualStrings("acceptForSession", parsed.file_approval.?);
     try std.testing.expectEqualStrings("grant-session", parsed.permissions_approval.?);
     try std.testing.expectEqual(cas.hooks.HookPolicy.require_observed, parsed.hook_policy);
+}
+
+test "parseArgs accepts review lane start" {
+    const argv = [_][]const u8{
+        "cas_review_session",
+        "lane",
+        "start",
+        "--cwd",
+        "/tmp/repo",
+        "--hooks",
+        "off",
+        "--json",
+    };
+
+    const parsed = try parseArgs(std.testing.allocator, &argv);
+    try std.testing.expectEqual(Action.lane, parsed.action.?);
+    try std.testing.expectEqual(LaneAction.start, parsed.lane_action.?);
+    try std.testing.expectEqualStrings("/tmp/repo", parsed.cwd.?);
+    try std.testing.expect(parsed.json);
+    try std.testing.expectEqual(cas.hooks.HookPolicy.off, parsed.hook_policy);
+}
+
+test "parseArgs accepts review lane review target" {
+    const argv = [_][]const u8{
+        "cas_review_session",
+        "lane",
+        "review",
+        "--lane-id",
+        "lane_123",
+        "--base",
+        "main",
+        "--fallback",
+        "native-review",
+        "--no-archive",
+        "--json",
+    };
+
+    const parsed = try parseArgs(std.testing.allocator, &argv);
+    try std.testing.expectEqual(Action.lane, parsed.action.?);
+    try std.testing.expectEqual(LaneAction.review, parsed.lane_action.?);
+    try std.testing.expectEqualStrings("lane_123", parsed.lane_id.?);
+    try std.testing.expectEqual(TargetKind.base_branch, parsed.target.?.kind);
+    try std.testing.expectEqualStrings("main", parsed.target.?.branch.?);
+    try std.testing.expectEqual(FallbackMode.native_review, parsed.fallback_mode);
+    try std.testing.expect(!parsed.archive_lane_threads);
+}
+
+test "dualParseVerdict fails closed on structured/raw mismatch" {
+    const structured =
+        \\{"findings":[{"title":"Issue","body":"Fix it.","confidenceScore":0.8,"priority":1,"codeLocation":{"absoluteFilePath":"/tmp/a.zig","lineRange":{"start":1,"end":1}}}],"overallCorrectness":"patch is incorrect","overallExplanation":"Issue found.","overallConfidenceScore":0.8}
+    ;
+    const status = ReviewStatus{
+        .thread_status = try std.testing.allocator.dupe(u8, "loaded"),
+        .turn_status = try std.testing.allocator.dupe(u8, "completed"),
+        .turn_count = 1,
+        .materialized = true,
+        .thread_preview = try std.testing.allocator.dupe(u8, ""),
+        .rollout_path = null,
+        .turn_error_message = null,
+        .last_turn_has_entered_review_mode = true,
+        .last_turn_has_exited_review_mode = true,
+        .review_result_available = true,
+        .review_result_source = "test",
+        .review_result_json = try std.testing.allocator.dupe(u8, structured),
+        .review_text = try std.testing.allocator.dupe(u8, "Review text with one finding rendered separately."),
+        .raw_response_json = try std.testing.allocator.dupe(u8, "{}"),
+    };
+    defer status.deinit(std.testing.allocator);
+
+    const verdict = try dualParseVerdictAlloc(std.testing.allocator, status);
+    defer verdict.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("mismatch", verdict.verdict);
+    try std.testing.expectEqual(@as(usize, 1), verdict.structured_findings);
+    try std.testing.expectEqual(@as(usize, 0), verdict.raw_findings.?);
+}
+
+test "notification-only review results are not trusted clean receipts" {
+    const source = "notification_exited_review_mode";
+    const trusted = std.mem.eql(u8, source, "rollout_exited_review_mode");
+    try std.testing.expect(!trusted);
 }
 
 test "parseReviewStatusAlloc handles materialized and pending states" {
