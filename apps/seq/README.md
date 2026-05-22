@@ -299,12 +299,21 @@ Floor flags:
 - `--next-actions` emits deterministic follow-up `seq` command suggestions
 - session-backed time windows now accept `--since` and `--until`
 
-`token-cost` estimates Codex token cost from local `token_count` traces:
+`token-usage` reports local token usage from `token_count` traces:
+- `--last <duration>` accepts rolling windows such as `90m`, `24h`, or `7d`, ending at `--until` or now
+- `--summary` emits aggregate component totals: `input_tokens`, `cached_input_tokens`, `uncached_input_tokens`, `output_tokens`, and `reasoning_output_tokens`
+- `--audit` adds proof fields for duplicate totals, resets, null/missing-total rows, requested/observed span days, and naive overcount
+
+`token-cost` estimates token cost from local `token_count` traces:
 - reuses monotonic `total_token_usage` deltas and keeps cached input separate from uncached input
+- `--last <duration>` shares the same rolling window syntax as `token-usage`
 - groups by `day`, `path`, `model`, or `fast_mode`; `--summary` emits one aggregate row
-- applies OpenAI Codex credit rates with explicit fast-mode evidence only; missing fast evidence is reported as `standard_assumption`
-- converts to USD only when `--usd-per-credit <amount>` is supplied
-- accepts `--pricing-file <json>` for pinned rates and `--refresh-pricing` to refresh current official pricing into the user cache, not the repo
+- defaults to OpenAI Codex credit rates with explicit fast-mode evidence only; missing fast evidence is reported as `standard_assumption`
+- `--pricing api` switches to exact OpenAI API USD pricing for known models and emits source metadata, model-source metadata, and API component costs
+- API pricing fails closed when the trace lacks a known exact model; pass `--model <name>` to price a specific what-if model
+- GPT-5.5 API pricing reports long-context surcharge rows when input exceeds the documented long-context threshold
+- `--pricing-file <json>` accepts pinned Codex credit or API USD rates for the selected pricing mode; `--refresh-pricing` refreshes current official pricing into the user cache, not the repo
+- `--usd-per-credit <amount>` applies only to Codex credit pricing
 - `--force-fast` and `--force-standard` are what-if overrides and are marked as override-sourced in output
 
 ## Validation

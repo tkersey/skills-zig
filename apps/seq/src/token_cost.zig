@@ -2,6 +2,8 @@ const std = @import("std");
 
 pub const OfficialRateCardUrl = "https://help.openai.com/en/articles/20001106-codex-rate-card";
 pub const OfficialSpeedUrl = "https://developers.openai.com/codex/speed";
+pub const OfficialApiPricingUrl = "https://openai.com/api/pricing/";
+pub const OfficialGpt55ModelUrl = "https://developers.openai.com/api/docs/models/gpt-5.5/";
 
 pub const PricingSource = enum {
     bundled,
@@ -17,8 +19,26 @@ pub const ModelRate = struct {
     fast_multiplier: ?f64 = null,
 };
 
+pub const ApiModelRate = struct {
+    model: []const u8,
+    input_usd_per_million: f64,
+    cached_input_usd_per_million: f64,
+    output_usd_per_million: f64,
+    long_context_threshold_input_tokens: ?i64 = null,
+    long_context_input_multiplier: f64 = 1,
+    long_context_cached_input_multiplier: f64 = 1,
+    long_context_output_multiplier: f64 = 1,
+};
+
 pub const Pricing = struct {
     rates: []const ModelRate,
+    source: PricingSource,
+    source_url: []const u8,
+    fetched_at: []const u8,
+};
+
+pub const ApiPricing = struct {
+    rates: []const ApiModelRate,
     source: PricingSource,
     source_url: []const u8,
     fetched_at: []const u8,
@@ -59,6 +79,12 @@ pub const FastMode = enum {
 pub const Estimate = struct {
     priced: bool,
     credits: f64 = 0,
+    api_usd: f64 = 0,
+    api_input_usd: f64 = 0,
+    api_cached_input_usd: f64 = 0,
+    api_output_usd: f64 = 0,
+    api_long_context_surcharge_usd: f64 = 0,
+    long_context_applied: bool = false,
     confidence: []const u8 = "unpriced",
     warning: ?[]const u8 = null,
 };
@@ -71,12 +97,36 @@ const bundled_rates = [_]ModelRate{
     .{ .model = "gpt-5.2", .input_credits_per_million = 43.75, .cached_input_credits_per_million = 4.375, .output_credits_per_million = 350, .fast_multiplier = null },
 };
 
+const bundled_api_rates = [_]ApiModelRate{
+    .{
+        .model = "gpt-5.5",
+        .input_usd_per_million = 5.00,
+        .cached_input_usd_per_million = 0.50,
+        .output_usd_per_million = 30.00,
+        .long_context_threshold_input_tokens = 272_000,
+        .long_context_input_multiplier = 2.0,
+        .long_context_cached_input_multiplier = 2.0,
+        .long_context_output_multiplier = 1.5,
+    },
+    .{ .model = "gpt-5.4", .input_usd_per_million = 2.50, .cached_input_usd_per_million = 0.25, .output_usd_per_million = 15.00 },
+    .{ .model = "gpt-5.4-mini", .input_usd_per_million = 0.75, .cached_input_usd_per_million = 0.075, .output_usd_per_million = 4.50 },
+};
+
 pub fn bundledPricing() Pricing {
     return .{
         .rates = bundled_rates[0..],
         .source = .bundled,
         .source_url = OfficialRateCardUrl,
         .fetched_at = "2026-05-13",
+    };
+}
+
+pub fn bundledApiPricing() ApiPricing {
+    return .{
+        .rates = bundled_api_rates[0..],
+        .source = .bundled,
+        .source_url = OfficialApiPricingUrl,
+        .fetched_at = "2026-05-22",
     };
 }
 
@@ -113,11 +163,59 @@ pub fn estimate(p: Pricing, model: ?[]const u8, usage: Usage, fast_mode: FastMod
     return .{ .priced = true, .credits = credits, .confidence = confidence, .warning = warning };
 }
 
+pub fn estimateApi(p: ApiPricing, model: ?[]const u8, usage: Usage, long_context: bool) Estimate {
+    const model_name = model orelse return .{ .priced = false, .warning = "missing_model" };
+    const rate = findApiRate(p, model_name) orelse return .{ .priced = false, .warning = "unknown_model" };
+
+    const cached = @max(usage.cached_input_tokens, 0);
+    const input = @max(usage.input_tokens, 0);
+    const uncached = @max(input - cached, 0);
+    const output = @max(usage.output_tokens, 0);
+
+    const input_multiplier: f64 = if (long_context) rate.long_context_input_multiplier else 1.0;
+    const cached_multiplier: f64 = if (long_context) rate.long_context_cached_input_multiplier else 1.0;
+    const output_multiplier: f64 = if (long_context) rate.long_context_output_multiplier else 1.0;
+
+    const standard_input_usd = @as(f64, @floatFromInt(uncached)) * rate.input_usd_per_million / 1_000_000.0;
+    const standard_cached_usd = @as(f64, @floatFromInt(cached)) * rate.cached_input_usd_per_million / 1_000_000.0;
+    const standard_output_usd = @as(f64, @floatFromInt(output)) * rate.output_usd_per_million / 1_000_000.0;
+    const input_usd = standard_input_usd * input_multiplier;
+    const cached_usd = standard_cached_usd * cached_multiplier;
+    const output_usd = standard_output_usd * output_multiplier;
+    const total_usd = input_usd + cached_usd + output_usd;
+    const standard_total = standard_input_usd + standard_cached_usd + standard_output_usd;
+
+    const warning: ?[]const u8 = if (usage.cached_input_tokens > usage.input_tokens) "cached_input_exceeds_input_clamped" else null;
+    return .{
+        .priced = true,
+        .api_usd = total_usd,
+        .api_input_usd = input_usd,
+        .api_cached_input_usd = cached_usd,
+        .api_output_usd = output_usd,
+        .api_long_context_surcharge_usd = @max(total_usd - standard_total, 0),
+        .long_context_applied = long_context,
+        .confidence = if (long_context) "api_exact_long_context" else "api_exact",
+        .warning = warning,
+    };
+}
+
 pub fn findRate(p: Pricing, model: []const u8) ?ModelRate {
     for (p.rates) |rate| {
         if (modelMatches(rate.model, model)) return rate;
     }
     return null;
+}
+
+pub fn findApiRate(p: ApiPricing, model: []const u8) ?ApiModelRate {
+    for (p.rates) |rate| {
+        if (modelMatches(rate.model, model)) return rate;
+    }
+    return null;
+}
+
+pub fn apiModelHasLongContext(rate: ApiModelRate, input_tokens: i64) bool {
+    const threshold = rate.long_context_threshold_input_tokens orelse return false;
+    return input_tokens > threshold;
 }
 
 fn modelMatches(canonical: []const u8, got_raw: []const u8) bool {
@@ -131,6 +229,12 @@ pub fn loadPricingFile(allocator: std.mem.Allocator, path: []const u8) !Pricing 
     const data = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(1024 * 1024));
     defer allocator.free(data);
     return parsePricingJson(allocator, data, .file);
+}
+
+pub fn loadApiPricingFile(allocator: std.mem.Allocator, path: []const u8) !ApiPricing {
+    const data = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(1024 * 1024));
+    defer allocator.free(data);
+    return parseApiPricingJson(allocator, data, .file);
 }
 
 pub fn parsePricingJson(allocator: std.mem.Allocator, data: []const u8, source: PricingSource) !Pricing {
@@ -181,6 +285,57 @@ pub fn parsePricingJson(allocator: std.mem.Allocator, data: []const u8, source: 
     };
 }
 
+pub fn parseApiPricingJson(allocator: std.mem.Allocator, data: []const u8, source: PricingSource) !ApiPricing {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidPricingFile,
+    };
+    const models_value = root.get("models") orelse return error.InvalidPricingFile;
+    const models = switch (models_value) {
+        .array => |arr| arr,
+        else => return error.InvalidPricingFile,
+    };
+    var rates: std.ArrayList(ApiModelRate) = .empty;
+    errdefer {
+        for (rates.items) |rate| allocator.free(rate.model);
+        rates.deinit(allocator);
+    }
+    for (models.items) |value| {
+        const obj = switch (value) {
+            .object => |inner| inner,
+            else => return error.InvalidPricingFile,
+        };
+        const model = jsonString(obj, "model") orelse return error.InvalidPricingFile;
+        try rates.append(allocator, .{
+            .model = try allocator.dupe(u8, model),
+            .input_usd_per_million = try jsonNumber(obj, "input_usd_per_million"),
+            .cached_input_usd_per_million = try jsonNumber(obj, "cached_input_usd_per_million"),
+            .output_usd_per_million = try jsonNumber(obj, "output_usd_per_million"),
+            .long_context_threshold_input_tokens = jsonInt(obj, "long_context_threshold_input_tokens") catch null,
+            .long_context_input_multiplier = jsonNumber(obj, "long_context_input_multiplier") catch 1,
+            .long_context_cached_input_multiplier = jsonNumber(obj, "long_context_cached_input_multiplier") catch 1,
+            .long_context_output_multiplier = jsonNumber(obj, "long_context_output_multiplier") catch 1,
+        });
+    }
+    const owned_rates = try rates.toOwnedSlice(allocator);
+    errdefer {
+        for (owned_rates) |rate| allocator.free(rate.model);
+        allocator.free(owned_rates);
+    }
+    const source_url = try allocator.dupe(u8, jsonString(root, "source_url") orelse OfficialApiPricingUrl);
+    errdefer allocator.free(source_url);
+    const fetched_at = try allocator.dupe(u8, jsonString(root, "fetched_at") orelse "unknown");
+    errdefer allocator.free(fetched_at);
+    return .{
+        .rates = owned_rates,
+        .source = source,
+        .source_url = source_url,
+        .fetched_at = fetched_at,
+    };
+}
+
 pub fn parseOfficialRateCardText(
     allocator: std.mem.Allocator,
     rate_card_text: []const u8,
@@ -208,6 +363,40 @@ pub fn parseOfficialRateCardText(
         .rates = try rates.toOwnedSlice(allocator),
         .source = .refreshed,
         .source_url = try allocator.dupe(u8, OfficialRateCardUrl),
+        .fetched_at = try allocator.dupe(u8, fetched_at),
+    };
+}
+
+pub fn parseOfficialApiPricingText(
+    allocator: std.mem.Allocator,
+    pricing_text: []const u8,
+    fetched_at: []const u8,
+) !ApiPricing {
+    var rates: std.ArrayList(ApiModelRate) = .empty;
+    errdefer {
+        for (rates.items) |rate| allocator.free(rate.model);
+        rates.deinit(allocator);
+    }
+
+    inline for (bundled_api_rates) |bundled| {
+        const label = officialModelLabel(bundled.model);
+        const parsed = try parseDollarTripleAfterLabel(pricing_text, label);
+        try rates.append(allocator, .{
+            .model = try allocator.dupe(u8, bundled.model),
+            .input_usd_per_million = parsed[0],
+            .cached_input_usd_per_million = parsed[1],
+            .output_usd_per_million = parsed[2],
+            .long_context_threshold_input_tokens = bundled.long_context_threshold_input_tokens,
+            .long_context_input_multiplier = bundled.long_context_input_multiplier,
+            .long_context_cached_input_multiplier = bundled.long_context_cached_input_multiplier,
+            .long_context_output_multiplier = bundled.long_context_output_multiplier,
+        });
+    }
+
+    return .{
+        .rates = try rates.toOwnedSlice(allocator),
+        .source = .refreshed,
+        .source_url = try allocator.dupe(u8, OfficialApiPricingUrl),
         .fetched_at = try allocator.dupe(u8, fetched_at),
     };
 }
@@ -241,7 +430,34 @@ fn parseCreditTripleAfterLabel(text: []const u8, label: []const u8) ![3]f64 {
     return out;
 }
 
+fn parseDollarTripleAfterLabel(text: []const u8, label: []const u8) ![3]f64 {
+    const start = std.mem.indexOf(u8, text, label) orelse return error.InvalidPricingFile;
+    const end = @min(text.len, start + 900);
+    var window = text[start..end];
+    var out: [3]f64 = undefined;
+    var count: usize = 0;
+    while (count < 3) {
+        const marker_idx = std.mem.indexOfScalar(u8, window, '$') orelse return error.InvalidPricingFile;
+        var idx = marker_idx + 1;
+        const number_start = idx;
+        while (idx < window.len and (std.ascii.isDigit(window[idx]) or window[idx] == '.')) idx += 1;
+        if (idx == number_start) return error.InvalidPricingFile;
+        out[count] = try std.fmt.parseFloat(f64, window[number_start..idx]);
+        count += 1;
+        window = window[idx..];
+    }
+    return out;
+}
+
 pub fn deinitPricing(allocator: std.mem.Allocator, pricing: Pricing) void {
+    if (pricing.source == .bundled) return;
+    for (pricing.rates) |rate| allocator.free(rate.model);
+    allocator.free(pricing.rates);
+    allocator.free(pricing.source_url);
+    allocator.free(pricing.fetched_at);
+}
+
+pub fn deinitApiPricing(allocator: std.mem.Allocator, pricing: ApiPricing) void {
     if (pricing.source == .bundled) return;
     for (pricing.rates) |rate| allocator.free(rate.model);
     allocator.free(pricing.rates);
@@ -262,6 +478,15 @@ fn jsonNumber(obj: std.json.ObjectMap, key: []const u8) !f64 {
     return switch (value) {
         .integer => |number| @floatFromInt(number),
         .float => |number| number,
+        else => error.InvalidPricingFile,
+    };
+}
+
+fn jsonInt(obj: std.json.ObjectMap, key: []const u8) !i64 {
+    const value = obj.get(key) orelse return error.InvalidPricingFile;
+    return switch (value) {
+        .integer => |n| n,
+        .float => |n| @intFromFloat(n),
         else => error.InvalidPricingFile,
     };
 }
@@ -308,6 +533,60 @@ test "pricing file fallback metadata is allocator-owned" {
     defer deinitPricing(std.testing.allocator, pricing);
     try std.testing.expectEqualStrings(OfficialRateCardUrl, pricing.source_url);
     try std.testing.expectEqualStrings("unknown", pricing.fetched_at);
+}
+
+test "api pricing estimates exact USD and long-context surcharge" {
+    const standard = estimateApi(bundledApiPricing(), "gpt-5.5", .{
+        .input_tokens = 100_000,
+        .cached_input_tokens = 20_000,
+        .output_tokens = 10_000,
+    }, false);
+    try std.testing.expect(standard.priced);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.71), standard.api_usd, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.4), standard.api_input_usd, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.01), standard.api_cached_input_usd, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.3), standard.api_output_usd, 0.0001);
+
+    const long_context = estimateApi(bundledApiPricing(), "gpt-5.5", .{
+        .input_tokens = 300_000,
+        .cached_input_tokens = 0,
+        .output_tokens = 20_000,
+    }, true);
+    try std.testing.expect(long_context.priced);
+    try std.testing.expect(long_context.long_context_applied);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.9), long_context.api_usd, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.8), long_context.api_long_context_surcharge_usd, 0.0001);
+}
+
+test "api pricing parser extracts official dollar triples" {
+    const text =
+        \\GPT-5.5
+        \\Input:
+        \\$5.00 / 1M tokens
+        \\Cached input:
+        \\$0.50 / 1M tokens
+        \\Output:
+        \\$30.00 / 1M tokens
+        \\GPT-5.4
+        \\Input:
+        \\$2.50 / 1M tokens
+        \\Cached input:
+        \\$0.25 / 1M tokens
+        \\Output:
+        \\$15.00 / 1M tokens
+        \\GPT-5.4-Mini
+        \\Input:
+        \\$0.75 / 1M tokens
+        \\Cached input:
+        \\$0.075 / 1M tokens
+        \\Output:
+        \\$4.50 / 1M tokens
+    ;
+    const pricing = try parseOfficialApiPricingText(std.testing.allocator, text, "fixture");
+    defer deinitApiPricing(std.testing.allocator, pricing);
+    const got = estimateApi(pricing, "gpt-5.4-mini", .{ .input_tokens = 1_000_000 }, false);
+    try std.testing.expect(got.priced);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.75), got.api_usd, 0.0001);
 }
 
 test "official rate-card text parser extracts current token rates" {

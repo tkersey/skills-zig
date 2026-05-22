@@ -84,6 +84,18 @@ if ! "$BIN_PATH" --help | rg -q '^- reply-latency$'; then
   echo "required command missing: reply-latency" >&2
   exit 1
 fi
+if ! "$BIN_PATH" token-usage --help | rg -q -- '--last <duration>'; then
+  echo "token-usage help missing --last duration support" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" token-cost --help | rg -q -- '--pricing <kind>'; then
+  echo "token-cost help missing pricing mode support" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" token-cost --help | rg -q -- '--model <name>'; then
+  echo "token-cost help missing API model override support" >&2
+  exit 1
+fi
 for cmd in skill-audit tool-audit memory-inventory message-search workdir-report; do
   if ! "$BIN_PATH" --help | rg -q "^- ${cmd}$"; then
     echo "required command missing: ${cmd}" >&2
