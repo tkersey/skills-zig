@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const delegate = @import("core_delegate");
 const core_cli = @import("core_cli");
@@ -66,7 +67,7 @@ pub fn main(init: std.process.Init) !void {
     try child_argv.append(allocator, target_exec);
     try child_argv.appendSlice(allocator, argv[2..]);
 
-    const exit_code = delegate.runCommand(allocator, child_argv.items) catch |err| {
+    const exit_code = runCommand(allocator, child_argv.items) catch |err| {
         var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stderr = &stderr_writer.interface;
         try stderr.print(
@@ -76,6 +77,82 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     };
     std.process.exit(exit_code);
+}
+
+fn runCommand(allocator: std.mem.Allocator, args: []const []const u8) !u8 {
+    if (builtin.os.tag == .macos) return runCommandPosixSpawn(allocator, args);
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var child = try std.process.spawn(io, .{
+        .argv = args,
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+    const term = try child.wait(io);
+    return switch (term) {
+        .exited => |code| code,
+        .signal => |signal| @intCast(@min(@as(u32, 128) + @intFromEnum(signal), @as(u32, 255))),
+        .stopped, .unknown => 1,
+    };
+}
+
+fn runCommandPosixSpawn(allocator: std.mem.Allocator, args: []const []const u8) !u8 {
+    if (args.len == 0) return error.FileNotFound;
+
+    var argv_buf = try allocator.allocSentinel(?[*:0]const u8, args.len, null);
+    defer allocator.free(argv_buf);
+
+    var arg_storage = try allocator.alloc([:0]u8, args.len);
+    var arg_count: usize = 0;
+    defer {
+        for (arg_storage[0..arg_count]) |arg| allocator.free(arg);
+        allocator.free(arg_storage);
+    }
+
+    for (args, 0..) |arg, i| {
+        arg_storage[i] = try allocator.dupeZ(u8, arg);
+        arg_count += 1;
+        argv_buf[i] = arg_storage[i].ptr;
+    }
+
+    var pid: std.c.pid_t = undefined;
+    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+    const spawn_rc = std.c.posix_spawn(&pid, argv_buf[0].?, null, null, argv_buf.ptr, envp);
+    if (spawn_rc != 0) return posixSpawnError(spawn_rc);
+
+    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    while (true) switch (std.posix.errno(std.posix.system.waitpid(pid, &status, 0))) {
+        .SUCCESS => return statusToExitCode(@bitCast(status)),
+        .INTR => continue,
+        .CHILD => return error.NoChildProcess,
+        else => return error.WaitFailed,
+    };
+}
+
+fn posixSpawnError(rc: c_int) anyerror {
+    const err: std.c.E = @enumFromInt(@as(u16, @intCast(rc)));
+    return switch (err) {
+        .NOMEM, .@"2BIG" => error.SystemResources,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .ACCES => error.AccessDenied,
+        .PERM => error.PermissionDenied,
+        .NOEXEC => error.InvalidExe,
+        .NOENT => error.FileNotFound,
+        .NOTDIR => error.NotDir,
+        .NAMETOOLONG => error.NameTooLong,
+        else => error.SpawnFailed,
+    };
+}
+
+fn statusToExitCode(status: u32) u8 {
+    if (std.posix.W.IFEXITED(status)) return std.posix.W.EXITSTATUS(status);
+    if (std.posix.W.IFSIGNALED(status)) {
+        const signal: u32 = @intFromEnum(std.posix.W.TERMSIG(status));
+        return @intCast(@min(@as(u32, 128) + signal, @as(u32, 255)));
+    }
+    return 1;
 }
 
 fn resolveTarget(subcommand: []const u8) ?[]const u8 {

@@ -1,4 +1,5 @@
 const app_meta = @import("app_meta");
+const builtin = @import("builtin");
 const cas_hooks = @import("cas_hook_policy.zig");
 const core_cli = @import("core_cli");
 const core_json = @import("core_json");
@@ -378,6 +379,8 @@ fn pathExists(path: []const u8) bool {
 }
 
 fn runCommandCapture(allocator: std.mem.Allocator, cwd: ?[]const u8, argv: []const []const u8) !CommandCapture {
+    if (builtin.os.tag == .macos) return runCommandCapturePosixSpawn(allocator, cwd, argv);
+
     const result = try std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
         .argv = argv,
         .cwd = if (cwd) |path| .{ .path = path } else .inherit,
@@ -394,6 +397,109 @@ fn runCommandCapture(allocator: std.mem.Allocator, cwd: ?[]const u8, argv: []con
         .stdout = result.stdout,
         .stderr = result.stderr,
     };
+}
+
+fn runCommandCapturePosixSpawn(allocator: std.mem.Allocator, cwd: ?[]const u8, argv: []const []const u8) !CommandCapture {
+    if (argv.len == 0) return error.FileNotFound;
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const temp_root = try makeTempRoot(allocator, "cas-capture");
+    defer {
+        deleteTreeAbsolute(temp_root) catch {};
+        allocator.free(temp_root);
+    }
+
+    const stdout_path = try std.fs.path.join(allocator, &.{ temp_root, "stdout.txt" });
+    defer allocator.free(stdout_path);
+    const stderr_path = try std.fs.path.join(allocator, &.{ temp_root, "stderr.txt" });
+    defer allocator.free(stderr_path);
+
+    var stdout_file = try std.Io.Dir.createFileAbsolute(io, stdout_path, .{ .truncate = true, .read = true });
+    defer stdout_file.close(io);
+    var stderr_file = try std.Io.Dir.createFileAbsolute(io, stderr_path, .{ .truncate = true, .read = true });
+    defer stderr_file.close(io);
+
+    var actions: std.c.posix_spawn_file_actions_t = undefined;
+    if (std.c.posix_spawn_file_actions_init(&actions) != 0) return error.SpawnFileActionsFailed;
+    defer _ = std.c.posix_spawn_file_actions_destroy(&actions);
+    if (std.c.posix_spawn_file_actions_adddup2(&actions, stdout_file.handle, std.posix.STDOUT_FILENO) != 0) return error.SpawnFileActionsFailed;
+    if (std.c.posix_spawn_file_actions_adddup2(&actions, stderr_file.handle, std.posix.STDERR_FILENO) != 0) return error.SpawnFileActionsFailed;
+
+    var cwd_storage: ?[:0]u8 = null;
+    defer if (cwd_storage) |path| allocator.free(path);
+    if (cwd) |path| {
+        cwd_storage = try allocator.dupeZ(u8, path);
+        if (std.c.posix_spawn_file_actions_addchdir_np(&actions, cwd_storage.?.ptr) != 0) return error.SpawnFileActionsFailed;
+    }
+
+    var argv_buf = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
+    defer allocator.free(argv_buf);
+    var arg_storage = try allocator.alloc([:0]u8, argv.len);
+    var arg_count: usize = 0;
+    defer {
+        for (arg_storage[0..arg_count]) |arg| allocator.free(arg);
+        allocator.free(arg_storage);
+    }
+    for (argv, 0..) |arg, i| {
+        arg_storage[i] = try allocator.dupeZ(u8, arg);
+        arg_count += 1;
+        argv_buf[i] = arg_storage[i].ptr;
+    }
+
+    var pid: std.c.pid_t = undefined;
+    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+    const spawn_rc = if (std.mem.indexOfScalar(u8, argv[0], '/') == null)
+        std.c.posix_spawnp(&pid, argv_buf[0].?, &actions, null, argv_buf.ptr, envp)
+    else
+        std.c.posix_spawn(&pid, argv_buf[0].?, &actions, null, argv_buf.ptr, envp);
+    if (spawn_rc != 0) return posixSpawnError(spawn_rc);
+
+    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    while (true) switch (std.posix.errno(std.posix.system.waitpid(pid, &status, 0))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        .CHILD => return error.NoChildProcess,
+        else => return error.WaitFailed,
+    };
+
+    return .{
+        .exit_code = statusToExitCode(@bitCast(status)),
+        .stdout = try readFileAbsoluteAlloc(allocator, stdout_path, MaxCommandOutputBytes),
+        .stderr = try readFileAbsoluteAlloc(allocator, stderr_path, MaxCommandOutputBytes / 2),
+    };
+}
+
+fn posixSpawnError(rc: c_int) anyerror {
+    const err: std.c.E = @enumFromInt(@as(u16, @intCast(rc)));
+    return switch (err) {
+        .NOMEM, .@"2BIG" => error.SystemResources,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .ACCES => error.AccessDenied,
+        .PERM => error.PermissionDenied,
+        .NOEXEC => error.InvalidExe,
+        .NOENT => error.FileNotFound,
+        .NOTDIR => error.NotDir,
+        .NAMETOOLONG => error.NameTooLong,
+        else => error.SpawnFailed,
+    };
+}
+
+fn statusToExitCode(status: u32) u8 {
+    if (std.posix.W.IFEXITED(status)) return std.posix.W.EXITSTATUS(status);
+    if (std.posix.W.IFSIGNALED(status)) {
+        const signal: u32 = @intFromEnum(std.posix.W.TERMSIG(status));
+        return @intCast(@min(@as(u32, 128) + signal, @as(u32, 255)));
+    }
+    return 1;
+}
+
+fn readFileAbsoluteAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+    const parent = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    const base = std.fs.path.basename(path);
+    var dir = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), parent, .{});
+    defer dir.close(std.Io.Threaded.global_single_threaded.io());
+    return dir.readFileAlloc(std.Io.Threaded.global_single_threaded.io(), base, allocator, .limited(max_bytes));
 }
 
 fn runSmokePreflight(allocator: std.mem.Allocator, ctx: Context) !SmokePreflightResult {
@@ -420,7 +526,7 @@ fn runSmokePreflight(allocator: std.mem.Allocator, ctx: Context) !SmokePreflight
         if (parsed) |report| {
             if (report.value == .object) {
                 if (boolField(report.value.object, "ok")) |parsed_ok| ok = parsed_ok and capture.exit_code == 0;
-                if (core_json.stringField(report.value.object, "threadId")) |value| thread_id = value;
+                if (core_json.stringField(report.value.object, "threadId")) |value| thread_id = try allocator.dupe(u8, value);
                 const checks_len = if (report.value.object.get("checks")) |checks_val|
                     switch (checks_val) {
                         .array => |arr| arr.items.len,
@@ -509,7 +615,7 @@ fn scenarioClaimSafeWave(allocator: std.mem.Allocator, ctx: Context, temp_root: 
     if (try runStExitNonZero(allocator, ctx, &.{ "import-orchplan", "--file", plan_path, "--input", orchplan_path, "--replace" })) |detail| {
         return failedScenario(.claim_safe_wave, detail);
     }
-    if (try runStExitNonZero(allocator, ctx, &.{ "claim", "--file", plan_path, "--ids", "cfg,ui", "--executor", "teams", "--wave", "w1" })) |detail| {
+    if (try runStExitNonZero(allocator, ctx, &.{ "claim", "--file", plan_path, "--executor", "teams", "--wave", "w1" })) |detail| {
         return failedScenario(.claim_safe_wave, detail);
     }
     if (try runStExitNonZero(allocator, ctx, &.{ "set-runtime", "--file", plan_path, "--id", "cfg", "--substrate", "spawn_agent", "--thread-id", "thread-cfg" })) |detail| {
@@ -580,7 +686,7 @@ fn scenarioStaleClaimReclaim(allocator: std.mem.Allocator, ctx: Context, temp_ro
     if (try runStExitNonZero(allocator, ctx, &.{ "import-orchplan", "--file", plan_path, "--input", orchplan_path, "--replace" })) |detail| {
         return failedScenario(.stale_claim_reclaim, detail);
     }
-    if (try runStExitNonZero(allocator, ctx, &.{ "claim", "--file", plan_path, "--ids", "api", "--executor", "teams", "--wave", "w1", "--lease-seconds", "60" })) |detail| {
+    if (try runStExitNonZero(allocator, ctx, &.{ "claim", "--file", plan_path, "--executor", "teams", "--wave", "w1", "--lease-seconds", "60" })) |detail| {
         return failedScenario(.stale_claim_reclaim, detail);
     }
     if (try runStExitNonZero(allocator, ctx, &.{ "set-runtime", "--file", plan_path, "--id", "api", "--substrate", "spawn_agent", "--thread-id", "thread-api" })) |detail| {
@@ -649,7 +755,7 @@ fn scenarioMeshRowAccountability(allocator: std.mem.Allocator, ctx: Context, tem
     if (try runStExitNonZero(allocator, ctx, &.{ "import-orchplan", "--file", plan_path, "--input", orchplan_path, "--replace" })) |detail| {
         return failedScenario(.mesh_row_accountability, detail);
     }
-    if (try runStExitNonZero(allocator, ctx, &.{ "claim", "--file", plan_path, "--ids", "api,docs", "--executor", "mesh", "--wave", "w1" })) |detail| {
+    if (try runStExitNonZero(allocator, ctx, &.{ "claim", "--file", plan_path, "--executor", "mesh", "--wave", "w1" })) |detail| {
         return failedScenario(.mesh_row_accountability, detail);
     }
     if (try runStExitNonZero(allocator, ctx, &.{ "set-runtime", "--file", plan_path, "--id", "api", "--substrate", "spawn_agents_on_csv", "--row-id", "api" })) |detail| {
