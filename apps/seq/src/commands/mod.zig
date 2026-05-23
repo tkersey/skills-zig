@@ -9815,7 +9815,6 @@ fn cmdRoutingGap(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
 
     var invoked_sessions: std.StringHashMap(void) = .init(allocator);
     defer deinitStringSet(allocator, &invoked_sessions);
-    try collectDiscoverySkillSessionPaths(allocator, sessions_root, where.items, &discovery_skills, &invoked_sessions);
 
     const cue_states = try compileRoutingGapCueStates(allocator, cue_specs);
     defer deinitRoutingGapCueStates(allocator, cue_states);
@@ -9829,7 +9828,15 @@ fn cmdRoutingGap(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
     defer deinitStringSet(allocator, &total_invoked_sessions);
     var total_cue_messages: i64 = 0;
 
-    try collectRoutingGapCueMatches(allocator, sessions_root, where.items, cue_states, &total_cue_sessions);
+    try collectRoutingGapSignals(
+        allocator,
+        sessions_root,
+        where.items,
+        &discovery_skills,
+        &invoked_sessions,
+        cue_states,
+        &total_cue_sessions,
+    );
 
     for (cue_states) |*cue_state| {
         total_cue_messages += cue_state.message_count;
@@ -9912,10 +9919,12 @@ fn deinitRoutingGapCueStates(allocator: std.mem.Allocator, states: []RoutingGapC
     allocator.free(states);
 }
 
-fn collectRoutingGapCueMatches(
+fn collectRoutingGapSignals(
     allocator: std.mem.Allocator,
     sessions_root: []const u8,
     query_where: []const spec.WhereClause,
+    discovery_skills: *const std.StringHashMap(void),
+    invoked_sessions: *std.StringHashMap(void),
     cue_states: []RoutingGapCueState,
     total_cue_sessions: *std.StringHashMap(void),
 ) !void {
@@ -9928,6 +9937,14 @@ fn collectRoutingGapCueMatches(
         if (content == null) continue;
         defer allocator.free(content.?);
 
+        const mentions = try datasets.skill_mentions.parseJsonl(allocator, path, content.?, .{});
+        defer datasets.skill_mentions.freeRows(allocator, mentions);
+        for (mentions) |row| {
+            if (!discovery_skills.contains(row.skill)) continue;
+            try addToStringSet(allocator, invoked_sessions, row.path);
+            break;
+        }
+
         const messages = try datasets.messages.parseJsonl(allocator, path, content.?, .{});
         defer datasets.messages.freeRows(allocator, messages);
 
@@ -9939,33 +9956,6 @@ fn collectRoutingGapCueMatches(
                 try addToStringSet(allocator, &cue_state.sessions, row.path);
                 try addToStringSet(allocator, total_cue_sessions, row.path);
             }
-        }
-    }
-}
-
-fn collectDiscoverySkillSessionPaths(
-    allocator: std.mem.Allocator,
-    sessions_root: []const u8,
-    query_where: []const spec.WhereClause,
-    discovery_skills: *const std.StringHashMap(void),
-    out: *std.StringHashMap(void),
-) !void {
-    const day_filter = deriveSessionDayPathFilter("skill_mentions", query_where);
-    var paths = try collectJsonlPaths(allocator, sessions_root, day_filter);
-    defer freePathList(allocator, &paths);
-
-    for (paths.items) |path| {
-        const content = try readFileAllocOrSkip(allocator, path);
-        if (content == null) continue;
-        defer allocator.free(content.?);
-
-        const mentions = try datasets.skill_mentions.parseJsonl(allocator, path, content.?, .{});
-        defer datasets.skill_mentions.freeRows(allocator, mentions);
-
-        for (mentions) |row| {
-            if (!discovery_skills.contains(row.skill)) continue;
-            try addToStringSet(allocator, out, row.path);
-            break;
         }
     }
 }
