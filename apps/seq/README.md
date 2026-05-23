@@ -62,6 +62,7 @@ Binary output:
 ./zig-out/bin/seq message-audit --contains-any "jq,seq query" --roles user,assistant --exclude-current --limit 20 --format table
 ./zig-out/bin/seq skill-cohort --skill seq --since 2026-04-01T00:00:00Z --exclude-current --format table
 ./zig-out/bin/seq tool-search --contains "seq query" --group-by executable --mode summary --exclude-current --format table
+./zig-out/bin/seq tool-search --session-id 019e5634-b21e-74f2-bc0a-9b0b0d9e37e3 --contains-any "jq,shasum,brew test" --mode rows --format table
 ./zig-out/bin/seq memory-extension-audit --extensions-root ~/.codex/memories/extensions --format table
 ./zig-out/bin/seq token-window --window-hours 24 --since 2026-04-01T00:00:00Z --exclude-current --format table
 ./zig-out/bin/seq goal-audit --root ~/.codex/sessions --workflow review,resolve --duration-gte 2h --summary --format table
@@ -189,7 +190,7 @@ Query-lift commands provide top-level shortcuts for common `seq query` shapes:
 - `message-search` searches session message text with `--contains`, `--regex`, `--contains-any`, or `--contains-all`.
 - `message-audit` summarizes message hits by role, emits matching rows, or groups matching sessions; use `--exclude-current` when mining an active Codex run and `--show-query` to print the generated `query` spec.
 - `skill-cohort` reports skills seen in the same session cohort as `--skill <name>`, or can fall back to summary/mention modes over `skill_mentions`.
-- `tool-search` searches lifecycle-enriched tool invocations and flattened tool arguments without shell `jq` post-processing.
+- `tool-search` searches lifecycle-enriched tool invocations and flattened tool arguments without shell `jq` post-processing. Use `--session-id` or `--path` for a single rollout and `--contains-any` when auditing several shell fragments at once.
 - `memory-extension-audit` inventories live memory extensions and labels results as `inventory_only` with `causality_claimed=false` so read/config evidence is not overclaimed.
 - `token-window` computes the max rolling token window from timestamp-sorted `token_deltas` rows and can emit the contributing rows.
 - `goal-audit` summarizes `/goal` runs from `get_goal` / `update_goal` / `create_goal` outputs, with workflow filters for `review` and `resolve` and duration thresholds like `--duration-gte 2h`.

@@ -588,7 +588,7 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\usage: seq skill-cohort [--skill <name>] [--mode summary|cohort|mentions] [--roles <csv>] [--contains <text>|--regex <expr>|--contains-any <csv>] [--since <iso>] [--until <iso>] [--exclude-current] [--show-query] [--limit N] [--format table|json|csv|jsonl]
         ,
         .tool_search =>
-        \\usage: seq tool-search [--mode rows|summary|args] [--group-by executable|tool|session|workdir|command] [--tool <name>] [--executable <name>] [--workdir <path>] [--contains <text>|--regex <expr>] [--since <iso>] [--until <iso>] [--exclude-current] [--show-query] [--limit N] [--format table|json|csv|jsonl]
+        \\usage: seq tool-search [--mode rows|summary|args] [--group-by executable|tool|session|workdir|command] [--tool <name>] [--executable <name>] [--workdir <path>] [--path <jsonl>|--session-id <id>] [--contains <text>|--contains-any <csv>|--regex <expr>] [--since <iso>] [--until <iso>] [--exclude-current] [--show-query] [--limit N] [--format table|json|csv|jsonl]
         ,
         .memory_extension_audit =>
         \\usage: seq memory-extension-audit [--mode summary|rows] [--extensions-root <path>] [--contains <text>|--regex <expr>] [--show-query] [--limit N] [--format table|json|csv|jsonl]
@@ -834,7 +834,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .artifact_search, .tool_audit, .memory_inventory, .message_search, .message_audit, .skill_cohort, .tool_search, .memory_extension_audit, .workdir_report, .plan_search, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .sessions, .turns, .goal_audit => true,
         else => false,
     };
-    const supports_contains_any = cmd == .message_search or cmd == .message_audit or cmd == .skill_cohort or cmd == .workdir_report;
+    const supports_contains_any = cmd == .message_search or cmd == .message_audit or cmd == .skill_cohort or cmd == .tool_search or cmd == .workdir_report;
     const supports_contains_all = cmd == .message_search or cmd == .message_audit;
     const supports_regex = switch (cmd) {
         .artifact_search, .memory_inventory, .message_search, .message_audit, .skill_cohort, .tool_search, .memory_extension_audit, .plan_search, .memory_map, .memory_history, .opencode_prompts, .opencode_events => true,
@@ -1181,6 +1181,7 @@ fn commandSupportsPath(cmd: lib.Command) bool {
         .token_cost,
         .token_window,
         .goal_audit,
+        .tool_search,
         .turns,
         .session_detail,
         .tool_lifecycle,
@@ -1203,6 +1204,7 @@ fn commandSupportsSessionId(cmd: lib.Command) bool {
         .token_usage,
         .token_cost,
         .goal_audit,
+        .tool_search,
         .turns,
         .session_detail,
         .tool_lifecycle,
@@ -2544,7 +2546,7 @@ const QueryLiftCommands = struct {
     const skill_cohort_summary_columns = [_][]const u8{ "skill", "mentions", "sessions", "first_seen", "last_seen" };
     const skill_cohort_mention_columns = [_][]const u8{ "timestamp", "role", "skill", "types", "snippet", "path" };
     const skill_cohort_columns = [_][]const u8{ "cohort_skill", "skill", "mentions", "sessions", "cohort_sessions", "first_seen", "last_seen" };
-    const tool_search_row_columns = [_][]const u8{ "timestamp", "tool_name", "primary_executable", "workdir", "exit_code", "wall_time_ms", "command_text", "arguments_text", "input_text", "path" };
+    const tool_search_row_columns = [_][]const u8{ "timestamp", "session_id", "tool_name", "primary_executable", "workdir", "exit_code", "wall_time_ms", "command_text", "arguments_text", "input_text", "path" };
     const tool_search_summary_columns = [_][]const u8{ "primary_executable", "calls", "sessions", "avg_wall_ms", "max_wall_ms" };
     const tool_search_arg_columns = [_][]const u8{ "tool_name", "arg_path", "value_kind", "value_text", "count" };
     const memory_extension_summary_columns = [_][]const u8{ "row_kind", "extensions", "with_instructions", "without_instructions", "total_bytes", "provenance_status", "causality_claimed" };
@@ -3393,15 +3395,30 @@ const QueryLiftCommands = struct {
 
     fn cmdToolSearch(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
         const mode = opts.mode orelse "rows";
+        const target_path = if (opts.path) |raw_path| try toAbsolutePath(allocator, raw_path) else null;
+        defer if (target_path) |path| allocator.free(path);
+        var params: std.ArrayList(spec.ParamSpec) = .empty;
+        defer params.deinit(allocator);
+        if (target_path) |path| {
+            try params.append(allocator, .{ .key = "path", .value = .{ .string = path } });
+        }
+        if (opts.session_id) |session_id| {
+            try params.append(allocator, .{ .key = "session_id", .value = .{ .string = session_id } });
+        }
+
         var where: std.ArrayList(spec.WhereClause) = .empty;
         defer where.deinit(allocator);
         try appendTimeBoundsForField(allocator, &where, "timestamp", opts);
         const exclude_path = try appendCurrentSessionExclusion(allocator, sessions_root, &where, opts);
         defer if (exclude_path) |path| allocator.free(path);
+        try appendOptionalStringEq(allocator, &where, "path", target_path);
+        try appendOptionalStringEq(allocator, &where, "session_id", opts.session_id);
         try appendOptionalStringEq(allocator, &where, "tool_name", opts.tool);
         try appendOptionalStringEq(allocator, &where, "primary_executable", opts.executable_text);
         try appendOptionalStringEq(allocator, &where, "workdir", opts.workdir_text);
         try appendOptionalContains(allocator, &where, "command_text", opts.contains);
+        const contains_any_values = try appendCsvContainsAny(allocator, &where, "command_text", opts.contains_any_text);
+        defer if (contains_any_values) |values| allocator.free(values);
         try appendOptionalRegex(allocator, &where, "command_text", opts.regex);
 
         if (std.mem.eql(u8, mode, "rows")) {
@@ -3409,6 +3426,7 @@ const QueryLiftCommands = struct {
                 .where = where.items,
                 .select = tool_search_row_columns[0..],
                 .sort = &.{.{ .field = "timestamp", .descending = true }},
+                .params = params.items,
                 .limit = queryLimit(opts, 50),
             };
             return runQueryLiftDataset(allocator, "tool_invocations", sessions_root, query_spec, opts, tool_search_row_columns[0..]);
@@ -3428,6 +3446,7 @@ const QueryLiftCommands = struct {
                     .{ .op = .max, .field = "wall_time_ms", .alias = "max_wall_ms" },
                 },
                 .sort = &.{.{ .field = "calls", .descending = true }},
+                .params = params.items,
                 .limit = queryLimit(opts, 20),
             };
             return runQueryLiftDataset(allocator, "tool_invocations", sessions_root, query_spec, opts, columns[0..]);
@@ -3439,14 +3458,19 @@ const QueryLiftCommands = struct {
             try appendTimeBoundsForField(allocator, &arg_where, "timestamp", opts);
             const arg_exclude_path = try appendCurrentSessionExclusion(allocator, sessions_root, &arg_where, opts);
             defer if (arg_exclude_path) |path| allocator.free(path);
+            try appendOptionalStringEq(allocator, &arg_where, "path", target_path);
+            try appendOptionalStringEq(allocator, &arg_where, "session_id", opts.session_id);
             try appendOptionalStringEq(allocator, &arg_where, "tool_name", opts.tool);
             try appendOptionalContains(allocator, &arg_where, "value_text", opts.contains);
+            const arg_contains_any_values = try appendCsvContainsAny(allocator, &arg_where, "value_text", opts.contains_any_text);
+            defer if (arg_contains_any_values) |values| allocator.free(values);
             try appendOptionalRegex(allocator, &arg_where, "value_text", opts.regex);
             const query_spec = spec.QuerySpec{
                 .where = arg_where.items,
                 .group_by = &.{ "tool_name", "arg_path", "value_kind", "value_text" },
                 .metrics = &.{.{ .op = .count, .alias = "count" }},
                 .sort = &.{.{ .field = "count", .descending = true }},
+                .params = params.items,
                 .limit = queryLimit(opts, 50),
             };
             return runQueryLiftDataset(allocator, "tool_call_args", sessions_root, query_spec, opts, tool_search_arg_columns[0..]);
@@ -6832,6 +6856,33 @@ fn collectInvocationRecordsForRoot(
     day_filter: ?SessionDayPathFilter,
 ) !std.ArrayList(InvocationRecord) {
     var input_paths = try collectJsonlPaths(allocator, sessions_root, day_filter);
+    defer freePathList(allocator, &input_paths);
+
+    var records: std.ArrayList(InvocationRecord) = .empty;
+    errdefer deinitInvocationRecords(allocator, &records);
+
+    for (input_paths.items) |session_path| {
+        try collectInvocationRecordsFromSession(allocator, session_path, &records);
+    }
+
+    return records;
+}
+
+fn collectInvocationRecordsForParams(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    day_filter: ?SessionDayPathFilter,
+    query_params: []const spec.ParamSpec,
+) !std.ArrayList(InvocationRecord) {
+    const opts = Options{
+        .path = paramString(query_params, "path"),
+        .session_id = paramString(query_params, "session_id"),
+    };
+    if (opts.path == null and opts.session_id == null) {
+        return collectInvocationRecordsForRoot(allocator, sessions_root, day_filter);
+    }
+
+    var input_paths = try resolveSessionPromptInputPaths(allocator, sessions_root, opts, day_filter);
     defer freePathList(allocator, &input_paths);
 
     var records: std.ArrayList(InvocationRecord) = .empty;
@@ -10261,9 +10312,9 @@ fn collectDatasetRows(
     } else if (std.mem.eql(u8, dataset_name, "tool_calls")) {
         try collectToolCallsRows(allocator, sessions_root, day_filter, &rows);
     } else if (std.mem.eql(u8, dataset_name, "tool_invocations")) {
-        try collectToolInvocationRows(allocator, sessions_root, day_filter, &rows);
+        try collectToolInvocationRows(allocator, sessions_root, day_filter, query_params, &rows);
     } else if (std.mem.eql(u8, dataset_name, "tool_call_args")) {
-        try collectToolCallArgRows(allocator, sessions_root, day_filter, &rows);
+        try collectToolCallArgRows(allocator, sessions_root, day_filter, query_params, &rows);
     } else if (std.mem.eql(u8, dataset_name, "goal_runs")) {
         try collectGoalRunRows(allocator, sessions_root, day_filter, &rows);
     } else if (std.mem.eql(u8, dataset_name, "sessions") or
@@ -10420,7 +10471,7 @@ fn collectWorkflowSignalRows(
 
     var tool_rows: std.ArrayList(query.Row) = .empty;
     defer deinitQueryRows(allocator, &tool_rows);
-    try collectToolInvocationRows(allocator, sessions_root, day_filter, &tool_rows);
+    try collectToolInvocationRows(allocator, sessions_root, day_filter, &.{}, &tool_rows);
     for (tool_rows.items) |row| {
         const tool_name = scalarString(row.valueOrNull("tool_name")) orelse continue;
         try appendWorkflowSignalRow(
@@ -10743,9 +10794,10 @@ fn collectToolInvocationRows(
     allocator: std.mem.Allocator,
     sessions_root: []const u8,
     day_filter: ?SessionDayPathFilter,
+    query_params: []const spec.ParamSpec,
     out_rows: *std.ArrayList(query.Row),
 ) !void {
-    var records = try collectInvocationRecordsForRoot(allocator, sessions_root, day_filter);
+    var records = try collectInvocationRecordsForParams(allocator, sessions_root, day_filter, query_params);
     defer deinitInvocationRecords(allocator, &records);
 
     for (records.items) |record| {
@@ -11105,9 +11157,10 @@ fn collectToolCallArgRows(
     allocator: std.mem.Allocator,
     sessions_root: []const u8,
     day_filter: ?SessionDayPathFilter,
+    query_params: []const spec.ParamSpec,
     out_rows: *std.ArrayList(query.Row),
 ) !void {
-    var records = try collectInvocationRecordsForRoot(allocator, sessions_root, day_filter);
+    var records = try collectInvocationRecordsForParams(allocator, sessions_root, day_filter, query_params);
     defer deinitInvocationRecords(allocator, &records);
 
     for (records.items) |record| {
@@ -14544,6 +14597,41 @@ test "query-lift commands run representative dataset wrappers" {
     const tool_search_got = try runCommandWithOutput(std.testing.allocator, .tool_search, tool_search_args[0..], tool_search_out);
     defer std.testing.allocator.free(tool_search_got);
     try std.testing.expect(std.mem.indexOf(u8, tool_search_got, "\"primary_executable\": \"seq\"") != null);
+
+    const targeted_tool_search_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "tool-search-targeted.json" });
+    defer std.testing.allocator.free(targeted_tool_search_out);
+    const targeted_tool_search_args = [_][]const u8{
+        "--root",
+        sessions_abs,
+        "--session-id",
+        "019c0000-0000-7000-8000-000000000101",
+        "--contains-any",
+        "missing needle,seq query",
+        "--format",
+        "json",
+    };
+    const targeted_tool_search_got = try runCommandWithOutput(std.testing.allocator, .tool_search, targeted_tool_search_args[0..], targeted_tool_search_out);
+    defer std.testing.allocator.free(targeted_tool_search_got);
+    try std.testing.expect(std.mem.indexOf(u8, targeted_tool_search_got, "\"session_id\": \"019c0000-0000-7000-8000-000000000101\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, targeted_tool_search_got, "\"primary_executable\": \"seq\"") != null);
+
+    const targeted_tool_args_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "tool-search-targeted-args.json" });
+    defer std.testing.allocator.free(targeted_tool_args_out);
+    const targeted_tool_args = [_][]const u8{
+        "--root",
+        sessions_abs,
+        "--mode",
+        "args",
+        "--session-id",
+        "019c0000-0000-7000-8000-000000000101",
+        "--contains-any",
+        "missing needle,seq query",
+        "--format",
+        "json",
+    };
+    const targeted_tool_args_got = try runCommandWithOutput(std.testing.allocator, .tool_search, targeted_tool_args[0..], targeted_tool_args_out);
+    defer std.testing.allocator.free(targeted_tool_args_got);
+    try std.testing.expect(std.mem.indexOf(u8, targeted_tool_args_got, "\"value_text\": \"seq query --spec @spec.json\"") != null);
 
     const extension_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "memory-extension-audit.json" });
     defer std.testing.allocator.free(extension_out);
