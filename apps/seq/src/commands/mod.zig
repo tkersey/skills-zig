@@ -8855,11 +8855,15 @@ fn cmdTokenCost(allocator: std.mem.Allocator, sessions_root: []const u8, opts: O
     var total = TokenCostBucket{ .key = undefined };
 
     for (paths.items) |path| {
-        const meta = try loadTokenCostTraceMeta(allocator, path, opts);
+        const content_opt = try readFileAllocOrSkip(allocator, path);
+        const content = content_opt orelse continue;
+        defer allocator.free(content);
+
+        const meta = try loadTokenCostTraceMetaFromContent(allocator, content, opts);
         defer meta.deinit(allocator);
         const model_name = opts.model_text orelse meta.model;
         const model_source: []const u8 = if (opts.model_text != null) "override" else if (meta.model != null) "trace" else "missing";
-        var events = try datasets.token_events.parseTokenEventsFileWithOptions(allocator, path, .{
+        var events = try datasets.token_events.parseTokenEventsWithOptions(allocator, path, content, .{
             .dedupe = !opts.audit,
             .derive_timestamp_fields = true,
             .include_null_info = opts.audit,
@@ -9230,21 +9234,48 @@ fn tokenCostCachePath(allocator: std.mem.Allocator) ![]u8 {
     return std.fs.path.join(allocator, &.{ root, "seq", "pricing", "codex-pricing.json" });
 }
 
-fn loadTokenCostTraceMeta(allocator: std.mem.Allocator, path: []const u8, opts: Options) !TokenCostTraceMeta {
+fn loadTokenCostTraceMetaFromContent(allocator: std.mem.Allocator, content: []const u8, opts: Options) !TokenCostTraceMeta {
     var out = TokenCostTraceMeta{};
     if (opts.force_fast) out.fast_mode = .override_fast;
     if (opts.force_standard) out.fast_mode = .override_standard;
-    var trace = canonical_trace.parseSessionTrace(allocator, path, .{}) catch null;
-    if (trace) |*parsed| {
-        defer parsed.deinit(allocator);
-        if (parsed.session.model) |model| out.model = try allocator.dupe(u8, model);
-    }
-    if (opts.force_fast or opts.force_standard) return out;
-    const content_opt = try readFileAllocOrSkip(allocator, path);
-    defer if (content_opt) |content| allocator.free(content);
-    const content = content_opt orelse return out;
-    out.fast_mode = detectFastModeEvidence(content);
+    out.model = try detectTokenCostModel(allocator, content);
+    if (!opts.force_fast and !opts.force_standard) out.fast_mode = detectFastModeEvidence(content);
     return out;
+}
+
+fn detectTokenCostModel(allocator: std.mem.Allocator, content: []const u8) !?[]u8 {
+    var model: ?[]u8 = null;
+    errdefer if (model) |value| allocator.free(value);
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw_line| {
+        if (std.mem.indexOf(u8, raw_line, "\"model\"") == null) continue;
+        const line = std.mem.trim(u8, raw_line, " \t\r\n");
+        if (line.len == 0) continue;
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), line, .{}) catch continue;
+        const root = switch (parsed.value) {
+            .object => |obj| obj,
+            else => continue,
+        };
+        const root_type = stdJsonStringField(root, "type") orelse continue;
+        if (std.mem.eql(u8, root_type, "session_meta")) {
+            const payload = stdJsonObjectField(root, "payload") orelse root;
+            if (stdJsonStringField(payload, "model")) |value| {
+                if (model) |old| allocator.free(old);
+                model = try allocator.dupe(u8, value);
+            }
+            continue;
+        }
+        if (model == null and std.mem.eql(u8, root_type, "turn_context")) {
+            const payload = stdJsonObjectField(root, "payload") orelse root;
+            if (stdJsonStringField(payload, "model")) |value| model = try allocator.dupe(u8, value);
+        }
+    }
+
+    return model;
 }
 
 fn detectFastModeEvidence(content: []const u8) token_cost.FastMode {
