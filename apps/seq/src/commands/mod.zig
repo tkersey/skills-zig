@@ -6217,7 +6217,39 @@ fn cmdOccurrenceExport(allocator: std.mem.Allocator, sessions_root: []const u8, 
         .limit = opts.limit,
     };
     const fmt = if (opts.format_set) opts.format else output.Format.jsonl;
-    try runDatasetQuery(allocator, "skill_mentions", sessions_root, query_spec, fmt, opts.out_path, select[0..]);
+    var rows = try collectDatasetRowsForSpec(allocator, "skill_mentions", sessions_root, query_spec);
+    defer deinitQueryRows(allocator, &rows);
+
+    var write_idx: usize = 0;
+    for (rows.items, 0..) |*row, idx| {
+        if (opts.skill) |skill_name| {
+            const row_skill = scalarString(row.valueOrNull("skill")) orelse {
+                row.deinit();
+                continue;
+            };
+            if (!std.mem.eql(u8, row_skill, skill_name)) {
+                row.deinit();
+                continue;
+            }
+        }
+        const timestamp = scalarString(row.valueOrNull("timestamp"));
+        if ((opts.since != null or opts.until != null) and !timestampSatisfiesBounds(timestamp, opts)) {
+            row.deinit();
+            continue;
+        }
+        if (write_idx != idx) rows.items[write_idx] = row.*;
+        write_idx += 1;
+    }
+    rows.items.len = write_idx;
+    std.mem.sort(query.Row, rows.items, {}, occurrenceExportRowLessThan);
+    trimQueryRows(&rows, opts.limit);
+    try output.writeOutput(allocator, fmt, rows.items, select[0..], opts.out_path);
+}
+
+fn occurrenceExportRowLessThan(_: void, lhs: query.Row, rhs: query.Row) bool {
+    const lhs_timestamp = scalarString(lhs.valueOrNull("timestamp")) orelse "";
+    const rhs_timestamp = scalarString(rhs.valueOrNull("timestamp")) orelse "";
+    return std.mem.order(u8, lhs_timestamp, rhs_timestamp) == .lt;
 }
 
 const ConcurrencySummary = struct {
