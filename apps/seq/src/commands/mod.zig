@@ -2418,7 +2418,10 @@ fn collectWorkflowAuditRows(
     defer where.deinit(allocator);
     try appendSessionTimeBounds(allocator, &where, opts);
 
-    const signal_query = spec.QuerySpec{ .where = where.items };
+    const signal_query = spec.QuerySpec{
+        .where = where.items,
+        .select = workflow_audit_signal_columns[0..],
+    };
     var collected = try collectDatasetRowsForSpec(allocator, "workflow_signals", sessions_root, signal_query);
     defer deinitQueryRows(allocator, &collected);
 
@@ -2444,11 +2447,13 @@ fn collectWorkflowAuditRows(
 
     var out: std.ArrayList(query.Row) = .empty;
     errdefer deinitQueryRows(allocator, &out);
-    for (filtered.rows.items) |row| {
+    for (filtered.rows.items) |*row| {
         const path = scalarString(row.valueOrNull("path")) orelse continue;
         if (!cohort_paths.contains(path)) continue;
         if (has_workdir_filter and !workdir_paths.contains(path)) continue;
-        try out.append(allocator, try row.cloneAll(allocator));
+        const moved = row.*;
+        try out.append(allocator, moved);
+        row.* = query.Row.init(allocator);
     }
 
     return out;
