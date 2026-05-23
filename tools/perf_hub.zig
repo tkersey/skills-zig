@@ -64,6 +64,8 @@ const CompatSetup = enum {
     cas_wrapper_smoke,
     cas_smoke_check_help,
     cas_instance_runner_help,
+    cas_review_session_help,
+    cas_review_session_version,
     cas_budget_governor_driver,
     cron_help,
     cron_list,
@@ -104,7 +106,31 @@ const CompatCase = struct {
 
 const DeepSetup = enum {
     seq_query_tool_calls,
+    seq_skill_success_rank,
+    seq_skill_audit,
+    seq_skill_blocks,
+    seq_tool_audit,
+    seq_memory_inventory,
+    seq_message_search,
+    seq_message_audit,
+    seq_skill_cohort,
+    seq_tool_search,
+    seq_memory_extension_audit,
+    seq_token_window,
+    seq_workdir_report,
+    seq_plan_search,
+    seq_reply_latency,
     seq_sessions_limit,
+    seq_turns,
+    seq_session_detail,
+    seq_tool_lifecycle,
+    seq_session_graph,
+    seq_tail_once,
+    seq_token_cost,
+    seq_goal_audit,
+    seq_workflow_audit,
+    seq_memory_map,
+    seq_memory_history,
     seq_session_tooling,
     seq_orchestration_concurrency,
     seq_datasets,
@@ -155,7 +181,22 @@ const DeepCase = struct {
 const SeqCases = [_]perf_contract.CaseDescriptor{
     .{ .case_id = "seq-help", .binary = "seq", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
     .{ .case_id = "seq-query-tool-calls", .binary = "seq", .family = "query", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-skill-success-rank", .binary = "seq", .family = "skill-success-rank", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-skill-audit", .binary = "seq", .family = "skill-audit", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-skill-blocks", .binary = "seq", .family = "skill-blocks", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-tool-audit", .binary = "seq", .family = "tool-audit", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-message-search", .binary = "seq", .family = "message-search", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-message-audit", .binary = "seq", .family = "message-audit", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-skill-cohort", .binary = "seq", .family = "skill-cohort", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-tool-search", .binary = "seq", .family = "tool-search", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-token-window", .binary = "seq", .family = "token-window", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-workdir-report", .binary = "seq", .family = "workdir-report", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-plan-search", .binary = "seq", .family = "plan-search", .case_kind = .native, .measurement_mode = .latency_alloc },
     .{ .case_id = "seq-sessions-limit", .binary = "seq", .family = "sessions", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-turns", .binary = "seq", .family = "turns", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-session-detail", .binary = "seq", .family = "session-detail", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-tool-lifecycle", .binary = "seq", .family = "tool-lifecycle", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-tail-once", .binary = "seq", .family = "tail", .case_kind = .native, .measurement_mode = .latency_alloc },
     .{ .case_id = "seq-session-tooling", .binary = "seq", .family = "session-tooling", .case_kind = .native, .measurement_mode = .latency_alloc },
     .{ .case_id = "seq-orchestration-concurrency", .binary = "seq", .family = "orchestration-concurrency", .case_kind = .native, .measurement_mode = .latency_alloc },
     .{ .case_id = "seq-datasets", .binary = "seq", .family = "datasets", .case_kind = .native, .measurement_mode = .latency_alloc },
@@ -173,6 +214,15 @@ const SeqCases = [_]perf_contract.CaseDescriptor{
     .{ .case_id = "seq-section-audit", .binary = "seq", .family = "section-audit", .case_kind = .native, .measurement_mode = .latency_alloc },
     .{ .case_id = "seq-token-usage", .binary = "seq", .family = "token-usage", .case_kind = .native, .measurement_mode = .latency_alloc },
     .{ .case_id = "seq-routing-gap", .binary = "seq", .family = "routing-gap", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-memory-inventory", .binary = "seq", .family = "memory-inventory", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-memory-extension-audit", .binary = "seq", .family = "memory-extension-audit", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-reply-latency", .binary = "seq", .family = "reply-latency", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-token-cost", .binary = "seq", .family = "token-cost", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-goal-audit", .binary = "seq", .family = "goal-audit", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-workflow-audit", .binary = "seq", .family = "workflow-audit", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-session-graph", .binary = "seq", .family = "session-graph", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-memory-map", .binary = "seq", .family = "memory-map", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-memory-history", .binary = "seq", .family = "memory-history", .case_kind = .native, .measurement_mode = .latency_alloc },
     .{ .case_id = "seq-parser-driver", .binary = "seq", .family = "parser", .case_kind = .driver, .measurement_mode = .latency_alloc, .compat_case = true },
 };
 
@@ -225,6 +275,8 @@ const MiscCases = [_]perf_contract.CaseDescriptor{
     .{ .case_id = "cas-wrapper-smoke", .binary = "cas", .family = "wrapper", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
     .{ .case_id = "cas-smoke-check-help", .binary = "cas_smoke_check", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
     .{ .case_id = "cas-instance-runner-help", .binary = "cas_instance_runner", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
+    .{ .case_id = "cas-review-session-help", .binary = "cas_review_session", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
+    .{ .case_id = "cas-review-session-version", .binary = "cas_review_session", .family = "version", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
     .{ .case_id = "cas-budget-governor-driver", .binary = "cas", .family = "driver", .case_kind = .driver, .measurement_mode = .latency_alloc, .compat_case = true },
     .{ .case_id = "puff-help", .binary = "puff", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
     .{ .case_id = "puff-wrapper", .binary = "puff", .family = "wrapper", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
@@ -253,7 +305,7 @@ const MiscCoverages = [_]perf_contract.CommandCoverage{
 
 const CompatCases = [_]CompatCase{
     .{ .descriptor = SeqCases[0], .builder = .seq_local, .build_step = null, .binary_path = "zig-out/bin/seq", .setup = .seq_help },
-    .{ .descriptor = SeqCases[20], .builder = .seq_local, .build_step = null, .binary_path = "zig-out/bin/seq-perf-parser", .setup = .seq_parser_driver, .tolerance_pct = 20.0 },
+    .{ .descriptor = SeqCases[SeqCases.len - 1], .builder = .seq_local, .build_step = null, .binary_path = "zig-out/bin/seq-perf-parser", .setup = .seq_parser_driver, .tolerance_pct = 20.0 },
     .{ .descriptor = MiscCases[0], .builder = .root, .build_step = "build-lift", .binary_path = "zig-out/bin/bench_stats", .setup = .bench_stats_help, .tolerance_pct = 25.0 },
     .{ .descriptor = MiscCases[1], .builder = .root, .build_step = "build-lift", .binary_path = "zig-out/bin/bench_stats", .setup = .bench_stats_parse, .tolerance_pct = 25.0 },
     .{ .descriptor = MiscCases[2], .builder = .root, .build_step = "build-lift", .binary_path = "zig-out/bin/perf_report", .setup = .perf_report_help, .tolerance_pct = 25.0 },
@@ -262,53 +314,79 @@ const CompatCases = [_]CompatCase{
     .{ .descriptor = MiscCases[5], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas", .setup = .cas_wrapper_smoke, .tolerance_pct = 120.0 },
     .{ .descriptor = MiscCases[6], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas_smoke_check", .setup = .cas_smoke_check_help, .tolerance_pct = 100.0 },
     .{ .descriptor = MiscCases[7], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas_instance_runner", .setup = .cas_instance_runner_help, .tolerance_pct = 100.0 },
-    .{ .descriptor = MiscCases[8], .builder = .root, .build_step = "install", .binary_path = "zig-out/bin/cas-perf-budget-governor", .setup = .cas_budget_governor_driver, .tolerance_pct = 45.0 },
+    .{ .descriptor = MiscCases[8], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas_review_session", .setup = .cas_review_session_help, .tolerance_pct = 100.0 },
+    .{ .descriptor = MiscCases[9], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas_review_session", .setup = .cas_review_session_version, .tolerance_pct = 100.0 },
+    .{ .descriptor = MiscCases[10], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas-perf-budget-governor", .setup = .cas_budget_governor_driver, .tolerance_pct = 45.0 },
     .{ .descriptor = CronCases[0], .builder = .root, .build_step = "build-cron", .binary_path = "zig-out/bin/cron", .setup = .cron_help, .tolerance_pct = 25.0 },
     .{ .descriptor = CronCases[1], .builder = .root, .build_step = "build-cron", .binary_path = "zig-out/bin/cron", .setup = .cron_list, .tolerance_pct = 35.0 },
-    .{ .descriptor = MiscCases[9], .builder = .root, .build_step = "build-puff", .binary_path = "zig-out/bin/puff", .setup = .puff_help, .tolerance_pct = 25.0 },
-    .{ .descriptor = MiscCases[10], .builder = .root, .build_step = "build-puff", .binary_path = "zig-out/bin/puff", .setup = .puff_wrapper, .tolerance_pct = 35.0 },
-    .{ .descriptor = MiscCases[11], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_help, .tolerance_pct = 150.0 },
-    .{ .descriptor = MiscCases[12], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_recent, .tolerance_pct = 120.0 },
-    .{ .descriptor = MiscCases[13], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_recall, .tolerance_pct = 20.0 },
-    .{ .descriptor = MiscCases[14], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_query, .tolerance_pct = 25.0 },
-    .{ .descriptor = MiscCases[15], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_codify, .tolerance_pct = 25.0 },
-    .{ .descriptor = MiscCases[16], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_quality, .tolerance_pct = 25.0 },
-    .{ .descriptor = MiscCases[17], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/append_learning", .setup = .append_learning_help },
-    .{ .descriptor = MiscCases[18], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/append_learning", .setup = .append_learning_append, .tolerance_pct = 100.0 },
-    .{ .descriptor = MiscCases[19], .builder = .root, .build_step = "build-mesh", .binary_path = "zig-out/bin/mesh", .setup = .mesh_help, .tolerance_pct = 200.0 },
-    .{ .descriptor = MiscCases[20], .builder = .root, .build_step = "build-mesh", .binary_path = "zig-out/bin/mesh", .setup = .mesh_budget, .tolerance_pct = 200.0 },
-    .{ .descriptor = MiscCases[21], .builder = .root, .build_step = "build-mesh", .binary_path = "zig-out/bin/mesh", .setup = .mesh_plan_sync, .tolerance_pct = 200.0 },
-    .{ .descriptor = MiscCases[22], .builder = .root, .build_step = "build-mesh", .binary_path = "zig-out/bin/mesh", .setup = .mesh_slice, .tolerance_pct = 200.0 },
-    .{ .descriptor = MiscCases[23], .builder = .root, .build_step = "build-mesh", .binary_path = "zig-out/bin/mesh", .setup = .mesh_wave, .tolerance_pct = 200.0 },
+    .{ .descriptor = MiscCases[11], .builder = .root, .build_step = "build-puff", .binary_path = "zig-out/bin/puff", .setup = .puff_help, .tolerance_pct = 25.0 },
+    .{ .descriptor = MiscCases[12], .builder = .root, .build_step = "build-puff", .binary_path = "zig-out/bin/puff", .setup = .puff_wrapper, .tolerance_pct = 35.0 },
+    .{ .descriptor = MiscCases[13], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_help, .tolerance_pct = 150.0 },
+    .{ .descriptor = MiscCases[14], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_recent, .tolerance_pct = 120.0 },
+    .{ .descriptor = MiscCases[15], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_recall, .tolerance_pct = 20.0 },
+    .{ .descriptor = MiscCases[16], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_query, .tolerance_pct = 25.0 },
+    .{ .descriptor = MiscCases[17], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_codify, .tolerance_pct = 25.0 },
+    .{ .descriptor = MiscCases[18], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_quality, .tolerance_pct = 25.0 },
+    .{ .descriptor = MiscCases[19], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/append_learning", .setup = .append_learning_help },
+    .{ .descriptor = MiscCases[20], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/append_learning", .setup = .append_learning_append, .tolerance_pct = 100.0 },
+    .{ .descriptor = MiscCases[21], .builder = .root, .build_step = "build-mesh", .binary_path = "zig-out/bin/mesh", .setup = .mesh_help, .tolerance_pct = 200.0 },
+    .{ .descriptor = MiscCases[22], .builder = .root, .build_step = "build-mesh", .binary_path = "zig-out/bin/mesh", .setup = .mesh_budget, .tolerance_pct = 200.0 },
+    .{ .descriptor = MiscCases[23], .builder = .root, .build_step = "build-mesh", .binary_path = "zig-out/bin/mesh", .setup = .mesh_plan_sync, .tolerance_pct = 200.0 },
+    .{ .descriptor = MiscCases[24], .builder = .root, .build_step = "build-mesh", .binary_path = "zig-out/bin/mesh", .setup = .mesh_slice, .tolerance_pct = 200.0 },
+    .{ .descriptor = MiscCases[25], .builder = .root, .build_step = "build-mesh", .binary_path = "zig-out/bin/mesh", .setup = .mesh_wave, .tolerance_pct = 200.0 },
     .{ .descriptor = StCases[0], .builder = .root, .build_step = "build-st", .binary_path = "zig-out/bin/st", .setup = .st_help, .tolerance_pct = 25.0 },
     .{ .descriptor = StCases[1], .builder = .root, .build_step = "build-st", .binary_path = "zig-out/bin/st", .setup = .st_add_show, .tolerance_pct = 20.0 },
     .{ .descriptor = StCases[2], .builder = .root, .build_step = "build-st", .binary_path = "zig-out/bin/st", .setup = .st_emit_export, .tolerance_pct = 300.0 },
-    .{ .descriptor = MiscCases[24], .builder = .root, .build_step = "build-parse-arch", .binary_path = "zig-out/bin/parse-arch", .setup = .parse_arch_help, .tolerance_pct = 200.0 },
-    .{ .descriptor = MiscCases[25], .builder = .root, .build_step = "build-parse-arch", .binary_path = "zig-out/bin/parse-arch", .setup = .parse_arch_collect, .tolerance_pct = 200.0 },
-    .{ .descriptor = MiscCases[26], .builder = .root, .build_step = "build-parse-arch", .binary_path = "zig-out/bin/parse-arch", .setup = .parse_arch_eval, .tolerance_pct = 800.0 },
-    .{ .descriptor = MiscCases[27], .builder = .root, .build_step = "build-parse-arch", .binary_path = "zig-out/bin/parse-arch", .setup = .parse_arch_doctor, .tolerance_pct = 200.0 },
+    .{ .descriptor = MiscCases[26], .builder = .root, .build_step = "build-parse-arch", .binary_path = "zig-out/bin/parse-arch", .setup = .parse_arch_help, .tolerance_pct = 200.0 },
+    .{ .descriptor = MiscCases[27], .builder = .root, .build_step = "build-parse-arch", .binary_path = "zig-out/bin/parse-arch", .setup = .parse_arch_collect, .tolerance_pct = 200.0 },
+    .{ .descriptor = MiscCases[28], .builder = .root, .build_step = "build-parse-arch", .binary_path = "zig-out/bin/parse-arch", .setup = .parse_arch_eval, .tolerance_pct = 800.0 },
+    .{ .descriptor = MiscCases[29], .builder = .root, .build_step = "build-parse-arch", .binary_path = "zig-out/bin/parse-arch", .setup = .parse_arch_doctor, .tolerance_pct = 200.0 },
 };
 
 const DeepCases = [_]DeepCase{
     .{ .descriptor = SeqCases[1], .setup = .seq_query_tool_calls, .tolerance_pct = 25.0 },
-    .{ .descriptor = SeqCases[2], .setup = .seq_sessions_limit, .tolerance_pct = 25.0 },
-    .{ .descriptor = SeqCases[3], .setup = .seq_session_tooling, .tolerance_pct = 125.0 },
-    .{ .descriptor = SeqCases[4], .setup = .seq_orchestration_concurrency, .tolerance_pct = 125.0 },
-    .{ .descriptor = SeqCases[5], .setup = .seq_datasets, .tolerance_pct = 125.0 },
-    .{ .descriptor = SeqCases[6], .setup = .seq_dataset_schema, .tolerance_pct = 75.0 },
-    .{ .descriptor = SeqCases[7], .setup = .seq_artifact_search, .tolerance_pct = 25.0 },
-    .{ .descriptor = SeqCases[8], .setup = .seq_find_session, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[9], .setup = .seq_session_prompts, .tolerance_pct = 25.0 },
-    .{ .descriptor = SeqCases[10], .setup = .seq_query_diagnose, .tolerance_pct = 25.0 },
-    .{ .descriptor = SeqCases[11], .setup = .seq_skills_rank, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[12], .setup = .seq_skill_trend, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[13], .setup = .seq_skill_report, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[14], .setup = .seq_role_breakdown, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[15], .setup = .seq_occurrence_export, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[16], .setup = .seq_report_bundle, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[17], .setup = .seq_section_audit, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[18], .setup = .seq_token_usage, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[19], .setup = .seq_routing_gap, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[2], .setup = .seq_skill_success_rank, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[3], .setup = .seq_skill_audit, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[4], .setup = .seq_skill_blocks, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[5], .setup = .seq_tool_audit, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[6], .setup = .seq_message_search, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[7], .setup = .seq_message_audit, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[8], .setup = .seq_skill_cohort, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[9], .setup = .seq_tool_search, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[10], .setup = .seq_token_window, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[11], .setup = .seq_workdir_report, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[12], .setup = .seq_plan_search, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[13], .setup = .seq_sessions_limit, .tolerance_pct = 25.0 },
+    .{ .descriptor = SeqCases[14], .setup = .seq_turns, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[15], .setup = .seq_session_detail, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[16], .setup = .seq_tool_lifecycle, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[17], .setup = .seq_tail_once, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[18], .setup = .seq_session_tooling, .tolerance_pct = 125.0 },
+    .{ .descriptor = SeqCases[19], .setup = .seq_orchestration_concurrency, .tolerance_pct = 125.0 },
+    .{ .descriptor = SeqCases[20], .setup = .seq_datasets, .tolerance_pct = 125.0 },
+    .{ .descriptor = SeqCases[21], .setup = .seq_dataset_schema, .tolerance_pct = 75.0 },
+    .{ .descriptor = SeqCases[22], .setup = .seq_artifact_search, .tolerance_pct = 25.0 },
+    .{ .descriptor = SeqCases[23], .setup = .seq_find_session, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[24], .setup = .seq_session_prompts, .tolerance_pct = 25.0 },
+    .{ .descriptor = SeqCases[25], .setup = .seq_query_diagnose, .tolerance_pct = 25.0 },
+    .{ .descriptor = SeqCases[26], .setup = .seq_skills_rank, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[27], .setup = .seq_skill_trend, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[28], .setup = .seq_skill_report, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[29], .setup = .seq_role_breakdown, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[30], .setup = .seq_occurrence_export, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[31], .setup = .seq_report_bundle, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[32], .setup = .seq_section_audit, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[33], .setup = .seq_token_usage, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[34], .setup = .seq_routing_gap, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[35], .setup = .seq_memory_inventory, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[36], .setup = .seq_memory_extension_audit, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[37], .setup = .seq_reply_latency, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[38], .setup = .seq_token_cost, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[39], .setup = .seq_goal_audit, .tolerance_pct = 80.0 },
+    .{ .descriptor = SeqCases[40], .setup = .seq_workflow_audit, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[41], .setup = .seq_session_graph, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[42], .setup = .seq_memory_map, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[43], .setup = .seq_memory_history, .tolerance_pct = 40.0 },
     .{ .descriptor = CronCases[2], .setup = .cron_show, .tolerance_pct = 200.0 },
     .{ .descriptor = CronCases[3], .setup = .cron_create, .tolerance_pct = 25.0 },
     .{ .descriptor = CronCases[4], .setup = .cron_update, .tolerance_pct = 25.0 },
@@ -332,28 +410,55 @@ const DeepCases = [_]DeepCase{
 };
 
 fn buildSeqCoverages() [seq_cli.commandNames().len]perf_contract.CommandCoverage {
+    @setEvalBranchQuota(5000);
     var out: [seq_cli.commandNames().len]perf_contract.CommandCoverage = undefined;
     for (seq_cli.commandNames(), 0..) |def, idx| {
         const coverage, const reason = if (std.mem.eql(u8, def.name, "query") or
             std.mem.eql(u8, def.name, "sessions") or
+            std.mem.eql(u8, def.name, "turns") or
+            std.mem.eql(u8, def.name, "session-detail") or
+            std.mem.eql(u8, def.name, "tool-lifecycle") or
+            std.mem.eql(u8, def.name, "tail") or
             std.mem.eql(u8, def.name, "session-tooling") or
             std.mem.eql(u8, def.name, "orchestration-concurrency") or
             std.mem.eql(u8, def.name, "datasets") or
             std.mem.eql(u8, def.name, "dataset-schema") or
             std.mem.eql(u8, def.name, "artifact-search") or
+            std.mem.eql(u8, def.name, "tool-audit") or
+            std.mem.eql(u8, def.name, "memory-inventory") or
+            std.mem.eql(u8, def.name, "message-search") or
+            std.mem.eql(u8, def.name, "message-audit") or
+            std.mem.eql(u8, def.name, "skill-cohort") or
+            std.mem.eql(u8, def.name, "tool-search") or
+            std.mem.eql(u8, def.name, "memory-extension-audit") or
+            std.mem.eql(u8, def.name, "token-window") or
+            std.mem.eql(u8, def.name, "workdir-report") or
             std.mem.eql(u8, def.name, "find-session") or
+            std.mem.eql(u8, def.name, "plan-search") or
+            std.mem.eql(u8, def.name, "reply-latency") or
             std.mem.eql(u8, def.name, "session-prompts") or
             std.mem.eql(u8, def.name, "query-diagnose") or
             std.mem.eql(u8, def.name, "skills-rank") or
+            std.mem.eql(u8, def.name, "skill-success-rank") or
             std.mem.eql(u8, def.name, "skill-trend") or
             std.mem.eql(u8, def.name, "skill-report") or
+            std.mem.eql(u8, def.name, "skill-audit") or
+            std.mem.eql(u8, def.name, "skill-blocks") or
             std.mem.eql(u8, def.name, "role-breakdown") or
             std.mem.eql(u8, def.name, "occurrence-export") or
             std.mem.eql(u8, def.name, "report-bundle") or
             std.mem.eql(u8, def.name, "section-audit") or
             std.mem.eql(u8, def.name, "token-usage") or
+            std.mem.eql(u8, def.name, "token-cost") or
+            std.mem.eql(u8, def.name, "goal-audit") or
+            std.mem.eql(u8, def.name, "workflow-audit") or
+            std.mem.eql(u8, def.name, "session-graph") or
+            std.mem.eql(u8, def.name, "memory-map") or
+            std.mem.eql(u8, def.name, "memory-history") or
             std.mem.eql(u8, def.name, "routing-gap"))
             .{ perf_contract.CoverageKind.deep, "native deep case landed" }
+        else if (std.mem.eql(u8, def.name, "memory-provenance"))
+            .{ perf_contract.CoverageKind.excluded, "state-db provenance fixture deferred" }
         else if (std.mem.eql(u8, def.name, "opencode-prompts") or std.mem.eql(u8, def.name, "opencode-events"))
             .{ perf_contract.CoverageKind.excluded, "opencode db/jsonl wave deferred" }
         else
@@ -801,6 +906,7 @@ const Sqlite = struct {
 
 fn matchesTarget(case_id: []const u8, binary: []const u8, target: ?[]const u8) bool {
     const needle = target orelse return true;
+    if (std.mem.eql(u8, needle, "cas")) return std.mem.startsWith(u8, case_id, "cas-");
     if (isKnownBinaryName(needle)) return std.mem.eql(u8, binary, needle);
     if (std.mem.eql(u8, binary, needle)) return true;
     return std.mem.indexOf(u8, case_id, needle) != null;
@@ -923,8 +1029,9 @@ fn runMeasuredCase(allocator: std.mem.Allocator, case_cfg: CompatCase) !Metrics 
 
     var warmup_idx: usize = 0;
     while (warmup_idx < case_cfg.warmups) : (warmup_idx += 1) {
-        const run = try renderCompatRun(allocator, case_cfg, temp_root);
-        defer allocator.free(run.cwd);
+        var run_arena = std.heap.ArenaAllocator.init(allocator);
+        defer run_arena.deinit();
+        const run = try renderCompatRun(run_arena.allocator(), case_cfg, temp_root);
         const result = try runChildCapture(allocator, run.cwd, run.argv);
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
@@ -941,8 +1048,9 @@ fn runMeasuredCase(allocator: std.mem.Allocator, case_cfg: CompatCase) !Metrics 
 
     var sample_idx: usize = 0;
     while (sample_idx < case_cfg.samples) : (sample_idx += 1) {
-        const run = try renderCompatRun(allocator, case_cfg, temp_root);
-        defer allocator.free(run.cwd);
+        var run_arena = std.heap.ArenaAllocator.init(allocator);
+        defer run_arena.deinit();
+        const run = try renderCompatRun(run_arena.allocator(), case_cfg, temp_root);
         const start_ns = std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds;
         const result = try runChildCapture(allocator, run.cwd, run.argv);
         const elapsed: u64 = @intCast(@max(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds - start_ns, 1));
@@ -1010,7 +1118,31 @@ fn runDeepMeasuredCase(allocator: std.mem.Allocator, case_cfg: DeepCase) !Metric
 fn executeDeepCase(allocator: std.mem.Allocator, setup: DeepSetup, temp_root: []const u8) !void {
     switch (setup) {
         .seq_query_tool_calls => try seq_cli.runPerfCase(allocator, .query_tool_calls, temp_root),
+        .seq_skill_success_rank => try seq_cli.runPerfCase(allocator, .skill_success_rank, temp_root),
+        .seq_skill_audit => try seq_cli.runPerfCase(allocator, .skill_audit, temp_root),
+        .seq_skill_blocks => try seq_cli.runPerfCase(allocator, .skill_blocks, temp_root),
+        .seq_tool_audit => try seq_cli.runPerfCase(allocator, .tool_audit, temp_root),
+        .seq_memory_inventory => try seq_cli.runPerfCase(allocator, .memory_inventory, temp_root),
+        .seq_message_search => try seq_cli.runPerfCase(allocator, .message_search, temp_root),
+        .seq_message_audit => try seq_cli.runPerfCase(allocator, .message_audit, temp_root),
+        .seq_skill_cohort => try seq_cli.runPerfCase(allocator, .skill_cohort, temp_root),
+        .seq_tool_search => try seq_cli.runPerfCase(allocator, .tool_search, temp_root),
+        .seq_memory_extension_audit => try seq_cli.runPerfCase(allocator, .memory_extension_audit, temp_root),
+        .seq_token_window => try seq_cli.runPerfCase(allocator, .token_window, temp_root),
+        .seq_workdir_report => try seq_cli.runPerfCase(allocator, .workdir_report, temp_root),
+        .seq_plan_search => try seq_cli.runPerfCase(allocator, .plan_search, temp_root),
+        .seq_reply_latency => try seq_cli.runPerfCase(allocator, .reply_latency, temp_root),
         .seq_sessions_limit => try seq_cli.runPerfCase(allocator, .sessions_limit, temp_root),
+        .seq_turns => try seq_cli.runPerfCase(allocator, .turns, temp_root),
+        .seq_session_detail => try seq_cli.runPerfCase(allocator, .session_detail, temp_root),
+        .seq_tool_lifecycle => try seq_cli.runPerfCase(allocator, .tool_lifecycle, temp_root),
+        .seq_session_graph => try seq_cli.runPerfCase(allocator, .session_graph, temp_root),
+        .seq_tail_once => try seq_cli.runPerfCase(allocator, .tail_once, temp_root),
+        .seq_token_cost => try seq_cli.runPerfCase(allocator, .token_cost, temp_root),
+        .seq_goal_audit => try seq_cli.runPerfCase(allocator, .goal_audit, temp_root),
+        .seq_workflow_audit => try seq_cli.runPerfCase(allocator, .workflow_audit, temp_root),
+        .seq_memory_map => try seq_cli.runPerfCase(allocator, .memory_map, temp_root),
+        .seq_memory_history => try seq_cli.runPerfCase(allocator, .memory_history, temp_root),
         .seq_session_tooling => try seq_cli.runPerfCase(allocator, .session_tooling, temp_root),
         .seq_orchestration_concurrency => try seq_cli.runPerfCase(allocator, .orchestration_concurrency, temp_root),
         .seq_datasets => try seq_cli.runPerfCase(allocator, .datasets, temp_root),
@@ -1186,7 +1318,8 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
 
     switch (case_cfg.setup) {
         .seq_help => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
-        .bench_stats_help, .perf_report_help, .cas_smoke_check_help, .cas_instance_runner_help, .cron_help, .puff_help, .learnings_help, .mesh_help, .st_help, .parse_arch_help => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
+        .bench_stats_help, .perf_report_help, .cas_smoke_check_help, .cas_instance_runner_help, .cas_review_session_help, .cron_help, .puff_help, .learnings_help, .mesh_help, .st_help, .parse_arch_help => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
+        .cas_review_session_version => try args.appendSlice(allocator, &.{ binary_path, "--version" }),
         .bench_stats_parse => {
             const input_path = try std.fs.path.join(allocator, &.{ ".", "apps/lift/perf/fixtures/bench_stats_input.txt" });
             try args.appendSlice(allocator, &.{ binary_path, "--input", input_path, "--json" });
@@ -1199,7 +1332,9 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
             const wrapper_dir = try std.fs.path.join(allocator, &.{ temp_root, "cas-wrapper" });
             try makeRepoAwarePath(allocator, wrapper_dir);
             const wrapper_binary = try std.fs.path.join(allocator, &.{ wrapper_dir, "cas" });
-            try std.Io.Dir.copyFileAbsolute(binary_path, wrapper_binary, std.Io.Threaded.global_single_threaded.io(), .{});
+            const source_binary = try absolutePathForCwdRelative(allocator, binary_path);
+            defer allocator.free(source_binary);
+            try std.Io.Dir.copyFileAbsolute(source_binary, wrapper_binary, std.Io.Threaded.global_single_threaded.io(), .{});
             try makeExecutable(wrapper_binary);
             const stub_path = try std.fs.path.join(allocator, &.{ wrapper_dir, "cas_smoke_check" });
             try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = stub_path, .data = "#!/usr/bin/env bash\nexit 0\n" });
@@ -1294,6 +1429,8 @@ const ChildResult = struct {
 };
 
 fn runChildCapture(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) !ChildResult {
+    if (builtin.os.tag == .macos) return runChildCapturePosixSpawn(allocator, cwd, argv);
+
     const result = try std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
         .argv = argv,
         .cwd = .{ .path = cwd },
@@ -1308,6 +1445,84 @@ fn runChildCapture(allocator: std.mem.Allocator, cwd: []const u8, argv: []const 
         .stdout = result.stdout,
         .stderr = result.stderr,
     };
+}
+
+fn runChildCapturePosixSpawn(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) !ChildResult {
+    if (argv.len == 0) return error.FileNotFound;
+
+    var argv_buf = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
+    defer allocator.free(argv_buf);
+
+    var arg_storage = try allocator.alloc([:0]u8, argv.len);
+    var arg_count: usize = 0;
+    defer {
+        for (arg_storage[0..arg_count]) |arg| allocator.free(arg);
+        allocator.free(arg_storage);
+    }
+    for (argv, 0..) |arg, idx| {
+        arg_storage[idx] = try allocator.dupeZ(u8, arg);
+        arg_count += 1;
+        argv_buf[idx] = arg_storage[idx].ptr;
+    }
+
+    const cwd_z = try allocator.dupeZ(u8, cwd);
+    defer allocator.free(cwd_z);
+
+    var actions: std.c.posix_spawn_file_actions_t = undefined;
+    const init_rc = std.c.posix_spawn_file_actions_init(&actions);
+    if (init_rc != 0) return posixSpawnError(init_rc);
+    defer _ = std.c.posix_spawn_file_actions_destroy(&actions);
+
+    const dev_null = "/dev/null";
+    const dev_null_flags: c_int = @intCast(@as(u32, @bitCast(std.c.O{ .ACCMODE = .WRONLY })));
+    for ([_]std.c.fd_t{ 1, 2 }) |fd| {
+        const open_rc = std.c.posix_spawn_file_actions_addopen(&actions, fd, dev_null, dev_null_flags, 0);
+        if (open_rc != 0) return posixSpawnError(open_rc);
+    }
+    const chdir_rc = std.c.posix_spawn_file_actions_addchdir_np(&actions, cwd_z);
+    if (chdir_rc != 0) return posixSpawnError(chdir_rc);
+
+    var pid: std.c.pid_t = undefined;
+    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+    const spawn_rc = std.c.posix_spawnp(&pid, argv_buf[0].?, &actions, null, argv_buf.ptr, envp);
+    if (spawn_rc != 0) return posixSpawnError(spawn_rc);
+
+    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    while (true) switch (std.posix.errno(std.posix.system.waitpid(pid, &status, 0))) {
+        .SUCCESS => return .{
+            .exit_code = statusToExitCode(@bitCast(status)),
+            .stdout = try allocator.dupe(u8, ""),
+            .stderr = try allocator.dupe(u8, ""),
+        },
+        .INTR => continue,
+        .CHILD => return error.NoChildProcess,
+        else => return error.WaitFailed,
+    };
+}
+
+fn posixSpawnError(rc: c_int) anyerror {
+    const err: std.c.E = @enumFromInt(@as(u16, @intCast(rc)));
+    return switch (err) {
+        .NOMEM, .@"2BIG" => error.SystemResources,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .ACCES => error.AccessDenied,
+        .PERM => error.PermissionDenied,
+        .NOEXEC => error.InvalidExe,
+        .NOENT => error.FileNotFound,
+        .NOTDIR => error.NotDir,
+        .NAMETOOLONG => error.NameTooLong,
+        else => error.SpawnFailed,
+    };
+}
+
+fn statusToExitCode(status: u32) u8 {
+    if (std.posix.W.IFEXITED(status)) return std.posix.W.EXITSTATUS(status);
+    if (std.posix.W.IFSIGNALED(status)) {
+        const signal: u32 = @intFromEnum(std.posix.W.TERMSIG(status));
+        return @intCast(@min(@as(u32, 128) + signal, @as(u32, 255)));
+    }
+    return 1;
 }
 
 fn makeTempRoot(allocator: std.mem.Allocator, label: []const u8) ![]u8 {
@@ -1327,6 +1542,13 @@ fn makeExecutable(path: []const u8) !void {
     var file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{ .mode = .read_write });
     defer file.close(std.Io.Threaded.global_single_threaded.io());
     try file.setPermissions(std.Io.Threaded.global_single_threaded.io(), @enumFromInt(0o755));
+}
+
+fn absolutePathForCwdRelative(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
+    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
+    defer allocator.free(cwd);
+    return std.fs.path.join(allocator, &.{ cwd, path });
 }
 
 fn seedCronDb(allocator: std.mem.Allocator, db_path: []const u8) !void {

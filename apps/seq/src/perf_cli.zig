@@ -10,7 +10,31 @@ pub fn commandNames() []const CommandDef {
 
 pub const PerfCase = enum {
     query_tool_calls,
+    skill_success_rank,
+    skill_audit,
+    skill_blocks,
+    tool_audit,
+    memory_inventory,
+    message_search,
+    message_audit,
+    skill_cohort,
+    tool_search,
+    memory_extension_audit,
+    token_window,
+    workdir_report,
+    plan_search,
+    reply_latency,
     sessions_limit,
+    turns,
+    session_detail,
+    tool_lifecycle,
+    session_graph,
+    tail_once,
+    token_cost,
+    goal_audit,
+    workflow_audit,
+    memory_map,
+    memory_history,
     session_tooling,
     orchestration_concurrency,
     datasets,
@@ -53,11 +77,144 @@ pub fn runPerfCase(allocator: std.mem.Allocator, perf_case: PerfCase, temp_root:
             "--root", sessions_root,
             "--spec", query_spec_arg,
         }, output_path),
+        .skill_success_rank => try runCommandWithOutput(allocator, .skill_success_rank, &.{
+            "--root",   sessions_root,
+            "--skill",  "seq",
+            "--format", "json",
+        }, output_path),
+        .skill_audit => try runCommandWithOutput(allocator, .skill_audit, &.{
+            "--root",   sessions_root,
+            "--skill",  "seq",
+            "--format", "json",
+        }, output_path),
+        .skill_blocks => try runCommandWithOutput(allocator, .skill_blocks, &.{
+            "--path",    sample_path,
+            "--skill",   "seq",
+            "--history", "distinct",
+            "--format",  "json",
+        }, output_path),
+        .tool_audit => try runCommandWithOutput(allocator, .tool_audit, &.{
+            "--root",     sessions_root,
+            "--group-by", "executable",
+            "--format",   "json",
+        }, output_path),
+        .memory_inventory => {
+            const memory_root = try seedMemoryPerfFixture(allocator, temp_root);
+            defer allocator.free(memory_root);
+            try runCommandWithOutput(allocator, .memory_inventory, &.{
+                "--memory-root", memory_root,
+                "--format",      "json",
+            }, output_path);
+        },
+        .message_search => try runCommandWithOutput(allocator, .message_search, &.{
+            "--root",     sessions_root,
+            "--contains", "seq",
+            "--format",   "json",
+        }, output_path),
+        .message_audit => try runCommandWithOutput(allocator, .message_audit, &.{
+            "--root",     sessions_root,
+            "--contains", "seq",
+            "--format",   "json",
+        }, output_path),
+        .skill_cohort => try runCommandWithOutput(allocator, .skill_cohort, &.{
+            "--root",   sessions_root,
+            "--skill",  "seq",
+            "--format", "json",
+        }, output_path),
+        .tool_search => try runCommandWithOutput(allocator, .tool_search, &.{
+            "--root",     sessions_root,
+            "--contains", "seq",
+            "--mode",     "summary",
+            "--format",   "json",
+        }, output_path),
+        .memory_extension_audit => {
+            const memory_root = try seedMemoryPerfFixture(allocator, temp_root);
+            defer allocator.free(memory_root);
+            const extensions_root = try std.fs.path.join(allocator, &.{ memory_root, "extensions" });
+            defer allocator.free(extensions_root);
+            try runCommandWithOutput(allocator, .memory_extension_audit, &.{
+                "--extensions-root", extensions_root,
+                "--mode",            "rows",
+                "--format",          "json",
+            }, output_path);
+        },
+        .token_window => try runCommandWithOutput(allocator, .token_window, &.{
+            "--root",         sessions_root,
+            "--window-hours", "24",
+            "--format",       "json",
+        }, output_path),
+        .workdir_report => try runCommandWithOutput(allocator, .workdir_report, &.{
+            "--root",   sessions_root,
+            "--format", "json",
+        }, output_path),
+        .plan_search => try runCommandWithOutput(allocator, .plan_search, &.{
+            "--path",   sample_path,
+            "--format", "json",
+        }, output_path),
+        .reply_latency => try runCommandWithOutput(allocator, .reply_latency, &.{
+            "--path",   sample_path,
+            "--format", "json",
+        }, output_path),
         .sessions_limit => try runCommandWithOutput(allocator, .sessions, &.{
             "--root",   sessions_root,
             "--limit",  "5",
             "--format", "json",
         }, output_path),
+        .turns => try runCommandWithOutput(allocator, .turns, &.{
+            "--path",   sample_path,
+            "--format", "json",
+        }, output_path),
+        .session_detail => try runCommandWithOutput(allocator, .session_detail, &.{
+            "--path",          sample_path,
+            "--include-tools", "--format",
+            "json",
+        }, output_path),
+        .tool_lifecycle => try runCommandWithOutput(allocator, .tool_lifecycle, &.{
+            "--path",   sample_path,
+            "--format", "json",
+        }, output_path),
+        .session_graph => try runCommandWithOutput(allocator, .session_graph, &.{
+            "--session-id", "019c0000-0000-7000-8000-000000000001",
+            "--root",       sessions_root,
+            "--format",     "json",
+        }, output_path),
+        .tail_once => try runCommandWithOutput(allocator, .tail, &.{
+            "--path", sample_path,
+            "--once", "--format",
+            "jsonl",
+        }, output_path),
+        .token_cost => try runCommandWithOutput(allocator, .token_cost, &.{
+            "--root",    sessions_root,
+            "--pricing", "codex",
+            "--format",  "json",
+        }, output_path),
+        .goal_audit => try runCommandWithOutput(allocator, .goal_audit, &.{
+            "--root",   sessions_root,
+            "--format", "json",
+        }, output_path),
+        .workflow_audit => try runCommandWithOutput(allocator, .workflow_audit, &.{
+            "--root",     sessions_root,
+            "--workflow", "seq",
+            "--format",   "json",
+        }, output_path),
+        .memory_map => {
+            const memory_root = try seedMemoryPerfFixture(allocator, temp_root);
+            defer allocator.free(memory_root);
+            try runCommandWithOutput(allocator, .memory_map, &.{
+                "--memory-root", memory_root,
+                "--contains",    "Perf",
+                "--format",      "json",
+            }, output_path);
+        },
+        .memory_history => {
+            const memory_root = try seedMemoryPerfFixture(allocator, temp_root);
+            defer allocator.free(memory_root);
+            try runCommandWithOutput(allocator, .memory_history, &.{
+                "--memory-root", memory_root,
+                "--contains",    "Perf",
+                "--format",      "json",
+            }, output_path);
+        },
         .session_tooling => try runCommandWithOutput(allocator, .session_tooling, &.{
             "--root",     sessions_root,
             "--summary",  "--group-by",
@@ -164,6 +321,40 @@ fn runCommandWithOutput(
     try commands.run(allocator, cmd, all_args.items);
 }
 
+fn seedMemoryPerfFixture(allocator: std.mem.Allocator, temp_root: []const u8) ![]u8 {
+    const memory_root = try std.fs.path.join(allocator, &.{ temp_root, "memories" });
+    errdefer allocator.free(memory_root);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), memory_root);
+
+    const rollout_dir = try std.fs.path.join(allocator, &.{ memory_root, "rollout_summaries" });
+    defer allocator.free(rollout_dir);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), rollout_dir);
+    const extensions_dir = try std.fs.path.join(allocator, &.{ memory_root, "extensions", "perf" });
+    defer allocator.free(extensions_dir);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), extensions_dir);
+
+    const memory_file = try std.fs.path.join(allocator, &.{ memory_root, "MEMORY.md" });
+    defer allocator.free(memory_file);
+    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = memory_file,
+        .data = "# Perf Memory\n\nPerf fixture body for seq memory-map and memory-history.\n",
+    });
+    const rollout_file = try std.fs.path.join(allocator, &.{ rollout_dir, "perf.md" });
+    defer allocator.free(rollout_file);
+    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = rollout_file,
+        .data = "# Perf Rollout\n\nthread_id=perf-thread\nrollout_path=/tmp/perf-rollout.jsonl\n",
+    });
+    const extension_file = try std.fs.path.join(allocator, &.{ extensions_dir, "instructions.md" });
+    defer allocator.free(extension_file);
+    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = extension_file,
+        .data = "# Perf Extension\n",
+    });
+
+    return memory_root;
+}
+
 test "runPerfCase covers promoted native seq families" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -173,7 +364,31 @@ test "runPerfCase covers promoted native seq families" {
 
     const cases = [_]PerfCase{
         .query_tool_calls,
+        .skill_success_rank,
+        .skill_audit,
+        .skill_blocks,
+        .tool_audit,
+        .memory_inventory,
+        .message_search,
+        .message_audit,
+        .skill_cohort,
+        .tool_search,
+        .memory_extension_audit,
+        .token_window,
+        .workdir_report,
+        .plan_search,
+        .reply_latency,
         .sessions_limit,
+        .turns,
+        .session_detail,
+        .tool_lifecycle,
+        .session_graph,
+        .tail_once,
+        .token_cost,
+        .goal_audit,
+        .workflow_audit,
+        .memory_map,
+        .memory_history,
         .session_tooling,
         .orchestration_concurrency,
         .datasets,
