@@ -5433,8 +5433,10 @@ fn cmdSkillSuccessRank(allocator: std.mem.Allocator, sessions_root: []const u8, 
         if (content == null) continue;
         defer allocator.free(content.?);
 
-        try collectSkillSuccessOutcomesForPath(allocator, &outcomes, path, content.?, window);
-        try collectSkillSuccessMentionsForPath(allocator, &aggregates, path, content.?, window, opts.skill);
+        const needs_outcome = try collectSkillSuccessMentionsForPath(allocator, &aggregates, path, content.?, window, opts.skill);
+        if (needs_outcome) {
+            try collectSkillSuccessOutcomesForPath(allocator, &outcomes, path, content.?, window);
+        }
     }
 
     try computeSkillSuccessCounts(&aggregates, &outcomes);
@@ -5543,10 +5545,11 @@ fn collectSkillSuccessMentionsForPath(
     content: []const u8,
     window: SkillSuccessWindow,
     skill_filter: ?[]const u8,
-) !void {
+) !bool {
     const mentions = try datasets.skill_mentions.parseJsonl(allocator, path, content, .{});
     defer datasets.skill_mentions.freeRows(allocator, mentions);
 
+    var needs_outcome = false;
     for (mentions) |mention| {
         if (!skillSuccessTimestampInWindow(mention.timestamp, window)) continue;
         if (skill_filter) |filter| {
@@ -5558,11 +5561,13 @@ fn collectSkillSuccessMentionsForPath(
         try aggregate.raw_sessions.put(mention.path);
         if (std.mem.eql(u8, mention.role, "user")) {
             try aggregate.called_sessions.put(mention.path);
+            needs_outcome = true;
         } else if (std.mem.eql(u8, mention.role, "assistant")) {
             try aggregate.assistant_sessions.put(mention.path);
         }
         try observeSkillSuccessTimestamp(allocator, aggregate, mention.timestamp);
     }
+    return needs_outcome;
 }
 
 fn getOrPutSkillSuccessAggregate(
