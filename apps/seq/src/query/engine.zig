@@ -283,14 +283,14 @@ const SingleFieldGroupIndex = struct {
     }
 };
 
-const RegexAtomMode = enum {
+pub const RegexAtomMode = enum {
     exact,
     prefix,
     suffix,
     contains,
 };
 
-const RegexAtom = struct {
+pub const RegexAtom = struct {
     mode: RegexAtomMode,
     text: []const u8,
 };
@@ -727,6 +727,17 @@ fn compileRegexAtoms(
 
     if (atoms.items.len == 0) return error.InvalidRegexValue;
     return atoms.toOwnedSlice(allocator);
+}
+
+pub fn compileTextPatternAtoms(
+    allocator: std.mem.Allocator,
+    pattern: []const u8,
+) ![]const RegexAtom {
+    return compileRegexAtoms(allocator, pattern);
+}
+
+pub fn textMatchesPatternAtoms(haystack: []const u8, atoms: []const RegexAtom, case_insensitive: bool) bool {
+    return regexMatchAny(haystack, atoms, case_insensitive);
 }
 
 fn compileRegexAnyAtoms(

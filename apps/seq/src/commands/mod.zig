@@ -2422,12 +2422,6 @@ fn collectWorkflowAuditRows(
         .where = where.items,
         .select = workflow_audit_signal_columns[0..],
     };
-    var collected = try collectDatasetRowsForSpec(allocator, "workflow_signals", sessions_root, signal_query);
-    defer deinitQueryRows(allocator, &collected);
-
-    var filtered = try query.execute(allocator, collected.items, signal_query);
-    defer filtered.deinit(allocator);
-
     var workdir_paths = StringSet.init(allocator);
     var has_workdir_filter = false;
     defer if (has_workdir_filter) workdir_paths.deinit();
@@ -2436,27 +2430,141 @@ fn collectWorkflowAuditRows(
         try collectWorkdirSessionPaths(allocator, sessions_root, opts, &workdir_paths);
     }
 
-    var cohort_paths = StringSet.init(allocator);
-    defer cohort_paths.deinit();
-    for (filtered.rows.items) |row| {
-        const path = scalarString(row.valueOrNull("path")) orelse continue;
-        if (has_workdir_filter and !workdir_paths.contains(path)) continue;
-        if (!isWorkflowCohortSignal(row, workflow)) continue;
-        try cohort_paths.put(path);
-    }
+    const day_filter = deriveSessionDayPathFilter("workflow_signals", where.items);
+    var paths = try collectJsonlPaths(allocator, sessions_root, day_filter);
+    defer freePathList(allocator, &paths);
 
     var out: std.ArrayList(query.Row) = .empty;
     errdefer deinitQueryRows(allocator, &out);
-    for (filtered.rows.items) |*row| {
-        const path = scalarString(row.valueOrNull("path")) orelse continue;
-        if (!cohort_paths.contains(path)) continue;
+    for (paths.items) |path| {
         if (has_workdir_filter and !workdir_paths.contains(path)) continue;
-        const moved = row.*;
-        try out.append(allocator, moved);
-        row.* = query.Row.init(allocator);
+        try appendWorkflowAuditRowsForPath(allocator, sessions_root, path, signal_query, workflow, &out);
     }
 
     return out;
+}
+
+fn appendWorkflowAuditRowsForPath(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    path: []const u8,
+    signal_query: spec.QuerySpec,
+    workflow: []const u8,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    var text_rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &text_rows);
+    try appendTextWorkflowSignalRowsForPath(allocator, path, &text_rows);
+
+    var filtered_text = try query.execute(allocator, text_rows.items, signal_query);
+    defer filtered_text.deinit(allocator);
+    if (!hasWorkflowCohortSignal(filtered_text.rows.items, workflow)) return;
+
+    try appendMovedRows(allocator, out_rows, &filtered_text.rows);
+
+    var derived_rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &derived_rows);
+    try appendToolWorkflowSignalRowsForPath(allocator, sessions_root, path, &derived_rows);
+    try appendWorkflowGraphSignalsForPath(allocator, sessions_root, path, &derived_rows);
+
+    var filtered_derived = try query.execute(allocator, derived_rows.items, signal_query);
+    defer filtered_derived.deinit(allocator);
+    try appendMovedRows(allocator, out_rows, &filtered_derived.rows);
+}
+
+fn appendTextWorkflowSignalRowsForPath(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    const content = try readFileAllocOrSkip(allocator, path);
+    if (content == null) return;
+    defer allocator.free(content.?);
+
+    const messages = try datasets.messages.parseJsonl(allocator, path, content.?, .{
+        .strip_skill_blocks = true,
+        .dedupe_by_role_and_text = true,
+    });
+    defer datasets.messages.freeRows(allocator, messages);
+
+    for (messages) |row| {
+        try appendDollarWorkflowSignals(allocator, out_rows, row);
+        try appendOutcomeSignals(allocator, out_rows, row);
+    }
+
+    const mentions = try datasets.skill_mentions.parseJsonl(allocator, path, content.?, .{
+        .include_blocks = false,
+        .include_dollars = true,
+        .skip_dollar_in_skill_block = true,
+        .dedupe_adjacent = true,
+    });
+    defer datasets.skill_mentions.freeRows(allocator, mentions);
+
+    for (mentions) |row| {
+        try appendWorkflowSignalRow(
+            allocator,
+            out_rows,
+            row.path,
+            null,
+            row.timestamp,
+            row.role,
+            sourceKindForRole(row.role),
+            "skill_mention",
+            row.skill,
+            null,
+            row.snippet,
+            "cleaned",
+        );
+    }
+}
+
+fn appendToolWorkflowSignalRowsForPath(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    path: []const u8,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    const params = [_]spec.ParamSpec{.{ .key = "path", .value = .{ .string = path } }};
+    var tool_rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &tool_rows);
+    try collectToolInvocationRows(allocator, sessions_root, null, params[0..], &tool_rows);
+
+    for (tool_rows.items) |row| {
+        const tool_name = scalarString(row.valueOrNull("tool_name")) orelse continue;
+        try appendWorkflowSignalRow(
+            allocator,
+            out_rows,
+            scalarString(row.valueOrNull("path")) orelse "",
+            scalarString(row.valueOrNull("session_id")),
+            scalarString(row.valueOrNull("timestamp")),
+            null,
+            "tool_trace",
+            "tool_call",
+            tool_name,
+            null,
+            scalarString(row.valueOrNull("command_text")) orelse tool_name,
+            "none",
+        );
+    }
+}
+
+fn appendMovedRows(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    rows: *std.ArrayList(query.Row),
+) !void {
+    for (rows.items) |*row| {
+        const moved = row.*;
+        try out_rows.append(allocator, moved);
+        row.* = query.Row.init(allocator);
+    }
+}
+
+fn hasWorkflowCohortSignal(rows: []const query.Row, workflow: []const u8) bool {
+    for (rows) |row| {
+        if (isWorkflowCohortSignal(row, workflow)) return true;
+    }
+    return false;
 }
 
 fn collectWorkdirSessionPaths(
@@ -9601,6 +9709,18 @@ const CueSpec = struct {
     case_insensitive: bool,
 };
 
+const RoutingGapCueState = struct {
+    spec: CueSpec,
+    atoms: []const query.RegexAtom,
+    sessions: std.StringHashMap(void),
+    message_count: i64 = 0,
+
+    fn deinit(self: *RoutingGapCueState, allocator: std.mem.Allocator) void {
+        allocator.free(self.atoms);
+        deinitStringSet(allocator, &self.sessions);
+    }
+};
+
 fn cmdRoutingGap(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
     const cue_spec_text = opts.cue_spec_text orelse return error.MissingCueSpecArg;
     const cue_specs = try parseCueSpecJson(allocator, cue_spec_text);
@@ -9613,22 +9733,12 @@ fn cmdRoutingGap(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
     defer where.deinit(allocator);
     try appendSessionTimeBounds(allocator, &where, opts);
 
-    var skill_rows = try collectDatasetRows(allocator, "skill_mentions", sessions_root, &.{}, where.items);
-    defer deinitQueryRows(allocator, &skill_rows);
-
     var invoked_sessions: std.StringHashMap(void) = .init(allocator);
     defer deinitStringSet(allocator, &invoked_sessions);
+    try collectDiscoverySkillSessionPaths(allocator, sessions_root, where.items, &discovery_skills, &invoked_sessions);
 
-    for (skill_rows.items) |row| {
-        const skill = row.valueOrNull("skill");
-        const path = row.valueOrNull("path");
-        if (skill != .string or path != .string) continue;
-        if (!discovery_skills.contains(skill.string)) continue;
-        try addToStringSet(allocator, &invoked_sessions, path.string);
-    }
-
-    var message_rows = try collectDatasetRows(allocator, "messages", sessions_root, &.{}, where.items);
-    defer deinitQueryRows(allocator, &message_rows);
+    const cue_states = try compileRoutingGapCueStates(allocator, cue_specs);
+    defer deinitRoutingGapCueStates(allocator, cue_states);
 
     var out_rows: std.ArrayList(query.Row) = .empty;
     defer deinitQueryRows(allocator, &out_rows);
@@ -9639,48 +9749,17 @@ fn cmdRoutingGap(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
     defer deinitStringSet(allocator, &total_invoked_sessions);
     var total_cue_messages: i64 = 0;
 
-    for (cue_specs) |cue| {
-        const cue_where = [_]spec.WhereClause{
-            .{
-                .field = "role",
-                .op = .eq,
-                .value = .{ .scalar = .{ .string = "user" } },
-            },
-            .{
-                .field = "text",
-                .op = .regex,
-                .value = .{ .scalar = .{ .string = cue.pattern } },
-                .case_insensitive = cue.case_insensitive,
-            },
-        };
+    try collectRoutingGapCueMatches(allocator, sessions_root, where.items, cue_states, &total_cue_sessions);
 
-        const query_spec = spec.QuerySpec{
-            .where = cue_where[0..],
-            .select = &.{"path"},
-        };
-        var matched = try query.execute(allocator, message_rows.items, query_spec);
-        defer matched.deinit(allocator);
-
-        const cue_message_count: i64 = @intCast(matched.rows.items.len);
-        total_cue_messages += cue_message_count;
-
-        var cue_sessions: std.StringHashMap(void) = .init(allocator);
-        defer deinitStringSet(allocator, &cue_sessions);
-
-        for (matched.rows.items) |matched_row| {
-            const path = matched_row.valueOrNull("path");
-            if (path != .string) continue;
-            try addToStringSet(allocator, &cue_sessions, path.string);
-            try addToStringSet(allocator, &total_cue_sessions, path.string);
-        }
-
+    for (cue_states) |*cue_state| {
+        total_cue_messages += cue_state.message_count;
         const invoked_count = try countIntersectionAndFill(
             allocator,
-            &cue_sessions,
+            &cue_state.sessions,
             &invoked_sessions,
             &total_invoked_sessions,
         );
-        const cue_session_count = cue_sessions.count();
+        const cue_session_count = cue_state.sessions.count();
         const gap_count = cue_session_count - invoked_count;
         const rate_pct: spec.Scalar = if (cue_session_count == 0)
             .null
@@ -9688,9 +9767,9 @@ fn cmdRoutingGap(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
             .{ .float = (@as(f64, @floatFromInt(invoked_count)) * 100.0) / @as(f64, @floatFromInt(cue_session_count)) };
 
         var out = query.Row.init(allocator);
-        try out.putOwnedKey("cue", .{ .string = cue.name });
-        try out.putOwnedKey("pattern", .{ .string = cue.pattern });
-        try out.putOwnedKey("cue_messages", .{ .int = cue_message_count });
+        try out.putOwnedKey("cue", .{ .string = cue_state.spec.name });
+        try out.putOwnedKey("pattern", .{ .string = cue_state.spec.pattern });
+        try out.putOwnedKey("cue_messages", .{ .int = cue_state.message_count });
         try out.putOwnedKey("cue_sessions", .{ .int = @intCast(cue_session_count) });
         try out.putOwnedKey("invoked_sessions", .{ .int = @intCast(invoked_count) });
         try out.putOwnedKey("gap_sessions", .{ .int = @intCast(gap_count) });
@@ -9725,6 +9804,90 @@ fn cmdRoutingGap(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
         "invoked_rate_pct",
     };
     try output.writeOutput(allocator, opts.format, out_rows.items, cols[0..], opts.out_path);
+}
+
+fn compileRoutingGapCueStates(allocator: std.mem.Allocator, cue_specs: []const CueSpec) ![]RoutingGapCueState {
+    const states = try allocator.alloc(RoutingGapCueState, cue_specs.len);
+    errdefer allocator.free(states);
+
+    var initialized: usize = 0;
+    errdefer {
+        for (states[0..initialized]) |*state| state.deinit(allocator);
+    }
+
+    for (cue_specs, 0..) |cue, idx| {
+        states[idx] = .{
+            .spec = cue,
+            .atoms = try query.compileTextPatternAtoms(allocator, cue.pattern),
+            .sessions = std.StringHashMap(void).init(allocator),
+        };
+        initialized += 1;
+    }
+
+    return states;
+}
+
+fn deinitRoutingGapCueStates(allocator: std.mem.Allocator, states: []RoutingGapCueState) void {
+    for (states) |*state| state.deinit(allocator);
+    allocator.free(states);
+}
+
+fn collectRoutingGapCueMatches(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    query_where: []const spec.WhereClause,
+    cue_states: []RoutingGapCueState,
+    total_cue_sessions: *std.StringHashMap(void),
+) !void {
+    const day_filter = deriveSessionDayPathFilter("messages", query_where);
+    var paths = try collectJsonlPaths(allocator, sessions_root, day_filter);
+    defer freePathList(allocator, &paths);
+
+    for (paths.items) |path| {
+        const content = try readFileAllocOrSkip(allocator, path);
+        if (content == null) continue;
+        defer allocator.free(content.?);
+
+        const messages = try datasets.messages.parseJsonl(allocator, path, content.?, .{});
+        defer datasets.messages.freeRows(allocator, messages);
+
+        for (messages) |row| {
+            if (!std.mem.eql(u8, row.role, "user")) continue;
+            for (cue_states) |*cue_state| {
+                if (!query.textMatchesPatternAtoms(row.text, cue_state.atoms, cue_state.spec.case_insensitive)) continue;
+                cue_state.message_count += 1;
+                try addToStringSet(allocator, &cue_state.sessions, row.path);
+                try addToStringSet(allocator, total_cue_sessions, row.path);
+            }
+        }
+    }
+}
+
+fn collectDiscoverySkillSessionPaths(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    query_where: []const spec.WhereClause,
+    discovery_skills: *const std.StringHashMap(void),
+    out: *std.StringHashMap(void),
+) !void {
+    const day_filter = deriveSessionDayPathFilter("skill_mentions", query_where);
+    var paths = try collectJsonlPaths(allocator, sessions_root, day_filter);
+    defer freePathList(allocator, &paths);
+
+    for (paths.items) |path| {
+        const content = try readFileAllocOrSkip(allocator, path);
+        if (content == null) continue;
+        defer allocator.free(content.?);
+
+        const mentions = try datasets.skill_mentions.parseJsonl(allocator, path, content.?, .{});
+        defer datasets.skill_mentions.freeRows(allocator, mentions);
+
+        for (mentions) |row| {
+            if (!discovery_skills.contains(row.skill)) continue;
+            try addToStringSet(allocator, out, row.path);
+            break;
+        }
+    }
 }
 
 fn parseCueSpecJson(allocator: std.mem.Allocator, raw: []const u8) ![]CueSpec {
