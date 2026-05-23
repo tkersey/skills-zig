@@ -32,6 +32,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - `cas review_session start` supports `--parent-mode auto|fresh|reuse`. `reuse` rejects unsafe parent threads. On Codex `0.118.x`, `auto` pre-materializes a fresh parent thread before detached `review/start`; `fresh` still forces the literal fresh-parent attempt and only retries after bootstrap materialization if the runtime rejects it.
 - `cas review_session` now forwards the native approval/runtime overrides already supported by the CAS Zig client: `--exec-approval`, `--file-approval`, `--permissions-approval`, `--request-user-input-response-json`, `--elicitation-action`, `--elicitation-content-json`, `--dynamic-tool-response-json`, and `--read-only`.
 - JSON review-session output now includes `resolvedCodexPath`, `resolvedCodexVersion`, `compatibilityVerdict`, `selectedTransport`, `selectionReason`, `degradedFallback`, `managedServerPid`, `managedServerListenUrl`, `orphanTtlSeconds`, `failureCode`, `failureHint`, plus optional `fallback*` fields when `--fallback native-review` is used.
+- `cas review_session lane review` includes a compact `reviewVerdict` object for caller control flow. The full receipt remains the audit artifact. Pass `--verdict-only` to emit only `reviewVerdict` while preserving the same exit semantics.
 - Terminal review failures are now classified more precisely: `review_interrupted`, `approval_denied`, `review_failed`, `review_output_missing`, `parent_thread_not_materialized`, and `unsafe_parent_thread_state`.
 - If a websocket-backed detached review already exists and `wait` cannot reconnect to its managed transport, `--fallback native-review` now returns an explicit degraded native-review success and persists that terminal fallback in the review-session record. It is not detached-review proof.
 - Repo-owned first-party callers should keep native fallback caller-owned: treat `start -> wait` as one detached CAS attempt, and switch to native `codex review` outside CAS after inspecting the JSON verdict when the resolved runtime is incompatible.
@@ -73,6 +74,18 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
   --base main \
   --fallback native-review \
   --json
+
+# Reuse a persistent review lane and consume only the compact verdict.
+./zig-out/bin/cas review_session lane start \
+  --cwd /path/to/workspace \
+  --hooks off \
+  --json
+./zig-out/bin/cas review_session lane review \
+  --lane-id lane_123 \
+  --base main \
+  --timeout-ms 1800000 \
+  --fallback none \
+  --verdict-only
 
 # Run one conformance scenario with JSON output.
 ./zig-out/bin/cas conformance --cwd /path/to/workspace --scenario mesh_row_accountability --json

@@ -67,6 +67,7 @@ const UsageText =
     \\
     \\Common options:
     \\  --json                           Emit machine-readable JSON.
+    \\  --verdict-only                   Emit only the compact reviewVerdict JSON for lane review.
     \\  --timeout-ms N                   Wait timeout for `wait` (default: 300000).
     \\  --poll-interval-ms N             Poll interval for `wait` (default: 250).
     \\  --help                           Show help.
@@ -178,6 +179,7 @@ const ParsedArgs = struct {
     wait_after_start: bool = false,
     archive_lane_threads: bool = true,
     json: bool = false,
+    verdict_only: bool = false,
     timeout_ms: u32 = 300_000,
     poll_interval_ms: u32 = 250,
     exec_approval: ?[]const u8 = null,
@@ -461,6 +463,11 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             continue;
         }
         if (std.mem.eql(u8, arg, "--json")) {
+            out.json = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--verdict-only")) {
+            out.verdict_only = true;
             out.json = true;
             continue;
         }
@@ -1811,7 +1818,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
             try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, .{
                 .code = "lane_transport_lost",
                 .hint = "persistent CAS lane app-server is not alive; returned explicit native-review fallback",
-            });
+            }, parsed.verdict_only);
             std.process.exit(if (fallback.ok) 0 else 1);
         }
         try renderErrorAndExit(
@@ -1853,7 +1860,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
             try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, .{
                 .code = "lane_transport_lost",
                 .hint = "persistent CAS lane websocket could not be reconnected; returned explicit native-review fallback",
-            });
+            }, parsed.verdict_only);
             std.process.exit(if (fallback.ok) 0 else 1);
         }
         try renderErrorAndExit(
@@ -1891,7 +1898,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
             try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, .{
                 .code = "lane_transport_lost",
                 .hint = "persistent CAS lane websocket was lost while starting a fresh parent; returned explicit native-review fallback",
-            });
+            }, parsed.verdict_only);
             std.process.exit(if (fallback.ok) 0 else 1);
         }
         if (isTransportLossError(err)) {
@@ -1936,7 +1943,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
                 try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, .{
                     .code = "lane_transport_lost",
                     .hint = "persistent CAS lane websocket was lost while materializing a fresh parent; returned explicit native-review fallback",
-                });
+                }, parsed.verdict_only);
                 std.process.exit(if (fallback.ok) 0 else 1);
             }
             if (isTransportLossError(err)) {
@@ -1975,7 +1982,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
             try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, .{
                 .code = "review_failed",
                 .hint = "lane review startup failed; returned explicit native-review fallback",
-            });
+            }, parsed.verdict_only);
             std.process.exit(if (fallback.ok) 0 else 1);
         }
         return err;
@@ -2047,6 +2054,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
                 record_path,
                 event_log_path,
                 parsed.timeout_ms,
+                parsed.verdict_only,
             );
             std.process.exit(1);
         },
@@ -2057,7 +2065,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
                 try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, .{
                     .code = "lane_transport_lost",
                     .hint = "persistent CAS lane websocket was lost while waiting; returned explicit native-review fallback",
-                });
+                }, parsed.verdict_only);
                 std.process.exit(if (fallback.ok) 0 else 1);
             }
             if (isTransportLossError(err)) {
@@ -2137,7 +2145,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
         if (parsed.fallback_mode == .native_review) {
             var fallback = try runNativeReviewFallbackAlloc(allocator, lane.cwd, lane.resolved_codex_path, target_record);
             defer fallback.deinit(allocator);
-            try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, lane_failure.?);
+            try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, lane_failure.?, parsed.verdict_only);
             std.process.exit(if (fallback.ok) 0 else 1);
         }
     }
@@ -2159,6 +2167,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
         archive_status,
         clean,
         lane_failure,
+        parsed.verdict_only,
     );
     if (!clean) std.process.exit(1);
 }
@@ -4009,6 +4018,200 @@ fn archiveLaneThreadsBestEffort(
     return allocator.dupe(u8, "failed");
 }
 
+fn writeJsonString(writer: *std.Io.Writer, text: []const u8) !void {
+    try std.json.Stringify.value(text, .{}, writer);
+}
+
+fn writeNullableJsonString(writer: *std.Io.Writer, text: ?[]const u8) !void {
+    if (text) |value| try writeJsonString(writer, value) else try writer.writeAll("null");
+}
+
+fn writeNullableJsonBool(writer: *std.Io.Writer, value: ?bool) !void {
+    if (value) |flag| try writer.writeAll(if (flag) "true" else "false") else try writer.writeAll("null");
+}
+
+fn writeNullableJsonUsize(writer: *std.Io.Writer, value: ?usize) !void {
+    if (value) |number| try writer.print("{d}", .{number}) else try writer.writeAll("null");
+}
+
+fn jsonStringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn jsonI64Field(obj: std.json.ObjectMap, key: []const u8) ?i64 {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .integer => |number| number,
+        .float => |number| @intFromFloat(number),
+        else => null,
+    };
+}
+
+fn compactFindingsJsonAlloc(allocator: std.mem.Allocator, review_result_json: ?[]const u8) ![]u8 {
+    const raw = review_result_json orelse return allocator.dupe(u8, "[]");
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('[');
+    const root_obj = switch (parsed.value) {
+        .object => |obj| obj,
+        else => {
+            try writer.writeByte(']');
+            return out.toOwnedSlice();
+        },
+    };
+    const findings_val = root_obj.get("findings") orelse {
+        try writer.writeByte(']');
+        return out.toOwnedSlice();
+    };
+    const findings = switch (findings_val) {
+        .array => |arr| arr,
+        else => {
+            try writer.writeByte(']');
+            return out.toOwnedSlice();
+        },
+    };
+
+    var emitted: usize = 0;
+    for (findings.items) |finding_val| {
+        const finding = switch (finding_val) {
+            .object => |obj| obj,
+            else => continue,
+        };
+        if (emitted > 0) try writer.writeByte(',');
+        try writer.writeByte('{');
+        try writeJsonString(writer, "title");
+        try writer.writeByte(':');
+        try writeNullableJsonString(writer, jsonStringField(finding, "title"));
+        try writer.writeByte(',');
+        try writeJsonString(writer, "file");
+        try writer.writeByte(':');
+        var file_path: ?[]const u8 = null;
+        var start_line: ?i64 = null;
+        if (finding.get("codeLocation")) |location_val| switch (location_val) {
+            .object => |location| {
+                file_path = jsonStringField(location, "absoluteFilePath");
+                if (location.get("lineRange")) |range_val| switch (range_val) {
+                    .object => |range| start_line = jsonI64Field(range, "start"),
+                    else => {},
+                };
+            },
+            else => {},
+        };
+        try writeNullableJsonString(writer, file_path);
+        try writer.writeByte(',');
+        try writeJsonString(writer, "line");
+        try writer.writeByte(':');
+        if (start_line) |line| try writer.print("{d}", .{line}) else try writer.writeAll("null");
+        try writer.writeByte(',');
+        try writeJsonString(writer, "priority");
+        try writer.writeByte(':');
+        if (jsonI64Field(finding, "priority")) |priority| try writer.print("{d}", .{priority}) else try writer.writeAll("null");
+        try writer.writeByte('}');
+        emitted += 1;
+    }
+    try writer.writeByte(']');
+    return out.toOwnedSlice();
+}
+
+fn reviewVerdictStatus(clean: ?bool, finding_count: ?usize, failure: ?FailureInfo) []const u8 {
+    if (failure) |info| {
+        if (std.mem.eql(u8, info.code, "wait_timed_out")) return "timeout";
+        if (std.mem.eql(u8, info.code, "review_parse_mismatch")) return "parse_mismatch";
+        if (std.mem.indexOf(u8, info.code, "transport") != null) return "transport_failure";
+        return "incomplete";
+    }
+    if (clean orelse false) return "clean";
+    if ((finding_count orelse 0) > 0) return "findings";
+    return "incomplete";
+}
+
+fn buildReviewVerdictJsonAlloc(
+    allocator: std.mem.Allocator,
+    backend_class: []const u8,
+    clean: ?bool,
+    finding_count: ?usize,
+    failure: ?FailureInfo,
+    identity: TargetIdentity,
+    review_thread_id: ?[]const u8,
+    review_turn_id: ?[]const u8,
+    record_path: ?[]const u8,
+    event_log_path: ?[]const u8,
+    review_result_json: ?[]const u8,
+) ![]u8 {
+    const findings_json = compactFindingsJsonAlloc(allocator, review_result_json) catch try allocator.dupe(u8, "[]");
+    defer allocator.free(findings_json);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('{');
+    try writeJsonString(writer, "status");
+    try writer.writeByte(':');
+    try writeJsonString(writer, reviewVerdictStatus(clean, finding_count, failure));
+    try writer.writeByte(',');
+    try writeJsonString(writer, "backendClass");
+    try writer.writeByte(':');
+    try writeJsonString(writer, backend_class);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "clean");
+    try writer.writeByte(':');
+    try writeNullableJsonBool(writer, clean);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "findingCount");
+    try writer.writeByte(':');
+    try writeNullableJsonUsize(writer, finding_count);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "failureCode");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, if (failure) |value| value.code else null);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "failureHint");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, if (failure) |value| value.hint else null);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "baseSha");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, identity.base_sha);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "headSha");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, identity.head_sha);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "targetFingerprint");
+    try writer.writeByte(':');
+    try writeJsonString(writer, identity.fingerprint);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "reviewThreadId");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, review_thread_id);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "reviewTurnId");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, review_turn_id);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "recordPath");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, record_path);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "eventLogPath");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, event_log_path);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "findings");
+    try writer.writeByte(':');
+    try writer.writeAll(findings_json);
+    try writer.writeByte('}');
+    return out.toOwnedSlice();
+}
+
 fn printLaneFallbackJson(
     allocator: std.mem.Allocator,
     lane: LaneRecord,
@@ -4017,14 +4220,33 @@ fn printLaneFallbackJson(
     identity: TargetIdentity,
     fallback: NativeFallbackResult,
     failure: FailureInfo,
+    verdict_only: bool,
 ) !void {
     const target_json = try stringifyAnyAlloc(allocator, target);
     const fallback_stdout_json = if (fallback.stdout_text) |text| try quoteJsonStringAlloc(allocator, text) else "null";
     const fallback_stderr_json = if (fallback.stderr_text) |text| try quoteJsonStringAlloc(allocator, text) else "null";
+    const review_verdict_json = try buildReviewVerdictJsonAlloc(
+        allocator,
+        "cas-native-fallback",
+        null,
+        null,
+        failure,
+        identity,
+        null,
+        null,
+        null,
+        null,
+        null,
+    );
+    defer allocator.free(review_verdict_json);
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
+    if (verdict_only) {
+        try stdout.print("{s}\n", .{review_verdict_json});
+        return;
+    }
     try stdout.print(
-        "{{\"demo\":\"cas-review-session\",\"action\":\"lane-review\",\"laneId\":{s},\"cwd\":{s},\"laneRecordPath\":{s},\"target\":{s},\"targetFingerprint\":{s},\"headSha\":{s},\"baseSha\":{s},\"selectedTransport\":\"native-review\",\"fallbackUsed\":true,\"fallbackTransport\":\"native-review\",\"fallbackExitCode\":{d},\"fallbackOutputText\":{s},\"fallbackErrorText\":{s},\"failureCode\":{s},\"failureHint\":{s}}}\n",
+        "{{\"demo\":\"cas-review-session\",\"action\":\"lane-review\",\"laneId\":{s},\"cwd\":{s},\"laneRecordPath\":{s},\"target\":{s},\"targetFingerprint\":{s},\"headSha\":{s},\"baseSha\":{s},\"selectedTransport\":\"native-review\",\"fallbackUsed\":true,\"fallbackTransport\":\"native-review\",\"fallbackExitCode\":{d},\"fallbackOutputText\":{s},\"fallbackErrorText\":{s},\"failureCode\":{s},\"failureHint\":{s},\"reviewVerdict\":{s}}}\n",
         .{
             try quoteJsonStringAlloc(allocator, lane.lane_id),
             try quoteJsonStringAlloc(allocator, lane.cwd),
@@ -4038,6 +4260,7 @@ fn printLaneFallbackJson(
             fallback_stderr_json,
             try quoteJsonStringAlloc(allocator, failure.code),
             try quoteJsonStringAlloc(allocator, failure.hint),
+            review_verdict_json,
         },
     );
 }
@@ -4057,6 +4280,7 @@ fn printLaneReviewJson(
     archive_status: []const u8,
     clean: bool,
     failure: ?FailureInfo,
+    verdict_only: bool,
 ) !void {
     const target_json = try stringifyAnyAlloc(allocator, target);
     const review_result_json = status.review_result_json orelse "null";
@@ -4064,10 +4288,28 @@ fn printLaneReviewJson(
     const raw_findings_json = if (dual_parse.raw_findings) |value| try std.fmt.allocPrint(allocator, "{d}", .{value}) else "null";
     const failure_code_json = if (failure) |value| try quoteJsonStringAlloc(allocator, value.code) else "null";
     const failure_hint_json = if (failure) |value| try quoteJsonStringAlloc(allocator, value.hint) else "null";
+    const review_verdict_json = try buildReviewVerdictJsonAlloc(
+        allocator,
+        "cas-lane",
+        clean,
+        dual_parse.structured_findings,
+        failure,
+        identity,
+        review_thread_id,
+        review_turn_id,
+        record_path,
+        event_log_path,
+        status.review_result_json,
+    );
+    defer allocator.free(review_verdict_json);
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
+    if (verdict_only) {
+        try stdout.print("{s}\n", .{review_verdict_json});
+        return;
+    }
     try stdout.print(
-        "{{\"demo\":\"cas-review-session\",\"action\":\"lane-review\",\"laneId\":{s},\"cwd\":{s},\"laneRecordPath\":{s},\"reviewCount\":{d},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"target\":{s},\"targetFingerprint\":{s},\"headSha\":{s},\"baseSha\":{s},\"selectedTransport\":\"websocket\",\"fallbackUsed\":false,\"managedServerPid\":{d},\"managedServerListenUrl\":{s},\"turnStatus\":{s},\"reviewResultAvailable\":{s},\"reviewResultSource\":{s},\"reviewResult\":{s},\"rawReviewText\":{s},\"dualParseVerdict\":{s},\"structuredFindingCount\":{d},\"rawFindingCount\":{s},\"archiveStatus\":{s},\"failureCode\":{s},\"failureHint\":{s},\"clean\":{s}}}\n",
+        "{{\"demo\":\"cas-review-session\",\"action\":\"lane-review\",\"laneId\":{s},\"cwd\":{s},\"laneRecordPath\":{s},\"reviewCount\":{d},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"target\":{s},\"targetFingerprint\":{s},\"headSha\":{s},\"baseSha\":{s},\"selectedTransport\":\"websocket\",\"fallbackUsed\":false,\"managedServerPid\":{d},\"managedServerListenUrl\":{s},\"turnStatus\":{s},\"reviewResultAvailable\":{s},\"reviewResultSource\":{s},\"reviewResult\":{s},\"rawReviewText\":{s},\"dualParseVerdict\":{s},\"structuredFindingCount\":{d},\"rawFindingCount\":{s},\"archiveStatus\":{s},\"failureCode\":{s},\"failureHint\":{s},\"clean\":{s},\"reviewVerdict\":{s}}}\n",
         .{
             try quoteJsonStringAlloc(allocator, lane.lane_id),
             try quoteJsonStringAlloc(allocator, lane.cwd),
@@ -4095,6 +4337,7 @@ fn printLaneReviewJson(
             failure_code_json,
             failure_hint_json,
             if (clean) "true" else "false",
+            review_verdict_json,
         },
     );
 }
@@ -4110,12 +4353,35 @@ fn printLaneReviewTimeoutJson(
     record_path: []const u8,
     event_log_path: []const u8,
     timeout_ms: u32,
+    verdict_only: bool,
 ) !void {
     const target_json = try stringifyAnyAlloc(allocator, target);
+    const failure = FailureInfo{
+        .code = "wait_timed_out",
+        .hint = "retry cas review_session wait on the same reviewThreadId or increase --timeout-ms",
+    };
+    const review_verdict_json = try buildReviewVerdictJsonAlloc(
+        allocator,
+        "cas-lane",
+        false,
+        0,
+        failure,
+        identity,
+        review_thread_id,
+        review_turn_id,
+        record_path,
+        event_log_path,
+        null,
+    );
+    defer allocator.free(review_verdict_json);
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
+    if (verdict_only) {
+        try stdout.print("{s}\n", .{review_verdict_json});
+        return;
+    }
     try stdout.print(
-        "{{\"demo\":\"cas-review-session\",\"action\":\"lane-review\",\"method\":\"review/wait\",\"laneId\":{s},\"cwd\":{s},\"laneRecordPath\":{s},\"reviewCount\":{d},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"target\":{s},\"targetFingerprint\":{s},\"headSha\":{s},\"baseSha\":{s},\"selectedTransport\":\"websocket\",\"fallbackUsed\":false,\"managedServerPid\":{d},\"managedServerListenUrl\":{s},\"timeoutMs\":{d},\"timedOut\":true,\"reviewResultAvailable\":false,\"reviewResultSource\":null,\"reviewResult\":null,\"rawReviewText\":null,\"dualParseVerdict\":\"timeout\",\"structuredFindingCount\":0,\"rawFindingCount\":null,\"archiveStatus\":\"skipped_timeout\",\"failureCode\":\"wait_timed_out\",\"failureHint\":\"retry cas review_session wait --review-thread-id {s} --timeout-ms {d} --json\",\"clean\":false}}\n",
+        "{{\"demo\":\"cas-review-session\",\"action\":\"lane-review\",\"method\":\"review/wait\",\"laneId\":{s},\"cwd\":{s},\"laneRecordPath\":{s},\"reviewCount\":{d},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"target\":{s},\"targetFingerprint\":{s},\"headSha\":{s},\"baseSha\":{s},\"selectedTransport\":\"websocket\",\"fallbackUsed\":false,\"managedServerPid\":{d},\"managedServerListenUrl\":{s},\"timeoutMs\":{d},\"timedOut\":true,\"reviewResultAvailable\":false,\"reviewResultSource\":null,\"reviewResult\":null,\"rawReviewText\":null,\"dualParseVerdict\":\"timeout\",\"structuredFindingCount\":0,\"rawFindingCount\":null,\"archiveStatus\":\"skipped_timeout\",\"failureCode\":\"wait_timed_out\",\"failureHint\":\"retry cas review_session wait --review-thread-id {s} --timeout-ms {d} --json\",\"clean\":false,\"reviewVerdict\":{s}}}\n",
         .{
             try quoteJsonStringAlloc(allocator, lane.lane_id),
             try quoteJsonStringAlloc(allocator, lane.cwd),
@@ -4134,6 +4400,7 @@ fn printLaneReviewTimeoutJson(
             timeout_ms,
             try quoteJsonStringAlloc(allocator, review_thread_id),
             timeout_ms,
+            review_verdict_json,
         },
     );
 }
@@ -4269,6 +4536,63 @@ test "parseArgs accepts review lane review target" {
     try std.testing.expectEqualStrings("main", parsed.target.?.branch.?);
     try std.testing.expectEqual(FallbackMode.native_review, parsed.fallback_mode);
     try std.testing.expect(!parsed.archive_lane_threads);
+}
+
+test "parseArgs accepts lane review verdict-only output" {
+    const argv = [_][]const u8{
+        "cas_review_session",
+        "lane",
+        "review",
+        "--lane-id",
+        "lane_123",
+        "--base",
+        "main",
+        "--verdict-only",
+    };
+
+    const parsed = try parseArgs(std.testing.allocator, &argv);
+    try std.testing.expectEqual(Action.lane, parsed.action.?);
+    try std.testing.expectEqual(LaneAction.review, parsed.lane_action.?);
+    try std.testing.expect(parsed.verdict_only);
+    try std.testing.expect(parsed.json);
+}
+
+test "review verdict compacts lane findings for consumers" {
+    const review_result =
+        \\{"findings":[{"title":"Count matching offers","body":"Body omitted in compact verdict.","confidenceScore":0.86,"priority":2,"codeLocation":{"absoluteFilePath":"/tmp/src/program/evidence.zig","lineRange":{"start":3571,"end":3571}}}],"overallCorrectness":"patch is incorrect","overallExplanation":"One issue.","overallConfidenceScore":0.86}
+    ;
+    const identity = TargetIdentity{
+        .head_sha = "head123",
+        .base_sha = "base123",
+        .fingerprint = "target-fingerprint",
+    };
+    const verdict = try buildReviewVerdictJsonAlloc(
+        std.testing.allocator,
+        "cas-lane",
+        false,
+        1,
+        null,
+        identity,
+        "review-thread",
+        "review-turn",
+        "/tmp/record.json",
+        "/tmp/events.ndjson",
+        review_result,
+    );
+    defer std.testing.allocator.free(verdict);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, verdict, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("findings", root.get("status").?.string);
+    try std.testing.expectEqualStrings("cas-lane", root.get("backendClass").?.string);
+    try std.testing.expect(!root.get("clean").?.bool);
+    try std.testing.expectEqual(@as(i64, 1), root.get("findingCount").?.integer);
+    const finding = root.get("findings").?.array.items[0].object;
+    try std.testing.expectEqualStrings("Count matching offers", finding.get("title").?.string);
+    try std.testing.expectEqualStrings("/tmp/src/program/evidence.zig", finding.get("file").?.string);
+    try std.testing.expectEqual(@as(i64, 3571), finding.get("line").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), finding.get("priority").?.integer);
 }
 
 test "dualParseVerdict fails closed on structured/raw mismatch" {
