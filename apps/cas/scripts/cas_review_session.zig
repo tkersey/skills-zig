@@ -1140,6 +1140,8 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
 fn cmdStatus(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     const loaded = try loadSessionRecord(allocator, parsed.review_thread_id.?);
     const record = loaded.record;
+    const identity_opt: ?TargetIdentity = computeTargetIdentityAlloc(allocator, io, record.cwd, record.target) catch null;
+    defer if (identity_opt) |identity| identity.deinit(allocator);
 
     if (record.terminal_fallback_transport != null and record.terminal_review_result_json != null) {
         const status = try makeStoredFallbackStatus(allocator, record);
@@ -1155,6 +1157,8 @@ fn cmdStatus(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void
                 status,
                 loaded.record_path,
                 record.event_log_path,
+                record.target,
+                identity_opt,
                 .{
                     .resolved_codex_path = record.resolved_codex_path,
                     .resolved_codex_version = record.codex_version,
@@ -1219,6 +1223,8 @@ fn cmdStatus(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void
             status,
             loaded.record_path,
             record.event_log_path,
+            record.target,
+            identity_opt,
             .{
                 .resolved_codex_path = record.resolved_codex_path,
                 .resolved_codex_version = record.codex_version,
@@ -1254,6 +1260,8 @@ fn cmdStatus(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void
 fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     const loaded = try loadSessionRecord(allocator, parsed.review_thread_id.?);
     var record = loaded.record;
+    const identity_opt: ?TargetIdentity = computeTargetIdentityAlloc(allocator, io, record.cwd, record.target) catch null;
+    defer if (identity_opt) |identity| identity.deinit(allocator);
     if (record.terminal_fallback_transport != null and record.terminal_review_result_json != null) {
         const status = try makeStoredFallbackStatus(allocator, record);
         defer status.deinit(allocator);
@@ -1268,6 +1276,8 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                 status,
                 loaded.record_path,
                 record.event_log_path,
+                record.target,
+                identity_opt,
                 .{
                     .resolved_codex_path = record.resolved_codex_path,
                     .resolved_codex_version = record.codex_version,
@@ -1349,6 +1359,8 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                     timeout_status,
                     loaded.record_path,
                     record.event_log_path,
+                    record.target,
+                    identity_opt,
                     .{
                         .resolved_codex_path = record.resolved_codex_path,
                         .resolved_codex_version = record.codex_version,
@@ -1426,6 +1438,8 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                 latest,
                 loaded.record_path,
                 record.event_log_path,
+                record.target,
+                identity_opt,
                 .{
                     .resolved_codex_path = record.resolved_codex_path,
                     .resolved_codex_version = record.codex_version,
@@ -1467,6 +1481,8 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
             latest,
             loaded.record_path,
             record.event_log_path,
+            record.target,
+            identity_opt,
             .{
                 .resolved_codex_path = record.resolved_codex_path,
                 .resolved_codex_version = record.codex_version,
@@ -2009,27 +2025,30 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
         error.WaitTimedOut => {
             record.last_observed_status = "timeout";
             try writeSessionRecord(allocator, record_path, record);
-            try renderErrorAndExit(
-                parsed.json,
-                "lane-review",
-                "review/wait",
-                "lane review timed out",
-                lane.cwd,
-                .{
-                    .resolved_codex_path = lane.resolved_codex_path,
-                    .resolved_codex_version = lane.codex_version,
-                    .compatibility_verdict = "compatible",
-                    .selected_transport = "websocket",
-                    .selection_reason = "persistent_review_lane",
-                    .managed_server_pid = lane.managed_server_pid,
-                    .managed_server_listen_url = lane.managed_server_listen_url,
-                    .orphan_ttl_seconds = lane.orphan_ttl_seconds,
-                },
-                .{
-                    .code = "wait_timed_out",
-                    .hint = "retry the same target through the lane or increase --timeout-ms",
-                },
+            lane.last_used_at_unix_s = unixSeconds();
+            lane.last_review_thread_id = review_thread_id;
+            lane.last_review_turn_id = review_turn_id;
+            lane.last_record_path = record_path;
+            lane.last_event_log_path = event_log_path;
+            lane.last_target_fingerprint = identity.fingerprint;
+            lane.last_head_sha = identity.head_sha;
+            lane.last_base_sha = identity.base_sha;
+            lane.last_dual_parse_verdict = "timeout";
+            lane.last_archive_status = "skipped_timeout";
+            try writeLaneRecord(allocator, loaded.record_path, lane);
+            try printLaneReviewTimeoutJson(
+                allocator,
+                lane,
+                loaded.record_path,
+                target_record,
+                identity,
+                review_thread_id,
+                review_turn_id,
+                record_path,
+                event_log_path,
+                parsed.timeout_ms,
             );
+            std.process.exit(1);
         },
         else => {
             if (parsed.fallback_mode == .native_review and isTransportLossError(err)) {
@@ -3213,6 +3232,8 @@ fn maybeRunNativeFallbackAndExitWait(
             if (status) |value| value else try makeStoredFallbackStatus(allocator, record.*),
             record_path,
             record.event_log_path,
+            record.target,
+            null,
             .{
                 .resolved_codex_path = record.resolved_codex_path,
                 .resolved_codex_version = record.codex_version,
@@ -3332,6 +3353,8 @@ fn printStatusJson(
     status: ReviewStatus,
     record_path: ?[]const u8,
     event_log_path: []const u8,
+    target: ?TargetRecord,
+    identity: ?TargetIdentity,
     receipt: OutputReceipt,
     timeout_ms: ?u32,
     timed_out: ?bool,
@@ -3345,8 +3368,19 @@ fn printStatusJson(
     const parent_thread_json = if (parent_thread_id) |value| try quoteJsonStringAlloc(allocator, value) else "null";
     const rollout_path_json = if (status.rollout_path) |value| try quoteJsonStringAlloc(allocator, value) else "null";
     const record_path_json = if (record_path) |value| try quoteJsonStringAlloc(allocator, value) else "null";
+    const target_json = if (target) |value| try stringifyAnyAlloc(allocator, value) else "null";
+    const target_fingerprint_json = if (identity) |value| try quoteJsonStringAlloc(allocator, value.fingerprint) else "null";
+    const head_sha_json = if (identity) |value|
+        if (value.head_sha) |sha| try quoteJsonStringAlloc(allocator, sha) else "null"
+    else
+        "null";
+    const base_sha_json = if (identity) |value|
+        if (value.base_sha) |sha| try quoteJsonStringAlloc(allocator, sha) else "null"
+    else
+        "null";
     const review_result_source_json = if (status.review_result_source) |value| try quoteJsonStringAlloc(allocator, value) else "null";
     const review_result_json = status.review_result_json orelse "null";
+    const review_text_json = if (status.review_text) |text| try quoteJsonStringAlloc(allocator, text) else "null";
     const resolved_codex_path_json = if (receipt.resolved_codex_path) |value| try quoteJsonStringAlloc(allocator, value) else "null";
     const resolved_codex_version_json = if (receipt.resolved_codex_version) |value| try quoteJsonStringAlloc(allocator, value) else "null";
     const selected_transport_json = try quoteJsonStringAlloc(allocator, receipt.selected_transport);
@@ -3386,9 +3420,24 @@ fn printStatusJson(
         "null";
     const hook_summary = try hookSummaryFromEventLog(allocator, receipt.hook_policy, receipt.hook_log_path orelse event_log_path);
     const hook_summary_json = try stringifyAnyAlloc(allocator, hook_summary);
+    const dual_parse_opt: ?DualParseVerdict = dualParseVerdictAlloc(allocator, status) catch null;
+    defer if (dual_parse_opt) |dual_parse| dual_parse.deinit(allocator);
+    const dual_parse_verdict_json = if (dual_parse_opt) |dual_parse| try quoteJsonStringAlloc(allocator, dual_parse.verdict) else "null";
+    const structured_finding_count_json = if (dual_parse_opt) |dual_parse|
+        try std.fmt.allocPrint(allocator, "{d}", .{dual_parse.structured_findings})
+    else
+        "null";
+    const raw_finding_count_json = if (dual_parse_opt) |dual_parse|
+        if (dual_parse.raw_findings) |value| try std.fmt.allocPrint(allocator, "{d}", .{value}) else "null"
+    else
+        "null";
+    const clean_json = if (dual_parse_opt) |dual_parse|
+        if (failure == null and status.review_result_available and dual_parse.structured_findings == 0 and !std.mem.eql(u8, dual_parse.verdict, "mismatch")) "true" else "false"
+    else
+        "null";
 
     try stdout.print(
-        "{{\"demo\":\"cas-review-session\",\"action\":\"{s}\",\"cwd\":{s},\"parentThreadId\":{s},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"threadStatus\":{s},\"turnStatus\":{s},\"turnCount\":{d},\"materialized\":{s},\"rolloutPath\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"resolvedCodexPath\":{s},\"resolvedCodexVersion\":{s},\"compatibilityVerdict\":{s},\"selectedTransport\":{s},\"selectionReason\":{s},\"degradedFallback\":{s},\"managedServerPid\":{s},\"managedServerListenUrl\":{s},\"managedServerStderrLogPath\":{s},\"orphanTtlSeconds\":{s}",
+        "{{\"demo\":\"cas-review-session\",\"action\":\"{s}\",\"cwd\":{s},\"parentThreadId\":{s},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"threadStatus\":{s},\"turnStatus\":{s},\"turnCount\":{d},\"materialized\":{s},\"rolloutPath\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"target\":{s},\"targetFingerprint\":{s},\"headSha\":{s},\"baseSha\":{s},\"resolvedCodexPath\":{s},\"resolvedCodexVersion\":{s},\"compatibilityVerdict\":{s},\"selectedTransport\":{s},\"selectionReason\":{s},\"degradedFallback\":{s},\"managedServerPid\":{s},\"managedServerListenUrl\":{s},\"managedServerStderrLogPath\":{s},\"orphanTtlSeconds\":{s}",
         .{
             @tagName(action),
             cwd_json,
@@ -3402,6 +3451,10 @@ fn printStatusJson(
             rollout_path_json,
             record_path_json,
             try quoteJsonStringAlloc(allocator, event_log_path),
+            target_json,
+            target_fingerprint_json,
+            head_sha_json,
+            base_sha_json,
             resolved_codex_path_json,
             resolved_codex_version_json,
             try quoteJsonStringAlloc(allocator, receipt.compatibility_verdict),
@@ -3415,7 +3468,7 @@ fn printStatusJson(
         },
     );
     try stdout.print(
-        ",\"timeoutMs\":{s},\"timedOut\":{s},\"failureCode\":{s},\"failureHint\":{s},\"fallbackUsed\":{s},\"fallbackTransport\":{s},\"fallbackExitCode\":{s},\"fallbackOutputText\":{s},\"fallbackErrorText\":{s},\"hookSummary\":{s},\"reviewResultAvailable\":{s},\"reviewResultSource\":{s},\"reviewResult\":{s}}}\n",
+        ",\"timeoutMs\":{s},\"timedOut\":{s},\"failureCode\":{s},\"failureHint\":{s},\"fallbackUsed\":{s},\"fallbackTransport\":{s},\"fallbackExitCode\":{s},\"fallbackOutputText\":{s},\"fallbackErrorText\":{s},\"hookSummary\":{s},\"reviewResultAvailable\":{s},\"reviewResultSource\":{s},\"reviewResult\":{s},\"rawReviewText\":{s},\"dualParseVerdict\":{s},\"structuredFindingCount\":{s},\"rawFindingCount\":{s},\"clean\":{s}}}\n",
         .{
             timeout_json,
             timed_out_json,
@@ -3430,6 +3483,11 @@ fn printStatusJson(
             if (status.review_result_available) "true" else "false",
             review_result_source_json,
             review_result_json,
+            review_text_json,
+            dual_parse_verdict_json,
+            structured_finding_count_json,
+            raw_finding_count_json,
+            clean_json,
         },
     );
 }
@@ -3743,14 +3801,137 @@ fn buildReviewResultJsonFromRenderedTextAlloc(allocator: std.mem.Allocator, revi
     var findings = std.ArrayList(ReviewFindingJson).empty;
     defer findings.deinit(allocator);
     const trimmed = std.mem.trim(u8, review_text, " \t\r\n");
+    var overall_explanation = if (trimmed.len > 0) trimmed else "Reviewer failed to output a response.";
+    var first_finding_offset: ?usize = null;
+    var current_finding_index: ?usize = null;
+    var current_body = std.ArrayList(u8).empty;
+    defer current_body.deinit(allocator);
+
+    var offset: usize = 0;
+    while (offset < trimmed.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, trimmed, offset, '\n') orelse trimmed.len;
+        const line = trimmed[offset..line_end];
+        const line_trimmed = std.mem.trim(u8, line, " \t\r\n");
+        if (parseRenderedFindingHeader(line_trimmed)) |header| {
+            if (current_finding_index) |index| {
+                findings.items[index].body = try allocator.dupe(u8, std.mem.trim(u8, current_body.items, " \t\r\n"));
+                current_body.clearRetainingCapacity();
+            }
+            if (first_finding_offset == null) {
+                first_finding_offset = offset;
+                const prefix = std.mem.trim(u8, trimmed[0..offset], " \t\r\n");
+                if (prefix.len > 0) overall_explanation = prefix;
+            }
+            try findings.append(allocator, .{
+                .title = header.title,
+                .body = "",
+                .confidenceScore = 0.0,
+                .priority = header.priority,
+                .codeLocation = .{
+                    .absoluteFilePath = header.path,
+                    .lineRange = .{
+                        .start = header.start,
+                        .end = header.end,
+                    },
+                },
+            });
+            current_finding_index = findings.items.len - 1;
+        } else if (current_finding_index != null and line_trimmed.len > 0) {
+            if (current_body.items.len > 0) try current_body.append(allocator, '\n');
+            try current_body.appendSlice(allocator, line_trimmed);
+        }
+        offset = if (line_end == trimmed.len) trimmed.len else line_end + 1;
+    }
+    if (current_finding_index) |index| {
+        findings.items[index].body = try allocator.dupe(u8, std.mem.trim(u8, current_body.items, " \t\r\n"));
+    }
     const payload = ReviewResultJson{
         .findings = try findings.toOwnedSlice(allocator),
         .overallCorrectness = "",
-        .overallExplanation = if (trimmed.len > 0) trimmed else "Reviewer failed to output a response.",
+        .overallExplanation = overall_explanation,
         .overallConfidenceScore = 0.0,
     };
-    defer allocator.free(payload.findings);
+    defer {
+        for (payload.findings) |finding| if (finding.body.len > 0) allocator.free(finding.body);
+        allocator.free(payload.findings);
+    }
     return stringifyAnyAlloc(allocator, payload);
+}
+
+const RenderedFindingHeader = struct {
+    priority: i32,
+    title: []const u8,
+    path: []const u8,
+    start: u32,
+    end: u32,
+};
+
+fn parseRenderedFindingHeader(line: []const u8) ?RenderedFindingHeader {
+    if (!std.mem.startsWith(u8, line, "- [P")) return null;
+    const close = std.mem.indexOfScalar(u8, line, ']') orelse return null;
+    const priority = std.fmt.parseInt(i32, line[4..close], 10) catch return null;
+
+    const tail_start = close + 1;
+    const location = parseTrailingLocation(line[tail_start..]) orelse return null;
+    var title_part = std.mem.trim(u8, line[tail_start .. tail_start + location.location_start], " \t-");
+    while (std.mem.startsWith(u8, title_part, "\xe2\x80\x94")) {
+        title_part = std.mem.trim(u8, title_part[3..], " \t-");
+    }
+    while (std.mem.endsWith(u8, title_part, "\xe2\x80\x94")) {
+        title_part = std.mem.trim(u8, title_part[0 .. title_part.len - 3], " \t-");
+    }
+    if (title_part.len == 0) return null;
+    return .{
+        .priority = priority,
+        .title = title_part,
+        .path = location.path,
+        .start = location.start,
+        .end = location.end,
+    };
+}
+
+fn parseTrailingLocation(text: []const u8) ?struct {
+    location_start: usize,
+    path: []const u8,
+    start: u32,
+    end: u32,
+} {
+    var colon_index: ?usize = null;
+    var cursor = text.len;
+    while (cursor > 0) {
+        cursor -= 1;
+        if (text[cursor] == ':') {
+            colon_index = cursor;
+            break;
+        }
+    }
+    const colon = colon_index orelse return null;
+    if (colon + 1 >= text.len or !std.ascii.isDigit(text[colon + 1])) return null;
+
+    var number_end = colon + 1;
+    while (number_end < text.len and std.ascii.isDigit(text[number_end])) : (number_end += 1) {}
+    const start = std.fmt.parseInt(u32, text[colon + 1 .. number_end], 10) catch return null;
+    var end = start;
+    if (number_end < text.len and text[number_end] == '-') {
+        const range_start = number_end + 1;
+        var range_end = range_start;
+        while (range_end < text.len and std.ascii.isDigit(text[range_end])) : (range_end += 1) {}
+        if (range_end == range_start) return null;
+        end = std.fmt.parseInt(u32, text[range_start..range_end], 10) catch return null;
+    }
+
+    const before_path = text[0..colon];
+    const slash = std.mem.lastIndexOfScalar(u8, before_path, '/') orelse return null;
+    var path_start = slash;
+    while (path_start > 0 and !std.ascii.isWhitespace(before_path[path_start - 1])) : (path_start -= 1) {}
+    const path = before_path[path_start..];
+    if (path.len == 0) return null;
+    return .{
+        .location_start = path_start,
+        .path = path,
+        .start = start,
+        .end = end,
+    };
 }
 
 fn reviewFindingCount(allocator: std.mem.Allocator, review_result_json: ?[]const u8) !usize {
@@ -3914,6 +4095,45 @@ fn printLaneReviewJson(
             failure_code_json,
             failure_hint_json,
             if (clean) "true" else "false",
+        },
+    );
+}
+
+fn printLaneReviewTimeoutJson(
+    allocator: std.mem.Allocator,
+    lane: LaneRecord,
+    lane_record_path: []const u8,
+    target: TargetRecord,
+    identity: TargetIdentity,
+    review_thread_id: []const u8,
+    review_turn_id: []const u8,
+    record_path: []const u8,
+    event_log_path: []const u8,
+    timeout_ms: u32,
+) !void {
+    const target_json = try stringifyAnyAlloc(allocator, target);
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.print(
+        "{{\"demo\":\"cas-review-session\",\"action\":\"lane-review\",\"method\":\"review/wait\",\"laneId\":{s},\"cwd\":{s},\"laneRecordPath\":{s},\"reviewCount\":{d},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"target\":{s},\"targetFingerprint\":{s},\"headSha\":{s},\"baseSha\":{s},\"selectedTransport\":\"websocket\",\"fallbackUsed\":false,\"managedServerPid\":{d},\"managedServerListenUrl\":{s},\"timeoutMs\":{d},\"timedOut\":true,\"reviewResultAvailable\":false,\"reviewResultSource\":null,\"reviewResult\":null,\"rawReviewText\":null,\"dualParseVerdict\":\"timeout\",\"structuredFindingCount\":0,\"rawFindingCount\":null,\"archiveStatus\":\"skipped_timeout\",\"failureCode\":\"wait_timed_out\",\"failureHint\":\"retry cas review_session wait --review-thread-id {s} --timeout-ms {d} --json\",\"clean\":false}}\n",
+        .{
+            try quoteJsonStringAlloc(allocator, lane.lane_id),
+            try quoteJsonStringAlloc(allocator, lane.cwd),
+            try quoteJsonStringAlloc(allocator, lane_record_path),
+            lane.review_count,
+            try quoteJsonStringAlloc(allocator, review_thread_id),
+            try quoteJsonStringAlloc(allocator, review_turn_id),
+            try quoteJsonStringAlloc(allocator, record_path),
+            try quoteJsonStringAlloc(allocator, event_log_path),
+            target_json,
+            try quoteJsonStringAlloc(allocator, identity.fingerprint),
+            if (identity.head_sha) |value| try quoteJsonStringAlloc(allocator, value) else "null",
+            if (identity.base_sha) |value| try quoteJsonStringAlloc(allocator, value) else "null",
+            lane.managed_server_pid,
+            try quoteJsonStringAlloc(allocator, lane.managed_server_listen_url),
+            timeout_ms,
+            try quoteJsonStringAlloc(allocator, review_thread_id),
+            timeout_ms,
         },
     );
 }
@@ -4174,6 +4394,62 @@ test "buildReviewResultJsonFromRenderedTextAlloc preserves review text" {
     const root_obj = parsed.value.object;
     try std.testing.expectEqualStrings("Looks solid overall.", core_json.stringField(root_obj, "overallExplanation").?);
     try std.testing.expectEqual(@as(usize, 0), root_obj.get("findings").?.array.items.len);
+}
+
+test "buildReviewResultJsonFromRenderedTextAlloc parses rendered review findings" {
+    const review_text =
+        "The boundary-closure analysis found one issue.\n\n" ++
+        "Review comment:\n" ++
+        "- [P2] Defer registering unproven provider programs \xe2\x80\x94 /Users/tk/workspace/tk/boundary/src/program/evidence.zig:3977-3981\n" ++
+        "  When this path registers the provider before closure proof, downstream evidence can observe an unproven program.";
+    const json = try buildReviewResultJsonFromRenderedTextAlloc(std.testing.allocator, review_text);
+    defer std.testing.allocator.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    const root_obj = parsed.value.object;
+    try std.testing.expectEqualStrings("The boundary-closure analysis found one issue.\n\nReview comment:", core_json.stringField(root_obj, "overallExplanation").?);
+    const findings = root_obj.get("findings").?.array;
+    try std.testing.expectEqual(@as(usize, 1), findings.items.len);
+    const first = findings.items[0].object;
+    try std.testing.expectEqualStrings("Defer registering unproven provider programs", core_json.stringField(first, "title").?);
+    try std.testing.expectEqual(@as(f32, 0.0), floatField(first, "confidenceScore").?);
+    try std.testing.expectEqual(@as(i64, 2), first.get("priority").?.integer);
+    try std.testing.expect(std.mem.indexOf(u8, core_json.stringField(first, "body").?, "downstream evidence") != null);
+    const code_location = core_json.objectField(first, "codeLocation").?;
+    try std.testing.expectEqualStrings("/Users/tk/workspace/tk/boundary/src/program/evidence.zig", core_json.stringField(code_location, "absoluteFilePath").?);
+    const line_range = core_json.objectField(code_location, "lineRange").?;
+    try std.testing.expectEqual(@as(i64, 3977), line_range.get("start").?.integer);
+    try std.testing.expectEqual(@as(i64, 3981), line_range.get("end").?.integer);
+}
+
+test "dualParseVerdict matches rendered review finding count" {
+    const structured =
+        \\{"findings":[{"title":"Defer registering unproven provider programs","body":"When this path registers the provider before closure proof, downstream evidence can observe an unproven program.","confidenceScore":0.0,"priority":2,"codeLocation":{"absoluteFilePath":"/Users/tk/workspace/tk/boundary/src/program/evidence.zig","lineRange":{"start":3977,"end":3981}}}],"overallCorrectness":"","overallExplanation":"The boundary-closure analysis found one issue.","overallConfidenceScore":0.0}
+    ;
+    const status = ReviewStatus{
+        .thread_status = try std.testing.allocator.dupe(u8, "loaded"),
+        .turn_status = try std.testing.allocator.dupe(u8, "completed"),
+        .turn_count = 1,
+        .materialized = true,
+        .thread_preview = try std.testing.allocator.dupe(u8, ""),
+        .rollout_path = null,
+        .turn_error_message = null,
+        .last_turn_has_entered_review_mode = true,
+        .last_turn_has_exited_review_mode = true,
+        .review_result_available = true,
+        .review_result_source = "rollout_exited_review_mode",
+        .review_result_json = try std.testing.allocator.dupe(u8, structured),
+        .review_text = try std.testing.allocator.dupe(u8, "- [P2] Defer registering unproven provider programs - /Users/tk/workspace/tk/boundary/src/program/evidence.zig:3977-3981\n  When this path registers the provider before closure proof, downstream evidence can observe an unproven program."),
+        .raw_response_json = try std.testing.allocator.dupe(u8, "{}"),
+    };
+    defer status.deinit(std.testing.allocator);
+
+    const verdict = try dualParseVerdictAlloc(std.testing.allocator, status);
+    defer verdict.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("match", verdict.verdict);
+    try std.testing.expectEqual(@as(usize, 1), verdict.structured_findings);
+    try std.testing.expectEqual(@as(usize, 1), verdict.raw_findings.?);
 }
 
 test "shouldPreMaterializeDetachedReviewParent gates auto mode for codex 0.118" {
