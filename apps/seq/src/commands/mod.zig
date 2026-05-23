@@ -6122,17 +6122,9 @@ fn cmdRoleBreakdown(allocator: std.mem.Allocator, sessions_root: []const u8, opt
     var where: std.ArrayList(spec.WhereClause) = .empty;
     defer where.deinit(allocator);
     try appendSessionTimeBounds(allocator, &where, opts);
-    const query_spec = spec.QuerySpec{
-        .where = where.items,
-        .group_by = &.{ "skill", "role" },
-        .metrics = &.{.{ .op = .count, .alias = "count" }},
-    };
 
     var occ_rows = try collectDatasetRows(allocator, "skill_mentions", sessions_root, &.{}, where.items);
     defer deinitQueryRows(allocator, &occ_rows);
-
-    var grouped = try query.execute(allocator, occ_rows.items, query_spec);
-    defer grouped.deinit(allocator);
 
     const Counts = struct {
         skill: []u8,
@@ -6146,31 +6138,28 @@ fn cmdRoleBreakdown(allocator: std.mem.Allocator, sessions_root: []const u8, opt
         totals.deinit(allocator);
     }
 
-    for (grouped.rows.items) |row| {
+    var total_index = std.StringHashMap(usize).init(allocator);
+    defer total_index.deinit();
+
+    for (occ_rows.items) |row| {
         const skill_scalar = row.valueOrNull("skill");
         const role_scalar = row.valueOrNull("role");
-        const count_scalar = row.valueOrNull("count");
         if (skill_scalar != .string or role_scalar != .string) continue;
-        const count = scalarAsInt(count_scalar) orelse 0;
 
-        var idx_opt: ?usize = null;
-        for (totals.items, 0..) |entry, idx| {
-            if (std.mem.eql(u8, entry.skill, skill_scalar.string)) {
-                idx_opt = idx;
-                break;
-            }
+        const gop = try total_index.getOrPut(skill_scalar.string);
+        if (!gop.found_existing) {
+            const skill_copy = try allocator.dupe(u8, skill_scalar.string);
+            errdefer allocator.free(skill_copy);
+            try totals.append(allocator, .{ .skill = skill_copy });
+            gop.key_ptr.* = skill_copy;
+            gop.value_ptr.* = totals.items.len - 1;
         }
 
-        if (idx_opt == null) {
-            try totals.append(allocator, .{ .skill = try allocator.dupe(u8, skill_scalar.string) });
-            idx_opt = totals.items.len - 1;
-        }
-
-        const idx = idx_opt.?;
+        const idx = gop.value_ptr.*;
         if (std.mem.eql(u8, role_scalar.string, "user")) {
-            totals.items[idx].user += count;
+            totals.items[idx].user += 1;
         } else if (std.mem.eql(u8, role_scalar.string, "assistant")) {
-            totals.items[idx].assistant += count;
+            totals.items[idx].assistant += 1;
         }
     }
 
