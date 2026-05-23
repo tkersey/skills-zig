@@ -4914,6 +4914,17 @@ fn cmdMemoryHistory(allocator: std.mem.Allocator, opts: Options) !void {
             const keywords = block_row.keywords orelse "";
             const score = try matchScoreForText(allocator, query_text, use_regex, &.{ block_row.title, block_row.heading_path, block_row.body, keywords, block_row.relative_path });
             if (score == null) continue;
+            try appendMemoryHistoryEvent(
+                allocator,
+                &rows,
+                "artifact_match",
+                block_row.updated_at.?,
+                block_row.thread_id,
+                block_row.rollout_path,
+                try buildMemoryBlockEvidenceRef(allocator, block_row),
+                block_row.preview,
+            );
+            try rows.items[rows.items.len - 1].putOwnedKey("score", .{ .int = score.? });
             event_count += 1;
         }
 
@@ -4929,51 +4940,22 @@ fn cmdMemoryHistory(allocator: std.mem.Allocator, opts: Options) !void {
         try summary_row.putOwnedKey("next_action_kind", .{ .string = "artifact-search" });
         try summary_row.putOwnedKey("next_action", .{ .string = topic_next_action });
         try rows.append(allocator, summary_row);
-
-        for (memory_rows.items) |block_row| {
-            if (!timestampSatisfiesBounds(block_row.updated_at, opts)) continue;
-            const keywords = block_row.keywords orelse "";
-            const score = try matchScoreForText(allocator, query_text, use_regex, &.{ block_row.title, block_row.heading_path, block_row.body, keywords, block_row.relative_path });
-            if (score == null) continue;
-            try appendMemoryHistoryEvent(
-                allocator,
-                &rows,
-                "artifact_match",
-                block_row.updated_at.?,
-                block_row.thread_id,
-                block_row.rollout_path,
-                try buildMemoryBlockEvidenceRef(allocator, block_row),
-                block_row.preview,
-            );
-            try rows.items[rows.items.len - 1].putOwnedKey("score", .{ .int = score.? });
-        }
     }
 
     const cols = [_][]const u8{ "row_kind", "timestamp", "change_kind", "thread_id", "summary", "preview", "evidence_ref", "next_action_kind", "next_action", "event_count", "score" };
     const limit = if (opts.limit == 0) 200 else opts.limit;
-    var ordered: std.ArrayList(query.Row) = .empty;
-    defer deinitQueryRows(allocator, &ordered);
-    for (rows.items) |row| {
+    var event_start: usize = 0;
+    for (rows.items, 0..) |row, idx| {
         if (scalarStringEq(row.valueOrNull("row_kind"), "summary")) {
-            try ordered.append(allocator, try row.cloneSelected(allocator, cols[0..]));
+            if (idx != 0) std.mem.swap(query.Row, &rows.items[0], &rows.items[idx]);
+            event_start = 1;
+            break;
         }
     }
-    var event_rows: std.ArrayList(query.Row) = .empty;
-    defer deinitQueryRows(allocator, &event_rows);
-    for (rows.items) |row| {
-        if (!scalarStringEq(row.valueOrNull("row_kind"), "summary")) {
-            try event_rows.append(allocator, try row.cloneSelected(allocator, cols[0..]));
-        }
-    }
-    std.mem.sort(query.Row, event_rows.items, {}, historyRowLessThan);
+    std.mem.sort(query.Row, rows.items[event_start..], {}, historyRowLessThan);
+    trimQueryRows(&rows, limit);
 
-    const remaining = if (limit > ordered.items.len) limit - ordered.items.len else 0;
-    const emit_count = @min(remaining, event_rows.items.len);
-    for (event_rows.items[0..emit_count]) |row| {
-        try ordered.append(allocator, try row.cloneAll(allocator));
-    }
-
-    try output.writeOutput(allocator, opts.format, ordered.items, cols[0..], opts.out_path);
+    try output.writeOutput(allocator, opts.format, rows.items, cols[0..], opts.out_path);
 }
 
 fn historyRowLessThan(_: void, lhs: query.Row, rhs: query.Row) bool {
