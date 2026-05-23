@@ -4001,19 +4001,23 @@ const QueryLiftCommands = struct {
         var collected = try collectDatasetRowsForSpec(allocator, "token_deltas", sessions_root, query_spec);
         defer deinitQueryRows(allocator, &collected);
 
-        var filtered = try query.execute(allocator, collected.items, query_spec);
-        defer filtered.deinit(allocator);
-
         var points: std.ArrayList(TokenWindowPoint) = .empty;
         defer points.deinit(allocator);
-        for (filtered.rows.items, 0..) |row, idx| {
+        for (collected.items, 0..) |row, idx| {
             const timestamp = scalarString(row.valueOrNull("timestamp")) orelse continue;
+            if (!timestampSatisfiesBounds(timestamp, opts)) continue;
             const timestamp_ms = time_utils.parseIsoTimestampMillis(timestamp) orelse continue;
             const delta = switch (row.valueOrNull("delta_total_tokens")) {
                 .int => |value| value,
                 else => continue,
             };
             const path = scalarString(row.valueOrNull("path")) orelse "";
+            if (path_filter) |wanted_path| {
+                if (!std.mem.eql(u8, path, wanted_path)) continue;
+            }
+            if (exclude_path) |current_path| {
+                if (std.mem.eql(u8, path, current_path)) continue;
+            }
             try points.append(allocator, .{
                 .row_index = idx,
                 .timestamp = timestamp,
@@ -4031,7 +4035,7 @@ const QueryLiftCommands = struct {
             if (best.rows > 0) {
                 var idx = best.left;
                 while (idx <= best.right) : (idx += 1) {
-                    const source = filtered.rows.items[points.items[idx].row_index];
+                    const source = collected.items[points.items[idx].row_index];
                     try out_rows.append(allocator, try source.cloneSelected(allocator, token_window_row_columns[0..]));
                 }
             }
