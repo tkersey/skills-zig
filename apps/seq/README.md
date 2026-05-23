@@ -53,6 +53,8 @@ Binary output:
 ./zig-out/bin/seq query-diagnose --path /absolute/path/to/rollout.jsonl --threshold-ms 10000 --next-actions --format json
 ./zig-out/bin/seq artifact-search --contains "spawn_agent" --kind orchestration --since 2026-03-01T00:00:00Z --limit 10 --format table
 ./zig-out/bin/seq artifact-search --contains "MEMORY.md" --kind memory --stats --format table
+./zig-out/bin/seq skill-success-rank --root ~/.codex/sessions --last 14d --format table
+./zig-out/bin/seq skill-success-rank --root ~/.codex/sessions --skill seq --mode sessions --last 14d --format jsonl
 ./zig-out/bin/seq skill-audit --skill seq --mode trend --since 2026-04-01T00:00:00Z --format table
 ./zig-out/bin/seq tool-audit --group-by executable --since 2026-04-01T00:00:00Z --limit 20 --format table
 ./zig-out/bin/seq memory-inventory --mode categories --memory-root ~/.codex/memories --format table
@@ -179,6 +181,7 @@ seq query --root ~/.codex/sessions --spec '{"dataset":"session_graph_edges","sel
 - `--stats` adds scan counters (`surfaces_scanned`, `candidate_files`, `files_opened`, `rows_examined`, `rows_emitted`, `duration_ms`)
 
 Query-lift commands provide top-level shortcuts for common `seq query` shapes:
+- `skill-success-rank` ranks user-called skills by sessions with positive outcome evidence, avoiding raw mention-count inflation and full `workflow_signals` scans.
 - `skill-audit` summarizes `skill_mentions` by skill, emits mention rows, or produces a daily trend for one skill.
 - `workflow-audit` summarizes workflow cohorts across session text, skill mentions, tool traces, session graph roles, and outcome signals.
 - `tool-audit` summarizes `tool_invocations` by tool, executable, session, workdir, or command, with row and unresolved modes for drilling down.

@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const Command = enum {
     skills_rank,
+    skill_success_rank,
     skill_trend,
     skill_report,
     skill_audit,
@@ -56,6 +57,7 @@ pub const CommandDef = struct {
 
 const command_defs = [_]CommandDef{
     .{ .name = "skills-rank", .cmd = .skills_rank },
+    .{ .name = "skill-success-rank", .cmd = .skill_success_rank },
     .{ .name = "skill-trend", .cmd = .skill_trend },
     .{ .name = "skill-report", .cmd = .skill_report },
     .{ .name = "skill-audit", .cmd = .skill_audit },

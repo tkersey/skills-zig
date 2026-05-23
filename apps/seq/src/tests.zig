@@ -37,6 +37,7 @@ const lib = @import("lib.zig");
 
 test "bootstrap parse coverage" {
     try std.testing.expectEqual(lib.Command.skills_rank, lib.parseCommand("skills-rank"));
+    try std.testing.expectEqual(lib.Command.skill_success_rank, lib.parseCommand("skill-success-rank"));
     try std.testing.expectEqual(lib.Command.skill_trend, lib.parseCommand("skill-trend"));
     try std.testing.expectEqual(lib.Command.skill_report, lib.parseCommand("skill-report"));
     try std.testing.expectEqual(lib.Command.skill_audit, lib.parseCommand("skill-audit"));

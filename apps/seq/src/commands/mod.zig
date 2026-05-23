@@ -489,6 +489,7 @@ pub fn run(
 
     switch (cmd) {
         .skills_rank => try cmdSkillsRank(allocator, sessions_root, opts),
+        .skill_success_rank => try cmdSkillSuccessRank(allocator, sessions_root, opts),
         .skill_trend => try cmdSkillTrend(allocator, sessions_root, opts),
         .skill_report => try cmdSkillReport(allocator, sessions_root, opts),
         .skill_audit => try QueryLiftCommands.cmdSkillAudit(allocator, sessions_root, opts),
@@ -552,6 +553,9 @@ fn printCommandHelp(cmd: lib.Command) !void {
     const body = switch (cmd) {
         .skills_rank =>
         \\usage: seq skills-rank [--since <iso>] [--until <iso>] [--format table|json|csv] [--max N]
+        ,
+        .skill_success_rank =>
+        \\usage: seq skill-success-rank [--skill <name>] [--mode summary|sessions] [--last <Nm|Nh|Nd>|--since <iso>] [--until <iso>] [--limit N] [--format table|json|csv|jsonl]
         ,
         .skill_trend =>
         \\usage: seq skill-trend --skill <name> [--bucket day|week|month] [--since <iso>] [--until <iso>] [--format table|json|csv] [--max N]
@@ -786,7 +790,7 @@ fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
             if (fmt == .csv or fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
         .query => {},
-        .artifact_search, .tool_audit, .memory_inventory, .message_search, .message_audit, .skill_cohort, .tool_search, .memory_extension_audit, .token_window, .workdir_report, .orchestration_concurrency, .find_session, .plan_search, .reply_latency, .session_prompts, .token_usage, .token_cost, .routing_gap, .session_tooling, .query_diagnose, .memory_provenance, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .skill_audit, .goal_audit => {
+        .artifact_search, .tool_audit, .memory_inventory, .message_search, .message_audit, .skill_cohort, .tool_search, .memory_extension_audit, .token_window, .workdir_report, .orchestration_concurrency, .find_session, .plan_search, .reply_latency, .session_prompts, .token_usage, .token_cost, .routing_gap, .session_tooling, .query_diagnose, .memory_provenance, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .skill_audit, .skill_success_rank, .goal_audit => {
             if (fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
         .unknown => return error.InvalidCommand,
@@ -811,7 +815,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_threshold_ms = cmd == .query_diagnose;
     const supports_strict_hang = cmd == .query_diagnose;
     const supports_skill = switch (cmd) {
-        .skill_trend, .skill_report, .skill_audit, .skill_cohort, .occurrence_export, .skill_blocks => true,
+        .skill_trend, .skill_report, .skill_audit, .skill_success_rank, .skill_cohort, .occurrence_export, .skill_blocks => true,
         else => false,
     };
     const supports_workflow = cmd == .workflow_audit or cmd == .goal_audit;
@@ -843,7 +847,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_repo = cmd == .plan_search or cmd == .sessions;
     const supports_status = cmd == .opencode_events or cmd == .turns or cmd == .goal_audit;
     const supports_mode = switch (cmd) {
-        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit, .goal_audit => true,
+        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .skill_success_rank, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit, .goal_audit => true,
         else => false,
     };
     const supports_kind = cmd == .artifact_search;
@@ -857,6 +861,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     };
     const supports_since = switch (cmd) {
         .skills_rank,
+        .skill_success_rank,
         .skill_trend,
         .skill_report,
         .skill_audit,
@@ -894,6 +899,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     };
     const supports_until = switch (cmd) {
         .skills_rank,
+        .skill_success_rank,
         .skill_trend,
         .skill_report,
         .skill_audit,
@@ -993,7 +999,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     };
     const supports_window_hours = cmd == .token_window;
     const supports_duration_gte = cmd == .goal_audit;
-    const supports_last = cmd == .token_usage or cmd == .token_cost;
+    const supports_last = cmd == .token_usage or cmd == .token_cost or cmd == .skill_success_rank;
     const supports_token_cost_options = cmd == .token_cost;
 
     try ensureOptionAllowed(opts.path != null, commandSupportsPath(cmd), "--path", cmd);
@@ -5070,6 +5076,400 @@ fn cmdSkillsRank(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
         .limit = opts.limit,
     };
     try runDatasetQuery(allocator, "skill_mentions", sessions_root, query_spec, opts.format, opts.out_path, null);
+}
+
+const SkillSuccessWindow = struct {
+    since_ms: ?i64 = null,
+    until_ms: ?i64 = null,
+};
+
+const SkillOutcome = struct {
+    positive_bits: u8 = 0,
+    blocked: bool = false,
+};
+
+const OUTCOME_TEST: u8 = 1 << 0;
+const OUTCOME_PROOF: u8 = 1 << 1;
+const OUTCOME_COMMIT: u8 = 1 << 2;
+const OUTCOME_PR: u8 = 1 << 3;
+const OUTCOME_CLOSURE: u8 = 1 << 4;
+
+const SkillSuccessAggregate = struct {
+    skill: []const u8,
+    raw_mentions: i64 = 0,
+    raw_sessions: StringSet,
+    called_sessions: StringSet,
+    assistant_sessions: StringSet,
+    successful_sessions: i64 = 0,
+    used_sessions: i64 = 0,
+    blocked_sessions: i64 = 0,
+    first_seen: ?[]u8 = null,
+    last_seen: ?[]u8 = null,
+
+    fn init(allocator: std.mem.Allocator, skill: []const u8) SkillSuccessAggregate {
+        return .{
+            .skill = skill,
+            .raw_sessions = StringSet.init(allocator),
+            .called_sessions = StringSet.init(allocator),
+            .assistant_sessions = StringSet.init(allocator),
+        };
+    }
+
+    fn deinit(self: *SkillSuccessAggregate, allocator: std.mem.Allocator) void {
+        self.raw_sessions.deinit();
+        self.called_sessions.deinit();
+        self.assistant_sessions.deinit();
+        if (self.first_seen) |value| allocator.free(value);
+        if (self.last_seen) |value| allocator.free(value);
+    }
+};
+
+fn cmdSkillSuccessRank(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    const mode = opts.mode orelse "summary";
+    if (!std.mem.eql(u8, mode, "summary") and !std.mem.eql(u8, mode, "sessions")) {
+        return error.InvalidModeArg;
+    }
+
+    const window = try resolveSkillSuccessWindow(opts);
+    var outcomes = std.StringHashMap(SkillOutcome).init(allocator);
+    defer {
+        var out_it = outcomes.iterator();
+        while (out_it.next()) |entry| allocator.free(entry.key_ptr.*);
+        outcomes.deinit();
+    }
+
+    var aggregates = std.StringHashMap(SkillSuccessAggregate).init(allocator);
+    defer deinitSkillSuccessAggregates(allocator, &aggregates);
+
+    const path_filter = skillSuccessDayFilter(window);
+    var paths = try collectJsonlPaths(allocator, sessions_root, path_filter);
+    defer freePathList(allocator, &paths);
+
+    for (paths.items) |path| {
+        const content = try readFileAllocOrSkip(allocator, path);
+        if (content == null) continue;
+        defer allocator.free(content.?);
+
+        try collectSkillSuccessOutcomesForPath(allocator, &outcomes, path, content.?, window);
+        try collectSkillSuccessMentionsForPath(allocator, &aggregates, path, content.?, window, opts.skill);
+    }
+
+    try computeSkillSuccessCounts(&aggregates, &outcomes);
+
+    if (std.mem.eql(u8, mode, "sessions")) {
+        return writeSkillSuccessSessionRows(allocator, &aggregates, &outcomes, opts);
+    }
+    return writeSkillSuccessSummaryRows(allocator, &aggregates, opts);
+}
+
+fn resolveSkillSuccessWindow(opts: Options) !SkillSuccessWindow {
+    const until_ms = try parseSkillSuccessBoundMillis(opts.until, "--until");
+    if (opts.last_text) |raw| {
+        const duration_ms = try parseLastWindowMillis(raw);
+        const anchor_ms = until_ms orelse currentUnixMillis();
+        return .{
+            .since_ms = anchor_ms - duration_ms,
+            .until_ms = anchor_ms,
+        };
+    }
+    return .{
+        .since_ms = try parseSkillSuccessBoundMillis(opts.since, "--since"),
+        .until_ms = until_ms,
+    };
+}
+
+fn parseSkillSuccessBoundMillis(raw_opt: ?[]const u8, flag_name: []const u8) !?i64 {
+    const raw = raw_opt orelse return null;
+    return time_utils.parseIsoTimestampMillis(raw) orelse blk: {
+        printCliError("error: skill-success-rank {s} must be an ISO-8601 timestamp with timezone\n", .{flag_name});
+        break :blk error.InvalidTimestampArg;
+    };
+}
+
+fn skillSuccessDayFilter(window: SkillSuccessWindow) ?SessionDayPathFilter {
+    return deriveSessionDayPathFilterFromWindow(.{
+        .since_ms = window.since_ms,
+        .until_ms = window.until_ms,
+    });
+}
+
+fn skillSuccessTimestampInWindow(timestamp: ?[]const u8, window: SkillSuccessWindow) bool {
+    if (window.since_ms == null and window.until_ms == null) return true;
+    const text = timestamp orelse return false;
+    const ts_ms = time_utils.parseIsoTimestampMillis(text) orelse return false;
+    if (window.since_ms) |since_ms| {
+        if (ts_ms < since_ms) return false;
+    }
+    if (window.until_ms) |until_ms| {
+        if (ts_ms > until_ms) return false;
+    }
+    return true;
+}
+
+fn collectSkillSuccessOutcomesForPath(
+    allocator: std.mem.Allocator,
+    outcomes: *std.StringHashMap(SkillOutcome),
+    path: []const u8,
+    content: []const u8,
+    window: SkillSuccessWindow,
+) !void {
+    const messages = try datasets.messages.parseJsonl(allocator, path, content, .{
+        .strip_skill_blocks = true,
+        .dedupe_by_role_and_text = true,
+    });
+    defer datasets.messages.freeRows(allocator, messages);
+
+    var outcome = outcomes.get(path) orelse SkillOutcome{};
+    for (messages) |message| {
+        if (!skillSuccessTimestampInWindow(message.timestamp, window)) continue;
+        const detected = skillSuccessOutcomeForText(message.text);
+        outcome.positive_bits |= detected.positive_bits;
+        outcome.blocked = outcome.blocked or detected.blocked;
+    }
+    if (outcome.positive_bits != 0 or outcome.blocked) {
+        const gop = try outcomes.getOrPut(path);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try allocator.dupe(u8, path);
+        }
+        gop.value_ptr.* = outcome;
+    }
+}
+
+fn skillSuccessOutcomeForText(text: []const u8) SkillOutcome {
+    var out = SkillOutcome{};
+    if (containsAnyIgnoreCaseAscii(text, &.{ "zig build test", "tests pass", "test passed" })) out.positive_bits |= OUTCOME_TEST;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "proof", "validated", "validation" })) out.positive_bits |= OUTCOME_PROOF;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "commit ", "committed", "pushed" })) out.positive_bits |= OUTCOME_COMMIT;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "PR #", "pull request", "gh pr" })) out.positive_bits |= OUTCOME_PR;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "closure", "fixed point", "fixed-point" })) out.positive_bits |= OUTCOME_CLOSURE;
+    out.blocked = containsAnyIgnoreCaseAscii(text, &.{ "blocked", "failed", "error:" });
+    return out;
+}
+
+fn containsAnyIgnoreCaseAscii(text: []const u8, needles: []const []const u8) bool {
+    for (needles) |needle| {
+        if (containsIgnoreCaseAscii(text, needle)) return true;
+    }
+    return false;
+}
+
+fn collectSkillSuccessMentionsForPath(
+    allocator: std.mem.Allocator,
+    aggregates: *std.StringHashMap(SkillSuccessAggregate),
+    path: []const u8,
+    content: []const u8,
+    window: SkillSuccessWindow,
+    skill_filter: ?[]const u8,
+) !void {
+    const mentions = try datasets.skill_mentions.parseJsonl(allocator, path, content, .{});
+    defer datasets.skill_mentions.freeRows(allocator, mentions);
+
+    for (mentions) |mention| {
+        if (!skillSuccessTimestampInWindow(mention.timestamp, window)) continue;
+        if (skill_filter) |filter| {
+            if (!std.mem.eql(u8, mention.skill, filter)) continue;
+        }
+
+        const aggregate = try getOrPutSkillSuccessAggregate(allocator, aggregates, mention.skill);
+        aggregate.raw_mentions += 1;
+        try aggregate.raw_sessions.put(mention.path);
+        if (std.mem.eql(u8, mention.role, "user")) {
+            try aggregate.called_sessions.put(mention.path);
+        } else if (std.mem.eql(u8, mention.role, "assistant")) {
+            try aggregate.assistant_sessions.put(mention.path);
+        }
+        try observeSkillSuccessTimestamp(allocator, aggregate, mention.timestamp);
+    }
+}
+
+fn getOrPutSkillSuccessAggregate(
+    allocator: std.mem.Allocator,
+    aggregates: *std.StringHashMap(SkillSuccessAggregate),
+    skill: []const u8,
+) !*SkillSuccessAggregate {
+    if (aggregates.getPtr(skill)) |existing| return existing;
+    const key = try allocator.dupe(u8, skill);
+    errdefer allocator.free(key);
+    try aggregates.put(key, SkillSuccessAggregate.init(allocator, key));
+    return aggregates.getPtr(key).?;
+}
+
+fn observeSkillSuccessTimestamp(
+    allocator: std.mem.Allocator,
+    aggregate: *SkillSuccessAggregate,
+    timestamp: ?[]const u8,
+) !void {
+    if (timestamp == null) return;
+    if (aggregate.first_seen == null or compareOptionalTimestamp(timestamp, aggregate.first_seen) == .lt) {
+        try replaceOptionalString(allocator, &aggregate.first_seen, timestamp);
+    }
+    if (aggregate.last_seen == null or compareOptionalTimestamp(timestamp, aggregate.last_seen) == .gt) {
+        try replaceOptionalString(allocator, &aggregate.last_seen, timestamp);
+    }
+}
+
+fn computeSkillSuccessCounts(
+    aggregates: *std.StringHashMap(SkillSuccessAggregate),
+    outcomes: *const std.StringHashMap(SkillOutcome),
+) !void {
+    var it = aggregates.iterator();
+    while (it.next()) |entry| {
+        var successful: i64 = 0;
+        var used: i64 = 0;
+        var blocked: i64 = 0;
+        var path_it = entry.value_ptr.called_sessions.map.keyIterator();
+        while (path_it.next()) |path_ptr| {
+            const path = path_ptr.*;
+            const outcome = outcomes.get(path) orelse SkillOutcome{};
+            const has_positive = outcome.positive_bits != 0;
+            if (has_positive) successful += 1;
+            if (entry.value_ptr.assistant_sessions.contains(path) or has_positive) used += 1;
+            if (outcome.blocked) blocked += 1;
+        }
+        entry.value_ptr.successful_sessions = successful;
+        entry.value_ptr.used_sessions = used;
+        entry.value_ptr.blocked_sessions = blocked;
+    }
+}
+
+fn deinitSkillSuccessAggregates(
+    allocator: std.mem.Allocator,
+    aggregates: *std.StringHashMap(SkillSuccessAggregate),
+) void {
+    var it = aggregates.iterator();
+    while (it.next()) |entry| {
+        entry.value_ptr.deinit(allocator);
+        allocator.free(entry.key_ptr.*);
+    }
+    aggregates.deinit();
+}
+
+fn writeSkillSuccessSummaryRows(
+    allocator: std.mem.Allocator,
+    aggregates: *std.StringHashMap(SkillSuccessAggregate),
+    opts: Options,
+) !void {
+    var values: std.ArrayList(*SkillSuccessAggregate) = .empty;
+    defer values.deinit(allocator);
+    var it = aggregates.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.successful_sessions == 0 and entry.value_ptr.used_sessions == 0) continue;
+        try values.append(allocator, entry.value_ptr);
+    }
+    std.mem.sort(*SkillSuccessAggregate, values.items, {}, skillSuccessSummaryLessThan);
+
+    const limit = if (opts.limit > 0) @min(opts.limit, values.items.len) else values.items.len;
+    var rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &rows);
+    for (values.items[0..limit], 0..) |aggregate, idx| {
+        var row = query.Row.init(allocator);
+        errdefer row.deinit();
+        try row.putOwnedKey("rank", .{ .int = @intCast(idx + 1) });
+        try row.putOwnedKey("skill", .{ .string = aggregate.skill });
+        try row.putOwnedKey("successful_sessions", .{ .int = aggregate.successful_sessions });
+        try row.putOwnedKey("used_sessions", .{ .int = aggregate.used_sessions });
+        try row.putOwnedKey("called_sessions", .{ .int = @intCast(aggregate.called_sessions.count()) });
+        try row.putOwnedKey("assistant_used_sessions", .{ .int = @intCast(aggregate.assistant_sessions.count()) });
+        try row.putOwnedKey("blocked_sessions", .{ .int = aggregate.blocked_sessions });
+        try row.putOwnedKey("raw_sessions", .{ .int = @intCast(aggregate.raw_sessions.count()) });
+        try row.putOwnedKey("raw_mentions", .{ .int = aggregate.raw_mentions });
+        try putOptionalString(&row, "first_seen", aggregate.first_seen);
+        try putOptionalString(&row, "last_seen", aggregate.last_seen);
+        try rows.append(allocator, row);
+    }
+
+    const columns = [_][]const u8{
+        "rank",
+        "skill",
+        "successful_sessions",
+        "used_sessions",
+        "called_sessions",
+        "assistant_used_sessions",
+        "blocked_sessions",
+        "raw_sessions",
+        "raw_mentions",
+        "first_seen",
+        "last_seen",
+    };
+    try output.writeOutput(allocator, opts.format, rows.items, columns[0..], opts.out_path);
+}
+
+fn skillSuccessSummaryLessThan(_: void, lhs: *SkillSuccessAggregate, rhs: *SkillSuccessAggregate) bool {
+    if (lhs.successful_sessions != rhs.successful_sessions) return lhs.successful_sessions > rhs.successful_sessions;
+    if (lhs.used_sessions != rhs.used_sessions) return lhs.used_sessions > rhs.used_sessions;
+    const lhs_called: i64 = @intCast(lhs.called_sessions.count());
+    const rhs_called: i64 = @intCast(rhs.called_sessions.count());
+    if (lhs_called != rhs_called) return lhs_called > rhs_called;
+    return std.mem.order(u8, lhs.skill, rhs.skill) == .lt;
+}
+
+fn writeSkillSuccessSessionRows(
+    allocator: std.mem.Allocator,
+    aggregates: *std.StringHashMap(SkillSuccessAggregate),
+    outcomes: *const std.StringHashMap(SkillOutcome),
+    opts: Options,
+) !void {
+    var rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &rows);
+
+    var it = aggregates.iterator();
+    while (it.next()) |entry| {
+        var path_it = entry.value_ptr.called_sessions.map.keyIterator();
+        while (path_it.next()) |path_ptr| {
+            const path = path_ptr.*;
+            const outcome = outcomes.get(path) orelse SkillOutcome{};
+            const successful = outcome.positive_bits != 0;
+            const used = entry.value_ptr.assistant_sessions.contains(path) or successful;
+
+            var row = query.Row.init(allocator);
+            errdefer row.deinit();
+            try row.putOwnedKey("skill", .{ .string = entry.value_ptr.skill });
+            try row.putOwnedKey("successful", .{ .bool = successful });
+            try row.putOwnedKey("used", .{ .bool = used });
+            try row.putOwnedKey("blocked", .{ .bool = outcome.blocked });
+            try row.putOwnedKey("assistant_mentioned", .{ .bool = entry.value_ptr.assistant_sessions.contains(path) });
+            const outcome_text = try skillSuccessOutcomeTextAlloc(allocator, outcome);
+            defer allocator.free(outcome_text);
+            try row.putOwnedKey("outcomes", .{ .string = outcome_text });
+            try row.putOwnedKey("path", .{ .string = path });
+            try rows.append(allocator, row);
+        }
+    }
+
+    const query_spec = spec.QuerySpec{
+        .sort = &.{
+            .{ .field = "successful", .descending = true },
+            .{ .field = "skill", .descending = false },
+            .{ .field = "path", .descending = false },
+        },
+        .limit = opts.limit,
+    };
+    var result = try query.execute(allocator, rows.items, query_spec);
+    defer result.deinit(allocator);
+
+    const columns = [_][]const u8{ "skill", "successful", "used", "blocked", "assistant_mentioned", "outcomes", "path" };
+    try output.writeOutput(allocator, opts.format, result.rows.items, columns[0..], opts.out_path);
+}
+
+fn skillSuccessOutcomeTextAlloc(allocator: std.mem.Allocator, outcome: SkillOutcome) ![]u8 {
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(allocator);
+    if ((outcome.positive_bits & OUTCOME_TEST) != 0) try parts.append(allocator, "test");
+    if ((outcome.positive_bits & OUTCOME_PROOF) != 0) try parts.append(allocator, "proof");
+    if ((outcome.positive_bits & OUTCOME_COMMIT) != 0) try parts.append(allocator, "commit");
+    if ((outcome.positive_bits & OUTCOME_PR) != 0) try parts.append(allocator, "pr");
+    if ((outcome.positive_bits & OUTCOME_CLOSURE) != 0) try parts.append(allocator, "closure");
+    if (outcome.blocked) try parts.append(allocator, "blocked");
+    if (parts.items.len == 0) return allocator.dupe(u8, "");
+
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+    for (parts.items, 0..) |part, idx| {
+        if (idx > 0) try writer.writeByte('+');
+        try writer.writeAll(part);
+    }
+    return writer_alloc.toOwnedSlice();
 }
 
 fn cmdSkillTrend(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
@@ -13480,6 +13880,57 @@ test "workflow-audit reports a workflow cohort without cross-session contaminati
         const first_row = std.mem.indexOf(u8, got, "| 2026-") orelse return error.TestUnexpectedResult;
         try std.testing.expect(std.mem.indexOfPos(u8, got, first_row + 1, "| 2026-") == null);
     }
+}
+
+test "skill-success-rank counts called skills with positive outcomes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/05");
+    const prove_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-05T10:00:00Z\",\"payload\":{\"id\":\"prove-session\",\"cwd\":\"/repo/seq\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-05T10:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Use $prove-it on this claim\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-05T10:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Using `prove-it` for the driver.\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-05T10:00:03Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Proof complete. Validation passed and committed.\"}]}}\n";
+    const base_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-05T11:00:00Z\",\"payload\":{\"id\":\"base-session\",\"cwd\":\"/repo/seq\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-05T11:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Run codex review --base main. Proof available.\"}]}}\n";
+    const blocked_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-05T12:00:00Z\",\"payload\":{\"id\":\"blocked-session\",\"cwd\":\"/repo/seq\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-05T12:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Use $cas\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-05T12:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Blocked waiting for credentials.\"}]}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "sessions/2026/05/05/rollout-prove-session.jsonl",
+        .data = prove_content,
+    });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "sessions/2026/05/05/rollout-base-session.jsonl",
+        .data = base_content,
+    });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "sessions/2026/05/05/rollout-blocked-session.jsonl",
+        .data = blocked_content,
+    });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const summary_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "skill-success-summary.json" });
+    defer std.testing.allocator.free(summary_out);
+
+    const summary = try runCommandWithOutput(std.testing.allocator, .skill_success_rank, &.{ "--root", root_abs, "--since", "2026-05-05T00:00:00Z", "--until", "2026-05-06T00:00:00Z", "--format", "json" }, summary_out);
+    defer std.testing.allocator.free(summary);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "\"skill\": \"prove-it\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "\"successful_sessions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "\"skill\": \"base\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "\"skill\": \"cas\"") == null);
+
+    const sessions_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "skill-success-sessions.jsonl" });
+    defer std.testing.allocator.free(sessions_out);
+    const sessions = try runCommandWithOutput(std.testing.allocator, .skill_success_rank, &.{ "--root", root_abs, "--skill", "cas", "--mode", "sessions", "--format", "jsonl" }, sessions_out);
+    defer std.testing.allocator.free(sessions);
+    try std.testing.expect(std.mem.indexOf(u8, sessions, "\"skill\":\"cas\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sessions, "\"successful\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sessions, "\"blocked\":true") != null);
 }
 
 test "memory-inventory summarizes memory file categories" {
