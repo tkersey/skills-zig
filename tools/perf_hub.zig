@@ -104,6 +104,7 @@ const CompatCase = struct {
 
 const DeepSetup = enum {
     seq_query_tool_calls,
+    seq_sessions_limit,
     seq_session_tooling,
     seq_orchestration_concurrency,
     seq_datasets,
@@ -154,6 +155,7 @@ const DeepCase = struct {
 const SeqCases = [_]perf_contract.CaseDescriptor{
     .{ .case_id = "seq-help", .binary = "seq", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
     .{ .case_id = "seq-query-tool-calls", .binary = "seq", .family = "query", .case_kind = .native, .measurement_mode = .latency_alloc },
+    .{ .case_id = "seq-sessions-limit", .binary = "seq", .family = "sessions", .case_kind = .native, .measurement_mode = .latency_alloc },
     .{ .case_id = "seq-session-tooling", .binary = "seq", .family = "session-tooling", .case_kind = .native, .measurement_mode = .latency_alloc },
     .{ .case_id = "seq-orchestration-concurrency", .binary = "seq", .family = "orchestration-concurrency", .case_kind = .native, .measurement_mode = .latency_alloc },
     .{ .case_id = "seq-datasets", .binary = "seq", .family = "datasets", .case_kind = .native, .measurement_mode = .latency_alloc },
@@ -251,7 +253,7 @@ const MiscCoverages = [_]perf_contract.CommandCoverage{
 
 const CompatCases = [_]CompatCase{
     .{ .descriptor = SeqCases[0], .builder = .seq_local, .build_step = null, .binary_path = "zig-out/bin/seq", .setup = .seq_help },
-    .{ .descriptor = SeqCases[19], .builder = .seq_local, .build_step = null, .binary_path = "zig-out/bin/seq-perf-parser", .setup = .seq_parser_driver, .tolerance_pct = 20.0 },
+    .{ .descriptor = SeqCases[20], .builder = .seq_local, .build_step = null, .binary_path = "zig-out/bin/seq-perf-parser", .setup = .seq_parser_driver, .tolerance_pct = 20.0 },
     .{ .descriptor = MiscCases[0], .builder = .root, .build_step = "build-lift", .binary_path = "zig-out/bin/bench_stats", .setup = .bench_stats_help, .tolerance_pct = 25.0 },
     .{ .descriptor = MiscCases[1], .builder = .root, .build_step = "build-lift", .binary_path = "zig-out/bin/bench_stats", .setup = .bench_stats_parse, .tolerance_pct = 25.0 },
     .{ .descriptor = MiscCases[2], .builder = .root, .build_step = "build-lift", .binary_path = "zig-out/bin/perf_report", .setup = .perf_report_help, .tolerance_pct = 25.0 },
@@ -289,23 +291,24 @@ const CompatCases = [_]CompatCase{
 
 const DeepCases = [_]DeepCase{
     .{ .descriptor = SeqCases[1], .setup = .seq_query_tool_calls, .tolerance_pct = 25.0 },
-    .{ .descriptor = SeqCases[2], .setup = .seq_session_tooling, .tolerance_pct = 125.0 },
-    .{ .descriptor = SeqCases[3], .setup = .seq_orchestration_concurrency, .tolerance_pct = 125.0 },
-    .{ .descriptor = SeqCases[4], .setup = .seq_datasets, .tolerance_pct = 125.0 },
-    .{ .descriptor = SeqCases[5], .setup = .seq_dataset_schema, .tolerance_pct = 75.0 },
-    .{ .descriptor = SeqCases[6], .setup = .seq_artifact_search, .tolerance_pct = 25.0 },
-    .{ .descriptor = SeqCases[7], .setup = .seq_find_session, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[8], .setup = .seq_session_prompts, .tolerance_pct = 25.0 },
-    .{ .descriptor = SeqCases[9], .setup = .seq_query_diagnose, .tolerance_pct = 25.0 },
-    .{ .descriptor = SeqCases[10], .setup = .seq_skills_rank, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[11], .setup = .seq_skill_trend, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[12], .setup = .seq_skill_report, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[13], .setup = .seq_role_breakdown, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[14], .setup = .seq_occurrence_export, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[15], .setup = .seq_report_bundle, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[16], .setup = .seq_section_audit, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[17], .setup = .seq_token_usage, .tolerance_pct = 40.0 },
-    .{ .descriptor = SeqCases[18], .setup = .seq_routing_gap, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[2], .setup = .seq_sessions_limit, .tolerance_pct = 25.0 },
+    .{ .descriptor = SeqCases[3], .setup = .seq_session_tooling, .tolerance_pct = 125.0 },
+    .{ .descriptor = SeqCases[4], .setup = .seq_orchestration_concurrency, .tolerance_pct = 125.0 },
+    .{ .descriptor = SeqCases[5], .setup = .seq_datasets, .tolerance_pct = 125.0 },
+    .{ .descriptor = SeqCases[6], .setup = .seq_dataset_schema, .tolerance_pct = 75.0 },
+    .{ .descriptor = SeqCases[7], .setup = .seq_artifact_search, .tolerance_pct = 25.0 },
+    .{ .descriptor = SeqCases[8], .setup = .seq_find_session, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[9], .setup = .seq_session_prompts, .tolerance_pct = 25.0 },
+    .{ .descriptor = SeqCases[10], .setup = .seq_query_diagnose, .tolerance_pct = 25.0 },
+    .{ .descriptor = SeqCases[11], .setup = .seq_skills_rank, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[12], .setup = .seq_skill_trend, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[13], .setup = .seq_skill_report, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[14], .setup = .seq_role_breakdown, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[15], .setup = .seq_occurrence_export, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[16], .setup = .seq_report_bundle, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[17], .setup = .seq_section_audit, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[18], .setup = .seq_token_usage, .tolerance_pct = 40.0 },
+    .{ .descriptor = SeqCases[19], .setup = .seq_routing_gap, .tolerance_pct = 40.0 },
     .{ .descriptor = CronCases[2], .setup = .cron_show, .tolerance_pct = 200.0 },
     .{ .descriptor = CronCases[3], .setup = .cron_create, .tolerance_pct = 25.0 },
     .{ .descriptor = CronCases[4], .setup = .cron_update, .tolerance_pct = 25.0 },
@@ -332,6 +335,7 @@ fn buildSeqCoverages() [seq_cli.commandNames().len]perf_contract.CommandCoverage
     var out: [seq_cli.commandNames().len]perf_contract.CommandCoverage = undefined;
     for (seq_cli.commandNames(), 0..) |def, idx| {
         const coverage, const reason = if (std.mem.eql(u8, def.name, "query") or
+            std.mem.eql(u8, def.name, "sessions") or
             std.mem.eql(u8, def.name, "session-tooling") or
             std.mem.eql(u8, def.name, "orchestration-concurrency") or
             std.mem.eql(u8, def.name, "datasets") or
@@ -1006,6 +1010,7 @@ fn runDeepMeasuredCase(allocator: std.mem.Allocator, case_cfg: DeepCase) !Metric
 fn executeDeepCase(allocator: std.mem.Allocator, setup: DeepSetup, temp_root: []const u8) !void {
     switch (setup) {
         .seq_query_tool_calls => try seq_cli.runPerfCase(allocator, .query_tool_calls, temp_root),
+        .seq_sessions_limit => try seq_cli.runPerfCase(allocator, .sessions_limit, temp_root),
         .seq_session_tooling => try seq_cli.runPerfCase(allocator, .session_tooling, temp_root),
         .seq_orchestration_concurrency => try seq_cli.runPerfCase(allocator, .orchestration_concurrency, temp_root),
         .seq_datasets => try seq_cli.runPerfCase(allocator, .datasets, temp_root),

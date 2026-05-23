@@ -114,9 +114,17 @@ seq workflow-audit --root ~/.codex/sessions --workflow fixed-point-driver --mode
 
 Trace inventory:
 ```bash
+seq sessions --root ~/.codex/sessions --limit 10 --format table
 seq sessions --root ~/.codex/sessions --format table
 seq sessions --root ~/.codex/sessions --ongoing --format jsonl
 seq sessions --root ~/.codex/sessions --repo /path/to/repo --since 2026-04-01T00:00:00Z --format table
+```
+
+Unfiltered latest-session queries use the same newest-rollout fast path when
+sorted by descending `start_time` with a `limit`, so `seq query` can replace
+shell/JQ scans for recent session inventory:
+```bash
+seq query --root ~/.codex/sessions --spec '{"dataset":"sessions","select":["start_time","session_id","cwd","thread_name"],"sort":["-start_time"],"limit":10,"format":"table"}'
 ```
 
 Canonical turns:

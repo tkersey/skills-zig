@@ -521,6 +521,202 @@ pub fn parseSessionTrace(
     return trace;
 }
 
+pub fn parseSessionSummaryTrace(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    options: TraceParseOptions,
+) !CanonicalSessionTrace {
+    const file = try std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{});
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+
+    const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
+    var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const content = try reader.interface.allocRemaining(allocator, .limited(256 * 1024 * 1024));
+    defer allocator.free(content);
+
+    var trace = CanonicalSessionTrace{
+        .session = try SessionRecord.init(allocator, path),
+    };
+    errdefer trace.deinit(allocator);
+    trace.session.date_group = try deriveDateGroup(allocator, path);
+
+    var seen_turn_ids = std.StringHashMap(void).init(allocator);
+    defer {
+        var it = seen_turn_ids.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        seen_turn_ids.deinit();
+    }
+
+    var last_turn_open = false;
+    var line_it = std.mem.splitScalar(u8, content, '\n');
+    var line_number: usize = 0;
+    while (line_it.next()) |raw_line| {
+        line_number += 1;
+        const line = std.mem.trim(u8, raw_line, " \t\r\n");
+        if (line.len == 0) continue;
+
+        if (fastTimestampSlice(line)) |ts| {
+            if (trace.session.start_time == null) trace.session.start_time = try allocator.dupe(u8, ts);
+            try replaceOpt(allocator, &trace.session.end_time, ts);
+        }
+        if (!sessionSummaryLineCouldMatter(line)) continue;
+
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), line, .{}) catch {
+            try trace.warnings.append(allocator, try std.fmt.allocPrint(allocator, "{s}:{d}: malformed JSONL skipped", .{ path, line_number }));
+            continue;
+        };
+        const root = switch (parsed.value) {
+            .object => |obj| obj,
+            else => continue,
+        };
+        if (stringField(root, "record_type")) |record_type| {
+            if (std.mem.eql(u8, record_type, "state")) continue;
+        }
+
+        const root_type = stringField(root, "type");
+        const payload = objectField(root, "payload");
+        const timestamp = bestTimestamp(root);
+        if (trace.session.start_time == null) trace.session.start_time = try dupOpt(allocator, timestamp);
+        if (timestamp) |ts| try replaceOpt(allocator, &trace.session.end_time, ts);
+
+        if (root_type) |entry_type| {
+            if (std.mem.eql(u8, entry_type, "session_meta")) {
+                if (payload) |p| try applySessionMeta(allocator, &trace.session, p);
+                continue;
+            }
+            if (std.mem.eql(u8, entry_type, "turn_context")) {
+                if (payload) |p| try applySessionContextFields(allocator, &trace.session, p);
+                continue;
+            }
+            if (std.mem.eql(u8, entry_type, "event_msg")) {
+                const p = payload orelse continue;
+                const event_type = stringField(p, "type") orelse "";
+                if (std.mem.eql(u8, event_type, "task_started")) {
+                    try noteSummaryTurn(allocator, &trace.session, &seen_turn_ids, stringField(p, "turn_id"));
+                    last_turn_open = true;
+                    try replaceOpt(allocator, &trace.session.status_reason, "task_started");
+                } else if (std.mem.eql(u8, event_type, "task_complete")) {
+                    last_turn_open = false;
+                    try replaceOpt(allocator, &trace.session.status_reason, "task_complete");
+                } else if (std.mem.eql(u8, event_type, "turn_aborted")) {
+                    last_turn_open = false;
+                    try replaceOpt(allocator, &trace.session.status_reason, stringField(p, "reason") orelse "turn_aborted");
+                } else if (std.mem.eql(u8, event_type, "error")) {
+                    try noteSummaryTurn(allocator, &trace.session, &seen_turn_ids, stringField(p, "turn_id"));
+                    last_turn_open = false;
+                    try replaceOpt(allocator, &trace.session.status_reason, stringField(p, "message") orelse stringField(p, "error") orelse "error");
+                } else if (std.mem.eql(u8, event_type, "token_count")) {
+                    applyTokenCountToSession(&trace.session, p);
+                } else if (std.mem.eql(u8, event_type, "thread_name_updated")) {
+                    const name = stringField(p, "thread_name") orelse stringField(p, "name");
+                    if (name) |value| try replaceOpt(allocator, &trace.session.thread_name, value);
+                } else if (std.mem.eql(u8, event_type, "collab_agent_spawn_end")) {
+                    try appendGraphEdge(allocator, &trace, p, timestamp);
+                    trace.session.spawned_worker_count += 1;
+                }
+                continue;
+            }
+        }
+
+        if (root_type == null and payload != null) {
+            const p = payload.?;
+            if (stringField(p, "type")) |payload_type| {
+                if (std.mem.eql(u8, payload_type, "session_meta")) try applySessionMeta(allocator, &trace.session, p);
+            }
+            continue;
+        }
+
+        if (root_type == null and root.get("id") != null and root.get("timestamp") != null) {
+            try applySessionMeta(allocator, &trace.session, root);
+        }
+    }
+
+    const now_ns = nowRealtimeNs();
+    const age_secs = @divTrunc(now_ns - stat.mtime.nanoseconds, std.time.ns_per_s);
+    if (last_turn_open) {
+        if (age_secs <= options.ongoing_threshold_secs) {
+            trace.session.is_ongoing = true;
+            try replaceOpt(allocator, &trace.session.status_reason, "fresh_ongoing_turn");
+        } else {
+            try replaceOpt(allocator, &trace.session.status_reason, "stale_ongoing_file");
+        }
+    }
+    if (!trace.session.is_ongoing and trace.session.status_reason == null) {
+        if (trace.session.turn_count == 0) {
+            try replaceOpt(allocator, &trace.session.status_reason, "no_turns");
+        } else {
+            try replaceOpt(allocator, &trace.session.status_reason, "task_complete");
+        }
+    }
+    return trace;
+}
+
+fn sessionSummaryLineCouldMatter(line: []const u8) bool {
+    const prefix = line[0..@min(line.len, 96)];
+    if (std.mem.indexOf(u8, prefix, "\"type\":\"response_item\"") != null) return false;
+    if (std.mem.indexOf(u8, prefix, "\"type\":\"session_meta\"") != null) return true;
+    if (std.mem.indexOf(u8, prefix, "\"type\":\"turn_context\"") != null) return true;
+    if (std.mem.indexOf(u8, prefix, "\"type\":\"event_msg\"") != null) {
+        return std.mem.containsAtLeast(u8, line, 1, "task_started") or
+            std.mem.containsAtLeast(u8, line, 1, "task_complete") or
+            std.mem.containsAtLeast(u8, line, 1, "turn_aborted") or
+            std.mem.containsAtLeast(u8, line, 1, "token_count") or
+            std.mem.containsAtLeast(u8, line, 1, "thread_name_updated") or
+            std.mem.containsAtLeast(u8, line, 1, "collab_agent_spawn_end") or
+            std.mem.containsAtLeast(u8, line, 1, "\"error\"");
+    }
+    return std.mem.containsAtLeast(u8, line, 1, "\"id\"") and
+        std.mem.containsAtLeast(u8, line, 1, "\"timestamp\"");
+}
+
+fn fastTimestampSlice(line: []const u8) ?[]const u8 {
+    const key = "\"timestamp\"";
+    const pos = std.mem.indexOf(u8, line, key) orelse return null;
+    var i = pos + key.len;
+    while (i < line.len and std.ascii.isWhitespace(line[i])) : (i += 1) {}
+    if (i >= line.len or line[i] != ':') return null;
+    i += 1;
+    while (i < line.len and std.ascii.isWhitespace(line[i])) : (i += 1) {}
+    if (i >= line.len or line[i] != '"') return null;
+    i += 1;
+    const start = i;
+    while (i < line.len and line[i] != '"') : (i += 1) {
+        if (line[i] == '\\') return null;
+    }
+    if (i >= line.len) return null;
+    return line[start..i];
+}
+
+fn applySessionContextFields(allocator: std.mem.Allocator, session: *SessionRecord, ctx: std.json.ObjectMap) !void {
+    if (session.model == null) if (stringField(ctx, "model")) |v| try replaceOpt(allocator, &session.model, v);
+    if (session.cwd == null) if (stringField(ctx, "cwd")) |v| try replaceOpt(allocator, &session.cwd, v);
+}
+
+fn noteSummaryTurn(
+    allocator: std.mem.Allocator,
+    session: *SessionRecord,
+    seen_turn_ids: *std.StringHashMap(void),
+    turn_id_opt: ?[]const u8,
+) !void {
+    if (turn_id_opt) |turn_id| {
+        if (seen_turn_ids.contains(turn_id)) return;
+        try seen_turn_ids.put(try allocator.dupe(u8, turn_id), {});
+    }
+    session.turn_count += 1;
+}
+
+fn applyTokenCountToSession(session: *SessionRecord, payload: std.json.ObjectMap) void {
+    const info = objectField(payload, "info") orelse payload;
+    const total = objectField(info, "total_token_usage") orelse objectField(info, "last_token_usage") orelse return;
+    if (intField(total, "input_tokens")) |v| session.input_tokens = v;
+    if (intField(total, "cached_input_tokens")) |v| session.cached_input_tokens = v;
+    if (intField(total, "output_tokens")) |v| session.output_tokens = v;
+    if (intField(total, "reasoning_output_tokens")) |v| session.reasoning_output_tokens = v;
+    if (intField(total, "total_tokens")) |v| session.total_tokens = v;
+}
+
 fn objectField(root: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
     const value = root.get(key) orelse return null;
     return switch (value) {
@@ -1015,6 +1211,24 @@ test "parseSessionTrace reconstructs new complete turn" {
     try std.testing.expect(trace.turns.items[0].has_compaction);
     try std.testing.expectEqual(@as(usize, 1), trace.tools.items.len);
     try std.testing.expectEqual(ToolKind.exec_command, trace.tools.items[0].kind);
+}
+
+test "parseSessionSummaryTrace preserves session inventory fields" {
+    const path = try testPath(std.testing.allocator, "testdata/trace/new_044_plus.jsonl");
+    defer std.testing.allocator.free(path);
+    var full = try parseSessionTrace(std.testing.allocator, path, .{ .ongoing_threshold_secs = 0 });
+    defer full.deinit(std.testing.allocator);
+    var summary = try parseSessionSummaryTrace(std.testing.allocator, path, .{ .ongoing_threshold_secs = 0 });
+    defer summary.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(full.session.session_id.?, summary.session.session_id.?);
+    try std.testing.expectEqualStrings(full.session.start_time.?, summary.session.start_time.?);
+    try std.testing.expectEqualStrings(full.session.end_time.?, summary.session.end_time.?);
+    try std.testing.expectEqualStrings(full.session.cwd.?, summary.session.cwd.?);
+    try std.testing.expectEqual(full.session.turn_count, summary.session.turn_count);
+    try std.testing.expectEqual(full.session.total_tokens.?, summary.session.total_tokens.?);
+    try std.testing.expectEqual(full.session.is_ongoing, summary.session.is_ongoing);
+    try std.testing.expectEqualStrings(full.session.status_reason.?, summary.session.status_reason.?);
 }
 
 test "parseSessionTrace reconstructs old synthetic turns" {

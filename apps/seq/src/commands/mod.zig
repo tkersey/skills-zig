@@ -1713,6 +1713,10 @@ fn collectTraceDatasetRowsWithOptions(
     sessions_root: []const u8,
     opts: Options,
 ) !std.ArrayList(query.Row) {
+    if (std.mem.eql(u8, dataset_name, "sessions") and traceSessionsCanUseNewestPathFastPath(opts)) {
+        return collectNewestTraceSessionRows(allocator, sessions_root, opts);
+    }
+
     var rows: std.ArrayList(query.Row) = .empty;
     errdefer deinitQueryRows(allocator, &rows);
     var paths = try resolveTraceTargetPaths(allocator, sessions_root, opts, false);
@@ -1725,27 +1729,17 @@ fn collectTraceDatasetRowsWithOptions(
         inline_worker_ids.deinit();
     }
 
-    if (std.mem.eql(u8, dataset_name, "sessions")) {
-        for (paths.items) |path| {
-            var parsed = canonical_trace.parseSessionTrace(allocator, path, traceParseOptions(opts)) catch continue;
-            defer parsed.deinit(allocator);
+    for (paths.items) |path| {
+        var parsed = canonical_trace.parseSessionTrace(allocator, path, traceParseOptions(opts)) catch continue;
+        defer parsed.deinit(allocator);
+
+        if (std.mem.eql(u8, dataset_name, "sessions")) {
             for (parsed.graph_edges.items) |edge| {
                 if (edge.worker_session_id) |id| {
                     if (!inline_worker_ids.contains(id)) {
                         try inline_worker_ids.put(try allocator.dupe(u8, id), {});
                     }
                 }
-            }
-        }
-    }
-
-    for (paths.items) |path| {
-        var parsed = canonical_trace.parseSessionTrace(allocator, path, traceParseOptions(opts)) catch continue;
-        defer parsed.deinit(allocator);
-
-        if (std.mem.eql(u8, dataset_name, "sessions")) {
-            if (parsed.session.session_id) |id| {
-                if (inline_worker_ids.contains(id)) parsed.session.is_inline_worker = true;
             }
             if (traceSessionPassesOptions(parsed.session, opts)) try appendTraceSessionRow(allocator, &rows, parsed.session);
         } else if (std.mem.eql(u8, dataset_name, "turns")) {
@@ -1767,7 +1761,109 @@ fn collectTraceDatasetRowsWithOptions(
             return error.UnknownDataset;
         }
     }
+    if (std.mem.eql(u8, dataset_name, "sessions")) {
+        try markInlineWorkerRows(&rows, inline_worker_ids);
+    }
     return rows;
+}
+
+fn traceSessionsCanUseNewestPathFastPath(opts: Options) bool {
+    return opts.limit > 0 and
+        opts.path == null and
+        opts.session_id == null and
+        !opts.current and
+        opts.since == null and
+        opts.until == null and
+        opts.repo_text == null and
+        opts.contains == null and
+        !opts.ongoing and
+        !opts.completed and
+        opts.worker_kind_text == null and
+        !opts.include_raw;
+}
+
+fn traceSessionsQueryCanUseNewestPathFastPath(query_spec: spec.QuerySpec) bool {
+    return query_spec.limit > 0 and
+        query_spec.where.len == 0 and
+        query_spec.group_by.len == 0 and
+        query_spec.metrics.len == 0 and
+        query_spec.joins.len == 0 and
+        query_spec.sort.len == 1 and
+        query_spec.sort[0].descending and
+        std.mem.eql(u8, query_spec.sort[0].field, "start_time");
+}
+
+fn collectNewestTraceSessionRows(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    opts: Options,
+) !std.ArrayList(query.Row) {
+    var rows: std.ArrayList(query.Row) = .empty;
+    errdefer deinitQueryRows(allocator, &rows);
+
+    var paths = try collectTraceRolloutPaths(allocator, sessions_root);
+    defer freePathList(allocator, &paths);
+
+    var inline_worker_ids = std.StringHashMap(void).init(allocator);
+    defer {
+        var id_it = inline_worker_ids.keyIterator();
+        while (id_it.next()) |key| allocator.free(key.*);
+        inline_worker_ids.deinit();
+    }
+
+    const scaled_limit = std.math.mul(usize, opts.limit, 8) catch std.math.maxInt(usize);
+    const candidate_count = @min(paths.items.len, @max(scaled_limit, @as(usize, 64)));
+    const start_index = paths.items.len - candidate_count;
+    for (paths.items[start_index..]) |path| {
+        var parsed = canonical_trace.parseSessionSummaryTrace(allocator, path, traceParseOptions(opts)) catch continue;
+        defer parsed.deinit(allocator);
+        for (parsed.graph_edges.items) |edge| {
+            if (edge.worker_session_id) |id| {
+                if (!inline_worker_ids.contains(id)) {
+                    try inline_worker_ids.put(try allocator.dupe(u8, id), {});
+                }
+            }
+        }
+        try appendTraceSessionRow(allocator, &rows, parsed.session);
+    }
+    try markInlineWorkerRows(&rows, inline_worker_ids);
+    return rows;
+}
+
+fn markInlineWorkerRows(rows: *std.ArrayList(query.Row), inline_worker_ids: std.StringHashMap(void)) !void {
+    for (rows.items) |*row| {
+        const id = scalarString(row.valueOrNull("session_id")) orelse continue;
+        if (!inline_worker_ids.contains(id)) continue;
+        try row.putOwnedKey("is_inline_worker", .{ .bool = true });
+        const is_external = switch (row.valueOrNull("is_external_worker")) {
+            .bool => |flag| flag,
+            else => false,
+        };
+        if (!is_external) try row.putOwnedKey("worker_kind", .{ .string = "inline" });
+    }
+}
+
+fn collectTraceDatasetRowsFromSpec(
+    allocator: std.mem.Allocator,
+    dataset_name: []const u8,
+    sessions_root: []const u8,
+    query_spec: spec.QuerySpec,
+) !std.ArrayList(query.Row) {
+    var opts = Options{};
+    if (paramString(query_spec.params, "path")) |path| opts.path = path;
+    if (paramString(query_spec.params, "session_id")) |id| opts.session_id = id;
+    if (paramBool(query_spec.params, "include_raw")) |flag| opts.include_raw = flag;
+    if (std.mem.eql(u8, dataset_name, "sessions") and traceSessionsQueryCanUseNewestPathFastPath(query_spec)) {
+        opts.limit = query_spec.limit;
+    }
+
+    if (paramString(query_spec.params, "root")) |root| {
+        const resolved = try resolveSessionsRoot(allocator, root);
+        defer allocator.free(resolved);
+        return collectTraceDatasetRowsWithOptions(allocator, dataset_name, resolved, opts);
+    }
+
+    return collectTraceDatasetRowsWithOptions(allocator, dataset_name, sessions_root, opts);
 }
 
 fn collectTraceDatasetRowsFromParams(
@@ -10139,6 +10235,13 @@ fn collectDatasetRowsForSpec(
     if (std.mem.eql(u8, dataset_name, "opencode_sessions")) {
         return collectOpencodeSessionRowsFromSpec(allocator, query_spec);
     }
+    if (std.mem.eql(u8, dataset_name, "sessions") or
+        std.mem.eql(u8, dataset_name, "turns") or
+        std.mem.eql(u8, dataset_name, "tool_lifecycle") or
+        std.mem.eql(u8, dataset_name, "session_graph_edges"))
+    {
+        return collectTraceDatasetRowsFromSpec(allocator, dataset_name, sessions_root, query_spec);
+    }
     return collectDatasetRows(allocator, dataset_name, sessions_root, query_spec.params, query_spec.where);
 }
 
@@ -13071,6 +13174,50 @@ test "collectJsonlPaths applies day filter pushdown on path dates" {
     try std.testing.expectEqual(@as(usize, 2), paths.items.len);
     try std.testing.expect(std.mem.containsAtLeast(u8, paths.items[0], 1, "/2026/02/27/") or std.mem.containsAtLeast(u8, paths.items[1], 1, "/2026/02/27/"));
     try std.testing.expect(std.mem.containsAtLeast(u8, paths.items[0], 1, "/2026/03/01/") or std.mem.containsAtLeast(u8, paths.items[1], 1, "/2026/03/01/"));
+}
+
+test "sessions limit uses newest rollout path candidates" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/01/01");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/01/02");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/01/03");
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "sessions/2026/01/01/rollout-2026-01-01T00-00-00-old.jsonl",
+        .data = "{\"type\":\"session_meta\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"payload\":{\"id\":\"old-session\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n",
+    });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "sessions/2026/01/02/rollout-2026-01-02T00-00-00-mid.jsonl",
+        .data = "{\"type\":\"session_meta\",\"timestamp\":\"2026-01-02T00:00:00Z\",\"payload\":{\"id\":\"mid-session\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n",
+    });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "sessions/2026/01/03/rollout-2026-01-03T00-00-00-new.jsonl",
+        .data = "{\"type\":\"session_meta\",\"timestamp\":\"2026-01-03T00:00:00Z\",\"payload\":{\"id\":\"new-session\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n",
+    });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const tmp_root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(tmp_root);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_root, "sessions-output.json" });
+    defer std.testing.allocator.free(output_path);
+    const got = try runCommandWithOutput(std.testing.allocator, .sessions, &.{ "--root", root_abs, "--limit", "2", "--format", "json" }, output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"session_id\": \"new-session\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"session_id\": \"mid-session\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"session_id\": \"old-session\"") == null);
+
+    const query_spec =
+        \\{"dataset":"sessions","select":["session_id","start_time"],"sort":["-start_time"],"limit":2,"format":"json"}
+    ;
+    const query_got = try runCommandWithOutput(std.testing.allocator, .query, &.{ "--root", root_abs, "--spec", query_spec }, output_path);
+    defer std.testing.allocator.free(query_got);
+
+    try std.testing.expect(std.mem.indexOf(u8, query_got, "new-session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, query_got, "mid-session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, query_got, "old-session") == null);
 }
 
 test "deriveSessionDayPathFilter widens timestamp bounds for safe path pushdown" {

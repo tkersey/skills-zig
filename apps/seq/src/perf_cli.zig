@@ -10,6 +10,7 @@ pub fn commandNames() []const CommandDef {
 
 pub const PerfCase = enum {
     query_tool_calls,
+    sessions_limit,
     session_tooling,
     orchestration_concurrency,
     datasets,
@@ -51,6 +52,11 @@ pub fn runPerfCase(allocator: std.mem.Allocator, perf_case: PerfCase, temp_root:
         .query_tool_calls => try runCommandWithOutput(allocator, .query, &.{
             "--root", sessions_root,
             "--spec", query_spec_arg,
+        }, output_path),
+        .sessions_limit => try runCommandWithOutput(allocator, .sessions, &.{
+            "--root",   sessions_root,
+            "--limit",  "5",
+            "--format", "json",
         }, output_path),
         .session_tooling => try runCommandWithOutput(allocator, .session_tooling, &.{
             "--root",     sessions_root,
@@ -167,6 +173,7 @@ test "runPerfCase covers promoted native seq families" {
 
     const cases = [_]PerfCase{
         .query_tool_calls,
+        .sessions_limit,
         .session_tooling,
         .orchestration_concurrency,
         .datasets,
