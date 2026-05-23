@@ -3254,22 +3254,7 @@ const QueryLiftCommands = struct {
         defer params.deinit(allocator);
 
         if (std.mem.eql(u8, mode, "categories")) {
-            try appendMemoryParams(allocator, &params, opts, false);
-            try appendOptionalContains(allocator, &where, "relative_path", opts.contains);
-            try appendOptionalRegex(allocator, &where, "relative_path", opts.regex);
-            const query_spec = spec.QuerySpec{
-                .where = where.items,
-                .params = params.items,
-                .group_by = &.{ "category", "extension" },
-                .metrics = &.{
-                    .{ .op = .count, .alias = "files" },
-                    .{ .op = .sum, .field = "size_bytes", .alias = "bytes" },
-                    .{ .op = .max, .field = "modified_at", .alias = "latest_modified" },
-                },
-                .sort = &.{.{ .field = "files", .descending = true }},
-                .limit = opts.limit,
-            };
-            return runQueryLiftDataset(allocator, "memory_files", sessions_root, query_spec, opts, memory_inventory_category_columns[0..]);
+            return cmdMemoryInventoryCategories(allocator, opts);
         }
 
         if (std.mem.eql(u8, mode, "files")) {
@@ -3329,6 +3314,89 @@ const QueryLiftCommands = struct {
         }
 
         return error.InvalidModeArg;
+    }
+
+    const MemoryCategoryBucket = struct {
+        category: []const u8,
+        extension: []const u8,
+        files: i64 = 0,
+        bytes: i64 = 0,
+        latest_modified: []const u8 = "",
+    };
+
+    fn cmdMemoryInventoryCategories(allocator: std.mem.Allocator, opts: Options) !void {
+        var file_options = datasets.memory_files.Options{};
+        if (opts.memory_root_text) |memory_root| file_options.memory_root = memory_root;
+
+        const regex_atoms = if (opts.regex) |pattern| try query.compileTextPatternAtoms(allocator, pattern) else null;
+        defer if (regex_atoms) |atoms| allocator.free(atoms);
+
+        var parsed = try datasets.memory_files.collect(allocator, file_options);
+        defer datasets.memory_files.deinitRows(allocator, &parsed);
+
+        var buckets: std.ArrayList(MemoryCategoryBucket) = .empty;
+        defer buckets.deinit(allocator);
+        var index = std.StringHashMap(usize).init(allocator);
+        defer deinitStringIndex(allocator, &index);
+
+        for (parsed.items) |row| {
+            if (opts.contains) |needle| {
+                if (!containsIgnoreCaseAscii(row.relative_path, needle)) continue;
+            }
+            if (regex_atoms) |atoms| {
+                if (!query.textMatchesPatternAtoms(row.relative_path, atoms, true)) continue;
+            }
+
+            const key = try memoryCategoryKeyAlloc(allocator, row.category, row.extension);
+            const gop = try index.getOrPut(key);
+            if (gop.found_existing) {
+                allocator.free(key);
+            } else {
+                gop.value_ptr.* = buckets.items.len;
+                try buckets.append(allocator, .{
+                    .category = row.category,
+                    .extension = row.extension,
+                });
+            }
+
+            const bucket = &buckets.items[gop.value_ptr.*];
+            bucket.files += 1;
+            bucket.bytes += @intCast(row.size_bytes);
+            if (bucket.latest_modified.len == 0 or std.mem.order(u8, row.modified_at, bucket.latest_modified) == .gt) {
+                bucket.latest_modified = row.modified_at;
+            }
+        }
+
+        std.mem.sort(MemoryCategoryBucket, buckets.items, {}, memoryCategoryBucketLess);
+
+        var out_rows: std.ArrayList(query.Row) = .empty;
+        defer deinitQueryRows(allocator, &out_rows);
+        const limit = if (opts.limit > 0) @min(opts.limit, buckets.items.len) else buckets.items.len;
+        for (buckets.items[0..limit]) |bucket| {
+            var qrow = query.Row.init(allocator);
+            try qrow.putOwnedKey("category", .{ .string = bucket.category });
+            try qrow.putOwnedKey("extension", .{ .string = bucket.extension });
+            try qrow.putOwnedKey("files", .{ .int = bucket.files });
+            try qrow.putOwnedKey("bytes", .{ .int = bucket.bytes });
+            try qrow.putOwnedKey("latest_modified", .{ .string = bucket.latest_modified });
+            try out_rows.append(allocator, qrow);
+        }
+
+        try output.writeOutput(allocator, opts.format, out_rows.items, memory_inventory_category_columns[0..], opts.out_path);
+    }
+
+    fn deinitStringIndex(allocator: std.mem.Allocator, index: *std.StringHashMap(usize)) void {
+        var it = index.keyIterator();
+        while (it.next()) |key| allocator.free(key.*);
+        index.deinit();
+    }
+
+    fn memoryCategoryKeyAlloc(allocator: std.mem.Allocator, category: []const u8, extension: []const u8) ![]u8 {
+        return std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ category, extension });
+    }
+
+    fn memoryCategoryBucketLess(_: void, lhs: MemoryCategoryBucket, rhs: MemoryCategoryBucket) bool {
+        return lhs.files > rhs.files;
     }
 
     fn cmdMessageSearch(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
