@@ -18,7 +18,7 @@ const UsageText =
     \\Control detached Codex review sessions via the app-server.
     \\
     \\Usage:
-    \\  cas_review_session <start|status|wait|interrupt|lane> [options]
+    \\  cas_review_session <start|status|wait|interrupt|lane|receipt> [options]
     \\
     \\Actions:
     \\  start      Start a detached review session and persist its handle.
@@ -26,6 +26,7 @@ const UsageText =
     \\  wait       Poll the persisted session until the review turn reaches a terminal status.
     \\  interrupt  Interrupt the persisted detached review turn.
     \\  lane       Reuse one managed app-server for multiple fresh-parent reviews.
+    \\  receipt    Summarize saved CAS review receipts without touching review state.
     \\
     \\Lane actions:
     \\  lane start   Start a reusable review lane.
@@ -68,6 +69,10 @@ const UsageText =
     \\Common options:
     \\  --json                           Emit machine-readable JSON.
     \\  --verdict-only                   Emit only the compact reviewVerdict JSON for lane review.
+    \\  --path FILE                      Receipt file to summarize; repeatable for receipt.
+    \\  --glob PATTERN                   Simple receipt glob; repeatable for receipt.
+    \\  --format FORMAT                  Receipt output: table|json|jsonl (default: table).
+    \\  --summary                        Include aggregate receipt counts.
     \\  --timeout-ms N                   Wait timeout for `wait` (default: 300000).
     \\  --poll-interval-ms N             Poll interval for `wait` (default: 250).
     \\  --help                           Show help.
@@ -83,6 +88,7 @@ const UsageText =
     \\  cas review_session interrupt --review-thread-id thr_123 --json
     \\  cas review_session lane start --cwd /path/to/repo --json
     \\  cas review_session lane review --lane-id lane_123 --base main --json
+    \\  cas review_session receipt --path review-1.json --format table --summary
     \\  cas review_session lane stop --lane-id lane_123 --json
 ;
 
@@ -92,6 +98,7 @@ const Action = enum {
     wait,
     interrupt,
     lane,
+    receipt,
 
     fn parse(raw: []const u8) ?Action {
         if (std.mem.eql(u8, raw, "start")) return .start;
@@ -99,6 +106,7 @@ const Action = enum {
         if (std.mem.eql(u8, raw, "wait")) return .wait;
         if (std.mem.eql(u8, raw, "interrupt")) return .interrupt;
         if (std.mem.eql(u8, raw, "lane")) return .lane;
+        if (std.mem.eql(u8, raw, "receipt")) return .receipt;
         return null;
     }
 };
@@ -139,6 +147,19 @@ const FallbackMode = enum {
         if (std.mem.eql(u8, raw, "none")) return .none;
         if (std.mem.eql(u8, raw, "native-review")) return .native_review;
         if (std.mem.eql(u8, raw, "native_review")) return .native_review;
+        return null;
+    }
+};
+
+const ReceiptFormat = enum {
+    table,
+    json,
+    jsonl,
+
+    fn parse(raw: []const u8) ?ReceiptFormat {
+        if (std.mem.eql(u8, raw, "table")) return .table;
+        if (std.mem.eql(u8, raw, "json")) return .json;
+        if (std.mem.eql(u8, raw, "jsonl")) return .jsonl;
         return null;
     }
 };
@@ -192,6 +213,10 @@ const ParsedArgs = struct {
     read_only: bool = false,
     hook_policy: cas.hooks.HookPolicy = .inherit,
     fallback_mode: FallbackMode = .none,
+    receipt_paths: []const []const u8 = &.{},
+    receipt_globs: []const []const u8 = &.{},
+    receipt_format: ReceiptFormat = .table,
+    receipt_summary: bool = false,
     show_help: bool = false,
     show_version: bool = false,
 };
@@ -426,11 +451,14 @@ pub fn main(init: std.process.Init) !void {
         .wait => try cmdWait(allocator, init.io, parsed),
         .interrupt => try cmdInterrupt(allocator, init.io, parsed),
         .lane => try cmdLane(allocator, init.io, parsed),
+        .receipt => try cmdReceipt(allocator, parsed),
     }
 }
 
 fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs {
     var out = ParsedArgs{};
+    var receipt_paths: std.ArrayList([]const u8) = .empty;
+    var receipt_globs: std.ArrayList([]const u8) = .empty;
     if (argv.len <= 1) return out;
 
     var i: usize = 1;
@@ -481,6 +509,10 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
         }
         if (std.mem.eql(u8, arg, "--no-archive")) {
             out.archive_lane_threads = false;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--summary")) {
+            out.receipt_summary = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "--uncommitted")) {
@@ -578,8 +610,23 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             out.fallback_mode = FallbackMode.parse(value) orelse return error.InvalidFallbackMode;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--path")) {
+            try receipt_paths.append(allocator, value);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--glob")) {
+            try receipt_globs.append(allocator, value);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--format")) {
+            out.receipt_format = ReceiptFormat.parse(value) orelse return error.InvalidReceiptFormat;
+            continue;
+        }
         return error.UnknownArg;
     }
+
+    out.receipt_paths = try receipt_paths.toOwnedSlice(allocator);
+    out.receipt_globs = try receipt_globs.toOwnedSlice(allocator);
 
     switch (out.action.?) {
         .start => {
@@ -602,6 +649,9 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             .status, .stop => {
                 if (out.lane_id == null) return error.MissingLaneId;
             },
+        },
+        .receipt => {
+            if (out.receipt_paths.len == 0 and out.receipt_globs.len == 0) return error.MissingReceiptInput;
         },
     }
 
@@ -1668,6 +1718,117 @@ fn cmdInterrupt(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !v
             loaded.record_path,
         });
     }
+}
+
+const NormalizedReceipt = struct {
+    source_path: []const u8,
+    status: []const u8,
+    backend_class: []const u8,
+    clean: bool,
+    finding_count: usize,
+    base_sha: ?[]const u8,
+    head_sha: ?[]const u8,
+    target_fingerprint: ?[]const u8,
+    review_thread_id: ?[]const u8,
+    review_turn_id: ?[]const u8,
+    record_path: ?[]const u8,
+    event_log_path: ?[]const u8,
+    failure_code: ?[]const u8,
+    failure_hint: ?[]const u8,
+    findings_json: []const u8,
+
+    fn deinit(self: NormalizedReceipt, allocator: std.mem.Allocator) void {
+        allocator.free(self.source_path);
+        allocator.free(self.status);
+        allocator.free(self.backend_class);
+        if (self.base_sha) |value| allocator.free(value);
+        if (self.head_sha) |value| allocator.free(value);
+        if (self.target_fingerprint) |value| allocator.free(value);
+        if (self.review_thread_id) |value| allocator.free(value);
+        if (self.review_turn_id) |value| allocator.free(value);
+        if (self.record_path) |value| allocator.free(value);
+        if (self.event_log_path) |value| allocator.free(value);
+        if (self.failure_code) |value| allocator.free(value);
+        if (self.failure_hint) |value| allocator.free(value);
+        allocator.free(self.findings_json);
+    }
+};
+
+const ReceiptError = struct {
+    source_path: []const u8,
+    message: []const u8,
+
+    fn deinit(self: ReceiptError, allocator: std.mem.Allocator) void {
+        allocator.free(self.source_path);
+        allocator.free(self.message);
+    }
+};
+
+const ReceiptSummary = struct {
+    total: usize = 0,
+    clean: usize = 0,
+    findings: usize = 0,
+    timeout: usize = 0,
+    parse_mismatch: usize = 0,
+    transport_failure: usize = 0,
+    incomplete: usize = 0,
+    other_status: usize = 0,
+    cas_lane: usize = 0,
+    cas_native_fallback: usize = 0,
+    other_backend: usize = 0,
+};
+
+fn cmdReceipt(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
+    var paths: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit(allocator);
+    }
+
+    for (parsed.receipt_paths) |path| {
+        try paths.append(allocator, try allocator.dupe(u8, path));
+    }
+    for (parsed.receipt_globs) |pattern| {
+        try expandReceiptGlob(allocator, pattern, &paths);
+    }
+    std.mem.sort([]const u8, paths.items, {}, lessThanString);
+
+    var receipts: std.ArrayList(NormalizedReceipt) = .empty;
+    defer {
+        for (receipts.items) |receipt| receipt.deinit(allocator);
+        receipts.deinit(allocator);
+    }
+    var errors: std.ArrayList(ReceiptError) = .empty;
+    defer {
+        for (errors.items) |err| err.deinit(allocator);
+        errors.deinit(allocator);
+    }
+
+    if (paths.items.len == 0) {
+        try errors.append(allocator, .{
+            .source_path = try allocator.dupe(u8, "<input>"),
+            .message = try allocator.dupe(u8, "no receipt files matched"),
+        });
+    }
+
+    for (paths.items) |path| {
+        const receipt = normalizeReceiptFromPathAlloc(allocator, path) catch |err| {
+            try errors.append(allocator, .{
+                .source_path = try allocator.dupe(u8, path),
+                .message = try allocator.dupe(u8, @errorName(err)),
+            });
+            continue;
+        };
+        try receipts.append(allocator, receipt);
+    }
+
+    const summary = summarizeReceipts(receipts.items);
+    switch (parsed.receipt_format) {
+        .table => try printReceiptTable(receipts.items, errors.items, if (parsed.receipt_summary) summary else null),
+        .json => try printReceiptJson(receipts.items, errors.items, if (parsed.receipt_summary) summary else null),
+        .jsonl => try printReceiptJsonl(receipts.items, errors.items, if (parsed.receipt_summary) summary else null),
+    }
+    if (errors.items.len > 0) std.process.exit(1);
 }
 
 fn cmdLane(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
@@ -4034,6 +4195,58 @@ fn writeNullableJsonUsize(writer: *std.Io.Writer, value: ?usize) !void {
     if (value) |number| try writer.print("{d}", .{number}) else try writer.writeAll("null");
 }
 
+fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]const u8 {
+    if (std.fs.path.isAbsolute(path)) {
+        var file = try std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{});
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
+        var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+        return reader.interface.allocRemaining(allocator, .limited(max_bytes));
+    }
+    var file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{});
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
+    return reader.interface.allocRemaining(allocator, .limited(max_bytes));
+}
+
+fn lessThanString(_: void, left: []const u8, right: []const u8) bool {
+    return std.mem.order(u8, left, right) == .lt;
+}
+
+fn expandReceiptGlob(allocator: std.mem.Allocator, pattern: []const u8, out: *std.ArrayList([]const u8)) !void {
+    if (std.mem.indexOfScalar(u8, pattern, '*') == null) {
+        try out.append(allocator, try allocator.dupe(u8, pattern));
+        return;
+    }
+    const slash_idx = std.mem.lastIndexOfScalar(u8, pattern, '/');
+    const dir_path = if (slash_idx) |idx|
+        if (idx == 0) "/" else pattern[0..idx]
+    else
+        ".";
+    const file_pat = if (slash_idx) |idx| pattern[idx + 1 ..] else pattern;
+    const star_idx = std.mem.indexOfScalar(u8, file_pat, '*') orelse return;
+    const prefix = file_pat[0..star_idx];
+    const suffix = file_pat[star_idx + 1 ..];
+
+    var dir = if (std.fs.path.isAbsolute(dir_path))
+        try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), dir_path, .{ .iterate = true })
+    else
+        try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), dir_path, .{ .iterate = true });
+    defer dir.close(std.Io.Threaded.global_single_threaded.io());
+    var it = dir.iterate();
+    while (try it.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
+        if (!std.mem.endsWith(u8, entry.name, suffix)) continue;
+        const full = if (std.mem.eql(u8, dir_path, "."))
+            try allocator.dupe(u8, entry.name)
+        else if (std.mem.eql(u8, dir_path, "/"))
+            try std.fmt.allocPrint(allocator, "/{s}", .{entry.name})
+        else
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
+        try out.append(allocator, full);
+    }
+}
+
 fn jsonStringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const value = obj.get(key) orelse return null;
     return switch (value) {
@@ -4049,6 +4262,268 @@ fn jsonI64Field(obj: std.json.ObjectMap, key: []const u8) ?i64 {
         .float => |number| @intFromFloat(number),
         else => null,
     };
+}
+
+fn jsonBoolField(obj: std.json.ObjectMap, key: []const u8) ?bool {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .bool => |flag| flag,
+        else => null,
+    };
+}
+
+fn jsonUsizeField(obj: std.json.ObjectMap, key: []const u8) ?usize {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .integer => |number| if (number >= 0) @intCast(number) else null,
+        else => null,
+    };
+}
+
+fn dupOptional(allocator: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
+    return if (value) |text| try allocator.dupe(u8, text) else null;
+}
+
+fn optionalStringFromVerdictOrRoot(verdict: std.json.ObjectMap, root: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    return jsonStringField(verdict, key) orelse jsonStringField(root, key);
+}
+
+fn stringifyJsonValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(value, .{}, &out.writer);
+    return out.toOwnedSlice();
+}
+
+fn normalizeReceiptFromPathAlloc(allocator: std.mem.Allocator, path: []const u8) !NormalizedReceipt {
+    const raw = try readFileAlloc(allocator, path, 8 * 1024 * 1024);
+    defer allocator.free(raw);
+    return normalizeReceiptFromJsonAlloc(allocator, path, raw);
+}
+
+fn normalizeReceiptFromJsonAlloc(allocator: std.mem.Allocator, source_path: []const u8, raw: []const u8) !NormalizedReceipt {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidReceiptJson,
+    };
+    const verdict = if (root.get("reviewVerdict")) |value| switch (value) {
+        .object => |obj| obj,
+        else => return error.InvalidReviewVerdict,
+    } else root;
+
+    const receipt_status = jsonStringField(verdict, "status") orelse return error.MissingReceiptStatus;
+    const backend_class = jsonStringField(verdict, "backendClass") orelse return error.MissingBackendClass;
+    const clean = jsonBoolField(verdict, "clean") orelse return error.MissingCleanFlag;
+    const finding_count = jsonUsizeField(verdict, "findingCount") orelse return error.MissingFindingCount;
+    const findings_json = if (verdict.get("findings")) |value|
+        try stringifyJsonValueAlloc(allocator, value)
+    else
+        try allocator.dupe(u8, "[]");
+
+    return .{
+        .source_path = try allocator.dupe(u8, source_path),
+        .status = try allocator.dupe(u8, receipt_status),
+        .backend_class = try allocator.dupe(u8, backend_class),
+        .clean = clean,
+        .finding_count = finding_count,
+        .base_sha = try dupOptional(allocator, optionalStringFromVerdictOrRoot(verdict, root, "baseSha")),
+        .head_sha = try dupOptional(allocator, optionalStringFromVerdictOrRoot(verdict, root, "headSha")),
+        .target_fingerprint = try dupOptional(allocator, optionalStringFromVerdictOrRoot(verdict, root, "targetFingerprint")),
+        .review_thread_id = try dupOptional(allocator, optionalStringFromVerdictOrRoot(verdict, root, "reviewThreadId")),
+        .review_turn_id = try dupOptional(allocator, optionalStringFromVerdictOrRoot(verdict, root, "reviewTurnId")),
+        .record_path = try dupOptional(allocator, optionalStringFromVerdictOrRoot(verdict, root, "recordPath")),
+        .event_log_path = try dupOptional(allocator, optionalStringFromVerdictOrRoot(verdict, root, "eventLogPath")),
+        .failure_code = try dupOptional(allocator, optionalStringFromVerdictOrRoot(verdict, root, "failureCode")),
+        .failure_hint = try dupOptional(allocator, optionalStringFromVerdictOrRoot(verdict, root, "failureHint")),
+        .findings_json = findings_json,
+    };
+}
+
+fn summarizeReceipts(receipts: []const NormalizedReceipt) ReceiptSummary {
+    var summary = ReceiptSummary{ .total = receipts.len };
+    for (receipts) |receipt| {
+        if (std.mem.eql(u8, receipt.status, "clean")) summary.clean += 1 else if (std.mem.eql(u8, receipt.status, "findings")) summary.findings += 1 else if (std.mem.eql(u8, receipt.status, "timeout")) summary.timeout += 1 else if (std.mem.eql(u8, receipt.status, "parse_mismatch")) summary.parse_mismatch += 1 else if (std.mem.eql(u8, receipt.status, "transport_failure")) summary.transport_failure += 1 else if (std.mem.eql(u8, receipt.status, "incomplete")) summary.incomplete += 1 else summary.other_status += 1;
+        if (std.mem.eql(u8, receipt.backend_class, "cas-lane")) summary.cas_lane += 1 else if (std.mem.eql(u8, receipt.backend_class, "cas-native-fallback")) summary.cas_native_fallback += 1 else summary.other_backend += 1;
+    }
+    return summary;
+}
+
+fn writeReceiptObject(writer: *std.Io.Writer, receipt: NormalizedReceipt) !void {
+    try writer.writeByte('{');
+    try writeJsonString(writer, "sourcePath");
+    try writer.writeByte(':');
+    try writeJsonString(writer, receipt.source_path);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "status");
+    try writer.writeByte(':');
+    try writeJsonString(writer, receipt.status);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "backendClass");
+    try writer.writeByte(':');
+    try writeJsonString(writer, receipt.backend_class);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "clean");
+    try writer.writeByte(':');
+    try writer.writeAll(if (receipt.clean) "true" else "false");
+    try writer.writeByte(',');
+    try writeJsonString(writer, "findingCount");
+    try writer.writeByte(':');
+    try writer.print("{d}", .{receipt.finding_count});
+    try writer.writeByte(',');
+    try writeJsonString(writer, "baseSha");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.base_sha);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "headSha");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.head_sha);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "targetFingerprint");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.target_fingerprint);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "reviewThreadId");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.review_thread_id);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "reviewTurnId");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.review_turn_id);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "recordPath");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.record_path);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "eventLogPath");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.event_log_path);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "failureCode");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.failure_code);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "failureHint");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.failure_hint);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "findings");
+    try writer.writeByte(':');
+    try writer.writeAll(receipt.findings_json);
+    try writer.writeByte('}');
+}
+
+fn writeReceiptErrorObject(writer: *std.Io.Writer, err: ReceiptError) !void {
+    try writer.writeByte('{');
+    try writeJsonString(writer, "sourcePath");
+    try writer.writeByte(':');
+    try writeJsonString(writer, err.source_path);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "error");
+    try writer.writeByte(':');
+    try writeJsonString(writer, err.message);
+    try writer.writeByte('}');
+}
+
+fn writeReceiptSummaryObject(writer: *std.Io.Writer, summary: ReceiptSummary) !void {
+    try writer.print(
+        "{{\"total\":{d},\"status\":{{\"clean\":{d},\"findings\":{d},\"timeout\":{d},\"parse_mismatch\":{d},\"transport_failure\":{d},\"incomplete\":{d},\"other\":{d}}},\"backendClass\":{{\"cas-lane\":{d},\"cas-native-fallback\":{d},\"other\":{d}}}}}",
+        .{
+            summary.total,
+            summary.clean,
+            summary.findings,
+            summary.timeout,
+            summary.parse_mismatch,
+            summary.transport_failure,
+            summary.incomplete,
+            summary.other_status,
+            summary.cas_lane,
+            summary.cas_native_fallback,
+            summary.other_backend,
+        },
+    );
+}
+
+fn printReceiptJson(receipts: []const NormalizedReceipt, errors: []const ReceiptError, summary: ?ReceiptSummary) !void {
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"receipts\":[");
+    for (receipts, 0..) |receipt, i| {
+        if (i > 0) try stdout.writeByte(',');
+        try writeReceiptObject(stdout, receipt);
+    }
+    try stdout.writeAll("],\"summary\":");
+    if (summary) |value| try writeReceiptSummaryObject(stdout, value) else try stdout.writeAll("null");
+    try stdout.writeAll(",\"errors\":[");
+    for (errors, 0..) |err, i| {
+        if (i > 0) try stdout.writeByte(',');
+        try writeReceiptErrorObject(stdout, err);
+    }
+    try stdout.writeAll("]}\n");
+}
+
+fn printReceiptJsonl(receipts: []const NormalizedReceipt, errors: []const ReceiptError, summary: ?ReceiptSummary) !void {
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    for (receipts) |receipt| {
+        try writeReceiptObject(stdout, receipt);
+        try stdout.writeByte('\n');
+    }
+    for (errors) |err| {
+        try stdout.writeAll("{\"recordType\":\"error\",");
+        try writeJsonString(stdout, "sourcePath");
+        try stdout.writeByte(':');
+        try writeJsonString(stdout, err.source_path);
+        try stdout.writeByte(',');
+        try writeJsonString(stdout, "error");
+        try stdout.writeByte(':');
+        try writeJsonString(stdout, err.message);
+        try stdout.writeAll("}\n");
+    }
+    if (summary) |value| {
+        try stdout.writeAll("{\"recordType\":\"summary\",");
+        try stdout.writeAll("\"summary\":");
+        try writeReceiptSummaryObject(stdout, value);
+        try stdout.writeAll("}\n");
+    }
+}
+
+fn printReceiptTable(receipts: []const NormalizedReceipt, errors: []const ReceiptError, summary: ?ReceiptSummary) !void {
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("sourcePath\tstatus\tbackendClass\tclean\tfindingCount\tbaseSha\theadSha\ttargetFingerprint\tfailureCode\n");
+    for (receipts) |receipt| {
+        try stdout.print("{s}\t{s}\t{s}\t{s}\t{d}\t{s}\t{s}\t{s}\t{s}\n", .{
+            receipt.source_path,
+            receipt.status,
+            receipt.backend_class,
+            if (receipt.clean) "true" else "false",
+            receipt.finding_count,
+            receipt.base_sha orelse "",
+            receipt.head_sha orelse "",
+            receipt.target_fingerprint orelse "",
+            receipt.failure_code orelse "",
+        });
+    }
+    for (errors) |err| {
+        try stdout.print("{s}\terror\t\tfalse\t0\t\t\t\t{s}\n", .{ err.source_path, err.message });
+    }
+    if (summary) |value| {
+        try stdout.print("# summary total={d} clean={d} findings={d} timeout={d} parse_mismatch={d} transport_failure={d} incomplete={d} other={d} cas-lane={d} cas-native-fallback={d} other-backend={d}\n", .{
+            value.total,
+            value.clean,
+            value.findings,
+            value.timeout,
+            value.parse_mismatch,
+            value.transport_failure,
+            value.incomplete,
+            value.other_status,
+            value.cas_lane,
+            value.cas_native_fallback,
+            value.other_backend,
+        });
+    }
 }
 
 fn compactFindingsJsonAlloc(allocator: std.mem.Allocator, review_result_json: ?[]const u8) ![]u8 {
@@ -4555,6 +5030,95 @@ test "parseArgs accepts lane review verdict-only output" {
     try std.testing.expectEqual(LaneAction.review, parsed.lane_action.?);
     try std.testing.expect(parsed.verdict_only);
     try std.testing.expect(parsed.json);
+}
+
+test "parseArgs accepts receipt inputs and format" {
+    const argv = [_][]const u8{
+        "cas_review_session",
+        "receipt",
+        "--path",
+        "review-1.json",
+        "--glob",
+        "reviews/*.json",
+        "--format",
+        "jsonl",
+        "--summary",
+    };
+
+    const parsed = try parseArgs(std.testing.allocator, &argv);
+    defer std.testing.allocator.free(parsed.receipt_paths);
+    defer std.testing.allocator.free(parsed.receipt_globs);
+    try std.testing.expectEqual(Action.receipt, parsed.action.?);
+    try std.testing.expectEqualStrings("review-1.json", parsed.receipt_paths[0]);
+    try std.testing.expectEqualStrings("reviews/*.json", parsed.receipt_globs[0]);
+    try std.testing.expectEqual(ReceiptFormat.jsonl, parsed.receipt_format);
+    try std.testing.expect(parsed.receipt_summary);
+}
+
+test "expandReceiptGlob matches current-directory patterns" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "review-a.json", .data = "{}" });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "review-b.json", .data = "{}" });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "other.txt", .data = "" });
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(tmp_path);
+    const old_cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(old_cwd);
+    try std.Io.Threaded.chdir(tmp_path);
+    defer std.Io.Threaded.chdir(old_cwd) catch {};
+
+    var paths: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (paths.items) |path| std.testing.allocator.free(path);
+        paths.deinit(std.testing.allocator);
+    }
+    try expandReceiptGlob(std.testing.allocator, "review-*.json", &paths);
+    std.mem.sort([]const u8, paths.items, {}, lessThanString);
+    try std.testing.expectEqual(@as(usize, 2), paths.items.len);
+    try std.testing.expectEqualStrings("review-a.json", paths.items[0]);
+    try std.testing.expectEqualStrings("review-b.json", paths.items[1]);
+}
+
+test "receipt normalizer accepts full CAS receipt" {
+    const raw =
+        \\{"demo":"cas-review-session","action":"lane-review","reviewThreadId":"thr_1","reviewTurnId":"turn_1","recordPath":"/tmp/record.json","eventLogPath":"/tmp/event.jsonl","targetFingerprint":"fp_1","headSha":"head_1","baseSha":"base_1","reviewVerdict":{"status":"clean","backendClass":"cas-lane","clean":true,"findingCount":0,"failureCode":null,"failureHint":null,"baseSha":"base_1","headSha":"head_1","targetFingerprint":"fp_1","reviewThreadId":"thr_1","reviewTurnId":"turn_1","recordPath":"/tmp/record.json","eventLogPath":"/tmp/event.jsonl","findings":[]}}
+    ;
+    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "review.json", raw);
+    defer receipt.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("review.json", receipt.source_path);
+    try std.testing.expectEqualStrings("clean", receipt.status);
+    try std.testing.expectEqualStrings("cas-lane", receipt.backend_class);
+    try std.testing.expect(receipt.clean);
+    try std.testing.expectEqual(@as(usize, 0), receipt.finding_count);
+    try std.testing.expectEqualStrings("base_1", receipt.base_sha.?);
+    try std.testing.expectEqualStrings("head_1", receipt.head_sha.?);
+    try std.testing.expectEqualStrings("fp_1", receipt.target_fingerprint.?);
+    try std.testing.expectEqualStrings("thr_1", receipt.review_thread_id.?);
+}
+
+test "receipt normalizer accepts compact verdict-only artifact" {
+    const raw =
+        \\{"status":"findings","backendClass":"cas-lane","clean":false,"findingCount":1,"failureCode":null,"failureHint":null,"baseSha":"base_2","headSha":"head_2","targetFingerprint":"fp_2","reviewThreadId":"thr_2","reviewTurnId":"turn_2","recordPath":"/tmp/record.json","eventLogPath":"/tmp/event.jsonl","findings":[{"title":"Issue","file":"/tmp/a.zig","line":12,"priority":1}]}
+    ;
+    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "verdict.json", raw);
+    defer receipt.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("findings", receipt.status);
+    try std.testing.expect(!receipt.clean);
+    try std.testing.expectEqual(@as(usize, 1), receipt.finding_count);
+    try std.testing.expect(std.mem.indexOf(u8, receipt.findings_json, "Issue") != null);
+}
+
+test "receipt normalizer fails closed on missing verdict fields" {
+    try std.testing.expectError(
+        error.MissingBackendClass,
+        normalizeReceiptFromJsonAlloc(std.testing.allocator, "bad.json", "{\"status\":\"clean\",\"clean\":true,\"findingCount\":0}"),
+    );
+    try std.testing.expectError(
+        error.MissingCleanFlag,
+        normalizeReceiptFromJsonAlloc(std.testing.allocator, "bad.json", "{\"status\":\"clean\",\"backendClass\":\"cas-lane\",\"findingCount\":0}"),
+    );
 }
 
 test "review verdict compacts lane findings for consumers" {
