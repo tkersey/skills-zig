@@ -127,6 +127,8 @@ pub const QuerySpec = struct {
     joins: []const JoinSpec = &.{},
     params: []const ParamSpec = &.{},
     limit: usize = 0,
+    stats: bool = false,
+    explain: bool = false,
 };
 
 pub fn paramValue(params: []const ParamSpec, key: []const u8) ?Scalar {
@@ -165,6 +167,8 @@ pub fn parseQuerySpecValue(allocator: std.mem.Allocator, value: std.json.Value) 
     const joins = try parseJoins(allocator, root.get("joins"));
     const params = try parseParams(allocator, root.get("params"));
     const limit = try parseLimit(root.get("limit"));
+    const stats = try parseOptionalBool(root.get("stats"), error.InvalidStats);
+    const explain = try parseOptionalBool(root.get("explain"), error.InvalidExplain);
 
     return .{
         .where = where,
@@ -175,6 +179,8 @@ pub fn parseQuerySpecValue(allocator: std.mem.Allocator, value: std.json.Value) 
         .joins = joins,
         .params = params,
         .limit = limit,
+        .stats = stats,
+        .explain = explain,
     };
 }
 
@@ -390,6 +396,11 @@ fn parseLimit(value_opt: ?std.json.Value) !usize {
     };
 }
 
+fn parseOptionalBool(value_opt: ?std.json.Value, err: anyerror) !bool {
+    const value = value_opt orelse return false;
+    return asBool(value, err);
+}
+
 fn parseScalarArray(allocator: std.mem.Allocator, items: []const std.json.Value) ![]const Scalar {
     var out: std.ArrayList(Scalar) = .empty;
     defer out.deinit(allocator);
@@ -525,6 +536,22 @@ test "parse query spec json supports params" {
     try std.testing.expectEqualStrings("~/tmp/mem", memory_root.string);
     try std.testing.expect(include_preview == .bool);
     try std.testing.expect(include_preview.bool);
+}
+
+test "parse query spec json supports stats and explain flags" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const query = try parseQuerySpecJson(arena.allocator(),
+        \\{
+        \\  "dataset": "messages",
+        \\  "stats": true,
+        \\  "explain": true
+        \\}
+    );
+
+    try std.testing.expect(query.stats);
+    try std.testing.expect(query.explain);
 }
 
 test "parse query spec json supports joins" {
