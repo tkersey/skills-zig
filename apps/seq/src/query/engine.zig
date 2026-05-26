@@ -1,5 +1,6 @@
 const std = @import("std");
 const spec = @import("../types/spec.zig");
+const stats_mod = @import("../stats.zig");
 const time_utils = @import("../time_utils.zig");
 
 pub const Row = struct {
@@ -45,6 +46,19 @@ pub const Row = struct {
         }
 
         try self.fields.put(key_copy, stored_value);
+    }
+
+    pub fn putStaticKey(self: *Row, key: []const u8, value: spec.Scalar) !void {
+        var stored_value = value;
+        if (value == .string) {
+            const text_copy = try self.allocator.dupe(u8, value.string);
+            errdefer self.allocator.free(text_copy);
+            try self.owned_string_values.append(self.allocator, text_copy);
+            errdefer _ = self.owned_string_values.pop();
+            stored_value = .{ .string = text_copy };
+        }
+
+        try self.fields.put(key, stored_value);
     }
 
     pub fn get(self: Row, key: []const u8) ?spec.Scalar {
@@ -320,6 +334,15 @@ pub fn execute(
     input_rows: []const Row,
     query: spec.QuerySpec,
 ) !QueryResult {
+    return executeWithStats(allocator, input_rows, query, null);
+}
+
+pub fn executeWithStats(
+    allocator: std.mem.Allocator,
+    input_rows: []const Row,
+    query: spec.QuerySpec,
+    stats: ?*stats_mod.SeqStats,
+) !QueryResult {
     var result = QueryResult{};
     errdefer result.deinit(allocator);
 
@@ -327,9 +350,9 @@ pub fn execute(
     defer compiled_where.deinit(allocator);
 
     if (query.group_by.len == 0) {
-        try executeUngrouped(allocator, input_rows, query, compiled_where.clauses, &result);
+        try executeUngrouped(allocator, input_rows, query, compiled_where.clauses, &result, stats);
     } else {
-        try executeGrouped(allocator, input_rows, query, compiled_where.clauses, &result);
+        try executeGrouped(allocator, input_rows, query, compiled_where.clauses, &result, stats);
     }
 
     return result;
@@ -341,9 +364,15 @@ fn executeUngrouped(
     query: spec.QuerySpec,
     where_clauses: []const CompiledWhereClause,
     result: *QueryResult,
+    stats: ?*stats_mod.SeqStats,
 ) !void {
+    if (query.sort.len > 0 and query.limit > 0 and query.joins.len == 0) {
+        return executeUngroupedTopK(allocator, input_rows, query, where_clauses, result, stats);
+    }
+
     for (input_rows) |row| {
         result.scanned_rows += 1;
+        if (stats) |s| s.query_scanned_rows += 1;
         if (!try rowMatches(row, where_clauses)) continue;
 
         const projected = if (query.select.len > 0)
@@ -363,22 +392,74 @@ fn executeUngrouped(
     applyLimit(&result.rows, query.limit);
 }
 
+fn executeUngroupedTopK(
+    allocator: std.mem.Allocator,
+    input_rows: []const Row,
+    query: spec.QuerySpec,
+    where_clauses: []const CompiledWhereClause,
+    result: *QueryResult,
+    stats: ?*stats_mod.SeqStats,
+) !void {
+    if (stats) |s| s.used_topk = true;
+
+    for (input_rows) |row| {
+        result.scanned_rows += 1;
+        if (stats) |s| s.query_scanned_rows += 1;
+        if (!try rowMatches(row, where_clauses)) continue;
+
+        var candidate = if (query.select.len > 0)
+            try row.cloneSelected(allocator, query.select)
+        else
+            try row.cloneAll(allocator);
+
+        if (result.rows.items.len < query.limit) {
+            result.rows.append(allocator, candidate) catch |err| {
+                candidate.deinit();
+                return err;
+            };
+            continue;
+        }
+
+        const worst_index = findWorstCandidate(result.rows.items, query.sort);
+        if (compareRowsForSort(candidate, result.rows.items[worst_index], query.sort) == .lt) {
+            result.rows.items[worst_index].deinit();
+            result.rows.items[worst_index] = candidate;
+        } else {
+            candidate.deinit();
+        }
+    }
+
+    sortRows(result.rows.items, query.sort);
+}
+
+fn findWorstCandidate(rows: []const Row, sort_specs: []const spec.SortSpec) usize {
+    var worst_index: usize = 0;
+    var index: usize = 1;
+    while (index < rows.len) : (index += 1) {
+        if (compareRowsForSort(rows[index], rows[worst_index], sort_specs) == .gt) {
+            worst_index = index;
+        }
+    }
+    return worst_index;
+}
+
 fn executeGrouped(
     allocator: std.mem.Allocator,
     input_rows: []const Row,
     query: spec.QuerySpec,
     where_clauses: []const CompiledWhereClause,
     result: *QueryResult,
+    stats: ?*stats_mod.SeqStats,
 ) !void {
     if (query.group_by.len == 1) {
         if (singleGroupCountMetric(query)) |count_alias| {
-            return executeGroupedSingleCount(allocator, input_rows, query, where_clauses, count_alias, result);
+            return executeGroupedSingleCount(allocator, input_rows, query, where_clauses, count_alias, result, stats);
         }
-        return executeGroupedSingleField(allocator, input_rows, query, where_clauses, result);
+        return executeGroupedSingleField(allocator, input_rows, query, where_clauses, result, stats);
     }
 
     if (singleGroupCountMetric(query)) |count_alias| {
-        return executeGroupedSingleCount(allocator, input_rows, query, where_clauses, count_alias, result);
+        return executeGroupedSingleCount(allocator, input_rows, query, where_clauses, count_alias, result, stats);
     }
 
     var metrics = try compileMetrics(allocator, query.metrics);
@@ -399,6 +480,7 @@ fn executeGrouped(
 
     for (input_rows) |row| {
         result.scanned_rows += 1;
+        if (stats) |s| s.query_scanned_rows += 1;
         if (!try rowMatches(row, where_clauses)) continue;
 
         const key_data = try buildGroupKey(allocator, row, query.group_by);
@@ -449,6 +531,7 @@ fn executeGroupedSingleField(
     query: spec.QuerySpec,
     where_clauses: []const CompiledWhereClause,
     result: *QueryResult,
+    stats: ?*stats_mod.SeqStats,
 ) !void {
     const group_field = query.group_by[0];
 
@@ -466,6 +549,7 @@ fn executeGroupedSingleField(
 
     for (input_rows) |row| {
         result.scanned_rows += 1;
+        if (stats) |s| s.query_scanned_rows += 1;
         if (!try rowMatches(row, where_clauses)) continue;
 
         const value = row.valueOrNull(group_field);
@@ -526,6 +610,7 @@ fn executeGroupedSingleCount(
     where_clauses: []const CompiledWhereClause,
     count_alias: []const u8,
     result: *QueryResult,
+    stats: ?*stats_mod.SeqStats,
 ) !void {
     const group_field = query.group_by[0];
 
@@ -537,6 +622,7 @@ fn executeGroupedSingleCount(
 
     for (input_rows) |row| {
         result.scanned_rows += 1;
+        if (stats) |s| s.query_scanned_rows += 1;
         if (!try rowMatches(row, where_clauses)) continue;
 
         const value = row.valueOrNull(group_field);
@@ -1346,6 +1432,124 @@ test "non-grouped where/select/sort/limit parity" {
     try expectIntField(result.rows.items[0], "arguments_len", 15);
     try expectStringField(result.rows.items[1], "path", "s1.jsonl");
     try expectIntField(result.rows.items[1], "arguments_len", 9);
+}
+
+test "topk sorted limit matches descending integer order and records stats" {
+    var rows = try buildToolRows(std.testing.allocator);
+    defer deinitRows(std.testing.allocator, &rows);
+
+    const query = spec.QuerySpec{
+        .select = &.{ "id", "arguments_len" },
+        .sort = &.{.{ .field = "arguments_len", .descending = true }},
+        .limit = 3,
+    };
+
+    var stats = stats_mod.SeqStats{};
+    var result = try executeWithStats(std.testing.allocator, rows.items, query, &stats);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(stats.used_topk);
+    try std.testing.expectEqual(@as(i64, 7), stats.query_scanned_rows);
+    try std.testing.expectEqual(@as(usize, 3), result.rows.items.len);
+    try expectIntField(result.rows.items[0], "id", 3);
+    try expectIntField(result.rows.items[1], "id", 6);
+    try expectIntField(result.rows.items[2], "id", 1);
+}
+
+test "topk sorted limit matches ascending integer order with nulls last" {
+    var rows = try buildToolRows(std.testing.allocator);
+    defer deinitRows(std.testing.allocator, &rows);
+
+    const query = spec.QuerySpec{
+        .select = &.{ "id", "arguments_len" },
+        .sort = &.{.{ .field = "arguments_len" }},
+        .limit = 2,
+    };
+
+    var result = try execute(std.testing.allocator, rows.items, query);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), result.rows.items.len);
+    try expectIntField(result.rows.items[0], "id", 4);
+    try expectIntField(result.rows.items[1], "id", 1);
+}
+
+test "topk sorted limit supports string timestamp and multi-key sorts" {
+    var rows: std.ArrayList(Row) = .empty;
+    defer deinitRows(std.testing.allocator, &rows);
+
+    try rows.append(std.testing.allocator, try rowFromEntries(std.testing.allocator, &.{
+        .{ .key = "id", .value = .{ .int = 1 } },
+        .{ .key = "timestamp", .value = .{ .string = "2026-02-19T10:00:00Z" } },
+        .{ .key = "score", .value = .{ .int = 7 } },
+    }));
+    try rows.append(std.testing.allocator, try rowFromEntries(std.testing.allocator, &.{
+        .{ .key = "id", .value = .{ .int = 2 } },
+        .{ .key = "timestamp", .value = .{ .string = "2026-02-20T10:00:00Z" } },
+        .{ .key = "score", .value = .{ .int = 7 } },
+    }));
+    try rows.append(std.testing.allocator, try rowFromEntries(std.testing.allocator, &.{
+        .{ .key = "id", .value = .{ .int = 3 } },
+        .{ .key = "timestamp", .value = .{ .string = "2026-02-21T09:00:00Z" } },
+        .{ .key = "score", .value = .{ .int = 9 } },
+    }));
+    try rows.append(std.testing.allocator, try rowFromEntries(std.testing.allocator, &.{
+        .{ .key = "id", .value = .{ .int = 4 } },
+        .{ .key = "timestamp", .value = .null },
+        .{ .key = "score", .value = .{ .int = 10 } },
+    }));
+
+    const timestamp_query = spec.QuerySpec{
+        .select = &.{ "id", "timestamp" },
+        .sort = &.{.{ .field = "timestamp", .descending = true }},
+        .limit = 2,
+    };
+
+    var timestamp_result = try execute(std.testing.allocator, rows.items, timestamp_query);
+    defer timestamp_result.deinit(std.testing.allocator);
+    try expectIntField(timestamp_result.rows.items[0], "id", 3);
+    try expectIntField(timestamp_result.rows.items[1], "id", 2);
+
+    const multi_key_query = spec.QuerySpec{
+        .select = &.{ "id", "score", "timestamp" },
+        .sort = &.{
+            .{ .field = "score", .descending = true },
+            .{ .field = "timestamp", .descending = false },
+        },
+        .limit = 3,
+    };
+
+    var multi_key_result = try execute(std.testing.allocator, rows.items, multi_key_query);
+    defer multi_key_result.deinit(std.testing.allocator);
+    try expectIntField(multi_key_result.rows.items[0], "id", 4);
+    try expectIntField(multi_key_result.rows.items[1], "id", 3);
+    try expectIntField(multi_key_result.rows.items[2], "id", 1);
+}
+
+test "topk is disabled for grouped queries and zero limit" {
+    var rows = try buildSkillRows(std.testing.allocator);
+    defer deinitRows(std.testing.allocator, &rows);
+
+    const grouped_query = spec.QuerySpec{
+        .group_by = &.{"day"},
+        .sort = &.{.{ .field = "day", .descending = true }},
+        .limit = 1,
+    };
+
+    var grouped_stats = stats_mod.SeqStats{};
+    var grouped_result = try executeWithStats(std.testing.allocator, rows.items, grouped_query, &grouped_stats);
+    defer grouped_result.deinit(std.testing.allocator);
+    try std.testing.expect(!grouped_stats.used_topk);
+
+    const zero_limit_query = spec.QuerySpec{
+        .sort = &.{.{ .field = "day", .descending = true }},
+        .limit = 0,
+    };
+
+    var zero_limit_stats = stats_mod.SeqStats{};
+    var zero_limit_result = try executeWithStats(std.testing.allocator, rows.items, zero_limit_query, &zero_limit_stats);
+    defer zero_limit_result.deinit(std.testing.allocator);
+    try std.testing.expect(!zero_limit_stats.used_topk);
 }
 
 test "non-grouped regex alternation matches expected tools" {

@@ -47,6 +47,7 @@ pub const Command = enum {
     opencode_prompts,
     opencode_events,
     goal_audit,
+    index,
     unknown,
 };
 
@@ -55,7 +56,7 @@ pub const CommandDef = struct {
     cmd: Command,
 };
 
-const command_defs = [_]CommandDef{
+pub const command_defs = [_]CommandDef{
     .{ .name = "skills-rank", .cmd = .skills_rank },
     .{ .name = "skill-success-rank", .cmd = .skill_success_rank },
     .{ .name = "skill-trend", .cmd = .skill_trend },
@@ -102,6 +103,7 @@ const command_defs = [_]CommandDef{
     .{ .name = "memory-history", .cmd = .memory_history },
     .{ .name = "opencode-prompts", .cmd = .opencode_prompts },
     .{ .name = "opencode-events", .cmd = .opencode_events },
+    .{ .name = "index", .cmd = .index },
 };
 
 pub fn parseCommand(arg: []const u8) Command {

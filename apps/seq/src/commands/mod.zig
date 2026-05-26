@@ -5,12 +5,100 @@ const plan_blocks = @import("../plan_blocks.zig");
 const query = @import("../query/engine.zig");
 const spec = @import("../types/spec.zig");
 const output = @import("../output/mod.zig");
+const stats_mod = @import("../stats.zig");
+const session_scan = @import("../session_scan.zig");
 const time_utils = @import("../time_utils.zig");
 const canonical_trace = @import("../canonical_trace.zig");
 const token_cost = @import("../token_cost.zig");
 
 fn defaultIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
+}
+
+const seq_stats_columns = [_][]const u8{
+    "candidate_files",
+    "files_opened",
+    "bytes_read",
+    "lines_seen",
+    "json_parse_attempts",
+    "json_parse_successes",
+    "rows_materialized",
+    "query_scanned_rows",
+    "rows_emitted",
+    "duration_ms",
+    "used_day_path_pushdown",
+    "used_bounded_day_dirs",
+    "used_session_selector",
+    "used_topk",
+    "used_index",
+};
+
+fn attachSeqStats(row: *query.Row, stats: stats_mod.SeqStats) !void {
+    try row.putStaticKey("candidate_files", .{ .int = stats.candidate_files });
+    try row.putStaticKey("files_opened", .{ .int = stats.files_opened });
+    try row.putStaticKey("bytes_read", .{ .int = stats.bytes_read });
+    try row.putStaticKey("lines_seen", .{ .int = stats.lines_seen });
+    try row.putStaticKey("json_parse_attempts", .{ .int = stats.json_parse_attempts });
+    try row.putStaticKey("json_parse_successes", .{ .int = stats.json_parse_successes });
+    try row.putStaticKey("rows_materialized", .{ .int = stats.rows_materialized });
+    try row.putStaticKey("query_scanned_rows", .{ .int = stats.query_scanned_rows });
+    try row.putStaticKey("rows_emitted", .{ .int = stats.rows_emitted });
+    try row.putStaticKey("duration_ms", .{ .int = stats.duration_ms });
+    try row.putStaticKey("used_day_path_pushdown", .{ .bool = stats.used_day_path_pushdown });
+    try row.putStaticKey("used_bounded_day_dirs", .{ .bool = stats.used_bounded_day_dirs });
+    try row.putStaticKey("used_session_selector", .{ .bool = stats.used_session_selector });
+    try row.putStaticKey("used_topk", .{ .bool = stats.used_topk });
+    try row.putStaticKey("used_index", .{ .bool = stats.used_index });
+}
+
+fn attachSeqStatsToRows(rows: []query.Row, stats: stats_mod.SeqStats) !void {
+    for (rows) |*row| try attachSeqStats(row, stats);
+}
+
+fn columnsWithStats(allocator: std.mem.Allocator, base_opt: ?[]const []const u8) !?[]const []const u8 {
+    const base = base_opt orelse return null;
+    var out = try allocator.alloc([]const u8, base.len + seq_stats_columns.len);
+    @memcpy(out[0..base.len], base);
+    @memcpy(out[base.len..], seq_stats_columns[0..]);
+    return out;
+}
+
+fn writeSeqStatsJson(writer: anytype, stats: stats_mod.SeqStats, pretty: bool, indent: []const u8) !void {
+    try writer.writeByte('{');
+    inline for (seq_stats_columns, 0..) |name, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        if (pretty) {
+            try writer.writeByte('\n');
+            try writer.writeAll(indent);
+        }
+        try output.writeJsonString(writer, name);
+        try writer.writeByte(':');
+        if (pretty) try writer.writeByte(' ');
+        const value: spec.Scalar = switch (idx) {
+            0 => .{ .int = stats.candidate_files },
+            1 => .{ .int = stats.files_opened },
+            2 => .{ .int = stats.bytes_read },
+            3 => .{ .int = stats.lines_seen },
+            4 => .{ .int = stats.json_parse_attempts },
+            5 => .{ .int = stats.json_parse_successes },
+            6 => .{ .int = stats.rows_materialized },
+            7 => .{ .int = stats.query_scanned_rows },
+            8 => .{ .int = stats.rows_emitted },
+            9 => .{ .int = stats.duration_ms },
+            10 => .{ .bool = stats.used_day_path_pushdown },
+            11 => .{ .bool = stats.used_bounded_day_dirs },
+            12 => .{ .bool = stats.used_session_selector },
+            13 => .{ .bool = stats.used_topk },
+            14 => .{ .bool = stats.used_index },
+            else => unreachable,
+        };
+        try output.writeScalarJson(writer, value);
+    }
+    if (pretty and seq_stats_columns.len > 0) {
+        try writer.writeByte('\n');
+        try writer.writeAll("  ");
+    }
+    try writer.writeByte('}');
 }
 
 fn getEnvVarOwned(allocator: std.mem.Allocator, comptime key: [:0]const u8) ![]u8 {
@@ -469,6 +557,8 @@ const Options = struct {
     poll_ms: i64 = 500,
     debounce_ms: i64 = 300,
     workflow: ?[]const u8 = null,
+    index_action: ?[]const u8 = null,
+    index_mode: []const u8 = "auto",
 };
 
 pub fn run(
@@ -476,7 +566,7 @@ pub fn run(
     cmd: lib.Command,
     args: []const []const u8,
 ) !void {
-    const opts = try parseOptions(args);
+    const opts = try parseOptionsForCommand(cmd, args);
     if (opts.help) {
         try printCommandHelp(cmd);
         return;
@@ -534,6 +624,7 @@ pub fn run(
         .tool_lifecycle => try cmdTraceToolLifecycle(allocator, sessions_root, opts),
         .session_graph => try cmdTraceSessionGraph(allocator, sessions_root, opts),
         .tail => try cmdTraceTail(allocator, sessions_root, opts),
+        .index => try cmdIndex(allocator, sessions_root, opts),
         .unknown => return error.InvalidCommand,
     }
 }
@@ -729,6 +820,9 @@ fn printCommandHelp(cmd: lib.Command) !void {
         .tail =>
         \\usage: seq tail (--current|--path <jsonl>|--session-id <id>) [--events raw,turns,tools,tokens,status] [--poll-ms N] [--debounce-ms N] [--once] [--format table|jsonl]
         ,
+        .index =>
+        \\usage: seq index build|status|refresh|vacuum [--root <path>] [--format table|json|csv|jsonl]
+        ,
         .unknown =>
         \\usage: seq <command> --help
         ,
@@ -790,7 +884,7 @@ fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
             if (fmt == .csv or fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
         .query => {},
-        .artifact_search, .tool_audit, .memory_inventory, .message_search, .message_audit, .skill_cohort, .tool_search, .memory_extension_audit, .token_window, .workdir_report, .orchestration_concurrency, .find_session, .plan_search, .reply_latency, .session_prompts, .token_usage, .token_cost, .routing_gap, .session_tooling, .query_diagnose, .memory_provenance, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .skill_audit, .skill_success_rank, .goal_audit => {
+        .artifact_search, .tool_audit, .memory_inventory, .message_search, .message_audit, .skill_cohort, .tool_search, .memory_extension_audit, .token_window, .workdir_report, .orchestration_concurrency, .find_session, .plan_search, .reply_latency, .session_prompts, .token_usage, .token_cost, .routing_gap, .session_tooling, .query_diagnose, .memory_provenance, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .skill_audit, .skill_success_rank, .goal_audit, .index => {
             if (fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
         .unknown => return error.InvalidCommand,
@@ -853,7 +947,14 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_kind = cmd == .artifact_search;
     const supports_surface = cmd == .artifact_search;
     const supports_follow = cmd == .artifact_search;
-    const supports_stats = cmd == .artifact_search or cmd == .plan_search;
+    const supports_stats = switch (cmd) {
+        .artifact_search,
+        .plan_search,
+        .query,
+        .sessions,
+        => true,
+        else => false,
+    };
     const supports_include_body = cmd == .plan_search;
     const supports_part_type = switch (cmd) {
         .opencode_prompts, .opencode_events => true,
@@ -971,6 +1072,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .opencode_prompts, .opencode_events => true,
         else => false,
     };
+    const supports_index_mode = cmd == .query;
     const supports_include_raw = switch (cmd) {
         .opencode_prompts, .opencode_events, .session_detail, .tool_lifecycle, .tail => true,
         else => false,
@@ -1061,6 +1163,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.opencode_db_path != null, supports_opencode_db_path, "--opencode-db-path", cmd);
     try ensureOptionAllowed(opts.opencode_path != null, supports_opencode_path, "--opencode-path", cmd);
     try ensureOptionAllowed(opts.opencode_source_text != null, supports_opencode_source, "--source", cmd);
+    try ensureOptionAllowed(!std.mem.eql(u8, opts.index_mode, "auto"), supports_index_mode, "--index", cmd);
     try ensureOptionAllowed(opts.include_raw, supports_include_raw, "--include-raw", cmd);
     try ensureOptionAllowed(opts.ongoing, cmd == .sessions, "--ongoing", cmd);
     try ensureOptionAllowed(opts.completed, cmd == .sessions, "--completed", cmd);
@@ -1244,6 +1347,15 @@ const TailEventMask = struct {
     fn default() TailEventMask {
         return .{ .turns = true, .tools = true, .tokens = true, .status = true };
     }
+};
+
+const TailState = struct {
+    path: []const u8,
+    raw_byte_offset: u64 = 0,
+    raw_line_number: usize = 0,
+    turn_count: usize = 0,
+    tool_count: usize = 0,
+    last_file_size: u64 = 0,
 };
 
 fn isValidTraceWorkerKind(text: []const u8) bool {
@@ -1533,9 +1645,9 @@ fn traceTurnPassesOptions(turn: canonical_trace.TurnRecord, opts: Options) bool 
 
 fn putOptionalBool(row: *query.Row, field: []const u8, value: ?bool) !void {
     if (value) |v| {
-        try row.putOwnedKey(field, .{ .bool = v });
+        try row.putStaticKey(field, .{ .bool = v });
     } else {
-        try row.putOwnedKey(field, .null);
+        try row.putStaticKey(field, .null);
     }
 }
 
@@ -1548,7 +1660,7 @@ fn appendTraceSessionRow(
     errdefer row.deinit();
 
     try putOptionalString(&row, "session_id", session.session_id);
-    try row.putOwnedKey("path", .{ .string = session.path });
+    try row.putStaticKey("path", .{ .string = session.path });
     try putOptionalString(&row, "date_group", session.date_group);
     try putOptionalString(&row, "start_time", session.start_time);
     try putOptionalString(&row, "end_time", session.end_time);
@@ -1561,19 +1673,19 @@ fn appendTraceSessionRow(
     try putOptionalString(&row, "model", session.model);
     try putOptionalString(&row, "model_provider", session.model_provider);
     try putOptionalString(&row, "thread_name", session.thread_name);
-    try row.putOwnedKey("turn_count", .{ .int = session.turn_count });
+    try row.putStaticKey("turn_count", .{ .int = session.turn_count });
     try putOptionalInt(&row, "total_tokens", session.total_tokens);
     try putOptionalInt(&row, "input_tokens", session.input_tokens);
     try putOptionalInt(&row, "cached_input_tokens", session.cached_input_tokens);
     try putOptionalInt(&row, "output_tokens", session.output_tokens);
     try putOptionalInt(&row, "reasoning_output_tokens", session.reasoning_output_tokens);
-    try row.putOwnedKey("is_ongoing", .{ .bool = session.is_ongoing });
+    try row.putStaticKey("is_ongoing", .{ .bool = session.is_ongoing });
     try putOptionalString(&row, "status_reason", session.status_reason);
-    try row.putOwnedKey("status", .{ .string = if (session.is_ongoing) "ongoing" else "completed" });
-    try row.putOwnedKey("is_external_worker", .{ .bool = session.is_external_worker });
-    try row.putOwnedKey("is_inline_worker", .{ .bool = session.is_inline_worker });
-    try row.putOwnedKey("worker_kind", .{ .string = if (session.is_external_worker) "external" else if (session.is_inline_worker) "inline" else "none" });
-    try row.putOwnedKey("spawned_worker_count", .{ .int = session.spawned_worker_count });
+    try row.putStaticKey("status", .{ .string = if (session.is_ongoing) "ongoing" else "completed" });
+    try row.putStaticKey("is_external_worker", .{ .bool = session.is_external_worker });
+    try row.putStaticKey("is_inline_worker", .{ .bool = session.is_inline_worker });
+    try row.putStaticKey("worker_kind", .{ .string = if (session.is_external_worker) "external" else if (session.is_inline_worker) "inline" else "none" });
+    try row.putStaticKey("spawned_worker_count", .{ .int = session.spawned_worker_count });
     try out_rows.append(allocator, row);
 }
 
@@ -1585,13 +1697,13 @@ fn appendTraceTurnRow(
     var row = query.Row.init(allocator);
     errdefer row.deinit();
     try putOptionalString(&row, "session_id", turn.session_id);
-    try row.putOwnedKey("path", .{ .string = turn.path });
-    try row.putOwnedKey("turn_id", .{ .string = turn.turn_id });
-    try row.putOwnedKey("turn_index", .{ .int = turn.turn_index });
+    try row.putStaticKey("path", .{ .string = turn.path });
+    try row.putStaticKey("turn_id", .{ .string = turn.turn_id });
+    try row.putStaticKey("turn_index", .{ .int = turn.turn_index });
     try putOptionalString(&row, "started_at", turn.started_at);
     try putOptionalString(&row, "completed_at", turn.completed_at);
     try putOptionalInt(&row, "duration_ms", turn.duration_ms);
-    try row.putOwnedKey("status", .{ .string = @tagName(turn.status) });
+    try row.putStaticKey("status", .{ .string = @tagName(turn.status) });
     try putOptionalString(&row, "status_reason", turn.status_reason);
     try putOptionalString(&row, "user_message", turn.user_message);
     try putOptionalString(&row, "user_preview", turn.user_preview);
@@ -1605,12 +1717,12 @@ fn appendTraceTurnRow(
     try putOptionalInt(&row, "output_tokens", turn.output_tokens);
     try putOptionalInt(&row, "reasoning_output_tokens", turn.reasoning_output_tokens);
     try putOptionalInt(&row, "total_tokens", turn.total_tokens);
-    try row.putOwnedKey("tool_count", .{ .int = turn.tool_count });
-    try row.putOwnedKey("has_compaction", .{ .bool = turn.has_compaction });
+    try row.putStaticKey("tool_count", .{ .int = turn.tool_count });
+    try row.putStaticKey("has_compaction", .{ .bool = turn.has_compaction });
     try putOptionalString(&row, "thread_name", turn.thread_name);
     try putOptionalString(&row, "error", turn.@"error");
     try putOptionalString(&row, "aborted_reason", turn.aborted_reason);
-    try row.putOwnedKey("spawned_worker_count", .{ .int = turn.spawned_worker_count });
+    try row.putStaticKey("spawned_worker_count", .{ .int = turn.spawned_worker_count });
     try out_rows.append(allocator, row);
 }
 
@@ -1658,11 +1770,11 @@ fn appendTraceToolRow(
     var row = query.Row.init(allocator);
     errdefer row.deinit();
     try putOptionalString(&row, "session_id", tool.session_id);
-    try row.putOwnedKey("path", .{ .string = tool.path });
+    try row.putStaticKey("path", .{ .string = tool.path });
     try putOptionalString(&row, "turn_id", tool.turn_id);
     try putOptionalInt(&row, "turn_index", tool.turn_index);
     try putOptionalString(&row, "call_id", tool.call_id);
-    try row.putOwnedKey("kind", .{ .string = @tagName(tool.kind) });
+    try row.putStaticKey("kind", .{ .string = @tagName(tool.kind) });
     try putOptionalString(&row, "tool_name", tool.tool_name);
     try putOptionalString(&row, "namespace", tool.namespace);
     try putOptionalString(&row, "arguments_json", tool.arguments_json);
@@ -1679,7 +1791,7 @@ fn appendTraceToolRow(
     try putOptionalString(&row, "web_query", tool.web_query);
     try putOptionalString(&row, "web_url", tool.web_url);
     try putOptionalString(&row, "image_prompt", tool.image_prompt);
-    try row.putOwnedKey("lifecycle_status", .{ .string = @tagName(tool.lifecycle_status) });
+    try row.putStaticKey("lifecycle_status", .{ .string = @tagName(tool.lifecycle_status) });
     try putOptionalInt(&row, "declared_line", tool.declared_line);
     try putOptionalInt(&row, "finalized_line", tool.finalized_line);
     try out_rows.append(allocator, row);
@@ -1694,7 +1806,7 @@ fn appendTraceGraphRow(
     errdefer row.deinit();
     try putOptionalString(&row, "parent_session_id", edge.parent_session_id);
     try putOptionalString(&row, "worker_session_id", edge.worker_session_id);
-    try row.putOwnedKey("parent_path", .{ .string = edge.parent_path });
+    try row.putStaticKey("parent_path", .{ .string = edge.parent_path });
     try putOptionalString(&row, "worker_path", edge.worker_path);
     try putOptionalString(&row, "call_id", edge.call_id);
     try putOptionalString(&row, "agent_nickname", edge.agent_nickname);
@@ -1890,34 +2002,48 @@ fn runTraceRows(
     opts: Options,
     default_sort_field: []const u8,
     columns: []const []const u8,
+    stats: ?*stats_mod.SeqStats,
+    stats_start_ms: i64,
 ) !void {
     const sort = [_]spec.SortSpec{.{ .field = default_sort_field, .descending = true }};
     const query_spec = spec.QuerySpec{
         .sort = sort[0..],
         .limit = opts.limit,
     };
-    var result = try query.execute(allocator, rows.items, query_spec);
+    var result = try query.executeWithStats(allocator, rows.items, query_spec, stats);
     defer result.deinit(allocator);
-    try output.writeOutput(allocator, opts.format, result.rows.items, columns, opts.out_path);
+    var stats_cols: ?[]const []const u8 = null;
+    defer if (stats_cols) |cols| allocator.free(cols);
+    if (stats) |s| {
+        s.rows_emitted = @intCast(result.rows.items.len);
+        s.finish(stats_start_ms);
+        try attachSeqStatsToRows(result.rows.items, s.*);
+        stats_cols = try columnsWithStats(allocator, columns);
+    }
+    try output.writeOutput(allocator, opts.format, result.rows.items, stats_cols orelse columns, opts.out_path);
 }
 
 fn cmdTraceSessions(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    var stats = stats_mod.SeqStats{};
+    const stats_start_ms = if (opts.stats) stats_mod.SeqStats.startTimer() else 0;
+    if (opts.path != null or opts.session_id != null or opts.current) stats.used_session_selector = true;
     var rows = try collectTraceDatasetRowsWithOptions(allocator, "sessions", sessions_root, opts);
     defer deinitQueryRows(allocator, &rows);
-    try runTraceRows(allocator, &rows, opts, "start_time", trace_session_columns[0..]);
+    if (opts.stats) stats.rows_materialized = @intCast(rows.items.len);
+    try runTraceRows(allocator, &rows, opts, "start_time", trace_session_columns[0..], if (opts.stats) &stats else null, stats_start_ms);
 }
 
 fn cmdTraceTurns(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
     var rows = try collectTraceDatasetRowsWithOptions(allocator, "turns", sessions_root, opts);
     defer deinitQueryRows(allocator, &rows);
     const columns = if (opts.include_tools) trace_turn_tool_columns[0..] else trace_turn_columns[0..];
-    try runTraceRows(allocator, &rows, opts, "started_at", columns);
+    try runTraceRows(allocator, &rows, opts, "started_at", columns, null, 0);
 }
 
 fn cmdTraceToolLifecycle(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
     var rows = try collectTraceDatasetRowsWithOptions(allocator, "tool_lifecycle", sessions_root, opts);
     defer deinitQueryRows(allocator, &rows);
-    try runTraceRows(allocator, &rows, opts, "turn_index", trace_tool_columns[0..]);
+    try runTraceRows(allocator, &rows, opts, "turn_index", trace_tool_columns[0..], null, 0);
 }
 
 fn writeTextOutput(text: []const u8, out_path: ?[]const u8) !void {
@@ -2064,7 +2190,7 @@ fn cmdTraceSessionGraph(allocator: std.mem.Allocator, sessions_root: []const u8,
         try writeTraceGraphDotRows(allocator, rows.items, opts.out_path);
         return;
     }
-    try runTraceRows(allocator, &rows, opts, "spawned_at", trace_graph_columns[0..]);
+    try runTraceRows(allocator, &rows, opts, "spawned_at", trace_graph_columns[0..], null, 0);
 }
 
 fn appendTailStatusRows(
@@ -2079,10 +2205,10 @@ fn appendTailStatusRows(
     if (mask.status and emit_status) {
         var status_row = query.Row.init(allocator);
         errdefer status_row.deinit();
-        try status_row.putOwnedKey("event", .{ .string = "status" });
+        try status_row.putStaticKey("event", .{ .string = "status" });
         try putOptionalString(&status_row, "session_id", parsed.session.session_id);
-        try status_row.putOwnedKey("path", .{ .string = parsed.session.path });
-        try status_row.putOwnedKey("is_ongoing", .{ .bool = parsed.session.is_ongoing });
+        try status_row.putStaticKey("path", .{ .string = parsed.session.path });
+        try status_row.putStaticKey("is_ongoing", .{ .bool = parsed.session.is_ongoing });
         try putOptionalString(&status_row, "status_reason", parsed.session.status_reason);
         try out_rows.append(allocator, status_row);
     }
@@ -2097,11 +2223,11 @@ fn appendTailStatusRows(
             "turn_complete"
         else
             "turn_status";
-        try row.putOwnedKey("event", .{ .string = event_name });
+        try row.putStaticKey("event", .{ .string = event_name });
         try putOptionalString(&row, "session_id", turn.session_id);
-        try row.putOwnedKey("turn_id", .{ .string = turn.turn_id });
-        try row.putOwnedKey("turn_index", .{ .int = turn.turn_index });
-        try row.putOwnedKey("path", .{ .string = turn.path });
+        try row.putStaticKey("turn_id", .{ .string = turn.turn_id });
+        try row.putStaticKey("turn_index", .{ .int = turn.turn_index });
+        try row.putStaticKey("path", .{ .string = turn.path });
         try putOptionalInt(&row, "duration_ms", turn.duration_ms);
         try putOptionalInt(&row, "total_tokens", turn.total_tokens);
         try putOptionalString(&row, "status_reason", turn.status_reason);
@@ -2112,13 +2238,13 @@ fn appendTailStatusRows(
     for (parsed.tools.items[tool_start..]) |tool| {
         var row = query.Row.init(allocator);
         errdefer row.deinit();
-        try row.putOwnedKey("event", .{ .string = if (tool.lifecycle_status == .completed or tool.lifecycle_status == .failed) "tool_complete" else "tool_status" });
+        try row.putStaticKey("event", .{ .string = if (tool.lifecycle_status == .completed or tool.lifecycle_status == .failed) "tool_complete" else "tool_status" });
         try putOptionalString(&row, "session_id", tool.session_id);
         try putOptionalString(&row, "turn_id", tool.turn_id);
         try putOptionalInt(&row, "turn_index", tool.turn_index);
-        try row.putOwnedKey("path", .{ .string = tool.path });
-        try row.putOwnedKey("kind", .{ .string = @tagName(tool.kind) });
-        try row.putOwnedKey("lifecycle_status", .{ .string = @tagName(tool.lifecycle_status) });
+        try row.putStaticKey("path", .{ .string = tool.path });
+        try row.putStaticKey("kind", .{ .string = @tagName(tool.kind) });
+        try row.putStaticKey("lifecycle_status", .{ .string = @tagName(tool.lifecycle_status) });
         try putOptionalInt(&row, "duration_ms", tool.duration_ms);
         try out_rows.append(allocator, row);
     }
@@ -2127,31 +2253,50 @@ fn appendTailStatusRows(
 fn appendTailRawRows(
     allocator: std.mem.Allocator,
     out_rows: *std.ArrayList(query.Row),
-    path: []const u8,
-    start_line_exclusive: usize,
-) !usize {
-    const content = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), path, allocator, .limited(256 * 1024 * 1024));
+    state: *TailState,
+) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file = try std.Io.Dir.openFileAbsolute(io, state.path, .{});
+    defer file.close(io);
+
+    const stat = try file.stat(io);
+    if (stat.size < state.raw_byte_offset or stat.size < state.last_file_size) {
+        state.raw_byte_offset = 0;
+        state.raw_line_number = 0;
+        var warning = query.Row.init(allocator);
+        errdefer warning.deinit();
+        try warning.putStaticKey("event", .{ .string = "warning" });
+        try warning.putStaticKey("path", .{ .string = state.path });
+        try warning.putStaticKey("line_number", .null);
+        try warning.putStaticKey("entry_type", .{ .string = "file_truncated" });
+        try warning.putStaticKey("event_type", .null);
+        try warning.putStaticKey("timestamp", .null);
+        try out_rows.append(allocator, warning);
+    }
+    state.last_file_size = stat.size;
+    if (stat.size <= state.raw_byte_offset) return;
+
+    var reader = file.reader(io, &.{});
+    try reader.seekTo(state.raw_byte_offset);
+    const content = try reader.interface.allocRemaining(allocator, .limited(256 * 1024 * 1024));
     defer allocator.free(content);
-    var last_seen = start_line_exclusive;
     var line_it = std.mem.splitScalar(u8, content, '\n');
-    var line_number: usize = 0;
     while (line_it.next()) |line| {
-        line_number += 1;
-        if (line_number <= start_line_exclusive) continue;
-        var event = try canonical_trace.parseRawTraceEvent(allocator, path, line_number, line) orelse continue;
+        if (line.len == 0) continue;
+        state.raw_line_number += 1;
+        var event = try canonical_trace.parseRawTraceEvent(allocator, state.path, state.raw_line_number, line) orelse continue;
         defer event.deinit(allocator);
-        last_seen = line_number;
         var row = query.Row.init(allocator);
         errdefer row.deinit();
-        try row.putOwnedKey("event", .{ .string = "raw" });
-        try row.putOwnedKey("path", .{ .string = event.path });
-        try row.putOwnedKey("line_number", .{ .int = @intCast(event.line_number) });
-        try row.putOwnedKey("entry_type", .{ .string = event.entry_type });
+        try row.putStaticKey("event", .{ .string = "raw" });
+        try row.putStaticKey("path", .{ .string = event.path });
+        try row.putStaticKey("line_number", .{ .int = @intCast(event.line_number) });
+        try row.putStaticKey("entry_type", .{ .string = event.entry_type });
         try putOptionalString(&row, "event_type", event.event_type);
         try putOptionalString(&row, "timestamp", event.timestamp);
         try out_rows.append(allocator, row);
     }
-    return last_seen;
+    state.raw_byte_offset = stat.size;
 }
 
 fn cmdTraceTail(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
@@ -2159,21 +2304,19 @@ fn cmdTraceTail(allocator: std.mem.Allocator, sessions_root: []const u8, opts: O
     defer freePathList(allocator, &paths);
     const mask = try parseTailEventMask(opts.events_text);
 
-    var last_raw_line: usize = 0;
-    var last_turn_count: usize = 0;
-    var last_tool_count: usize = 0;
+    var state = TailState{ .path = paths.items[0] };
     var emitted_status = false;
     while (true) {
         var rows: std.ArrayList(query.Row) = .empty;
         defer deinitQueryRows(allocator, &rows);
 
-        if (mask.raw) last_raw_line = try appendTailRawRows(allocator, &rows, paths.items[0], last_raw_line);
+        if (mask.raw) try appendTailRawRows(allocator, &rows, &state);
 
         var parsed = try canonical_trace.parseSessionTrace(allocator, paths.items[0], traceParseOptions(opts));
         defer parsed.deinit(allocator);
-        try appendTailStatusRows(allocator, &rows, parsed, mask, last_turn_count, last_tool_count, !emitted_status);
-        last_turn_count = parsed.turns.items.len;
-        last_tool_count = parsed.tools.items.len;
+        try appendTailStatusRows(allocator, &rows, parsed, mask, state.turn_count, state.tool_count, !emitted_status);
+        state.turn_count = parsed.turns.items.len;
+        state.tool_count = parsed.tools.items.len;
         emitted_status = true;
 
         if (rows.items.len > 0) try output.writeOutput(allocator, opts.format, rows.items, trace_tail_columns[0..], opts.out_path);
@@ -2252,12 +2395,25 @@ fn cmdQuery(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Optio
         if (opts.format_set) break :blk opts.format;
         break :blk if (query_spec.group_by.len > 0) output.Format.table else output.Format.jsonl;
     };
+    if (std.mem.eql(u8, opts.index_mode, "required") and !(try seqIndexExists(allocator, sessions_root))) {
+        return error.IndexUnavailable;
+    }
 
-    var rows = try collectDatasetRowsForSpec(allocator, dataset_name, sessions_root, query_spec);
+    const wants_stats = opts.stats or query_spec.stats or query_spec.explain;
+    var stats = stats_mod.SeqStats{};
+    const stats_start_ms = if (wants_stats) stats_mod.SeqStats.startTimer() else 0;
+    if (opts.path != null or opts.session_id != null or opts.current) stats.used_session_selector = true;
+
+    var rows = try collectDatasetRowsForSpecTracked(allocator, dataset_name, sessions_root, query_spec, if (wants_stats) &stats else null);
     defer deinitQueryRows(allocator, &rows);
+    if (wants_stats) stats.rows_materialized = @intCast(rows.items.len);
 
-    var result = try query.execute(allocator, rows.items, query_spec);
+    var result = try query.executeWithStats(allocator, rows.items, query_spec, if (wants_stats) &stats else null);
     defer result.deinit(allocator);
+    if (wants_stats) {
+        stats.rows_emitted = @intCast(result.rows.items.len);
+        stats.finish(stats_start_ms);
+    }
 
     const cols_opt: ?[]const []const u8 = if (query_spec.select.len > 0) query_spec.select else null;
     if (fmt == .dot and std.mem.eql(u8, dataset_name, "session_graph_edges")) {
@@ -2265,7 +2421,149 @@ fn cmdQuery(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Optio
         return;
     }
     if (fmt == .dot or fmt == .markdown) return error.InvalidFormatForCommand;
-    try output.writeOutput(allocator, fmt, result.rows.items, cols_opt, opts.out_path);
+    if (query_spec.explain) {
+        try writeQueryExplainJson(allocator, dataset_name, query_spec, stats, result.rows.items, cols_opt, opts.out_path);
+        return;
+    }
+    const stats_cols = if (wants_stats) try columnsWithStats(allocator, cols_opt) else null;
+    defer if (stats_cols) |cols| allocator.free(cols);
+    if (wants_stats) try attachSeqStatsToRows(result.rows.items, stats);
+    try output.writeOutput(allocator, fmt, result.rows.items, stats_cols orelse cols_opt, opts.out_path);
+}
+
+fn seqIndexPath(allocator: std.mem.Allocator, sessions_root: []const u8) ![]u8 {
+    return std.fs.path.join(allocator, &.{ sessions_root, ".seq-index.jsonl" });
+}
+
+fn seqIndexExists(allocator: std.mem.Allocator, sessions_root: []const u8) !bool {
+    const path = try seqIndexPath(allocator, sessions_root);
+    defer allocator.free(path);
+    const file = std.Io.Dir.openFileAbsolute(defaultIo(), path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    file.close(defaultIo());
+    return true;
+}
+
+fn cmdIndex(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    const action = opts.index_action orelse "status";
+    if (std.mem.eql(u8, action, "build") or std.mem.eql(u8, action, "refresh")) {
+        try writeSeqIndex(allocator, sessions_root);
+    } else if (std.mem.eql(u8, action, "vacuum")) {
+        const path = try seqIndexPath(allocator, sessions_root);
+        defer allocator.free(path);
+        std.Io.Dir.deleteFileAbsolute(defaultIo(), path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    } else if (!std.mem.eql(u8, action, "status")) {
+        return error.InvalidModeArg;
+    }
+
+    var rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &rows);
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    const index_path = try seqIndexPath(allocator, sessions_root);
+    defer allocator.free(index_path);
+    try row.putStaticKey("root", .{ .string = sessions_root });
+    try row.putStaticKey("index_path", .{ .string = index_path });
+    try row.putStaticKey("exists", .{ .bool = try seqIndexExists(allocator, sessions_root) });
+    try row.putStaticKey("action", .{ .string = action });
+    try rows.append(allocator, row);
+    const cols = [_][]const u8{ "root", "index_path", "exists", "action" };
+    try output.writeOutput(allocator, opts.format, rows.items, cols[0..], opts.out_path);
+}
+
+fn writeSeqIndex(allocator: std.mem.Allocator, sessions_root: []const u8) !void {
+    var paths = try collectJsonlPaths(allocator, sessions_root, null);
+    defer freePathList(allocator, &paths);
+
+    const index_path = try seqIndexPath(allocator, sessions_root);
+    defer allocator.free(index_path);
+
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+    for (paths.items) |path| {
+        const file = std.Io.Dir.openFileAbsolute(defaultIo(), path, .{}) catch continue;
+        defer file.close(defaultIo());
+        const stat = try file.stat(defaultIo());
+        try writer.writeByte('{');
+        try output.writeJsonString(writer, "path");
+        try writer.writeAll(":");
+        try output.writeJsonString(writer, path);
+        try writer.writeAll(",\"size_bytes\":");
+        try writer.print("{d}", .{stat.size});
+        try writer.writeAll(",\"mtime_ns\":");
+        try writer.print("{d}", .{stat.mtime.nanoseconds});
+        try writer.writeAll(",\"schema_version\":1,\"parser_version\":1}\n");
+    }
+    const data = try writer_alloc.toOwnedSlice();
+    defer allocator.free(data);
+    try std.Io.Dir.cwd().writeFile(defaultIo(), .{ .sub_path = index_path, .data = data });
+}
+
+fn writeQueryExplainJson(
+    allocator: std.mem.Allocator,
+    dataset_name: []const u8,
+    query_spec: spec.QuerySpec,
+    stats: stats_mod.SeqStats,
+    rows: []const query.Row,
+    columns_opt: ?[]const []const u8,
+    out_path: ?[]const u8,
+) !void {
+    var infer_owned = false;
+    const columns = blk: {
+        if (columns_opt) |provided| break :blk provided;
+        infer_owned = true;
+        break :blk try output.inferColumns(allocator, rows);
+    };
+    defer if (infer_owned) output.freeColumns(allocator, columns);
+
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+
+    try writer.writeAll("{\n  \"plan\": {\n");
+    try writer.writeAll("    \"dataset\": ");
+    try output.writeJsonString(writer, dataset_name);
+    try writer.writeAll(",\n    \"scan\": ");
+    try output.writeJsonString(writer, if (stats.used_bounded_day_dirs)
+        "bounded_day_dirs"
+    else if (stats.used_day_path_pushdown)
+        "day_pushdown"
+    else
+        "walk");
+    try writer.writeAll(",\n    \"query\": ");
+    try output.writeJsonString(writer, if (stats.used_topk)
+        "topk"
+    else if (query_spec.group_by.len > 0)
+        "grouped"
+    else if (query_spec.sort.len > 0)
+        "full_sort"
+    else
+        "scan");
+    try writer.writeAll(",\n    \"projection\": ");
+    try output.writeJsonString(writer, if (query_spec.select.len > 0) "selected" else "all");
+    try writer.writeAll(",\n    \"index\": ");
+    try output.writeJsonString(writer, if (stats.used_index) "used" else "none");
+    try writer.writeAll("\n  },\n  \"stats\": ");
+    try writeSeqStatsJson(writer, stats, true, "    ");
+    try writer.writeAll(",\n  \"rows\": [");
+    for (rows, 0..) |row, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writer.writeByte('\n');
+        try writer.writeAll("    ");
+        try output.writeJsonObject(writer, row, columns, false, "");
+    }
+    if (rows.len > 0) try writer.writeByte('\n');
+    try writer.writeAll("  ]\n}\n");
+
+    const text = try writer_alloc.toOwnedSlice();
+    defer allocator.free(text);
+    try writeTextOutput(text, out_path);
 }
 
 const workflow_audit_summary_columns = [_][]const u8{ "source_kind", "signal_kind", "name", "outcome_kind", "mentions", "sessions" };
@@ -10473,8 +10771,18 @@ fn collectDatasetRowsForSpec(
     sessions_root: []const u8,
     query_spec: spec.QuerySpec,
 ) !std.ArrayList(query.Row) {
+    return collectDatasetRowsForSpecTracked(allocator, dataset_name, sessions_root, query_spec, null);
+}
+
+fn collectDatasetRowsForSpecTracked(
+    allocator: std.mem.Allocator,
+    dataset_name: []const u8,
+    sessions_root: []const u8,
+    query_spec: spec.QuerySpec,
+    stats: ?*stats_mod.SeqStats,
+) !std.ArrayList(query.Row) {
     if (query_spec.joins.len > 0) {
-        var rows = try collectDatasetRows(allocator, dataset_name, sessions_root, query_spec.params, query_spec.where);
+        var rows = try collectDatasetRowsTracked(allocator, dataset_name, sessions_root, query_spec.params, query_spec.where, stats);
         errdefer deinitQueryRows(allocator, &rows);
 
         for (query_spec.joins) |join_spec| {
@@ -10511,7 +10819,7 @@ fn collectDatasetRowsForSpec(
     {
         return collectTraceDatasetRowsFromSpec(allocator, dataset_name, sessions_root, query_spec);
     }
-    return collectDatasetRows(allocator, dataset_name, sessions_root, query_spec.params, query_spec.where);
+    return collectDatasetRowsTracked(allocator, dataset_name, sessions_root, query_spec.params, query_spec.where, stats);
 }
 
 fn collectRowsForJoin(
@@ -10666,13 +10974,32 @@ fn collectDatasetRows(
     query_params: []const spec.ParamSpec,
     query_where: []const spec.WhereClause,
 ) !std.ArrayList(query.Row) {
+    return collectDatasetRowsTracked(allocator, dataset_name, sessions_root, query_params, query_where, null);
+}
+
+fn collectDatasetRowsTracked(
+    allocator: std.mem.Allocator,
+    dataset_name: []const u8,
+    sessions_root: []const u8,
+    query_params: []const spec.ParamSpec,
+    query_where: []const spec.WhereClause,
+    stats: ?*stats_mod.SeqStats,
+) !std.ArrayList(query.Row) {
     var rows: std.ArrayList(query.Row) = .empty;
     errdefer deinitQueryRows(allocator, &rows);
 
     const day_filter = deriveSessionDayPathFilter(dataset_name, query_where);
 
     if (std.mem.eql(u8, dataset_name, "messages")) {
-        try collectMessagesRows(allocator, sessions_root, day_filter, &rows);
+        if (paramString(query_params, "path")) |path| {
+            if (stats) |s| {
+                s.used_session_selector = true;
+                s.candidate_files += 1;
+            }
+            try collectMessagesRowsFromPathTracked(allocator, path, &rows, stats);
+        } else {
+            try collectMessagesRowsTracked(allocator, sessions_root, day_filter, &rows, stats);
+        }
     } else if (std.mem.eql(u8, dataset_name, "skill_mentions")) {
         try collectSkillMentionsRows(allocator, sessions_root, day_filter, &rows);
     } else if (std.mem.eql(u8, dataset_name, "token_events")) {
@@ -10725,35 +11052,41 @@ fn collectDatasetRows(
     return rows;
 }
 
-fn collectMessagesRows(
+fn collectMessagesRowsTracked(
     allocator: std.mem.Allocator,
     sessions_root: []const u8,
     day_filter: ?SessionDayPathFilter,
     out_rows: *std.ArrayList(query.Row),
+    stats: ?*stats_mod.SeqStats,
 ) !void {
-    var paths = try collectJsonlPaths(allocator, sessions_root, day_filter);
+    var paths = try collectJsonlPathsTracked(allocator, sessions_root, day_filter, stats);
     defer freePathList(allocator, &paths);
 
     for (paths.items) |path| {
-        const content = try readFileAllocOrSkip(allocator, path);
-        if (content == null) continue;
-        defer allocator.free(content.?);
+        try collectMessagesRowsFromPathTracked(allocator, path, out_rows, stats);
+    }
+}
 
-        const parsed = try datasets.messages.parseJsonl(allocator, path, content.?, .{});
-        defer datasets.messages.freeRows(allocator, parsed);
+fn collectMessagesRowsFromPathTracked(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    out_rows: *std.ArrayList(query.Row),
+    stats: ?*stats_mod.SeqStats,
+) !void {
+    var scanned = (try session_scan.scanFile(allocator, path, .{ .messages = true }, stats)) orelse return;
+    defer scanned.deinit(allocator);
 
-        for (parsed) |row| {
-            var qrow = query.Row.init(allocator);
-            try qrow.putOwnedKey("path", .{ .string = row.path });
-            try putOptionalString(&qrow, "timestamp", row.timestamp);
-            try putOptionalString(&qrow, "day", row.day);
-            try putOptionalString(&qrow, "week", row.week);
-            try putOptionalString(&qrow, "month", row.month);
-            try qrow.putOwnedKey("role", .{ .string = row.role });
-            try qrow.putOwnedKey("text", .{ .string = row.text });
-            try qrow.putOwnedKey("text_len", .{ .int = @intCast(row.text_len) });
-            try out_rows.append(allocator, qrow);
-        }
+    for (scanned.messages) |row| {
+        var qrow = query.Row.init(allocator);
+        try qrow.putStaticKey("path", .{ .string = row.path });
+        try putOptionalString(&qrow, "timestamp", row.timestamp);
+        try putOptionalString(&qrow, "day", row.day);
+        try putOptionalString(&qrow, "week", row.week);
+        try putOptionalString(&qrow, "month", row.month);
+        try qrow.putStaticKey("role", .{ .string = row.role });
+        try qrow.putStaticKey("text", .{ .string = row.text });
+        try qrow.putStaticKey("text_len", .{ .int = @intCast(row.text_len) });
+        try out_rows.append(allocator, qrow);
     }
 }
 
@@ -10767,24 +11100,20 @@ fn collectSkillMentionsRows(
     defer freePathList(allocator, &paths);
 
     for (paths.items) |path| {
-        const content = try readFileAllocOrSkip(allocator, path);
-        if (content == null) continue;
-        defer allocator.free(content.?);
+        var scanned = (try session_scan.scanFile(allocator, path, .{ .skill_mentions = true }, null)) orelse continue;
+        defer scanned.deinit(allocator);
 
-        const parsed = try datasets.skill_mentions.parseJsonl(allocator, path, content.?, .{});
-        defer datasets.skill_mentions.freeRows(allocator, parsed);
-
-        for (parsed) |row| {
+        for (scanned.skill_mentions) |row| {
             var qrow = query.Row.init(allocator);
-            try qrow.putOwnedKey("path", .{ .string = row.path });
+            try qrow.putStaticKey("path", .{ .string = row.path });
             try putOptionalString(&qrow, "timestamp", row.timestamp);
             try putOptionalString(&qrow, "day", row.day);
             try putOptionalString(&qrow, "week", row.week);
             try putOptionalString(&qrow, "month", row.month);
-            try qrow.putOwnedKey("role", .{ .string = row.role });
-            try qrow.putOwnedKey("skill", .{ .string = row.skill });
-            try qrow.putOwnedKey("types", .{ .string = row.types });
-            try qrow.putOwnedKey("snippet", .{ .string = row.snippet });
+            try qrow.putStaticKey("role", .{ .string = row.role });
+            try qrow.putStaticKey("skill", .{ .string = row.skill });
+            try qrow.putStaticKey("types", .{ .string = row.types });
+            try qrow.putStaticKey("snippet", .{ .string = row.snippet });
             try out_rows.append(allocator, qrow);
         }
     }
@@ -11028,7 +11357,7 @@ fn collectTokenEventsRows(
 
         for (parsed.items) |row| {
             var qrow = query.Row.init(allocator);
-            try qrow.putOwnedKey("path", .{ .string = row.path });
+            try qrow.putStaticKey("path", .{ .string = row.path });
             try putSmallText(&qrow, "timestamp", row.timestamp);
             try putSmallText(&qrow, "day", row.day);
             try putSmallText(&qrow, "week", row.week);
@@ -11066,12 +11395,12 @@ fn collectTokenDeltasRows(
 
         for (deltas.items) |row| {
             var qrow = query.Row.init(allocator);
-            try qrow.putOwnedKey("path", .{ .string = row.path });
+            try qrow.putStaticKey("path", .{ .string = row.path });
             try putSmallText(&qrow, "timestamp", row.timestamp);
             try putSmallText(&qrow, "day", row.day);
             try putSmallText(&qrow, "week", row.week);
             try putSmallText(&qrow, "month", row.month);
-            try qrow.putOwnedKey("segment", .{ .int = @intCast(row.segment) });
+            try qrow.putStaticKey("segment", .{ .int = @intCast(row.segment) });
             try putOptionalInt(&qrow, "model_context_window", row.model_context_window);
             try putOptionalInt(&qrow, "delta_input_tokens", row.delta_input_tokens);
             try putOptionalInt(&qrow, "delta_cached_input_tokens", row.delta_cached_input_tokens);
@@ -11102,7 +11431,7 @@ fn collectTokenSessionsRows(
         const row = maybe_row orelse continue;
 
         var qrow = query.Row.init(allocator);
-        try qrow.putOwnedKey("path", .{ .string = row.path });
+        try qrow.putStaticKey("path", .{ .string = row.path });
         try putSmallText(&qrow, "start", row.start);
         try putSmallText(&qrow, "end", row.end);
         try putSmallText(&qrow, "max_at", row.max_at);
@@ -11131,33 +11460,33 @@ fn collectToolCallsRows(
         var qrow = query.Row.init(allocator);
         const week = try timestampWeekAlloc(allocator, record.start_ts);
         defer if (week) |value| allocator.free(value);
-        try qrow.putOwnedKey("path", .{ .string = record.path });
+        try qrow.putStaticKey("path", .{ .string = record.path });
         try putOptionalString(&qrow, "timestamp", record.start_ts);
         try putOptionalString(&qrow, "day", timestampDaySlice(record.start_ts));
         try putOptionalString(&qrow, "week", week);
         try putOptionalString(&qrow, "month", timestampMonthSlice(record.start_ts));
-        try qrow.putOwnedKey("kind", .{ .string = record.invocationKindText() });
+        try qrow.putStaticKey("kind", .{ .string = record.invocationKindText() });
         try putOptionalString(&qrow, "tool", record.tool_name);
         try putOptionalString(&qrow, "call_id", record.call_id);
         if (record.arguments_text) |v| {
-            try qrow.putOwnedKey("arguments_len", .{ .int = @intCast(v.len) });
-            try qrow.putOwnedKey("arguments_text", .{ .string = v });
+            try qrow.putStaticKey("arguments_len", .{ .int = @intCast(v.len) });
+            try qrow.putStaticKey("arguments_text", .{ .string = v });
         } else {
-            try qrow.putOwnedKey("arguments_len", .null);
-            try qrow.putOwnedKey("arguments_text", .null);
+            try qrow.putStaticKey("arguments_len", .null);
+            try qrow.putStaticKey("arguments_text", .null);
         }
         if (record.input_text) |v| {
-            try qrow.putOwnedKey("input_len", .{ .int = @intCast(v.len) });
-            try qrow.putOwnedKey("input_text", .{ .string = v });
+            try qrow.putStaticKey("input_len", .{ .int = @intCast(v.len) });
+            try qrow.putStaticKey("input_text", .{ .string = v });
         } else {
-            try qrow.putOwnedKey("input_len", .null);
-            try qrow.putOwnedKey("input_text", .null);
+            try qrow.putStaticKey("input_len", .null);
+            try qrow.putStaticKey("input_text", .null);
         }
         try putOptionalString(&qrow, "status", record.status_text);
         try putOptionalString(&qrow, "command_text", record.command_text);
         try putOptionalString(&qrow, "primary_executable", record.primary_executable);
         try putOptionalString(&qrow, "workdir", record.workdir);
-        try qrow.putOwnedKey("parse_error", .{ .bool = record.parse_error });
+        try qrow.putStaticKey("parse_error", .{ .bool = record.parse_error });
         try out_rows.append(allocator, qrow);
     }
 }
@@ -11176,8 +11505,8 @@ fn collectToolInvocationRows(
         var qrow = query.Row.init(allocator);
         const week = try timestampWeekAlloc(allocator, record.start_ts);
         defer if (week) |value| allocator.free(value);
-        try qrow.putOwnedKey("path", .{ .string = record.path });
-        try qrow.putOwnedKey("session_id", .{ .string = record.session_id });
+        try qrow.putStaticKey("path", .{ .string = record.path });
+        try qrow.putStaticKey("session_id", .{ .string = record.session_id });
         try putOptionalString(&qrow, "timestamp", record.start_ts);
         try putOptionalString(&qrow, "end_timestamp", record.end_ts);
         try putOptionalString(&qrow, "day", timestampDaySlice(record.start_ts));
@@ -11185,7 +11514,7 @@ fn collectToolInvocationRows(
         try putOptionalString(&qrow, "month", timestampMonthSlice(record.start_ts));
         try putOptionalString(&qrow, "call_id", record.call_id);
         try putOptionalString(&qrow, "tool_name", record.tool_name);
-        try qrow.putOwnedKey("invocation_kind", .{ .string = record.invocationKindText() });
+        try qrow.putStaticKey("invocation_kind", .{ .string = record.invocationKindText() });
         try putOptionalString(&qrow, "arguments_text", record.arguments_text);
         try putOptionalString(&qrow, "input_text", record.input_text);
         try putOptionalString(&qrow, "command_text", record.command_text);
@@ -11194,9 +11523,9 @@ fn collectToolInvocationRows(
         try putOptionalInt(&qrow, "pty_session_id", record.pty_session_id);
         try putOptionalInt(&qrow, "wall_time_ms", record.wall_time_ms);
         try putOptionalInt(&qrow, "exit_code", record.exit_code);
-        try qrow.putOwnedKey("running_state", .{ .string = record.runningState() });
-        try qrow.putOwnedKey("unresolved", .{ .bool = record.unresolved() });
-        try qrow.putOwnedKey("parse_error", .{ .bool = record.parse_error });
+        try qrow.putStaticKey("running_state", .{ .string = record.runningState() });
+        try qrow.putStaticKey("unresolved", .{ .bool = record.unresolved() });
+        try qrow.putStaticKey("parse_error", .{ .bool = record.parse_error });
         try out_rows.append(allocator, qrow);
     }
 }
@@ -12151,17 +12480,17 @@ fn applyOpencodeEventPushdown(options: *datasets.opencode_events.Options, query_
 
 fn putOptionalString(row: *query.Row, field: []const u8, value: ?[]const u8) !void {
     if (value) |text| {
-        try row.putOwnedKey(field, .{ .string = text });
+        try row.putStaticKey(field, .{ .string = text });
     } else {
-        try row.putOwnedKey(field, .null);
+        try row.putStaticKey(field, .null);
     }
 }
 
 fn putOptionalInt(row: *query.Row, field: []const u8, value: ?i64) !void {
     if (value) |v| {
-        try row.putOwnedKey(field, .{ .int = v });
+        try row.putStaticKey(field, .{ .int = v });
     } else {
-        try row.putOwnedKey(field, .null);
+        try row.putStaticKey(field, .null);
     }
 }
 
@@ -12670,10 +12999,19 @@ fn putSmallText(
     value: ?datasets.token_events.SmallText,
 ) !void {
     if (value) |text| {
-        try row.putOwnedKey(field, .{ .string = text.slice() });
+        try row.putStaticKey(field, .{ .string = text.slice() });
     } else {
-        try row.putOwnedKey(field, .null);
+        try row.putStaticKey(field, .null);
     }
+}
+
+fn parseOptionsForCommand(cmd: lib.Command, args: []const []const u8) !Options {
+    if (cmd == .index and args.len > 0 and !std.mem.startsWith(u8, args[0], "-")) {
+        var opts = try parseOptions(args[1..]);
+        opts.index_action = args[0];
+        return opts;
+    }
+    return parseOptions(args);
 }
 
 fn parseOptions(args: []const []const u8) !Options {
@@ -12890,6 +13228,13 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.opencode_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--index")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            if (!std.mem.eql(u8, args[i], "auto") and !std.mem.eql(u8, args[i], "off") and !std.mem.eql(u8, args[i], "required")) {
+                return error.InvalidModeArg;
+            }
+            opts.index_mode = args[i];
         } else if (std.mem.eql(u8, arg, "--source")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -13068,8 +13413,22 @@ fn collectJsonlPaths(
     root_abs: []const u8,
     day_filter: ?SessionDayPathFilter,
 ) !std.ArrayList([]u8) {
+    return collectJsonlPathsTracked(allocator, root_abs, day_filter, null);
+}
+
+fn collectJsonlPathsTracked(
+    allocator: std.mem.Allocator,
+    root_abs: []const u8,
+    day_filter: ?SessionDayPathFilter,
+    stats: ?*stats_mod.SeqStats,
+) !std.ArrayList([]u8) {
     if (day_filter) |filter| {
+        if (stats) |s| s.used_day_path_pushdown = true;
         if (try collectJsonlPathsFromBoundedDayDirs(allocator, root_abs, filter)) |bounded| {
+            if (stats) |s| {
+                s.used_bounded_day_dirs = true;
+                s.candidate_files += @intCast(bounded.items.len);
+            }
             return bounded;
         }
     }
@@ -13102,6 +13461,7 @@ fn collectJsonlPaths(
         try out.append(allocator, abs);
     }
     std.mem.sort([]u8, out.items, {}, lessThanString);
+    if (stats) |s| s.candidate_files += @intCast(out.items.len);
     return out;
 }
 
@@ -13170,7 +13530,20 @@ fn loadSpecText(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
 }
 
 fn readFileAllocOrSkip(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(defaultIo(), path, allocator, .limited(256 * 1024 * 1024)) catch null;
+    return readFileAllocOrSkipTracked(allocator, path, null);
+}
+
+fn readFileAllocOrSkipTracked(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    stats: ?*stats_mod.SeqStats,
+) !?[]u8 {
+    const content = std.Io.Dir.cwd().readFileAlloc(defaultIo(), path, allocator, .limited(256 * 1024 * 1024)) catch return null;
+    if (stats) |s| {
+        s.files_opened += 1;
+        s.bytes_read += @intCast(content.len);
+    }
+    return content;
 }
 
 fn freePathList(allocator: std.mem.Allocator, list: *std.ArrayList([]u8)) void {
@@ -13487,6 +13860,116 @@ test "sessions limit uses newest rollout path candidates" {
     try std.testing.expect(std.mem.indexOf(u8, query_got, "new-session") != null);
     try std.testing.expect(std.mem.indexOf(u8, query_got, "mid-session") != null);
     try std.testing.expect(std.mem.indexOf(u8, query_got, "old-session") == null);
+}
+
+test "query stats emit scan counters and topk flag" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/01");
+    const session_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-01T10:00:00Z\",\"payload\":{\"id\":\"stats-session\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-01T10:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"first\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-01T10:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"second\"}]}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "sessions/2026/05/01/rollout-stats-session.jsonl",
+        .data = session_content,
+    });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "query-stats.jsonl" });
+    defer std.testing.allocator.free(output_path);
+
+    const query_spec =
+        \\{"dataset":"messages","select":["timestamp","role","text"],"sort":["-timestamp"],"limit":1,"format":"jsonl","stats":true}
+    ;
+    const got = try runCommandWithOutput(std.testing.allocator, .query, &.{ "--root", root_abs, "--spec", query_spec }, output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"candidate_files\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"files_opened\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"rows_materialized\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"rows_emitted\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"used_topk\":true") != null);
+
+    const no_stats_spec =
+        \\{"dataset":"messages","select":["timestamp","role","text"],"sort":["-timestamp"],"limit":1,"format":"jsonl"}
+    ;
+    const without_stats = try runCommandWithOutput(std.testing.allocator, .query, &.{ "--root", root_abs, "--spec", no_stats_spec }, output_path);
+    defer std.testing.allocator.free(without_stats);
+    try std.testing.expect(std.mem.indexOf(u8, without_stats, "\"candidate_files\"") == null);
+}
+
+test "query explain emits top-level plan stats and rows" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/01");
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "sessions/2026/05/01/rollout-explain-session.jsonl",
+        .data = "{\"type\":\"response_item\",\"timestamp\":\"2026-05-01T10:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"explain me\"}]}}\n",
+    });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "query-explain.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const query_spec =
+        \\{"dataset":"messages","select":["timestamp","role","text"],"sort":["-timestamp"],"limit":1,"format":"json","explain":true}
+    ;
+    const got = try runCommandWithOutput(std.testing.allocator, .query, &.{ "--root", root_abs, "--spec", query_spec }, output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"plan\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"stats\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"query\": \"topk\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"rows\"") != null);
+}
+
+test "query stats report bounded day pushdown and explicit path selector" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/01");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/02");
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "sessions/2026/05/01/rollout-day-one.jsonl",
+        .data = "{\"type\":\"response_item\",\"timestamp\":\"2026-05-01T10:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"day one\"}]}}\n",
+    });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "sessions/2026/05/02/rollout-day-two.jsonl",
+        .data = "{\"type\":\"response_item\",\"timestamp\":\"2026-05-02T10:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"day two\"}]}}\n",
+    });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const path_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/02/rollout-day-two.jsonl", std.testing.allocator);
+    defer std.testing.allocator.free(path_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "query-pushdown.jsonl" });
+    defer std.testing.allocator.free(output_path);
+
+    const day_spec =
+        \\{"dataset":"messages","where":[{"field":"day","op":"eq","value":"2026-05-02"}],"select":["day","text"],"sort":["-timestamp"],"limit":1,"format":"jsonl","stats":true}
+    ;
+    const day_got = try runCommandWithOutput(std.testing.allocator, .query, &.{ "--root", root_abs, "--spec", day_spec }, output_path);
+    defer std.testing.allocator.free(day_got);
+    try std.testing.expect(std.mem.indexOf(u8, day_got, "\"candidate_files\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, day_got, "\"used_day_path_pushdown\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, day_got, "\"used_bounded_day_dirs\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, day_got, "day two") != null);
+    try std.testing.expect(std.mem.indexOf(u8, day_got, "day one") == null);
+
+    const path_spec = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"dataset":"messages","params":{{"path":"{s}"}},"select":["text"],"limit":1,"format":"jsonl","stats":true}}
+    , .{path_abs});
+    defer std.testing.allocator.free(path_spec);
+    const path_got = try runCommandWithOutput(std.testing.allocator, .query, &.{ "--root", root_abs, "--spec", path_spec }, output_path);
+    defer std.testing.allocator.free(path_got);
+    try std.testing.expect(std.mem.indexOf(u8, path_got, "\"candidate_files\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, path_got, "\"files_opened\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, path_got, "\"used_session_selector\":true") != null);
 }
 
 test "deriveSessionDayPathFilter widens timestamp bounds for safe path pushdown" {

@@ -8,7 +8,13 @@ comptime {
     _ = @import("query/engine.zig");
     _ = @import("output/mod.zig");
     _ = @import("commands/mod.zig");
+    _ = @import("cli/registry.zig");
+    _ = @import("cli/options.zig");
+    _ = @import("cli/help.zig");
+    _ = @import("cli/validate.zig");
     _ = @import("canonical_trace.zig");
+    _ = @import("scan_plan.zig");
+    _ = @import("session_scan.zig");
     _ = @import("datasets/mod.zig");
     _ = @import("plan_blocks.zig");
     _ = @import("datasets/messages.zig");
@@ -76,5 +82,6 @@ test "bootstrap parse coverage" {
     try std.testing.expectEqual(lib.Command.memory_history, lib.parseCommand("memory-history"));
     try std.testing.expectEqual(lib.Command.opencode_prompts, lib.parseCommand("opencode-prompts"));
     try std.testing.expectEqual(lib.Command.opencode_events, lib.parseCommand("opencode-events"));
+    try std.testing.expectEqual(lib.Command.index, lib.parseCommand("index"));
     try std.testing.expectEqual(lib.Command.unknown, lib.parseCommand("invalid"));
 }
