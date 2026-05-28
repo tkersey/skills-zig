@@ -531,6 +531,8 @@ const Options = struct {
     pricing_file: ?[]const u8 = null,
     usd_per_credit_text: ?[]const u8 = null,
     trace_text: ?[]const u8 = null,
+    include_root_equivalent_text: ?[]const u8 = null,
+    bundle_dir_text: ?[]const u8 = null,
     state_db_path: ?[]const u8 = null,
     memory_root_text: ?[]const u8 = null,
     extensions_root_text: ?[]const u8 = null,
@@ -609,6 +611,7 @@ pub fn run(
         .datasets => try cmdDatasets(allocator, opts),
         .dataset_schema => try cmdDatasetSchema(allocator, opts),
         .query => try cmdQuery(allocator, sessions_root, opts),
+        .adjudication_audit => try cmdAdjudicationAudit(allocator, sessions_root, opts),
         .goal_audit => try QueryLiftCommands.cmdGoalAudit(allocator, sessions_root, opts),
         .workflow_audit => try cmdWorkflowAudit(allocator, sessions_root, opts),
         .session_tooling => try cmdSessionTooling(allocator, sessions_root, opts),
@@ -775,6 +778,13 @@ fn printCommandHelp(cmd: lib.Command) !void {
         .query =>
         \\usage: seq query --spec <json|@path>
         ,
+        .adjudication_audit =>
+        \\usage: seq adjudication-audit [--skill <name>] [--last <Nm|Nh|Nd>|--since <iso>] [--until <iso>] [--include-root-equivalent <csv>] [--bundle-dir <path>] [--limit N] [--format markdown|json|jsonl]
+        \\extra options:
+        \\  --skill <name>                 Skill to audit (default: review-adjudication)
+        \\  --include-root-equivalent <csv> Include root-equivalent workflow names such as resolve,fixed-point-driver
+        \\  --bundle-dir <path>            Write reproducible evidence rows beside the main report
+        ,
         .goal_audit =>
         \\usage: seq goal-audit [--mode summary|rows] [--workflow review|resolve|review,resolve] [--duration-gte <seconds|minutes|hours>] [--status <name>] [--contains <text>] [--since <iso>] [--until <iso>] [--path <jsonl>|--session-id <id>] [--exclude-current] [--show-query] [--limit N] [--format table|json|csv|jsonl]
         ,
@@ -880,6 +890,9 @@ fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
         .workflow_audit => {
             if (fmt == .csv or fmt == .jsonl or fmt == .dot) return error.InvalidFormatForCommand;
         },
+        .adjudication_audit => {
+            if (fmt == .table or fmt == .csv or fmt == .dot) return error.InvalidFormatForCommand;
+        },
         .sessions, .turns, .tool_lifecycle, .tail => {
             if (fmt == .csv or fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
@@ -909,7 +922,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_threshold_ms = cmd == .query_diagnose;
     const supports_strict_hang = cmd == .query_diagnose;
     const supports_skill = switch (cmd) {
-        .skill_trend, .skill_report, .skill_audit, .skill_success_rank, .skill_cohort, .occurrence_export, .skill_blocks => true,
+        .skill_trend, .skill_report, .skill_audit, .skill_success_rank, .skill_cohort, .occurrence_export, .skill_blocks, .adjudication_audit => true,
         else => false,
     };
     const supports_workflow = cmd == .workflow_audit or cmd == .goal_audit;
@@ -987,6 +1000,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .session_tooling,
         .query_diagnose,
         .workflow_audit,
+        .adjudication_audit,
         .goal_audit,
         .memory_map,
         .memory_history,
@@ -1025,6 +1039,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .session_tooling,
         .query_diagnose,
         .workflow_audit,
+        .adjudication_audit,
         .goal_audit,
         .memory_map,
         .memory_history,
@@ -1101,7 +1116,9 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     };
     const supports_window_hours = cmd == .token_window;
     const supports_duration_gte = cmd == .goal_audit;
-    const supports_last = cmd == .token_usage or cmd == .token_cost or cmd == .skill_success_rank;
+    const supports_last = cmd == .token_usage or cmd == .token_cost or cmd == .skill_success_rank or cmd == .adjudication_audit;
+    const supports_include_root_equivalent = cmd == .adjudication_audit;
+    const supports_bundle_dir = cmd == .adjudication_audit;
     const supports_token_cost_options = cmd == .token_cost;
 
     try ensureOptionAllowed(opts.path != null, commandSupportsPath(cmd), "--path", cmd);
@@ -1132,6 +1149,8 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.sections != null, supports_sections, "--sections", cmd);
     try ensureOptionAllowed(opts.cue_spec_text != null, supports_cue_spec, "--cue-spec", cmd);
     try ensureOptionAllowed(opts.discovery_skills != null, supports_discovery_skills, "--discovery-skills", cmd);
+    try ensureOptionAllowed(opts.include_root_equivalent_text != null, supports_include_root_equivalent, "--include-root-equivalent", cmd);
+    try ensureOptionAllowed(opts.bundle_dir_text != null, supports_bundle_dir, "--bundle-dir", cmd);
     try ensureOptionAllowed(opts.dataset != null, supports_dataset, "--dataset", cmd);
     try ensureOptionAllowed(opts.spec_text != null, supports_spec_text, "--spec", cmd);
     try ensureOptionAllowed(opts.contains != null, supports_contains, "--contains", cmd);
@@ -2976,6 +2995,357 @@ fn writeWorkflowAuditModeMarkdown(
     const rendered = try writer_alloc.toOwnedSlice();
     defer allocator.free(rendered);
     try writeTextOutput(rendered, out_path);
+}
+
+const adjudication_audit_columns = [_][]const u8{
+    "session_id",
+    "timestamp",
+    "invocation_kind",
+    "classification",
+    "resolve_selection_present",
+    "selected_count",
+    "rejected_count",
+    "address_count",
+    "validate_only_count",
+    "resolve_thread_only_count",
+    "do_not_address_count",
+    "rebut_count",
+    "defer_count",
+    "investigate_count",
+    "route_count",
+    "blocked_count",
+    "skew_flags",
+    "invariant_flags",
+    "evidence_excerpt",
+    "path",
+};
+
+const AdjudicationRouteCounts = struct {
+    address: usize = 0,
+    validate_only: usize = 0,
+    resolve_thread_only: usize = 0,
+    do_not_address: usize = 0,
+    rebut: usize = 0,
+    defer_route: usize = 0,
+    investigate: usize = 0,
+    route: usize = 0,
+    blocked: usize = 0,
+
+    fn selected(self: AdjudicationRouteCounts) usize {
+        return self.address + self.validate_only + self.investigate;
+    }
+
+    fn rejected(self: AdjudicationRouteCounts) usize {
+        return self.resolve_thread_only + self.do_not_address + self.rebut + self.defer_route + self.blocked;
+    }
+
+    fn total(self: AdjudicationRouteCounts) usize {
+        return self.selected() + self.rejected();
+    }
+};
+
+const AdjudicationSessionSummary = struct {
+    timestamp: ?[]const u8 = null,
+    direct: bool = false,
+    root_equivalent: bool = false,
+    resolve_selection_present: bool = false,
+    legacy_prose_inferred: bool = false,
+    invariant_framed: bool = false,
+    invariant_ace_seen: bool = false,
+    tuning_or_spec: bool = false,
+    counts: AdjudicationRouteCounts = .{},
+    evidence_excerpt: []const u8 = "",
+};
+
+fn cmdAdjudicationAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    const skill = opts.skill orelse "review-adjudication";
+    const window = try resolveSkillSuccessWindow(opts);
+    const day_filter = skillSuccessDayFilter(window);
+
+    var rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &rows);
+
+    var paths = try collectJsonlPaths(allocator, sessions_root, day_filter);
+    defer freePathList(allocator, &paths);
+
+    for (paths.items) |path| {
+        const content = try readFileAllocOrSkip(allocator, path);
+        if (content == null) continue;
+        defer allocator.free(content.?);
+
+        const parse_options = datasets.messages.ParseOptions{
+            .include_user = true,
+            .include_assistant = true,
+            .strip_echo_assistant = true,
+            .skip_meta_user_messages = true,
+            .dedupe_by_role_and_text = false,
+            .strip_skill_blocks = true,
+        };
+        const messages = try datasets.messages.parseJsonl(allocator, path, content.?, parse_options);
+        defer datasets.messages.freeRows(allocator, messages);
+
+        const summary = try summarizeAdjudicationSession(allocator, messages, window, skill, opts.include_root_equivalent_text);
+        if (!summary.direct and !summary.root_equivalent) continue;
+
+        var row = query.Row.init(allocator);
+        errdefer row.deinit();
+
+        const session_id = try sessionIdFromPath(allocator, path);
+        defer allocator.free(session_id);
+        const invocation_kind = if (summary.direct and summary.root_equivalent)
+            "direct+root-equivalent"
+        else if (summary.direct)
+            "direct"
+        else
+            "root-equivalent";
+        const classification = adjudicationClassification(summary);
+        const skew_flags = try adjudicationSkewFlags(allocator, summary);
+        defer allocator.free(skew_flags);
+        const invariant_flags = try adjudicationInvariantFlags(allocator, summary);
+        defer allocator.free(invariant_flags);
+
+        try row.putStaticKey("session_id", .{ .string = session_id });
+        try putOptionalString(&row, "timestamp", summary.timestamp);
+        try row.putStaticKey("invocation_kind", .{ .string = invocation_kind });
+        try row.putStaticKey("classification", .{ .string = classification });
+        try row.putStaticKey("resolve_selection_present", .{ .bool = summary.resolve_selection_present });
+        try row.putStaticKey("selected_count", .{ .int = @intCast(summary.counts.selected()) });
+        try row.putStaticKey("rejected_count", .{ .int = @intCast(summary.counts.rejected()) });
+        try row.putStaticKey("address_count", .{ .int = @intCast(summary.counts.address) });
+        try row.putStaticKey("validate_only_count", .{ .int = @intCast(summary.counts.validate_only) });
+        try row.putStaticKey("resolve_thread_only_count", .{ .int = @intCast(summary.counts.resolve_thread_only) });
+        try row.putStaticKey("do_not_address_count", .{ .int = @intCast(summary.counts.do_not_address) });
+        try row.putStaticKey("rebut_count", .{ .int = @intCast(summary.counts.rebut) });
+        try row.putStaticKey("defer_count", .{ .int = @intCast(summary.counts.defer_route) });
+        try row.putStaticKey("investigate_count", .{ .int = @intCast(summary.counts.investigate) });
+        try row.putStaticKey("route_count", .{ .int = @intCast(summary.counts.route) });
+        try row.putStaticKey("blocked_count", .{ .int = @intCast(summary.counts.blocked) });
+        try row.putStaticKey("skew_flags", .{ .string = skew_flags });
+        try row.putStaticKey("invariant_flags", .{ .string = invariant_flags });
+        try row.putStaticKey("evidence_excerpt", .{ .string = summary.evidence_excerpt });
+        try row.putStaticKey("path", .{ .string = path });
+
+        try rows.append(allocator, row);
+    }
+
+    trimQueryRows(&rows, opts.limit);
+
+    if (opts.bundle_dir_text) |dir| {
+        try writeAdjudicationAuditBundle(allocator, rows.items, dir);
+    }
+
+    const fmt = if (opts.format_set) opts.format else output.Format.markdown;
+    if (fmt == .markdown) {
+        return writeAdjudicationAuditMarkdown(allocator, rows.items, skill, opts.out_path);
+    }
+    return output.writeOutput(allocator, fmt, rows.items, adjudication_audit_columns[0..], opts.out_path);
+}
+
+fn summarizeAdjudicationSession(
+    allocator: std.mem.Allocator,
+    messages: []const datasets.messages.MessageRow,
+    window: SkillSuccessWindow,
+    skill: []const u8,
+    include_root_equivalent_text: ?[]const u8,
+) !AdjudicationSessionSummary {
+    _ = allocator;
+    var summary = AdjudicationSessionSummary{};
+    for (messages) |message| {
+        if (!skillSuccessTimestampInWindow(message.timestamp, window)) continue;
+        if (summary.timestamp == null) summary.timestamp = message.timestamp;
+        const text = message.text;
+        const is_assistant = std.mem.eql(u8, message.role, "assistant");
+
+        if (containsAdjudicationSkill(text, skill)) summary.direct = true;
+        if (matchesRootEquivalent(text, include_root_equivalent_text)) summary.root_equivalent = true;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "tuning", "spec out", "spec-pipeline", "quick_validate" })) {
+            summary.tuning_or_spec = true;
+        }
+
+        if (!is_assistant) continue;
+        if (containsIgnoreCaseAscii(text, "Resolve Selection")) summary.resolve_selection_present = true;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "invariant", "state boundary", "ownership boundary" })) summary.invariant_framed = true;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "$invariant-ace", "invariant-ace" })) summary.invariant_ace_seen = true;
+        if (summary.evidence_excerpt.len == 0 and
+            containsAnyIgnoreCaseAscii(text, &.{ "Resolve Selection", "address", "validate-only", "do-not-address", "proof-only" }))
+        {
+            summary.evidence_excerpt = firstNonEmptyLine(text);
+        }
+        countAdjudicationRoutes(text, &summary.counts);
+    }
+    if (summary.evidence_excerpt.len == 0) {
+        for (messages) |message| {
+            if (!skillSuccessTimestampInWindow(message.timestamp, window)) continue;
+            if (containsAdjudicationSkill(message.text, skill) or matchesRootEquivalent(message.text, include_root_equivalent_text)) {
+                summary.evidence_excerpt = firstNonEmptyLine(message.text);
+                break;
+            }
+        }
+    }
+    if (summary.counts.total() == 0 and !summary.resolve_selection_present and summary.evidence_excerpt.len > 0) {
+        summary.legacy_prose_inferred = containsAnyIgnoreCaseAscii(summary.evidence_excerpt, &.{ "selected", "actionable", "valid concern", "accepted" });
+    }
+    return summary;
+}
+
+fn containsAdjudicationSkill(text: []const u8, skill: []const u8) bool {
+    return containsIgnoreCaseAscii(text, skill) or
+        (std.mem.eql(u8, skill, "review-adjudication") and containsIgnoreCaseAscii(text, "$review-adjudication"));
+}
+
+fn matchesRootEquivalent(text: []const u8, include_root_equivalent_text: ?[]const u8) bool {
+    const csv = include_root_equivalent_text orelse return false;
+    var split = std.mem.splitScalar(u8, csv, ',');
+    while (split.next()) |part_raw| {
+        const part = std.mem.trim(u8, part_raw, " \t\r\n");
+        if (part.len == 0) continue;
+        if (containsIgnoreCaseAscii(text, part)) return true;
+        if (part.len < 80) {
+            var buf: [96]u8 = undefined;
+            const skill_token = std.fmt.bufPrint(&buf, "${s}", .{part}) catch continue;
+            if (containsIgnoreCaseAscii(text, skill_token)) return true;
+        }
+    }
+    return false;
+}
+
+fn countAdjudicationRoutes(text: []const u8, counts: *AdjudicationRouteCounts) void {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len == 0) continue;
+        if (lineMatchesRoute(line, "address")) counts.address += 1;
+        if (lineMatchesRoute(line, "validate-only")) counts.validate_only += 1;
+        if (lineMatchesRoute(line, "resolve-thread-only") or lineMatchesRoute(line, "proof-only-thread")) counts.resolve_thread_only += 1;
+        if (lineMatchesRoute(line, "do-not-address") or lineMatchesRoute(line, "no-change")) counts.do_not_address += 1;
+        if (lineMatchesRoute(line, "rebut")) counts.rebut += 1;
+        if (lineMatchesRoute(line, "defer")) counts.defer_route += 1;
+        if (lineMatchesRoute(line, "investigate") or lineMatchesRoute(line, "need-evidence")) counts.investigate += 1;
+        if (lineMatchesRoute(line, "route")) counts.route += 1;
+        if (lineMatchesRoute(line, "blocked")) counts.blocked += 1;
+    }
+}
+
+fn lineMatchesRoute(line: []const u8, route: []const u8) bool {
+    var backtick_buf: [64]u8 = undefined;
+    const backtick = std.fmt.bufPrint(&backtick_buf, "`{s}`", .{route}) catch route;
+    if (containsIgnoreCaseAscii(line, backtick)) return true;
+
+    var pipe_buf: [80]u8 = undefined;
+    const pipe_route = std.fmt.bufPrint(&pipe_buf, "| {s} |", .{route}) catch route;
+    if (containsIgnoreCaseAscii(line, pipe_route)) return true;
+
+    var decision_buf: [96]u8 = undefined;
+    const decision = std.fmt.bufPrint(&decision_buf, "decision: {s}", .{route}) catch route;
+    if (containsIgnoreCaseAscii(line, decision)) return true;
+
+    var rationale_buf: [96]u8 = undefined;
+    const rationale = std.fmt.bufPrint(&rationale_buf, "route rationale: {s}", .{route}) catch route;
+    return containsIgnoreCaseAscii(line, rationale);
+}
+
+fn adjudicationClassification(summary: AdjudicationSessionSummary) []const u8 {
+    if (summary.resolve_selection_present or summary.counts.total() > 0) return "decision-bearing";
+    if (summary.legacy_prose_inferred) return "decision-bearing";
+    if (summary.tuning_or_spec) return "tuning";
+    return "mention-only";
+}
+
+fn adjudicationSkewFlags(allocator: std.mem.Allocator, summary: AdjudicationSessionSummary) ![]u8 {
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(allocator);
+    if (summary.counts.selected() > 0 and summary.counts.rejected() == 0) try parts.append(allocator, "all-selected");
+    if (summary.counts.rejected() == 0) try parts.append(allocator, "no-rejections");
+    if ((summary.counts.total() > 0 or summary.legacy_prose_inferred) and !summary.resolve_selection_present) try parts.append(allocator, "missing-resolve-selection");
+    if (summary.legacy_prose_inferred) try parts.append(allocator, "legacy-prose-inferred");
+    if (!summary.direct and summary.root_equivalent) try parts.append(allocator, "root-equivalent-only");
+    return joinStringParts(allocator, parts.items, ",");
+}
+
+fn adjudicationInvariantFlags(allocator: std.mem.Allocator, summary: AdjudicationSessionSummary) ![]u8 {
+    var parts: std.ArrayList([]const u8) = .empty;
+    defer parts.deinit(allocator);
+    if (summary.invariant_framed) try parts.append(allocator, "invariant-framed");
+    if (summary.invariant_ace_seen) try parts.append(allocator, "invariant-ace-seen");
+    if (summary.invariant_framed and summary.counts.selected() > 0 and !summary.invariant_ace_seen) {
+        try parts.append(allocator, "selected-invariant-without-invariant-ace");
+    }
+    return joinStringParts(allocator, parts.items, ",");
+}
+
+fn joinStringParts(allocator: std.mem.Allocator, parts: []const []const u8, sep: []const u8) ![]u8 {
+    if (parts.len == 0) return allocator.dupe(u8, "none");
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    for (parts, 0..) |part, idx| {
+        if (idx > 0) try out.appendSlice(allocator, sep);
+        try out.appendSlice(allocator, part);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn firstNonEmptyLine(text: []const u8) []const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len == 0) continue;
+        return if (line.len > 180) line[0..180] else line;
+    }
+    return "";
+}
+
+fn sessionIdFromPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const base = std.fs.path.basename(path);
+    var stem = base;
+    if (std.mem.endsWith(u8, stem, ".jsonl")) stem = stem[0 .. stem.len - ".jsonl".len];
+    if (std.mem.startsWith(u8, stem, "rollout-")) stem = stem["rollout-".len..];
+    return allocator.dupe(u8, stem);
+}
+
+fn writeAdjudicationAuditMarkdown(
+    allocator: std.mem.Allocator,
+    rows: []const query.Row,
+    skill: []const u8,
+    out_path: ?[]const u8,
+) !void {
+    var decision_bearing: usize = 0;
+    var all_selected: usize = 0;
+    for (rows) |row| {
+        if (scalarStringEq(row.valueOrNull("classification"), "decision-bearing")) decision_bearing += 1;
+        if (containsIgnoreCaseAscii(scalarString(row.valueOrNull("skew_flags")) orelse "", "all-selected")) all_selected += 1;
+    }
+
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+    try writer.print("# seq adjudication-audit: {s}\n\n", .{skill});
+    try writer.print("- candidate_sessions: {d}\n", .{rows.len});
+    try writer.print("- decision_bearing_sessions: {d}\n", .{decision_bearing});
+    try writer.print("- all_selected_sessions: {d}\n\n", .{all_selected});
+    try writeMarkdownTable(writer, rows, adjudication_audit_columns[0..]);
+
+    const rendered = try writer_alloc.toOwnedSlice();
+    defer allocator.free(rendered);
+    if (out_path) |path| try ensureParentDir(path);
+    try writeTextOutput(rendered, out_path);
+}
+
+fn writeAdjudicationAuditBundle(allocator: std.mem.Allocator, rows: []const query.Row, dir: []const u8) !void {
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), dir);
+    const rows_path = try std.fs.path.join(allocator, &.{ dir, "adjudication-audit-rows.jsonl" });
+    defer allocator.free(rows_path);
+    try output.writeOutput(allocator, .jsonl, rows, adjudication_audit_columns[0..], rows_path);
+
+    const readme_path = try std.fs.path.join(allocator, &.{ dir, "README.md" });
+    defer allocator.free(readme_path);
+    const readme = "Evidence bundle generated by seq adjudication-audit.\nRows are conservative session-level classifications; legacy prose is flagged as inferred.\n";
+    try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = readme_path, .data = readme });
+}
+
+fn ensureParentDir(path: []const u8) !void {
+    if (std.fs.path.dirname(path)) |dir| {
+        if (dir.len > 0) try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), dir);
+    }
 }
 
 fn writeMarkdownTable(writer: anytype, rows: []const query.Row, columns: []const []const u8) !void {
@@ -13208,6 +13578,14 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.trace_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--include-root-equivalent")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.include_root_equivalent_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--bundle-dir")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.bundle_dir_text = args[i];
         } else if (std.mem.eql(u8, arg, "--state-db-path")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -14168,6 +14546,10 @@ test "parse options supports common flags" {
         "@cues.json",
         "--discovery-skills",
         "grill-me,prove-it",
+        "--include-root-equivalent",
+        "resolve,fixed-point-driver",
+        "--bundle-dir",
+        "/tmp/adjudication-bundle",
         "--roles",
         "user,assistant",
         "--contains",
@@ -14252,6 +14634,8 @@ test "parse options supports common flags" {
     try std.testing.expectEqual(@as(usize, 7), opts.limit);
     try std.testing.expectEqualStrings("@cues.json", opts.cue_spec_text.?);
     try std.testing.expectEqualStrings("grill-me,prove-it", opts.discovery_skills.?);
+    try std.testing.expectEqualStrings("resolve,fixed-point-driver", opts.include_root_equivalent_text.?);
+    try std.testing.expectEqualStrings("/tmp/adjudication-bundle", opts.bundle_dir_text.?);
     try std.testing.expectEqualStrings("user,assistant", opts.roles_csv.?);
     try std.testing.expectEqualStrings("needle", opts.contains.?);
     try std.testing.expectEqualStrings("^foo", opts.regex.?);
@@ -14832,6 +15216,61 @@ test "workflow-audit reports a workflow cohort without cross-session contaminati
         const first_row = std.mem.indexOf(u8, got, "| 2026-") orelse return error.TestUnexpectedResult;
         try std.testing.expect(std.mem.indexOfPos(u8, got, first_row + 1, "| 2026-") == null);
     }
+}
+
+test "adjudication-audit extracts route counts and conservative skew flags" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/06");
+    const direct_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-06T10:00:00Z\",\"payload\":{\"id\":\"adjudication-direct\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-06T10:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Use $review-adjudication on the live review.\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-06T10:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"## Resolve Selection\\n| id | decision | route rationale |\\n| c1 | `address` | `invariant-level` |\\n| c2 | `do-not-address` | `no-change` |\\nInvariant-Ace Coverage: $invariant-ace receipt present.\"}]}}\n";
+    const root_equiv_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-06T11:00:00Z\",\"payload\":{\"id\":\"adjudication-root\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-06T11:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Use $resolve for these findings.\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-06T11:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"## Resolve Selection\\n| id | decision | route rationale |\\n| r1 | `address` | `invariant-level` |\"}]}}\n";
+    const mention_only_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-06T12:00:00Z\",\"payload\":{\"id\":\"adjudication-mention\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-06T12:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Mention review-adjudication but do not run it.\"}]}}\n";
+    const skill_block_only_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-06T13:00:00Z\",\"payload\":{\"id\":\"skill-block-only\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-06T13:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"<skill>\\n<name>review-adjudication</name>\\n</skill>\"}]}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/06/rollout-adjudication-direct.jsonl", .data = direct_content });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/06/rollout-adjudication-root.jsonl", .data = root_equiv_content });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/06/rollout-adjudication-mention.jsonl", .data = mention_only_content });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/06/rollout-skill-block-only.jsonl", .data = skill_block_only_content });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "adjudication-audit.jsonl" });
+    defer std.testing.allocator.free(output_path);
+    const bundle_dir = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "adjudication-bundle" });
+    defer std.testing.allocator.free(bundle_dir);
+
+    const got = try runCommandWithOutput(std.testing.allocator, .adjudication_audit, &.{
+        "--root",                    root_abs,
+        "--since",                   "2026-05-06T00:00:00Z",
+        "--until",                   "2026-05-07T00:00:00Z",
+        "--include-root-equivalent", "resolve,fixed-point-driver",
+        "--bundle-dir",              bundle_dir,
+        "--format",                  "jsonl",
+    }, output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "adjudication-direct") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "adjudication-root") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "adjudication-mention") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "skill-block-only") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"selected_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"rejected_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"skew_flags\":\"all-selected,no-rejections,root-equivalent-only\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "selected-invariant-without-invariant-ace") != null);
+
+    const bundle_rows = try std.fs.path.join(std.testing.allocator, &.{ bundle_dir, "adjudication-audit-rows.jsonl" });
+    defer std.testing.allocator.free(bundle_rows);
+    try std.testing.expect((try std.Io.Dir.cwd().statFile(std.Io.Threaded.global_single_threaded.io(), bundle_rows, .{})).size > 0);
 }
 
 test "skill-success-rank counts called skills with positive outcomes" {
