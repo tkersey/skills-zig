@@ -49,9 +49,76 @@ case "$mode" in
       done
     }
 
+    mark_build_zig() {
+      local changed=0
+      local ambiguous=0
+      local line app token matched
+
+      is_build_boilerplate() {
+        local raw="$1"
+        local compact="${raw//[[:space:]]/}"
+        case "$compact" in
+          ".{"|"},"|"});"|");"|"b,")
+            return 0
+            ;;
+        esac
+        case "$raw" in
+          *".target = target,"*|*".optimize = optimize,"*|*".imports = &.{"*|*".{ .name = \"core_"*)
+            return 0
+            ;;
+        esac
+        return 1
+      }
+
+      while IFS= read -r line; do
+        case "$line" in
+          "+++"*|"---"*|"@@"*) continue ;;
+          "+"*|"-"*) ;;
+          *) continue ;;
+        esac
+
+        line="${line:1}"
+        [[ -z "$line" ]] && continue
+        changed=1
+        matched=0
+
+        for app in "${apps[@]}"; do
+          token="${app//-/_}"
+          if [[ "$app" == "st" ]]; then
+            case "$line" in
+              *"apps/st/"*|*"st_root"*|*"st_install"*|*"\"st\""*|*"build-st"*|*"test-st"*|*"run-st"*)
+                mark_app "$app"
+                matched=1
+                ;;
+            esac
+          else
+            case "$line" in
+              *"apps/$app/"*|*"${token}_"*|*"\"$app\""*|*"build-$app"*|*"test-$app"*|*"run-$app"*)
+                mark_app "$app"
+                matched=1
+                ;;
+            esac
+          fi
+        done
+
+        if [[ "$matched" -eq 0 ]]; then
+          if ! is_build_boilerplate "$line"; then
+            ambiguous=1
+          fi
+        fi
+      done < <(git diff -U0 --no-ext-diff "$base" "$head" -- build.zig)
+
+      if [[ "$changed" -eq 1 && "$ambiguous" -eq 1 ]]; then
+        mark_all
+      fi
+    }
+
     while IFS= read -r path; do
       case "$path" in
-        build.zig|build.zig.zon|libs/core/*)
+        build.zig)
+          mark_build_zig
+          ;;
+        build.zig.zon|libs/core/*)
           mark_all
           ;;
         .github/workflows/release-seq.yml)
