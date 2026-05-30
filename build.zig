@@ -182,6 +182,16 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = cas_meta },
         },
     });
+    const cas_goal_root = b.createModule(.{
+        .root_source_file = b.path("apps/cas/scripts/cas_goal.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_json", .module = core_json },
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = cas_meta },
+        },
+    });
     const cas_proxy_client_root = b.createModule(.{
         .root_source_file = b.path("apps/cas/scripts/cas_proxy_client.zig"),
         .target = target,
@@ -319,6 +329,7 @@ pub fn build(b: *std.Build) void {
     const cas_instance_runner = addExecutable(b, "cas_instance_runner", cas_runner_root);
     const cas_review_session = addExecutable(b, "cas_review_session", cas_review_session_root);
     const cas_conformance_suite = addExecutable(b, "cas_conformance_suite", cas_conformance_root);
+    const cas_goal = addExecutable(b, "cas_goal", cas_goal_root);
     const cas_budget_perf = addExecutable(b, "cas-perf-budget-governor", cas_budget_perf_root);
     const cas = addExecutable(b, "cas", cas_root);
     const cron = addExecutable(b, "cron", cron_root);
@@ -341,6 +352,7 @@ pub fn build(b: *std.Build) void {
     const cas_instance_runner_install = addInstallStep(b, cas_instance_runner);
     const cas_review_session_install = addInstallStep(b, cas_review_session);
     const cas_conformance_suite_install = addInstallStep(b, cas_conformance_suite);
+    const cas_goal_install = addInstallStep(b, cas_goal);
     const cas_budget_perf_install = addInstallStep(b, cas_budget_perf);
     const cas_install = addInstallStep(b, cas);
     const cron_install = addInstallStep(b, cron);
@@ -362,6 +374,7 @@ pub fn build(b: *std.Build) void {
     install_all.dependOn(&cas_instance_runner_install.step);
     install_all.dependOn(&cas_review_session_install.step);
     install_all.dependOn(&cas_conformance_suite_install.step);
+    install_all.dependOn(&cas_goal_install.step);
     install_all.dependOn(&cas_budget_perf_install.step);
     install_all.dependOn(&cas_install.step);
     install_all.dependOn(&cron_install.step);
@@ -452,6 +465,12 @@ pub fn build(b: *std.Build) void {
         "test-cas-conformance-suite",
         "Run cas_conformance_suite tests",
     );
+    const run_cas_goal_tests = addTestStep(
+        b,
+        cas_goal_root,
+        "test-cas-goal",
+        "Run cas_goal tests",
+    );
     const run_cas_proxy_client_tests = addTestStep(
         b,
         cas_proxy_client_root,
@@ -464,6 +483,7 @@ pub fn build(b: *std.Build) void {
     test_cas.dependOn(&run_cas_runner_tests.step);
     test_cas.dependOn(&run_cas_review_session_tests.step);
     test_cas.dependOn(&run_cas_conformance_tests.step);
+    test_cas.dependOn(&run_cas_goal_tests.step);
     test_cas.dependOn(&run_cas_proxy_client_tests.step);
 
     const run_cron_tests = addTestStepWithOptions(
@@ -533,7 +553,7 @@ pub fn build(b: *std.Build) void {
             .path = b.path("apps/cas"),
             .build_step_name = "build-cas",
             .build_description = "Build cas binaries",
-            .build_deps = &.{ &cas_smoke_check_install.step, &cas_instance_runner_install.step, &cas_review_session_install.step, &cas_conformance_suite_install.step, &cas_budget_perf_install.step, &cas_install.step },
+            .build_deps = &.{ &cas_smoke_check_install.step, &cas_instance_runner_install.step, &cas_review_session_install.step, &cas_conformance_suite_install.step, &cas_goal_install.step, &cas_budget_perf_install.step, &cas_install.step },
             .test_deps = &.{test_cas},
         },
         .{
@@ -614,6 +634,7 @@ pub fn build(b: *std.Build) void {
     addRunStep(b, bench_stats, "run-bench-stats", "Run bench_stats", &.{"--help"});
     addRunStep(b, cas_smoke_check, "run-cas-smoke-check", "Run cas_smoke_check", &.{"--help"});
     addRunStep(b, cas_conformance_suite, "run-cas-conformance-suite", "Run cas_conformance_suite", &.{"--help"});
+    addRunStep(b, cas_goal, "run-cas-goal", "Run cas_goal", &.{"--help"});
     addRunStepPrefixed(b, perf_hub, "perf-list-local", "List local perf cases", &.{"list"});
     addRunStepPrefixed(b, perf_hub, "perf-manifest-local", "Emit native perf manifest", &.{"manifest"});
     addRunStepPrefixed(b, perf_hub, "perf-audit-local", "Audit native perf coverage", &.{"audit"});

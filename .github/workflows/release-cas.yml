@@ -58,6 +58,7 @@ jobs:
           cp zig-out/bin/cas_instance_runner dist/cas/cas-instance-runner
           cp zig-out/bin/cas_review_session dist/cas/cas-review-session
           cp zig-out/bin/cas_conformance_suite dist/cas/cas-conformance-suite
+          cp zig-out/bin/cas_goal dist/cas/cas-goal
           cp zig-out/bin/cas-perf-budget-governor dist/cas/cas-perf-budget-governor
           tar -czf "${TAR_NAME}" -C dist/cas .
       - name: Upload cas workflow artifact

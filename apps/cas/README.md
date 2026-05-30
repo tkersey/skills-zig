@@ -7,6 +7,8 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - `scripts/cas.zig`
 - `scripts/budget_governor.zig`
 - `scripts/cas_conformance_suite.zig`
+- `scripts/cas_goal.zig`
+- `scripts/cas_goal_core.zig`
 - `scripts/cas_smoke_check.zig`
 - `scripts/cas_instance_runner.zig`
 - `scripts/cas_review_session.zig`
@@ -14,7 +16,8 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 
 ## Behavior
 
-- `cas` dispatches `conformance`, `smoke_check`, `instance_runner`, and `review_session`.
+- `cas` dispatches `conformance`, `goal`, `smoke_check`, `instance_runner`, and `review_session`.
+- `cas_goal` manages Codex app-server v2 thread goals through `thread/goal/get`, `thread/goal/set`, and `thread/goal/clear`. It adds safe target selection over `thread/list`, explicit `resolve`/`--dry-run` previews, create-by-default `set`, and lifecycle `wait` through `thread/resume` plus goal polling.
 - `cas_conformance_suite` verifies claim-safe wave handling, stale-claim reclaim, mesh result accountability, and bounded overload retry behavior.
 - `cas_smoke_check` verifies the native v2 handshake plus `experimentalFeature/list`, `thread/start`, `thread/resume`, `turn/start`, `turn/interrupt`, and `turn/steer`.
 - `cas_instance_runner` executes one app-server method per isolated instance and now prefers a CAS-managed loopback websocket app-server per instance, falling back to stdio when websocket bootstrap or handshake fails. Result rows and summaries now report the selected transport.
@@ -42,6 +45,37 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 ```bash
 # Run the dispatcher help surface.
 ./zig-out/bin/cas --help
+
+# Preview the latest materialized goal target for a repository.
+./zig-out/bin/cas goal resolve \
+  --cwd /path/to/workspace \
+  --latest \
+  --json
+
+# Create or update a goal, creating a materialized thread when no target is supplied.
+./zig-out/bin/cas goal set \
+  --cwd /path/to/workspace \
+  --objective "finish the review" \
+  --json
+
+# Clear a selected thread goal after previewing the selected target.
+./zig-out/bin/cas goal clear \
+  --cwd /path/to/workspace \
+  --latest \
+  --dry-run \
+  --json
+
+./zig-out/bin/cas goal clear \
+  --cwd /path/to/workspace \
+  --latest \
+  --json
+
+# Resume the thread and wait for a terminal goal status.
+./zig-out/bin/cas goal wait \
+  --cwd /path/to/workspace \
+  --thread-id thr_123 \
+  --timeout-ms 300000 \
+  --json
 
 # Start a detached review session for the working tree.
 ./zig-out/bin/cas review_session start \
@@ -127,6 +161,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 zig build test-cas
 zig build build-cas -Doptimize=ReleaseFast
 ./zig-out/bin/cas_conformance_suite --help
+./zig-out/bin/cas goal --help
 bash apps/cas/scripts/perf/budget_governor_gate.sh
 
 # Linux-only bounded fuzz smoke (matches CI behavior).
