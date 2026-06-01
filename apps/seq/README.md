@@ -43,6 +43,8 @@ Binary output:
 ./zig-out/bin/seq query --root ~/.codex/sessions --spec '{"dataset":"tool_call_args","where":[{"field":"tool_name","op":"eq","value":"exec_command"},{"field":"arg_path","op":"eq","value":"workdir"}],"select":["path","arg_path","value_text"],"sort":["timestamp"],"limit":5,"format":"table"}'
 ./zig-out/bin/seq workflow-audit --workflow fixed-point-driver --since 2026-04-01T00:00:00Z --format table
 ./zig-out/bin/seq workflow-audit --workflow fixed-point-driver --mode report --format markdown
+./zig-out/bin/seq workflow-audit --workflow fixed-point-driver --mode term-summary --term-group additive=add,added,patch --term-group reductive=delete,remove,refactor --since 2026-05-02T00:00:00-07:00 --format table
+./zig-out/bin/seq workflow-overlap --workflow fixed-point-driver,review-adjudication --since 2026-05-02T00:00:00-07:00 --format table
 ./zig-out/bin/seq find-session --root ~/.codex/sessions --prompt "learnings recall" --since 2026-03-08T00:00:00Z --until 2026-03-10T23:59:59Z --limit 5 --format table
 ./zig-out/bin/seq plan-search --root ~/.codex/sessions --repo /Users/tk/workspace/tk/shift --since 2026-03-01T00:00:00Z --format table
 ./zig-out/bin/seq plan-search --root ~/.codex/sessions --repo /Users/tk/workspace/tk/shift --contains "PromptMode" --stats --format jsonl
@@ -52,6 +54,7 @@ Binary output:
 ./zig-out/bin/seq session-tooling --root ~/.codex/sessions --since 2026-03-08T00:00:00Z --until 2026-03-10T23:59:59Z --summary --group-by executable --format table
 ./zig-out/bin/seq query-diagnose --path /absolute/path/to/rollout.jsonl --threshold-ms 10000 --next-actions --format json
 ./zig-out/bin/seq artifact-search --contains "spawn_agent" --kind orchestration --since 2026-03-01T00:00:00Z --limit 10 --format table
+./zig-out/bin/seq artifact-search --contains-any "fixed-point-driver,review-adjudication" --surface messages --since 2026-05-02T00:00:00-07:00 --format jsonl
 ./zig-out/bin/seq artifact-search --contains "MEMORY.md" --kind memory --stats --format table
 ./zig-out/bin/seq skill-success-rank --root ~/.codex/sessions --last 14d --format table
 ./zig-out/bin/seq skill-success-rank --root ~/.codex/sessions --skill seq --mode sessions --last 14d --format jsonl
@@ -66,6 +69,7 @@ Binary output:
 ./zig-out/bin/seq memory-extension-audit --extensions-root ~/.codex/memories/extensions --format table
 ./zig-out/bin/seq token-window --window-hours 24 --since 2026-04-01T00:00:00Z --exclude-current --format table
 ./zig-out/bin/seq goal-audit --root ~/.codex/sessions --workflow review,resolve --duration-gte 2h --summary --format table
+./zig-out/bin/seq adjudication-audit --mode summary --include-root-equivalent resolve,fixed-point-driver --since 2026-05-02T00:00:00-07:00 --format table
 ./zig-out/bin/seq workdir-report --workdir /Users/tk/workspace/tk/skills-zig --mode sessions --format table
 ./zig-out/bin/seq memory-provenance --thread-id 019bae5d-7d12-7b01-9cb5-b8bb6046b85b --format table
 ./zig-out/bin/seq memory-provenance --rollout-summary-file rollout_summaries/2026-01-11T18-42-01-jpEf-resolve_merge_pr_11_squash_cleanup.md --format json
@@ -99,13 +103,17 @@ seq query --root ~/.codex/sessions --spec '{"dataset":"messages","joins":[{"data
 `workflow-audit` is the high-level surface for workflow utilization reports:
 - selects sessions by exact `$workflow` / skill mention after stripping injected skill blocks
 - preserves signal source breakdown (`user_prompt`, `assistant_text`, `tool_trace`, `session_graph`)
-- emits `summary`, `signals`, `outcomes`, `sessions`, or `report` modes
-- supports `--since`, `--until`, `--workdir`, `--limit`, and `--format table|json|markdown`
+- emits `summary`, `signals`, `outcomes`, `sessions`, `report`, or `term-summary` modes
+- `term-summary` accepts repeated `--term-group <name=csv>` flags, `--examples N`, and `--unique-by snippet|path-snippet` for native phrase-bucket rollups without shell `jq`
+- supports `--since`, `--until`, `--workdir`, `--limit`, and `--format table|json|csv|jsonl|markdown`
 
 Examples:
 ```bash
 seq workflow-audit --root ~/.codex/sessions --workflow fixed-point-driver --mode summary --since 2026-04-01T00:00:00Z --format table
 seq workflow-audit --root ~/.codex/sessions --workflow fixed-point-driver --mode report --since 2026-04-01T00:00:00Z --format markdown
+seq workflow-audit --root ~/.codex/sessions --workflow fixed-point-driver --mode term-summary --term-group additive=add,added,patch --term-group reductive=delete,remove,refactor --format table
+seq workflow-overlap --root ~/.codex/sessions --workflow fixed-point-driver,review-adjudication --mode summary --since 2026-05-02T00:00:00-07:00 --format table
+seq workflow-overlap --root ~/.codex/sessions --workflow fixed-point-driver,review-adjudication --mode sessions --limit 20 --format jsonl
 ```
 
 ## Trace-native session surfaces
@@ -184,6 +192,7 @@ seq query --root ~/.codex/sessions --spec '{"dataset":"session_graph_edges","sel
 
 `artifact-search` is the seq-first forensic entrypoint:
 - searches `messages`, `tool_calls`, and `memory_blocks` with one normalized result shape
+- accepts `--contains`, `--contains-any <csv>`, or `--regex` as the native text match owner
 - accepts `--kind auto|session|memory|orchestration|tooling|prompt`
 - accepts `--surface auto|messages|tool_calls|memory_blocks` when you need to pin the substrate
 - emits `next_action_kind` / `next_action` suggestions for follow-up commands

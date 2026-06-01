@@ -44,6 +44,10 @@ if ! "$BIN_PATH" --help | rg -q '^- artifact-search$'; then
   echo "required command missing: artifact-search" >&2
   exit 1
 fi
+if ! "$BIN_PATH" --help | rg -q '^- workflow-overlap$'; then
+  echo "required command missing: workflow-overlap" >&2
+  exit 1
+fi
 if ! "$BIN_PATH" --help | rg -q '^- skill-audit$'; then
   echo "required command missing: skill-audit" >&2
   exit 1
@@ -94,6 +98,26 @@ if ! "$BIN_PATH" token-cost --help | rg -q -- '--pricing <kind>'; then
 fi
 if ! "$BIN_PATH" token-cost --help | rg -q -- '--model <name>'; then
   echo "token-cost help missing API model override support" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" artifact-search --help | rg -q -- '--contains-any <csv>'; then
+  echo "artifact-search help missing --contains-any support" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" workflow-audit --help | rg -q -- 'term-summary'; then
+  echo "workflow-audit help missing term-summary mode" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" workflow-audit --help | rg -q -- '--term-group <name=csv>'; then
+  echo "workflow-audit help missing --term-group support" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" workflow-overlap --help | rg -q -- '--mode summary|sessions'; then
+  echo "workflow-overlap help missing summary/sessions modes" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" adjudication-audit --help | rg -q -- '--mode summary|rows|report'; then
+  echo "adjudication-audit help missing native summary/rows/report modes" >&2
   exit 1
 fi
 for cmd in skill-audit tool-audit memory-inventory message-search workdir-report; do

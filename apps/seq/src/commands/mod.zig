@@ -524,6 +524,11 @@ const Options = struct {
     select_text: ?[]const u8 = null,
     sort_text: ?[]const u8 = null,
     group_by_text: ?[]const u8 = null,
+    term_group_texts: [16]?[]const u8 = [_]?[]const u8{null} ** 16,
+    term_group_count: usize = 0,
+    examples: usize = 3,
+    examples_set: bool = false,
+    unique_by_text: ?[]const u8 = null,
     metric_text: ?[]const u8 = null,
     pricing_text: ?[]const u8 = null,
     model_text: ?[]const u8 = null,
@@ -614,6 +619,7 @@ pub fn run(
         .adjudication_audit => try cmdAdjudicationAudit(allocator, sessions_root, opts),
         .goal_audit => try QueryLiftCommands.cmdGoalAudit(allocator, sessions_root, opts),
         .workflow_audit => try cmdWorkflowAudit(allocator, sessions_root, opts),
+        .workflow_overlap => try cmdWorkflowOverlap(allocator, sessions_root, opts),
         .session_tooling => try cmdSessionTooling(allocator, sessions_root, opts),
         .query_diagnose => try cmdQueryDiagnose(allocator, sessions_root, opts),
         .memory_provenance => try cmdMemoryProvenance(allocator, opts),
@@ -664,7 +670,7 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\usage: seq skill-blocks --skill <name> [--history <distinct|all|latest>] [--session-id <id>|--path <jsonl>|--current] [--since <iso>] [--until <iso>] [--limit N] [--format json|jsonl]
         ,
         .artifact_search =>
-        \\usage: seq artifact-search [--contains <text>|--regex <expr>] [--kind <auto|session|memory|orchestration|tooling|prompt>] [--surface <auto|messages|tool_calls|memory_blocks>] [--roles <csv>] [--tool <name>] [--workdir <path>] [--session-id <id>|--path <jsonl>] [--since <iso>] [--until <iso>] [--follow <none|auto>] [--strip-skill-blocks] [--no-dedupe-exact] [--stats] [--limit N] [--format table|json|csv|jsonl]
+        \\usage: seq artifact-search [--contains <text>|--contains-any <csv>|--regex <expr>] [--kind <auto|session|memory|orchestration|tooling|prompt>] [--surface <auto|messages|tool_calls|memory_blocks>] [--roles <csv>] [--tool <name>] [--workdir <path>] [--session-id <id>|--path <jsonl>] [--since <iso>] [--until <iso>] [--follow <none|auto>] [--strip-skill-blocks] [--no-dedupe-exact] [--stats] [--limit N] [--format table|json|csv|jsonl]
         ,
         .tool_audit =>
         \\usage: seq tool-audit [--mode summary|rows|args|unresolved] [--group-by executable|tool|session|workdir|command] [--tool <name>] [--executable <name>] [--workdir <path>] [--contains <text>] [--since <iso>] [--until <iso>] [--limit N] [--format table|json|csv|jsonl]
@@ -779,7 +785,7 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\usage: seq query --spec <json|@path>
         ,
         .adjudication_audit =>
-        \\usage: seq adjudication-audit [--skill <name>] [--last <Nm|Nh|Nd>|--since <iso>] [--until <iso>] [--include-root-equivalent <csv>] [--bundle-dir <path>] [--limit N] [--format markdown|json|jsonl]
+        \\usage: seq adjudication-audit [--mode summary|rows|report] [--skill <name>] [--last <Nm|Nh|Nd>|--since <iso>] [--until <iso>] [--include-root-equivalent <csv>] [--bundle-dir <path>] [--limit N] [--format table|markdown|json|csv|jsonl]
         \\extra options:
         \\  --skill <name>                 Skill to audit (default: review-adjudication)
         \\  --include-root-equivalent <csv> Include root-equivalent workflow names such as resolve,fixed-point-driver
@@ -789,7 +795,10 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\usage: seq goal-audit [--mode summary|rows] [--workflow review|resolve|review,resolve] [--duration-gte <seconds|minutes|hours>] [--status <name>] [--contains <text>] [--since <iso>] [--until <iso>] [--path <jsonl>|--session-id <id>] [--exclude-current] [--show-query] [--limit N] [--format table|json|csv|jsonl]
         ,
         .workflow_audit =>
-        \\usage: seq workflow-audit --workflow <name> [--mode summary|signals|outcomes|sessions|report] [--since <iso>] [--until <iso>] [--workdir <path>] [--limit N] [--format table|json|markdown]
+        \\usage: seq workflow-audit --workflow <name> [--mode summary|signals|outcomes|sessions|report|term-summary] [--term-group <name=csv>] [--examples N] [--unique-by snippet|path-snippet] [--since <iso>] [--until <iso>] [--workdir <path>] [--limit N] [--format table|json|csv|jsonl|markdown]
+        ,
+        .workflow_overlap =>
+        \\usage: seq workflow-overlap --workflow <a,b> [--mode summary|sessions] [--since <iso>] [--until <iso>] [--workdir <path>] [--limit N] [--format table|json|csv|jsonl]
         ,
         .session_tooling =>
         \\usage: seq session-tooling [--session-id <id>|--path <jsonl>] [--since <iso>] [--until <iso>] [--group-by executable|command|tool] [--summary] [--limit N] [--format table|json|csv|jsonl]
@@ -888,16 +897,16 @@ fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
             if (fmt == .csv or fmt == .markdown) return error.InvalidFormatForCommand;
         },
         .workflow_audit => {
-            if (fmt == .csv or fmt == .jsonl or fmt == .dot) return error.InvalidFormatForCommand;
+            if (fmt == .dot) return error.InvalidFormatForCommand;
         },
         .adjudication_audit => {
-            if (fmt == .table or fmt == .csv or fmt == .dot) return error.InvalidFormatForCommand;
+            if (fmt == .dot) return error.InvalidFormatForCommand;
         },
         .sessions, .turns, .tool_lifecycle, .tail => {
             if (fmt == .csv or fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
         .query => {},
-        .artifact_search, .tool_audit, .memory_inventory, .message_search, .message_audit, .skill_cohort, .tool_search, .memory_extension_audit, .token_window, .workdir_report, .orchestration_concurrency, .find_session, .plan_search, .reply_latency, .session_prompts, .token_usage, .token_cost, .routing_gap, .session_tooling, .query_diagnose, .memory_provenance, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .skill_audit, .skill_success_rank, .goal_audit, .index => {
+        .artifact_search, .tool_audit, .memory_inventory, .message_search, .message_audit, .skill_cohort, .tool_search, .memory_extension_audit, .token_window, .workdir_report, .orchestration_concurrency, .find_session, .plan_search, .reply_latency, .session_prompts, .token_usage, .token_cost, .routing_gap, .session_tooling, .query_diagnose, .memory_provenance, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .skill_audit, .skill_success_rank, .goal_audit, .workflow_overlap, .index => {
             if (fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
         .unknown => return error.InvalidCommand,
@@ -925,7 +934,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .skill_trend, .skill_report, .skill_audit, .skill_success_rank, .skill_cohort, .occurrence_export, .skill_blocks, .adjudication_audit => true,
         else => false,
     };
-    const supports_workflow = cmd == .workflow_audit or cmd == .goal_audit;
+    const supports_workflow = cmd == .workflow_audit or cmd == .workflow_overlap or cmd == .goal_audit;
     const supports_history = cmd == .skill_blocks;
     const supports_bucket = cmd == .skill_trend;
     const supports_prompt = cmd == .find_session;
@@ -941,7 +950,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .artifact_search, .tool_audit, .memory_inventory, .message_search, .message_audit, .skill_cohort, .tool_search, .memory_extension_audit, .workdir_report, .plan_search, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .sessions, .turns, .goal_audit => true,
         else => false,
     };
-    const supports_contains_any = cmd == .message_search or cmd == .message_audit or cmd == .skill_cohort or cmd == .tool_search or cmd == .workdir_report;
+    const supports_contains_any = cmd == .artifact_search or cmd == .message_search or cmd == .message_audit or cmd == .skill_cohort or cmd == .tool_search or cmd == .workdir_report;
     const supports_contains_all = cmd == .message_search or cmd == .message_audit;
     const supports_regex = switch (cmd) {
         .artifact_search, .memory_inventory, .message_search, .message_audit, .skill_cohort, .tool_search, .memory_extension_audit, .plan_search, .memory_map, .memory_history, .opencode_prompts, .opencode_events => true,
@@ -950,11 +959,11 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_role = cmd == .opencode_events;
     const supports_tool = cmd == .opencode_events or cmd == .artifact_search or cmd == .tool_audit or cmd == .tool_search;
     const supports_executable = cmd == .tool_audit or cmd == .tool_search;
-    const supports_workdir = cmd == .artifact_search or cmd == .tool_audit or cmd == .tool_search or cmd == .workdir_report or cmd == .workflow_audit;
+    const supports_workdir = cmd == .artifact_search or cmd == .tool_audit or cmd == .tool_search or cmd == .workdir_report or cmd == .workflow_audit or cmd == .workflow_overlap;
     const supports_repo = cmd == .plan_search or cmd == .sessions;
     const supports_status = cmd == .opencode_events or cmd == .turns or cmd == .goal_audit;
     const supports_mode = switch (cmd) {
-        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .skill_success_rank, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit, .goal_audit => true,
+        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .skill_success_rank, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit, .workflow_overlap, .adjudication_audit, .goal_audit => true,
         else => false,
     };
     const supports_kind = cmd == .artifact_search;
@@ -1000,6 +1009,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .session_tooling,
         .query_diagnose,
         .workflow_audit,
+        .workflow_overlap,
         .adjudication_audit,
         .goal_audit,
         .memory_map,
@@ -1039,6 +1049,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .session_tooling,
         .query_diagnose,
         .workflow_audit,
+        .workflow_overlap,
         .adjudication_audit,
         .goal_audit,
         .memory_map,
@@ -1059,6 +1070,9 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .session_tooling, .tool_audit, .tool_search, .opencode_prompts, .opencode_events, .token_usage, .token_cost => true,
         else => false,
     };
+    const supports_term_group = cmd == .workflow_audit;
+    const supports_examples = cmd == .workflow_audit;
+    const supports_unique_by = cmd == .workflow_audit;
     const supports_timezone = switch (cmd) {
         .token_usage, .token_cost => true,
         else => false,
@@ -1176,6 +1190,9 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.last_text != null, supports_last, "--last", cmd);
     try ensureOptionAllowed(opts.session != null, supports_session, "--session", cmd);
     try ensureOptionAllowed(opts.group_by_text != null, supports_group_by, "--group-by", cmd);
+    try ensureOptionAllowed(opts.term_group_count > 0, supports_term_group, "--term-group", cmd);
+    try ensureOptionAllowed(opts.examples_set, supports_examples, "--examples", cmd);
+    try ensureOptionAllowed(opts.unique_by_text != null, supports_unique_by, "--unique-by", cmd);
     try ensureOptionAllowed(opts.metric_text != null, supports_metric, "--metric", cmd);
     try ensureOptionAllowed(opts.select_text != null, supports_select, "--select", cmd);
     try ensureOptionAllowed(opts.sort_text != null, supports_sort, "--sort", cmd);
@@ -1278,6 +1295,23 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
             if (!isValidWorkflowAuditMode(text)) return error.InvalidModeArg;
         }
     }
+    if (cmd == .workflow_overlap) {
+        if (opts.mode) |text| {
+            if (!isValidWorkflowOverlapMode(text)) return error.InvalidModeArg;
+        }
+        if (opts.workflow) |text| {
+            if (!isValidWorkflowOverlapCsv(text)) return error.InvalidModeArg;
+        }
+    }
+    if (cmd == .adjudication_audit) {
+        if (opts.mode) |text| {
+            if (!isValidAdjudicationAuditMode(text)) return error.InvalidModeArg;
+        }
+    }
+    if (opts.unique_by_text) |text| {
+        if (!std.mem.eql(u8, text, "snippet") and !std.mem.eql(u8, text, "path-snippet")) return error.InvalidModeArg;
+    }
+    if (opts.examples > 10) return error.InvalidLimit;
     if (cmd == .goal_audit) {
         if (opts.mode) |text| {
             if (!isValidGoalAuditMode(text)) return error.InvalidModeArg;
@@ -1458,7 +1492,30 @@ fn isValidWorkflowAuditMode(text: []const u8) bool {
         std.mem.eql(u8, text, "signals") or
         std.mem.eql(u8, text, "outcomes") or
         std.mem.eql(u8, text, "sessions") or
+        std.mem.eql(u8, text, "report") or
+        std.mem.eql(u8, text, "term-summary");
+}
+
+fn isValidWorkflowOverlapMode(text: []const u8) bool {
+    return std.mem.eql(u8, text, "summary") or
+        std.mem.eql(u8, text, "sessions");
+}
+
+fn isValidAdjudicationAuditMode(text: []const u8) bool {
+    return std.mem.eql(u8, text, "summary") or
+        std.mem.eql(u8, text, "rows") or
         std.mem.eql(u8, text, "report");
+}
+
+fn isValidWorkflowOverlapCsv(text: []const u8) bool {
+    var split = std.mem.splitScalar(u8, text, ',');
+    var count: usize = 0;
+    while (split.next()) |part_raw| {
+        const part = std.mem.trim(u8, part_raw, " \t\r\n");
+        if (part.len == 0) return false;
+        count += 1;
+    }
+    return count == 2;
 }
 
 fn isValidGoalAuditMode(text: []const u8) bool {
@@ -2589,6 +2646,9 @@ const workflow_audit_summary_columns = [_][]const u8{ "source_kind", "signal_kin
 const workflow_audit_signal_columns = [_][]const u8{ "timestamp", "path", "source_kind", "signal_kind", "name", "outcome_kind", "snippet", "contamination_flags" };
 const workflow_audit_outcome_columns = [_][]const u8{ "outcome_kind", "mentions", "sessions" };
 const workflow_audit_session_columns = [_][]const u8{ "path", "signals", "first_seen", "last_seen" };
+const workflow_audit_term_summary_columns = [_][]const u8{ "term_group", "terms", "matched_rows", "unique_snippets", "sessions", "examples" };
+const workflow_overlap_summary_columns = [_][]const u8{ "workflow_a", "workflow_b", "sessions_a", "sessions_b", "overlap_sessions", "a_only_sessions", "b_only_sessions", "pct_a_with_b", "pct_b_with_a" };
+const workflow_overlap_session_columns = [_][]const u8{ "path", "overlap_class", "in_a", "in_b", "signals_a", "signals_b", "first_seen_a", "last_seen_a", "first_seen_b", "last_seen_b" };
 
 const StringSet = struct {
     allocator: std.mem.Allocator,
@@ -2608,10 +2668,15 @@ const StringSet = struct {
     }
 
     fn put(self: *StringSet, text: []const u8) !void {
-        if (self.map.contains(text)) return;
+        _ = try self.putNew(text);
+    }
+
+    fn putNew(self: *StringSet, text: []const u8) !bool {
+        if (self.map.contains(text)) return false;
         const copy = try self.allocator.dupe(u8, text);
         errdefer self.allocator.free(copy);
         try self.map.put(copy, {});
+        return true;
     }
 
     fn contains(self: *const StringSet, text: []const u8) bool {
@@ -2632,6 +2697,11 @@ fn cmdWorkflowAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opt
         output.Format.markdown
     else
         output.Format.table;
+
+    if (std.mem.eql(u8, mode, "term-summary")) {
+        if (fmt == .markdown) return error.InvalidFormatForCommand;
+        return cmdWorkflowTermSummaryRaw(allocator, sessions_root, opts, fmt);
+    }
 
     var rows = try collectWorkflowAuditRows(allocator, sessions_root, opts);
     defer deinitQueryRows(allocator, &rows);
@@ -2721,7 +2791,435 @@ fn workflowAuditColumnsForMode(mode: []const u8) ?[]const []const u8 {
     if (std.mem.eql(u8, mode, "outcomes")) return workflow_audit_outcome_columns[0..];
     if (std.mem.eql(u8, mode, "sessions")) return workflow_audit_session_columns[0..];
     if (std.mem.eql(u8, mode, "report")) return workflow_audit_signal_columns[0..];
+    if (std.mem.eql(u8, mode, "term-summary")) return workflow_audit_term_summary_columns[0..];
     return null;
+}
+
+const WorkflowTermGroup = struct {
+    name: []const u8,
+    terms: []const []const u8,
+    terms_display: []const u8,
+
+    fn deinit(self: WorkflowTermGroup, allocator: std.mem.Allocator) void {
+        allocator.free(self.terms);
+        allocator.free(self.terms_display);
+    }
+};
+
+const WorkflowTermState = struct {
+    group: WorkflowTermGroup,
+    matched_rows: usize = 0,
+    sessions: StringSet,
+    uniques: StringSet,
+    examples: std.ArrayList([]u8) = .empty,
+
+    fn init(allocator: std.mem.Allocator, group: WorkflowTermGroup) WorkflowTermState {
+        return .{
+            .group = group,
+            .sessions = StringSet.init(allocator),
+            .uniques = StringSet.init(allocator),
+        };
+    }
+
+    fn deinit(self: *WorkflowTermState, allocator: std.mem.Allocator) void {
+        self.group.deinit(allocator);
+        self.sessions.deinit();
+        self.uniques.deinit();
+        for (self.examples.items) |example| allocator.free(example);
+        self.examples.deinit(allocator);
+    }
+};
+
+fn cmdWorkflowTermSummaryRaw(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    opts: Options,
+    fmt: output.Format,
+) !void {
+    const workflow = opts.workflow orelse return error.MissingWorkflowArg;
+    if (opts.term_group_count == 0) return error.MissingArgValue;
+    const example_limit = @min(opts.examples, @as(usize, 10));
+    const unique_by = opts.unique_by_text orelse "path-snippet";
+
+    var states: std.ArrayList(WorkflowTermState) = .empty;
+    defer {
+        for (states.items) |*state| state.deinit(allocator);
+        states.deinit(allocator);
+    }
+
+    var idx: usize = 0;
+    while (idx < opts.term_group_count) : (idx += 1) {
+        const raw = opts.term_group_texts[idx] orelse return error.InvalidModeArg;
+        try states.append(allocator, WorkflowTermState.init(allocator, try parseWorkflowTermGroup(allocator, raw)));
+    }
+
+    var workdir_paths = StringSet.init(allocator);
+    var has_workdir_filter = false;
+    defer if (has_workdir_filter) workdir_paths.deinit();
+    if (opts.workdir_text != null) {
+        has_workdir_filter = true;
+        try collectWorkdirSessionPaths(allocator, sessions_root, opts, &workdir_paths);
+    }
+
+    const day_filter = deriveSessionDayPathFilterFromOptions(opts);
+    var paths = try collectJsonlPaths(allocator, sessions_root, day_filter);
+    defer freePathList(allocator, &paths);
+
+    for (paths.items) |path| {
+        if (has_workdir_filter and !workdir_paths.contains(path)) continue;
+        try recordWorkflowTermSummaryFromRawSignals(allocator, &states, path, workflow, opts, unique_by, example_limit);
+    }
+
+    var out_rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &out_rows);
+    for (states.items) |*state| {
+        var row = query.Row.init(allocator);
+        errdefer row.deinit();
+        const examples = try joinExamples(allocator, state.examples.items);
+        defer allocator.free(examples);
+        try row.putOwnedKey("term_group", .{ .string = state.group.name });
+        try row.putOwnedKey("terms", .{ .string = state.group.terms_display });
+        try row.putOwnedKey("matched_rows", .{ .int = @intCast(state.matched_rows) });
+        try row.putOwnedKey("unique_snippets", .{ .int = @intCast(state.uniques.count()) });
+        try row.putOwnedKey("sessions", .{ .int = @intCast(state.sessions.count()) });
+        try row.putOwnedKey("examples", .{ .string = examples });
+        try out_rows.append(allocator, row);
+    }
+
+    try output.writeOutput(allocator, fmt, out_rows.items, workflow_audit_term_summary_columns[0..], opts.out_path);
+}
+
+fn recordWorkflowTermSummaryFromRawSignals(
+    allocator: std.mem.Allocator,
+    states: *std.ArrayList(WorkflowTermState),
+    path: []const u8,
+    workflow: []const u8,
+    opts: Options,
+    unique_by: []const u8,
+    example_limit: usize,
+) !void {
+    const content = try readFileAllocOrSkip(allocator, path);
+    if (content == null) return;
+    defer allocator.free(content.?);
+
+    var lines = std.mem.splitScalar(u8, content.?, '\n');
+    while (lines.next()) |line| {
+        if (!containsDollarWorkflowMention(line, workflow)) continue;
+        if (!lineLooksLikeAssistantMessage(line)) continue;
+        const timestamp = extractFlatJsonStringField(line, "timestamp");
+        if (timestamp != null and !timestampSatisfiesBounds(timestamp, opts)) continue;
+        const snippet = line[0..@min(line.len, 240)];
+        for (states.items) |*state| {
+            if (!termGroupMatches(snippet, state.group.terms)) continue;
+            state.matched_rows += 1;
+            try state.sessions.put(path);
+            const unique_key = if (std.mem.eql(u8, unique_by, "snippet"))
+                try allocator.dupe(u8, snippet)
+            else
+                try std.fmt.allocPrint(allocator, "{s}\x1f{s}", .{ path, snippet });
+            defer allocator.free(unique_key);
+            const was_new = try state.uniques.putNew(unique_key);
+            if (was_new and state.examples.items.len < example_limit) {
+                try state.examples.append(allocator, try allocator.dupe(u8, snippet));
+            }
+        }
+    }
+}
+
+fn lineLooksLikeAssistantMessage(line: []const u8) bool {
+    return std.mem.indexOf(u8, line, "\"role\":\"assistant\"") != null;
+}
+
+fn parseWorkflowTermGroup(allocator: std.mem.Allocator, raw: []const u8) !WorkflowTermGroup {
+    const eq = std.mem.indexOfScalar(u8, raw, '=') orelse return error.InvalidModeArg;
+    const name = std.mem.trim(u8, raw[0..eq], " \t\r\n");
+    const terms_raw = std.mem.trim(u8, raw[eq + 1 ..], " \t\r\n");
+    if (name.len == 0 or terms_raw.len == 0) return error.InvalidModeArg;
+
+    var terms: std.ArrayList([]const u8) = .empty;
+    defer terms.deinit(allocator);
+    var split = std.mem.splitScalar(u8, terms_raw, ',');
+    while (split.next()) |part_raw| {
+        const part = std.mem.trim(u8, part_raw, " \t\r\n");
+        if (part.len == 0) return error.InvalidModeArg;
+        try terms.append(allocator, part);
+    }
+    if (terms.items.len == 0) return error.InvalidModeArg;
+
+    return .{
+        .name = name,
+        .terms = try terms.toOwnedSlice(allocator),
+        .terms_display = try allocator.dupe(u8, terms_raw),
+    };
+}
+
+fn termGroupMatches(text: []const u8, terms: []const []const u8) bool {
+    for (terms) |term| {
+        if (containsIgnoreCaseAscii(text, term)) return true;
+    }
+    return false;
+}
+
+fn joinExamples(allocator: std.mem.Allocator, examples: []const []u8) ![]u8 {
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+    for (examples, 0..) |example, idx| {
+        if (idx > 0) try writer.writeAll(" | ");
+        try writer.writeAll(example);
+    }
+    return writer_alloc.toOwnedSlice();
+}
+
+const WorkflowPair = struct {
+    a: []const u8,
+    b: []const u8,
+};
+
+const WorkflowOverlapState = struct {
+    path: []u8,
+    signals_a: usize = 0,
+    signals_b: usize = 0,
+    first_seen_a: ?[]u8 = null,
+    last_seen_a: ?[]u8 = null,
+    first_seen_b: ?[]u8 = null,
+    last_seen_b: ?[]u8 = null,
+
+    fn deinit(self: *WorkflowOverlapState, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        if (self.first_seen_a) |value| allocator.free(value);
+        if (self.last_seen_a) |value| allocator.free(value);
+        if (self.first_seen_b) |value| allocator.free(value);
+        if (self.last_seen_b) |value| allocator.free(value);
+    }
+};
+
+fn cmdWorkflowOverlap(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    const pair = try parseWorkflowPair(opts.workflow orelse return error.MissingWorkflowArg);
+    const mode = opts.mode orelse "summary";
+
+    var states = try collectWorkflowOverlapStates(allocator, sessions_root, opts, pair);
+    defer deinitWorkflowOverlapStates(allocator, &states);
+
+    var sessions_a: usize = 0;
+    var sessions_b: usize = 0;
+    var overlap_count: usize = 0;
+    for (states.items) |state| {
+        const has_a = state.signals_a > 0;
+        const has_b = state.signals_b > 0;
+        if (has_a) sessions_a += 1;
+        if (has_b) sessions_b += 1;
+        if (has_a and has_b) overlap_count += 1;
+    }
+
+    var out_rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &out_rows);
+
+    if (std.mem.eql(u8, mode, "summary")) {
+        var row = query.Row.init(allocator);
+        errdefer row.deinit();
+        try row.putOwnedKey("workflow_a", .{ .string = pair.a });
+        try row.putOwnedKey("workflow_b", .{ .string = pair.b });
+        try row.putOwnedKey("sessions_a", .{ .int = @intCast(sessions_a) });
+        try row.putOwnedKey("sessions_b", .{ .int = @intCast(sessions_b) });
+        try row.putOwnedKey("overlap_sessions", .{ .int = @intCast(overlap_count) });
+        try row.putOwnedKey("a_only_sessions", .{ .int = @intCast(sessions_a - overlap_count) });
+        try row.putOwnedKey("b_only_sessions", .{ .int = @intCast(sessions_b - overlap_count) });
+        try row.putOwnedKey("pct_a_with_b", .{ .float = percentage(overlap_count, sessions_a) });
+        try row.putOwnedKey("pct_b_with_a", .{ .float = percentage(overlap_count, sessions_b) });
+        try out_rows.append(allocator, row);
+        return output.writeOutput(allocator, opts.format, out_rows.items, workflow_overlap_summary_columns[0..], opts.out_path);
+    }
+
+    if (!std.mem.eql(u8, mode, "sessions")) return error.InvalidModeArg;
+    for (states.items) |state| {
+        try appendWorkflowOverlapSessionStateRow(allocator, &out_rows, state);
+    }
+
+    const sort = [_]spec.SortSpec{
+        .{ .field = "overlap_class", .descending = false },
+        .{ .field = "path", .descending = false },
+    };
+    const limit = if (opts.limit > 0) opts.limit else out_rows.items.len;
+    const query_spec = spec.QuerySpec{ .sort = sort[0..], .limit = limit };
+    var result = try query.execute(allocator, out_rows.items, query_spec);
+    defer result.deinit(allocator);
+    try output.writeOutput(allocator, opts.format, result.rows.items, workflow_overlap_session_columns[0..], opts.out_path);
+}
+
+fn collectWorkflowOverlapStates(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    opts: Options,
+    pair: WorkflowPair,
+) !std.ArrayList(WorkflowOverlapState) {
+    var where: std.ArrayList(spec.WhereClause) = .empty;
+    defer where.deinit(allocator);
+    try appendSessionTimeBounds(allocator, &where, opts);
+
+    var workdir_paths = StringSet.init(allocator);
+    var has_workdir_filter = false;
+    defer if (has_workdir_filter) workdir_paths.deinit();
+    if (opts.workdir_text != null) {
+        has_workdir_filter = true;
+        try collectWorkdirSessionPaths(allocator, sessions_root, opts, &workdir_paths);
+    }
+
+    const day_filter = deriveSessionDayPathFilter("workflow_signals", where.items);
+    var paths = try collectJsonlPaths(allocator, sessions_root, day_filter);
+    defer freePathList(allocator, &paths);
+
+    var states: std.ArrayList(WorkflowOverlapState) = .empty;
+    errdefer deinitWorkflowOverlapStates(allocator, &states);
+    var index = std.StringHashMap(usize).init(allocator);
+    defer index.deinit();
+
+    for (paths.items) |path| {
+        if (has_workdir_filter and !workdir_paths.contains(path)) continue;
+        try appendWorkflowOverlapStateFromRawSignals(allocator, &states, &index, path, pair, opts);
+    }
+
+    return states;
+}
+
+fn appendWorkflowOverlapStateFromRawSignals(
+    allocator: std.mem.Allocator,
+    states: *std.ArrayList(WorkflowOverlapState),
+    index: *std.StringHashMap(usize),
+    path: []const u8,
+    pair: WorkflowPair,
+    opts: Options,
+) !void {
+    const content = try readFileAllocOrSkip(allocator, path);
+    if (content == null) return;
+    defer allocator.free(content.?);
+
+    var lines = std.mem.splitScalar(u8, content.?, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOfScalar(u8, line, '$') == null) continue;
+        const timestamp = extractFlatJsonStringField(line, "timestamp");
+        if (timestamp != null and !timestampSatisfiesBounds(timestamp, opts)) continue;
+        if (containsDollarWorkflowMention(line, pair.a)) {
+            const idx = try getOrCreateWorkflowOverlapState(allocator, states, index, path);
+            try recordWorkflowOverlapSignal(allocator, &states.items[idx], true, timestamp);
+        }
+        if (containsDollarWorkflowMention(line, pair.b)) {
+            const idx = try getOrCreateWorkflowOverlapState(allocator, states, index, path);
+            try recordWorkflowOverlapSignal(allocator, &states.items[idx], false, timestamp);
+        }
+    }
+}
+
+fn containsDollarWorkflowMention(text: []const u8, workflow: []const u8) bool {
+    var pos: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, text, pos, '$')) |dollar| {
+        const start = dollar + 1;
+        if (start + workflow.len <= text.len and std.mem.eql(u8, text[start .. start + workflow.len], workflow)) {
+            const end = start + workflow.len;
+            if (end == text.len or !isSignalNameChar(text[end])) return true;
+        }
+        pos = start;
+    }
+    return false;
+}
+
+fn extractFlatJsonStringField(line: []const u8, field: []const u8) ?[]const u8 {
+    var buf: [64]u8 = undefined;
+    const pattern = std.fmt.bufPrint(&buf, "\"{s}\":\"", .{field}) catch return null;
+    const start = (std.mem.indexOf(u8, line, pattern) orelse return null) + pattern.len;
+    const rel_end = std.mem.indexOfScalarPos(u8, line, start, '"') orelse return null;
+    return line[start..rel_end];
+}
+
+fn getOrCreateWorkflowOverlapState(
+    allocator: std.mem.Allocator,
+    states: *std.ArrayList(WorkflowOverlapState),
+    index: *std.StringHashMap(usize),
+    path: []const u8,
+) !usize {
+    if (index.get(path)) |idx| return idx;
+    const owned_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned_path);
+    try states.append(allocator, .{ .path = owned_path });
+    errdefer {
+        var popped = states.pop().?;
+        popped.deinit(allocator);
+    }
+    const idx = states.items.len - 1;
+    try index.put(states.items[idx].path, idx);
+    return idx;
+}
+
+fn recordWorkflowOverlapSignal(
+    allocator: std.mem.Allocator,
+    state: *WorkflowOverlapState,
+    is_a: bool,
+    timestamp: ?[]const u8,
+) !void {
+    if (is_a) {
+        state.signals_a += 1;
+        try recordWorkflowOverlapTimestamp(allocator, &state.first_seen_a, &state.last_seen_a, timestamp);
+    } else {
+        state.signals_b += 1;
+        try recordWorkflowOverlapTimestamp(allocator, &state.first_seen_b, &state.last_seen_b, timestamp);
+    }
+}
+
+fn recordWorkflowOverlapTimestamp(
+    allocator: std.mem.Allocator,
+    first_seen: *?[]u8,
+    last_seen: *?[]u8,
+    timestamp: ?[]const u8,
+) !void {
+    const value = timestamp orelse return;
+    if (first_seen.* == null or std.mem.order(u8, value, first_seen.*.?) == .lt) {
+        if (first_seen.*) |old| allocator.free(old);
+        first_seen.* = try allocator.dupe(u8, value);
+    }
+    if (last_seen.* == null or std.mem.order(u8, value, last_seen.*.?) == .gt) {
+        if (last_seen.*) |old| allocator.free(old);
+        last_seen.* = try allocator.dupe(u8, value);
+    }
+}
+
+fn deinitWorkflowOverlapStates(allocator: std.mem.Allocator, states: *std.ArrayList(WorkflowOverlapState)) void {
+    for (states.items) |*state| state.deinit(allocator);
+    states.deinit(allocator);
+}
+
+fn parseWorkflowPair(raw: []const u8) !WorkflowPair {
+    var split = std.mem.splitScalar(u8, raw, ',');
+    const a = std.mem.trim(u8, split.next() orelse return error.InvalidModeArg, " \t\r\n");
+    const b = std.mem.trim(u8, split.next() orelse return error.InvalidModeArg, " \t\r\n");
+    if (split.next() != null or a.len == 0 or b.len == 0) return error.InvalidModeArg;
+    return .{ .a = a, .b = b };
+}
+
+fn percentage(numerator: usize, denominator: usize) f64 {
+    if (denominator == 0) return 0;
+    return (@as(f64, @floatFromInt(numerator)) * 100.0) / @as(f64, @floatFromInt(denominator));
+}
+
+fn appendWorkflowOverlapSessionStateRow(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    state: WorkflowOverlapState,
+) !void {
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    const has_a = state.signals_a > 0;
+    const has_b = state.signals_b > 0;
+    try row.putOwnedKey("path", .{ .string = state.path });
+    try row.putOwnedKey("overlap_class", .{ .string = if (has_a and has_b) "overlap" else if (has_a) "a_only" else "b_only" });
+    try row.putOwnedKey("in_a", .{ .bool = has_a });
+    try row.putOwnedKey("in_b", .{ .bool = has_b });
+    try row.putOwnedKey("signals_a", if (has_a) .{ .int = @intCast(state.signals_a) } else .null);
+    try row.putOwnedKey("signals_b", if (has_b) .{ .int = @intCast(state.signals_b) } else .null);
+    try row.putOwnedKey("first_seen_a", if (state.first_seen_a) |value| .{ .string = value } else .null);
+    try row.putOwnedKey("last_seen_a", if (state.last_seen_a) |value| .{ .string = value } else .null);
+    try row.putOwnedKey("first_seen_b", if (state.first_seen_b) |value| .{ .string = value } else .null);
+    try row.putOwnedKey("last_seen_b", if (state.last_seen_b) |value| .{ .string = value } else .null);
+    try out_rows.append(allocator, row);
 }
 
 fn collectWorkflowAuditRows(
@@ -3019,6 +3517,29 @@ const adjudication_audit_columns = [_][]const u8{
     "evidence_excerpt",
     "path",
 };
+const adjudication_audit_summary_columns = [_][]const u8{
+    "candidate_sessions",
+    "decision_bearing_sessions",
+    "resolve_selection_present_sessions",
+    "missing_resolve_selection_sessions",
+    "selected_total",
+    "rejected_total",
+    "address_total",
+    "validate_only_total",
+    "resolve_thread_only_total",
+    "do_not_address_total",
+    "rebut_total",
+    "defer_total",
+    "investigate_total",
+    "route_total",
+    "blocked_total",
+    "all_selected_sessions",
+    "no_rejections_sessions",
+    "invariant_framed_sessions",
+    "invariant_ace_seen_sessions",
+    "selected_invariant_without_invariant_ace_sessions",
+    "root_equivalent_only_sessions",
+};
 
 const AdjudicationRouteCounts = struct {
     address: usize = 0,
@@ -3072,6 +3593,7 @@ fn cmdAdjudicationAudit(allocator: std.mem.Allocator, sessions_root: []const u8,
         const content = try readFileAllocOrSkip(allocator, path);
         if (content == null) continue;
         defer allocator.free(content.?);
+        if (!contentContainsAdjudicationCandidate(content.?, skill, opts.include_root_equivalent_text)) continue;
 
         const parse_options = datasets.messages.ParseOptions{
             .include_user = true,
@@ -3128,17 +3650,142 @@ fn cmdAdjudicationAudit(allocator: std.mem.Allocator, sessions_root: []const u8,
         try rows.append(allocator, row);
     }
 
-    trimQueryRows(&rows, opts.limit);
-
     if (opts.bundle_dir_text) |dir| {
         try writeAdjudicationAuditBundle(allocator, rows.items, dir);
     }
 
-    const fmt = if (opts.format_set) opts.format else output.Format.markdown;
-    if (fmt == .markdown) {
+    const mode = opts.mode orelse "report";
+    const fmt = if (opts.format_set)
+        opts.format
+    else if (std.mem.eql(u8, mode, "summary"))
+        output.Format.table
+    else if (std.mem.eql(u8, mode, "rows"))
+        output.Format.jsonl
+    else
+        output.Format.markdown;
+    if (std.mem.eql(u8, mode, "summary")) {
+        if (fmt == .markdown) return error.InvalidFormatForCommand;
+        var summary_rows = try adjudicationSummaryRows(allocator, rows.items);
+        defer deinitQueryRows(allocator, &summary_rows);
+        return output.writeOutput(allocator, fmt, summary_rows.items, adjudication_audit_summary_columns[0..], opts.out_path);
+    }
+
+    trimQueryRows(&rows, opts.limit);
+    if (std.mem.eql(u8, mode, "report") and fmt == .markdown) {
         return writeAdjudicationAuditMarkdown(allocator, rows.items, skill, opts.out_path);
     }
+    if (!std.mem.eql(u8, mode, "rows") and !std.mem.eql(u8, mode, "report")) return error.InvalidModeArg;
     return output.writeOutput(allocator, fmt, rows.items, adjudication_audit_columns[0..], opts.out_path);
+}
+
+fn contentContainsAdjudicationCandidate(content: []const u8, skill: []const u8, root_equivalents: ?[]const u8) bool {
+    if (containsDollarWorkflowMention(content, skill)) return true;
+    const csv = root_equivalents orelse return false;
+    var split = std.mem.splitScalar(u8, csv, ',');
+    while (split.next()) |part_raw| {
+        const part = std.mem.trim(u8, part_raw, " \t\r\n");
+        if (part.len == 0) continue;
+        if (containsDollarWorkflowMention(content, part)) return true;
+    }
+    return false;
+}
+
+fn adjudicationSummaryRows(allocator: std.mem.Allocator, rows: []const query.Row) !std.ArrayList(query.Row) {
+    var out: std.ArrayList(query.Row) = .empty;
+    errdefer deinitQueryRows(allocator, &out);
+
+    var decision_bearing: usize = 0;
+    var resolve_selection_present: usize = 0;
+    var selected_total: i64 = 0;
+    var rejected_total: i64 = 0;
+    var address_total: i64 = 0;
+    var validate_only_total: i64 = 0;
+    var resolve_thread_only_total: i64 = 0;
+    var do_not_address_total: i64 = 0;
+    var rebut_total: i64 = 0;
+    var defer_total: i64 = 0;
+    var investigate_total: i64 = 0;
+    var route_total: i64 = 0;
+    var blocked_total: i64 = 0;
+    var all_selected: usize = 0;
+    var no_rejections: usize = 0;
+    var invariant_framed: usize = 0;
+    var invariant_ace_seen: usize = 0;
+    var selected_invariant_without_invariant_ace: usize = 0;
+    var root_equivalent_only: usize = 0;
+
+    for (rows) |row| {
+        if (scalarStringEq(row.valueOrNull("classification"), "decision-bearing")) decision_bearing += 1;
+        if (scalarBool(row.valueOrNull("resolve_selection_present"))) resolve_selection_present += 1;
+        selected_total += scalarIntOrZero(row.valueOrNull("selected_count"));
+        rejected_total += scalarIntOrZero(row.valueOrNull("rejected_count"));
+        address_total += scalarIntOrZero(row.valueOrNull("address_count"));
+        validate_only_total += scalarIntOrZero(row.valueOrNull("validate_only_count"));
+        resolve_thread_only_total += scalarIntOrZero(row.valueOrNull("resolve_thread_only_count"));
+        do_not_address_total += scalarIntOrZero(row.valueOrNull("do_not_address_count"));
+        rebut_total += scalarIntOrZero(row.valueOrNull("rebut_count"));
+        defer_total += scalarIntOrZero(row.valueOrNull("defer_count"));
+        investigate_total += scalarIntOrZero(row.valueOrNull("investigate_count"));
+        route_total += scalarIntOrZero(row.valueOrNull("route_count"));
+        blocked_total += scalarIntOrZero(row.valueOrNull("blocked_count"));
+        const skew_flags = scalarString(row.valueOrNull("skew_flags")) orelse "";
+        const invariant_flags = scalarString(row.valueOrNull("invariant_flags")) orelse "";
+        if (containsCsvFlag(skew_flags, "all-selected")) all_selected += 1;
+        if (containsCsvFlag(skew_flags, "no-rejections")) no_rejections += 1;
+        if (containsCsvFlag(skew_flags, "root-equivalent-only")) root_equivalent_only += 1;
+        if (containsCsvFlag(invariant_flags, "invariant-framed")) invariant_framed += 1;
+        if (containsCsvFlag(invariant_flags, "invariant-ace-seen")) invariant_ace_seen += 1;
+        if (containsCsvFlag(invariant_flags, "selected-invariant-without-invariant-ace")) selected_invariant_without_invariant_ace += 1;
+    }
+
+    var summary = query.Row.init(allocator);
+    errdefer summary.deinit();
+    try summary.putOwnedKey("candidate_sessions", .{ .int = @intCast(rows.len) });
+    try summary.putOwnedKey("decision_bearing_sessions", .{ .int = @intCast(decision_bearing) });
+    try summary.putOwnedKey("resolve_selection_present_sessions", .{ .int = @intCast(resolve_selection_present) });
+    try summary.putOwnedKey("missing_resolve_selection_sessions", .{ .int = @intCast(rows.len - resolve_selection_present) });
+    try summary.putOwnedKey("selected_total", .{ .int = selected_total });
+    try summary.putOwnedKey("rejected_total", .{ .int = rejected_total });
+    try summary.putOwnedKey("address_total", .{ .int = address_total });
+    try summary.putOwnedKey("validate_only_total", .{ .int = validate_only_total });
+    try summary.putOwnedKey("resolve_thread_only_total", .{ .int = resolve_thread_only_total });
+    try summary.putOwnedKey("do_not_address_total", .{ .int = do_not_address_total });
+    try summary.putOwnedKey("rebut_total", .{ .int = rebut_total });
+    try summary.putOwnedKey("defer_total", .{ .int = defer_total });
+    try summary.putOwnedKey("investigate_total", .{ .int = investigate_total });
+    try summary.putOwnedKey("route_total", .{ .int = route_total });
+    try summary.putOwnedKey("blocked_total", .{ .int = blocked_total });
+    try summary.putOwnedKey("all_selected_sessions", .{ .int = @intCast(all_selected) });
+    try summary.putOwnedKey("no_rejections_sessions", .{ .int = @intCast(no_rejections) });
+    try summary.putOwnedKey("invariant_framed_sessions", .{ .int = @intCast(invariant_framed) });
+    try summary.putOwnedKey("invariant_ace_seen_sessions", .{ .int = @intCast(invariant_ace_seen) });
+    try summary.putOwnedKey("selected_invariant_without_invariant_ace_sessions", .{ .int = @intCast(selected_invariant_without_invariant_ace) });
+    try summary.putOwnedKey("root_equivalent_only_sessions", .{ .int = @intCast(root_equivalent_only) });
+    try out.append(allocator, summary);
+    return out;
+}
+
+fn scalarBool(value: spec.Scalar) bool {
+    return switch (value) {
+        .bool => |flag| flag,
+        else => false,
+    };
+}
+
+fn scalarIntOrZero(value: spec.Scalar) i64 {
+    return switch (value) {
+        .int => |v| v,
+        else => 0,
+    };
+}
+
+fn containsCsvFlag(csv: []const u8, flag: []const u8) bool {
+    var split = std.mem.splitScalar(u8, csv, ',');
+    while (split.next()) |part_raw| {
+        const part = std.mem.trim(u8, part_raw, " \t\r\n");
+        if (std.mem.eql(u8, part, flag)) return true;
+    }
+    return false;
 }
 
 fn summarizeAdjudicationSession(
@@ -4828,9 +5475,33 @@ const ArtifactStats = struct {
     used_targeted_session: bool = false,
 };
 
+const ArtifactMatchMode = enum {
+    contains,
+    contains_any,
+    regex,
+
+    fn label(self: ArtifactMatchMode) []const u8 {
+        return switch (self) {
+            .contains => "contains",
+            .contains_any => "contains-any",
+            .regex => "regex",
+        };
+    }
+};
+
 fn cmdArtifactSearch(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
-    const query_text = opts.contains orelse opts.regex orelse return error.MissingContainsArg;
-    const use_regex = opts.regex != null;
+    const filter_count: usize = (if (opts.contains != null) @as(usize, 1) else 0) +
+        (if (opts.contains_any_text != null) @as(usize, 1) else 0) +
+        (if (opts.regex != null) @as(usize, 1) else 0);
+    if (filter_count == 0) return error.MissingContainsArg;
+    if (filter_count > 1) return error.InvalidModeArg;
+    const query_text = opts.contains orelse opts.contains_any_text orelse opts.regex.?;
+    const match_mode: ArtifactMatchMode = if (opts.regex != null)
+        .regex
+    else if (opts.contains_any_text != null)
+        .contains_any
+    else
+        .contains;
     const kind = try parseArtifactKind(opts.kind_text);
     const surface = try parseArtifactSurface(opts.surface_text);
     const follow = try parseArtifactFollow(opts.follow_text);
@@ -4847,15 +5518,15 @@ fn cmdArtifactSearch(allocator: std.mem.Allocator, sessions_root: []const u8, op
 
     if (shouldSearchSurface(kind, surface, .memory_blocks)) {
         stats.surfaces_scanned += 1;
-        try searchMemoryBlockHits(allocator, query_text, use_regex, &stats, &hit_rows);
+        try searchMemoryBlockHits(allocator, query_text, match_mode, &stats, &hit_rows);
     }
     if (shouldSearchSurface(kind, surface, .messages)) {
         stats.surfaces_scanned += 1;
-        try searchMessageHits(allocator, sessions_root, opts, query_text, use_regex, &stats, &hit_rows);
+        try searchMessageHits(allocator, sessions_root, opts, query_text, match_mode, &stats, &hit_rows);
     }
     if (shouldSearchSurface(kind, surface, .tool_calls)) {
         stats.surfaces_scanned += 1;
-        try searchToolCallHits(allocator, sessions_root, opts, query_text, use_regex, &stats, &hit_rows);
+        try searchToolCallHits(allocator, sessions_root, opts, query_text, match_mode, &stats, &hit_rows);
     }
 
     const duration_delta = @divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000) - start_ms;
@@ -4971,7 +5642,7 @@ fn searchMessageHits(
     sessions_root: []const u8,
     opts: Options,
     query_text: []const u8,
-    use_regex: bool,
+    match_mode: ArtifactMatchMode,
     stats: *ArtifactStats,
     out_rows: *std.ArrayList(query.Row),
 ) !void {
@@ -4992,7 +5663,7 @@ fn searchMessageHits(
         stats.rows_examined += @intCast(parsed.len);
 
         for (parsed) |row| {
-            const score = try matchScoreForText(allocator, query_text, use_regex, &.{row.text});
+            const score = try matchScoreForText(allocator, query_text, match_mode, &.{row.text});
             if (score == null) continue;
             const session_id = inferSessionIdFromPath(row.path);
             const next_action = try std.fmt.allocPrint(
@@ -5010,7 +5681,7 @@ fn searchMessageHits(
                 row.timestamp,
                 row.role,
                 row.text,
-                if (use_regex) "regex" else "contains",
+                match_mode.label(),
                 score.?,
                 "session-prompts",
                 next_action,
@@ -5024,7 +5695,7 @@ fn searchToolCallHits(
     sessions_root: []const u8,
     opts: Options,
     query_text: []const u8,
-    use_regex: bool,
+    match_mode: ArtifactMatchMode,
     stats: *ArtifactStats,
     out_rows: *std.ArrayList(query.Row),
 ) !void {
@@ -5052,7 +5723,7 @@ fn searchToolCallHits(
             const workdir = record.workdir orelse "";
             const arguments_text = record.arguments_text orelse "";
             const input_text = record.input_text orelse "";
-            const score = try matchScoreForText(allocator, query_text, use_regex, &.{ tool_name, command_text, workdir, arguments_text, input_text });
+            const score = try matchScoreForText(allocator, query_text, match_mode, &.{ tool_name, command_text, workdir, arguments_text, input_text });
             if (score == null) continue;
 
             const is_orchestration = std.mem.eql(u8, tool_name, "spawn_agent") or
@@ -5077,7 +5748,7 @@ fn searchToolCallHits(
                 record.start_ts,
                 label,
                 snippet,
-                if (use_regex) "regex" else "contains",
+                match_mode.label(),
                 score.?,
                 next_action_kind,
                 next_action,
@@ -5089,7 +5760,7 @@ fn searchToolCallHits(
 fn searchMemoryBlockHits(
     allocator: std.mem.Allocator,
     query_text: []const u8,
-    use_regex: bool,
+    match_mode: ArtifactMatchMode,
     stats: *ArtifactStats,
     out_rows: *std.ArrayList(query.Row),
 ) !void {
@@ -5101,7 +5772,7 @@ fn searchMemoryBlockHits(
 
     for (parsed.items) |row| {
         const keywords = row.keywords orelse "";
-        const score = try matchScoreForText(allocator, query_text, use_regex, &.{ row.title, row.heading_path, row.body, keywords, row.relative_path });
+        const score = try matchScoreForText(allocator, query_text, match_mode, &.{ row.title, row.heading_path, row.body, keywords, row.relative_path });
         if (score == null) continue;
         const session_id = if (row.rollout_path) |rollout_path| inferSessionIdFromPath(rollout_path) else "";
         const next_action_kind = if (row.rollout_path != null) "session-prompts" else "none";
@@ -5119,7 +5790,7 @@ fn searchMemoryBlockHits(
             row.updated_at,
             row.title,
             row.preview,
-            if (use_regex) "regex" else "contains",
+            match_mode.label(),
             score.?,
             next_action_kind,
             next_action,
@@ -5130,21 +5801,35 @@ fn searchMemoryBlockHits(
 fn matchScoreForText(
     allocator: std.mem.Allocator,
     query_text: []const u8,
-    use_regex: bool,
+    match_mode: ArtifactMatchMode,
     haystacks: []const []const u8,
 ) !?i64 {
     for (haystacks) |haystack| {
         if (haystack.len == 0) continue;
-        if (use_regex) {
-            const score = try regexScore(allocator, haystack, query_text);
-            if (score != null) return score;
-        } else if (containsIgnoreCaseAscii(haystack, query_text)) {
-            if (eqlIgnoreCaseAscii(haystack, query_text)) return 140;
-            if (startsWithIgnoreCaseAscii(haystack, query_text)) return 120;
-            return 100;
+        switch (match_mode) {
+            .regex => {
+                const score = try regexScore(allocator, haystack, query_text);
+                if (score != null) return score;
+            },
+            .contains => if (containsScore(haystack, query_text)) |score| return score,
+            .contains_any => {
+                var split = std.mem.splitScalar(u8, query_text, ',');
+                while (split.next()) |part_raw| {
+                    const part = std.mem.trim(u8, part_raw, " \t\r\n");
+                    if (part.len == 0) continue;
+                    if (containsScore(haystack, part)) |score| return score;
+                }
+            },
         }
     }
     return null;
+}
+
+fn containsScore(haystack: []const u8, needle: []const u8) ?i64 {
+    if (!containsIgnoreCaseAscii(haystack, needle)) return null;
+    if (eqlIgnoreCaseAscii(haystack, needle)) return 140;
+    if (startsWithIgnoreCaseAscii(haystack, needle)) return 120;
+    return 100;
 }
 
 const ArtifactRegexMode = enum { exact, prefix, suffix, contains };
@@ -5445,10 +6130,11 @@ fn cmdMemoryMap(allocator: std.mem.Allocator, opts: Options) !void {
         }
     } else {
         const match_kind = if (use_regex) "regex" else "contains";
+        const match_mode: ArtifactMatchMode = if (use_regex) .regex else .contains;
         for (memory_rows.items) |block_row| {
             if (!timestampSatisfiesBounds(block_row.updated_at, opts)) continue;
             const keywords = block_row.keywords orelse "";
-            const score = try matchScoreForText(allocator, query_text.?, use_regex, &.{ block_row.title, block_row.heading_path, block_row.body, keywords, block_row.relative_path });
+            const score = try matchScoreForText(allocator, query_text.?, match_mode, &.{ block_row.title, block_row.heading_path, block_row.body, keywords, block_row.relative_path });
             if (score == null) continue;
             const next_action_kind: []const u8 = if (block_row.rollout_path != null) "session-prompts" else "none";
             const next_action = if (block_row.rollout_path) |rollout_path|
@@ -5577,6 +6263,7 @@ fn cmdMemoryHistory(allocator: std.mem.Allocator, opts: Options) !void {
     } else {
         const use_regex = opts.regex != null;
         const query_text = opts.contains orelse opts.regex orelse unreachable;
+        const match_mode: ArtifactMatchMode = if (use_regex) .regex else .contains;
         var memory_rows = try datasets.memory_blocks.collect(allocator, .{ .memory_root = opts.memory_root_text });
         defer datasets.memory_blocks.deinitRows(allocator, &memory_rows);
 
@@ -5584,7 +6271,7 @@ fn cmdMemoryHistory(allocator: std.mem.Allocator, opts: Options) !void {
         for (memory_rows.items) |block_row| {
             if (!timestampSatisfiesBounds(block_row.updated_at, opts)) continue;
             const keywords = block_row.keywords orelse "";
-            const score = try matchScoreForText(allocator, query_text, use_regex, &.{ block_row.title, block_row.heading_path, block_row.body, keywords, block_row.relative_path });
+            const score = try matchScoreForText(allocator, query_text, match_mode, &.{ block_row.title, block_row.heading_path, block_row.body, keywords, block_row.relative_path });
             if (score == null) continue;
             try appendMemoryHistoryEvent(
                 allocator,
@@ -8547,7 +9234,8 @@ fn planSearchMatchesFilters(
     block: []const u8,
 ) !bool {
     const query_text = opts.contains orelse opts.regex orelse return true;
-    const score = try matchScoreForText(allocator, query_text, opts.regex != null, &.{ title orelse "", block });
+    const match_mode: ArtifactMatchMode = if (opts.regex != null) .regex else .contains;
+    const score = try matchScoreForText(allocator, query_text, match_mode, &.{ title orelse "", block });
     return score != null;
 }
 
@@ -13542,6 +14230,23 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.group_by_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--term-group")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            if (opts.term_group_count >= opts.term_group_texts.len) return error.InvalidLimit;
+            opts.term_group_texts[opts.term_group_count] = args[i];
+            opts.term_group_count += 1;
+        } else if (std.mem.eql(u8, arg, "--examples")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            const n = try std.fmt.parseInt(i64, args[i], 10);
+            if (n < 0) return error.InvalidLimit;
+            opts.examples = @intCast(n);
+            opts.examples_set = true;
+        } else if (std.mem.eql(u8, arg, "--unique-by")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.unique_by_text = args[i];
         } else if (std.mem.eql(u8, arg, "--metric")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -14580,6 +15285,14 @@ test "parse options supports common flags" {
         "24h",
         "--group-by",
         "mode",
+        "--term-group",
+        "additive=add,patch",
+        "--term-group",
+        "reductive=delete,refactor",
+        "--examples",
+        "5",
+        "--unique-by",
+        "snippet",
         "--metric",
         "count::count",
         "--pricing",
@@ -14651,6 +15364,12 @@ test "parse options supports common flags" {
     try std.testing.expectEqualStrings("2026-03-05T00:00:00Z", opts.until.?);
     try std.testing.expectEqualStrings("24h", opts.last_text.?);
     try std.testing.expectEqualStrings("mode", opts.group_by_text.?);
+    try std.testing.expectEqual(@as(usize, 2), opts.term_group_count);
+    try std.testing.expectEqualStrings("additive=add,patch", opts.term_group_texts[0].?);
+    try std.testing.expectEqualStrings("reductive=delete,refactor", opts.term_group_texts[1].?);
+    try std.testing.expectEqual(@as(usize, 5), opts.examples);
+    try std.testing.expect(opts.examples_set);
+    try std.testing.expectEqualStrings("snippet", opts.unique_by_text.?);
     try std.testing.expectEqualStrings("count::count", opts.metric_text.?);
     try std.testing.expectEqualStrings("api", opts.pricing_text.?);
     try std.testing.expectEqualStrings("gpt-5.5", opts.model_text.?);
@@ -15218,6 +15937,91 @@ test "workflow-audit reports a workflow cohort without cross-session contaminati
     }
 }
 
+test "workflow-overlap and term-summary replace jq-heavy workflow rollups" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/07");
+    const fixed_only =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-07T09:00:00Z\",\"payload\":{\"id\":\"fixed-only\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-07T09:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Use $fixed-point-driver.\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-07T09:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Using $fixed-point-driver. Added patch, then refactor remove duplicated code.\"}]}}\n";
+    const review_only =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-07T10:00:00Z\",\"payload\":{\"id\":\"review-only\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-07T10:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Use $review-adjudication.\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-07T10:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Using $review-adjudication. Validate-only, no fixed-point work.\"}]}}\n";
+    const overlap =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-07T11:00:00Z\",\"payload\":{\"id\":\"overlap\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-07T11:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Use $review-adjudication then $fixed-point-driver.\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-07T11:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Using $fixed-point-driver and $review-adjudication. Added code, delete scaffold, and refactor owner.\"}]}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/07/rollout-fixed-only.jsonl", .data = fixed_only });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/07/rollout-review-only.jsonl", .data = review_only });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/07/rollout-overlap.jsonl", .data = overlap });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const overlap_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "workflow-overlap.json" });
+    defer std.testing.allocator.free(overlap_out);
+    const term_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "workflow-term-summary.jsonl" });
+    defer std.testing.allocator.free(term_out);
+
+    const overlap_got = try runCommandWithOutput(std.testing.allocator, .workflow_overlap, &.{
+        "--root",     root_abs,
+        "--workflow", "fixed-point-driver,review-adjudication",
+        "--since",    "2026-05-07T00:00:00Z",
+        "--until",    "2026-05-08T00:00:00Z",
+        "--limit",    "1",
+        "--format",   "json",
+    }, overlap_out);
+    defer std.testing.allocator.free(overlap_got);
+    try std.testing.expect(std.mem.indexOf(u8, overlap_got, "\"sessions_a\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, overlap_got, "\"sessions_b\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, overlap_got, "\"overlap_sessions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, overlap_got, "\"a_only_sessions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, overlap_got, "\"b_only_sessions\": 1") != null);
+
+    const term_got = try runCommandWithOutput(std.testing.allocator, .workflow_audit, &.{
+        "--root",       root_abs,
+        "--workflow",   "fixed-point-driver",
+        "--mode",       "term-summary",
+        "--term-group", "additive=added,patch,code",
+        "--term-group", "reductive=delete,remove,refactor",
+        "--examples",   "2",
+        "--format",     "jsonl",
+    }, term_out);
+    defer std.testing.allocator.free(term_got);
+    try std.testing.expect(std.mem.indexOf(u8, term_got, "\"term_group\":\"additive\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, term_got, "\"term_group\":\"reductive\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, term_got, "\"sessions\":2") != null);
+}
+
+test "artifact-search supports contains-any across selected surfaces" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/08");
+    const content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-08T09:00:00Z\",\"payload\":{\"id\":\"artifact-any\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-08T09:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"The report mentions alpha-signal for lookup.\"}]}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/08/rollout-artifact-any.jsonl", .data = content });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "artifact-search.jsonl" });
+    defer std.testing.allocator.free(output_path);
+
+    const got = try runCommandWithOutput(std.testing.allocator, .artifact_search, &.{
+        "--root",         root_abs,
+        "--surface",      "messages",
+        "--contains-any", "missing,alpha-signal",
+        "--format",       "jsonl",
+    }, output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"match_kind\":\"contains-any\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "alpha-signal") != null);
+}
+
 test "adjudication-audit extracts route counts and conservative skew flags" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -15261,7 +16065,7 @@ test "adjudication-audit extracts route counts and conservative skew flags" {
 
     try std.testing.expect(std.mem.indexOf(u8, got, "adjudication-direct") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "adjudication-root") != null);
-    try std.testing.expect(std.mem.indexOf(u8, got, "adjudication-mention") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "adjudication-mention") == null);
     try std.testing.expect(std.mem.indexOf(u8, got, "skill-block-only") == null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"selected_count\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"rejected_count\":1") != null);
@@ -15271,6 +16075,24 @@ test "adjudication-audit extracts route counts and conservative skew flags" {
     const bundle_rows = try std.fs.path.join(std.testing.allocator, &.{ bundle_dir, "adjudication-audit-rows.jsonl" });
     defer std.testing.allocator.free(bundle_rows);
     try std.testing.expect((try std.Io.Dir.cwd().statFile(std.Io.Threaded.global_single_threaded.io(), bundle_rows, .{})).size > 0);
+
+    const summary_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "adjudication-summary.json" });
+    defer std.testing.allocator.free(summary_out);
+    const summary = try runCommandWithOutput(std.testing.allocator, .adjudication_audit, &.{
+        "--root",                    root_abs,
+        "--mode",                    "summary",
+        "--since",                   "2026-05-06T00:00:00Z",
+        "--until",                   "2026-05-07T00:00:00Z",
+        "--include-root-equivalent", "resolve,fixed-point-driver",
+        "--limit",                   "1",
+        "--format",                  "json",
+    }, summary_out);
+    defer std.testing.allocator.free(summary);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "\"candidate_sessions\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "\"decision_bearing_sessions\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "\"selected_total\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "\"rejected_total\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "\"missing_resolve_selection_sessions\": 0") != null);
 }
 
 test "skill-success-rank counts called skills with positive outcomes" {
