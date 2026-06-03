@@ -934,17 +934,38 @@ const StdoutGuard = struct {
     devnull: std.Io.File,
 };
 
+fn dupFd(fd: std.posix.fd_t) !std.posix.fd_t {
+    while (true) {
+        const rc = std.posix.system.dup(fd);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .BADF => return error.BadFileDescriptor,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn dup2Fd(old_fd: std.posix.fd_t, new_fd: std.posix.fd_t) !void {
+    try std.Io.Threaded.dup2(old_fd, new_fd);
+}
+
 fn silenceStdout() !StdoutGuard {
-    const saved_fd = std.c.dup(std.posix.STDOUT_FILENO);
-    if (saved_fd < 0) return error.SystemResources;
+    const saved_fd = try dupFd(std.posix.STDOUT_FILENO);
+    errdefer std.Io.Threaded.closeFd(saved_fd);
+
     const devnull = try std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), "/dev/null", .{ .mode = .write_only });
-    if (std.c.dup2(devnull.handle, std.posix.STDOUT_FILENO) < 0) return error.SystemResources;
+    errdefer devnull.close(std.Io.Threaded.global_single_threaded.io());
+
+    try dup2Fd(devnull.handle, std.posix.STDOUT_FILENO);
     return .{ .saved_fd = saved_fd, .devnull = devnull };
 }
 
 fn restoreStdout(guard: StdoutGuard) void {
-    _ = std.c.dup2(guard.saved_fd, std.posix.STDOUT_FILENO);
-    _ = std.c.close(guard.saved_fd);
+    dup2Fd(guard.saved_fd, std.posix.STDOUT_FILENO) catch {};
+    std.Io.Threaded.closeFd(guard.saved_fd);
     guard.devnull.close(std.Io.Threaded.global_single_threaded.io());
 }
 
