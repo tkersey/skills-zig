@@ -5,6 +5,8 @@ const std = @import("std");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
 const SchemaVersion: i64 = 3;
+const GraphSchemaVersion: i64 = 4;
+const GraphEnvelopeVersion: i64 = 1;
 const PlanSyncVersion: i64 = 3;
 const HelpSurface = core_cli.HelpSurface{
     .executable_name = "st",
@@ -14,9 +16,9 @@ const HelpSurface = core_cli.HelpSurface{
 const UsageText =
     \\st
     \\
-    \\Manage dependency-aware JSONL v3 plan state.
+    \\Manage dependency-aware JSONL v3/v4 plan state.
     \\
-    \\usage: st {init,add,select,deselect,set-status,set-priority,set-deps,set-notes,add-comment,remove,show,ready,blocked,doctor,prime,assert-projection,reconcile-codex,import-proposed-plan,guard-session-start,guard-pre-tool-use,export,import-plan,import-orchplan,claim,heartbeat,set-runtime,set-proof,release,reclaim-stale,import-mesh-results} [options]
+    \\usage: st {init,add,select,deselect,set-status,set-priority,set-deps,set-notes,add-comment,remove,show,ready,blocked,doctor,prime,assert-projection,reconcile-codex,import-proposed-plan,guard-session-start,guard-pre-tool-use,export,import-plan,import-orchplan,claim,heartbeat,set-runtime,set-proof,complete,proof,release,reclaim-stale,import-mesh-results,graph,aperture,compile} [options]
     \\
     \\commands:
     \\  init              Initialize plan storage
@@ -46,9 +48,14 @@ const UsageText =
     \\  heartbeat         Refresh a held claim lease
     \\  set-runtime       Attach runtime execution metadata to a claimed item
     \\  set-proof         Record proof state and evidence for an item
+    \\  complete          Record proof and complete a graph-mode item
+    \\  proof             Proof commands: audit
     \\  release           Release a held claim and normalize task status
     \\  reclaim-stale     Reclaim expired held claims
     \\  import-mesh-results  Import mesh output CSV results into the ledger
+    \\  graph            Graph compiler commands: schema, apply, audit, insights, polish
+    \\  aperture         Aperture commands: next, plan, select, explain
+    \\  compile          Compile shortcuts: intent, graph, ready, aperture
     \\
     \\common options:
     \\  --file PATH                     Path to plan JSONL file (default: .step/st-plan.jsonl)
@@ -58,7 +65,7 @@ const UsageText =
     \\  --priority high|medium|low      Priority for add/set-priority (add default: medium)
     \\  --limit N                       Projection limit for prime/assert-projection (default: 7)
     \\  --target codex|opencode|all     Projection target for prime/assert-projection (default: all/codex)
-    \\  --mode selected|auto-top-up|replace-ready  Prime selection mode (default: selected)
+    \\  --mode selected|auto-top-up|replace-ready|aperture  Prime selection mode (default: selected)
     \\  --preview                       Compute prime output without writing selection changes
     \\  --hook-json                     Emit documented Codex hook JSON shapes
     \\  -h, --help                      Show help
@@ -206,13 +213,66 @@ const ProofMeta = struct {
     last_run_at: []const u8 = "",
 };
 
+const ItemType = enum {
+    bug,
+    chore,
+    decision,
+    docs,
+    epic,
+    feature,
+    research,
+    spike,
+    task,
+    @"test",
+    verification,
+
+    fn asString(self: ItemType) []const u8 {
+        return switch (self) {
+            .epic => "epic",
+            .feature => "feature",
+            .task => "task",
+            .bug => "bug",
+            .@"test" => "test",
+            .verification => "verification",
+            .docs => "docs",
+            .chore => "chore",
+            .research => "research",
+            .spike => "spike",
+            .decision => "decision",
+        };
+    }
+};
+
+const GraphLink = struct {
+    id: []const u8,
+    type: []const u8,
+    reason: []const u8 = "",
+};
+
+const ProofObligation = struct {
+    id: []const u8,
+    kind: []const u8,
+    command: []const u8 = "",
+    evidence_ref: []const u8 = "",
+    required: bool = true,
+};
+
+const Contract = struct {
+    objective: []const u8 = "",
+    background: []const u8 = "",
+    implementation_approach: []const u8 = "",
+    success_criteria: []const []const u8 = &.{},
+    proof_obligations: []const ProofObligation = &.{},
+    risks: []const []const u8 = &.{},
+};
+
 const Item = struct {
     id: []const u8,
     step: []const u8,
     status: Status,
     priority: Priority,
     in_plan: bool,
-    deps: []Dep,
+    deps: []const Dep,
     notes: []const u8,
     comments: []const Comment,
     related_to: []const []const u8 = &.{},
@@ -225,6 +285,94 @@ const Item = struct {
     claim: ?ClaimMeta = null,
     runtime: ?RuntimeMeta = null,
     proof: ?ProofMeta = null,
+    item_type: ItemType = .task,
+    parent_id: ?[]const u8 = null,
+    links: []const GraphLink = &.{},
+    intent_refs: []const []const u8 = &.{},
+    acceptance: []const []const u8 = &.{},
+    contract: ?Contract = null,
+    labels: []const []const u8 = &.{},
+    lock_roots: []const []const u8 = &.{},
+    uncertainty: []const []const u8 = &.{},
+    non_goals: []const []const u8 = &.{},
+};
+
+const GraphPolicy = struct {
+    completion_requires_proof: bool = false,
+    implementation_ready_required: bool = true,
+    default_projection_strategy: []const u8 = "aperture-score",
+    default_gate: []const u8 = "implementation-ready",
+    max_aperture_items: i64 = 7,
+};
+
+const IntentSource = struct {
+    kind: []const u8 = "",
+    locator: []const u8 = "",
+    anchor: []const u8 = "",
+};
+
+const IntentAtom = struct {
+    id: []const u8,
+    source: ?IntentSource = null,
+    text: []const u8,
+    category: []const u8,
+    disposition: []const u8,
+    reason: []const u8 = "",
+};
+
+const Waiver = struct {
+    id: []const u8,
+    gate: []const u8,
+    code: []const u8,
+    target: []const u8,
+    reason: []const u8,
+    expires: []const u8,
+    created_at: []const u8 = "",
+    created_by: []const u8 = "",
+};
+
+const PolishDelta = struct {
+    items_added: i64 = 0,
+    items_removed: i64 = 0,
+    items_split: i64 = 0,
+    deps_changed: i64 = 0,
+    contracts_changed: i64 = 0,
+    intent_coverage_changed: i64 = 0,
+};
+
+const PolishPass = struct {
+    pass: i64,
+    seq: i64 = 0,
+    created_at: []const u8 = "",
+    structure_fingerprint: []const u8 = "",
+    contract_fingerprint: []const u8 = "",
+    coverage_fingerprint: []const u8 = "",
+    execution_fingerprint: []const u8 = "",
+    audit_gate: []const u8 = "",
+    hard_failures: i64 = 0,
+    warnings: i64 = 0,
+    delta: PolishDelta = .{},
+};
+
+const PolishState = struct {
+    session_id: []const u8 = "",
+    passes: []const PolishPass = &.{},
+};
+
+const GraphFingerprints = struct {
+    structure: []const u8 = "",
+    contract: []const u8 = "",
+    coverage: []const u8 = "",
+    execution: []const u8 = "",
+};
+
+const GraphEnvelope = struct {
+    version: i64 = GraphEnvelopeVersion,
+    policy: GraphPolicy = .{},
+    intent: []const IntentAtom = &.{},
+    waivers: []const Waiver = &.{},
+    polish: PolishState = .{},
+    fingerprints: GraphFingerprints = .{},
 };
 
 const EnrichedItem = struct {
@@ -270,12 +418,14 @@ const ProjectionTarget = enum {
 };
 
 const ProjectionMode = enum {
-    selected,
+    aperture,
     auto_top_up,
     replace_ready,
+    selected,
 
     fn asString(self: ProjectionMode) []const u8 {
         return switch (self) {
+            .aperture => "aperture",
             .selected => "selected",
             .auto_top_up => "auto-top-up",
             .replace_ready => "replace-ready",
@@ -292,6 +442,60 @@ const ProjectionPolicy = struct {
     allow_opencode_parallel: bool = true,
     source_file: []const u8 = ".step/st-plan.jsonl",
     source_seq: i64 = 0,
+};
+
+const GraphCommand = enum {
+    none,
+    audit,
+    apply,
+    insights,
+    polish,
+    schema,
+};
+
+const PolishCommand = enum {
+    none,
+    begin,
+    snapshot,
+    status,
+    gate,
+};
+
+const ApertureCommand = enum {
+    none,
+    next,
+    plan,
+    select,
+    explain,
+};
+
+const CompileCommand = enum {
+    none,
+    intent,
+    graph,
+    ready,
+    aperture,
+};
+
+const ProofCommand = enum {
+    none,
+    audit,
+};
+
+const AuditGate = enum {
+    draft,
+    implementation_ready,
+    execution_ready,
+    proof_complete,
+
+    fn asString(self: AuditGate) []const u8 {
+        return switch (self) {
+            .draft => "draft",
+            .implementation_ready => "implementation-ready",
+            .execution_ready => "execution-ready",
+            .proof_complete => "proof-complete",
+        };
+    }
 };
 
 const CodexPlanProjectionEntry = struct {
@@ -316,6 +520,45 @@ const ProjectionResult = struct {
     warnings: []const []const u8,
 };
 
+const FindingSeverity = enum {
+    @"error",
+    warning,
+    info,
+
+    fn asString(self: FindingSeverity) []const u8 {
+        return switch (self) {
+            .@"error" => "error",
+            .warning => "warning",
+            .info => "info",
+        };
+    }
+};
+
+const AuditFinding = struct {
+    code: []const u8,
+    severity: FindingSeverity,
+    target: []const u8,
+    message: []const u8,
+    waived: bool = false,
+    waiver_id: ?[]const u8 = null,
+};
+
+const AuditResult = struct {
+    gate: AuditGate,
+    findings: []AuditFinding,
+    errors: usize,
+    warnings: usize,
+};
+
+const GraphDelta = struct {
+    seq_before: i64,
+    seq_after: i64,
+    items_added: []const []const u8 = &.{},
+    items_removed: []const []const u8 = &.{},
+    items_changed: []const []const u8 = &.{},
+    intent_coverage_changed: []const []const u8 = &.{},
+};
+
 const RepairMeta = struct {
     op: []const u8,
 };
@@ -324,12 +567,16 @@ const ItemState = struct {
     allocator: std.mem.Allocator,
     items: std.ArrayList(Item),
     index: std.StringHashMap(usize),
+    graph: GraphEnvelope,
+    graph_active: bool,
 
     fn init(allocator: std.mem.Allocator) ItemState {
         return .{
             .allocator = allocator,
             .items = .empty,
             .index = std.StringHashMap(usize).init(allocator),
+            .graph = .{},
+            .graph_active = false,
         };
     }
 
@@ -381,12 +628,16 @@ pub const Command = enum {
     add,
     add_comment,
     assert_projection,
+    aperture,
     blocked,
     claim,
+    compile,
+    complete,
     deselect,
     doctor,
     guard_pre_tool_use,
     guard_session_start,
+    graph,
     heartbeat,
     import_mesh_results,
     import_orchplan,
@@ -394,6 +645,7 @@ pub const Command = enum {
     import_proposed_plan,
     init,
     prime,
+    proof,
     ready,
     reclaim_stale,
     reconcile_codex,
@@ -431,17 +683,22 @@ const command_defs = [_]CommandDef{
     .{ .name = "doctor", .command = .doctor },
     .{ .name = "prime", .command = .prime },
     .{ .name = "assert-projection", .command = .assert_projection },
+    .{ .name = "aperture", .command = .aperture },
+    .{ .name = "complete", .command = .complete },
     .{ .name = "reconcile-codex", .command = .reconcile_codex },
     .{ .name = "import-proposed-plan", .command = .import_proposed_plan },
     .{ .name = "guard-session-start", .command = .guard_session_start },
     .{ .name = "guard-pre-tool-use", .command = .guard_pre_tool_use },
+    .{ .name = "graph", .command = .graph },
     .{ .name = "export", .command = .@"export" },
     .{ .name = "import-plan", .command = .import_plan },
     .{ .name = "import-orchplan", .command = .import_orchplan },
     .{ .name = "claim", .command = .claim },
+    .{ .name = "compile", .command = .compile },
     .{ .name = "heartbeat", .command = .heartbeat },
     .{ .name = "set-runtime", .command = .set_runtime },
     .{ .name = "set-proof", .command = .set_proof },
+    .{ .name = "proof", .command = .proof },
     .{ .name = "release", .command = .release },
     .{ .name = "reclaim-stale", .command = .reclaim_stale },
     .{ .name = "import-mesh-results", .command = .import_mesh_results },
@@ -500,6 +757,12 @@ const OutputFormat = enum {
 
 pub const Args = struct {
     command: Command,
+    graph_command: GraphCommand = .none,
+    polish_command: PolishCommand = .none,
+    aperture_command: ApertureCommand = .none,
+    compile_command: CompileCommand = .none,
+    proof_command: ProofCommand = .none,
+    gate: AuditGate = .draft,
     file: []const u8 = ".step/st-plan.jsonl",
     allow_multiple_in_progress: bool = false,
     format: OutputFormat = .markdown,
@@ -529,6 +792,7 @@ pub const Args = struct {
     output_ref: ?[]const u8 = null,
     last_event: ?[]const u8 = null,
     proof_state: ?[]const u8 = null,
+    proof_id: ?[]const u8 = null,
     evidence_ref: ?[]const u8 = null,
     reason: ?[]const u8 = null,
     now: ?[]const u8 = null,
@@ -537,6 +801,10 @@ pub const Args = struct {
     guard_root: ?[]const u8 = null,
     id_prefix: []const u8 = "st",
     start_at: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    pass_number: ?[]const u8 = null,
+    min_stable_passes: usize = 2,
+    strategy: []const u8 = "aperture-score",
 
     replace: bool = false,
     repair_seq: bool = false,
@@ -544,6 +812,8 @@ pub const Args = struct {
     input: ?[]const u8 = null,
     backlog_only: bool = false,
     preview: bool = false,
+    dry_run: bool = false,
+    allow_unproven: bool = false,
     include_completed_context: bool = false,
     include_waiting_pending_set: bool = false,
     include_waiting_pending: bool = false,
@@ -719,7 +989,11 @@ pub fn main(init: std.process.Init) !void {
         return exitWithError(err);
     };
 
-    const mutating = isMutatingCommand(args.command);
+    const mutating = isMutatingCommand(args.command) or
+        (args.command == .graph and args.graph_command == .apply and !args.dry_run) or
+        (args.command == .aperture and args.aperture_command == .select) or
+        (args.command == .complete) or
+        (args.command == .compile and (args.compile_command == .intent or args.compile_command == .graph or args.compile_command == .aperture));
     if (args.command == .doctor and args.repair_seq) {
         try ensureLockSidecarGitignored(allocator, args.file);
     }
@@ -745,6 +1019,31 @@ fn parseArgs(argv: []const []const u8) !Args {
     };
 
     var i: usize = 2;
+    if (args.command == .graph) {
+        if (argv.len < 3) return error.MissingCommand;
+        args.graph_command = parseGraphCommand(argv[2]) orelse return error.UnknownCommand;
+        i = 3;
+        if (args.graph_command == .polish) {
+            if (argv.len < 4) return error.MissingCommand;
+            args.polish_command = parsePolishCommand(argv[3]) orelse return error.UnknownCommand;
+            i = 4;
+        }
+    }
+    if (args.command == .aperture) {
+        if (argv.len < 3) return error.MissingCommand;
+        args.aperture_command = parseApertureCommand(argv[2]) orelse return error.UnknownCommand;
+        i = 3;
+    }
+    if (args.command == .compile) {
+        if (argv.len < 3) return error.MissingCommand;
+        args.compile_command = parseCompileCommand(argv[2]) orelse return error.UnknownCommand;
+        i = 3;
+    }
+    if (args.command == .proof) {
+        if (argv.len < 3) return error.MissingCommand;
+        args.proof_command = parseProofCommand(argv[2]) orelse return error.UnknownCommand;
+        i = 3;
+    }
     while (i < argv.len) : (i += 1) {
         const token = argv[i];
 
@@ -789,6 +1088,12 @@ fn parseArgs(argv: []const []const u8) !Args {
         if (std.mem.eql(u8, token, "--include-waiting-pending")) {
             args.include_waiting_pending_set = true;
             args.include_waiting_pending = true;
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--strategy")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.strategy = argv[i];
             continue;
         }
 
@@ -871,6 +1176,16 @@ fn parseArgs(argv: []const []const u8) !Args {
                     args.status = argv[i];
                     continue;
                 }
+                if (std.mem.eql(u8, token, "--allow-unproven")) {
+                    args.allow_unproven = true;
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--reason")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.reason = argv[i];
+                    continue;
+                }
                 return error.InvalidSetStatusArg;
             },
             .set_priority => {
@@ -950,6 +1265,65 @@ fn parseArgs(argv: []const []const u8) !Args {
             },
             .show, .ready, .blocked => {
                 return error.InvalidListArg;
+            },
+            .graph => {
+                if (std.mem.eql(u8, token, "--input")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingInputValue;
+                    args.input = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--gate")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.gate = parseAuditGate(argv[i]) orelse return error.InvalidGraphGate;
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--dry-run")) {
+                    args.dry_run = true;
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--name")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.name = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--pass")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.pass_number = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--min-stable-passes")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.min_stable_passes = try parsePositiveUsize(argv[i]);
+                    continue;
+                }
+                return error.InvalidGraphArg;
+            },
+            .aperture => {
+                if (std.mem.eql(u8, token, "--replace")) {
+                    args.replace = true;
+                    continue;
+                }
+                return error.InvalidApertureArg;
+            },
+            .compile => {
+                if (std.mem.eql(u8, token, "--input")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingInputValue;
+                    args.input = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--gate")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.gate = parseAuditGate(argv[i]) orelse return error.InvalidGraphGate;
+                    continue;
+                }
+                return error.InvalidCompileArg;
             },
             .doctor => {
                 if (std.mem.eql(u8, token, "--repair-seq")) {
@@ -1229,6 +1603,52 @@ fn parseArgs(argv: []const []const u8) !Args {
                 }
                 return error.InvalidSetProofArg;
             },
+            .complete => {
+                if (std.mem.eql(u8, token, "--id")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingIdValue;
+                    args.id = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--proof")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.proof_id = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--command")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.step = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--evidence-ref")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.evidence_ref = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--allow-unproven")) {
+                    args.allow_unproven = true;
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--reason")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.reason = argv[i];
+                    continue;
+                }
+                return error.InvalidCompleteArg;
+            },
+            .proof => {
+                if (std.mem.eql(u8, token, "--id")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingIdValue;
+                    args.id = argv[i];
+                    continue;
+                }
+                return error.InvalidProofArg;
+            },
             .release => {
                 if (std.mem.eql(u8, token, "--id")) {
                     i += 1;
@@ -1317,6 +1737,14 @@ fn parseArgs(argv: []const []const u8) !Args {
         },
         .release => if (args.id == null) return error.MissingIdValue,
         .import_mesh_results => if (args.input == null) return error.MissingInputValue,
+        .graph => {
+            if (args.graph_command == .apply and args.input == null) return error.MissingInputValue;
+            if (args.graph_command == .polish and args.polish_command == .begin and args.name == null) return error.MissingValue;
+            if (args.graph_command == .polish and args.polish_command == .snapshot and args.pass_number == null) return error.MissingValue;
+        },
+        .compile => {
+            if ((args.compile_command == .intent or args.compile_command == .graph) and args.input == null) return error.MissingInputValue;
+        },
         else => {},
     }
 
@@ -1327,6 +1755,52 @@ fn parseCommand(raw: []const u8) ?Command {
     for (command_defs) |def| {
         if (std.mem.eql(u8, raw, def.name)) return def.command;
     }
+    return null;
+}
+
+fn parseGraphCommand(raw: []const u8) ?GraphCommand {
+    if (std.mem.eql(u8, raw, "schema")) return .schema;
+    if (std.mem.eql(u8, raw, "apply")) return .apply;
+    if (std.mem.eql(u8, raw, "audit")) return .audit;
+    if (std.mem.eql(u8, raw, "insights")) return .insights;
+    if (std.mem.eql(u8, raw, "polish")) return .polish;
+    return null;
+}
+
+fn parsePolishCommand(raw: []const u8) ?PolishCommand {
+    if (std.mem.eql(u8, raw, "begin")) return .begin;
+    if (std.mem.eql(u8, raw, "snapshot")) return .snapshot;
+    if (std.mem.eql(u8, raw, "status")) return .status;
+    if (std.mem.eql(u8, raw, "gate")) return .gate;
+    return null;
+}
+
+fn parseApertureCommand(raw: []const u8) ?ApertureCommand {
+    if (std.mem.eql(u8, raw, "next")) return .next;
+    if (std.mem.eql(u8, raw, "plan")) return .plan;
+    if (std.mem.eql(u8, raw, "select")) return .select;
+    if (std.mem.eql(u8, raw, "explain")) return .explain;
+    return null;
+}
+
+fn parseCompileCommand(raw: []const u8) ?CompileCommand {
+    if (std.mem.eql(u8, raw, "intent")) return .intent;
+    if (std.mem.eql(u8, raw, "graph")) return .graph;
+    if (std.mem.eql(u8, raw, "ready")) return .ready;
+    if (std.mem.eql(u8, raw, "aperture")) return .aperture;
+    return null;
+}
+
+fn parseProofCommand(raw: []const u8) ?ProofCommand {
+    if (std.mem.eql(u8, raw, "audit")) return .audit;
+    return null;
+}
+
+fn parseAuditGate(raw: []const u8) ?AuditGate {
+    if (std.mem.eql(u8, raw, "draft")) return .draft;
+    if (std.mem.eql(u8, raw, "implementation-ready")) return .implementation_ready;
+    if (std.mem.eql(u8, raw, "execution-ready")) return .execution_ready;
+    if (std.mem.eql(u8, raw, "proof-complete")) return .proof_complete;
     return null;
 }
 
@@ -1355,6 +1829,7 @@ fn parseProjectionTarget(raw: []const u8) ?ProjectionTarget {
 
 fn parseProjectionMode(raw: []const u8) ?ProjectionMode {
     if (std.mem.eql(u8, raw, "selected")) return .selected;
+    if (std.mem.eql(u8, raw, "aperture")) return .aperture;
     if (std.mem.eql(u8, raw, "auto-top-up")) return .auto_top_up;
     if (std.mem.eql(u8, raw, "auto_top_up")) return .auto_top_up;
     if (std.mem.eql(u8, raw, "replace-ready")) return .replace_ready;
@@ -1366,6 +1841,13 @@ fn parsePositiveUsize(raw: []const u8) !usize {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     const value = try std.fmt.parseInt(usize, trimmed, 10);
     if (value == 0) return error.InvalidLimit;
+    return value;
+}
+
+fn parsePositiveI64(raw: []const u8) !i64 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const value = try std.fmt.parseInt(i64, trimmed, 10);
+    if (value <= 0) return error.InvalidLimit;
     return value;
 }
 
@@ -1568,6 +2050,10 @@ fn applyPrimeSelection(
 
     switch (mode) {
         .selected => {},
+        .aperture => {
+            const selected = try selectApertureIds(allocator, state, limit);
+            for (selected) |id| try frontier.append(allocator, id);
+        },
         .auto_top_up, .replace_ready => {
             if (mode == .auto_top_up) {
                 for (state.items.items) |item| {
@@ -1593,7 +2079,7 @@ fn applyPrimeSelection(
     }
 
     var changed = false;
-    if (mode == .replace_ready) {
+    if (mode == .replace_ready or mode == .aperture) {
         for (state.items.items) |*item| {
             const should_select = containsString(frontier.items, item.id);
             if (item.in_plan != should_select) {
@@ -1672,8 +2158,10 @@ fn runCommand(allocator: std.mem.Allocator, args: Args) !u8 {
         .ready => try cmdReady(allocator, args),
         .blocked => try cmdBlocked(allocator, args),
         .claim => try cmdClaim(allocator, args),
+        .complete => try cmdComplete(allocator, args),
         .doctor => try cmdDoctor(allocator, args),
         .prime => try cmdPrime(allocator, args),
+        .proof => try cmdProof(allocator, args),
         .assert_projection => try cmdAssertProjection(allocator, args),
         .guard_session_start => try cmdGuardSessionStart(allocator, args),
         .guard_pre_tool_use => try cmdGuardPreToolUse(allocator, args),
@@ -1688,6 +2176,9 @@ fn runCommand(allocator: std.mem.Allocator, args: Args) !u8 {
         .release => try cmdRelease(allocator, args),
         .reclaim_stale => try cmdReclaimStale(allocator, args),
         .import_mesh_results => try cmdImportMeshResults(allocator, args),
+        .graph => try cmdGraph(allocator, args),
+        .aperture => try cmdAperture(allocator, args),
+        .compile => try cmdCompile(allocator, args),
     };
 }
 
@@ -1816,6 +2307,20 @@ fn cmdSetStatus(allocator: std.mem.Allocator, args: Args) !u8 {
     const item_id = try requireNonEmptyString(allocator, args.id.?, "--id");
     const status = try normalizeStatus(args.status);
     const item = state.get(item_id) orelse return error.UnknownItemId;
+    if (status == .completed and state.graph_active and state.graph.policy.completion_requires_proof and isExecutableItem(item.*)) {
+        if (proofCompletionMissingReason(item.*)) |missing| {
+            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+            const stdout = &stdout_writer.interface;
+            if (!args.allow_unproven) {
+                try stdout.print("completion blocked for {s}: {s}\n", .{ item_id, missing });
+                return 2;
+            }
+            const waiver_reason = try requireNonEmptyString(allocator, args.reason orelse return error.MissingReason, "--reason");
+            state.graph_active = true;
+            const now = try nowUtcAlloc(allocator);
+            try addForcedCompletionWaivers(allocator, &state, item_id, waiver_reason, now);
+        }
+    }
     item.status = status;
     normalizeItemPlanMembership(item);
 
@@ -2251,9 +2756,9 @@ fn cmdImportPlan(allocator: std.mem.Allocator, args: Args) !u8 {
     const input_path = args.input.?;
     const input_bytes = try readFileAlloc(allocator, input_path, 32 * 1024 * 1024);
     const parsed_snapshot = try std.json.parseFromSlice(std.json.Value, allocator, input_bytes, .{});
-    const imported_items = try parseSnapshotItems(allocator, parsed_snapshot.value);
+    const imported = try parseSnapshotPlan(allocator, parsed_snapshot.value);
     if (args.backlog_only) {
-        for (imported_items) |*item| {
+        for (imported.items) |*item| {
             item.in_plan = false;
             normalizeItemPlanMembership(item);
         }
@@ -2265,18 +2770,24 @@ fn cmdImportPlan(allocator: std.mem.Allocator, args: Args) !u8 {
 
     if (args.replace) {
         state.clear();
-        for (imported_items) |item| {
+        state.graph = if (imported.graph_active) imported.graph else .{};
+        state.graph_active = imported.graph_active;
+        for (imported.items) |item| {
             try state.upsert(item);
         }
     } else {
-        for (imported_items) |item| {
+        if (imported.graph_active) {
+            state.graph = imported.graph;
+            state.graph_active = true;
+        }
+        for (imported.items) |item| {
             try state.upsert(item);
         }
     }
 
     try validateState(&state, args.allow_multiple_in_progress);
 
-    const bump: i64 = if (args.replace) 1 else @intCast(@max(imported_items.len, 1));
+    const bump: i64 = if (args.replace) 1 else @intCast(@max(imported.items.len, 1));
     const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
     const ts = try nowUtcAlloc(allocator);
     try writeCanonicalRecords(args.file, &state, loaded.latest_seq + bump, ts, meta, null);
@@ -2286,10 +2797,1583 @@ fn cmdImportPlan(allocator: std.mem.Allocator, args: Args) !u8 {
     if (args.replace) {
         try stdout.print("replaced plan from {s}\n", .{input_path});
     } else {
-        try stdout.print("imported {d} item(s) from {s}\n", .{ imported_items.len, input_path });
+        try stdout.print("imported {d} item(s) from {s}\n", .{ imported.items.len, input_path });
     }
     try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, loaded.latest_seq + bump);
     return 0;
+}
+
+fn cmdGraph(allocator: std.mem.Allocator, args: Args) !u8 {
+    return switch (args.graph_command) {
+        .schema => try cmdGraphSchema(allocator, args),
+        .apply => try cmdGraphApply(allocator, args),
+        .audit => try cmdGraphAudit(allocator, args),
+        .insights => try cmdGraphInsights(allocator, args),
+        .polish => try cmdGraphPolish(allocator, args),
+        .none => error.MissingCommand,
+    };
+}
+
+fn cmdGraphSchema(allocator: std.mem.Allocator, args: Args) !u8 {
+    _ = allocator;
+    _ = args;
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll(
+        "{\"version\":1,\"ops\":[\"upsert-intent\",\"waive-intent\",\"upsert-item\",\"remove-item\",\"set-status\",\"set-priority\",\"set-contract\",\"set-acceptance\",\"set-validation\",\"set-location\",\"set-scope\",\"set-labels\",\"set-lock-roots\",\"add-dep\",\"remove-dep\",\"add-link\",\"remove-link\",\"reparent\",\"add-comment\",\"waive-audit\"],\"gates\":[\"draft\",\"implementation-ready\",\"execution-ready\",\"proof-complete\"]}\n",
+    );
+    return 0;
+}
+
+fn cmdGraphAudit(allocator: std.mem.Allocator, args: Args) !u8 {
+    _ = args.allow_multiple_in_progress;
+    const parsed = try readRecords(allocator, args.file);
+    var state = try materializeStateFromRecords(allocator, parsed.records);
+    defer state.deinit();
+
+    const audit = try auditGraph(allocator, &state, args.gate);
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    if (args.format == .json) {
+        try writeAuditResultJson(stdout, &state, audit);
+        try stdout.writeByte('\n');
+    } else {
+        try writeAuditResultMarkdown(stdout, audit);
+    }
+    return if (audit.errors == 0) 0 else 2;
+}
+
+fn cmdGraphInsights(allocator: std.mem.Allocator, args: Args) !u8 {
+    const parsed = try readRecords(allocator, args.file);
+    var state = try materializeStateFromRecords(allocator, parsed.records);
+    defer state.deinit();
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    if (args.format == .json) {
+        try writeGraphInsightsJson(allocator, stdout, &state);
+        try stdout.writeByte('\n');
+    } else {
+        try writeGraphInsightsMarkdown(allocator, stdout, &state);
+    }
+    return 0;
+}
+
+fn cmdGraphPolish(allocator: std.mem.Allocator, args: Args) !u8 {
+    return switch (args.polish_command) {
+        .begin => try cmdGraphPolishBegin(allocator, args),
+        .snapshot => try cmdGraphPolishSnapshot(allocator, args),
+        .status => try cmdGraphPolishStatus(allocator, args),
+        .gate => try cmdGraphPolishGate(allocator, args),
+        .none => error.MissingCommand,
+    };
+}
+
+fn cmdGraphPolishBegin(allocator: std.mem.Allocator, args: Args) !u8 {
+    const loaded = try loadValidatedState(allocator, args.file, args.allow_multiple_in_progress);
+    var state = loaded.state;
+    defer state.deinit();
+    state.graph_active = true;
+    state.graph.polish = .{ .session_id = args.name.?, .passes = &.{} };
+    const fps = try computeGraphFingerprints(allocator, &state);
+    state.graph.fingerprints = fps;
+    const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
+    const ts = try nowUtcAlloc(allocator);
+    try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, ts, meta, null);
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    try stdout_writer.interface.print("polish session started: {s}\n", .{args.name.?});
+    return 0;
+}
+
+fn cmdGraphPolishSnapshot(allocator: std.mem.Allocator, args: Args) !u8 {
+    const loaded = try loadValidatedState(allocator, args.file, args.allow_multiple_in_progress);
+    var state = loaded.state;
+    defer state.deinit();
+    state.graph_active = true;
+    const pass_no = try parsePositiveI64(args.pass_number.?);
+    const fps = try computeGraphFingerprints(allocator, &state);
+    const audit = try auditGraph(allocator, &state, args.gate);
+    const now = try nowUtcAlloc(allocator);
+    var passes = std.ArrayList(PolishPass).empty;
+    try passes.appendSlice(allocator, state.graph.polish.passes);
+    try passes.append(allocator, .{
+        .pass = pass_no,
+        .seq = loaded.latest_seq + 1,
+        .created_at = now,
+        .structure_fingerprint = fps.structure,
+        .contract_fingerprint = fps.contract,
+        .coverage_fingerprint = fps.coverage,
+        .execution_fingerprint = fps.execution,
+        .audit_gate = args.gate.asString(),
+        .hard_failures = @intCast(audit.errors),
+        .warnings = @intCast(audit.warnings),
+    });
+    state.graph.polish.passes = try passes.toOwnedSlice(allocator);
+    state.graph.fingerprints = fps;
+    const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
+    try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, now, meta, null);
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    try stdout_writer.interface.print("polish snapshot recorded: pass {d}\n", .{pass_no});
+    return 0;
+}
+
+fn cmdGraphPolishStatus(allocator: std.mem.Allocator, args: Args) !u8 {
+    const parsed = try readRecords(allocator, args.file);
+    var state = try materializeStateFromRecords(allocator, parsed.records);
+    defer state.deinit();
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    if (args.format == .json) {
+        try writePolishStatusJson(stdout, &state);
+        try stdout.writeByte('\n');
+    } else {
+        try writePolishStatusMarkdown(stdout, &state);
+    }
+    return 0;
+}
+
+fn cmdGraphPolishGate(allocator: std.mem.Allocator, args: Args) !u8 {
+    const parsed = try readRecords(allocator, args.file);
+    var state = try materializeStateFromRecords(allocator, parsed.records);
+    defer state.deinit();
+    const audit = try auditGraph(allocator, &state, args.gate);
+    const stable = polishStable(&state, args.min_stable_passes);
+    const ok = audit.errors == 0 and stable;
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    if (args.format == .json) {
+        try stdout.writeAll("{\"version\":1,\"ok\":");
+        try stdout.writeAll(if (ok) "true" else "false");
+        try stdout.writeAll(",\"gate\":");
+        try std.json.Stringify.value(args.gate.asString(), .{}, stdout);
+        try stdout.writeAll(",\"stable\":");
+        try stdout.writeAll(if (stable) "true" else "false");
+        try stdout.writeAll(",\"errors\":");
+        try stdout.print("{d}", .{audit.errors});
+        try stdout.writeAll("}\n");
+    } else {
+        try stdout.print("st graph polish gate: {s}\n", .{if (ok) "PASS" else "FAIL"});
+        try stdout.print("Gate: {s}\nStable: {s}\nErrors: {d}\n", .{ args.gate.asString(), if (stable) "true" else "false", audit.errors });
+    }
+    return if (ok) 0 else 2;
+}
+
+fn cmdGraphApply(allocator: std.mem.Allocator, args: Args) !u8 {
+    const input_path = args.input.?;
+    const patch_bytes = try readFileAlloc(allocator, input_path, 32 * 1024 * 1024);
+    const parsed_patch = try std.json.parseFromSlice(std.json.Value, allocator, patch_bytes, .{});
+    const patch_obj = switch (parsed_patch.value) {
+        .object => |o| o,
+        else => return error.InvalidGraphPatch,
+    };
+    const reason = try requireNonEmptyString(allocator, asString(patch_obj.get("reason") orelse return error.MissingReason) orelse return error.MissingReason, "patch.reason");
+    _ = reason;
+    const ops_value = patch_obj.get("ops") orelse return error.InvalidGraphPatch;
+    const ops = switch (ops_value) {
+        .array => |a| a.items,
+        else => return error.InvalidGraphPatch,
+    };
+    if (ops.len == 0) return error.InvalidGraphPatch;
+
+    const loaded = try loadValidatedState(allocator, args.file, args.allow_multiple_in_progress);
+    var state = loaded.state;
+    defer state.deinit();
+
+    const before_ids = try itemIdsAlloc(allocator, &state);
+    state.graph_active = true;
+    if (!state.graph.policy.completion_requires_proof) {
+        state.graph.policy.completion_requires_proof = true;
+    }
+
+    for (ops) |op_value| try applyGraphPatchOp(allocator, &state, op_value);
+
+    const audit = try auditGraph(allocator, &state, args.gate);
+    if (audit.errors != 0) {
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        const stdout = &stdout_writer.interface;
+        try writeAuditSummaryJson(stdout, audit);
+        try stdout.writeByte('\n');
+        return 2;
+    }
+    try validateState(&state, args.allow_multiple_in_progress);
+
+    const seq_after = if (args.dry_run) loaded.latest_seq else loaded.latest_seq + 1;
+    const delta = try computeGraphDelta(allocator, before_ids, &state, loaded.latest_seq, seq_after);
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+
+    if (!args.dry_run) {
+        const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
+        const ts = try nowUtcAlloc(allocator);
+        try writeCanonicalRecords(args.file, &state, seq_after, ts, meta, null);
+    }
+
+    try emitPlanSyncWithPolicy(allocator, stdout, &state, .{ .source_file = args.file, .source_seq = seq_after }, true);
+    try stdout.writeAll("graph_delta: ");
+    try writeGraphDeltaJson(stdout, delta);
+    try stdout.writeByte('\n');
+    try stdout.writeAll("audit_summary: ");
+    try writeAuditSummaryJson(stdout, audit);
+    try stdout.writeByte('\n');
+    return 0;
+}
+
+const ApertureCandidate = struct {
+    id: []const u8,
+    score: i64,
+    durable_index: usize,
+};
+
+fn cmdAperture(allocator: std.mem.Allocator, args: Args) !u8 {
+    return switch (args.aperture_command) {
+        .next => try cmdApertureNext(allocator, args),
+        .plan => try cmdAperturePlan(allocator, args, false),
+        .select => try cmdApertureSelect(allocator, args),
+        .explain => try cmdAperturePlan(allocator, args, true),
+        .none => error.MissingCommand,
+    };
+}
+
+fn cmdCompile(allocator: std.mem.Allocator, args: Args) !u8 {
+    return switch (args.compile_command) {
+        .intent => try cmdCompileIntent(allocator, args),
+        .graph => try cmdGraphApply(allocator, .{ .command = .graph, .graph_command = .apply, .file = args.file, .input = args.input, .gate = args.gate, .allow_multiple_in_progress = args.allow_multiple_in_progress }),
+        .ready => try cmdGraphAudit(allocator, .{ .command = .graph, .graph_command = .audit, .file = args.file, .gate = .implementation_ready, .format = args.format }),
+        .aperture => try cmdCompileAperture(allocator, args),
+        .none => error.MissingCommand,
+    };
+}
+
+fn cmdCompileIntent(allocator: std.mem.Allocator, args: Args) !u8 {
+    const input_bytes = try readFileAlloc(allocator, args.input.?, 32 * 1024 * 1024);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, input_bytes, .{});
+    const intents = switch (parsed.value) {
+        .array => |arr| arr.items,
+        .object => |obj| switch (obj.get("intent") orelse parsed.value) {
+            .array => |arr| arr.items,
+            else => return error.InvalidIntentAtom,
+        },
+        else => return error.InvalidIntentAtom,
+    };
+    var ops = std.ArrayList(std.json.Value).empty;
+    for (intents) |intent_value| {
+        var op_obj: std.json.ObjectMap = .empty;
+        try op_obj.put(allocator, "op", .{ .string = "upsert-intent" });
+        try op_obj.put(allocator, "intent", intent_value);
+        try ops.append(allocator, .{ .object = op_obj });
+    }
+    const loaded = try loadValidatedState(allocator, args.file, args.allow_multiple_in_progress);
+    var state = loaded.state;
+    defer state.deinit();
+    state.graph_active = true;
+    state.graph.policy.completion_requires_proof = true;
+    for (ops.items) |op_value| try applyGraphPatchOp(allocator, &state, op_value);
+    const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
+    const ts = try nowUtcAlloc(allocator);
+    try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, ts, meta, null);
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    try emitPlanSyncWithPolicy(allocator, &stdout_writer.interface, &state, .{ .source_file = args.file, .source_seq = loaded.latest_seq + 1 }, true);
+    return 0;
+}
+
+fn cmdCompileAperture(allocator: std.mem.Allocator, args: Args) !u8 {
+    const code = try cmdApertureSelect(allocator, .{ .command = .aperture, .aperture_command = .select, .file = args.file, .limit = args.limit, .allow_multiple_in_progress = args.allow_multiple_in_progress });
+    if (code != 0) return code;
+    return cmdPrime(allocator, .{ .command = .prime, .file = args.file, .mode = .aperture, .limit = args.limit, .allow_multiple_in_progress = args.allow_multiple_in_progress });
+}
+
+fn cmdApertureNext(allocator: std.mem.Allocator, args: Args) !u8 {
+    const loaded = try loadValidatedState(allocator, args.file, args.allow_multiple_in_progress);
+    var state = loaded.state;
+    defer state.deinit();
+    const selected = try apertureCandidates(allocator, &state, 1);
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    if (selected.len == 0) {
+        try stdout.writeAll("{\"version\":1,\"id\":null}\n");
+        return 0;
+    }
+    try writeApertureCandidateJson(stdout, &state, selected[0]);
+    try stdout.writeByte('\n');
+    return 0;
+}
+
+fn cmdAperturePlan(allocator: std.mem.Allocator, args: Args, markdown: bool) !u8 {
+    const loaded = try loadValidatedState(allocator, args.file, args.allow_multiple_in_progress);
+    var state = loaded.state;
+    defer state.deinit();
+    const selected = try apertureCandidates(allocator, &state, args.limit);
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    if (markdown or args.format == .markdown) {
+        try writeApertureMarkdown(stdout, &state, selected);
+    } else {
+        try writeAperturePlanJson(stdout, &state, selected, args.limit, args.strategy);
+        try stdout.writeByte('\n');
+    }
+    return 0;
+}
+
+fn cmdApertureSelect(allocator: std.mem.Allocator, args: Args) !u8 {
+    const loaded = try loadValidatedState(allocator, args.file, args.allow_multiple_in_progress);
+    var state = loaded.state;
+    defer state.deinit();
+    const selected_ids = try selectApertureIds(allocator, &state, args.limit);
+    for (state.items.items) |*item| {
+        item.in_plan = containsString(selected_ids, item.id);
+        normalizeItemPlanMembership(item);
+    }
+    const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
+    const ts = try nowUtcAlloc(allocator);
+    try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, ts, meta, null);
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    try emitPlanSyncWithPolicy(allocator, &stdout_writer.interface, &state, .{ .source_file = args.file, .source_seq = loaded.latest_seq + 1 }, true);
+    return 0;
+}
+
+fn applyGraphPatchOp(allocator: std.mem.Allocator, state: *ItemState, value: std.json.Value) !void {
+    const obj = switch (value) {
+        .object => |o| o,
+        else => return error.InvalidGraphPatch,
+    };
+    const op = asString(obj.get("op") orelse return error.InvalidGraphPatch) orelse return error.InvalidGraphPatch;
+
+    if (std.mem.eql(u8, op, "upsert-intent")) {
+        const atom = try canonicalIntentAtom(allocator, obj.get("intent") orelse return error.InvalidIntentAtom);
+        try upsertIntentAtom(allocator, &state.graph, atom);
+        return;
+    }
+    if (std.mem.eql(u8, op, "upsert-item")) {
+        const item_value = obj.get("item") orelse return error.InvalidItem;
+        var item = try canonicalItem(allocator, item_value);
+        if (state.getConst(item.id)) |existing| {
+            const item_obj = switch (item_value) {
+                .object => |o| o,
+                else => return error.InvalidItem,
+            };
+            if (item_obj.get("claim") == null) item.claim = existing.claim;
+            if (item_obj.get("runtime") == null) item.runtime = existing.runtime;
+            if (item_obj.get("proof") == null) item.proof = existing.proof;
+        }
+        try state.upsert(item);
+        return;
+    }
+    if (std.mem.eql(u8, op, "remove-item")) {
+        const id = try graphOpItemId(allocator, obj);
+        try state.remove(id);
+        return;
+    }
+    if (std.mem.eql(u8, op, "set-status")) {
+        const item = state.get(try graphOpItemId(allocator, obj)) orelse return error.UnknownItemId;
+        item.status = try normalizeStatus(asString(obj.get("status") orelse return error.MissingStatusValue) orelse return error.MissingStatusValue);
+        normalizeItemPlanMembership(item);
+        return;
+    }
+    if (std.mem.eql(u8, op, "set-priority")) {
+        const item = state.get(try graphOpItemId(allocator, obj)) orelse return error.UnknownItemId;
+        item.priority = try normalizePriority(asString(obj.get("priority") orelse return error.MissingPriorityValue) orelse return error.MissingPriorityValue);
+        return;
+    }
+    if (std.mem.eql(u8, op, "set-contract")) {
+        const item = state.get(try graphOpItemId(allocator, obj)) orelse return error.UnknownItemId;
+        item.contract = try canonicalContract(allocator, obj.get("contract") orelse return error.InvalidContract);
+        return;
+    }
+    if (std.mem.eql(u8, op, "set-acceptance")) return try setItemStringListField(allocator, state, obj, "acceptance", .acceptance);
+    if (std.mem.eql(u8, op, "set-validation")) return try setItemStringListField(allocator, state, obj, "validation", .validation);
+    if (std.mem.eql(u8, op, "set-location")) return try setItemStringListField(allocator, state, obj, "location", .location);
+    if (std.mem.eql(u8, op, "set-scope")) return try setItemStringListField(allocator, state, obj, "scope", .scope);
+    if (std.mem.eql(u8, op, "set-labels")) return try setItemStringListField(allocator, state, obj, "labels", .labels);
+    if (std.mem.eql(u8, op, "set-lock-roots")) return try setItemStringListField(allocator, state, obj, "lock_roots", .lock_roots);
+    if (std.mem.eql(u8, op, "add-dep")) {
+        const from = try graphOpFromId(allocator, obj);
+        const item = state.get(from) orelse return error.UnknownItemId;
+        const dep = try graphOpDep(allocator, obj);
+        item.deps = try appendDep(allocator, item.deps, dep);
+        return;
+    }
+    if (std.mem.eql(u8, op, "remove-dep")) {
+        const from = try graphOpFromId(allocator, obj);
+        const item = state.get(from) orelse return error.UnknownItemId;
+        const dep_id = try graphOpToId(allocator, obj);
+        item.deps = try removeDep(allocator, item.deps, dep_id);
+        return;
+    }
+    if (std.mem.eql(u8, op, "add-link")) {
+        const from = try graphOpFromId(allocator, obj);
+        const item = state.get(from) orelse return error.UnknownItemId;
+        const link = try graphOpLink(allocator, obj);
+        item.links = try appendGraphLink(allocator, item.links, link);
+        return;
+    }
+    if (std.mem.eql(u8, op, "remove-link")) {
+        const from = try graphOpFromId(allocator, obj);
+        const item = state.get(from) orelse return error.UnknownItemId;
+        const to = try graphOpToId(allocator, obj);
+        item.links = try removeGraphLink(allocator, item.links, to);
+        return;
+    }
+    if (std.mem.eql(u8, op, "reparent")) {
+        const item = state.get(try graphOpItemId(allocator, obj)) orelse return error.UnknownItemId;
+        item.parent_id = if (obj.get("parent_id")) |v| try optionalString(allocator, v, "parent_id") else try optionalString(allocator, obj.get("parent") orelse .null, "parent");
+        return;
+    }
+    if (std.mem.eql(u8, op, "add-comment")) {
+        const item = state.get(try graphOpItemId(allocator, obj)) orelse return error.UnknownItemId;
+        const text = try requireNonEmptyString(allocator, asString(obj.get("text") orelse return error.MissingTextValue) orelse return error.MissingTextValue, "text");
+        const author = if (obj.get("author")) |v| asString(v) orelse "codex" else "codex";
+        const ts = if (obj.get("ts")) |v| asString(v) orelse "" else "";
+        var comments = std.ArrayList(Comment).empty;
+        try comments.appendSlice(allocator, item.comments);
+        try comments.append(allocator, .{ .ts = if (ts.len > 0) ts else try nowUtcAlloc(allocator), .author = author, .text = text });
+        item.comments = try comments.toOwnedSlice(allocator);
+        return;
+    }
+    if (std.mem.eql(u8, op, "waive-audit")) {
+        const waiver = try canonicalWaiver(allocator, obj.get("waiver") orelse return error.InvalidWaiver);
+        try upsertWaiver(allocator, &state.graph, waiver);
+        return;
+    }
+    if (std.mem.eql(u8, op, "waive-intent")) {
+        const waiver = try canonicalWaiver(allocator, obj.get("waiver") orelse return error.InvalidWaiver);
+        try upsertWaiver(allocator, &state.graph, waiver);
+        return;
+    }
+
+    return error.InvalidGraphPatchOp;
+}
+
+const StringListField = enum { acceptance, validation, location, scope, labels, lock_roots };
+
+fn setItemStringListField(
+    allocator: std.mem.Allocator,
+    state: *ItemState,
+    obj: std.json.ObjectMap,
+    key: []const u8,
+    field: StringListField,
+) !void {
+    const item = state.get(try graphOpItemId(allocator, obj)) orelse return error.UnknownItemId;
+    const values = try normalizeStringList(allocator, obj.get(key) orelse return error.InvalidGraphPatch);
+    switch (field) {
+        .acceptance => item.acceptance = values,
+        .validation => item.validation = values,
+        .location => item.location = values,
+        .scope => item.scope = values,
+        .labels => item.labels = values,
+        .lock_roots => item.lock_roots = values,
+    }
+}
+
+fn upsertIntentAtom(allocator: std.mem.Allocator, graph: *GraphEnvelope, atom: IntentAtom) !void {
+    var out = std.ArrayList(IntentAtom).empty;
+    var replaced = false;
+    for (graph.intent) |existing| {
+        if (std.mem.eql(u8, existing.id, atom.id)) {
+            try out.append(allocator, atom);
+            replaced = true;
+        } else {
+            try out.append(allocator, existing);
+        }
+    }
+    if (!replaced) try out.append(allocator, atom);
+    graph.intent = try out.toOwnedSlice(allocator);
+}
+
+fn upsertWaiver(allocator: std.mem.Allocator, graph: *GraphEnvelope, waiver: Waiver) !void {
+    var out = std.ArrayList(Waiver).empty;
+    var replaced = false;
+    for (graph.waivers) |existing| {
+        if (std.mem.eql(u8, existing.id, waiver.id)) {
+            try out.append(allocator, waiver);
+            replaced = true;
+        } else {
+            try out.append(allocator, existing);
+        }
+    }
+    if (!replaced) try out.append(allocator, waiver);
+    graph.waivers = try out.toOwnedSlice(allocator);
+}
+
+fn graphOpItemId(allocator: std.mem.Allocator, obj: std.json.ObjectMap) ![]const u8 {
+    return try requireNonEmptyString(allocator, asString(obj.get("id") orelse return error.MissingItemId) orelse return error.MissingItemId, "id");
+}
+
+fn graphOpFromId(allocator: std.mem.Allocator, obj: std.json.ObjectMap) ![]const u8 {
+    if (obj.get("from")) |v| return try requireNonEmptyString(allocator, asString(v) orelse return error.MissingItemId, "from");
+    return graphOpItemId(allocator, obj);
+}
+
+fn graphOpToId(allocator: std.mem.Allocator, obj: std.json.ObjectMap) ![]const u8 {
+    if (obj.get("to")) |v| return try requireNonEmptyString(allocator, asString(v) orelse return error.MissingItemId, "to");
+    if (obj.get("target")) |v| return try requireNonEmptyString(allocator, asString(v) orelse return error.MissingItemId, "target");
+    if (obj.get("dep_id")) |v| return try requireNonEmptyString(allocator, asString(v) orelse return error.MissingItemId, "dep_id");
+    return error.MissingItemId;
+}
+
+fn graphOpDep(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !Dep {
+    if (obj.get("dep")) |v| return try canonicalDepEdge(allocator, v);
+    return .{
+        .id = try graphOpToId(allocator, obj),
+        .type = if (obj.get("type")) |v| asString(v) orelse "requires" else "requires",
+    };
+}
+
+fn graphOpLink(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !GraphLink {
+    if (obj.get("link")) |v| return try canonicalGraphLink(allocator, v);
+    return .{
+        .id = try graphOpToId(allocator, obj),
+        .type = try requireNonEmptyString(allocator, asString(obj.get("type") orelse return error.InvalidGraphLink) orelse return error.InvalidGraphLink, "link.type"),
+        .reason = if (obj.get("reason")) |v| asString(v) orelse "" else "",
+    };
+}
+
+fn appendDep(allocator: std.mem.Allocator, deps: []const Dep, dep: Dep) ![]const Dep {
+    var out = std.ArrayList(Dep).empty;
+    for (deps) |existing| {
+        if (!std.mem.eql(u8, existing.id, dep.id)) try out.append(allocator, existing);
+    }
+    try out.append(allocator, dep);
+    return try out.toOwnedSlice(allocator);
+}
+
+fn removeDep(allocator: std.mem.Allocator, deps: []const Dep, dep_id: []const u8) ![]const Dep {
+    var out = std.ArrayList(Dep).empty;
+    for (deps) |existing| {
+        if (!std.mem.eql(u8, existing.id, dep_id)) try out.append(allocator, existing);
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn appendGraphLink(allocator: std.mem.Allocator, links: []const GraphLink, link: GraphLink) ![]const GraphLink {
+    var out = std.ArrayList(GraphLink).empty;
+    for (links) |existing| {
+        if (!(std.mem.eql(u8, existing.id, link.id) and std.mem.eql(u8, existing.type, link.type))) {
+            try out.append(allocator, existing);
+        }
+    }
+    try out.append(allocator, link);
+    return try out.toOwnedSlice(allocator);
+}
+
+fn removeGraphLink(allocator: std.mem.Allocator, links: []const GraphLink, link_id: []const u8) ![]const GraphLink {
+    var out = std.ArrayList(GraphLink).empty;
+    for (links) |existing| {
+        if (!std.mem.eql(u8, existing.id, link_id)) try out.append(allocator, existing);
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn itemIdsAlloc(allocator: std.mem.Allocator, state: *const ItemState) ![]const []const u8 {
+    var out = std.ArrayList([]const u8).empty;
+    for (state.items.items) |item| try out.append(allocator, item.id);
+    return try out.toOwnedSlice(allocator);
+}
+
+fn computeGraphDelta(allocator: std.mem.Allocator, before_ids: []const []const u8, state: *const ItemState, seq_before: i64, seq_after: i64) !GraphDelta {
+    var added = std.ArrayList([]const u8).empty;
+    var changed = std.ArrayList([]const u8).empty;
+    for (state.items.items) |item| {
+        if (!containsString(before_ids, item.id)) {
+            try added.append(allocator, item.id);
+        } else {
+            try changed.append(allocator, item.id);
+        }
+    }
+    var removed = std.ArrayList([]const u8).empty;
+    for (before_ids) |id| {
+        if (state.getConst(id) == null) try removed.append(allocator, id);
+    }
+    var intent_ids = std.ArrayList([]const u8).empty;
+    for (state.graph.intent) |atom| try intent_ids.append(allocator, atom.id);
+    return .{
+        .seq_before = seq_before,
+        .seq_after = seq_after,
+        .items_added = try added.toOwnedSlice(allocator),
+        .items_removed = try removed.toOwnedSlice(allocator),
+        .items_changed = try changed.toOwnedSlice(allocator),
+        .intent_coverage_changed = try intent_ids.toOwnedSlice(allocator),
+    };
+}
+
+fn auditGraph(allocator: std.mem.Allocator, state: *const ItemState, gate: AuditGate) !AuditResult {
+    var findings = std.ArrayList(AuditFinding).empty;
+
+    try auditDraftGraph(allocator, state, gate, &findings);
+    if (gate == .implementation_ready or gate == .execution_ready or gate == .proof_complete) {
+        try auditImplementationReadyGraph(allocator, state, gate, &findings);
+    }
+    if (gate == .execution_ready) {
+        try auditExecutionReadyGraph(allocator, state, gate, &findings);
+    }
+    if (gate == .proof_complete) {
+        try auditProofCompleteGraph(allocator, state, gate, &findings);
+    }
+
+    var errors: usize = 0;
+    var warnings: usize = 0;
+    for (findings.items) |finding| {
+        if (finding.waived) continue;
+        switch (finding.severity) {
+            .@"error" => errors += 1,
+            .warning => warnings += 1,
+            .info => {},
+        }
+    }
+    return .{ .gate = gate, .findings = try findings.toOwnedSlice(allocator), .errors = errors, .warnings = warnings };
+}
+
+fn auditDraftGraph(allocator: std.mem.Allocator, state: *const ItemState, gate: AuditGate, findings: *std.ArrayList(AuditFinding)) !void {
+    var intent_ids = std.StringHashMap(void).init(allocator);
+    for (state.graph.intent) |atom| {
+        if (intent_ids.get(atom.id) != null) {
+            try addFinding(allocator, state, gate, findings, "duplicate-id", .@"error", atom.id, "Intent atom id is duplicated.");
+        } else {
+            try intent_ids.put(atom.id, {});
+        }
+        if (!validIntentCategory(atom.category)) {
+            try addFinding(allocator, state, gate, findings, "invalid-intent-category", .@"error", atom.id, "Intent atom category is invalid.");
+        }
+        if (!validIntentDisposition(atom.disposition)) {
+            try addFinding(allocator, state, gate, findings, "invalid-intent-disposition", .@"error", atom.id, "Intent atom disposition is invalid.");
+        }
+    }
+
+    for (state.items.items) |item| {
+        for (item.deps) |dep| {
+            if (std.mem.eql(u8, dep.id, item.id)) {
+                try addFinding(allocator, state, gate, findings, "self-dependency", .@"error", item.id, "Item depends on itself.");
+            } else if (state.getConst(dep.id) == null) {
+                try addFinding(allocator, state, gate, findings, "unknown-dependency", .@"error", item.id, "Item dependency does not reference an existing item.");
+            }
+        }
+        if (item.parent_id) |parent_id| {
+            if (state.getConst(parent_id) == null) {
+                try addFinding(allocator, state, gate, findings, "unknown-parent", .@"error", item.id, "Item parent_id does not reference an existing item.");
+            }
+        }
+        for (item.links) |link| {
+            if (!validLinkType(link.type)) {
+                try addFinding(allocator, state, gate, findings, "invalid-link-type", .@"error", item.id, "Item link type is invalid.");
+            }
+            if (std.mem.eql(u8, link.type, "covers-intent")) {
+                if (!intentExists(state, link.id)) try addFinding(allocator, state, gate, findings, "unknown-link-target", .@"error", item.id, "covers-intent link target does not exist.");
+            } else if (state.getConst(link.id) == null) {
+                try addFinding(allocator, state, gate, findings, "unknown-link-target", .@"error", item.id, "Item link target does not exist.");
+            }
+        }
+        for (item.intent_refs) |intent_id| {
+            if (!intentExists(state, intent_id)) {
+                try addFinding(allocator, state, gate, findings, "unknown-intent-ref", .@"error", item.id, "Item references an unknown intent atom.");
+            }
+        }
+        if (isExecutableItem(item) and item.contract == null) {
+            try addFinding(allocator, state, gate, findings, "missing-contract", .warning, item.id, "Executable item has no structured contract.");
+        }
+        if (isExecutableItem(item) and item.acceptance.len == 0) {
+            try addFinding(allocator, state, gate, findings, "missing-acceptance", .warning, item.id, "Executable item has no acceptance criteria.");
+        }
+        if (isExecutableItem(item) and item.validation.len == 0 and !itemHasProofObligations(item)) {
+            try addFinding(allocator, state, gate, findings, "missing-validation", .warning, item.id, "Executable item has no validation or proof obligations.");
+        }
+    }
+
+    try auditParentCycles(allocator, state, gate, findings);
+    try auditDependencyCycles(allocator, state, gate, findings);
+    for (state.graph.waivers) |waiver| {
+        if (waiver.reason.len == 0) {
+            try addFinding(allocator, state, gate, findings, "invalid-waiver-target", .@"error", waiver.id, "Waiver requires a reason.");
+        }
+        if (!waiverTargetExists(state, waiver.target)) {
+            try addFinding(allocator, state, gate, findings, "invalid-waiver-target", .@"error", waiver.id, "Waiver target does not exist.");
+        }
+    }
+}
+
+fn auditImplementationReadyGraph(allocator: std.mem.Allocator, state: *const ItemState, gate: AuditGate, findings: *std.ArrayList(AuditFinding)) !void {
+    for (state.graph.intent) |atom| {
+        if (std.mem.eql(u8, atom.disposition, "unknown")) {
+            try addFinding(allocator, state, gate, findings, "unknown-intent-disposition", .@"error", atom.id, "Intent atom has unknown disposition.");
+        }
+        if (std.mem.eql(u8, atom.disposition, "covered") and !intentCovered(state, atom.id)) {
+            try addFinding(allocator, state, gate, findings, "intent-not-covered-or-waived", .@"error", atom.id, "Covered intent atom has no covering item.");
+        }
+        if (!std.mem.eql(u8, atom.disposition, "covered") and !std.mem.eql(u8, atom.disposition, "unknown") and atom.reason.len == 0) {
+            try addFinding(allocator, state, gate, findings, "intent-disposition-missing-reason", .@"error", atom.id, "Non-covered intent disposition requires a reason or waiver.");
+        }
+    }
+    for (state.items.items) |item| {
+        if (!isExecutableItem(item)) continue;
+        if (item.contract == null) {
+            try addFinding(allocator, state, gate, findings, "executable-item-missing-contract", .@"error", item.id, "Executable item is missing a structured contract.");
+        }
+        if (item.acceptance.len == 0) {
+            try addFinding(allocator, state, gate, findings, "executable-item-missing-acceptance", .@"error", item.id, "Executable item is missing acceptance criteria.");
+        }
+        if (item.validation.len == 0 and !itemHasProofObligations(item)) {
+            try addFinding(allocator, state, gate, findings, "executable-item-missing-validation-or-proof-obligation", .@"error", item.id, "Executable item is missing validation or proof obligations.");
+        }
+        if ((item.item_type == .feature or item.item_type == .bug) and !itemHasTestCoverage(state, item)) {
+            try addFinding(allocator, state, gate, findings, "feature-or-bug-missing-test-coverage", .@"error", item.id, "Feature or bug item has no validation, proof obligation, child test, or linked test coverage.");
+        }
+        if ((item.item_type == .@"test" or item.item_type == .verification) and !testItemLinkedToCoveredItem(state, item)) {
+            try addFinding(allocator, state, gate, findings, "test-item-not-linked-to-covered-item", .@"error", item.id, "Test or verification item is not linked to covered work.");
+        }
+        if (item.contract) |contract| {
+            if (contract.risks.len > 0 and item.validation.len == 0 and !itemHasProofObligations(item) and item.acceptance.len == 0) {
+                try addFinding(allocator, state, gate, findings, "risk-without-mitigation", .@"error", item.id, "Contract risks have no structural validation, proof, or acceptance mitigation.");
+            }
+        }
+    }
+}
+
+fn auditExecutionReadyGraph(allocator: std.mem.Allocator, state: *const ItemState, gate: AuditGate, findings: *std.ArrayList(AuditFinding)) !void {
+    for (state.items.items) |item| {
+        if (!effectiveInPlan(item)) continue;
+        if (!isExecutableItem(item)) {
+            try addFinding(allocator, state, gate, findings, "selected-draft-item", .@"error", item.id, "Selected item is not executable.");
+        }
+        if (isTerminalStatus(item.status)) {
+            try addFinding(allocator, state, gate, findings, "terminal-item-selected", .@"error", item.id, "Terminal item is selected.");
+        }
+        const waiting = try unresolvedDependencyIds(allocator, item, state);
+        if (waiting.len > 0) {
+            try addFinding(allocator, state, gate, findings, "selected-item-waiting-on-deps", .@"error", item.id, "Selected item is waiting on dependencies.");
+            if (item.status == .in_progress) {
+                try addFinding(allocator, state, gate, findings, "in-progress-waiting-on-deps", .@"error", item.id, "In-progress item is waiting on dependencies.");
+            }
+        }
+        if (item.claim) |claim| {
+            if (claim.state == .stale) {
+                try addFinding(allocator, state, gate, findings, "stale-claim-selected", .@"error", item.id, "Selected item has a stale claim.");
+            }
+        }
+    }
+}
+
+fn auditProofCompleteGraph(allocator: std.mem.Allocator, state: *const ItemState, gate: AuditGate, findings: *std.ArrayList(AuditFinding)) !void {
+    for (state.items.items) |item| {
+        if (item.status != .completed or !isExecutableItem(item)) continue;
+        const obligations = proofObligationsForItem(item);
+        for (obligations) |obligation| {
+            if (!obligation.required) continue;
+            if (obligation.command.len == 0 and proofKindUsuallyNeedsCommand(obligation.kind)) {
+                try addFinding(allocator, state, gate, findings, "proof-command-missing", .@"error", item.id, "Required proof obligation is missing a command.");
+            }
+            const proof = item.proof orelse {
+                try addFinding(allocator, state, gate, findings, "completed-item-missing-required-proof", .@"error", item.id, "Completed item is missing required proof.");
+                continue;
+            };
+            if (proof.state != .pass) {
+                try addFinding(allocator, state, gate, findings, "proof-failed", .@"error", item.id, "Required proof did not pass.");
+            }
+            if (proof.evidence_ref.len == 0 and obligation.evidence_ref.len == 0) {
+                try addFinding(allocator, state, gate, findings, "proof-evidence-ref-missing", .@"error", item.id, "Required proof has no evidence reference.");
+            }
+        }
+    }
+}
+
+fn addFinding(
+    allocator: std.mem.Allocator,
+    state: *const ItemState,
+    gate: AuditGate,
+    findings: *std.ArrayList(AuditFinding),
+    code: []const u8,
+    severity: FindingSeverity,
+    target: []const u8,
+    message: []const u8,
+) !void {
+    const waiver_id = matchingWaiver(state, gate, code, target);
+    try findings.append(allocator, .{
+        .code = code,
+        .severity = severity,
+        .target = target,
+        .message = message,
+        .waived = waiver_id != null,
+        .waiver_id = waiver_id,
+    });
+}
+
+fn validIntentCategory(raw: []const u8) bool {
+    const allowed = [_][]const u8{ "requirement", "constraint", "non-goal", "risk", "compatibility", "migration", "test-expectation", "user-behavior", "architecture", "performance", "security", "accessibility", "observability", "documentation" };
+    return containsString(allowed[0..], raw);
+}
+
+fn validIntentDisposition(raw: []const u8) bool {
+    const allowed = [_][]const u8{ "covered", "deferred", "rejected", "duplicate", "non-goal", "unknown" };
+    return containsString(allowed[0..], raw);
+}
+
+fn validLinkType(raw: []const u8) bool {
+    const allowed = [_][]const u8{ "tests", "validates", "implements", "documents", "covers-intent", "relates-to", "supersedes", "duplicate-of", "follow-up", "context-for", "risk-for" };
+    return containsString(allowed[0..], raw);
+}
+
+fn intentExists(state: *const ItemState, intent_id: []const u8) bool {
+    for (state.graph.intent) |atom| {
+        if (std.mem.eql(u8, atom.id, intent_id)) return true;
+    }
+    return false;
+}
+
+fn intentCovered(state: *const ItemState, intent_id: []const u8) bool {
+    for (state.items.items) |item| {
+        if (containsString(item.intent_refs, intent_id)) return true;
+        for (item.links) |link| {
+            if (std.mem.eql(u8, link.type, "covers-intent") and std.mem.eql(u8, link.id, intent_id)) return true;
+        }
+    }
+    return false;
+}
+
+fn waiverTargetExists(state: *const ItemState, target: []const u8) bool {
+    if (state.getConst(target) != null) return true;
+    if (intentExists(state, target)) return true;
+    return false;
+}
+
+fn matchingWaiver(state: *const ItemState, gate: AuditGate, code: []const u8, target: []const u8) ?[]const u8 {
+    for (state.graph.waivers) |waiver| {
+        if (!std.mem.eql(u8, waiver.gate, gate.asString())) continue;
+        if (!std.mem.eql(u8, waiver.code, code)) continue;
+        if (!std.mem.eql(u8, waiver.target, target)) continue;
+        if (!(std.mem.eql(u8, waiver.expires, "never") or std.mem.eql(u8, waiver.expires, "on-next-touch"))) continue;
+        if (waiver.reason.len == 0) continue;
+        return waiver.id;
+    }
+    return null;
+}
+
+fn isExecutableItem(item: Item) bool {
+    return item.item_type != .epic and item.item_type != .decision;
+}
+
+fn itemHasProofObligations(item: Item) bool {
+    return proofObligationsForItem(item).len > 0;
+}
+
+fn proofObligationsForItem(item: Item) []const ProofObligation {
+    if (item.contract) |contract| return contract.proof_obligations;
+    return &.{};
+}
+
+fn itemHasTestCoverage(state: *const ItemState, item: Item) bool {
+    if (item.validation.len > 0 or itemHasProofObligations(item)) return true;
+    for (item.links) |link| {
+        if ((std.mem.eql(u8, link.type, "tests") or std.mem.eql(u8, link.type, "validates")) and state.getConst(link.id) != null) return true;
+    }
+    for (state.items.items) |candidate| {
+        if (candidate.parent_id) |parent_id| {
+            if (std.mem.eql(u8, parent_id, item.id) and (candidate.item_type == .@"test" or candidate.item_type == .verification)) return true;
+        }
+        for (candidate.links) |link| {
+            if ((std.mem.eql(u8, link.type, "tests") or std.mem.eql(u8, link.type, "validates")) and std.mem.eql(u8, link.id, item.id)) return true;
+        }
+    }
+    return false;
+}
+
+fn testItemLinkedToCoveredItem(state: *const ItemState, item: Item) bool {
+    if (item.parent_id != null) return true;
+    for (item.links) |link| {
+        if ((std.mem.eql(u8, link.type, "tests") or std.mem.eql(u8, link.type, "validates")) and state.getConst(link.id) != null) return true;
+    }
+    return false;
+}
+
+fn proofKindUsuallyNeedsCommand(kind: []const u8) bool {
+    const command_kinds = [_][]const u8{ "command", "test", "unit", "integration", "e2e", "lint", "typecheck", "benchmark" };
+    return containsString(command_kinds[0..], kind);
+}
+
+fn proofCompletionMissingReason(item: Item) ?[]const u8 {
+    const obligations = proofObligationsForItem(item);
+    if (obligations.len == 0) return null;
+    const proof = item.proof orelse return "missing required proof receipt";
+    if (proof.state != .pass) return "proof receipt is not passing";
+    if (proof.evidence_ref.len == 0) return "proof receipt is missing evidence reference";
+    for (obligations) |obligation| {
+        if (!obligation.required) continue;
+        if (obligation.command.len == 0 and proofKindUsuallyNeedsCommand(obligation.kind)) return "required proof obligation is missing a command";
+        if (obligation.command.len > 0 and proof.command.len == 0) return "proof receipt is missing command";
+        if (obligation.command.len > 0 and !std.mem.eql(u8, obligation.command, proof.command)) return "proof command does not satisfy required obligation";
+    }
+    return null;
+}
+
+fn addForcedCompletionWaivers(allocator: std.mem.Allocator, state: *ItemState, item_id: []const u8, reason: []const u8, created_at: []const u8) !void {
+    const codes = [_][]const u8{
+        "completed-item-missing-required-proof",
+        "proof-command-missing",
+        "proof-evidence-ref-missing",
+        "proof-failed",
+        "unwaived-forced-completion",
+    };
+    for (codes) |code| {
+        const waiver_id = try std.fmt.allocPrint(allocator, "waiver-{s}-{s}", .{ item_id, code });
+        try upsertWaiver(allocator, &state.graph, .{
+            .id = waiver_id,
+            .gate = "proof-complete",
+            .code = code,
+            .target = item_id,
+            .reason = reason,
+            .expires = "on-next-touch",
+            .created_at = created_at,
+            .created_by = "codex",
+        });
+    }
+}
+
+fn auditParentCycles(allocator: std.mem.Allocator, state: *const ItemState, gate: AuditGate, findings: *std.ArrayList(AuditFinding)) !void {
+    for (state.items.items) |item| {
+        var seen = std.StringHashMap(void).init(allocator);
+        var current: ?[]const u8 = item.parent_id;
+        while (current) |parent_id| {
+            if (std.mem.eql(u8, parent_id, item.id) or seen.get(parent_id) != null) {
+                try addFinding(allocator, state, gate, findings, "parent-cycle", .@"error", item.id, "Parent hierarchy contains a cycle.");
+                break;
+            }
+            try seen.put(parent_id, {});
+            current = if (state.getConst(parent_id)) |parent| parent.parent_id else null;
+        }
+    }
+}
+
+fn auditDependencyCycles(allocator: std.mem.Allocator, state: *const ItemState, gate: AuditGate, findings: *std.ArrayList(AuditFinding)) !void {
+    for (state.items.items) |item| {
+        var visiting = std.StringHashMap(void).init(allocator);
+        if (try dependencyCycleReachable(allocator, state, item.id, item.id, &visiting)) {
+            try addFinding(allocator, state, gate, findings, "dependency-cycle", .@"error", item.id, "Dependency graph contains a cycle.");
+        }
+    }
+}
+
+fn dependencyCycleReachable(
+    allocator: std.mem.Allocator,
+    state: *const ItemState,
+    start_id: []const u8,
+    current_id: []const u8,
+    visiting: *std.StringHashMap(void),
+) !bool {
+    const item = state.getConst(current_id) orelse return false;
+    if (visiting.get(current_id) != null) return false;
+    try visiting.put(current_id, {});
+    for (item.deps) |dep| {
+        if (std.mem.eql(u8, dep.id, start_id)) return true;
+        if (try dependencyCycleReachable(allocator, state, start_id, dep.id, visiting)) return true;
+    }
+    _ = visiting.remove(current_id);
+    return false;
+}
+
+fn writeGraphDeltaJson(writer: anytype, delta: GraphDelta) !void {
+    try writer.writeByte('{');
+    try writer.writeAll("\"version\":1,\"seq_before\":");
+    try writer.print("{d}", .{delta.seq_before});
+    try writer.writeAll(",\"seq_after\":");
+    try writer.print("{d}", .{delta.seq_after});
+    try writer.writeAll(",\"items_added\":");
+    try writeStringListArray(writer, delta.items_added);
+    try writer.writeAll(",\"items_removed\":");
+    try writeStringListArray(writer, delta.items_removed);
+    try writer.writeAll(",\"items_changed\":");
+    try writeStringListArray(writer, delta.items_changed);
+    try writer.writeAll(",\"deps_added\":[],\"deps_removed\":[],\"links_added\":[],\"links_removed\":[],\"intent_coverage_changed\":");
+    try writeStringListArray(writer, delta.intent_coverage_changed);
+    try writer.writeAll(",\"fingerprints\":{\"structure\":\"\",\"contract\":\"\",\"coverage\":\"\",\"execution\":\"\"}}");
+}
+
+fn writeAuditSummaryJson(writer: anytype, audit: AuditResult) !void {
+    try writer.writeByte('{');
+    try writer.writeAll("\"gate\":");
+    try std.json.Stringify.value(audit.gate.asString(), .{}, writer);
+    try writer.writeAll(",\"ok\":");
+    try writer.writeAll(if (audit.errors == 0) "true" else "false");
+    try writer.writeAll(",\"errors\":");
+    try writer.print("{d}", .{audit.errors});
+    try writer.writeAll(",\"warnings\":");
+    try writer.print("{d}", .{audit.warnings});
+    try writer.writeAll(",\"top_findings\":[");
+    var emitted: usize = 0;
+    for (audit.findings) |finding| {
+        if (finding.waived or finding.severity != .@"error") continue;
+        if (emitted > 0) try writer.writeByte(',');
+        try writeFindingJson(writer, finding);
+        emitted += 1;
+        if (emitted >= 5) break;
+    }
+    try writer.writeAll("]}");
+}
+
+fn writeAuditResultJson(writer: anytype, state: *const ItemState, audit: AuditResult) !void {
+    try writer.writeByte('{');
+    try writer.writeAll("\"version\":1,\"gate\":");
+    try std.json.Stringify.value(audit.gate.asString(), .{}, writer);
+    try writer.writeAll(",\"ok\":");
+    try writer.writeAll(if (audit.errors == 0) "true" else "false");
+    try writer.writeAll(",\"summary\":{\"items\":");
+    try writer.print("{d}", .{state.items.items.len});
+    try writer.writeAll(",\"open\":");
+    try writer.print("{d}", .{countOpenItems(state)});
+    try writer.writeAll(",\"ready\":");
+    try writer.print("{d}", .{countReadyItems(state)});
+    try writer.writeAll(",\"blocked\":");
+    try writer.print("{d}", .{countBlockedItems(state)});
+    try writer.writeAll(",\"terminal\":");
+    try writer.print("{d}", .{countTerminalItems(state)});
+    try writer.writeAll(",\"intent\":");
+    try writer.print("{d}", .{state.graph.intent.len});
+    try writer.writeAll(",\"covered_intent\":");
+    try writer.print("{d}", .{countCoveredIntent(state)});
+    try writer.writeAll(",\"waived_intent\":0,\"unknown_intent\":");
+    try writer.print("{d}", .{countUnknownIntent(state)});
+    try writer.writeAll(",\"errors\":");
+    try writer.print("{d}", .{audit.errors});
+    try writer.writeAll(",\"warnings\":");
+    try writer.print("{d}", .{audit.warnings});
+    try writer.writeAll("},\"findings\":[");
+    for (audit.findings, 0..) |finding, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writeFindingJson(writer, finding);
+    }
+    try writer.writeAll("],\"waivers\":");
+    try writeWaiversArray(writer, state.graph.waivers);
+    try writer.writeAll(",\"fingerprints\":{\"structure\":\"\",\"contract\":\"\",\"coverage\":\"\",\"execution\":\"\"}}");
+}
+
+fn writeFindingJson(writer: anytype, finding: AuditFinding) !void {
+    try writer.writeByte('{');
+    try writer.writeAll("\"code\":");
+    try std.json.Stringify.value(finding.code, .{}, writer);
+    try writer.writeAll(",\"severity\":");
+    try std.json.Stringify.value(finding.severity.asString(), .{}, writer);
+    try writer.writeAll(",\"target\":");
+    try std.json.Stringify.value(finding.target, .{}, writer);
+    try writer.writeAll(",\"message\":");
+    try std.json.Stringify.value(finding.message, .{}, writer);
+    try writer.writeAll(",\"waived\":");
+    try writer.writeAll(if (finding.waived) "true" else "false");
+    try writer.writeAll(",\"waiver_id\":");
+    if (finding.waiver_id) |waiver_id| {
+        try std.json.Stringify.value(waiver_id, .{}, writer);
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeByte('}');
+}
+
+fn writeAuditResultMarkdown(writer: anytype, audit: AuditResult) !void {
+    try writer.print("# st graph audit: {s}\n\n", .{audit.gate.asString()});
+    try writer.print("Status: {s}\n", .{if (audit.errors == 0) "PASS" else "FAIL"});
+    try writer.print("Errors: {d}\nWarnings: {d}\n\n", .{ audit.errors, audit.warnings });
+    try writer.writeAll("## Findings\n\n");
+    var any = false;
+    for (audit.findings) |finding| {
+        if (finding.waived) continue;
+        any = true;
+        try writer.print("- [{s}] {s}: {s}\n", .{ finding.code, finding.target, finding.message });
+    }
+    if (!any) try writer.writeAll("- (none)\n");
+}
+
+fn countOpenItems(state: *const ItemState) usize {
+    var count: usize = 0;
+    for (state.items.items) |item| {
+        if (!isTerminalStatus(item.status)) count += 1;
+    }
+    return count;
+}
+
+fn countTerminalItems(state: *const ItemState) usize {
+    var count: usize = 0;
+    for (state.items.items) |item| {
+        if (isTerminalStatus(item.status)) count += 1;
+    }
+    return count;
+}
+
+fn countBlockedItems(state: *const ItemState) usize {
+    var count: usize = 0;
+    for (state.items.items) |item| {
+        if (item.status == .blocked) count += 1;
+    }
+    return count;
+}
+
+fn countReadyItems(state: *const ItemState) usize {
+    var count: usize = 0;
+    for (state.items.items) |item| {
+        if (item.status != .pending) continue;
+        var ready = true;
+        for (item.deps) |dep| {
+            const dep_item = state.getConst(dep.id) orelse {
+                ready = false;
+                break;
+            };
+            if (dep_item.status != .completed) {
+                ready = false;
+                break;
+            }
+        }
+        if (ready) count += 1;
+    }
+    return count;
+}
+
+fn countCoveredIntent(state: *const ItemState) usize {
+    var count: usize = 0;
+    for (state.graph.intent) |atom| {
+        if (intentCovered(state, atom.id)) count += 1;
+    }
+    return count;
+}
+
+fn countUnknownIntent(state: *const ItemState) usize {
+    var count: usize = 0;
+    for (state.graph.intent) |atom| {
+        if (std.mem.eql(u8, atom.disposition, "unknown")) count += 1;
+    }
+    return count;
+}
+
+fn computeGraphFingerprints(allocator: std.mem.Allocator, state: *const ItemState) !GraphFingerprints {
+    return .{
+        .structure = try fingerprintGraph(allocator, state, .structure),
+        .contract = try fingerprintGraph(allocator, state, .contract),
+        .coverage = try fingerprintGraph(allocator, state, .coverage),
+        .execution = try fingerprintGraph(allocator, state, .execution),
+    };
+}
+
+const FingerprintKind = enum { structure, contract, coverage, execution };
+
+fn fingerprintGraph(allocator: std.mem.Allocator, state: *const ItemState, kind: FingerprintKind) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
+    try writer.print("{s}\n", .{@tagName(kind)});
+    for (state.items.items) |item| {
+        switch (kind) {
+            .structure => {
+                try writer.print("{s}|{s}|", .{ item.id, item.item_type.asString() });
+                if (item.parent_id) |parent_id| try writer.writeAll(parent_id);
+                try writer.writeByte('|');
+                try writeDepsArray(writer, item.deps);
+                try writer.writeByte('|');
+                try writeGraphLinksArray(writer, item.links);
+                try writer.writeByte('|');
+                try writeStringListArray(writer, item.intent_refs);
+                try writer.writeByte('|');
+                try writer.writeAll(item.priority.asString());
+                try writer.writeByte('\n');
+            },
+            .contract => {
+                try writer.print("{s}|{s}|{s}|", .{ item.id, item.step, item.notes });
+                try writeStringListArray(writer, item.acceptance);
+                try writer.writeByte('|');
+                try writeStringListArray(writer, item.validation);
+                try writer.writeByte('|');
+                if (item.contract) |contract| try writeContractObject(writer, contract);
+                try writer.writeByte('\n');
+            },
+            .coverage => {
+                try writer.print("{s}|", .{item.id});
+                try writeStringListArray(writer, item.intent_refs);
+                try writer.writeByte('|');
+                try writeGraphLinksArray(writer, item.links);
+                try writer.writeByte('|');
+                if (item.contract) |contract| try writeProofObligationsArray(writer, contract.proof_obligations);
+                try writer.writeByte('\n');
+            },
+            .execution => {
+                try writer.print("{s}|{s}|{s}|", .{ item.id, item.status.asString(), if (effectiveInPlan(item)) "true" else "false" });
+                if (item.claim) |claim| try writeClaimMetaObject(writer, claim);
+                try writer.writeByte('|');
+                if (item.runtime) |runtime| try writeRuntimeMetaObject(writer, runtime);
+                try writer.writeByte('|');
+                if (item.proof) |proof| try writeProofMetaObject(writer, proof);
+                try writer.writeByte('\n');
+            },
+        }
+    }
+    if (kind == .coverage) {
+        try writeIntentArray(writer, state.graph.intent);
+        try writer.writeByte('|');
+        try writeWaiversArray(writer, state.graph.waivers);
+    }
+    const payload = try out.toOwnedSlice();
+    return try hashTextSha256Alloc(allocator, payload);
+}
+
+fn hashTextSha256Alloc(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(text, &digest, .{});
+    const encoded = std.fmt.bytesToHex(digest, .lower);
+    return std.fmt.allocPrint(allocator, "sha256:{s}", .{&encoded});
+}
+
+fn polishStable(state: *const ItemState, min_stable_passes: usize) bool {
+    const passes = state.graph.polish.passes;
+    if (passes.len < min_stable_passes) return false;
+    const last = passes[passes.len - 1];
+    var checked: usize = 1;
+    var idx = passes.len - 1;
+    while (checked < min_stable_passes) : (checked += 1) {
+        if (idx == 0) return false;
+        idx -= 1;
+        const prior = passes[idx];
+        if (!std.mem.eql(u8, prior.structure_fingerprint, last.structure_fingerprint)) return false;
+        if (!std.mem.eql(u8, prior.coverage_fingerprint, last.coverage_fingerprint)) return false;
+    }
+    return true;
+}
+
+fn writeGraphInsightsJson(allocator: std.mem.Allocator, writer: anytype, state: *const ItemState) !void {
+    const ready_ids = try readyItemIds(allocator, state);
+    const blocked_ids = try blockedItemIds(allocator, state);
+    try writer.writeByte('{');
+    try writer.writeAll("\"version\":1,\"summary\":{\"items\":");
+    try writer.print("{d}", .{state.items.items.len});
+    try writer.writeAll(",\"ready\":");
+    try writer.print("{d}", .{ready_ids.len});
+    try writer.writeAll(",\"blocked\":");
+    try writer.print("{d}", .{blocked_ids.len});
+    try writer.writeAll(",\"critical_path_length\":");
+    try writer.print("{d}", .{criticalPathLength(state)});
+    try writer.writeAll(",\"intent_atoms\":");
+    try writer.print("{d}", .{state.graph.intent.len});
+    try writer.writeAll(",\"covered_intent\":");
+    try writer.print("{d}", .{countCoveredIntent(state)});
+    try writer.writeAll(",\"proof_complete\":");
+    try writer.print("{d}", .{countProofComplete(state)});
+    try writer.writeAll("},\"ready\":[");
+    for (ready_ids, 0..) |id, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        const item = state.getConst(id).?;
+        try writer.writeAll("{\"id\":");
+        try std.json.Stringify.value(item.id, .{}, writer);
+        try writer.writeAll(",\"step\":");
+        try std.json.Stringify.value(item.step, .{}, writer);
+        try writer.writeAll(",\"priority\":");
+        try std.json.Stringify.value(item.priority.asString(), .{}, writer);
+        try writer.writeAll(",\"score\":");
+        try writer.print("{d}", .{priorityWeight(item.priority) + downstreamCount(state, item.id)});
+        try writer.writeAll(",\"downstream_count\":");
+        try writer.print("{d}", .{downstreamCount(state, item.id)});
+        try writer.writeAll(",\"critical_path_length\":");
+        try writer.print("{d}", .{criticalPathFrom(state, item.id)});
+        try writer.writeByte('}');
+    }
+    try writer.writeAll("],\"blocked\":");
+    try writeStringListArray(writer, blocked_ids);
+    try writer.writeAll(",\"coverage\":{\"intent\":{\"total\":");
+    try writer.print("{d}", .{state.graph.intent.len});
+    try writer.writeAll(",\"covered\":");
+    try writer.print("{d}", .{countCoveredIntent(state)});
+    try writer.writeAll(",\"waived\":0,\"unknown\":[]},\"tests\":{\"items_requiring_tests\":0,\"covered\":0,\"uncovered\":[]},\"proof\":{\"items_requiring_proof\":");
+    try writer.print("{d}", .{countItemsWithProofObligations(state)});
+    try writer.writeAll(",\"complete\":");
+    try writer.print("{d}", .{countProofComplete(state)});
+    try writer.writeAll(",\"missing\":[]}},\"waves\":[{\"wave\":1,\"items\":");
+    try writeStringListArray(writer, ready_ids);
+    try writer.writeAll(",\"safe_parallel\":");
+    try writer.writeAll(if (readyIdsHaveDisjointLocks(state, ready_ids)) "true" else "false");
+    try writer.writeAll("}]}");
+}
+
+fn writeGraphInsightsMarkdown(allocator: std.mem.Allocator, writer: anytype, state: *const ItemState) !void {
+    const ready_ids = try readyItemIds(allocator, state);
+    try writer.writeAll("# st graph insights\n\n");
+    try writer.print("Items: {d}\nReady: {d}\nBlocked: {d}\nCritical path: {d}\nIntent: {d}/{d} covered\n\n", .{
+        state.items.items.len,
+        ready_ids.len,
+        countBlockedItems(state),
+        criticalPathLength(state),
+        countCoveredIntent(state),
+        state.graph.intent.len,
+    });
+    try writer.writeAll("## Ready\n\n");
+    if (ready_ids.len == 0) {
+        try writer.writeAll("- (none)\n");
+    } else {
+        for (ready_ids) |id| {
+            const item = state.getConst(id).?;
+            try writer.print("- {s}: {s}\n", .{ item.id, item.step });
+        }
+    }
+}
+
+fn writePolishStatusJson(writer: anytype, state: *const ItemState) !void {
+    try writer.writeAll("{\"version\":1,\"session_id\":");
+    try std.json.Stringify.value(state.graph.polish.session_id, .{}, writer);
+    try writer.writeAll(",\"passes\":");
+    try writer.print("{d}", .{state.graph.polish.passes.len});
+    try writer.writeAll(",\"fingerprints\":");
+    try writeGraphFingerprintsObject(writer, state.graph.fingerprints);
+    try writer.writeByte('}');
+}
+
+fn writePolishStatusMarkdown(writer: anytype, state: *const ItemState) !void {
+    try writer.writeAll("# st graph polish status\n\n");
+    try writer.print("Session: {s}\nPasses: {d}\n", .{ state.graph.polish.session_id, state.graph.polish.passes.len });
+    if (state.graph.polish.passes.len > 0) {
+        const last = state.graph.polish.passes[state.graph.polish.passes.len - 1];
+        try writer.print("Last pass: {d}\nStructure: {s}\nCoverage: {s}\n", .{ last.pass, last.structure_fingerprint, last.coverage_fingerprint });
+    }
+}
+
+fn readyItemIds(allocator: std.mem.Allocator, state: *const ItemState) ![]const []const u8 {
+    var out = std.ArrayList([]const u8).empty;
+    for (state.items.items) |item| {
+        if (item.status != .pending or !isExecutableItem(item)) continue;
+        var ready = true;
+        for (item.deps) |dep| {
+            const dep_item = state.getConst(dep.id) orelse {
+                ready = false;
+                break;
+            };
+            if (dep_item.status != .completed) {
+                ready = false;
+                break;
+            }
+        }
+        if (ready) try out.append(allocator, item.id);
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn blockedItemIds(allocator: std.mem.Allocator, state: *const ItemState) ![]const []const u8 {
+    var out = std.ArrayList([]const u8).empty;
+    for (state.items.items) |item| {
+        if (item.status == .blocked) {
+            try out.append(allocator, item.id);
+            continue;
+        }
+        for (item.deps) |dep| {
+            const dep_item = state.getConst(dep.id) orelse continue;
+            if (dep_item.status != .completed) {
+                try out.append(allocator, item.id);
+                break;
+            }
+        }
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn priorityWeight(priority: Priority) i64 {
+    return switch (priority) {
+        .high => 100,
+        .medium => 50,
+        .low => 10,
+    };
+}
+
+fn downstreamCount(state: *const ItemState, item_id: []const u8) i64 {
+    var count: i64 = 0;
+    for (state.items.items) |item| {
+        for (item.deps) |dep| {
+            if (std.mem.eql(u8, dep.id, item_id)) {
+                count += 1;
+                break;
+            }
+        }
+    }
+    return count;
+}
+
+fn criticalPathLength(state: *const ItemState) i64 {
+    var max_len: i64 = 0;
+    for (state.items.items) |item| {
+        const len = criticalPathFrom(state, item.id);
+        if (len > max_len) max_len = len;
+    }
+    return max_len;
+}
+
+fn criticalPathFrom(state: *const ItemState, item_id: []const u8) i64 {
+    var max_child: i64 = 0;
+    for (state.items.items) |item| {
+        for (item.deps) |dep| {
+            if (std.mem.eql(u8, dep.id, item_id)) {
+                const child_len = criticalPathFrom(state, item.id);
+                if (child_len > max_child) max_child = child_len;
+            }
+        }
+    }
+    return 1 + max_child;
+}
+
+fn countProofComplete(state: *const ItemState) usize {
+    var count: usize = 0;
+    for (state.items.items) |item| {
+        if (item.proof) |proof| {
+            if (proof.state == .pass) count += 1;
+        }
+    }
+    return count;
+}
+
+fn countItemsWithProofObligations(state: *const ItemState) usize {
+    var count: usize = 0;
+    for (state.items.items) |item| {
+        if (itemHasProofObligations(item)) count += 1;
+    }
+    return count;
+}
+
+fn readyIdsHaveDisjointLocks(state: *const ItemState, ready_ids: []const []const u8) bool {
+    for (ready_ids, 0..) |lhs_id, i| {
+        const lhs = state.getConst(lhs_id) orelse continue;
+        const lhs_roots = if (lhs.lock_roots.len > 0) lhs.lock_roots else lhs.location;
+        if (lhs_roots.len == 0) return false;
+        for (ready_ids[i + 1 ..]) |rhs_id| {
+            const rhs = state.getConst(rhs_id) orelse continue;
+            const rhs_roots = if (rhs.lock_roots.len > 0) rhs.lock_roots else rhs.location;
+            if (rhs_roots.len == 0) return false;
+            if (rootsOverlapAny(lhs_roots, rhs_roots)) return false;
+        }
+    }
+    return true;
+}
+
+fn selectApertureIds(allocator: std.mem.Allocator, state: *const ItemState, limit: usize) ![]const []const u8 {
+    const candidates = try apertureCandidates(allocator, state, limit);
+    var out = std.ArrayList([]const u8).empty;
+    for (candidates) |candidate| try out.append(allocator, candidate.id);
+    return try out.toOwnedSlice(allocator);
+}
+
+fn apertureCandidates(allocator: std.mem.Allocator, state: *const ItemState, limit: usize) ![]const ApertureCandidate {
+    const audit = try auditGraph(allocator, state, .implementation_ready);
+    var out = std.ArrayList(ApertureCandidate).empty;
+    for (state.items.items, 0..) |item, idx| {
+        if (!try apertureEligibleItem(allocator, state, item, audit)) continue;
+        try out.append(allocator, .{ .id = item.id, .score = apertureScore(state, item), .durable_index = idx });
+    }
+    const slice = try out.toOwnedSlice(allocator);
+    std.mem.sort(ApertureCandidate, slice, state, apertureCandidateLess);
+    return slice[0..@min(limit, slice.len)];
+}
+
+fn apertureCandidateLess(state: *const ItemState, lhs: ApertureCandidate, rhs: ApertureCandidate) bool {
+    _ = state;
+    if (lhs.score != rhs.score) return lhs.score > rhs.score;
+    if (lhs.durable_index != rhs.durable_index) return lhs.durable_index < rhs.durable_index;
+    return std.mem.lessThan(u8, lhs.id, rhs.id);
+}
+
+fn apertureEligibleItem(allocator: std.mem.Allocator, state: *const ItemState, item: Item, audit: AuditResult) !bool {
+    if (item.status != .pending) return false;
+    if (!isExecutableItem(item)) return false;
+    if (item.claim) |claim| {
+        if (claim.state == .held or claim.state == .stale) return false;
+    }
+    const waiting = try unresolvedDependencyIds(allocator, item, state);
+    if (waiting.len > 0) return false;
+    for (audit.findings) |finding| {
+        if (finding.waived or finding.severity != .@"error") continue;
+        if (std.mem.eql(u8, finding.target, item.id)) return false;
+    }
+    return true;
+}
+
+fn apertureScore(state: *const ItemState, item: Item) i64 {
+    var score: i64 = priorityWeight(item.priority);
+    score += 4 * criticalPathFrom(state, item.id);
+    score += 3 * downstreamCount(state, item.id);
+    score += 2 * downstreamCount(state, item.id);
+    if (itemHasProofObligations(item) or item.validation.len > 0) score += 2;
+    if (item.lock_roots.len > 0 or item.location.len > 0) score += 1 else score -= 2;
+    score += @intCast(item.intent_refs.len);
+    score -= 3 * @as(i64, @intCast(item.uncertainty.len));
+    if (item.claim) |claim| {
+        if (claim.state == .stale) score -= 4;
+    }
+    if (item.contract) |contract| {
+        if (contract.risks.len > 0 and item.validation.len == 0 and !itemHasProofObligations(item)) score -= 5;
+    }
+    return score;
+}
+
+fn writeApertureCandidateJson(writer: anytype, state: *const ItemState, candidate: ApertureCandidate) !void {
+    const item = state.getConst(candidate.id).?;
+    try writer.writeByte('{');
+    try writer.writeAll("\"version\":1,\"id\":");
+    try std.json.Stringify.value(item.id, .{}, writer);
+    try writer.writeAll(",\"step\":");
+    try std.json.Stringify.value(item.step, .{}, writer);
+    try writer.writeAll(",\"priority\":");
+    try std.json.Stringify.value(item.priority.asString(), .{}, writer);
+    try writer.writeAll(",\"item_type\":");
+    try std.json.Stringify.value(item.item_type.asString(), .{}, writer);
+    try writer.writeAll(",\"score\":");
+    try writer.print("{d}", .{candidate.score});
+    try writer.writeAll(",\"rationale\":[\"ready: all dependencies completed\",\"");
+    try writer.writeAll(item.priority.asString());
+    try writer.writeAll(" priority\"],\"validation\":");
+    try writeStringListArray(writer, item.validation);
+    try writer.writeAll(",\"location\":");
+    try writeStringListArray(writer, item.location);
+    try writer.writeAll(",\"lock_roots\":");
+    try writeStringListArray(writer, if (item.lock_roots.len > 0) item.lock_roots else item.location);
+    try writer.writeByte('}');
+}
+
+fn writeAperturePlanJson(writer: anytype, state: *const ItemState, selected: []const ApertureCandidate, limit: usize, strategy: []const u8) !void {
+    try writer.writeByte('{');
+    try writer.writeAll("\"version\":1,\"strategy\":");
+    try std.json.Stringify.value(strategy, .{}, writer);
+    try writer.writeAll(",\"limit\":");
+    try writer.print("{d}", .{limit});
+    try writer.writeAll(",\"selected\":[");
+    for (selected, 0..) |candidate, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        const item = state.getConst(candidate.id).?;
+        try writer.writeAll("{\"id\":");
+        try std.json.Stringify.value(item.id, .{}, writer);
+        try writer.writeAll(",\"step\":");
+        try std.json.Stringify.value(item.step, .{}, writer);
+        try writer.writeAll(",\"score\":");
+        try writer.print("{d}", .{candidate.score});
+        try writer.writeAll(",\"rationale\":[\"ready\",\"ranked by aperture-score\"],\"lock_roots\":");
+        try writeStringListArray(writer, if (item.lock_roots.len > 0) item.lock_roots else item.location);
+        try writer.writeAll(",\"proof_obligations\":");
+        try writeProofObligationCommands(writer, item);
+        try writer.writeByte('}');
+    }
+    try writer.writeAll("],\"context\":[],\"waves\":[{\"id\":\"w1\",\"safe_parallel\":");
+    var ids = std.ArrayList([]const u8).empty;
+    for (selected) |candidate| try ids.append(state.allocator, candidate.id);
+    try writer.writeAll(if (readyIdsHaveDisjointLocks(state, ids.items)) "true" else "false");
+    try writer.writeAll(",\"items\":");
+    try writeStringListArray(writer, ids.items);
+    try writer.writeAll("}],\"warnings\":[]}");
+}
+
+fn writeProofObligationCommands(writer: anytype, item: *const Item) !void {
+    try writer.writeByte('[');
+    if (item.contract) |contract| {
+        var emitted: usize = 0;
+        for (contract.proof_obligations) |obligation| {
+            if (obligation.command.len == 0) continue;
+            if (emitted > 0) try writer.writeByte(',');
+            try std.json.Stringify.value(obligation.command, .{}, writer);
+            emitted += 1;
+        }
+    }
+    try writer.writeByte(']');
+}
+
+fn writeApertureMarkdown(writer: anytype, state: *const ItemState, selected: []const ApertureCandidate) !void {
+    try writer.writeAll("# st aperture\n\n");
+    if (selected.len == 0) {
+        try writer.writeAll("- (no eligible work)\n");
+        return;
+    }
+    for (selected) |candidate| {
+        const item = state.getConst(candidate.id).?;
+        try writer.print("- {s} ({d}): {s}\n", .{ item.id, candidate.score, item.step });
+    }
 }
 
 fn cmdImportOrchplan(allocator: std.mem.Allocator, args: Args) !u8 {
@@ -2533,6 +4617,93 @@ fn cmdSetProof(allocator: std.mem.Allocator, args: Args) !u8 {
     try stdout.print("updated proof for {s} -> {s}\n", .{ item_id, proof.state.asString() });
     try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, loaded.latest_seq + 1);
     return 0;
+}
+
+fn cmdComplete(allocator: std.mem.Allocator, args: Args) !u8 {
+    const loaded = try loadValidatedState(allocator, args.file, args.allow_multiple_in_progress);
+    var state = loaded.state;
+    defer state.deinit();
+
+    const item_id = try requireNonEmptyString(allocator, args.id.?, "--id");
+    const item = state.get(item_id) orelse return error.UnknownItemId;
+    if (state.graph_active and state.graph.policy.completion_requires_proof and isExecutableItem(item.*)) {
+        if (!args.allow_unproven) {
+            var proof = item.proof orelse ProofMeta{};
+            proof.state = .pass;
+            proof.command = try requireNonEmptyString(allocator, args.step orelse return error.MissingValue, "--command");
+            proof.evidence_ref = if (args.evidence_ref) |raw|
+                try requireNonEmptyString(allocator, raw, "--evidence-ref")
+            else
+                "";
+            proof.last_run_at = try nowUtcAlloc(allocator);
+            item.proof = proof;
+        }
+        if (proofCompletionMissingReason(item.*)) |missing| {
+            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+            const stdout = &stdout_writer.interface;
+            if (!args.allow_unproven) {
+                try stdout.print("completion blocked for {s}: {s}\n", .{ item_id, missing });
+                return 2;
+            }
+            const waiver_reason = try requireNonEmptyString(allocator, args.reason orelse return error.MissingReason, "--reason");
+            const now = try nowUtcAlloc(allocator);
+            try addForcedCompletionWaivers(allocator, &state, item_id, waiver_reason, now);
+        }
+    }
+    item.status = .completed;
+    normalizeItemPlanMembership(item);
+
+    try validateState(&state, args.allow_multiple_in_progress);
+    const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
+    const ts = try nowUtcAlloc(allocator);
+    try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, ts, meta, null);
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.print("completed {s}\n", .{item_id});
+    try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, loaded.latest_seq + 1);
+    return 0;
+}
+
+fn cmdProof(allocator: std.mem.Allocator, args: Args) !u8 {
+    return switch (args.proof_command) {
+        .audit => try cmdProofAudit(allocator, args),
+        .none => error.MissingCommand,
+    };
+}
+
+fn cmdProofAudit(allocator: std.mem.Allocator, args: Args) !u8 {
+    const loaded = try loadValidatedState(allocator, args.file, args.allow_multiple_in_progress);
+    var state = loaded.state;
+    defer state.deinit();
+
+    const item_id = try requireNonEmptyString(allocator, args.id.?, "--id");
+    const item = state.getConst(item_id) orelse return error.UnknownItemId;
+    const missing = proofCompletionMissingReason(item.*);
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    switch (args.format) {
+        .json => {
+            try stdout.writeAll("{\"version\":1,\"id\":");
+            try std.json.Stringify.value(item.id, .{}, stdout);
+            try stdout.writeAll(",\"ok\":");
+            try stdout.writeAll(if (missing == null) "true" else "false");
+            try stdout.writeAll(",\"missing\":");
+            if (missing) |reason| try std.json.Stringify.value(reason, .{}, stdout) else try stdout.writeAll("null");
+            try stdout.writeAll(",\"proof\":");
+            if (item.proof) |proof| try writeProofMetaObject(stdout, proof) else try stdout.writeAll("null");
+            try stdout.writeAll(",\"required_obligations\":");
+            try writeProofObligationsArray(stdout, proofObligationsForItem(item.*));
+            try stdout.writeAll("}\n");
+        },
+        .markdown, .text, .table => {
+            try stdout.print("# st proof audit: {s}\n\n", .{item.id});
+            try stdout.print("Status: {s}\n", .{if (missing == null) "PASS" else "FAIL"});
+            if (missing) |reason| try stdout.print("Missing: {s}\n", .{reason});
+        },
+        .plan_sync => return error.InvalidFormat,
+    }
+    return if (missing == null) 0 else 2;
 }
 
 fn cmdRelease(allocator: std.mem.Allocator, args: Args) !u8 {
@@ -3608,14 +5779,21 @@ fn materializeStateFromRecords(allocator: std.mem.Allocator, records: []const st
         const version = intField(record, "v") orelse return error.UnsupportedSchemaVersion;
 
         if (version == 2) {
-            try applyEventOp(allocator, &state, record, source_index);
+            try applyEventOp(allocator, &state, record, source_index, version);
             continue;
         }
-        if (version != 3) return error.UnsupportedSchemaVersion;
+        if (version != SchemaVersion and version != GraphSchemaVersion) return error.UnsupportedSchemaVersion;
 
         const lane = normalizedLane(record) orelse return error.InvalidLane;
         if (std.mem.eql(u8, lane, "checkpoint")) {
             state.clear();
+            if (version == GraphSchemaVersion) {
+                state.graph = try canonicalGraphEnvelope(allocator, objectField(record, "graph") orelse .{ .object = .empty });
+                state.graph_active = true;
+            } else {
+                state.graph = .{};
+                state.graph_active = false;
+            }
             const items_value = objectField(record, "items") orelse return error.InvalidCheckpoint;
             const arr = switch (items_value) {
                 .array => |a| a.items,
@@ -3628,7 +5806,7 @@ fn materializeStateFromRecords(allocator: std.mem.Allocator, records: []const st
             continue;
         }
 
-        try applyEventOp(allocator, &state, record, source_index);
+        try applyEventOp(allocator, &state, record, source_index, version);
     }
 
     normalizeStatePlanMembership(&state);
@@ -3636,7 +5814,7 @@ fn materializeStateFromRecords(allocator: std.mem.Allocator, records: []const st
     return state;
 }
 
-fn applyEventOp(allocator: std.mem.Allocator, state: *ItemState, record: std.json.Value, source_index: i64) !void {
+fn applyEventOp(allocator: std.mem.Allocator, state: *ItemState, record: std.json.Value, source_index: i64, version: i64) !void {
     _ = source_index;
     const op = normalizedOp(record) orelse return error.InvalidOp;
 
@@ -3649,6 +5827,10 @@ fn applyEventOp(allocator: std.mem.Allocator, state: *ItemState, record: std.jso
             else => return error.ReplaceMissingItems,
         };
         state.clear();
+        if (version == GraphSchemaVersion) {
+            state.graph = try canonicalGraphEnvelope(allocator, objectField(record, "graph") orelse .{ .object = .empty });
+            state.graph_active = true;
+        }
         for (arr) |raw_item| {
             const item = try canonicalItem(allocator, raw_item);
             try state.upsert(item);
@@ -3737,9 +5919,9 @@ fn writeCanonicalRecords(
     var out: std.Io.Writer.Allocating = .init(state.allocator);
     defer out.deinit();
 
-    try writeEventRecord(&out.writer, seq, ts, state.items.items, mutation, repair);
+    try writeEventRecord(&out.writer, seq, ts, state.items.items, mutation, repair, if (state.graph_active) state.graph else null);
     try out.writer.writeByte('\n');
-    try writeCheckpointRecord(&out.writer, seq, ts, state.items.items, mutation, repair);
+    try writeCheckpointRecord(&out.writer, seq, ts, state.items.items, mutation, repair, if (state.graph_active) state.graph else null);
     try out.writer.writeByte('\n');
 
     const payload = try out.toOwnedSlice();
@@ -3767,9 +5949,12 @@ fn writeEventRecord(
     items: []const Item,
     mutation: MutationMeta,
     repair: ?RepairMeta,
+    graph: ?GraphEnvelope,
 ) !void {
     try writer.writeByte('{');
-    try writer.writeAll("\"v\":3,");
+    try writer.writeAll("\"v\":");
+    try writer.print("{d}", .{if (graph != null) GraphSchemaVersion else SchemaVersion});
+    try writer.writeByte(',');
     try writer.writeAll("\"ts\":");
     try std.json.Stringify.value(ts, .{}, writer);
     try writer.writeAll(",\"lane\":\"event\"");
@@ -3777,6 +5962,10 @@ fn writeEventRecord(
     try writer.print("{d}", .{seq});
     try writer.writeAll(",\"op\":\"replace\",\"items\":");
     try writeItemsArray(writer, items);
+    if (graph) |envelope| {
+        try writer.writeAll(",\"graph\":");
+        try writeGraphEnvelopeObject(writer, envelope);
+    }
     if (repair) |repair_meta| {
         try writer.writeAll(",\"repair\":{\"op\":");
         try std.json.Stringify.value(repair_meta.op, .{}, writer);
@@ -3794,9 +5983,12 @@ fn writeCheckpointRecord(
     items: []const Item,
     mutation: MutationMeta,
     repair: ?RepairMeta,
+    graph: ?GraphEnvelope,
 ) !void {
     try writer.writeByte('{');
-    try writer.writeAll("\"v\":3,");
+    try writer.writeAll("\"v\":");
+    try writer.print("{d}", .{if (graph != null) GraphSchemaVersion else SchemaVersion});
+    try writer.writeByte(',');
     try writer.writeAll("\"ts\":");
     try std.json.Stringify.value(ts, .{}, writer);
     try writer.writeAll(",\"lane\":\"checkpoint\"");
@@ -3804,6 +5996,10 @@ fn writeCheckpointRecord(
     try writer.print("{d}", .{seq});
     try writer.writeAll(",\"items\":");
     try writeItemsArray(writer, items);
+    if (graph) |envelope| {
+        try writer.writeAll(",\"graph\":");
+        try writeGraphEnvelopeObject(writer, envelope);
+    }
     if (repair) |repair_meta| {
         try writer.writeAll(",\"repair\":{\"op\":");
         try std.json.Stringify.value(repair_meta.op, .{}, writer);
@@ -3897,6 +6093,65 @@ fn writeStringListArray(writer: anytype, values: []const []const u8) !void {
     try writer.writeByte(']');
 }
 
+fn writeGraphLinksArray(writer: anytype, links: []const GraphLink) !void {
+    try writer.writeByte('[');
+    for (links, 0..) |link, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writer.writeByte('{');
+        try writer.writeAll("\"id\":");
+        try std.json.Stringify.value(link.id, .{}, writer);
+        try writer.writeAll(",\"type\":");
+        try std.json.Stringify.value(link.type, .{}, writer);
+        if (link.reason.len > 0) {
+            try writer.writeAll(",\"reason\":");
+            try std.json.Stringify.value(link.reason, .{}, writer);
+        }
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
+}
+
+fn writeProofObligationsArray(writer: anytype, obligations: []const ProofObligation) !void {
+    try writer.writeByte('[');
+    for (obligations, 0..) |obligation, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writer.writeByte('{');
+        try writer.writeAll("\"id\":");
+        try std.json.Stringify.value(obligation.id, .{}, writer);
+        try writer.writeAll(",\"kind\":");
+        try std.json.Stringify.value(obligation.kind, .{}, writer);
+        if (obligation.command.len > 0) {
+            try writer.writeAll(",\"command\":");
+            try std.json.Stringify.value(obligation.command, .{}, writer);
+        }
+        if (obligation.evidence_ref.len > 0) {
+            try writer.writeAll(",\"evidence_ref\":");
+            try std.json.Stringify.value(obligation.evidence_ref, .{}, writer);
+        }
+        try writer.writeAll(",\"required\":");
+        try writer.writeAll(if (obligation.required) "true" else "false");
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
+}
+
+fn writeContractObject(writer: anytype, contract: Contract) !void {
+    try writer.writeByte('{');
+    try writer.writeAll("\"objective\":");
+    try std.json.Stringify.value(contract.objective, .{}, writer);
+    try writer.writeAll(",\"background\":");
+    try std.json.Stringify.value(contract.background, .{}, writer);
+    try writer.writeAll(",\"implementation_approach\":");
+    try std.json.Stringify.value(contract.implementation_approach, .{}, writer);
+    try writer.writeAll(",\"success_criteria\":");
+    try writeStringListArray(writer, contract.success_criteria);
+    try writer.writeAll(",\"proof_obligations\":");
+    try writeProofObligationsArray(writer, contract.proof_obligations);
+    try writer.writeAll(",\"risks\":");
+    try writeStringListArray(writer, contract.risks);
+    try writer.writeByte('}');
+}
+
 fn writeOptionalItemMetadata(writer: anytype, item: Item) !void {
     if (item.related_to.len > 0) {
         try writer.writeAll(",\"related_to\":");
@@ -3937,6 +6192,46 @@ fn writeOptionalItemMetadata(writer: anytype, item: Item) !void {
     if (item.proof) |proof| {
         try writer.writeAll(",\"proof\":");
         try writeProofMetaObject(writer, proof);
+    }
+    if (item.item_type != .task) {
+        try writer.writeAll(",\"item_type\":");
+        try std.json.Stringify.value(item.item_type.asString(), .{}, writer);
+    }
+    if (item.parent_id) |parent_id| {
+        try writer.writeAll(",\"parent_id\":");
+        try std.json.Stringify.value(parent_id, .{}, writer);
+    }
+    if (item.links.len > 0) {
+        try writer.writeAll(",\"links\":");
+        try writeGraphLinksArray(writer, item.links);
+    }
+    if (item.intent_refs.len > 0) {
+        try writer.writeAll(",\"intent_refs\":");
+        try writeStringListArray(writer, item.intent_refs);
+    }
+    if (item.acceptance.len > 0) {
+        try writer.writeAll(",\"acceptance\":");
+        try writeStringListArray(writer, item.acceptance);
+    }
+    if (item.contract) |contract| {
+        try writer.writeAll(",\"contract\":");
+        try writeContractObject(writer, contract);
+    }
+    if (item.labels.len > 0) {
+        try writer.writeAll(",\"labels\":");
+        try writeStringListArray(writer, item.labels);
+    }
+    if (item.lock_roots.len > 0) {
+        try writer.writeAll(",\"lock_roots\":");
+        try writeStringListArray(writer, item.lock_roots);
+    }
+    if (item.uncertainty.len > 0) {
+        try writer.writeAll(",\"uncertainty\":");
+        try writeStringListArray(writer, item.uncertainty);
+    }
+    if (item.non_goals.len > 0) {
+        try writer.writeAll(",\"non_goals\":");
+        try writeStringListArray(writer, item.non_goals);
     }
 }
 
@@ -4042,8 +6337,186 @@ fn writeProofMetaObject(writer: anytype, proof: ProofMeta) !void {
     try writer.writeByte('}');
 }
 
+fn writeGraphEnvelopeObject(writer: anytype, graph: GraphEnvelope) !void {
+    try writer.writeByte('{');
+    try writer.writeAll("\"version\":");
+    try writer.print("{d}", .{graph.version});
+    try writer.writeAll(",\"policy\":");
+    try writeGraphPolicyObject(writer, graph.policy);
+    try writer.writeAll(",\"intent\":");
+    try writeIntentArray(writer, graph.intent);
+    try writer.writeAll(",\"waivers\":");
+    try writeWaiversArray(writer, graph.waivers);
+    try writer.writeAll(",\"polish\":");
+    try writePolishStateObject(writer, graph.polish);
+    try writer.writeAll(",\"fingerprints\":");
+    try writeGraphFingerprintsObject(writer, graph.fingerprints);
+    try writer.writeByte('}');
+}
+
+fn writeGraphPolicyObject(writer: anytype, policy: GraphPolicy) !void {
+    try writer.writeByte('{');
+    try writer.writeAll("\"completion_requires_proof\":");
+    try writer.writeAll(if (policy.completion_requires_proof) "true" else "false");
+    try writer.writeAll(",\"implementation_ready_required\":");
+    try writer.writeAll(if (policy.implementation_ready_required) "true" else "false");
+    try writer.writeAll(",\"default_projection_strategy\":");
+    try std.json.Stringify.value(policy.default_projection_strategy, .{}, writer);
+    try writer.writeAll(",\"default_gate\":");
+    try std.json.Stringify.value(policy.default_gate, .{}, writer);
+    try writer.writeAll(",\"max_aperture_items\":");
+    try writer.print("{d}", .{policy.max_aperture_items});
+    try writer.writeByte('}');
+}
+
+fn writeIntentSourceObject(writer: anytype, source: IntentSource) !void {
+    try writer.writeByte('{');
+    try writer.writeAll("\"kind\":");
+    try std.json.Stringify.value(source.kind, .{}, writer);
+    if (source.locator.len > 0) {
+        try writer.writeAll(",\"locator\":");
+        try std.json.Stringify.value(source.locator, .{}, writer);
+    }
+    if (source.anchor.len > 0) {
+        try writer.writeAll(",\"anchor\":");
+        try std.json.Stringify.value(source.anchor, .{}, writer);
+    }
+    try writer.writeByte('}');
+}
+
+fn writeIntentArray(writer: anytype, intent: []const IntentAtom) !void {
+    try writer.writeByte('[');
+    for (intent, 0..) |atom, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writer.writeByte('{');
+        try writer.writeAll("\"id\":");
+        try std.json.Stringify.value(atom.id, .{}, writer);
+        if (atom.source) |source| {
+            try writer.writeAll(",\"source\":");
+            try writeIntentSourceObject(writer, source);
+        }
+        try writer.writeAll(",\"text\":");
+        try std.json.Stringify.value(atom.text, .{}, writer);
+        try writer.writeAll(",\"category\":");
+        try std.json.Stringify.value(atom.category, .{}, writer);
+        try writer.writeAll(",\"disposition\":");
+        try std.json.Stringify.value(atom.disposition, .{}, writer);
+        if (atom.reason.len > 0) {
+            try writer.writeAll(",\"reason\":");
+            try std.json.Stringify.value(atom.reason, .{}, writer);
+        }
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
+}
+
+fn writeWaiversArray(writer: anytype, waivers: []const Waiver) !void {
+    try writer.writeByte('[');
+    for (waivers, 0..) |waiver, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writer.writeByte('{');
+        try writer.writeAll("\"id\":");
+        try std.json.Stringify.value(waiver.id, .{}, writer);
+        try writer.writeAll(",\"gate\":");
+        try std.json.Stringify.value(waiver.gate, .{}, writer);
+        try writer.writeAll(",\"code\":");
+        try std.json.Stringify.value(waiver.code, .{}, writer);
+        try writer.writeAll(",\"target\":");
+        try std.json.Stringify.value(waiver.target, .{}, writer);
+        try writer.writeAll(",\"reason\":");
+        try std.json.Stringify.value(waiver.reason, .{}, writer);
+        try writer.writeAll(",\"expires\":");
+        try std.json.Stringify.value(waiver.expires, .{}, writer);
+        if (waiver.created_at.len > 0) {
+            try writer.writeAll(",\"created_at\":");
+            try std.json.Stringify.value(waiver.created_at, .{}, writer);
+        }
+        if (waiver.created_by.len > 0) {
+            try writer.writeAll(",\"created_by\":");
+            try std.json.Stringify.value(waiver.created_by, .{}, writer);
+        }
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
+}
+
+fn writePolishStateObject(writer: anytype, polish: PolishState) !void {
+    try writer.writeByte('{');
+    try writer.writeAll("\"session_id\":");
+    try std.json.Stringify.value(polish.session_id, .{}, writer);
+    try writer.writeAll(",\"passes\":[");
+    for (polish.passes, 0..) |pass, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writePolishPassObject(writer, pass);
+    }
+    try writer.writeAll("]}");
+}
+
+fn writePolishPassObject(writer: anytype, pass: PolishPass) !void {
+    try writer.writeByte('{');
+    try writer.writeAll("\"pass\":");
+    try writer.print("{d}", .{pass.pass});
+    try writer.writeAll(",\"seq\":");
+    try writer.print("{d}", .{pass.seq});
+    try writer.writeAll(",\"created_at\":");
+    try std.json.Stringify.value(pass.created_at, .{}, writer);
+    try writer.writeAll(",\"structure_fingerprint\":");
+    try std.json.Stringify.value(pass.structure_fingerprint, .{}, writer);
+    try writer.writeAll(",\"contract_fingerprint\":");
+    try std.json.Stringify.value(pass.contract_fingerprint, .{}, writer);
+    try writer.writeAll(",\"coverage_fingerprint\":");
+    try std.json.Stringify.value(pass.coverage_fingerprint, .{}, writer);
+    try writer.writeAll(",\"execution_fingerprint\":");
+    try std.json.Stringify.value(pass.execution_fingerprint, .{}, writer);
+    try writer.writeAll(",\"audit_gate\":");
+    try std.json.Stringify.value(pass.audit_gate, .{}, writer);
+    try writer.writeAll(",\"hard_failures\":");
+    try writer.print("{d}", .{pass.hard_failures});
+    try writer.writeAll(",\"warnings\":");
+    try writer.print("{d}", .{pass.warnings});
+    try writer.writeAll(",\"delta\":");
+    try writePolishDeltaObject(writer, pass.delta);
+    try writer.writeByte('}');
+}
+
+fn writePolishDeltaObject(writer: anytype, delta: PolishDelta) !void {
+    try writer.writeByte('{');
+    try writer.writeAll("\"items_added\":");
+    try writer.print("{d}", .{delta.items_added});
+    try writer.writeAll(",\"items_removed\":");
+    try writer.print("{d}", .{delta.items_removed});
+    try writer.writeAll(",\"items_split\":");
+    try writer.print("{d}", .{delta.items_split});
+    try writer.writeAll(",\"deps_changed\":");
+    try writer.print("{d}", .{delta.deps_changed});
+    try writer.writeAll(",\"contracts_changed\":");
+    try writer.print("{d}", .{delta.contracts_changed});
+    try writer.writeAll(",\"intent_coverage_changed\":");
+    try writer.print("{d}", .{delta.intent_coverage_changed});
+    try writer.writeByte('}');
+}
+
+fn writeGraphFingerprintsObject(writer: anytype, fingerprints: GraphFingerprints) !void {
+    try writer.writeByte('{');
+    try writer.writeAll("\"structure\":");
+    try std.json.Stringify.value(fingerprints.structure, .{}, writer);
+    try writer.writeAll(",\"contract\":");
+    try std.json.Stringify.value(fingerprints.contract, .{}, writer);
+    try writer.writeAll(",\"coverage\":");
+    try std.json.Stringify.value(fingerprints.coverage, .{}, writer);
+    try writer.writeAll(",\"execution\":");
+    try std.json.Stringify.value(fingerprints.execution, .{}, writer);
+    try writer.writeByte('}');
+}
+
 fn writeSnapshotJson(writer: anytype, state: *const ItemState) !void {
-    try writer.writeAll("{\"items\":");
+    try writer.writeByte('{');
+    if (state.graph_active) {
+        try writer.writeAll("\"graph\":");
+        try writeGraphEnvelopeObject(writer, state.graph);
+        try writer.writeByte(',');
+    }
+    try writer.writeAll("\"items\":");
     try writeItemsArray(writer, state.items.items);
     try writer.writeByte('}');
 }
@@ -4062,7 +6535,7 @@ fn renderShow(
         .markdown => try renderShowMarkdown(allocator, writer, filtered, surface),
         .table => try renderTable(writer, filtered),
         .json => {
-            try writeEnrichedItemsJson(writer, filtered);
+            try writeShowJson(writer, state, filtered);
             try writer.writeByte('\n');
         },
         .plan_sync, .text => return error.InvalidFormat,
@@ -4338,6 +6811,21 @@ fn writeWaitingOnArray(writer: anytype, waiting_on: []const []const u8) !void {
 
 fn writeEnrichedItemsJson(writer: anytype, rows: []const EnrichedItem) !void {
     try writer.writeAll("{\"items\":[");
+    for (rows, 0..) |row, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writeEnrichedItemObject(writer, row);
+    }
+    try writer.writeAll("]}");
+}
+
+fn writeShowJson(writer: anytype, state: *const ItemState, rows: []const EnrichedItem) !void {
+    try writer.writeByte('{');
+    if (state.graph_active) {
+        try writer.writeAll("\"graph\":");
+        try writeGraphEnvelopeObject(writer, state.graph);
+        try writer.writeByte(',');
+    }
+    try writer.writeAll("\"items\":[");
     for (rows, 0..) |row, idx| {
         if (idx > 0) try writer.writeByte(',');
         try writeEnrichedItemObject(writer, row);
@@ -5029,10 +7517,20 @@ fn itemsEqual(lhs: Item, rhs: Item) bool {
         sourceMetaEqual(lhs.source, rhs.source) and
         claimMetaEqual(lhs.claim, rhs.claim) and
         runtimeMetaEqual(lhs.runtime, rhs.runtime) and
-        proofMetaEqual(lhs.proof, rhs.proof);
+        proofMetaEqual(lhs.proof, rhs.proof) and
+        lhs.item_type == rhs.item_type and
+        optionalStringEqual(lhs.parent_id, rhs.parent_id) and
+        graphLinksEqual(lhs.links, rhs.links) and
+        stringListsEqual(lhs.intent_refs, rhs.intent_refs) and
+        stringListsEqual(lhs.acceptance, rhs.acceptance) and
+        contractEqual(lhs.contract, rhs.contract) and
+        stringListsEqual(lhs.labels, rhs.labels) and
+        stringListsEqual(lhs.lock_roots, rhs.lock_roots) and
+        stringListsEqual(lhs.uncertainty, rhs.uncertainty) and
+        stringListsEqual(lhs.non_goals, rhs.non_goals);
 }
 
-fn depsEqual(lhs: []Dep, rhs: []Dep) bool {
+fn depsEqual(lhs: []const Dep, rhs: []const Dep) bool {
     if (lhs.len != rhs.len) return false;
     for (lhs, rhs) |left, right| {
         if (!std.mem.eql(u8, left.id, right.id) or !std.mem.eql(u8, left.type, right.type)) return false;
@@ -5054,6 +7552,45 @@ fn stringListsEqual(lhs: []const []const u8, rhs: []const []const u8) bool {
         if (!std.mem.eql(u8, left, right)) return false;
     }
     return true;
+}
+
+fn optionalStringEqual(lhs: ?[]const u8, rhs: ?[]const u8) bool {
+    if (lhs == null and rhs == null) return true;
+    if (lhs == null or rhs == null) return false;
+    return std.mem.eql(u8, lhs.?, rhs.?);
+}
+
+fn graphLinksEqual(lhs: []const GraphLink, rhs: []const GraphLink) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        if (!std.mem.eql(u8, left.id, right.id) or
+            !std.mem.eql(u8, left.type, right.type) or
+            !std.mem.eql(u8, left.reason, right.reason)) return false;
+    }
+    return true;
+}
+
+fn proofObligationsEqual(lhs: []const ProofObligation, rhs: []const ProofObligation) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        if (!std.mem.eql(u8, left.id, right.id) or
+            !std.mem.eql(u8, left.kind, right.kind) or
+            !std.mem.eql(u8, left.command, right.command) or
+            !std.mem.eql(u8, left.evidence_ref, right.evidence_ref) or
+            left.required != right.required) return false;
+    }
+    return true;
+}
+
+fn contractEqual(lhs: ?Contract, rhs: ?Contract) bool {
+    if (lhs == null and rhs == null) return true;
+    if (lhs == null or rhs == null) return false;
+    return std.mem.eql(u8, lhs.?.objective, rhs.?.objective) and
+        std.mem.eql(u8, lhs.?.background, rhs.?.background) and
+        std.mem.eql(u8, lhs.?.implementation_approach, rhs.?.implementation_approach) and
+        stringListsEqual(lhs.?.success_criteria, rhs.?.success_criteria) and
+        proofObligationsEqual(lhs.?.proof_obligations, rhs.?.proof_obligations) and
+        stringListsEqual(lhs.?.risks, rhs.?.risks);
 }
 
 fn sourceMetaEqual(lhs: ?SourceMeta, rhs: ?SourceMeta) bool {
@@ -5256,6 +7793,26 @@ fn parseIdSuffix(id: []const u8) ?u32 {
     return std.fmt.parseInt(u32, id[3..], 10) catch null;
 }
 
+const SnapshotPlan = struct {
+    items: []Item,
+    graph: GraphEnvelope = .{},
+    graph_active: bool = false,
+};
+
+fn parseSnapshotPlan(allocator: std.mem.Allocator, value: std.json.Value) !SnapshotPlan {
+    const items = try parseSnapshotItems(allocator, value);
+    if (value == .object) {
+        if (value.object.get("graph")) |graph_value| {
+            return .{
+                .items = items,
+                .graph = try canonicalGraphEnvelope(allocator, graph_value),
+                .graph_active = true,
+            };
+        }
+    }
+    return .{ .items = items };
+}
+
 fn parseSnapshotItems(allocator: std.mem.Allocator, value: std.json.Value) ![]Item {
     var arr_values: []const std.json.Value = undefined;
     switch (value) {
@@ -5306,8 +7863,7 @@ fn canonicalItem(allocator: std.mem.Allocator, value: std.json.Value) !Item {
         else => return error.InvalidInPlan,
     } else true;
 
-    const deps_value = obj.get("deps") orelse return error.MissingDepsValue;
-    const deps = try normalizeDeps(allocator, deps_value);
+    const deps = if (obj.get("deps")) |v| try normalizeDeps(allocator, v) else &.{};
 
     const notes = if (obj.get("notes")) |v| switch (v) {
         .string => |s| s,
@@ -5334,6 +7890,16 @@ fn canonicalItem(allocator: std.mem.Allocator, value: std.json.Value) !Item {
     const claim = if (obj.get("claim")) |v| try canonicalClaimMeta(allocator, v) else null;
     const runtime = if (obj.get("runtime")) |v| try canonicalRuntimeMeta(allocator, v) else null;
     const proof = if (obj.get("proof")) |v| try canonicalProofMeta(allocator, v) else null;
+    const item_type = if (obj.get("item_type")) |v| try normalizeItemType(asString(v) orelse return error.InvalidItemType) else ItemType.task;
+    const parent_id = if (obj.get("parent_id")) |v| try optionalString(allocator, v, "parent_id") else null;
+    const links = if (obj.get("links")) |v| try normalizeGraphLinks(allocator, v) else &.{};
+    const intent_refs = if (obj.get("intent_refs")) |v| try normalizeStringList(allocator, v) else &.{};
+    const acceptance = if (obj.get("acceptance")) |v| try normalizeStringList(allocator, v) else &.{};
+    const contract = if (obj.get("contract")) |v| try canonicalContract(allocator, v) else null;
+    const labels = if (obj.get("labels")) |v| try normalizeStringList(allocator, v) else &.{};
+    const lock_roots = if (obj.get("lock_roots")) |v| try normalizeStringList(allocator, v) else &.{};
+    const uncertainty = if (obj.get("uncertainty")) |v| try normalizeStringList(allocator, v) else &.{};
+    const non_goals = if (obj.get("non_goals")) |v| try normalizeStringList(allocator, v) else &.{};
 
     var item = Item{
         .id = id,
@@ -5354,6 +7920,16 @@ fn canonicalItem(allocator: std.mem.Allocator, value: std.json.Value) !Item {
         .claim = claim,
         .runtime = runtime,
         .proof = proof,
+        .item_type = item_type,
+        .parent_id = parent_id,
+        .links = links,
+        .intent_refs = intent_refs,
+        .acceptance = acceptance,
+        .contract = contract,
+        .labels = labels,
+        .lock_roots = lock_roots,
+        .uncertainty = uncertainty,
+        .non_goals = non_goals,
     };
     normalizeItemPlanMembership(&item);
     return item;
@@ -5408,6 +7984,123 @@ fn normalizeStringList(allocator: std.mem.Allocator, value: std.json.Value) ![]c
         },
         else => error.InvalidItem,
     };
+}
+
+fn optionalString(allocator: std.mem.Allocator, value: std.json.Value, field_name: []const u8) !?[]const u8 {
+    return switch (value) {
+        .null => null,
+        .string => |s| blk: {
+            const trimmed = std.mem.trim(u8, s, " \t\r\n");
+            if (trimmed.len == 0) break :blk null;
+            break :blk try requireNonEmptyString(allocator, trimmed, field_name);
+        },
+        else => error.InvalidItem,
+    };
+}
+
+fn normalizeItemType(raw: []const u8) !ItemType {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "epic")) return .epic;
+    if (std.ascii.eqlIgnoreCase(trimmed, "feature")) return .feature;
+    if (std.ascii.eqlIgnoreCase(trimmed, "task")) return .task;
+    if (std.ascii.eqlIgnoreCase(trimmed, "bug")) return .bug;
+    if (std.ascii.eqlIgnoreCase(trimmed, "test")) return .@"test";
+    if (std.ascii.eqlIgnoreCase(trimmed, "verification")) return .verification;
+    if (std.ascii.eqlIgnoreCase(trimmed, "docs")) return .docs;
+    if (std.ascii.eqlIgnoreCase(trimmed, "chore")) return .chore;
+    if (std.ascii.eqlIgnoreCase(trimmed, "research")) return .research;
+    if (std.ascii.eqlIgnoreCase(trimmed, "spike")) return .spike;
+    if (std.ascii.eqlIgnoreCase(trimmed, "decision")) return .decision;
+    return error.InvalidItemType;
+}
+
+fn normalizeGraphLinks(allocator: std.mem.Allocator, value: std.json.Value) ![]const GraphLink {
+    return switch (value) {
+        .null => &.{},
+        .array => |arr| blk: {
+            var out = std.ArrayList(GraphLink).empty;
+            for (arr.items) |entry| {
+                try out.append(allocator, try canonicalGraphLink(allocator, entry));
+            }
+            if (out.items.len == 0) break :blk &.{};
+            break :blk try out.toOwnedSlice(allocator);
+        },
+        else => error.InvalidGraphLink,
+    };
+}
+
+fn canonicalGraphLink(allocator: std.mem.Allocator, value: std.json.Value) !GraphLink {
+    const obj = switch (value) {
+        .object => |o| o,
+        else => return error.InvalidGraphLink,
+    };
+    return .{
+        .id = try requireNonEmptyString(allocator, asString(obj.get("id") orelse return error.InvalidGraphLink) orelse return error.InvalidGraphLink, "link.id"),
+        .type = try requireNonEmptyString(allocator, asString(obj.get("type") orelse return error.InvalidGraphLink) orelse return error.InvalidGraphLink, "link.type"),
+        .reason = if (obj.get("reason")) |v| switch (v) {
+            .string => |s| s,
+            .null => "",
+            else => return error.InvalidGraphLink,
+        } else "",
+    };
+}
+
+fn canonicalContract(allocator: std.mem.Allocator, value: std.json.Value) !?Contract {
+    if (value == .null) return null;
+    const obj = switch (value) {
+        .object => |o| o,
+        else => return error.InvalidContract,
+    };
+    return Contract{
+        .objective = try optionalObjectString(allocator, obj, "objective"),
+        .background = try optionalObjectString(allocator, obj, "background"),
+        .implementation_approach = try optionalObjectString(allocator, obj, "implementation_approach"),
+        .success_criteria = if (obj.get("success_criteria")) |v| try normalizeStringList(allocator, v) else &.{},
+        .proof_obligations = if (obj.get("proof_obligations")) |v| try normalizeProofObligations(allocator, v) else &.{},
+        .risks = if (obj.get("risks")) |v| try normalizeStringList(allocator, v) else &.{},
+    };
+}
+
+fn normalizeProofObligations(allocator: std.mem.Allocator, value: std.json.Value) ![]const ProofObligation {
+    return switch (value) {
+        .null => &.{},
+        .array => |arr| blk: {
+            var out = std.ArrayList(ProofObligation).empty;
+            for (arr.items) |entry| {
+                try out.append(allocator, try canonicalProofObligation(allocator, entry));
+            }
+            if (out.items.len == 0) break :blk &.{};
+            break :blk try out.toOwnedSlice(allocator);
+        },
+        else => error.InvalidProofObligation,
+    };
+}
+
+fn canonicalProofObligation(allocator: std.mem.Allocator, value: std.json.Value) !ProofObligation {
+    const obj = switch (value) {
+        .object => |o| o,
+        else => return error.InvalidProofObligation,
+    };
+    return .{
+        .id = try requireNonEmptyString(allocator, asString(obj.get("id") orelse return error.InvalidProofObligation) orelse return error.InvalidProofObligation, "proof_obligation.id"),
+        .kind = try requireNonEmptyString(allocator, asString(obj.get("kind") orelse return error.InvalidProofObligation) orelse return error.InvalidProofObligation, "proof_obligation.kind"),
+        .command = try optionalObjectString(allocator, obj, "command"),
+        .evidence_ref = try optionalObjectString(allocator, obj, "evidence_ref"),
+        .required = if (obj.get("required")) |v| switch (v) {
+            .bool => |b| b,
+            .null => true,
+            else => return error.InvalidProofObligation,
+        } else true,
+    };
+}
+
+fn optionalObjectString(allocator: std.mem.Allocator, obj: std.json.ObjectMap, key: []const u8) ![]const u8 {
+    _ = allocator;
+    return if (obj.get(key)) |v| switch (v) {
+        .string => |s| s,
+        .null => "",
+        else => error.InvalidItem,
+    } else "";
 }
 
 fn canonicalSourceMeta(allocator: std.mem.Allocator, value: std.json.Value) !?SourceMeta {
@@ -5560,6 +8253,218 @@ fn canonicalProofMeta(allocator: std.mem.Allocator, value: std.json.Value) !?Pro
     };
 }
 
+fn canonicalGraphEnvelope(allocator: std.mem.Allocator, value: std.json.Value) !GraphEnvelope {
+    const obj = switch (value) {
+        .object => |o| o,
+        else => return error.InvalidGraphEnvelope,
+    };
+    return .{
+        .version = if (obj.get("version")) |v| switch (v) {
+            .integer => |n| n,
+            .null => GraphEnvelopeVersion,
+            else => return error.InvalidGraphEnvelope,
+        } else GraphEnvelopeVersion,
+        .policy = if (obj.get("policy")) |v| try canonicalGraphPolicy(allocator, v) else .{},
+        .intent = if (obj.get("intent")) |v| try normalizeIntentAtoms(allocator, v) else &.{},
+        .waivers = if (obj.get("waivers")) |v| try normalizeWaivers(allocator, v) else &.{},
+        .polish = if (obj.get("polish")) |v| try canonicalPolishState(allocator, v) else .{},
+        .fingerprints = if (obj.get("fingerprints")) |v| try canonicalGraphFingerprints(allocator, v) else .{},
+    };
+}
+
+fn canonicalGraphPolicy(allocator: std.mem.Allocator, value: std.json.Value) !GraphPolicy {
+    _ = allocator;
+    const obj = switch (value) {
+        .object => |o| o,
+        else => return error.InvalidGraphPolicy,
+    };
+    return .{
+        .completion_requires_proof = try optionalObjectBool(obj, "completion_requires_proof", false),
+        .implementation_ready_required = try optionalObjectBool(obj, "implementation_ready_required", true),
+        .default_projection_strategy = if (obj.get("default_projection_strategy")) |v| switch (v) {
+            .string => |s| s,
+            .null => "aperture-score",
+            else => return error.InvalidGraphPolicy,
+        } else "aperture-score",
+        .default_gate = if (obj.get("default_gate")) |v| switch (v) {
+            .string => |s| s,
+            .null => "implementation-ready",
+            else => return error.InvalidGraphPolicy,
+        } else "implementation-ready",
+        .max_aperture_items = if (obj.get("max_aperture_items")) |v| switch (v) {
+            .integer => |n| n,
+            .null => 7,
+            else => return error.InvalidGraphPolicy,
+        } else 7,
+    };
+}
+
+fn normalizeIntentAtoms(allocator: std.mem.Allocator, value: std.json.Value) ![]const IntentAtom {
+    return switch (value) {
+        .null => &.{},
+        .array => |arr| blk: {
+            var out = std.ArrayList(IntentAtom).empty;
+            for (arr.items) |entry| try out.append(allocator, try canonicalIntentAtom(allocator, entry));
+            if (out.items.len == 0) break :blk &.{};
+            break :blk try out.toOwnedSlice(allocator);
+        },
+        else => error.InvalidIntentAtom,
+    };
+}
+
+fn canonicalIntentAtom(allocator: std.mem.Allocator, value: std.json.Value) !IntentAtom {
+    const obj = switch (value) {
+        .object => |o| o,
+        else => return error.InvalidIntentAtom,
+    };
+    return .{
+        .id = try requireNonEmptyString(allocator, asString(obj.get("id") orelse return error.InvalidIntentAtom) orelse return error.InvalidIntentAtom, "intent.id"),
+        .source = if (obj.get("source")) |v| try canonicalIntentSource(allocator, v) else null,
+        .text = try requireNonEmptyString(allocator, asString(obj.get("text") orelse return error.InvalidIntentAtom) orelse return error.InvalidIntentAtom, "intent.text"),
+        .category = try requireNonEmptyString(allocator, asString(obj.get("category") orelse return error.InvalidIntentAtom) orelse return error.InvalidIntentAtom, "intent.category"),
+        .disposition = try requireNonEmptyString(allocator, asString(obj.get("disposition") orelse return error.InvalidIntentAtom) orelse return error.InvalidIntentAtom, "intent.disposition"),
+        .reason = try optionalObjectString(allocator, obj, "reason"),
+    };
+}
+
+fn canonicalIntentSource(allocator: std.mem.Allocator, value: std.json.Value) !?IntentSource {
+    if (value == .null) return null;
+    const obj = switch (value) {
+        .object => |o| o,
+        else => return error.InvalidIntentSource,
+    };
+    return IntentSource{
+        .kind = try optionalObjectString(allocator, obj, "kind"),
+        .locator = try optionalObjectString(allocator, obj, "locator"),
+        .anchor = try optionalObjectString(allocator, obj, "anchor"),
+    };
+}
+
+fn normalizeWaivers(allocator: std.mem.Allocator, value: std.json.Value) ![]const Waiver {
+    return switch (value) {
+        .null => &.{},
+        .array => |arr| blk: {
+            var out = std.ArrayList(Waiver).empty;
+            for (arr.items) |entry| try out.append(allocator, try canonicalWaiver(allocator, entry));
+            if (out.items.len == 0) break :blk &.{};
+            break :blk try out.toOwnedSlice(allocator);
+        },
+        else => error.InvalidWaiver,
+    };
+}
+
+fn canonicalWaiver(allocator: std.mem.Allocator, value: std.json.Value) !Waiver {
+    const obj = switch (value) {
+        .object => |o| o,
+        else => return error.InvalidWaiver,
+    };
+    return .{
+        .id = try requireNonEmptyString(allocator, asString(obj.get("id") orelse return error.InvalidWaiver) orelse return error.InvalidWaiver, "waiver.id"),
+        .gate = try requireNonEmptyString(allocator, asString(obj.get("gate") orelse return error.InvalidWaiver) orelse return error.InvalidWaiver, "waiver.gate"),
+        .code = try requireNonEmptyString(allocator, asString(obj.get("code") orelse return error.InvalidWaiver) orelse return error.InvalidWaiver, "waiver.code"),
+        .target = try requireNonEmptyString(allocator, asString(obj.get("target") orelse return error.InvalidWaiver) orelse return error.InvalidWaiver, "waiver.target"),
+        .reason = try requireNonEmptyString(allocator, asString(obj.get("reason") orelse return error.InvalidWaiver) orelse return error.InvalidWaiver, "waiver.reason"),
+        .expires = try requireNonEmptyString(allocator, asString(obj.get("expires") orelse return error.InvalidWaiver) orelse return error.InvalidWaiver, "waiver.expires"),
+        .created_at = try optionalObjectString(allocator, obj, "created_at"),
+        .created_by = try optionalObjectString(allocator, obj, "created_by"),
+    };
+}
+
+fn canonicalPolishState(allocator: std.mem.Allocator, value: std.json.Value) !PolishState {
+    const obj = switch (value) {
+        .object => |o| o,
+        else => return error.InvalidPolishState,
+    };
+    return .{
+        .session_id = try optionalObjectString(allocator, obj, "session_id"),
+        .passes = if (obj.get("passes")) |v| try normalizePolishPasses(allocator, v) else &.{},
+    };
+}
+
+fn normalizePolishPasses(allocator: std.mem.Allocator, value: std.json.Value) ![]const PolishPass {
+    return switch (value) {
+        .null => &.{},
+        .array => |arr| blk: {
+            var out = std.ArrayList(PolishPass).empty;
+            for (arr.items) |entry| try out.append(allocator, try canonicalPolishPass(allocator, entry));
+            if (out.items.len == 0) break :blk &.{};
+            break :blk try out.toOwnedSlice(allocator);
+        },
+        else => error.InvalidPolishPass,
+    };
+}
+
+fn canonicalPolishPass(allocator: std.mem.Allocator, value: std.json.Value) !PolishPass {
+    const obj = switch (value) {
+        .object => |o| o,
+        else => return error.InvalidPolishPass,
+    };
+    return .{
+        .pass = try requiredObjectInt(obj, "pass", error.InvalidPolishPass),
+        .seq = try optionalObjectInt(obj, "seq", 0, error.InvalidPolishPass),
+        .created_at = try optionalObjectString(allocator, obj, "created_at"),
+        .structure_fingerprint = try optionalObjectString(allocator, obj, "structure_fingerprint"),
+        .contract_fingerprint = try optionalObjectString(allocator, obj, "contract_fingerprint"),
+        .coverage_fingerprint = try optionalObjectString(allocator, obj, "coverage_fingerprint"),
+        .execution_fingerprint = try optionalObjectString(allocator, obj, "execution_fingerprint"),
+        .audit_gate = try optionalObjectString(allocator, obj, "audit_gate"),
+        .hard_failures = try optionalObjectInt(obj, "hard_failures", 0, error.InvalidPolishPass),
+        .warnings = try optionalObjectInt(obj, "warnings", 0, error.InvalidPolishPass),
+        .delta = if (obj.get("delta")) |v| try canonicalPolishDelta(v) else .{},
+    };
+}
+
+fn canonicalPolishDelta(value: std.json.Value) !PolishDelta {
+    const obj = switch (value) {
+        .object => |o| o,
+        else => return error.InvalidPolishPass,
+    };
+    return .{
+        .items_added = try optionalObjectInt(obj, "items_added", 0, error.InvalidPolishPass),
+        .items_removed = try optionalObjectInt(obj, "items_removed", 0, error.InvalidPolishPass),
+        .items_split = try optionalObjectInt(obj, "items_split", 0, error.InvalidPolishPass),
+        .deps_changed = try optionalObjectInt(obj, "deps_changed", 0, error.InvalidPolishPass),
+        .contracts_changed = try optionalObjectInt(obj, "contracts_changed", 0, error.InvalidPolishPass),
+        .intent_coverage_changed = try optionalObjectInt(obj, "intent_coverage_changed", 0, error.InvalidPolishPass),
+    };
+}
+
+fn canonicalGraphFingerprints(allocator: std.mem.Allocator, value: std.json.Value) !GraphFingerprints {
+    const obj = switch (value) {
+        .object => |o| o,
+        else => return error.InvalidGraphFingerprints,
+    };
+    return .{
+        .structure = try optionalObjectString(allocator, obj, "structure"),
+        .contract = try optionalObjectString(allocator, obj, "contract"),
+        .coverage = try optionalObjectString(allocator, obj, "coverage"),
+        .execution = try optionalObjectString(allocator, obj, "execution"),
+    };
+}
+
+fn optionalObjectBool(obj: std.json.ObjectMap, key: []const u8, default_value: bool) !bool {
+    return if (obj.get(key)) |v| switch (v) {
+        .bool => |b| b,
+        .null => default_value,
+        else => error.InvalidGraphPolicy,
+    } else default_value;
+}
+
+fn optionalObjectInt(obj: std.json.ObjectMap, key: []const u8, default_value: i64, err: anyerror) !i64 {
+    return if (obj.get(key)) |v| switch (v) {
+        .integer => |n| n,
+        .null => default_value,
+        else => err,
+    } else default_value;
+}
+
+fn requiredObjectInt(obj: std.json.ObjectMap, key: []const u8, err: anyerror) !i64 {
+    return if (obj.get(key)) |v| switch (v) {
+        .integer => |n| n,
+        else => err,
+    } else err;
+}
+
 fn normalizeClaimState(raw: []const u8) !ClaimState {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (std.ascii.eqlIgnoreCase(trimmed, "none")) return .none;
@@ -5699,7 +8604,7 @@ fn collectSeqContractIssues(allocator: std.mem.Allocator, records: []const std.j
 
     for (records, 0..) |record, idx| {
         const version = intField(record, "v");
-        if (version == null or (version.? != 2 and version.? != 3)) {
+        if (version == null or (version.? != 2 and version.? != SchemaVersion and version.? != GraphSchemaVersion)) {
             try issues.append(allocator, try std.fmt.allocPrint(allocator, "record {d} has unsupported version", .{idx + 1}));
             continue;
         }
@@ -5710,7 +8615,7 @@ fn collectSeqContractIssues(allocator: std.mem.Allocator, records: []const std.j
             continue;
         }
 
-        if (version.? == 3) {
+        if (version.? == SchemaVersion or version.? == GraphSchemaVersion) {
             const lane = normalizedLane(record) orelse {
                 try issues.append(allocator, try std.fmt.allocPrint(allocator, "record {d} has invalid lane", .{idx + 1}));
                 continue;
@@ -6205,6 +9110,16 @@ test "parseCommand and parseOutputFormat recognize known values" {
     try std.testing.expectEqual(Command.import_proposed_plan, parseCommand("import-proposed-plan").?);
     try std.testing.expectEqual(Command.guard_session_start, parseCommand("guard-session-start").?);
     try std.testing.expectEqual(Command.guard_pre_tool_use, parseCommand("guard-pre-tool-use").?);
+    try std.testing.expectEqual(Command.graph, parseCommand("graph").?);
+    try std.testing.expectEqual(Command.complete, parseCommand("complete").?);
+    try std.testing.expectEqual(Command.proof, parseCommand("proof").?);
+    try std.testing.expectEqual(GraphCommand.apply, parseGraphCommand("apply").?);
+    try std.testing.expectEqual(GraphCommand.insights, parseGraphCommand("insights").?);
+    try std.testing.expectEqual(PolishCommand.snapshot, parsePolishCommand("snapshot").?);
+    try std.testing.expectEqual(ApertureCommand.select, parseApertureCommand("select").?);
+    try std.testing.expectEqual(CompileCommand.aperture, parseCompileCommand("aperture").?);
+    try std.testing.expectEqual(ProofCommand.audit, parseProofCommand("audit").?);
+    try std.testing.expectEqual(AuditGate.implementation_ready, parseAuditGate("implementation-ready").?);
     try std.testing.expect(parseCommand("unknown-cmd") == null);
 
     try std.testing.expectEqual(OutputFormat.markdown, parseOutputFormat("markdown").?);
@@ -6299,6 +9214,332 @@ test "canonicalItem preserves orchestration metadata" {
     try std.testing.expectEqualStrings("src/api", item.claim.?.lock_roots[0]);
     try std.testing.expectEqualStrings("spawn_agent", item.runtime.?.substrate);
     try std.testing.expectEqual(ProofState.pass, item.proof.?.state);
+}
+
+test "canonicalItem preserves graph capsule metadata" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        \\{"id":"st-004","step":"Implement graph capsule","status":"pending","priority":"high","in_plan":true,"deps":[],"notes":"","comments":[],"item_type":"feature","parent_id":"st-001","links":[{"id":"st-009","type":"tests","reason":"coverage"}],"intent_refs":["intent-001"],"acceptance":["capsule round-trips"],"contract":{"objective":"Add capsule fields.","background":"Graph mode needs structured tasks.","implementation_approach":"Extend canonical item parser and writer.","success_criteria":["fields persist"],"proof_obligations":[{"id":"proof-001","kind":"unit","command":"zig build test-st","required":true}],"risks":["metadata loss"]},"labels":["graph"],"lock_roots":["apps/st"],"uncertainty":["parser defaults"],"non_goals":["external runtime integration"]}
+    ,
+        .{},
+    );
+
+    const item = try canonicalItem(allocator, parsed.value);
+    try std.testing.expectEqual(ItemType.feature, item.item_type);
+    try std.testing.expectEqualStrings("st-001", item.parent_id.?);
+    try std.testing.expectEqualStrings("st-009", item.links[0].id);
+    try std.testing.expectEqualStrings("tests", item.links[0].type);
+    try std.testing.expectEqualStrings("intent-001", item.intent_refs[0]);
+    try std.testing.expectEqualStrings("capsule round-trips", item.acceptance[0]);
+    try std.testing.expectEqualStrings("Add capsule fields.", item.contract.?.objective);
+    try std.testing.expectEqualStrings("proof-001", item.contract.?.proof_obligations[0].id);
+    try std.testing.expect(item.contract.?.proof_obligations[0].required);
+    try std.testing.expectEqualStrings("apps/st", item.lock_roots[0]);
+    try std.testing.expectEqualStrings("external runtime integration", item.non_goals[0]);
+}
+
+test "v4 graph envelope round trips and stays out of plan_sync projection" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
+
+    var state = ItemState.init(allocator);
+    defer state.deinit();
+    state.graph_active = true;
+    state.graph = .{
+        .policy = .{ .completion_requires_proof = true },
+        .intent = &.{
+            .{
+                .id = "intent-001",
+                .source = .{ .kind = "markdown", .locator = "PLAN.md", .anchor = "Graph" },
+                .text = "Graph metadata must be durable.",
+                .category = "requirement",
+                .disposition = "covered",
+            },
+        },
+        .waivers = &.{
+            .{
+                .id = "waiver-001",
+                .gate = "implementation-ready",
+                .code = "fixture-only",
+                .target = "st-001",
+                .reason = "Fixture waiver exercises v4 round-trip.",
+                .expires = "never",
+            },
+        },
+        .fingerprints = .{ .structure = "sha256:structure" },
+    };
+    try state.upsert(.{
+        .id = "st-001",
+        .step = "Implement graph metadata",
+        .status = .pending,
+        .priority = .high,
+        .in_plan = true,
+        .deps = &.{},
+        .notes = "",
+        .comments = &.{},
+        .item_type = .feature,
+        .intent_refs = &.{"intent-001"},
+        .acceptance = &.{"Graph envelope survives canonical rewrite"},
+        .contract = .{
+            .objective = "Round-trip graph metadata.",
+            .proof_obligations = &.{.{ .id = "proof-001", .kind = "unit", .command = "zig build test-st" }},
+        },
+    });
+
+    const meta = MutationMeta{ .allow_multiple_in_progress = false, .actor = "test", .pid = 1, .session = null };
+    try writeCanonicalRecords(plan_path, &state, 1, "2026-06-03T00:00:00Z", meta, null);
+
+    var loaded = try loadValidatedState(allocator, plan_path, false);
+    defer loaded.state.deinit();
+    try std.testing.expect(loaded.state.graph_active);
+    try std.testing.expectEqual(GraphSchemaVersion, intField((try readRecords(allocator, plan_path)).records[0], "v").?);
+    try std.testing.expect(loaded.state.graph.policy.completion_requires_proof);
+    try std.testing.expectEqualStrings("intent-001", loaded.state.graph.intent[0].id);
+    try std.testing.expectEqualStrings("waiver-001", loaded.state.graph.waivers[0].id);
+    try std.testing.expectEqual(ItemType.feature, loaded.state.items.items[0].item_type);
+    try std.testing.expectEqualStrings("intent-001", loaded.state.items.items[0].intent_refs[0]);
+
+    var sync_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer sync_writer.deinit();
+    try emitPlanSyncWithPolicy(allocator, &sync_writer.writer, &loaded.state, .{}, false);
+    const sync_payload = try sync_writer.toOwnedSlice();
+    try std.testing.expect(std.mem.indexOf(u8, sync_payload, "\"graph\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sync_payload, "\"intent_refs\"") != null);
+}
+
+test "graph apply writes v4 candidate after implementation-ready gate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
+    const patch_path = try std.fs.path.join(allocator, &.{ root, "patch.json" });
+    try writeTextAtomic(allocator, patch_path,
+        \\{"version":1,"author":"test","reason":"fixture graph apply","ops":[
+        \\{"op":"upsert-intent","intent":{"id":"intent-001","source":{"kind":"markdown","locator":"PLAN.md"},"text":"Graph patch applies.","category":"requirement","disposition":"covered"}},
+        \\{"op":"upsert-item","item":{"id":"st-001","step":"Implement graph apply fixture","status":"pending","priority":"high","in_plan":true,"item_type":"feature","intent_refs":["intent-001"],"acceptance":["Patch applies atomically"],"validation":["zig build test-st"],"contract":{"objective":"Apply graph patch.","proof_obligations":[{"id":"proof-001","kind":"unit","command":"zig build test-st"}]}}}
+        \\]}
+    );
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    const exit_code = try cmdGraph(allocator, .{ .command = .graph, .graph_command = .apply, .file = plan_path, .input = patch_path, .gate = .implementation_ready });
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+
+    var loaded = try loadValidatedState(allocator, plan_path, false);
+    defer loaded.state.deinit();
+    try std.testing.expect(loaded.state.graph_active);
+    try std.testing.expectEqualStrings("intent-001", loaded.state.graph.intent[0].id);
+    try std.testing.expectEqual(ItemType.feature, loaded.state.items.items[0].item_type);
+}
+
+test "graph apply rejects invalid patch atomically" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
+    const patch_path = try std.fs.path.join(allocator, &.{ root, "bad.patch.json" });
+    try writeTextAtomic(allocator, patch_path,
+        \\{"version":1,"author":"test","reason":"bad dep","ops":[
+        \\{"op":"upsert-item","item":{"id":"st-001","step":"Bad dep","deps":[{"id":"missing","type":"requires"}]}}
+        \\]}
+    );
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    const exit_code = try cmdGraph(allocator, .{ .command = .graph, .graph_command = .apply, .file = plan_path, .input = patch_path, .gate = .draft });
+    try std.testing.expectEqual(@as(u8, 2), exit_code);
+    try std.testing.expect(!fileExists(plan_path));
+}
+
+test "graph audit implementation-ready findings can be waived by exact target" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var state = ItemState.init(allocator);
+    defer state.deinit();
+    state.graph_active = true;
+    state.graph.waivers = &.{.{
+        .id = "waiver-001",
+        .gate = "implementation-ready",
+        .code = "executable-item-missing-acceptance",
+        .target = "st-001",
+        .reason = "Fixture waiver",
+        .expires = "never",
+    }};
+    try state.upsert(.{
+        .id = "st-001",
+        .step = "Waived missing acceptance",
+        .status = .pending,
+        .priority = .high,
+        .in_plan = true,
+        .deps = &.{},
+        .notes = "",
+        .comments = &.{},
+        .validation = &.{"zig build test-st"},
+        .contract = .{ .objective = "Exercise waiver." },
+    });
+
+    const audit = try auditGraph(allocator, &state, .implementation_ready);
+    try std.testing.expectEqual(@as(usize, 0), audit.errors);
+}
+
+test "graph insights and polish gate use stable fingerprints" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
+    const patch_path = try std.fs.path.join(allocator, &.{ root, "patch.json" });
+    try writeTextAtomic(allocator, patch_path,
+        \\{"version":1,"author":"test","reason":"fixture graph polish","ops":[
+        \\{"op":"upsert-intent","intent":{"id":"intent-001","source":{"kind":"markdown","locator":"PLAN.md"},"text":"Polish gate passes.","category":"requirement","disposition":"covered"}},
+        \\{"op":"upsert-item","item":{"id":"st-001","step":"Implement polish fixture","status":"pending","priority":"high","in_plan":true,"item_type":"feature","intent_refs":["intent-001"],"acceptance":["Polish gate passes"],"validation":["zig build test-st"],"lock_roots":["apps/st"],"contract":{"objective":"Exercise polish.","proof_obligations":[{"id":"proof-001","kind":"unit","command":"zig build test-st"}]}}}
+        \\]}
+    );
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 0), try cmdGraph(allocator, .{ .command = .graph, .graph_command = .apply, .file = plan_path, .input = patch_path, .gate = .implementation_ready }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdGraph(allocator, .{ .command = .graph, .graph_command = .insights, .file = plan_path, .format = .json }));
+    try std.testing.expectEqual(@as(u8, 2), try cmdGraph(allocator, .{ .command = .graph, .graph_command = .polish, .polish_command = .gate, .file = plan_path, .gate = .implementation_ready, .min_stable_passes = 1 }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdGraph(allocator, .{ .command = .graph, .graph_command = .polish, .polish_command = .begin, .file = plan_path, .name = "fixture" }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdGraph(allocator, .{ .command = .graph, .graph_command = .polish, .polish_command = .snapshot, .file = plan_path, .pass_number = "1", .gate = .implementation_ready }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdGraph(allocator, .{ .command = .graph, .graph_command = .polish, .polish_command = .gate, .file = plan_path, .gate = .implementation_ready, .min_stable_passes = 1 }));
+
+    var loaded = try loadValidatedState(allocator, plan_path, false);
+    defer loaded.state.deinit();
+    try std.testing.expectEqual(@as(usize, 1), loaded.state.graph.polish.passes.len);
+    try std.testing.expect(std.mem.startsWith(u8, loaded.state.graph.polish.passes[0].structure_fingerprint, "sha256:"));
+}
+
+test "aperture ranks ready executable work and prime selects it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var state = ItemState.init(allocator);
+    defer state.deinit();
+    state.graph_active = true;
+    try state.upsert(.{
+        .id = "st-001",
+        .step = "Completed dependency",
+        .status = .completed,
+        .priority = .medium,
+        .in_plan = false,
+        .deps = &.{},
+        .notes = "",
+        .comments = &.{},
+    });
+    try state.upsert(.{
+        .id = "st-002",
+        .step = "Ready high value",
+        .status = .pending,
+        .priority = .high,
+        .in_plan = false,
+        .deps = &.{.{ .id = "st-001", .type = "requires" }},
+        .notes = "",
+        .comments = &.{},
+        .item_type = .feature,
+        .acceptance = &.{"done"},
+        .validation = &.{"zig build test-st"},
+        .lock_roots = &.{"apps/st"},
+        .contract = .{ .objective = "ready", .proof_obligations = &.{.{ .id = "proof-001", .kind = "unit", .command = "zig build test-st" }} },
+    });
+    try state.upsert(.{
+        .id = "st-003",
+        .step = "Blocked item",
+        .status = .pending,
+        .priority = .high,
+        .in_plan = false,
+        .deps = &.{.{ .id = "st-099", .type = "requires" }},
+        .notes = "",
+        .comments = &.{},
+        .item_type = .feature,
+        .acceptance = &.{"done"},
+        .validation = &.{"zig build test-st"},
+        .contract = .{ .objective = "blocked" },
+    });
+    try state.upsert(.{
+        .id = "st-004",
+        .step = "Epic context",
+        .status = .pending,
+        .priority = .high,
+        .in_plan = false,
+        .deps = &.{},
+        .notes = "",
+        .comments = &.{},
+        .item_type = .epic,
+    });
+
+    const selected = try selectApertureIds(allocator, &state, 7);
+    try std.testing.expectEqual(@as(usize, 1), selected.len);
+    try std.testing.expectEqualStrings("st-002", selected[0]);
+
+    const changed = try applyPrimeSelection(allocator, &state, .aperture, 7);
+    try std.testing.expect(changed);
+    try std.testing.expect(state.getConst("st-002").?.in_plan);
+    try std.testing.expect(!state.getConst("st-003").?.in_plan);
+    try std.testing.expect(!state.getConst("st-004").?.in_plan);
+}
+
+test "graph complete requires proof and demotes completed item" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
+    const patch_path = try std.fs.path.join(allocator, &.{ root, "patch.json" });
+    try writeTextAtomic(allocator, patch_path,
+        \\{"version":1,"author":"test","reason":"proof completion fixture","ops":[
+        \\{"op":"upsert-intent","intent":{"id":"intent-001","text":"Completion requires proof.","category":"requirement","disposition":"covered"}},
+        \\{"op":"upsert-item","item":{"id":"st-001","step":"Implement proof fixture","status":"pending","priority":"high","in_plan":true,"item_type":"feature","intent_refs":["intent-001"],"acceptance":["Completion is proof-gated"],"validation":["zig build test-st"],"lock_roots":["apps/st"],"contract":{"objective":"Exercise proof-aware completion.","proof_obligations":[{"id":"proof-001","kind":"unit","command":"zig build test-st","required":true}]}}}
+        \\]}
+    );
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 0), try cmdGraph(allocator, .{ .command = .graph, .graph_command = .apply, .file = plan_path, .input = patch_path, .gate = .implementation_ready }));
+    try std.testing.expectEqual(@as(u8, 2), try cmdSetStatus(allocator, .{ .command = .set_status, .file = plan_path, .id = "st-001", .status = "completed" }));
+
+    var blocked = try loadValidatedState(allocator, plan_path, false);
+    defer blocked.state.deinit();
+    try std.testing.expectEqual(Status.pending, blocked.state.getConst("st-001").?.status);
+
+    try std.testing.expectEqual(@as(u8, 0), try cmdComplete(allocator, .{ .command = .complete, .file = plan_path, .id = "st-001", .step = "zig build test-st", .evidence_ref = "proof.log" }));
+    var completed = try loadValidatedState(allocator, plan_path, false);
+    defer completed.state.deinit();
+    const item = completed.state.getConst("st-001").?;
+    try std.testing.expectEqual(Status.completed, item.status);
+    try std.testing.expect(!item.in_plan);
+    try std.testing.expectEqual(ProofState.pass, item.proof.?.state);
+    try std.testing.expectEqualStrings("proof.log", item.proof.?.evidence_ref);
+    try std.testing.expectEqual(@as(u8, 0), try cmdProof(allocator, .{ .command = .proof, .proof_command = .audit, .file = plan_path, .id = "st-001", .format = .json }));
 }
 
 test "emitPlanSync keeps inventory while filtering mirrored plan projections" {

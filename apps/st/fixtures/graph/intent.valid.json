@@ -1,0 +1,15 @@
+{
+  "intent": [
+    {
+      "id": "intent-001",
+      "source": {
+        "kind": "markdown",
+        "locator": "apps/st/fixtures/graph/intent.valid.json",
+        "anchor": "fixture"
+      },
+      "text": "Graph fixture work must compile into a proof-gated executable aperture.",
+      "category": "requirement",
+      "disposition": "covered"
+    }
+  ]
+}
