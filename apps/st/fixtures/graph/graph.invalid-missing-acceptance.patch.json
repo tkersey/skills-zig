@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "author": "codex",
+  "reason": "Invalid missing acceptance fixture",
+  "ops": [
+    {"op": "upsert-intent", "intent": {"id": "intent-001", "text": "Missing acceptance must fail.", "category": "requirement", "disposition": "covered"}},
+    {"op": "upsert-item", "item": {"id": "st-001", "step": "Missing acceptance", "item_type": "feature", "intent_refs": ["intent-001"], "validation": ["zig build test-st"], "contract": {"objective": "No acceptance.", "proof_obligations": [{"id": "proof-001", "kind": "unit", "command": "zig build test-st"}]}}}
+  ]
+}

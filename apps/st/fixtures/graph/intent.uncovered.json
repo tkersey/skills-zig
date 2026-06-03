@@ -1,0 +1,10 @@
+{
+  "intent": [
+    {
+      "id": "intent-uncovered",
+      "text": "This fixture intent is intentionally uncovered.",
+      "category": "requirement",
+      "disposition": "covered"
+    }
+  ]
+}

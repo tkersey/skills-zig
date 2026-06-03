@@ -1,0 +1,1 @@
+fixture proof: zig build test-st passed

@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "author": "codex",
+  "reason": "Valid linked test coverage fixture",
+  "ops": [
+    {"op": "upsert-intent", "intent": {"id": "intent-001", "text": "Feature has linked verification.", "category": "requirement", "disposition": "covered"}},
+    {"op": "upsert-item", "item": {"id": "st-001", "step": "Feature with linked test", "item_type": "feature", "intent_refs": ["intent-001"], "acceptance": ["done"], "validation": ["zig build test-st"], "contract": {"objective": "Feature.", "proof_obligations": [{"id": "proof-001", "kind": "unit", "command": "zig build test-st"}]}}},
+    {"op": "upsert-item", "item": {"id": "st-002", "step": "Verify feature", "item_type": "verification", "links": [{"id": "st-001", "type": "validates"}], "acceptance": ["feature validated"], "validation": ["zig build test-st"], "contract": {"objective": "Verify.", "proof_obligations": [{"id": "proof-002", "kind": "unit", "command": "zig build test-st"}]}}}
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "author": "codex",
+  "reason": "Invalid unknown dependency fixture",
+  "ops": [
+    {
+      "op": "upsert-item",
+      "item": {
+        "id": "st-001",
+        "step": "Depend on missing work",
+        "deps": [{"id": "st-missing", "type": "requires"}]
+      }
+    }
+  ]
+}
