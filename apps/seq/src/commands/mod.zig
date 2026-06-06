@@ -578,7 +578,7 @@ pub fn run(
         try printCommandHelp(cmd);
         return;
     }
-    if (opts.format_set) try validateFormatForCommand(cmd, opts.format);
+    if (opts.format_set) try validateFormatForCommand(cmd, opts);
     try validateCommandOptions(cmd, opts);
 
     const sessions_root = try resolveSessionsRoot(allocator, opts.root);
@@ -667,7 +667,7 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\usage: seq skill-audit [--skill <name>] [--mode summary|mentions|trend] [--roles <csv>] [--since <iso>] [--until <iso>] [--limit N] [--format table|json|csv|jsonl]
         ,
         .skill_blocks =>
-        \\usage: seq skill-blocks --skill <name> [--history <distinct|all|latest>] [--session-id <id>|--path <jsonl>|--current] [--since <iso>] [--until <iso>] [--limit N] [--format json|jsonl]
+        \\usage: seq skill-blocks --skill <name> [--mode blocks|term-counts|term-summary] [--term-group <name=csv>] [--examples N] [--history <distinct|all|latest>] [--session-id <id>|--path <jsonl>|--current] [--since <iso>] [--until <iso>] [--limit N] [--format table|json|csv|jsonl]
         ,
         .artifact_search =>
         \\usage: seq artifact-search [--contains <text>|--contains-any <csv>|--regex <expr>] [--kind <auto|session|memory|orchestration|tooling|prompt>] [--surface <auto|messages|tool_calls|memory_blocks>] [--roles <csv>] [--tool <name>] [--workdir <path>] [--session-id <id>|--path <jsonl>] [--since <iso>] [--until <iso>] [--follow <none|auto>] [--strip-skill-blocks] [--no-dedupe-exact] [--stats] [--limit N] [--format table|json|csv|jsonl]
@@ -879,13 +879,20 @@ fn commandSupportsSummary(cmd: lib.Command) bool {
         std.mem.eql(u8, name, "goal_audit");
 }
 
-fn validateFormatForCommand(cmd: lib.Command, fmt: output.Format) !void {
+fn validateFormatForCommand(cmd: lib.Command, opts: Options) !void {
+    const fmt = opts.format;
     switch (cmd) {
         .skills_rank, .skill_trend, .skill_report, .role_breakdown, .report_bundle, .section_audit, .datasets, .dataset_schema => {
             if (fmt == .jsonl or fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
         .skill_blocks => {
-            if (fmt != .json and fmt != .jsonl) return error.InvalidFormatForCommand;
+            if (opts.mode == null or std.mem.eql(u8, opts.mode.?, "blocks")) {
+                if (fmt != .json and fmt != .jsonl) return error.InvalidFormatForCommand;
+            } else if (std.mem.eql(u8, opts.mode.?, "term-counts") or std.mem.eql(u8, opts.mode.?, "term-summary")) {
+                if (fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
+            } else {
+                return error.InvalidModeArg;
+            }
         },
         .occurrence_export => {
             if (fmt == .table or fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
@@ -963,7 +970,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_repo = cmd == .plan_search or cmd == .sessions;
     const supports_status = cmd == .opencode_events or cmd == .turns or cmd == .goal_audit;
     const supports_mode = switch (cmd) {
-        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .skill_success_rank, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit, .workflow_overlap, .adjudication_audit, .goal_audit => true,
+        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .skill_success_rank, .skill_blocks, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit, .workflow_overlap, .adjudication_audit, .goal_audit => true,
         else => false,
     };
     const supports_kind = cmd == .artifact_search;
@@ -1070,8 +1077,8 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .session_tooling, .tool_audit, .tool_search, .opencode_prompts, .opencode_events, .token_usage, .token_cost => true,
         else => false,
     };
-    const supports_term_group = cmd == .workflow_audit;
-    const supports_examples = cmd == .workflow_audit;
+    const supports_term_group = cmd == .workflow_audit or cmd == .skill_blocks;
+    const supports_examples = cmd == .workflow_audit or cmd == .skill_blocks;
     const supports_unique_by = cmd == .workflow_audit;
     const supports_timezone = switch (cmd) {
         .token_usage, .token_cost => true,
@@ -1242,6 +1249,11 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     if (cmd == .skill_audit) {
         if (opts.mode) |text| {
             if (!isValidSkillAuditMode(text)) return error.InvalidModeArg;
+        }
+    }
+    if (cmd == .skill_blocks) {
+        if (opts.mode) |text| {
+            if (!isValidSkillBlocksMode(text)) return error.InvalidModeArg;
         }
     }
     if (cmd == .message_audit) {
@@ -1493,6 +1505,12 @@ fn isValidWorkflowAuditMode(text: []const u8) bool {
         std.mem.eql(u8, text, "outcomes") or
         std.mem.eql(u8, text, "sessions") or
         std.mem.eql(u8, text, "report") or
+        std.mem.eql(u8, text, "term-summary");
+}
+
+fn isValidSkillBlocksMode(text: []const u8) bool {
+    return std.mem.eql(u8, text, "blocks") or
+        std.mem.eql(u8, text, "term-counts") or
         std.mem.eql(u8, text, "term-summary");
 }
 
@@ -2647,6 +2665,8 @@ const workflow_audit_signal_columns = [_][]const u8{ "timestamp", "path", "sourc
 const workflow_audit_outcome_columns = [_][]const u8{ "outcome_kind", "mentions", "sessions" };
 const workflow_audit_session_columns = [_][]const u8{ "path", "signals", "first_seen", "last_seen" };
 const workflow_audit_term_summary_columns = [_][]const u8{ "term_group", "terms", "matched_rows", "unique_snippets", "sessions", "examples" };
+const skill_block_term_count_columns = [_][]const u8{ "skill", "block_hash", "term_group", "terms", "matched", "term_occurrence_count", "block_occurrence_count", "first_seen_timestamp", "last_seen_timestamp" };
+const skill_block_term_summary_columns = [_][]const u8{ "skill", "term_group", "terms", "blocks_scanned", "matching_blocks", "term_occurrence_count", "examples" };
 const workflow_overlap_summary_columns = [_][]const u8{ "workflow_a", "workflow_b", "sessions_a", "sessions_b", "overlap_sessions", "a_only_sessions", "b_only_sessions", "pct_a_with_b", "pct_b_with_a" };
 const workflow_overlap_session_columns = [_][]const u8{ "path", "overlap_class", "in_a", "in_b", "signals_a", "signals_b", "first_seen_a", "last_seen_a", "first_seen_b", "last_seen_b" };
 
@@ -2795,25 +2815,25 @@ fn workflowAuditColumnsForMode(mode: []const u8) ?[]const []const u8 {
     return null;
 }
 
-const WorkflowTermGroup = struct {
+const TermGroup = struct {
     name: []const u8,
     terms: []const []const u8,
     terms_display: []const u8,
 
-    fn deinit(self: WorkflowTermGroup, allocator: std.mem.Allocator) void {
+    fn deinit(self: TermGroup, allocator: std.mem.Allocator) void {
         allocator.free(self.terms);
         allocator.free(self.terms_display);
     }
 };
 
 const WorkflowTermState = struct {
-    group: WorkflowTermGroup,
+    group: TermGroup,
     matched_rows: usize = 0,
     sessions: StringSet,
     uniques: StringSet,
     examples: std.ArrayList([]u8) = .empty,
 
-    fn init(allocator: std.mem.Allocator, group: WorkflowTermGroup) WorkflowTermState {
+    fn init(allocator: std.mem.Allocator, group: TermGroup) WorkflowTermState {
         return .{
             .group = group,
             .sessions = StringSet.init(allocator),
@@ -2850,7 +2870,7 @@ fn cmdWorkflowTermSummaryRaw(
     var idx: usize = 0;
     while (idx < opts.term_group_count) : (idx += 1) {
         const raw = opts.term_group_texts[idx] orelse return error.InvalidModeArg;
-        try states.append(allocator, WorkflowTermState.init(allocator, try parseWorkflowTermGroup(allocator, raw)));
+        try states.append(allocator, WorkflowTermState.init(allocator, try parseTermGroup(allocator, raw)));
     }
 
     var workdir_paths = StringSet.init(allocator);
@@ -2930,7 +2950,7 @@ fn lineLooksLikeAssistantMessage(line: []const u8) bool {
     return std.mem.indexOf(u8, line, "\"role\":\"assistant\"") != null;
 }
 
-fn parseWorkflowTermGroup(allocator: std.mem.Allocator, raw: []const u8) !WorkflowTermGroup {
+fn parseTermGroup(allocator: std.mem.Allocator, raw: []const u8) !TermGroup {
     const eq = std.mem.indexOfScalar(u8, raw, '=') orelse return error.InvalidModeArg;
     const name = std.mem.trim(u8, raw[0..eq], " \t\r\n");
     const terms_raw = std.mem.trim(u8, raw[eq + 1 ..], " \t\r\n");
@@ -2958,6 +2978,29 @@ fn termGroupMatches(text: []const u8, terms: []const []const u8) bool {
         if (containsIgnoreCaseAscii(text, term)) return true;
     }
     return false;
+}
+
+fn countIgnoreCaseAsciiOccurrences(haystack: []const u8, needle: []const u8) usize {
+    if (needle.len == 0 or needle.len > haystack.len) return 0;
+    var count: usize = 0;
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) {
+        if (eqlIgnoreCaseAscii(haystack[start .. start + needle.len], needle)) {
+            count += 1;
+            start += needle.len;
+        } else {
+            start += 1;
+        }
+    }
+    return count;
+}
+
+fn countTermGroupOccurrences(text: []const u8, terms: []const []const u8) usize {
+    var total: usize = 0;
+    for (terms) |term| {
+        total += countIgnoreCaseAsciiOccurrences(text, term);
+    }
+    return total;
 }
 
 fn joinExamples(allocator: std.mem.Allocator, examples: []const []u8) ![]u8 {
@@ -7193,6 +7236,21 @@ const SkillBlockHistory = enum {
     }
 };
 
+const SkillBlockMode = enum {
+    blocks,
+    term_counts,
+    term_summary,
+
+    fn parse(raw_opt: ?[]const u8) !SkillBlockMode {
+        const raw = raw_opt orelse return .blocks;
+        if (std.mem.eql(u8, raw, "blocks")) return .blocks;
+        if (std.mem.eql(u8, raw, "term-counts")) return .term_counts;
+        if (std.mem.eql(u8, raw, "term-summary")) return .term_summary;
+        printCliError("error: invalid --mode value {s}; expected blocks, term-counts, or term-summary\n", .{raw});
+        return error.InvalidModeArg;
+    }
+};
+
 const ROLE_USER: u8 = 1;
 const ROLE_ASSISTANT: u8 = 2;
 
@@ -7428,8 +7486,124 @@ fn aggregatedSkillBlockRowsToQueryRows(
     return out;
 }
 
+fn deinitTermGroups(allocator: std.mem.Allocator, groups: *std.ArrayList(TermGroup)) void {
+    for (groups.items) |group| group.deinit(allocator);
+    groups.deinit(allocator);
+}
+
+fn parseSkillBlockTermGroups(allocator: std.mem.Allocator, opts: Options) !std.ArrayList(TermGroup) {
+    var groups: std.ArrayList(TermGroup) = .empty;
+    errdefer deinitTermGroups(allocator, &groups);
+
+    var idx: usize = 0;
+    while (idx < opts.term_group_count) : (idx += 1) {
+        const raw = opts.term_group_texts[idx] orelse return error.InvalidModeArg;
+        try groups.append(allocator, try parseTermGroup(allocator, raw));
+    }
+
+    return groups;
+}
+
+fn skillBlockExample(allocator: std.mem.Allocator, row: SkillBlockAggregate) ![]u8 {
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+    try writer.print("{s}: ", .{row.block_hash});
+    const snippet = row.block_text[0..@min(row.block_text.len, 160)];
+    for (snippet) |ch| {
+        switch (ch) {
+            '\n', '\r', '\t' => try writer.writeByte(' '),
+            else => try writer.writeByte(ch),
+        }
+    }
+    return writer_alloc.toOwnedSlice();
+}
+
+fn skillBlockTermCountRows(
+    allocator: std.mem.Allocator,
+    aggregates: []const SkillBlockAggregate,
+    groups: []const TermGroup,
+) !std.ArrayList(query.Row) {
+    var out: std.ArrayList(query.Row) = .empty;
+    errdefer deinitQueryRows(allocator, &out);
+
+    for (aggregates) |row| {
+        for (groups) |group| {
+            const occurrence_count = countTermGroupOccurrences(row.block_text, group.terms);
+            var qrow = query.Row.init(allocator);
+            errdefer qrow.deinit();
+
+            try qrow.putOwnedKey("skill", .{ .string = row.skill });
+            try qrow.putOwnedKey("block_hash", .{ .string = row.block_hash });
+            try qrow.putOwnedKey("term_group", .{ .string = group.name });
+            try qrow.putOwnedKey("terms", .{ .string = group.terms_display });
+            try qrow.putOwnedKey("matched", .{ .bool = occurrence_count > 0 });
+            try qrow.putOwnedKey("term_occurrence_count", .{ .int = @intCast(occurrence_count) });
+            try qrow.putOwnedKey("block_occurrence_count", .{ .int = @intCast(row.occurrence_count) });
+            try putOptionalString(&qrow, "first_seen_timestamp", row.first_seen_timestamp);
+            try putOptionalString(&qrow, "last_seen_timestamp", row.last_seen_timestamp);
+            try out.append(allocator, qrow);
+        }
+    }
+
+    return out;
+}
+
+fn skillBlockTermSummaryRows(
+    allocator: std.mem.Allocator,
+    skill: []const u8,
+    aggregates: []const SkillBlockAggregate,
+    groups: []const TermGroup,
+    example_limit: usize,
+) !std.ArrayList(query.Row) {
+    var out: std.ArrayList(query.Row) = .empty;
+    errdefer deinitQueryRows(allocator, &out);
+
+    for (groups) |group| {
+        var examples: std.ArrayList([]u8) = .empty;
+        defer {
+            for (examples.items) |example| allocator.free(example);
+            examples.deinit(allocator);
+        }
+
+        var matching_blocks: usize = 0;
+        var occurrence_count: usize = 0;
+        for (aggregates) |row| {
+            const count = countTermGroupOccurrences(row.block_text, group.terms);
+            if (count == 0) continue;
+            matching_blocks += 1;
+            occurrence_count += count;
+            if (examples.items.len < example_limit) {
+                try examples.append(allocator, try skillBlockExample(allocator, row));
+            }
+        }
+
+        var qrow = query.Row.init(allocator);
+        errdefer qrow.deinit();
+        const examples_text = try joinExamples(allocator, examples.items);
+        defer allocator.free(examples_text);
+        try qrow.putOwnedKey("skill", .{ .string = skill });
+        try qrow.putOwnedKey("term_group", .{ .string = group.name });
+        try qrow.putOwnedKey("terms", .{ .string = group.terms_display });
+        try qrow.putOwnedKey("blocks_scanned", .{ .int = @intCast(aggregates.len) });
+        try qrow.putOwnedKey("matching_blocks", .{ .int = @intCast(matching_blocks) });
+        try qrow.putOwnedKey("term_occurrence_count", .{ .int = @intCast(occurrence_count) });
+        try qrow.putOwnedKey("examples", .{ .string = examples_text });
+        try out.append(allocator, qrow);
+    }
+
+    return out;
+}
+
 fn cmdSkillBlocks(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
     const history = try SkillBlockHistory.parse(opts.history_text);
+    const mode = try SkillBlockMode.parse(opts.mode);
+    const term_mode = mode == .term_counts or mode == .term_summary;
+    if (mode == .blocks and (opts.term_group_count > 0 or opts.examples_set)) return error.InvalidModeArg;
+    if (mode == .term_counts and opts.examples_set) return error.InvalidModeArg;
+    if (term_mode and history == .all) return error.InvalidModeArg;
+    if (term_mode and opts.term_group_count == 0) return error.MissingArgValue;
+
     const day_filter = deriveSessionDayPathFilterFromOptions(opts);
     var input_paths = try resolveSessionPromptInputPaths(allocator, sessions_root, opts, day_filter);
     defer freePathList(allocator, &input_paths);
@@ -7440,7 +7614,7 @@ fn cmdSkillBlocks(allocator: std.mem.Allocator, sessions_root: []const u8, opts:
         raw_rows.deinit(allocator);
     }
 
-    if (history == .all) {
+    if (mode == .blocks and history == .all) {
         std.mem.sort(datasets.skill_blocks.SkillBlockRow, raw_rows.items, {}, skillBlockAllLessThan);
         const start_idx: usize = if (opts.limit > 0 and raw_rows.items.len > opts.limit) 0 else 0;
         const end_idx: usize = if (opts.limit > 0 and raw_rows.items.len > opts.limit) opts.limit else raw_rows.items.len;
@@ -7463,6 +7637,22 @@ fn cmdSkillBlocks(allocator: std.mem.Allocator, sessions_root: []const u8, opts:
         aggregate_slice = aggregates.items[aggregates.items.len - 1 ..];
     } else if (history == .distinct and opts.limit > 0 and aggregates.items.len > opts.limit) {
         aggregate_slice = aggregates.items[0..opts.limit];
+    }
+
+    if (mode == .term_counts or mode == .term_summary) {
+        var groups = try parseSkillBlockTermGroups(allocator, opts);
+        defer deinitTermGroups(allocator, &groups);
+        if (mode == .term_counts) {
+            var out_rows = try skillBlockTermCountRows(allocator, aggregate_slice, groups.items);
+            defer deinitQueryRows(allocator, &out_rows);
+            try output.writeOutput(allocator, if (opts.format_set) opts.format else .table, out_rows.items, skill_block_term_count_columns[0..], opts.out_path);
+            return;
+        }
+
+        var out_rows = try skillBlockTermSummaryRows(allocator, opts.skill orelse return error.MissingSkillArg, aggregate_slice, groups.items, opts.examples);
+        defer deinitQueryRows(allocator, &out_rows);
+        try output.writeOutput(allocator, if (opts.format_set) opts.format else .table, out_rows.items, skill_block_term_summary_columns[0..], opts.out_path);
+        return;
     }
 
     var out_rows = try aggregatedSkillBlockRowsToQueryRows(allocator, aggregate_slice);
@@ -15745,8 +15935,11 @@ test "validateCommandOptions rejects unsupported audit on skill-report" {
     try std.testing.expectError(error.UnsupportedOption, validateCommandOptions(.skill_report, opts));
 }
 
-test "validateFormatForCommand rejects table for skill-blocks" {
-    try std.testing.expectError(error.InvalidFormatForCommand, validateFormatForCommand(.skill_blocks, .table));
+test "validateFormatForCommand gates skill-blocks formats by mode" {
+    try std.testing.expectError(error.InvalidFormatForCommand, validateFormatForCommand(.skill_blocks, .{ .format = .table }));
+    try validateFormatForCommand(.skill_blocks, .{ .format = .table, .mode = "term-counts" });
+    try validateFormatForCommand(.skill_blocks, .{ .format = .csv, .mode = "term-summary" });
+    try std.testing.expectError(error.InvalidFormatForCommand, validateFormatForCommand(.skill_blocks, .{ .format = .markdown, .mode = "term-summary" }));
 }
 
 fn runCommandWithOutput(
@@ -16890,4 +17083,106 @@ test "skill-blocks history all preserves duplicate occurrences" {
     const needle = "\"skill\": \"accretive\"";
     try std.testing.expect(std.mem.indexOf(u8, got, needle) != null);
     try std.testing.expect(std.mem.count(u8, got, needle) == 2);
+}
+
+test "skill-blocks term modes count distinct aggregate block text" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/03/10");
+    const session_rel = "2026/03/10/rollout-2026-03-10T10-00-00-019c0000-0000-7000-8000-000000000022.jsonl";
+    const block_one =
+        "<skill>\\n<name>accretive</name>\\n# one\\nAblative ablation. Ablative.\\n</skill>";
+    const block_two =
+        "<skill>\\n<name>accretive</name>\\n# two\\nNo doctrine here.\\n</skill>";
+    const session_content =
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"" ++ block_one ++ "\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:01:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"" ++ block_one ++ "\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:02:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"" ++ block_two ++ "\"}]}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = session_rel, .data = session_content });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "skill-blocks-terms.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const counts_args = [_][]const u8{
+        "--root",
+        root_abs,
+        "--skill",
+        "accretive",
+        "--mode",
+        "term-counts",
+        "--term-group",
+        "ablation=ablative,ablation",
+        "--session-id",
+        "019c0000-0000-7000-8000-000000000022",
+        "--format",
+        "json",
+    };
+    const counts_got = try runCommandWithOutput(std.testing.allocator, .skill_blocks, counts_args[0..], output_path);
+    defer std.testing.allocator.free(counts_got);
+    try std.testing.expect(std.mem.indexOf(u8, counts_got, "\"term_occurrence_count\": 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, counts_got, "\"block_occurrence_count\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, counts_got, "\"term_occurrence_count\": 0") != null);
+    try std.testing.expect(std.mem.count(u8, counts_got, "\"term_group\": \"ablation\"") == 2);
+
+    const summary_args = [_][]const u8{
+        "--root",
+        root_abs,
+        "--skill",
+        "accretive",
+        "--mode",
+        "term-summary",
+        "--term-group",
+        "ablation=ablative,ablation",
+        "--session-id",
+        "019c0000-0000-7000-8000-000000000022",
+        "--format",
+        "json",
+    };
+    const summary_got = try runCommandWithOutput(std.testing.allocator, .skill_blocks, summary_args[0..], output_path);
+    defer std.testing.allocator.free(summary_got);
+    try std.testing.expect(std.mem.indexOf(u8, summary_got, "\"blocks_scanned\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary_got, "\"matching_blocks\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary_got, "\"term_occurrence_count\": 3") != null);
+}
+
+test "skill-blocks term modes fail closed on missing groups and raw history" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/03/10");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "skill-blocks-terms-invalid.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const missing_group_args = [_][]const u8{
+        "--root",
+        root_abs,
+        "--skill",
+        "accretive",
+        "--mode",
+        "term-summary",
+        "--format",
+        "json",
+    };
+    try std.testing.expectError(error.MissingArgValue, runCommandWithOutput(std.testing.allocator, .skill_blocks, missing_group_args[0..], output_path));
+
+    const raw_history_args = [_][]const u8{
+        "--root",
+        root_abs,
+        "--skill",
+        "accretive",
+        "--mode",
+        "term-counts",
+        "--term-group",
+        "ablation=ablative,ablation",
+        "--history",
+        "all",
+        "--format",
+        "json",
+    };
+    try std.testing.expectError(error.InvalidModeArg, runCommandWithOutput(std.testing.allocator, .skill_blocks, raw_history_args[0..], output_path));
 }

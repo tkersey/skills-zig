@@ -44,6 +44,7 @@ Binary output:
 ./zig-out/bin/seq workflow-audit --workflow fixed-point-driver --since 2026-04-01T00:00:00Z --format table
 ./zig-out/bin/seq workflow-audit --workflow fixed-point-driver --mode report --format markdown
 ./zig-out/bin/seq workflow-audit --workflow fixed-point-driver --mode term-summary --term-group additive=add,added,patch --term-group reductive=delete,remove,refactor --since 2026-05-02T00:00:00-07:00 --format table
+./zig-out/bin/seq skill-blocks --skill fixed-point-driver --mode term-summary --term-group ablation=ablative,ablation --term-group isomorphism=isomorphic,isomorphism --since 2026-05-02T00:00:00-07:00 --format table
 ./zig-out/bin/seq workflow-overlap --workflow fixed-point-driver,review-adjudication --since 2026-05-02T00:00:00-07:00 --format table
 ./zig-out/bin/seq find-session --root ~/.codex/sessions --prompt "learnings recall" --since 2026-03-08T00:00:00Z --until 2026-03-10T23:59:59Z --limit 5 --format table
 ./zig-out/bin/seq plan-search --root ~/.codex/sessions --repo /Users/tk/workspace/tk/shift --since 2026-03-01T00:00:00Z --format table
@@ -114,6 +115,19 @@ seq workflow-audit --root ~/.codex/sessions --workflow fixed-point-driver --mode
 seq workflow-audit --root ~/.codex/sessions --workflow fixed-point-driver --mode term-summary --term-group additive=add,added,patch --term-group reductive=delete,remove,refactor --format table
 seq workflow-overlap --root ~/.codex/sessions --workflow fixed-point-driver,review-adjudication --mode summary --since 2026-05-02T00:00:00-07:00 --format table
 seq workflow-overlap --root ~/.codex/sessions --workflow fixed-point-driver,review-adjudication --mode sessions --limit 20 --format jsonl
+```
+
+`skill-blocks` is the exact-body surface for injected `<skill>...</skill>` content:
+- defaults to `--mode blocks --history distinct --format jsonl`, preserving the existing exact block export contract
+- `--mode term-counts` emits one row per selected distinct/latest `block_hash + term_group`, including zero-count rows
+- `--mode term-summary` aggregates the same term-count data by `skill + term_group` and caps examples with `--examples N` (default 3, max 10)
+- term modes require repeated `--term-group <name=csv>` flags, count case-insensitive literal terms inside `block_text`, and reject `--history all` for v1
+- term modes support `--format table|json|csv|jsonl`; legacy `blocks` mode remains `json|jsonl`
+
+Examples:
+```bash
+seq skill-blocks --root ~/.codex/sessions --skill fixed-point-driver --mode term-counts --term-group ablation=ablative,ablation --format table
+seq skill-blocks --root ~/.codex/sessions --skill fixed-point-driver --mode term-summary --term-group ablation=ablative,ablation --term-group isomorphism=isomorphic,isomorphism --examples 5 --format table
 ```
 
 ## Trace-native session surfaces

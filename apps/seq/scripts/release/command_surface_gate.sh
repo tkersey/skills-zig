@@ -112,6 +112,14 @@ if ! "$BIN_PATH" workflow-audit --help | rg -q -- '--term-group <name=csv>'; the
   echo "workflow-audit help missing --term-group support" >&2
   exit 1
 fi
+if ! "$BIN_PATH" skill-blocks --help | rg -q -- '--mode blocks|term-counts|term-summary'; then
+  echo "skill-blocks help missing native term-analysis modes" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" skill-blocks --help | rg -q -- '--term-group <name=csv>'; then
+  echo "skill-blocks help missing --term-group support" >&2
+  exit 1
+fi
 if ! "$BIN_PATH" workflow-overlap --help | rg -q -- '--mode summary|sessions'; then
   echo "workflow-overlap help missing summary/sessions modes" >&2
   exit 1
