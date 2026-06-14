@@ -1625,6 +1625,10 @@ fn parseArgs(argv: []const []const u8) !Args {
                 return error.InvalidSetProofArg;
             },
             .complete => {
+                if (!std.mem.startsWith(u8, token, "--") and args.id == null) {
+                    args.id = token;
+                    continue;
+                }
                 if (std.mem.eql(u8, token, "--id")) {
                     i += 1;
                     if (i >= argv.len) return error.MissingIdValue;
@@ -1634,7 +1638,7 @@ fn parseArgs(argv: []const []const u8) !Args {
                 if (std.mem.eql(u8, token, "--proof")) {
                     i += 1;
                     if (i >= argv.len) return error.MissingValue;
-                    args.proof_id = argv[i];
+                    args.evidence_ref = argv[i];
                     continue;
                 }
                 if (std.mem.eql(u8, token, "--command")) {
@@ -9561,6 +9565,23 @@ test "graph complete requires proof and demotes completed item" {
     try std.testing.expectEqual(ProofState.pass, item.proof.?.state);
     try std.testing.expectEqualStrings("proof.log", item.proof.?.evidence_ref);
     try std.testing.expectEqual(@as(u8, 0), try cmdProof(allocator, .{ .command = .proof, .proof_command = .audit, .file = plan_path, .id = "st-001", .format = .json }));
+}
+
+test "complete parses legacy positional id and proof evidence alias" {
+    const args = try parseArgs(&.{
+        "st",
+        "complete",
+        "st-982",
+        "--proof",
+        ".step/proof/st-982.log",
+        "--command",
+        "zig build test-st --summary all",
+    });
+
+    try std.testing.expectEqual(Command.complete, args.command);
+    try std.testing.expectEqualStrings("st-982", args.id.?);
+    try std.testing.expectEqualStrings(".step/proof/st-982.log", args.evidence_ref.?);
+    try std.testing.expectEqualStrings("zig build test-st --summary all", args.step.?);
 }
 
 test "emitPlanSync keeps inventory while filtering mirrored plan projections" {
