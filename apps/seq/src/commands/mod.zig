@@ -670,6 +670,8 @@ fn printCommandHelp(cmd: lib.Command) !void {
         ,
         .skill_audit =>
         \\usage: seq skill-audit [--skill <name>] [--mode summary|mentions|trend|activation] [--roles <csv>] [--last <Nm|Nh|Nd>|--since <iso>] [--until <iso>] [--exclude-current] [--limit N] [--format table|json|csv|jsonl]
+        \\extra options:
+        \\  --mode activation         Counts explicit $skill calls, assistant $skill calls, injected blocks, bare references, and SKILL.md tool reads
         ,
         .skill_blocks =>
         \\usage: seq skill-blocks --skill <name> [--mode blocks|term-counts|term-summary] [--term-group <name=csv>] [--examples N] [--history <distinct|all|latest>] [--session-id <id>|--path <jsonl>|--current] [--since <iso>] [--until <iso>] [--limit N] [--format table|json|csv|jsonl]
@@ -690,7 +692,7 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\usage: seq message-audit [--mode summary|rows|sessions] [--contains <text>|--regex <expr>|--contains-any <csv>|--contains-all <csv>] [--roles <csv>] [--since <iso>] [--until <iso>] [--exclude-current] [--show-query] [--limit N] [--format table|json|csv|jsonl]
         ,
         .skill_cohort =>
-        \\usage: seq skill-cohort [--skill <name>] [--mode summary|cohort|mentions] [--roles <csv>] [--contains <text>|--regex <expr>|--contains-any <csv>] [--since <iso>] [--until <iso>] [--exclude-current] [--show-query] [--limit N] [--format table|json|csv|jsonl]
+        \\usage: seq skill-cohort [--skill <name>] [--mode summary|cohort|mentions] [--roles <csv>] [--contains <text>|--regex <expr>|--contains-any <csv>] [--last <Nm|Nh|Nd>|--since <iso>] [--until <iso>] [--exclude-current] [--show-query] [--limit N] [--format table|json|csv|jsonl]
         ,
         .tool_search =>
         \\usage: seq tool-search [--mode rows|summary|args] [--group-by executable|tool|session|workdir|command] [--tool <name>] [--executable <name>] [--workdir <path>] [--path <jsonl>|--session-id <id>] [--contains <text>|--contains-any <csv>|--regex <expr>] [--since <iso>] [--until <iso>] [--exclude-current] [--show-query] [--limit N] [--format table|json|csv|jsonl]
@@ -800,7 +802,7 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\usage: seq goal-audit [--mode summary|rows] [--workflow review|resolve|review,resolve] [--duration-gte <seconds|minutes|hours>] [--status <name>] [--contains <text>] [--since <iso>] [--until <iso>] [--path <jsonl>|--session-id <id>] [--exclude-current] [--show-query] [--limit N] [--format table|json|csv|jsonl]
         ,
         .workflow_audit =>
-        \\usage: seq workflow-audit --workflow <name> [--mode summary|signals|outcomes|sessions|report|term-summary] [--term-group <name=csv>] [--examples N] [--unique-by snippet|path-snippet] [--since <iso>] [--until <iso>] [--exclude-current] [--workdir <path>] [--limit N] [--format table|json|csv|jsonl|markdown]
+        \\usage: seq workflow-audit --workflow <name> [--mode summary|signals|outcomes|sessions|report|term-summary] [--term-group <name=csv>] [--examples N] [--unique-by snippet|path-snippet] [--last <Nm|Nh|Nd>|--since <iso>] [--until <iso>] [--exclude-current] [--workdir <path>] [--limit N] [--format table|json|csv|jsonl|markdown]
         ,
         .workflow_overlap =>
         \\usage: seq workflow-overlap --workflow <a,b> [--mode summary|sessions] [--since <iso>] [--until <iso>] [--workdir <path>] [--limit N] [--format table|json|csv|jsonl]
@@ -1142,7 +1144,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     };
     const supports_window_hours = cmd == .token_window;
     const supports_duration_gte = cmd == .goal_audit;
-    const supports_last = cmd == .token_usage or cmd == .token_cost or cmd == .skill_audit or cmd == .skill_success_rank or cmd == .adjudication_audit;
+    const supports_last = cmd == .token_usage or cmd == .token_cost or cmd == .skill_audit or cmd == .skill_success_rank or cmd == .skill_cohort or cmd == .workflow_audit or cmd == .adjudication_audit;
     const supports_include_root_equivalent = cmd == .adjudication_audit;
     const supports_bundle_dir = cmd == .adjudication_audit;
     const supports_token_cost_options = cmd == .token_cost;
@@ -3285,6 +3287,8 @@ fn collectWorkflowAuditRows(
 
     var where: std.ArrayList(spec.WhereClause) = .empty;
     defer where.deinit(allocator);
+    const last_bounds = try QueryLiftCommands.appendLastWindowBoundsForField(allocator, &where, "timestamp", opts);
+    defer last_bounds.deinit(allocator);
     try appendSessionTimeBounds(allocator, &where, opts);
 
     const signal_query = spec.QuerySpec{
@@ -4120,6 +4124,7 @@ const QueryLiftCommands = struct {
         explicit_user_call,
         implicit_assistant_call,
         injected_skill_block,
+        skill_file_read,
         other_reference,
     };
 
@@ -4180,6 +4185,7 @@ const QueryLiftCommands = struct {
             .explicit_user_call => "explicit_user_call",
             .implicit_assistant_call => "implicit_assistant_call",
             .injected_skill_block => "injected_skill_block",
+            .skill_file_read => "skill_file_read",
             .other_reference => "other_reference",
         };
     }
@@ -4187,7 +4193,7 @@ const QueryLiftCommands = struct {
     fn activationVerdict(kind: SkillActivationKind) []const u8 {
         return switch (kind) {
             .explicit_user_call, .implicit_assistant_call => "activation",
-            .injected_skill_block => "not_activation",
+            .injected_skill_block, .skill_file_read => "not_activation",
             .other_reference => "reference",
         };
     }
@@ -4197,7 +4203,8 @@ const QueryLiftCommands = struct {
             .explicit_user_call => 0,
             .implicit_assistant_call => 1,
             .injected_skill_block => 2,
-            .other_reference => 3,
+            .skill_file_read => 3,
+            .other_reference => 4,
         };
     }
 
@@ -4272,6 +4279,24 @@ const QueryLiftCommands = struct {
         return false;
     }
 
+    fn containsSkillPathSegment(text: []const u8, skill: []const u8) bool {
+        if (skill.len == 0 or skill.len > text.len) return false;
+        var pos: usize = 0;
+        while (pos + skill.len <= text.len) : (pos += 1) {
+            const end = pos + skill.len;
+            if (!eqlIgnoreCaseAscii(text[pos..end], skill)) continue;
+            if (pos == 0 or !isPathSep(text[pos - 1])) continue;
+            if (end >= text.len or !isPathSep(text[end])) continue;
+            return true;
+        }
+        return false;
+    }
+
+    fn containsSkillFileRead(text_opt: ?[]const u8, skill: []const u8) bool {
+        const text = text_opt orelse return false;
+        return containsIgnoreCaseAscii(text, "SKILL.md") and containsSkillPathSegment(text, skill);
+    }
+
     fn isSkillSignalNameChar(ch: u8) bool {
         return std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_';
     }
@@ -4340,6 +4365,20 @@ const QueryLiftCommands = struct {
         fn deinit(self: OwnedTimeBounds, allocator: std.mem.Allocator) void {
             if (self.since) |value| allocator.free(value);
             if (self.until) |value| allocator.free(value);
+        }
+    };
+
+    const OwnedScalarLists = struct {
+        lists: std.ArrayList([]spec.Scalar) = .empty,
+
+        fn keep(self: *OwnedScalarLists, allocator: std.mem.Allocator, list_opt: ?[]spec.Scalar) !void {
+            const list = list_opt orelse return;
+            try self.lists.append(allocator, list);
+        }
+
+        fn deinit(self: *OwnedScalarLists, allocator: std.mem.Allocator) void {
+            for (self.lists.items) |list| allocator.free(list);
+            self.lists.deinit(allocator);
         }
     };
 
@@ -4790,6 +4829,7 @@ const QueryLiftCommands = struct {
             SkillActivationState.init(allocator, .explicit_user_call),
             SkillActivationState.init(allocator, .implicit_assistant_call),
             SkillActivationState.init(allocator, .injected_skill_block),
+            SkillActivationState.init(allocator, .skill_file_read),
             SkillActivationState.init(allocator, .other_reference),
         };
         defer for (&states) |*state| state.deinit(allocator);
@@ -4804,6 +4844,7 @@ const QueryLiftCommands = struct {
 
             try recordSkillActivationMentions(allocator, &states, skill, path, content.?, window, opts);
             try recordSkillActivationReferences(allocator, &states, skill, path, content.?, window, opts);
+            try recordSkillActivationToolReads(allocator, &states, skill, path, window);
         }
 
         var out_rows: std.ArrayList(query.Row) = .empty;
@@ -4827,7 +4868,7 @@ const QueryLiftCommands = struct {
 
     fn recordSkillActivationMentions(
         allocator: std.mem.Allocator,
-        states: *[4]SkillActivationState,
+        states: *[5]SkillActivationState,
         skill: []const u8,
         path: []const u8,
         content: []const u8,
@@ -4858,7 +4899,7 @@ const QueryLiftCommands = struct {
 
     fn recordSkillActivationReferences(
         allocator: std.mem.Allocator,
-        states: *[4]SkillActivationState,
+        states: *[5]SkillActivationState,
         skill: []const u8,
         path: []const u8,
         content: []const u8,
@@ -4879,6 +4920,30 @@ const QueryLiftCommands = struct {
             if (!containsBareSkillReference(row.text, skill)) continue;
             if (containsDollarSkill(row.text, skill)) continue;
             try states[activationStateIndex(.other_reference)].record(allocator, row.path, row.timestamp, row.text);
+        }
+    }
+
+    fn recordSkillActivationToolReads(
+        allocator: std.mem.Allocator,
+        states: *[5]SkillActivationState,
+        skill: []const u8,
+        path: []const u8,
+        window: SkillActivationWindow,
+    ) !void {
+        var records: std.ArrayList(InvocationRecord) = .empty;
+        defer deinitInvocationRecords(allocator, &records);
+        try collectInvocationRecordsFromSession(allocator, path, &records);
+
+        for (records.items) |record| {
+            if (!timestampSatisfiesActivationWindow(record.start_ts, window)) continue;
+            if (!containsSkillFileRead(record.command_text, skill) and
+                !containsSkillFileRead(record.arguments_text, skill) and
+                !containsSkillFileRead(record.input_text, skill))
+            {
+                continue;
+            }
+            const snippet = record.command_text orelse record.arguments_text orelse record.input_text orelse "";
+            try states[activationStateIndex(.skill_file_read)].record(allocator, record.path, record.start_ts, snippet);
         }
     }
 
@@ -5174,15 +5239,16 @@ const QueryLiftCommands = struct {
         sessions_root: []const u8,
         where: *std.ArrayList(spec.WhereClause),
         opts: Options,
+        owned_lists: *OwnedScalarLists,
     ) !?[]u8 {
         try appendSessionTimeBounds(allocator, where, opts);
         const exclude_path = try appendCurrentSessionExclusion(allocator, sessions_root, where, opts);
         errdefer if (exclude_path) |path| allocator.free(path);
         const role_values = try appendRolesWhere(allocator, where, opts.roles_csv);
-        defer if (role_values) |values| allocator.free(values);
+        try owned_lists.keep(allocator, role_values);
         try appendOptionalContains(allocator, where, "text", opts.contains);
         const contains_any_values = try appendCsvContainsAny(allocator, where, "text", opts.contains_any_text);
-        defer if (contains_any_values) |values| allocator.free(values);
+        try owned_lists.keep(allocator, contains_any_values);
         try appendCsvContainsAll(allocator, where, "text", opts.contains_all_text);
         try appendOptionalRegex(allocator, where, "text", opts.regex);
         return exclude_path;
@@ -5192,7 +5258,9 @@ const QueryLiftCommands = struct {
         const mode = opts.mode orelse "summary";
         var where: std.ArrayList(spec.WhereClause) = .empty;
         defer where.deinit(allocator);
-        const exclude_path = try appendMessageAuditFilters(allocator, sessions_root, &where, opts);
+        var owned_lists = OwnedScalarLists{};
+        defer owned_lists.deinit(allocator);
+        const exclude_path = try appendMessageAuditFilters(allocator, sessions_root, &where, opts, &owned_lists);
         defer if (exclude_path) |path| allocator.free(path);
 
         if (std.mem.eql(u8, mode, "summary")) {
@@ -5247,15 +5315,16 @@ const QueryLiftCommands = struct {
         where: *std.ArrayList(spec.WhereClause),
         opts: Options,
         include_exact_skill: bool,
+        owned_lists: *OwnedScalarLists,
     ) !?[]u8 {
         try appendSessionTimeBounds(allocator, where, opts);
         const exclude_path = try appendCurrentSessionExclusion(allocator, sessions_root, where, opts);
         errdefer if (exclude_path) |path| allocator.free(path);
         const role_values = try appendRolesWhere(allocator, where, opts.roles_csv);
-        defer if (role_values) |values| allocator.free(values);
+        try owned_lists.keep(allocator, role_values);
         if (include_exact_skill) try appendOptionalStringEq(allocator, where, "skill", opts.skill);
         const contains_any_values = try appendCsvContainsAny(allocator, where, "skill", opts.contains_any_text);
-        defer if (contains_any_values) |values| allocator.free(values);
+        try owned_lists.keep(allocator, contains_any_values);
         try appendOptionalContains(allocator, where, "snippet", opts.contains);
         try appendOptionalRegex(allocator, where, "snippet", opts.regex);
         return exclude_path;
@@ -5267,7 +5336,11 @@ const QueryLiftCommands = struct {
 
         var where: std.ArrayList(spec.WhereClause) = .empty;
         defer where.deinit(allocator);
-        const exclude_path = try appendSkillCohortFilters(allocator, sessions_root, &where, opts, true);
+        const last_bounds = try appendLastWindowBoundsForField(allocator, &where, "timestamp", opts);
+        defer last_bounds.deinit(allocator);
+        var owned_lists = OwnedScalarLists{};
+        defer owned_lists.deinit(allocator);
+        const exclude_path = try appendSkillCohortFilters(allocator, sessions_root, &where, opts, true, &owned_lists);
         defer if (exclude_path) |path| allocator.free(path);
 
         if (std.mem.eql(u8, mode, "summary")) {
@@ -5335,7 +5408,11 @@ const QueryLiftCommands = struct {
         const cohort_skill = opts.skill orelse return error.MissingSkillArg;
         var where: std.ArrayList(spec.WhereClause) = .empty;
         defer where.deinit(allocator);
-        const exclude_path = try appendSkillCohortFilters(allocator, sessions_root, &where, opts, false);
+        const last_bounds = try appendLastWindowBoundsForField(allocator, &where, "timestamp", opts);
+        defer last_bounds.deinit(allocator);
+        var owned_lists = OwnedScalarLists{};
+        defer owned_lists.deinit(allocator);
+        const exclude_path = try appendSkillCohortFilters(allocator, sessions_root, &where, opts, false, &owned_lists);
         defer if (exclude_path) |path| allocator.free(path);
         const base_query = spec.QuerySpec{
             .where = where.items,
@@ -12271,6 +12348,17 @@ fn appendSessionTimeBounds(
 
 fn timestampSatisfiesBounds(ts_opt: ?[]const u8, opts: Options) bool {
     const ts = ts_opt orelse return false;
+    if (opts.last_text) |raw_last| {
+        const duration_ms = parseLastWindowMillis(raw_last) catch return false;
+        const anchor_ms = if (opts.until) |raw_until|
+            time_utils.parseIsoTimestampMillis(raw_until) orelse return false
+        else
+            currentUnixMillis();
+        const ts_ms = time_utils.parseIsoTimestampMillis(ts) orelse return false;
+        if (ts_ms < anchor_ms - duration_ms) return false;
+        if (ts_ms > anchor_ms) return false;
+        return true;
+    }
     if (opts.since) |raw_since| {
         if (compareNormalizedTimestamp(ts, raw_since) == .lt) return false;
     }
@@ -12293,6 +12381,18 @@ fn compareNormalizedTimestamp(lhs: []const u8, raw_rhs: []const u8) std.math.Ord
 }
 
 fn deriveSessionDayPathFilterFromOptions(opts: Options) ?SessionDayPathFilter {
+    if (opts.last_text) |raw_last| {
+        const duration_ms = parseLastWindowMillis(raw_last) catch return null;
+        const anchor_ms = if (opts.until) |raw_until|
+            time_utils.parseIsoTimestampMillis(raw_until) orelse return null
+        else
+            currentUnixMillis();
+        return deriveSessionDayPathFilterFromWindow(.{
+            .since_ms = anchor_ms - duration_ms,
+            .until_ms = anchor_ms,
+        });
+    }
+
     var where: [2]spec.WhereClause = undefined;
     var len: usize = 0;
     if (opts.since) |value| {
@@ -16509,6 +16609,26 @@ test "workflow-audit reports a workflow cohort without cross-session contaminati
     }
 
     {
+        const got = try runCommandWithOutput(std.testing.allocator, .workflow_audit, &.{
+            "--root",
+            root_abs,
+            "--workflow",
+            "fixed-point-driver",
+            "--mode",
+            "signals",
+            "--last",
+            "1h",
+            "--until",
+            "2026-05-04T10:30:00Z",
+            "--format",
+            "json",
+        }, output_path);
+        defer std.testing.allocator.free(got);
+        try std.testing.expect(std.mem.indexOf(u8, got, "workflow-target") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "workflow-other") == null);
+    }
+
+    {
         const got = try runCommandWithOutput(std.testing.allocator, .workflow_audit, &.{ "--root", root_abs, "--workflow", "fixed-point-driver", "--mode", "report" }, output_path);
         defer std.testing.allocator.free(got);
         try std.testing.expect(std.mem.indexOf(u8, got, "# seq workflow-audit: fixed-point-driver") != null);
@@ -17266,6 +17386,7 @@ test "query-lift commands run representative dataset wrappers" {
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Using seq\"}]}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:00:02Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"q1\",\"arguments\":\"{\\\"cmd\\\":\\\"seq query --spec @spec.json\\\",\\\"workdir\\\":\\\"/tmp/query-lift-repo\\\"}\"}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:00:03Z\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"q1\",\"output\":\"Chunk ID: aa\\nWall time: 0.120 seconds\\nProcess exited with code 0\\nOutput:\\n\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:00:04Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"q2\",\"arguments\":\"{\\\"cmd\\\":\\\"sed -n '1,220p' /Users/tk/.dotfiles/codex/skills/seq/SKILL.md\\\",\\\"workdir\\\":\\\"/tmp/query-lift-repo\\\"}\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-05T10:00:04Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":10}}}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-03-05T10:30:04Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":25}}}}\n";
     try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
@@ -17299,6 +17420,27 @@ test "query-lift commands run representative dataset wrappers" {
     defer std.testing.allocator.free(skill_got);
     try std.testing.expect(std.mem.indexOf(u8, skill_got, "\"skill\": \"seq\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, skill_got, "\"mentions\": 1") != null);
+
+    const skill_activation_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "skill-audit-activation.json" });
+    defer std.testing.allocator.free(skill_activation_out);
+    const skill_activation_args = [_][]const u8{
+        "--root",
+        sessions_abs,
+        "--skill",
+        "seq",
+        "--mode",
+        "activation",
+        "--last",
+        "1d",
+        "--until",
+        "2026-03-06T00:00:00Z",
+        "--format",
+        "json",
+    };
+    const skill_activation_got = try runCommandWithOutput(std.testing.allocator, .skill_audit, skill_activation_args[0..], skill_activation_out);
+    defer std.testing.allocator.free(skill_activation_got);
+    try std.testing.expect(std.mem.indexOf(u8, skill_activation_got, "\"evidence_kind\": \"skill_file_read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, skill_activation_got, "codex/skills/seq/SKILL.md") != null);
 
     const tool_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "tool-audit.json" });
     defer std.testing.allocator.free(tool_out);
@@ -17415,6 +17557,43 @@ test "query-lift commands run representative dataset wrappers" {
     defer std.testing.allocator.free(show_query_got);
     try std.testing.expect(std.mem.indexOf(u8, show_query_got, "\"dataset\": \"messages\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, show_query_got, "\"field\":\"text\"") != null);
+
+    const show_query_list_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "show-query-list.json" });
+    defer std.testing.allocator.free(show_query_list_out);
+    const show_query_list_args = [_][]const u8{
+        "--root",
+        sessions_abs,
+        "--contains-any",
+        "query lift needle,missing needle",
+        "--roles",
+        "user,assistant",
+        "--show-query",
+        "--format",
+        "json",
+    };
+    const show_query_list_got = try runCommandWithOutput(std.testing.allocator, .message_audit, show_query_list_args[0..], show_query_list_out);
+    defer std.testing.allocator.free(show_query_list_got);
+    try std.testing.expect(std.mem.indexOf(u8, show_query_list_got, "\"op\":\"in\",\"value\":[\"user\", \"assistant\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, show_query_list_got, "\"op\":\"contains_any\",\"value\":[\"query lift needle\", \"missing needle\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, show_query_list_got, "null") == null);
+
+    const skill_cohort_last_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "skill-cohort-last.json" });
+    defer std.testing.allocator.free(skill_cohort_last_out);
+    const skill_cohort_last_args = [_][]const u8{
+        "--root",
+        sessions_abs,
+        "--skill",
+        "seq",
+        "--last",
+        "1d",
+        "--until",
+        "2026-03-06T00:00:00Z",
+        "--format",
+        "json",
+    };
+    const skill_cohort_last_got = try runCommandWithOutput(std.testing.allocator, .skill_cohort, skill_cohort_last_args[0..], skill_cohort_last_out);
+    defer std.testing.allocator.free(skill_cohort_last_got);
+    try std.testing.expect(std.mem.indexOf(u8, skill_cohort_last_got, "\"cohort_skill\": \"seq\"") != null);
 }
 
 test "skill-audit activation classifies evidence and excludes current session" {
@@ -17549,7 +17728,7 @@ test "skill-audit activation classifies evidence and excludes current session" {
     };
     const zero_got = try runCommandWithOutput(std.testing.allocator, .skill_audit, zero_args[0..], zero_out);
     defer std.testing.allocator.free(zero_got);
-    try std.testing.expectEqual(@as(usize, 4), countOccurrences(zero_got, "\"rows\": 0"));
+    try std.testing.expectEqual(@as(usize, 5), countOccurrences(zero_got, "\"rows\": 0"));
 }
 
 test "skill-blocks distinct returns one aggregated version with metadata" {
