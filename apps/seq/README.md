@@ -60,9 +60,10 @@ Binary output:
 ./zig-out/bin/seq skill-success-rank --root ~/.codex/sessions --last 14d --format table
 ./zig-out/bin/seq skill-success-rank --root ~/.codex/sessions --skill seq --mode sessions --last 14d --format jsonl
 ./zig-out/bin/seq skill-audit --skill seq --mode trend --since 2026-04-01T00:00:00Z --format table
+./zig-out/bin/seq skill-audit --skill universalist --mode activation --last 36h --exclude-current --format table
 ./zig-out/bin/seq tool-audit --group-by executable --since 2026-04-01T00:00:00Z --limit 20 --format table
 ./zig-out/bin/seq memory-inventory --mode categories --memory-root ~/.codex/memories --format table
-./zig-out/bin/seq message-search --contains "release workflow" --roles user,assistant --limit 20 --format table
+./zig-out/bin/seq message-search --contains "release workflow" --roles user,assistant --exclude-current --limit 20 --format table
 ./zig-out/bin/seq message-audit --contains-any "jq,seq query" --roles user,assistant --exclude-current --limit 20 --format table
 ./zig-out/bin/seq skill-cohort --skill seq --since 2026-04-01T00:00:00Z --exclude-current --format table
 ./zig-out/bin/seq tool-search --contains "seq query" --group-by executable --mode summary --exclude-current --format table
@@ -214,8 +215,9 @@ seq query --root ~/.codex/sessions --spec '{"dataset":"session_graph_edges","sel
 
 Query-lift commands provide top-level shortcuts for common `seq query` shapes:
 - `skill-success-rank` ranks user-called skills by sessions with positive outcome evidence, avoiding raw mention-count inflation and full `workflow_signals` scans.
-- `skill-audit` summarizes `skill_mentions` by skill, emits mention rows, or produces a daily trend for one skill.
-- `workflow-audit` summarizes workflow cohorts across session text, skill mentions, tool traces, session graph roles, and outcome signals.
+- `skill-audit` summarizes `skill_mentions` by skill, emits mention rows, produces a daily trend for one skill, or classifies activation evidence with `--mode activation`.
+- `skill-audit --mode activation --skill <name> --last <window> --exclude-current` is the optimized path for "was `$skill` called explicitly or implicitly?" It emits explicit user calls, implicit assistant calls, injected skill blocks, and other references separately, so pasted skill bodies are not counted as activation.
+- `workflow-audit` summarizes workflow cohorts across session text, skill mentions, tool traces, session graph roles, and outcome signals; use `--exclude-current` when auditing an active run.
 - `tool-audit` summarizes `tool_invocations` by tool, executable, session, workdir, or command, with row and unresolved modes for drilling down.
 - `memory-inventory` summarizes file-backed memory categories and can switch to file, block, stage1, or extension inventory modes.
 - `message-search` searches session message text with `--contains`, `--regex`, `--contains-any`, or `--contains-all`.
@@ -226,6 +228,11 @@ Query-lift commands provide top-level shortcuts for common `seq query` shapes:
 - `token-window` computes the max rolling token window from timestamp-sorted `token_deltas` rows and can emit the contributing rows.
 - `goal-audit` summarizes `/goal` runs from `get_goal` / `update_goal` / `create_goal` outputs, with workflow filters for `review` and `resolve` and duration thresholds like `--duration-gte 2h`.
 - `workdir-report` summarizes canonical session rows by `cwd` and can list matching sessions.
+
+Generic `seq query` remains the right tool for novel joins, custom denominators,
+or one-off dataset projections that are not covered by a lifted command. Use a
+lifted command when it matches the question; do not avoid raw `query` when it is
+the simpler and more exact expression.
 
 `memory-provenance` answers the targeted origin question for one memory thread or rollout summary:
 - accepts `--thread-id` or `--rollout-summary-file`
