@@ -59,6 +59,7 @@ Binary output:
 ./zig-out/bin/seq artifact-search --contains "MEMORY.md" --kind memory --stats --format table
 ./zig-out/bin/seq skill-success-rank --root ~/.codex/sessions --last 14d --format table
 ./zig-out/bin/seq skill-success-rank --root ~/.codex/sessions --skill seq --mode sessions --last 14d --format jsonl
+./zig-out/bin/seq skill-evidence --root ~/.codex/sessions --session-id <session_id> --skill seq --format json
 ./zig-out/bin/seq skill-audit --skill seq --mode trend --since 2026-04-01T00:00:00Z --format table
 ./zig-out/bin/seq skill-audit --skill universalist --mode activation --last 36h --exclude-current --format table
 ./zig-out/bin/seq tool-audit --group-by executable --since 2026-04-01T00:00:00Z --limit 20 --format table
@@ -129,6 +130,19 @@ Examples:
 ```bash
 seq skill-blocks --root ~/.codex/sessions --skill fixed-point-driver --mode term-counts --term-group ablation=ablative,ablation --format table
 seq skill-blocks --root ~/.codex/sessions --skill fixed-point-driver --mode term-summary --term-group ablation=ablative,ablation --term-group isomorphism=isomorphic,isomorphism --examples 5 --format table
+```
+
+`skill-evidence` summarizes skill-use evidence for one watched session:
+- requires `--skill <name>` plus `--session-id <id>` or `--path <jsonl>`
+- distinguishes injected skill blocks, assistant-declared use, manual `SKILL.md` reads, target-skill lens use, successful outcome evidence, and raw mentions
+- emits a cursor in JSON and base64url token forms; pass `--since-cursor <cursor>` for delta mode
+- defaults to sanitized examples only; pass `--include-raw` when raw snippets are explicitly needed
+- supports `--last`, `--since`, and `--until`; output is JSON-only
+
+Examples:
+```bash
+seq skill-evidence --root ~/.codex/sessions --session-id <session_id> --skill seq --format json
+seq skill-evidence --root ~/.codex/sessions --session-id <session_id> --skill seq --since-cursor '<cursor-token>' --format json
 ```
 
 ## Trace-native session surfaces
@@ -215,6 +229,7 @@ seq query --root ~/.codex/sessions --spec '{"dataset":"session_graph_edges","sel
 
 Query-lift commands provide top-level shortcuts for common `seq query` shapes:
 - `skill-success-rank` ranks user-called skills by sessions with positive outcome evidence, avoiding raw mention-count inflation and full `workflow_signals` scans.
+- `skill-evidence` is the session-scoped watched-run surface for "what changed since cursor X?" skill-use evidence; use it before broad corpus ranking when the question is about one session.
 - `skill-audit` summarizes `skill_mentions` by skill, emits mention rows, produces a daily trend for one skill, or classifies activation evidence with `--mode activation`.
 - `skill-audit --mode activation --skill <name> --last <window> --exclude-current` is the optimized path for "was `$skill` called explicitly or implicitly?" It emits explicit user calls, implicit assistant calls, injected skill blocks, and other references separately, so pasted skill bodies are not counted as activation.
 - `workflow-audit` summarizes workflow cohorts across session text, skill mentions, tool traces, session graph roles, and outcome signals; use `--exclude-current` when auditing an active run.
@@ -332,6 +347,8 @@ Floor flags:
 - raw mode (default) emits per-invocation rows with `command_text`, `primary_executable`, `workdir`, call lifecycle, and runtime markers
 - `--summary` aggregates by `--group-by executable|command|tool` (default `executable`)
 - session-backed time windows now accept `--since` and `--until`
+
+`message-search`, `message-audit`, `tool-search`, `tool-audit`, `skill-blocks`, and `skill-evidence` accept `--last <duration>` using the same rolling-window syntax as `token-usage`.
 
 `query-diagnose` inspects `seq query` lifecycle health inside rollout JSONL:
 - raw mode (default) emits per-query diagnostics (`resolution_state`, `duration_ms`, `hang_flag`)
