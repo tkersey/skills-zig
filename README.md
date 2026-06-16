@@ -100,6 +100,8 @@ Per-app VERSION files are the source of truth:
 
 PRs that touch release-relevant CLI surfaces must bump the corresponding `VERSION` file.
 The check is conservative: app-local changes count for that app, and shared shipped surfaces such as `build.zig`, `build.zig.zon`, and `libs/core/**` count for every shipped CLI.
+Do not close release-relevant CLI work with a local `./zig-out/bin` binary alone.
+Release closure means the changed CLI has a tagged GitHub release, the tap formula has been updated, Homebrew audit/test have passed, and the installed Homebrew binary reports the expected version.
 
 Independent tags trigger independent workflows, and each tag must match its app VERSION file:
 

@@ -32,6 +32,7 @@ Release contract:
    - shared shipped surfaces (`build.zig`, `build.zig.zon`, `libs/core/**`) count for every shipped CLI.
    - `.github/workflows/release-<cli>.yml` counts for that CLI's packaged artifact contract.
 3. When those `VERSION` bumps land on `main`, `.github/workflows/auto-release.yml` creates any missing tags and dispatches the matching release workflows automatically.
+4. Do not treat a local `./zig-out/bin` binary as release closure for a shipped CLI. Closure requires a tagged release, tap formula update, Homebrew audit/test proof, and installed binary version proof.
 
 Release tags must match file versions:
 

@@ -219,6 +219,11 @@ const ParsedArgs = struct {
     receipt_summary: bool = false,
     show_help: bool = false,
     show_version: bool = false,
+
+    fn deinit(self: ParsedArgs, allocator: std.mem.Allocator) void {
+        allocator.free(self.receipt_paths);
+        allocator.free(self.receipt_globs);
+    }
 };
 
 const TargetRecord = struct {
@@ -430,6 +435,7 @@ pub fn main(init: std.process.Init) !void {
     const parsed = parseArgs(allocator, argv) catch |err| {
         core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
     };
+    defer parsed.deinit(allocator);
 
     if (parsed.show_version) {
         var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
@@ -1778,6 +1784,8 @@ const ReceiptSummary = struct {
     other_backend: usize = 0,
 };
 
+const ReceiptEventLogRecoveryMaxInputs = 64;
+
 fn cmdReceipt(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
     var paths: std.ArrayList([]const u8) = .empty;
     defer {
@@ -1811,8 +1819,11 @@ fn cmdReceipt(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
         });
     }
 
+    const recover_event_logs = paths.items.len <= ReceiptEventLogRecoveryMaxInputs;
+    const skip_non_receipts = parsed.receipt_globs.len > 0;
     for (paths.items) |path| {
-        const receipt = normalizeReceiptFromPathAlloc(allocator, path) catch |err| {
+        const receipt = normalizeReceiptFromPathAlloc(allocator, path, recover_event_logs) catch |err| {
+            if (skip_non_receipts and err == error.NotReviewReceipt) continue;
             try errors.append(allocator, .{
                 .source_path = try allocator.dupe(u8, path),
                 .message = try allocator.dupe(u8, @errorName(err)),
@@ -4288,6 +4299,10 @@ fn optionalStringFromVerdictOrRoot(verdict: std.json.ObjectMap, root: std.json.O
     return jsonStringField(verdict, key) orelse jsonStringField(root, key);
 }
 
+fn optionalStringFromRootKeys(root: std.json.ObjectMap, primary: []const u8, secondary: []const u8) ?[]const u8 {
+    return jsonStringField(root, primary) orelse jsonStringField(root, secondary);
+}
+
 fn stringifyJsonValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
     var out = std.Io.Writer.Allocating.init(allocator);
     defer out.deinit();
@@ -4295,23 +4310,65 @@ fn stringifyJsonValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) 
     return out.toOwnedSlice();
 }
 
-fn normalizeReceiptFromPathAlloc(allocator: std.mem.Allocator, path: []const u8) !NormalizedReceipt {
-    const raw = try readFileAlloc(allocator, path, 8 * 1024 * 1024);
+fn readReviewTextFromEventLogAlloc(allocator: std.mem.Allocator, event_log_path: []const u8) !?[]u8 {
+    const raw = try readFileAlloc(allocator, event_log_path, 16 * 1024 * 1024);
     defer allocator.free(raw);
-    return normalizeReceiptFromJsonAlloc(allocator, path, raw);
+
+    var latest_review_text: ?[]u8 = null;
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch continue;
+        defer parsed.deinit();
+        const root_obj = switch (parsed.value) {
+            .object => |obj| obj,
+            else => continue,
+        };
+        const method = jsonStringField(root_obj, "method") orelse continue;
+        if (!std.mem.eql(u8, method, "item/completed")) continue;
+
+        const payload_text = jsonStringField(root_obj, "payload") orelse continue;
+        var payload_parsed = std.json.parseFromSlice(std.json.Value, allocator, payload_text, .{}) catch continue;
+        defer payload_parsed.deinit();
+        const payload_obj = switch (payload_parsed.value) {
+            .object => |obj| obj,
+            else => continue,
+        };
+        const params_obj = core_json.objectField(payload_obj, "params") orelse continue;
+        const item_obj = core_json.objectField(params_obj, "item") orelse continue;
+        const item_type = core_json.stringField(item_obj, "type") orelse continue;
+        if (!std.mem.eql(u8, item_type, "exitedReviewMode")) continue;
+        const review_text = core_json.stringField(item_obj, "review") orelse continue;
+        if (latest_review_text) |existing| allocator.free(existing);
+        latest_review_text = try allocator.dupe(u8, review_text);
+    }
+    return latest_review_text;
 }
 
-fn normalizeReceiptFromJsonAlloc(allocator: std.mem.Allocator, source_path: []const u8, raw: []const u8) !NormalizedReceipt {
+fn normalizeReceiptFromPathAlloc(allocator: std.mem.Allocator, path: []const u8, recover_event_logs: bool) !NormalizedReceipt {
+    const raw = try readFileAlloc(allocator, path, 8 * 1024 * 1024);
+    defer allocator.free(raw);
+    return normalizeReceiptFromJsonAlloc(allocator, path, raw, recover_event_logs);
+}
+
+fn normalizeReceiptFromJsonAlloc(allocator: std.mem.Allocator, source_path: []const u8, raw: []const u8, recover_event_logs: bool) !NormalizedReceipt {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
     const root = switch (parsed.value) {
         .object => |obj| obj,
         else => return error.InvalidReceiptJson,
     };
+    if (jsonStringField(root, "lane_id") != null and root.get("reviewVerdict") == null) return error.NotReviewReceipt;
     const verdict = if (root.get("reviewVerdict")) |value| switch (value) {
         .object => |obj| obj,
         else => return error.InvalidReviewVerdict,
     } else root;
+
+    if (jsonStringField(verdict, "status") == null) {
+        return normalizeStoredSessionRecordReceiptAlloc(allocator, source_path, root, recover_event_logs);
+    }
 
     const receipt_status = jsonStringField(verdict, "status") orelse return error.MissingReceiptStatus;
     const backend_class = jsonStringField(verdict, "backendClass") orelse return error.MissingBackendClass;
@@ -4337,6 +4394,64 @@ fn normalizeReceiptFromJsonAlloc(allocator: std.mem.Allocator, source_path: []co
         .event_log_path = try dupOptional(allocator, optionalStringFromVerdictOrRoot(verdict, root, "eventLogPath")),
         .failure_code = try dupOptional(allocator, optionalStringFromVerdictOrRoot(verdict, root, "failureCode")),
         .failure_hint = try dupOptional(allocator, optionalStringFromVerdictOrRoot(verdict, root, "failureHint")),
+        .findings_json = findings_json,
+    };
+}
+
+fn normalizeStoredSessionRecordReceiptAlloc(allocator: std.mem.Allocator, source_path: []const u8, root: std.json.ObjectMap, recover_event_logs: bool) !NormalizedReceipt {
+    const review_thread_id = jsonStringField(root, "review_thread_id") orelse return error.NotReviewReceipt;
+    const review_turn_id = jsonStringField(root, "review_turn_id");
+    const event_log_path = jsonStringField(root, "event_log_path");
+    const result_source = jsonStringField(root, "terminal_review_result_source");
+
+    var review_result_json: ?[]u8 = null;
+    defer if (review_result_json) |value| allocator.free(value);
+    if (jsonStringField(root, "terminal_review_result_json")) |json| {
+        review_result_json = try allocator.dupe(u8, json);
+    } else if (recover_event_logs) {
+        if (event_log_path) |path| {
+            if (try readReviewTextFromEventLogAlloc(allocator, path)) |review_text| {
+                defer allocator.free(review_text);
+                if (!std.mem.eql(u8, review_text, review_fallback_text)) {
+                    review_result_json = try buildReviewResultJsonFromRenderedTextAlloc(allocator, review_text);
+                }
+            }
+        }
+    }
+
+    const finding_count = try reviewFindingCount(allocator, review_result_json);
+    const missing_completed_result = review_result_json == null and
+        std.mem.eql(u8, jsonStringField(root, "last_observed_status") orelse "", "completed");
+    const failure_code: ?[]const u8 = if (missing_completed_result) "review_output_missing" else null;
+    const failure_hint: ?[]const u8 = if (missing_completed_result)
+        "stored review session record did not include a materialized reviewResult or recoverable exitedReviewMode text"
+    else
+        null;
+    const status = if (finding_count > 0)
+        "findings"
+    else if (missing_completed_result)
+        "incomplete"
+    else if (std.mem.eql(u8, result_source orelse "", "rollout_exited_review_mode"))
+        "clean"
+    else
+        "incomplete";
+    const findings_json = compactFindingsJsonAlloc(allocator, review_result_json) catch try allocator.dupe(u8, "[]");
+
+    return .{
+        .source_path = try allocator.dupe(u8, source_path),
+        .status = try allocator.dupe(u8, status),
+        .backend_class = try allocator.dupe(u8, if (std.mem.eql(u8, jsonStringField(root, "terminal_fallback_transport") orelse "", "native-review")) "cas-native-fallback" else "cas-lane"),
+        .clean = std.mem.eql(u8, status, "clean"),
+        .finding_count = finding_count,
+        .base_sha = try dupOptional(allocator, optionalStringFromRootKeys(root, "baseSha", "base_sha")),
+        .head_sha = try dupOptional(allocator, optionalStringFromRootKeys(root, "headSha", "head_sha")),
+        .target_fingerprint = try dupOptional(allocator, optionalStringFromRootKeys(root, "targetFingerprint", "target_fingerprint")),
+        .review_thread_id = try allocator.dupe(u8, review_thread_id),
+        .review_turn_id = try dupOptional(allocator, review_turn_id),
+        .record_path = try allocator.dupe(u8, source_path),
+        .event_log_path = try dupOptional(allocator, event_log_path),
+        .failure_code = try dupOptional(allocator, failure_code),
+        .failure_hint = try dupOptional(allocator, failure_hint),
         .findings_json = findings_json,
     };
 }
@@ -4565,6 +4680,10 @@ fn compactFindingsJsonAlloc(allocator: std.mem.Allocator, review_result_json: ?[
         try writeJsonString(writer, "title");
         try writer.writeByte(':');
         try writeNullableJsonString(writer, jsonStringField(finding, "title"));
+        try writer.writeByte(',');
+        try writeJsonString(writer, "body");
+        try writer.writeByte(':');
+        try writeNullableJsonString(writer, jsonStringField(finding, "body"));
         try writer.writeByte(',');
         try writeJsonString(writer, "file");
         try writer.writeByte(':');
@@ -5085,7 +5204,7 @@ test "receipt normalizer accepts full CAS receipt" {
     const raw =
         \\{"demo":"cas-review-session","action":"lane-review","reviewThreadId":"thr_1","reviewTurnId":"turn_1","recordPath":"/tmp/record.json","eventLogPath":"/tmp/event.jsonl","targetFingerprint":"fp_1","headSha":"head_1","baseSha":"base_1","reviewVerdict":{"status":"clean","backendClass":"cas-lane","clean":true,"findingCount":0,"failureCode":null,"failureHint":null,"baseSha":"base_1","headSha":"head_1","targetFingerprint":"fp_1","reviewThreadId":"thr_1","reviewTurnId":"turn_1","recordPath":"/tmp/record.json","eventLogPath":"/tmp/event.jsonl","findings":[]}}
     ;
-    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "review.json", raw);
+    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "review.json", raw, true);
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("review.json", receipt.source_path);
     try std.testing.expectEqualStrings("clean", receipt.status);
@@ -5102,7 +5221,7 @@ test "receipt normalizer accepts compact verdict-only artifact" {
     const raw =
         \\{"status":"findings","backendClass":"cas-lane","clean":false,"findingCount":1,"failureCode":null,"failureHint":null,"baseSha":"base_2","headSha":"head_2","targetFingerprint":"fp_2","reviewThreadId":"thr_2","reviewTurnId":"turn_2","recordPath":"/tmp/record.json","eventLogPath":"/tmp/event.jsonl","findings":[{"title":"Issue","file":"/tmp/a.zig","line":12,"priority":1}]}
     ;
-    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "verdict.json", raw);
+    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "verdict.json", raw, true);
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("findings", receipt.status);
     try std.testing.expect(!receipt.clean);
@@ -5110,14 +5229,88 @@ test "receipt normalizer accepts compact verdict-only artifact" {
     try std.testing.expect(std.mem.indexOf(u8, receipt.findings_json, "Issue") != null);
 }
 
+test "receipt normalizer recovers findings from stored review session event log" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const review_text =
+        \\The patch is incorrect.
+        \\
+        \\Full review comments:
+        \\
+        \\- [P1] Keep idempotency keys aligned — /tmp/src/world.zig:10-12
+        \\  This is the raw finding body that the compact title alone cannot preserve.
+    ;
+    const notification = try stringifyAnyAlloc(std.testing.allocator, .{
+        .method = "item/completed",
+        .params = .{
+            .threadId = "thr_event",
+            .turnId = "turn_event",
+            .item = .{
+                .type = "exitedReviewMode",
+                .review = review_text,
+            },
+        },
+    });
+    defer std.testing.allocator.free(notification);
+    const notification_json = try quoteJsonStringAlloc(std.testing.allocator, notification);
+    defer std.testing.allocator.free(notification_json);
+    const line = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"recordedAtUnixS\":1,\"method\":\"item/completed\",\"direction\":\"notification\",\"payload\":{s}}}\n",
+        .{notification_json},
+    );
+    defer std.testing.allocator.free(line);
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "review.events.ndjson", .data = line });
+    const event_log_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "review.events.ndjson", std.testing.allocator);
+    defer std.testing.allocator.free(event_log_path);
+    const event_log_path_json = try quoteJsonStringAlloc(std.testing.allocator, event_log_path);
+    defer std.testing.allocator.free(event_log_path_json);
+
+    const raw = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema_version\":3,\"cwd\":\"/tmp\",\"parent_thread_id\":\"parent\",\"review_thread_id\":\"thr_event\",\"review_turn_id\":\"turn_event\",\"delivery\":\"detached\",\"target\":{{\"type\":\"baseBranch\",\"branch\":\"main\"}},\"event_log_path\":{s},\"created_at_unix_s\":1,\"last_observed_status\":\"completed\",\"codex_version\":\"0.140.0\",\"compatibility_verdict\":\"compatible\",\"transport_kind\":\"websocket\",\"terminal_review_result_source\":null,\"terminal_review_result_json\":null}}",
+        .{event_log_path_json},
+    );
+    defer std.testing.allocator.free(raw);
+    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "stored.json", raw, true);
+    defer receipt.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("findings", receipt.status);
+    try std.testing.expect(!receipt.clean);
+    try std.testing.expectEqual(@as(usize, 1), receipt.finding_count);
+    try std.testing.expectEqualStrings("cas-lane", receipt.backend_class);
+    try std.testing.expectEqualStrings("thr_event", receipt.review_thread_id.?);
+    try std.testing.expect(std.mem.indexOf(u8, receipt.findings_json, "Keep idempotency keys aligned") != null);
+    try std.testing.expect(std.mem.indexOf(u8, receipt.findings_json, "raw finding body") != null);
+}
+
+test "receipt normalizer bounds broad stored session recovery" {
+    const raw =
+        \\{"schema_version":3,"cwd":"/tmp","parent_thread_id":"parent","review_thread_id":"thr_broad","review_turn_id":"turn_broad","delivery":"detached","target":{"type":"baseBranch","branch":"main"},"event_log_path":"/tmp/missing.events.ndjson","created_at_unix_s":1,"last_observed_status":"completed","codex_version":"0.140.0","compatibility_verdict":"compatible","transport_kind":"websocket","terminal_review_result_source":null,"terminal_review_result_json":null}
+    ;
+    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "stored.json", raw, false);
+    defer receipt.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("incomplete", receipt.status);
+    try std.testing.expect(!receipt.clean);
+    try std.testing.expectEqual(@as(usize, 0), receipt.finding_count);
+    try std.testing.expectEqualStrings("review_output_missing", receipt.failure_code.?);
+}
+
+test "receipt normalizer rejects non-receipt lane artifact" {
+    try std.testing.expectError(
+        error.NotReviewReceipt,
+        normalizeReceiptFromJsonAlloc(std.testing.allocator, "lane.json", "{\"lane_id\":\"lane_1\",\"status_path\":\"/tmp/status.json\"}", true),
+    );
+}
+
 test "receipt normalizer fails closed on missing verdict fields" {
     try std.testing.expectError(
         error.MissingBackendClass,
-        normalizeReceiptFromJsonAlloc(std.testing.allocator, "bad.json", "{\"status\":\"clean\",\"clean\":true,\"findingCount\":0}"),
+        normalizeReceiptFromJsonAlloc(std.testing.allocator, "bad.json", "{\"status\":\"clean\",\"clean\":true,\"findingCount\":0}", true),
     );
     try std.testing.expectError(
         error.MissingCleanFlag,
-        normalizeReceiptFromJsonAlloc(std.testing.allocator, "bad.json", "{\"status\":\"clean\",\"backendClass\":\"cas-lane\",\"findingCount\":0}"),
+        normalizeReceiptFromJsonAlloc(std.testing.allocator, "bad.json", "{\"status\":\"clean\",\"backendClass\":\"cas-lane\",\"findingCount\":0}", true),
     );
 }
 
