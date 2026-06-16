@@ -18,7 +18,7 @@ const UsageText =
     \\
     \\Manage dependency-aware JSONL v3/v4 plan state.
     \\
-    \\usage: st {init,add,select,deselect,set-status,set-priority,set-deps,set-notes,add-comment,remove,show,ready,blocked,doctor,prime,assert-projection,reconcile-codex,import-proposed-plan,guard-session-start,guard-pre-tool-use,export,import-plan,import-orchplan,claim,heartbeat,set-runtime,set-proof,complete,proof,release,reclaim-stale,import-mesh-results,graph,aperture,compile} [options]
+    \\usage: st {init,add,select,deselect,set-status,set-priority,set-deps,set-notes,add-comment,remove,show,ready,blocked,doctor,prime,assert-projection,reconcile-codex,import-proposed-plan,guard-session-start,guard-pre-tool-use,export,import-plan,import-orchplan,claim,heartbeat,set-runtime,set-proof,complete,proof,release,reclaim-stale,import-mesh-results,intake,graph,aperture,compile} [options]
     \\
     \\commands:
     \\  init              Initialize plan storage
@@ -53,6 +53,7 @@ const UsageText =
     \\  release           Release a held claim and normalize task status
     \\  reclaim-stale     Reclaim expired held claims
     \\  import-mesh-results  Import mesh output CSV results into the ledger
+    \\  intake          Material plan intake commands: plan, apply
     \\  graph            Graph compiler commands: schema, apply, audit, insights, polish
     \\  aperture         Aperture commands: next, plan, select, explain
     \\  compile          Compile shortcuts: intent, graph, ready, aperture
@@ -453,6 +454,12 @@ const GraphCommand = enum {
     schema,
 };
 
+const IntakeCommand = enum {
+    none,
+    apply,
+    plan,
+};
+
 const PolishCommand = enum {
     none,
     begin,
@@ -559,6 +566,51 @@ const GraphDelta = struct {
     intent_coverage_changed: []const []const u8 = &.{},
 };
 
+const IntakeSection = enum {
+    none,
+    covers,
+    depends,
+    locations,
+    acceptance,
+    validation,
+    proof,
+    background,
+    objective,
+    approach,
+    risks,
+};
+
+const IntakeIntentBuilder = struct {
+    id: []const u8,
+    category: []const u8,
+    disposition: []const u8,
+    text: []const u8 = "",
+    source_locator: []const u8 = "",
+};
+
+const IntakeItemBuilder = struct {
+    id: []const u8,
+    item_type: ItemType,
+    priority: Priority,
+    step: []const u8 = "",
+    covers: std.ArrayList([]const u8) = .empty,
+    deps: std.ArrayList(Dep) = .empty,
+    locations: std.ArrayList([]const u8) = .empty,
+    acceptance: std.ArrayList([]const u8) = .empty,
+    validation: std.ArrayList([]const u8) = .empty,
+    proof: std.ArrayList(ProofObligation) = .empty,
+    background: std.ArrayList(u8) = .empty,
+    objective: std.ArrayList(u8) = .empty,
+    approach: std.ArrayList(u8) = .empty,
+    risks: std.ArrayList([]const u8) = .empty,
+};
+
+const ParsedIntake = struct {
+    source: []const u8,
+    intents: []const IntentAtom,
+    items: []const Item,
+};
+
 const RepairMeta = struct {
     op: []const u8,
 };
@@ -643,6 +695,7 @@ pub const Command = enum {
     import_orchplan,
     import_plan,
     import_proposed_plan,
+    intake,
     init,
     prime,
     proof,
@@ -702,6 +755,7 @@ const command_defs = [_]CommandDef{
     .{ .name = "release", .command = .release },
     .{ .name = "reclaim-stale", .command = .reclaim_stale },
     .{ .name = "import-mesh-results", .command = .import_mesh_results },
+    .{ .name = "intake", .command = .intake },
 };
 
 pub fn commandDefs() []const CommandDef {
@@ -758,6 +812,7 @@ const OutputFormat = enum {
 pub const Args = struct {
     command: Command,
     graph_command: GraphCommand = .none,
+    intake_command: IntakeCommand = .none,
     polish_command: PolishCommand = .none,
     aperture_command: ApertureCommand = .none,
     compile_command: CompileCommand = .none,
@@ -810,6 +865,7 @@ pub const Args = struct {
     repair_seq: bool = false,
     output: ?[]const u8 = null,
     input: ?[]const u8 = null,
+    source: ?[]const u8 = null,
     backlog_only: bool = false,
     preview: bool = false,
     dry_run: bool = false,
@@ -1012,6 +1068,7 @@ pub fn main(init: std.process.Init) !void {
 
     const mutating = isMutatingCommand(args.command) or
         (args.command == .graph and args.graph_command == .apply and !args.dry_run) or
+        (args.command == .intake and args.intake_command == .apply) or
         (args.command == .aperture and args.aperture_command == .select) or
         (args.command == .complete) or
         (args.command == .compile and (args.compile_command == .intent or args.compile_command == .graph or args.compile_command == .aperture));
@@ -1049,6 +1106,11 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.polish_command = parsePolishCommand(argv[3]) orelse return error.UnknownCommand;
             i = 4;
         }
+    }
+    if (args.command == .intake) {
+        if (argv.len < 3) return error.MissingCommand;
+        args.intake_command = parseIntakeCommand(argv[2]) orelse return error.UnknownCommand;
+        i = 3;
     }
     if (args.command == .aperture) {
         if (argv.len < 3) return error.MissingCommand;
@@ -1323,6 +1385,33 @@ fn parseArgs(argv: []const []const u8) !Args {
                     continue;
                 }
                 return error.InvalidGraphArg;
+            },
+            .intake => {
+                if (std.mem.eql(u8, token, "--source")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.source = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--out")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingOutputValue;
+                    args.output = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--input")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingInputValue;
+                    args.input = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--gate")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.gate = parseAuditGate(argv[i]) orelse return error.InvalidGraphGate;
+                    continue;
+                }
+                return error.InvalidImportArg;
             },
             .aperture => {
                 if (std.mem.eql(u8, token, "--replace")) {
@@ -1767,6 +1856,11 @@ fn parseArgs(argv: []const []const u8) !Args {
             if (args.graph_command == .polish and args.polish_command == .begin and args.name == null) return error.MissingValue;
             if (args.graph_command == .polish and args.polish_command == .snapshot and args.pass_number == null) return error.MissingValue;
         },
+        .intake => {
+            if (args.intake_command == .plan and args.source == null) return error.MissingValue;
+            if (args.intake_command == .plan and args.output == null) return error.MissingOutputValue;
+            if (args.intake_command == .apply and args.input == null) return error.MissingInputValue;
+        },
         .compile => {
             if ((args.compile_command == .intent or args.compile_command == .graph) and args.input == null) return error.MissingInputValue;
         },
@@ -1789,6 +1883,12 @@ fn parseGraphCommand(raw: []const u8) ?GraphCommand {
     if (std.mem.eql(u8, raw, "audit")) return .audit;
     if (std.mem.eql(u8, raw, "insights")) return .insights;
     if (std.mem.eql(u8, raw, "polish")) return .polish;
+    return null;
+}
+
+fn parseIntakeCommand(raw: []const u8) ?IntakeCommand {
+    if (std.mem.eql(u8, raw, "plan")) return .plan;
+    if (std.mem.eql(u8, raw, "apply")) return .apply;
     return null;
 }
 
@@ -2201,6 +2301,7 @@ fn runCommand(allocator: std.mem.Allocator, args: Args) !u8 {
         .release => try cmdRelease(allocator, args),
         .reclaim_stale => try cmdReclaimStale(allocator, args),
         .import_mesh_results => try cmdImportMeshResults(allocator, args),
+        .intake => try cmdIntake(allocator, args),
         .graph => try cmdGraph(allocator, args),
         .aperture => try cmdAperture(allocator, args),
         .compile => try cmdCompile(allocator, args),
@@ -2837,6 +2938,416 @@ fn cmdGraph(allocator: std.mem.Allocator, args: Args) !u8 {
         .polish => try cmdGraphPolish(allocator, args),
         .none => error.MissingCommand,
     };
+}
+
+fn cmdIntake(allocator: std.mem.Allocator, args: Args) !u8 {
+    return switch (args.intake_command) {
+        .plan => try cmdIntakePlan(allocator, args),
+        .apply => try cmdIntakeApply(allocator, args),
+        .none => error.MissingCommand,
+    };
+}
+
+fn cmdIntakePlan(allocator: std.mem.Allocator, args: Args) !u8 {
+    const source = try requireNonEmptyString(allocator, args.source.?, "--source");
+    const output_path = args.output.?;
+    const payload = try std.fmt.allocPrint(allocator,
+        \\# st graph intake
+        \\
+        \\Source: {s}
+        \\
+        \\## Intent
+        \\
+        \\- intent-001 | requirement | covered
+        \\  Text: <material requirement from the source plan>
+        \\  Source: {s}
+        \\
+        \\- intent-002 | test-expectation | covered
+        \\  Text: <material validation expectation>
+        \\  Source: {s}
+        \\
+        \\## Items
+        \\
+        \\### st-001 | feature | high
+        \\
+        \\Step: <actionable task title>
+        \\
+        \\Covers:
+        \\- intent-001
+        \\
+        \\Depends:
+        \\- none
+        \\
+        \\Locations:
+        \\- <file-or-directory>
+        \\- <test-file-or-directory>
+        \\
+        \\Acceptance:
+        \\- <user-visible done criterion>
+        \\- <another criterion>
+        \\
+        \\Validation:
+        \\- <command that proves the work>
+        \\
+        \\Proof:
+        \\- proof-001 | unit | <command that proves the work>
+        \\
+        \\Contract:
+        \\Background:
+        \\<Why this exists and what source-plan context must not be lost.>
+        \\
+        \\Objective:
+        \\<What this item accomplishes.>
+        \\
+        \\Implementation Approach:
+        \\<How to implement at a useful level of specificity.>
+        \\
+        \\Risks:
+        \\- <risk or edge case>
+        \\- <risk or edge case>
+        \\
+    , .{ source, source, source });
+    try writeTextAtomic(allocator, output_path, payload);
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.print("wrote intake scaffold: {s}\n", .{output_path});
+    return 0;
+}
+
+fn cmdIntakeApply(allocator: std.mem.Allocator, args: Args) !u8 {
+    const input_path = args.input.?;
+    const input_bytes = try readFileAlloc(allocator, input_path, 32 * 1024 * 1024);
+    const intake = try parseIntakeMarkdown(allocator, input_bytes, input_path);
+
+    const loaded = try loadValidatedState(allocator, args.file, args.allow_multiple_in_progress);
+    var state = loaded.state;
+    defer state.deinit();
+
+    state.graph_active = true;
+    state.graph.policy.completion_requires_proof = true;
+    for (intake.intents) |intent| try upsertIntentAtom(allocator, &state.graph, intent);
+    for (intake.items) |item| try state.upsert(item);
+
+    const audit = try auditGraph(allocator, &state, args.gate);
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    if (audit.errors != 0) {
+        try writeAuditSummaryJson(stdout, audit);
+        try stdout.writeByte('\n');
+        return 2;
+    }
+    try validateState(&state, args.allow_multiple_in_progress);
+
+    const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
+    const ts = try nowUtcAlloc(allocator);
+    const seq_after = loaded.latest_seq + 1;
+    try writeCanonicalRecords(args.file, &state, seq_after, ts, meta, null);
+
+    try emitPlanSyncWithPolicy(allocator, stdout, &state, .{ .source_file = args.file, .source_seq = seq_after }, true);
+    try stdout.print(
+        "st_receipt: {{\"kind\":\"graph_intake\",\"gate\":\"{s}\",\"items\":{d},\"intent\":{d},\"source\":",
+        .{ args.gate.asString(), intake.items.len, intake.intents.len },
+    );
+    try std.json.Stringify.value(intake.source, .{}, stdout);
+    try stdout.writeAll("}\n");
+    return 0;
+}
+
+fn parseIntakeMarkdown(allocator: std.mem.Allocator, bytes: []const u8, fallback_source: []const u8) !ParsedIntake {
+    var source = try requireNonEmptyString(allocator, fallback_source, "source");
+    var intents = std.ArrayList(IntentAtom).empty;
+    var items = std.ArrayList(Item).empty;
+    var current_intent: ?IntakeIntentBuilder = null;
+    var current_item: ?IntakeItemBuilder = null;
+    var section: IntakeSection = .none;
+    var in_items = false;
+
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0 or std.mem.startsWith(u8, line, "```")) continue;
+
+        if (std.mem.eql(u8, line, "## Intent")) {
+            try finishIntakeItem(allocator, &current_item, &items, source);
+            in_items = false;
+            section = .none;
+            continue;
+        }
+        if (std.mem.eql(u8, line, "## Items")) {
+            try finishIntakeIntent(allocator, &current_intent, &intents, source);
+            in_items = true;
+            section = .none;
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "Source:") and current_intent == null and !in_items) {
+            source = try requireNonEmptyString(allocator, valueAfterPrefix(line, "Source:"), "source");
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "- intent-") and !in_items) {
+            try finishIntakeIntent(allocator, &current_intent, &intents, source);
+            const raw_fields = std.mem.trim(u8, line[2..], " \t\r\n");
+            current_intent = .{
+                .id = try requireNonEmptyString(allocator, pipeField(raw_fields, 0) orelse return error.InvalidIntentAtom, "intent.id"),
+                .category = try requireNonEmptyString(allocator, pipeField(raw_fields, 1) orelse return error.InvalidIntentAtom, "intent.category"),
+                .disposition = try requireNonEmptyString(allocator, pipeField(raw_fields, 2) orelse return error.InvalidIntentAtom, "intent.disposition"),
+            };
+            section = .none;
+            continue;
+        }
+        if (current_intent) |*intent| {
+            if (std.mem.startsWith(u8, line, "Text:")) {
+                intent.text = try requireNonEmptyString(allocator, valueAfterPrefix(line, "Text:"), "intent.text");
+                continue;
+            }
+            if (std.mem.startsWith(u8, line, "Source:")) {
+                intent.source_locator = try requireNonEmptyString(allocator, valueAfterPrefix(line, "Source:"), "intent.source");
+                continue;
+            }
+        }
+
+        if (std.mem.startsWith(u8, line, "### ")) {
+            try finishIntakeIntent(allocator, &current_intent, &intents, source);
+            try finishIntakeItem(allocator, &current_item, &items, source);
+            const raw_fields = std.mem.trim(u8, line[4..], " \t\r\n");
+            current_item = .{
+                .id = try requireNonEmptyString(allocator, pipeField(raw_fields, 0) orelse return error.MissingItemId, "item.id"),
+                .item_type = try normalizeItemType(pipeField(raw_fields, 1) orelse "task"),
+                .priority = try normalizePriority(pipeField(raw_fields, 2) orelse "medium"),
+            };
+            in_items = true;
+            section = .none;
+            continue;
+        }
+
+        const item = if (current_item) |*item| item else continue;
+        if (std.mem.startsWith(u8, line, "Step:")) {
+            item.step = try requireNonEmptyString(allocator, valueAfterPrefix(line, "Step:"), "item.step");
+            section = .none;
+            continue;
+        }
+        if (std.mem.eql(u8, line, "Covers:")) {
+            section = .covers;
+            continue;
+        }
+        if (std.mem.eql(u8, line, "Depends:")) {
+            section = .depends;
+            continue;
+        }
+        if (std.mem.eql(u8, line, "Locations:")) {
+            section = .locations;
+            continue;
+        }
+        if (std.mem.eql(u8, line, "Acceptance:")) {
+            section = .acceptance;
+            continue;
+        }
+        if (std.mem.eql(u8, line, "Validation:")) {
+            section = .validation;
+            continue;
+        }
+        if (std.mem.eql(u8, line, "Proof:")) {
+            section = .proof;
+            continue;
+        }
+        if (std.mem.eql(u8, line, "Contract:")) {
+            section = .none;
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "Background:")) {
+            section = .background;
+            try appendInlineSectionText(allocator, &item.background, line, "Background:");
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "Objective:")) {
+            section = .objective;
+            try appendInlineSectionText(allocator, &item.objective, line, "Objective:");
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "Implementation Approach:")) {
+            section = .approach;
+            try appendInlineSectionText(allocator, &item.approach, line, "Implementation Approach:");
+            continue;
+        }
+        if (std.mem.eql(u8, line, "Risks:")) {
+            section = .risks;
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, line, "- ")) {
+            const bullet = try requireNonEmptyString(allocator, line[2..], "intake.list_item");
+            switch (section) {
+                .covers => try item.covers.append(allocator, bullet),
+                .depends => if (!std.ascii.eqlIgnoreCase(bullet, "none")) {
+                    try item.deps.append(allocator, try parseIntakeDep(allocator, bullet));
+                },
+                .locations => try item.locations.append(allocator, bullet),
+                .acceptance => try item.acceptance.append(allocator, bullet),
+                .validation => try item.validation.append(allocator, bullet),
+                .proof => try item.proof.append(allocator, try parseIntakeProof(allocator, bullet)),
+                .risks => try item.risks.append(allocator, bullet),
+                else => {},
+            }
+            continue;
+        }
+
+        switch (section) {
+            .background => try appendParagraphLine(allocator, &item.background, line),
+            .objective => try appendParagraphLine(allocator, &item.objective, line),
+            .approach => try appendParagraphLine(allocator, &item.approach, line),
+            else => {},
+        }
+    }
+
+    try finishIntakeIntent(allocator, &current_intent, &intents, source);
+    try finishIntakeItem(allocator, &current_item, &items, source);
+    if (intents.items.len == 0) return error.InvalidIntentAtom;
+    if (items.items.len == 0) return error.InvalidItem;
+
+    return .{
+        .source = source,
+        .intents = try intents.toOwnedSlice(allocator),
+        .items = try items.toOwnedSlice(allocator),
+    };
+}
+
+fn finishIntakeIntent(
+    allocator: std.mem.Allocator,
+    current: *?IntakeIntentBuilder,
+    intents: *std.ArrayList(IntentAtom),
+    default_source: []const u8,
+) !void {
+    const builder = current.* orelse return;
+    const text = try requireNonEmptyString(allocator, builder.text, "intent.text");
+    const locator = if (builder.source_locator.len > 0) builder.source_locator else default_source;
+    try intents.append(allocator, .{
+        .id = builder.id,
+        .source = .{ .kind = "markdown", .locator = locator },
+        .text = text,
+        .category = builder.category,
+        .disposition = builder.disposition,
+    });
+    current.* = null;
+}
+
+fn finishIntakeItem(
+    allocator: std.mem.Allocator,
+    current: *?IntakeItemBuilder,
+    items: *std.ArrayList(Item),
+    source: []const u8,
+) !void {
+    var builder = current.* orelse return;
+    const step = try requireNonEmptyString(allocator, builder.step, "item.step");
+    const locations = try builder.locations.toOwnedSlice(allocator);
+    const acceptance = try builder.acceptance.toOwnedSlice(allocator);
+    const validation = try builder.validation.toOwnedSlice(allocator);
+    const proof = try builder.proof.toOwnedSlice(allocator);
+    const risks = try builder.risks.toOwnedSlice(allocator);
+    const objective = if (builder.objective.items.len > 0)
+        try builder.objective.toOwnedSlice(allocator)
+    else
+        step;
+    const background = if (builder.background.items.len > 0)
+        try builder.background.toOwnedSlice(allocator)
+    else
+        "";
+    const approach = if (builder.approach.items.len > 0)
+        try builder.approach.toOwnedSlice(allocator)
+    else
+        "";
+    var item = Item{
+        .id = builder.id,
+        .step = step,
+        .status = .pending,
+        .priority = builder.priority,
+        .in_plan = true,
+        .deps = try builder.deps.toOwnedSlice(allocator),
+        .notes = "",
+        .comments = &.{},
+        .location = locations,
+        .validation = validation,
+        .source = .{ .kind = "intake", .locator = source },
+        .item_type = builder.item_type,
+        .intent_refs = try builder.covers.toOwnedSlice(allocator),
+        .acceptance = acceptance,
+        .contract = .{
+            .objective = objective,
+            .background = background,
+            .implementation_approach = approach,
+            .success_criteria = acceptance,
+            .proof_obligations = proof,
+            .risks = risks,
+        },
+        .lock_roots = locations,
+    };
+    normalizeItemPlanMembership(&item);
+    try items.append(allocator, item);
+    current.* = null;
+}
+
+fn valueAfterPrefix(line: []const u8, prefix: []const u8) []const u8 {
+    return std.mem.trim(u8, line[prefix.len..], " \t\r\n");
+}
+
+fn pipeField(raw: []const u8, wanted: usize) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, raw, '|');
+    var idx: usize = 0;
+    while (it.next()) |field| : (idx += 1) {
+        if (idx == wanted) {
+            const trimmed = std.mem.trim(u8, field, " \t\r\n");
+            if (trimmed.len == 0) return null;
+            return trimmed;
+        }
+    }
+    return null;
+}
+
+fn parseIntakeDep(allocator: std.mem.Allocator, raw: []const u8) !Dep {
+    const id_raw = pipeField(raw, 0) orelse raw;
+    var parts = std.mem.splitScalar(u8, id_raw, ':');
+    const id = try requireNonEmptyString(allocator, parts.next() orelse return error.MissingItemId, "dep.id");
+    const dep_type = if (parts.next()) |raw_type|
+        try requireNonEmptyString(allocator, raw_type, "dep.type")
+    else
+        "requires";
+    return .{ .id = id, .type = dep_type };
+}
+
+fn parseIntakeProof(allocator: std.mem.Allocator, raw: []const u8) !ProofObligation {
+    return .{
+        .id = try requireNonEmptyString(allocator, pipeField(raw, 0) orelse return error.InvalidProofObligation, "proof.id"),
+        .kind = try requireNonEmptyString(allocator, pipeField(raw, 1) orelse return error.InvalidProofObligation, "proof.kind"),
+        .command = if (pipeTailField(raw, 2)) |command|
+            try requireNonEmptyString(allocator, command, "proof.command")
+        else
+            "",
+    };
+}
+
+fn pipeTailField(raw: []const u8, wanted: usize) ?[]const u8 {
+    var bars_seen: usize = 0;
+    for (raw, 0..) |byte, idx| {
+        if (byte != '|') continue;
+        bars_seen += 1;
+        if (bars_seen == wanted) {
+            const trimmed = std.mem.trim(u8, raw[idx + 1 ..], " \t\r\n");
+            if (trimmed.len == 0) return null;
+            return trimmed;
+        }
+    }
+    return if (wanted == 0) std.mem.trim(u8, raw, " \t\r\n") else null;
+}
+
+fn appendInlineSectionText(allocator: std.mem.Allocator, out: *std.ArrayList(u8), line: []const u8, prefix: []const u8) !void {
+    const value = valueAfterPrefix(line, prefix);
+    if (value.len > 0) try appendParagraphLine(allocator, out, value);
+}
+
+fn appendParagraphLine(allocator: std.mem.Allocator, out: *std.ArrayList(u8), line: []const u8) !void {
+    const text = std.mem.trim(u8, line, " \t\r\n");
+    if (text.len == 0) return;
+    if (out.items.len > 0) try out.append(allocator, '\n');
+    try out.appendSlice(allocator, text);
 }
 
 fn cmdGraphSchema(allocator: std.mem.Allocator, args: Args) !u8 {
@@ -9136,8 +9647,11 @@ test "parseCommand and parseOutputFormat recognize known values" {
     try std.testing.expectEqual(Command.guard_session_start, parseCommand("guard-session-start").?);
     try std.testing.expectEqual(Command.guard_pre_tool_use, parseCommand("guard-pre-tool-use").?);
     try std.testing.expectEqual(Command.graph, parseCommand("graph").?);
+    try std.testing.expectEqual(Command.intake, parseCommand("intake").?);
     try std.testing.expectEqual(Command.complete, parseCommand("complete").?);
     try std.testing.expectEqual(Command.proof, parseCommand("proof").?);
+    try std.testing.expectEqual(IntakeCommand.plan, parseIntakeCommand("plan").?);
+    try std.testing.expectEqual(IntakeCommand.apply, parseIntakeCommand("apply").?);
     try std.testing.expectEqual(GraphCommand.apply, parseGraphCommand("apply").?);
     try std.testing.expectEqual(GraphCommand.insights, parseGraphCommand("insights").?);
     try std.testing.expectEqual(PolishCommand.snapshot, parsePolishCommand("snapshot").?);
@@ -9370,6 +9884,109 @@ test "graph apply writes v4 candidate after implementation-ready gate" {
     try std.testing.expect(loaded.state.graph_active);
     try std.testing.expectEqualStrings("intent-001", loaded.state.graph.intent[0].id);
     try std.testing.expectEqual(ItemType.feature, loaded.state.items.items[0].item_type);
+}
+
+test "intake plan writes markdown scaffold" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const out_path = try std.fs.path.join(allocator, &.{ root, "st-intake.md" });
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 0), try cmdIntake(allocator, .{ .command = .intake, .intake_command = .plan, .source = "PLAN.md", .output = out_path }));
+
+    const got = try readFileAlloc(allocator, out_path, 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, got, "Source: PLAN.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "st intake apply") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "### st-001 | feature | high") != null);
+}
+
+test "intake apply compiles markdown into graph state" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
+    const intake_path = try std.fs.path.join(allocator, &.{ root, "st-intake.md" });
+    try writeTextAtomic(allocator, intake_path,
+        \\# st graph intake
+        \\
+        \\Source: PLAN.md
+        \\
+        \\## Intent
+        \\
+        \\- intent-001 | requirement | covered
+        \\  Text: Intake apply must create graph state.
+        \\  Source: PLAN.md#intake
+        \\
+        \\- intent-002 | test-expectation | covered
+        \\  Text: Intake apply must preserve proof commands.
+        \\  Source: PLAN.md#proof
+        \\
+        \\## Items
+        \\
+        \\### st-001 | feature | high
+        \\
+        \\Step: Implement intake apply fixture
+        \\
+        \\Covers:
+        \\- intent-001
+        \\- intent-002
+        \\
+        \\Depends:
+        \\- none
+        \\
+        \\Locations:
+        \\- apps/st/scripts/st.zig
+        \\
+        \\Acceptance:
+        \\- Intake markdown creates durable graph items.
+        \\
+        \\Validation:
+        \\- zig build test-st
+        \\
+        \\Proof:
+        \\- proof-001 | unit | zig build test-st 2>&1 | tee .step/proof/st-001.log
+        \\
+        \\Contract:
+        \\Background:
+        \\Skill documentation names intake commands.
+        \\
+        \\Objective:
+        \\Add executable intake apply support.
+        \\
+        \\Implementation Approach:
+        \\Parse the documented Markdown template into existing graph fields.
+        \\
+        \\Risks:
+        \\- Markdown drift could drop proof metadata.
+        \\
+    );
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 0), try cmdIntake(allocator, .{ .command = .intake, .intake_command = .apply, .file = plan_path, .input = intake_path, .gate = .implementation_ready }));
+
+    var loaded = try loadValidatedState(allocator, plan_path, false);
+    defer loaded.state.deinit();
+    try std.testing.expect(loaded.state.graph_active);
+    try std.testing.expect(loaded.state.graph.policy.completion_requires_proof);
+    try std.testing.expectEqual(@as(usize, 2), loaded.state.graph.intent.len);
+    const item = loaded.state.items.items[0];
+    try std.testing.expectEqualStrings("st-001", item.id);
+    try std.testing.expectEqual(ItemType.feature, item.item_type);
+    try std.testing.expectEqualStrings("intent-002", item.intent_refs[1]);
+    try std.testing.expectEqualStrings("apps/st/scripts/st.zig", item.lock_roots[0]);
+    try std.testing.expectEqualStrings("proof-001", item.contract.?.proof_obligations[0].id);
+    try std.testing.expect(std.mem.indexOf(u8, item.contract.?.proof_obligations[0].command, "| tee .step/proof/st-001.log") != null);
 }
 
 test "graph apply rejects invalid patch atomically" {
