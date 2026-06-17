@@ -894,6 +894,19 @@ fn commandSupportsSummary(cmd: lib.Command) bool {
         std.mem.eql(u8, name, "goal_audit");
 }
 
+fn commandSupportsExcludeCurrent(cmd: lib.Command) bool {
+    const name = @tagName(cmd);
+    return std.mem.eql(u8, name, "message_audit") or
+        std.mem.eql(u8, name, "skill_audit") or
+        std.mem.eql(u8, name, "skill_cohort") or
+        std.mem.eql(u8, name, "skill_success_rank") or
+        std.mem.eql(u8, name, "message_search") or
+        std.mem.eql(u8, name, "tool_search") or
+        std.mem.eql(u8, name, "token_window") or
+        std.mem.eql(u8, name, "workflow_audit") or
+        std.mem.eql(u8, name, "goal_audit");
+}
+
 fn validateFormatForCommand(cmd: lib.Command, opts: Options) !void {
     const fmt = opts.format;
     switch (cmd) {
@@ -1151,10 +1164,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         => true,
         else => false,
     };
-    const supports_exclude_current = switch (cmd) {
-        .message_audit, .skill_audit, .skill_cohort, .skill_success_rank, .message_search, .tool_search, .token_window, .workflow_audit, .goal_audit => true,
-        else => false,
-    };
+    const supports_exclude_current = commandSupportsExcludeCurrent(cmd);
     const supports_window_hours = cmd == .token_window;
     const supports_duration_gte = cmd == .goal_audit;
     const supports_since_cursor = cmd == .skill_evidence;
@@ -17053,6 +17063,10 @@ test "skill-evidence gates cursor and json-only output" {
     try std.testing.expectError(error.UnsupportedOption, validateCommandOptions(.message_audit, .{ .since_cursor_text = "{}" }));
     try validateFormatForCommand(.skill_evidence, .{ .format = .json });
     try std.testing.expectError(error.InvalidFormatForCommand, validateFormatForCommand(.skill_evidence, .{ .format = .jsonl }));
+}
+
+test "skill-audit supports exclude-current option" {
+    try validateCommandOptions(.skill_audit, .{ .exclude_current = true });
 }
 
 fn runCommandWithOutput(

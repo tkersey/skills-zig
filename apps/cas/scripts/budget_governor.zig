@@ -396,7 +396,7 @@ fn pickStricterWindow(primary: ?WindowEval, secondary: ?WindowEval, preferred_ki
     return primary.?;
 }
 
-fn computeBudgetGovernor(root: ObjectMap, now_sec_opt: ?i64) GovernorOut {
+pub fn computeBudgetGovernor(root: ObjectMap, now_sec_opt: ?i64) GovernorOut {
     const now_sec = now_sec_opt orelse @as(i64, @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000)));
     const picked = pickBucket(root);
     if (picked.bucket == null) {
