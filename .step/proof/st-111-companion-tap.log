@@ -1,0 +1,51 @@
+## brew audit companion formulas
+## brew reinstall st
+Warning: You are using macOS 27.
+We do not provide support for this pre-release version.
+
+This is a Tier 2 configuration:
+  https://docs.brew.sh/Support-Tiers#tier-2
+You can report issues with Tier 2 configurations to Homebrew/* repositories!
+Read the above document before opening any issues or PRs.
+
+==> Fetching downloads for: st
+✔︎ Formula st (0.3.3)
+==> Reinstalling tkersey/tap/st
+🍺  /opt/homebrew/Cellar/st/0.3.3: 3 files, 1.1MB, built in 2 seconds
+==> Running `brew cleanup st`...
+Disable this behaviour by setting `HOMEBREW_NO_INSTALL_CLEANUP=1`.
+Hide these hints with `HOMEBREW_NO_ENV_HINTS=1` (see `man brew`).
+Removing: /Users/tk/Library/Caches/Homebrew/st--0.3.2.tar.gz... (461.5KB)
+## brew test st
+==> Testing tkersey/tap/st
+==> /opt/homebrew/Cellar/st/0.3.3/bin/st --help
+## installed st version
+0.3.3
+## brew reinstall learnings
+==> Trusted formula tkersey/tap/learnings
+Warning: You are using macOS 27.
+We do not provide support for this pre-release version.
+
+This is a Tier 2 configuration:
+  https://docs.brew.sh/Support-Tiers#tier-2
+You can report issues with Tier 2 configurations to Homebrew/* repositories!
+Read the above document before opening any issues or PRs.
+
+==> Fetching downloads for: learnings
+✔︎ Formula learnings (0.1.18)
+==> Reinstalling tkersey/tap/learnings
+🍺  /opt/homebrew/Cellar/learnings/0.1.18: 4 files, 1.6MB, built in 2 seconds
+==> Running `brew cleanup learnings`...
+Disable this behaviour by setting `HOMEBREW_NO_INSTALL_CLEANUP=1`.
+Hide these hints with `HOMEBREW_NO_ENV_HINTS=1` (see `man brew`).
+Removing: /Users/tk/Library/Caches/Homebrew/learnings--0.1.17.tar.gz... (661.1KB)
+## brew test learnings
+==> Testing tkersey/tap/learnings
+==> /opt/homebrew/Cellar/learnings/0.1.18/bin/learnings --help 2>&1
+==> /opt/homebrew/Cellar/learnings/0.1.18/bin/learnings append --help 2>&1
+==> /opt/homebrew/Cellar/learnings/0.1.18/bin/learnings memory-digest --help 2>&
+==> /opt/homebrew/Cellar/learnings/0.1.18/bin/append_learning --help 2>&1
+## installed learnings version
+0.1.18
+## installed append_learning version
+0.1.18

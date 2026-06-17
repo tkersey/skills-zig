@@ -1,0 +1,44 @@
+## skills-zig releases
+{"assets":[{"apiUrl":"https://api.github.com/repos/tkersey/skills-zig/releases/assets/450402784","contentType":"application/x-gtar","createdAt":"2026-06-17T16:50:55Z","digest":"sha256:88b147bad6c336287f60c8687e28db6f41283c70c09b3dadfc31bb0903170614","downloadCount":0,"id":"RA_kwDORU0Lzc4a2Jng","label":"","name":"ledger-v0.1.0-darwin-arm64.tar.gz","size":213586,"state":"uploaded","updatedAt":"2026-06-17T16:50:55Z","url":"https://github.com/tkersey/skills-zig/releases/download/ledger-v0.1.0/ledger-v0.1.0-darwin-arm64.tar.gz"},{"apiUrl":"https://api.github.com/repos/tkersey/skills-zig/releases/assets/450402783","contentType":"application/x-gtar","createdAt":"2026-06-17T16:50:55Z","digest":"sha256:539d6e7d0d8e87c3abcca87bb8a72bcb73de762ba5bfa6f90105b7724a69e63f","downloadCount":0,"id":"RA_kwDORU0Lzc4a2Jnf","label":"","name":"ledger-v0.1.0-linux-x86_64.tar.gz","size":1231355,"state":"uploaded","updatedAt":"2026-06-17T16:50:55Z","url":"https://github.com/tkersey/skills-zig/releases/download/ledger-v0.1.0/ledger-v0.1.0-linux-x86_64.tar.gz"}],"tagName":"ledger-v0.1.0","targetCommitish":"main","url":"https://github.com/tkersey/skills-zig/releases/tag/ledger-v0.1.0"}
+{"assets":[{"apiUrl":"https://api.github.com/repos/tkersey/skills-zig/releases/assets/450402799","contentType":"application/x-gtar","createdAt":"2026-06-17T16:50:58Z","digest":"sha256:35a01990fe112f506a193a97ac1e98b5169a62e3742cd6a25ae992394d8fdefb","downloadCount":0,"id":"RA_kwDORU0Lzc4a2Jnv","label":"","name":"st-v0.3.3-darwin-arm64.tar.gz","size":460710,"state":"uploaded","updatedAt":"2026-06-17T16:50:58Z","url":"https://github.com/tkersey/skills-zig/releases/download/st-v0.3.3/st-v0.3.3-darwin-arm64.tar.gz"},{"apiUrl":"https://api.github.com/repos/tkersey/skills-zig/releases/assets/450402798","contentType":"application/x-gtar","createdAt":"2026-06-17T16:50:58Z","digest":"sha256:64b3169cc1a5b0fee04ca0f63d9261d1e763f7f7ba53c24fc482eca9d13436d1","downloadCount":0,"id":"RA_kwDORU0Lzc4a2Jnu","label":"","name":"st-v0.3.3-linux-x86_64.tar.gz","size":1969420,"state":"uploaded","updatedAt":"2026-06-17T16:50:58Z","url":"https://github.com/tkersey/skills-zig/releases/download/st-v0.3.3/st-v0.3.3-linux-x86_64.tar.gz"}],"tagName":"st-v0.3.3","targetCommitish":"main","url":"https://github.com/tkersey/skills-zig/releases/tag/st-v0.3.3"}
+{"assets":[{"apiUrl":"https://api.github.com/repos/tkersey/skills-zig/releases/assets/450403031","contentType":"application/gzip","createdAt":"2026-06-17T16:51:13Z","digest":"sha256:a4ac499996e844776403f28cbe4f2daa1716885e8029848055e058107865e72b","downloadCount":0,"id":"RA_kwDORU0Lzc4a2JrX","label":"","name":"learnings-v0.1.18-darwin-arm64.tar.gz","size":666954,"state":"uploaded","updatedAt":"2026-06-17T16:51:14Z","url":"https://github.com/tkersey/skills-zig/releases/download/learnings-v0.1.18/learnings-v0.1.18-darwin-arm64.tar.gz"},{"apiUrl":"https://api.github.com/repos/tkersey/skills-zig/releases/assets/450403032","contentType":"application/gzip","createdAt":"2026-06-17T16:51:13Z","digest":"sha256:f7bd17bb1044e2eaae6ebce2c85f94d7cdf4a6462d3fc2f54bdfbb4a9dad1c0d","downloadCount":0,"id":"RA_kwDORU0Lzc4a2JrY","label":"","name":"learnings-v0.1.18-linux-x86_64.tar.gz","size":3451454,"state":"uploaded","updatedAt":"2026-06-17T16:51:14Z","url":"https://github.com/tkersey/skills-zig/releases/download/learnings-v0.1.18/learnings-v0.1.18-linux-x86_64.tar.gz"}],"tagName":"learnings-v0.1.18","targetCommitish":"main","url":"https://github.com/tkersey/skills-zig/releases/tag/learnings-v0.1.18"}
+## brew update registered tap
+==> Updating Homebrew...
+Updated 1 tap (tkersey/tap).
+==> Outdated Formulae
+learnings
+st
+
+You have 2 outdated formulae installed.
+You can upgrade them with brew upgrade
+or list them with brew outdated.
+## tap head
+e37f27d
+## brew audit ledger
+## brew reinstall ledger
+Warning: You are using macOS 27.
+We do not provide support for this pre-release version.
+
+This is a Tier 2 configuration:
+  https://docs.brew.sh/Support-Tiers#tier-2
+You can report issues with Tier 2 configurations to Homebrew/* repositories!
+Read the above document before opening any issues or PRs.
+
+==> Fetching downloads for: ledger
+✔︎ Formula ledger (0.1.0)
+✔︎ Formula ledger (0.1.0)
+==> Reinstalling tkersey/tap/ledger
+🍺  /opt/homebrew/Cellar/ledger/0.1.0: 3 files, 516.5KB, built in 2 seconds
+==> Running `brew cleanup ledger`...
+Disable this behaviour by setting `HOMEBREW_NO_INSTALL_CLEANUP=1`.
+Hide these hints with `HOMEBREW_NO_ENV_HINTS=1` (see `man brew`).
+## brew test ledger
+==> Testing tkersey/tap/ledger
+==> /opt/homebrew/Cellar/ledger/0.1.0/bin/ledger --version
+==> /opt/homebrew/Cellar/ledger/0.1.0/bin/ledger --help
+==> /opt/homebrew/Cellar/ledger/0.1.0/bin/ledger init
+==> /opt/homebrew/Cellar/ledger/0.1.0/bin/ledger doctor
+## installed ledger version
+0.1.0
+## command path
+/opt/homebrew/bin/ledger
