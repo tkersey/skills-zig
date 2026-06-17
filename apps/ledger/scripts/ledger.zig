@@ -285,6 +285,7 @@ fn appendCapture(allocator: std.mem.Allocator, args: Args) !CaptureResult {
         .object => |value| value,
         else => return error.InvalidCaptureJson,
     };
+    try validateCaptureInput(obj);
 
     var records = try loadRecords(allocator, args.file);
     defer deinitRecords(allocator, &records);
@@ -597,7 +598,6 @@ fn loadRecordsValidated(allocator: std.mem.Allocator, path: []const u8) !LoadRes
             },
         };
         const status = jsonStringField(obj, "status") orelse jsonStringField(record_obj, "status") orelse "unknown";
-        if (!isKnownStatus(status)) validation.add("unknown status");
         if (findRecord(records.items, neg_id)) |idx| {
             validation.add("duplicate capture neg_id");
             records.items[idx].evidence_count += 1;
@@ -626,15 +626,15 @@ fn loadRecordsValidated(allocator: std.mem.Allocator, path: []const u8) !LoadRes
             .evidence_count = 1,
         };
         errdefer record.deinit(allocator);
-        validateProjectedRecord(record, &validation);
         try records.append(allocator, record);
     }
+    for (records.items) |record| validateProjectedRecord(record, &validation);
     return .{ .records = records, .validation = validation };
 }
 
 fn validateProjectedRecord(record: Record, validation: *ValidationIssue) void {
     if (!isKnownStatus(record.status)) validation.add("unknown status");
-    if (!std.mem.eql(u8, record.exclusion_scope, "route") and !std.mem.eql(u8, record.exclusion_scope, "cluster")) {
+    if (!isKnownExclusionScope(record.exclusion_scope)) {
         validation.add("unknown exclusion_scope");
     }
     if (std.mem.eql(u8, record.status, "active") and !recordCanBlock(record)) {
@@ -695,6 +695,11 @@ fn captureCanRequestStatus(obj: std.json.ObjectMap, requested_status: []const u8
     return !std.mem.eql(u8, requested_status, "user-context");
 }
 
+fn validateCaptureInput(obj: std.json.ObjectMap) !void {
+    const exclusion_scope = jsonStringField(obj, "exclusion_scope") orelse "route";
+    if (!isKnownExclusionScope(exclusion_scope)) return error.InvalidExclusionScope;
+}
+
 fn captureHasWitness(obj: std.json.ObjectMap) bool {
     if (obj.get("source_refs")) |value| {
         if (value == .array and value.array.items.len > 0) return true;
@@ -727,6 +732,10 @@ fn jsonArrayCount(obj: std.json.ObjectMap, key: []const u8) usize {
         .array => |array| array.items.len,
         else => 0,
     };
+}
+
+fn isKnownExclusionScope(exclusion_scope: []const u8) bool {
+    return std.mem.eql(u8, exclusion_scope, "route") or std.mem.eql(u8, exclusion_scope, "cluster");
 }
 
 fn lexicalOverlap(a: []const u8, b: []const u8) bool {
@@ -1103,4 +1112,54 @@ test "doctor reports unsafe active records" {
     var loaded = try loadRecordsValidated(std.testing.allocator, store);
     defer loaded.deinit(std.testing.allocator);
     try std.testing.expect(!loaded.validation.ok());
+}
+
+test "capture rejects unknown exclusion scope before append" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const store = try std.fs.path.join(std.testing.allocator, &.{ root, "negative-ledger.jsonl" });
+    defer std.testing.allocator.free(store);
+    const input = try std.fs.path.join(std.testing.allocator, &.{ root, "capture.json" });
+    defer std.testing.allocator.free(input);
+    try durable_store.writeTextAtomic(
+        std.testing.allocator,
+        input,
+        "{\"hypothesis\":\"h\",\"route_id\":\"route-a\",\"exclusion_scope\":\"rouet\",\"source_refs\":[{\"kind\":\"test\",\"ref\":\"fixture\"}]}",
+    );
+
+    try std.testing.expectError(error.InvalidExclusionScope, appendCapture(std.testing.allocator, .{ .command = .capture, .file = store, .json_path = input }));
+    try std.testing.expect(!durable_store.fileExists(store));
+}
+
+test "projection validation uses final replayed status" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const promoted = try std.fs.path.join(std.testing.allocator, &.{ root, "promoted.jsonl" });
+    defer std.testing.allocator.free(promoted);
+    const reopened = try std.fs.path.join(std.testing.allocator, &.{ root, "reopened.jsonl" });
+    defer std.testing.allocator.free(reopened);
+
+    try durable_store.writeTextAtomic(
+        std.testing.allocator,
+        promoted,
+        "{\"v\":1,\"event\":\"capture\",\"neg_id\":\"NEG-000001\",\"status\":\"need-evidence\",\"record\":{\"hypothesis\":\"h\",\"route_id\":\"route-a\"}}\n{\"v\":1,\"event\":\"status\",\"neg_id\":\"NEG-000001\",\"status\":\"active\"}\n",
+    );
+    var promoted_loaded = try loadRecordsValidated(std.testing.allocator, promoted);
+    defer promoted_loaded.deinit(std.testing.allocator);
+    try std.testing.expect(!promoted_loaded.validation.ok());
+    try std.testing.expectEqualStrings("active", promoted_loaded.records.items[0].status);
+
+    try durable_store.writeTextAtomic(
+        std.testing.allocator,
+        reopened,
+        "{\"v\":1,\"event\":\"capture\",\"neg_id\":\"NEG-000001\",\"status\":\"active\",\"record\":{\"hypothesis\":\"h\",\"route_id\":\"route-a\"}}\n{\"v\":1,\"event\":\"status\",\"neg_id\":\"NEG-000001\",\"status\":\"reopened\"}\n",
+    );
+    var reopened_loaded = try loadRecordsValidated(std.testing.allocator, reopened);
+    defer reopened_loaded.deinit(std.testing.allocator);
+    try std.testing.expect(reopened_loaded.validation.ok());
+    try std.testing.expectEqualStrings("reopened", reopened_loaded.records.items[0].status);
 }

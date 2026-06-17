@@ -113,3 +113,19 @@ git diff --check
 st assert-projection --file .step/st-plan.jsonl --format json
 
 st proof audit --file .step/st-plan.jsonl --id st-116 --format json
+
+review-fix validation
+
+zig version
+0.16.0
+
+zig build test-ledger --summary all
+
+zig build build-ledger -Doptimize=ReleaseFast --summary all
+
+zig build lint --summary all
+No issues!
+
+zig build test --summary all
+
+git diff --check
