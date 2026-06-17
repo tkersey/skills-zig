@@ -1,0 +1,16 @@
+Build Summary: 4/4 steps succeeded; 6/6 tests passed
+test-ledger success
++- run test 6 pass (6 total) 25ms MaxRSS:3M
+   +- compile test Debug native cached 102ms MaxRSS:35M
+      +- options cached
+
+Build Summary: 4/4 steps succeeded
+build-ledger cached
++- install ledger cached
+   +- compile exe ledger Debug native cached 103ms MaxRSS:35M
+      +- options cached
+
+{"command":"init","status":"initialized","subject":"/var/folders/8g/smldc3c95hlfp9_z2_47mx440000gn/T/tmp.jB0Ekllhz8/negative-ledger.jsonl","count":0}
+{"command":"capture","neg_id":"NEG-000001","status":"active"}
+{"negative_route_gate":{"query_or_map":"yes","evidence_source":"/var/folders/8g/smldc3c95hlfp9_z2_47mx440000gn/T/tmp.jB0Ekllhz8/negative-ledger.jsonl","active_exclusion_match":true,"exclusion_id":"NEG-000001","fuzzy_candidates":0,"fuzzy_authority":"suggest_only","handoff_allowed":false}}
+{"negative_route_gate":{"query_or_map":"missing","evidence_source":"/var/folders/8g/smldc3c95hlfp9_z2_47mx440000gn/T/tmp.jB0Ekllhz8/missing/negative-ledger.jsonl","ledger_available":false,"active_exclusion_match":null,"exclusion_id":null,"fuzzy_candidates":0,"fuzzy_authority":"none","handoff_allowed":false,"failure":"ledger_missing"}}

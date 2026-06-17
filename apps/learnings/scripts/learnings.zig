@@ -1,6 +1,7 @@
 const std = @import("std");
 const append_learning_cli = @import("append_learning_cli");
 const core_cli = @import("core_cli");
+const durable_store = @import("durable_store");
 const app_meta = @import("app_meta");
 const seq_bundle = @import("seq_bundle");
 const query_engine = seq_bundle.query_engine;
@@ -1781,9 +1782,7 @@ fn collectLearningFilesUnder(
 }
 
 fn fileExistsAbsolute(path: []const u8) bool {
-    var file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return false;
-    file.close(std.Io.Threaded.global_single_threaded.io());
-    return true;
+    return durable_store.fileExists(path);
 }
 
 fn appendUniqueLearningFile(
@@ -2237,32 +2236,7 @@ fn appendFmt(
 }
 
 fn writeTextFile(path: []const u8, text: []const u8) !void {
-    try ensureParentPath(path);
-    if (std.fs.path.isAbsolute(path)) {
-        var file = try std.Io.Dir.createFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{ .truncate = true });
-        defer file.close(std.Io.Threaded.global_single_threaded.io());
-        try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), text);
-        return;
-    }
-    var file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), path, .{ .truncate = true });
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
-    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), text);
-}
-
-fn ensureParentPath(path: []const u8) !void {
-    const parent = std.fs.path.dirname(path) orelse return;
-    if (parent.len == 0) return;
-
-    if (std.fs.path.isAbsolute(parent)) {
-        const rel = std.mem.trim(u8, parent, "/");
-        if (rel.len == 0) return;
-        var root = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), "/", .{});
-        defer root.close(std.Io.Threaded.global_single_threaded.io());
-        try root.createDirPath(std.Io.Threaded.global_single_threaded.io(), rel);
-        return;
-    }
-
-    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), parent);
+    return durable_store.writeTextAtomic(std.heap.page_allocator, path, text);
 }
 
 fn nowUtcAlloc(allocator: std.mem.Allocator) ![]u8 {
@@ -3045,14 +3019,10 @@ fn collectLearningRows(
 ) !std.ArrayList(query_engine.Row) {
     var rows: std.ArrayList(query_engine.Row) = .empty;
 
-    const file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), jsonl_path, .{}) catch |err| switch (err) {
+    const data = durable_store.readFileAlloc(allocator, jsonl_path, 64 * 1024 * 1024) catch |err| switch (err) {
         error.FileNotFound => return rows,
         else => return err,
     };
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
-
-    var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
-    const data = try reader.interface.allocRemaining(allocator, .limited(64 * 1024 * 1024));
     defer allocator.free(data);
 
     var lines = std.mem.splitScalar(u8, data, '\n');

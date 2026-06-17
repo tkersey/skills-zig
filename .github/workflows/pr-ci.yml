@@ -12,10 +12,12 @@ on:
       - "apps/cron/**"
       - "apps/puff/**"
       - "apps/learnings/**"
+      - "apps/ledger/**"
       - "apps/mesh/**"
       - "apps/st/**"
       - "apps/parse-arch/**"
       - "libs/core/**"
+      - "libs/durable_store/**"
       - ".github/scripts/**"
       - ".github/workflows/release-*.yml"
       - ".github/workflows/auto-release.yml"
@@ -36,6 +38,7 @@ jobs:
       cron: ${{ steps.filter.outputs.cron }}
       puff: ${{ steps.filter.outputs.puff }}
       learnings: ${{ steps.filter.outputs.learnings }}
+      ledger: ${{ steps.filter.outputs.ledger }}
       mesh: ${{ steps.filter.outputs.mesh }}
       st: ${{ steps.filter.outputs.st }}
       parse_arch: ${{ steps.filter.outputs.parse_arch }}
@@ -58,6 +61,8 @@ jobs:
               - "apps/puff/**"
             learnings:
               - "apps/learnings/**"
+            ledger:
+              - "apps/ledger/**"
             mesh:
               - "apps/mesh/**"
             st:
@@ -69,6 +74,7 @@ jobs:
               - "build.zig.zon"
               - "README.md"
               - "libs/core/**"
+              - "libs/durable_store/**"
               - ".github/scripts/**"
               - ".github/workflows/release-*.yml"
               - ".github/workflows/auto-release.yml"
@@ -259,6 +265,20 @@ jobs:
         run: zig build test-learnings
       - name: Test append_learning
         run: zig build test-append-learning
+
+  ledger:
+    needs: changes
+    if: needs.changes.outputs.ledger == 'true' || needs.changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build ledger
+        run: zig build build-ledger -Doptimize=ReleaseFast
+      - name: Test ledger
+        run: zig build test-ledger
 
   st:
     needs: changes

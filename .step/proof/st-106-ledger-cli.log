@@ -1,0 +1,16 @@
+Build Summary: 4/4 steps succeeded; 2/2 tests passed
+test-ledger success
++- run test 2 pass (2 total) 12ms MaxRSS:3M
+   +- compile test Debug native cached 103ms MaxRSS:35M
+      +- options cached
+
+Build Summary: 4/4 steps succeeded
+build-ledger cached
++- install ledger cached
+   +- compile exe ledger Debug native cached 104ms MaxRSS:35M
+      +- options cached
+
+{"command":"init","status":"initialized","subject":"/var/folders/8g/smldc3c95hlfp9_z2_47mx440000gn/T/tmp.4VEeMwT6GA/negative-ledger.jsonl","count":0}
+{"command":"capture","neg_id":"NEG-000001","status":"active"}
+{"negative_route_gate":{"query_or_map":"yes","evidence_source":"/var/folders/8g/smldc3c95hlfp9_z2_47mx440000gn/T/tmp.4VEeMwT6GA/negative-ledger.jsonl","active_exclusion_match":true,"exclusion_id":"NEG-000001","fuzzy_candidates":0,"fuzzy_authority":"suggest_only","handoff_allowed":false}}
+{"command":"doctor","ok":true,"records":1,"blank_lines":1}

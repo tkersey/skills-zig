@@ -43,6 +43,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const durable_store = b.createModule(.{
+        .root_source_file = b.path("libs/durable_store/src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const seq_bundle = b.createModule(.{
         .root_source_file = b.path("apps/seq/src/bundle.zig"),
         .target = target,
@@ -64,6 +69,7 @@ pub fn build(b: *std.Build) void {
     const cron_meta = addVersionModule(b, @embedFile("apps/cron/VERSION"));
     const puff_meta = addVersionModule(b, @embedFile("apps/puff/VERSION"));
     const learnings_meta = addVersionModule(b, @embedFile("apps/learnings/VERSION"));
+    const ledger_meta = addVersionModule(b, @embedFile("apps/ledger/VERSION"));
     const mesh_meta = addVersionModule(b, @embedFile("apps/mesh/VERSION"));
     const st_meta = addVersionModule(b, @embedFile("apps/st/VERSION"));
     const parse_arch_meta = addVersionModule(b, @embedFile("apps/parse-arch/VERSION"));
@@ -260,6 +266,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "core_delegate", .module = core_delegate },
             .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "durable_store", .module = durable_store },
             .{ .name = "app_meta", .module = learnings_meta },
         },
     });
@@ -271,8 +278,19 @@ pub fn build(b: *std.Build) void {
             .{ .name = "append_learning_cli", .module = append_learning_root },
             .{ .name = "core_delegate", .module = core_delegate },
             .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "durable_store", .module = durable_store },
             .{ .name = "app_meta", .module = learnings_meta },
             .{ .name = "seq_bundle", .module = seq_bundle },
+        },
+    });
+    const ledger_root = b.createModule(.{
+        .root_source_file = b.path("apps/ledger/scripts/ledger.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "durable_store", .module = durable_store },
+            .{ .name = "app_meta", .module = ledger_meta },
         },
     });
     const mesh_root = b.createModule(.{
@@ -290,6 +308,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "durable_store", .module = durable_store },
             .{ .name = "app_meta", .module = st_meta },
         },
     });
@@ -338,6 +357,7 @@ pub fn build(b: *std.Build) void {
     const puff = addExecutable(b, "puff", puff_root);
     const learnings = addExecutable(b, "learnings", learnings_root);
     const append_learning = addExecutable(b, "append_learning", append_learning_root);
+    const ledger = addExecutable(b, "ledger", ledger_root);
     const mesh = addExecutable(b, "mesh", mesh_root);
     const st = addExecutable(b, "st", st_root);
     const parse_arch = addExecutable(b, "parse-arch", parse_arch_root);
@@ -359,6 +379,7 @@ pub fn build(b: *std.Build) void {
     const puff_install = addInstallStep(b, puff);
     const learnings_install = addInstallStep(b, learnings);
     const append_learning_install = addInstallStep(b, append_learning);
+    const ledger_install = addInstallStep(b, ledger);
     const mesh_install = addInstallStep(b, mesh);
     const st_install = addInstallStep(b, st);
     const parse_arch_install = addInstallStep(b, parse_arch);
@@ -381,6 +402,7 @@ pub fn build(b: *std.Build) void {
     install_all.dependOn(&puff_install.step);
     install_all.dependOn(&learnings_install.step);
     install_all.dependOn(&append_learning_install.step);
+    install_all.dependOn(&ledger_install.step);
     install_all.dependOn(&mesh_install.step);
     install_all.dependOn(&st_install.step);
     install_all.dependOn(&parse_arch_install.step);
@@ -509,6 +531,12 @@ pub fn build(b: *std.Build) void {
         "test-append-learning",
         "Run append_learning tests",
     );
+    const run_ledger_tests = addTestStep(
+        b,
+        ledger_root,
+        "test-ledger",
+        "Run ledger tests",
+    );
     const run_mesh_tests = addTestStep(
         b,
         mesh_root,
@@ -532,6 +560,12 @@ pub fn build(b: *std.Build) void {
         perf_hub_root,
         "test-perf-hub",
         "Run perf_hub tests",
+    );
+    const run_durable_store_tests = addTestStep(
+        b,
+        durable_store,
+        "test-durable-store",
+        "Run durable_store tests",
     );
 
     const app_surfaces = [_]AppSurface{
@@ -578,6 +612,13 @@ pub fn build(b: *std.Build) void {
             .test_deps = &.{ &run_learnings_tests.step, &run_append_learning_tests.step },
         },
         .{
+            .path = b.path("apps/ledger"),
+            .build_step_name = "build-ledger",
+            .build_description = "Build ledger binary",
+            .build_deps = &.{&ledger_install.step},
+            .test_deps = &.{&run_ledger_tests.step},
+        },
+        .{
             .path = b.path("apps/mesh"),
             .build_step_name = "build-mesh",
             .build_description = "Build mesh binary",
@@ -609,6 +650,7 @@ pub fn build(b: *std.Build) void {
         for (surface.test_deps) |dep| test_all.dependOn(dep);
     }
     test_all.dependOn(&run_perf_hub_tests.step);
+    test_all.dependOn(&run_durable_store_tests.step);
 
     const enable_zlinter = b.option(
         bool,
@@ -628,6 +670,7 @@ pub fn build(b: *std.Build) void {
     }
 
     addRunStep(b, seq, "run-seq", "Run seq", &.{});
+    addRunStep(b, ledger, "run-ledger", "Run ledger", &.{"--help"});
     addRunStep(b, st, "run-st", "Run st", &.{"--help"});
     addRunStep(b, mesh, "run-mesh", "Run mesh", &.{"--help"});
     addRunStep(b, parse_arch, "run-parse-arch", "Run parse-arch", &.{"--help"});

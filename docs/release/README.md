@@ -8,6 +8,7 @@ This monorepo uses independent GitHub Actions release workflows per CLI:
 - `cron`: `.github/workflows/release-cron.yml` on tag `cron-v*`
 - `puff`: `.github/workflows/release-puff.yml` on tag `puff-v*`
 - `learnings`: `.github/workflows/release-learnings.yml` on tag `learnings-v*`
+- `ledger`: `.github/workflows/release-ledger.yml` on tag `ledger-v*`
 - `mesh`: `.github/workflows/release-mesh.yml` on tag `mesh-v*`
 - `st`: `.github/workflows/release-st.yml` on tag `st-v*`
 - `parse-arch`: `.github/workflows/release-parse-arch.yml` on tag `parse-arch-v*`
@@ -20,6 +21,7 @@ Per-app VERSION files:
 - `apps/cron/VERSION`
 - `apps/puff/VERSION`
 - `apps/learnings/VERSION`
+- `apps/ledger/VERSION`
 - `apps/mesh/VERSION`
 - `apps/st/VERSION`
 - `apps/parse-arch/VERSION`
@@ -29,7 +31,8 @@ Release contract:
 1. If a PR changes a release-relevant CLI surface, it must also bump that CLI's `VERSION` file.
 2. Release-relevant surfaces are conservative:
    - `apps/<cli>/**` except the per-app `README.md` counts for that CLI.
-   - shared shipped surfaces (`build.zig`, `build.zig.zon`, `libs/core/**`) count for every shipped CLI.
+   - broad shared shipped surfaces (`build.zig`, `build.zig.zon`, `libs/core/**`) count for every shipped CLI.
+   - `libs/durable_store/**` counts for its shipped consumers: `learnings`, `ledger`, and `st`.
    - `.github/workflows/release-<cli>.yml` counts for that CLI's packaged artifact contract.
 3. When those `VERSION` bumps land on `main`, `.github/workflows/auto-release.yml` creates any missing tags and dispatches the matching release workflows automatically.
 4. Do not treat a local `./zig-out/bin` binary as release closure for a shipped CLI. Closure requires a tagged release, tap formula update, Homebrew audit/test proof, and installed binary version proof.
@@ -42,6 +45,7 @@ Release tags must match file versions:
 - `cron-v<version>` where `<version>` equals `apps/cron/VERSION`
 - `puff-v<version>` where `<version>` equals `apps/puff/VERSION`
 - `learnings-v<version>` where `<version>` equals `apps/learnings/VERSION`
+- `ledger-v<version>` where `<version>` equals `apps/ledger/VERSION`
 - `mesh-v<version>` where `<version>` equals `apps/mesh/VERSION`
 - `st-v<version>` where `<version>` equals `apps/st/VERSION`
 - `parse-arch-v<version>` where `<version>` equals `apps/parse-arch/VERSION`
@@ -65,6 +69,8 @@ Examples:
 - `puff-v1.2.3-darwin-arm64.tar.gz`
 - `learnings-v1.2.3-linux-x86_64.tar.gz`
 - `learnings-v1.2.3-darwin-arm64.tar.gz`
+- `ledger-v1.2.3-linux-x86_64.tar.gz`
+- `ledger-v1.2.3-darwin-arm64.tar.gz`
 - `mesh-v1.2.3-linux-x86_64.tar.gz`
 - `mesh-v1.2.3-darwin-arm64.tar.gz`
 - `st-v1.2.3-linux-x86_64.tar.gz`

@@ -9,6 +9,7 @@ on:
       - "build.zig.zon"
       - "apps/**"
       - "libs/core/**"
+      - "libs/durable_store/**"
       - ".github/scripts/**"
       - ".github/workflows/release-*.yml"
       - ".github/workflows/auto-release.yml"

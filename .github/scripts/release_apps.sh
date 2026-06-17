@@ -17,6 +17,7 @@ apps=(
   cron
   puff
   learnings
+  ledger
   mesh
   st
   parse-arch
@@ -49,6 +50,12 @@ case "$mode" in
       done
     }
 
+    mark_durable_store_consumers() {
+      mark_app learnings
+      mark_app ledger
+      mark_app st
+    }
+
     mark_build_zig() {
       local changed=0
       local ambiguous=0
@@ -64,6 +71,9 @@ case "$mode" in
         esac
         case "$raw" in
           *".target = target,"*|*".optimize = optimize,"*|*".imports = &.{"*|*".{ .name = \"core_"*)
+            return 0
+            ;;
+          *\"Build\ *|*\"Run\ *|*\"Test\ *)
             return 0
             ;;
         esac
@@ -93,13 +103,22 @@ case "$mode" in
             esac
           else
             case "$line" in
-              *"apps/$app/"*|*"${token}_"*|*"\"$app\""*|*"build-$app"*|*"test-$app"*|*"run-$app"*)
+              *"apps/$app/"*|*"apps/$app\""*|*"${token}_"*|*"\"$app\""*|*"build-$app"*|*"test-$app"*|*"run-$app"*)
                 mark_app "$app"
                 matched=1
                 ;;
             esac
           fi
         done
+
+        if [[ "$matched" -eq 0 ]]; then
+          case "$line" in
+            *"durable_store"*|*"durable-store"*|*"libs/durable_store/"*)
+              mark_durable_store_consumers
+              matched=1
+              ;;
+          esac
+        fi
 
         if [[ "$matched" -eq 0 ]]; then
           if ! is_build_boilerplate "$line"; then
@@ -121,6 +140,9 @@ case "$mode" in
         build.zig.zon|libs/core/*)
           mark_all
           ;;
+        libs/durable_store/*)
+          mark_durable_store_consumers
+          ;;
         .github/workflows/release-seq.yml)
           mark_app seq
           ;;
@@ -139,6 +161,9 @@ case "$mode" in
         .github/workflows/release-learnings.yml)
           mark_app learnings
           ;;
+        .github/workflows/release-ledger.yml)
+          mark_app ledger
+          ;;
         .github/workflows/release-mesh.yml)
           mark_app mesh
           ;;
@@ -148,7 +173,7 @@ case "$mode" in
         .github/workflows/release-parse-arch.yml)
           mark_app parse-arch
           ;;
-        apps/seq/README.md|apps/lift/README.md|apps/cas/README.md|apps/cron/README.md|apps/puff/README.md|apps/learnings/README.md|apps/mesh/README.md|apps/st/README.md|apps/parse-arch/README.md)
+        apps/seq/README.md|apps/lift/README.md|apps/cas/README.md|apps/cron/README.md|apps/puff/README.md|apps/learnings/README.md|apps/ledger/README.md|apps/mesh/README.md|apps/st/README.md|apps/parse-arch/README.md)
           ;;
         apps/seq/*)
           mark_app seq
@@ -167,6 +192,9 @@ case "$mode" in
           ;;
         apps/learnings/*)
           mark_app learnings
+          ;;
+        apps/ledger/*)
+          mark_app ledger
           ;;
         apps/mesh/*)
           mark_app mesh

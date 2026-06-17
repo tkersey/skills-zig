@@ -1,0 +1,103 @@
+$ zig fmt --check build.zig libs/durable_store/src/lib.zig apps/st/scripts/st.zig apps/learnings/scripts/learnings.zig apps/learnings/scripts/append_learning.zig
+$ zig build test-st --summary all
+Build Summary: 4/4 steps succeeded; 35/35 tests passed
+test-st success
++- run test 35 pass (35 total) 84ms MaxRSS:5M
+   +- compile test Debug native cached 102ms MaxRSS:35M
+      +- options cached
+
+$ zig build test-learnings --summary all
+Build Summary: 4/4 steps succeeded; 22/22 tests passed
+test-learnings success
++- run test 22 pass (22 total) 19ms MaxRSS:3M
+   +- compile test Debug native cached 102ms MaxRSS:35M
+      +- options cached
+
+$ zig build test-append-learning --summary all
+Build Summary: 4/4 steps succeeded; 6/6 tests passed
+test-append-learning success
++- run test 6 pass (6 total) 6ms MaxRSS:3M
+   +- compile test Debug native cached 102ms MaxRSS:35M
+      +- options cached
+
+$ zig build test --summary all
+test
++- run test w
+error: unsupported FREQ: MONTHLY (allowed: HOURLY, DAILY, WEEKLY)
+error: invalid label: ../bad (allowed: [A-Za-z0-9._-])
+error: invalid label: bad label (allowed: [A-Za-z0-9._-])
+error: invalid label: ../bad (allowed: [A-Za-z0-9._-])
+error: invalid label: bad label (allowed: [A-Za-z0-9._-])
+error: no automation with id cron-001
+failed command: ./.zig-cache/o/d9a4bd3127178d15eb9c266c487388fc/test --cache-dir=./.zig-cache --seed=0x1066a377 --listen=-
+
+test
++- run test w
+error: token-cost --pricing api requires an exact known API model; pass --model <name>. Bundled supported models: gpt-5.5, gpt-5.4, gpt-5.4-mini
+error: unknown option --bogus
+error: option --path is not supported for skill_report
+error: option --audit is not supported for skill_report
+error: option --since-cursor is not supported for message_audit
+failed command: cd /Users/tk/workspace/tk/skills-zig/apps/seq && ./../../.zig-cache/o/acafdb59271fc745eedc07d64e5c6ac2/test --cache-dir=./../../.zig-cache --seed=0x1066a377 --listen=-
+
+Build Summary: 49/49 steps succeeded; 401/401 tests passed
+test success
++- run test 160 pass (160 total) 3s MaxRSS:30M
+|  +- compile test Debug native cached 217ms MaxRSS:36M
+|     +- options cached
++- test-lift success
+|  +- run test 12 pass (12 total) 54ms MaxRSS:28M
+|  |  +- compile test Debug native cached 197ms MaxRSS:35M
+|  |     +- options cached
+|  +- run test 1 pass (1 total) 33ms MaxRSS:2M
+|  |  +- compile test Debug native cached 220ms MaxRSS:35M
+|  |     +- options (reused)
+|  +- run test 16 pass (16 total) 103ms MaxRSS:28M
+|     +- compile test Debug native cached 195ms MaxRSS:35M
+|        +- options (reused)
++- test-cas success
+|  +- run test 3 pass (3 total) 24ms MaxRSS:3M
+|  |  +- compile test Debug native cached 221ms MaxRSS:35M
+|  |     +- options cached
+|  +- run test 16 pass (16 total) 26ms MaxRSS:3M
+|  |  +- compile test Debug native cached 221ms MaxRSS:35M
+|  |     +- options (reused)
+|  +- run test 15 pass (15 total) 26ms MaxRSS:3M
+|  |  +- compile test Debug native cached 219ms MaxRSS:35M
+|  |     +- options (reused)
+|  +- run test 42 pass (42 total) 41ms MaxRSS:4M
+|  |  +- compile test Debug native cached 219ms MaxRSS:35M
+|  |     +- options (reused)
+|  +- run test 8 pass (8 total) 8ms MaxRSS:3M
+|  |  +- compile test Debug native cached 220ms MaxRSS:35M
+|  |     +- options (reused)
+|  +- run test 17 pass (17 total) 28ms MaxRSS:3M
+|  |  +- compile test Debug native cached 213ms MaxRSS:35M
+|  |     +- options (reused)
+|  +- run test 6 pass (6 total) 10ms MaxRSS:3M
+|     +- compile test Debug native cached 220ms MaxRSS:35M
++- run test 16 pass (16 total) 179ms MaxRSS:6M
+|  +- compile test Debug native cached 223ms MaxRSS:36M
+|     +- options cached
++- run test 22 pass (22 total) 21ms MaxRSS:3M
+|  +- compile test Debug native cached 195ms MaxRSS:35M
+|     +- options cached
++- run test 6 pass (6 total) 19ms MaxRSS:3M
+|  +- compile test Debug native cached 193ms MaxRSS:35M
+|     +- options (reused)
++- run test 10 pass (10 total) 12ms MaxRSS:3M
+|  +- compile test Debug native cached 220ms MaxRSS:35M
+|     +- options cached
++- run test 35 pass (35 total) 116ms MaxRSS:5M
+|  +- compile test Debug native cached 188ms MaxRSS:35M
+|     +- options cached
++- run test 4 pass (4 total) 5ms MaxRSS:2M
+|  +- compile test Debug native cached 226ms MaxRSS:35M
+|     +- options cached
++- run test 7 pass (7 total) 17ms MaxRSS:3M
+|  +- compile test Debug native cached 199ms MaxRSS:36M
+|     +- options (reused)
+|     +- options (reused)
+|     +- options (reused)
++- run test 5 pass (5 total) 14ms MaxRSS:3M
+   +- compile test Debug native cached 187ms MaxRSS:35M

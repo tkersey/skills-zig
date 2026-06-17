@@ -1,0 +1,46 @@
+.github/workflows/auto-release.yml
+.github/workflows/pr-ci.yml
+.github/workflows/release-cas.yml
+.github/workflows/release-cron.yml
+.github/workflows/release-learnings.yml
+.github/workflows/release-ledger.yml
+.github/workflows/release-lift.yml
+.github/workflows/release-mesh.yml
+.github/workflows/release-parse-arch.yml
+.github/workflows/release-puff.yml
+.github/workflows/release-seq.yml
+.github/workflows/release-st.yml
+affected: learnings,ledger,st
+version-changed: learnings,ledger,st
+Build Summary: 4/4 steps succeeded
+build-ledger cached
++- install ledger cached
+   +- compile exe ledger ReleaseFast native cached 105ms MaxRSS:35M
+      +- options cached
+
+Build Summary: 4/4 steps succeeded; 6/6 tests passed
+test-ledger success
++- run test 6 pass (6 total) 25ms MaxRSS:3M
+   +- compile test Debug native cached 105ms MaxRSS:35M
+      +- options cached
+
+Build Summary: 4/4 steps succeeded; 35/35 tests passed
+test-st success
++- run test 35 pass (35 total) 84ms MaxRSS:5M
+   +- compile test Debug native cached 105ms MaxRSS:35M
+      +- options cached
+
+Build Summary: 4/4 steps succeeded; 22/22 tests passed
+test-learnings success
++- run test 22 pass (22 total) 18ms MaxRSS:3M
+   +- compile test Debug native cached 101ms MaxRSS:35M
+      +- options cached
+
+Build Summary: 4/4 steps succeeded; 6/6 tests passed
+test-append-learning success
++- run test 6 pass (6 total) 6ms MaxRSS:3M
+   +- compile test Debug native cached 102ms MaxRSS:35M
+      +- options cached
+
+prefix
+0.1.0

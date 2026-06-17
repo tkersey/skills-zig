@@ -1,0 +1,46 @@
+codex/skills/resolve/tools/rgr_gate.py:84:        if not has(r"ledger_cli\s*:\s*ledger", text) or not has(r"store\s*:\s*\.ledger/negative-ledger\.jsonl", text) or not has(r"command\s*:\s*.*ledger map", text) or not has(r"exit_code\s*:\s*(0|2|3)", text):
+codex/skills/resolve/tools/rgr_gate.py:86:            print("same-cluster recurrence requires machine-auditable ledger map evidence")
+codex/skills/resolve/references/negative-route-gate.md:8:  ledger_cli: ledger
+codex/skills/resolve/references/negative-route-gate.md:9:  store: .ledger/negative-ledger.jsonl
+codex/skills/resolve/references/negative-route-gate.md:10:  command: "ledger map --route ... --cluster ... --artifact ..."
+codex/skills/resolve/references/negative-route-gate.md:23:If `ledger map` is missing or exits `3`, same-cluster mutation is blocked. If active evidence excludes the route and is not reopened/stale/superseded/accepted, implementation is blocked. Fuzzy matches are advisory only.
+codex/skills/resolve/tools/mutation_permit_gate.py:33:    r"command\s*:\s*.*ledger map",
+codex/skills/resolve/tools/mutation_permit_gate.py:88:        print("mutation permit requires available ledger map evidence")
+codex/skills/negative-ledger/references/negative-ledger-jsonl.md:3:Use `.ledger/negative-ledger.jsonl` as the repo-local durable store for negative evidence.
+codex/skills/negative-ledger/references/negative-ledger-jsonl.md:28:ledger map \
+codex/skills/negative-ledger/references/negative-ledger-jsonl.md:44:Append through `ledger capture`; do not hand-edit `.ledger/negative-ledger.jsonl`.
+codex/skills/negative-ledger/SKILL.md:13:.ledger/negative-ledger.jsonl
+codex/skills/negative-ledger/SKILL.md:40:  ledger_cli: ledger
+codex/skills/negative-ledger/SKILL.md:41:  store: .ledger/negative-ledger.jsonl
+codex/skills/negative-ledger/SKILL.md:42:  command: "ledger map --route ... --cluster ... --artifact ..."
+codex/skills/negative-ledger/SKILL.md:53:If the store is missing or `ledger map` was not run, same-cluster mutation is blocked. If an active exclusion matches and is not reopened/stale/superseded, implementation is blocked. Fuzzy candidates are advisory only.
+codex/skills/negative-ledger/SKILL.md:60:ledger map --route "$ROUTE" --cluster "$CLUSTER" --artifact "$ARTIFACT"
+codex/skills/negative-ledger/SKILL.md:98:Do not flood `.ledger/negative-ledger.jsonl`.
+codex/skills/negative-ledger/SKILL.md:107:One-off same-session route failures can stay in the route record. `.learnings.jsonl` rows may be cited as historical evidence, but durable negative-route exclusion state belongs in `.ledger/negative-ledger.jsonl`.
+codex/skills/resolve/references/negative-ledger-operational-evidence.md:13:    ledger_cli: ledger
+codex/skills/resolve/references/negative-ledger-operational-evidence.md:14:    store: .ledger/negative-ledger.jsonl
+codex/skills/resolve/references/negative-ledger-operational-evidence.md:15:    command: "ledger map --route ... --cluster ... --artifact ..."
+codex/skills/resolve/references/negative-ledger-operational-evidence.md:30:If same_cluster_count >= 2 and `query_or_map: no`, `ledger map` is missing, `ledger_available: no`, or `exit_code: 3`, mutation is blocked.
+codex/skills/resolve/SKILL.md:241:    ledger_cli: ledger
+codex/skills/resolve/SKILL.md:242:    store: ".ledger/negative-ledger.jsonl"
+codex/skills/resolve/SKILL.md:243:    command: "ledger map --route ... --cluster ... --artifact ..."
+codex/skills/resolve/SKILL.md:379:    ledger_cli: ledger
+codex/skills/resolve/SKILL.md:380:    store: ".ledger/negative-ledger.jsonl"
+codex/skills/resolve/SKILL.md:381:    command: "ledger map --route ... --cluster ... --artifact ..."
+codex/skills/resolve/SKILL.md:399:If same_cluster_count >= 2 and query_or_map is no, `ledger map` is missing, `ledger_available: no`, or `exit_code: 3`, mutation is blocked.
+codex/skills/resolve/SKILL.md:506:      ledger_cli: ledger
+codex/skills/resolve/SKILL.md:507:      store: ".ledger/negative-ledger.jsonl"
+codex/skills/resolve/SKILL.md:508:      command: "ledger map --route ... --cluster ... --artifact ..."
+Mutation permit gate: PASS
+Mutation permit gate: FAIL
+missing pattern: ledger_cli\s*:\s*ledger
+missing pattern: store\s*:\s*\.ledger/negative-ledger\.jsonl
+missing pattern: command\s*:\s*.*ledger map
+missing pattern: exit_code\s*:\s*(0|2|3)
+missing pattern: ledger_available\s*:\s*(yes|no)
+missing pattern: active_exclusion_match\s*:\s*(yes|no|null)
+RGR gate: PASS
+RGR gate: FAIL
+same-cluster recurrence requires machine-auditable ledger map evidence
+Skill is valid!
+Skill is valid!

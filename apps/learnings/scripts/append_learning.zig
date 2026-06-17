@@ -1,5 +1,6 @@
 const app_meta = @import("app_meta");
 const core_cli = @import("core_cli");
+const durable_store = @import("durable_store");
 const std = @import("std");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
@@ -975,36 +976,8 @@ fn resolveOutputPathAlloc(allocator: std.mem.Allocator, repo_root: []const u8, r
     return std.fs.path.join(allocator, &.{ repo_root, raw_path });
 }
 
-fn ensureParentPath(path: []const u8) !void {
-    const parent = std.fs.path.dirname(path) orelse return;
-    if (parent.len == 0) return;
-
-    if (std.fs.path.isAbsolute(parent)) {
-        const rel = std.mem.trim(u8, parent, "/");
-        if (rel.len == 0) return;
-        var root = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), "/", .{});
-        defer root.close(std.Io.Threaded.global_single_threaded.io());
-        try root.createDirPath(std.Io.Threaded.global_single_threaded.io(), rel);
-        return;
-    }
-
-    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), parent);
-}
-
 fn appendJsonLine(path: []const u8, json_line: []const u8) !void {
-    try ensureParentPath(path);
-
-    var file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{ .mode = .write_only }) catch |err| switch (err) {
-        error.FileNotFound => try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), path, .{ .truncate = false }),
-        else => return err,
-    };
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
-
-    const end_pos = (try file.stat(std.Io.Threaded.global_single_threaded.io())).size;
-    var writer = file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-    try writer.seekTo(end_pos);
-    try writer.interface.writeAll(json_line);
-    try writer.interface.writeAll("\n");
+    return durable_store.appendLineAtomic(std.heap.page_allocator, path, json_line, 64 * 1024 * 1024);
 }
 
 fn findDuplicateExistingIdAlloc(allocator: std.mem.Allocator, path: []const u8, fingerprint: []const u8) !?[]u8 {

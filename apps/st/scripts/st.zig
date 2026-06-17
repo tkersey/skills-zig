@@ -1,6 +1,7 @@
 const app_meta = @import("app_meta");
 const builtin = @import("builtin");
 const core_cli = @import("core_cli");
+const durable_store = @import("durable_store");
 const std = @import("std");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
@@ -9443,152 +9444,23 @@ fn civilFromDays(days_since_unix_epoch: i64) Date {
 }
 
 fn ensureLockSidecarGitignored(allocator: std.mem.Allocator, plan_file: []const u8) !void {
-    const parent = std.fs.path.dirname(plan_file) orelse ".";
-    const git_root = findGitRootAlloc(allocator, parent) catch return;
-    if (git_root.len == 0) return;
-    const git_root_real_alloc = if (std.fs.path.isAbsolute(git_root))
-        std.Io.Dir.realPathFileAbsoluteAlloc(std.Io.Threaded.global_single_threaded.io(), git_root, allocator) catch null
-    else
-        std.Io.Dir.cwd().realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), git_root, allocator) catch null;
-    defer if (git_root_real_alloc) |p| allocator.free(p);
-    const git_root_real = git_root_real_alloc orelse git_root;
-
-    const plan_rel = if (std.fs.path.isAbsolute(plan_file)) blk: {
-        const plan_real = std.Io.Dir.realPathFileAbsoluteAlloc(std.Io.Threaded.global_single_threaded.io(), plan_file, allocator) catch plan_file;
-        break :blk try std.fs.path.relative(allocator, git_root_real, null, git_root_real, plan_real);
-    } else plan_file;
-    const lock_rel = try std.fmt.allocPrint(allocator, "{s}.lock", .{plan_rel});
-
-    var argv = [_][]const u8{ "git", "-C", git_root_real, "check-ignore", "-q", "--", lock_rel };
-    const result = try runCommandCapture(allocator, null, &argv);
-    if (result.exit_code == 0) return;
-    if (result.exit_code == 1) {
-        const fix_cmd = try std.fmt.allocPrint(
-            allocator,
-            "cd {s} && echo {s} >> .gitignore",
-            .{ git_root, lock_rel },
-        );
-        _ = fix_cmd;
-        return error.LockSidecarNotGitignored;
-    }
-    return error.GitCommandFailed;
-}
-
-fn findGitRootAlloc(allocator: std.mem.Allocator, start: []const u8) ![]const u8 {
-    var argv = [_][]const u8{ "git", "-C", start, "rev-parse", "--show-toplevel" };
-    const result = try runCommandCapture(allocator, null, &argv);
-    if (result.exit_code != 0) return error.GitCommandFailed;
-    const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
-    if (trimmed.len == 0) return error.GitCommandFailed;
-    return allocator.dupe(u8, trimmed);
-}
-
-const CommandCapture = struct {
-    exit_code: i32,
-    stdout: []const u8,
-    stderr: []const u8,
-};
-
-fn runCommandCapture(allocator: std.mem.Allocator, cwd: ?[]const u8, argv: []const []const u8) !CommandCapture {
-    const result = try std.process.run(allocator, std.Io.Threaded.global_single_threaded.io(), .{
-        .argv = argv,
-        .cwd = if (cwd) |path| .{ .path = path } else .inherit,
-        .stdout_limit = .limited(4 * 1024 * 1024),
-        .stderr_limit = .limited(1024 * 1024),
-    });
-    const exit_code: i32 = switch (result.term) {
-        .exited => |code| code,
-        else => -1,
-    };
-
-    return .{
-        .exit_code = exit_code,
-        .stdout = result.stdout,
-        .stderr = result.stderr,
-    };
+    return durable_store.ensureLockSidecarGitignored(allocator, plan_file);
 }
 
 fn fileExists(path: []const u8) bool {
-    if (std.fs.path.isAbsolute(path)) {
-        std.Io.Dir.accessAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return false;
-        return true;
-    }
-    std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch return false;
-    return true;
+    return durable_store.fileExists(path);
 }
 
 fn fileSize(path: []const u8) !u64 {
-    if (std.fs.path.isAbsolute(path)) {
-        var file = try std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{});
-        defer file.close(std.Io.Threaded.global_single_threaded.io());
-        const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
-        return stat.size;
-    }
-
-    var file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{});
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
-    const stat = try file.stat(std.Io.Threaded.global_single_threaded.io());
-    return stat.size;
+    return durable_store.fileSize(path);
 }
 
 fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]const u8 {
-    if (std.fs.path.isAbsolute(path)) {
-        var file = try std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{});
-        defer file.close(std.Io.Threaded.global_single_threaded.io());
-        var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
-        return reader.interface.allocRemaining(allocator, .limited(max_bytes));
-    }
-
-    var file = try std.Io.Dir.cwd().openFile(std.Io.Threaded.global_single_threaded.io(), path, .{});
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
-    var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
-    return reader.interface.allocRemaining(allocator, .limited(max_bytes));
+    return durable_store.readFileAlloc(allocator, path, max_bytes);
 }
 
 fn writeTextAtomic(allocator: std.mem.Allocator, path: []const u8, text: []const u8) !void {
-    try ensureParentPath(path);
-
-    const base = std.fs.path.basename(path);
-    const parent = std.fs.path.dirname(path) orelse ".";
-    const tmp_name = try std.fmt.allocPrint(allocator, ".{s}.{d}.tmp", .{ base, std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds });
-
-    if (std.fs.path.isAbsolute(path)) {
-        var dir = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), parent, .{});
-        defer dir.close(std.Io.Threaded.global_single_threaded.io());
-
-        var file = try dir.createFile(std.Io.Threaded.global_single_threaded.io(), tmp_name, .{ .truncate = true, .read = true });
-        defer file.close(std.Io.Threaded.global_single_threaded.io());
-        try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), text);
-        try file.sync(std.Io.Threaded.global_single_threaded.io());
-        try dir.rename(tmp_name, dir, base, std.Io.Threaded.global_single_threaded.io());
-        return;
-    }
-
-    const cwd = std.Io.Dir.cwd();
-    var dir = try cwd.openDir(std.Io.Threaded.global_single_threaded.io(), parent, .{});
-    defer dir.close(std.Io.Threaded.global_single_threaded.io());
-
-    var file = try dir.createFile(std.Io.Threaded.global_single_threaded.io(), tmp_name, .{ .truncate = true, .read = true });
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
-    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), text);
-    try file.sync(std.Io.Threaded.global_single_threaded.io());
-    try dir.rename(tmp_name, dir, base, std.Io.Threaded.global_single_threaded.io());
-}
-
-fn ensureParentPath(path: []const u8) !void {
-    const parent = std.fs.path.dirname(path) orelse return;
-    if (parent.len == 0 or std.mem.eql(u8, parent, ".")) return;
-
-    if (std.fs.path.isAbsolute(parent)) {
-        const rel = std.mem.trim(u8, parent, "/");
-        if (rel.len == 0) return;
-        var root = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), "/", .{});
-        defer root.close(std.Io.Threaded.global_single_threaded.io());
-        try root.createDirPath(std.Io.Threaded.global_single_threaded.io(), rel);
-        return;
-    }
-
-    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), parent);
+    return durable_store.writeTextAtomic(allocator, path, text);
 }
 
 fn joinCommaLimited(buf: []u8, items: []const []const u8) ![]const u8 {

@@ -10,6 +10,7 @@ Monorepo for Zig CLIs with shared internal libraries and independent release str
 - `cron` (`cron`)
 - `puff` (`puff`)
 - `learnings` (`learnings append` primary, `append_learning` compatibility)
+- `ledger` (`ledger`)
 - `mesh` (`mesh`)
 - `st` (`st`)
 - `parse-arch` (`parse-arch`)
@@ -24,10 +25,12 @@ No unified umbrella CLI is introduced. Binaries remain separate.
 - `apps/cron`
 - `apps/puff`
 - `apps/learnings`
+- `apps/ledger`
 - `apps/mesh`
 - `apps/st`
 - `apps/parse-arch`
 - `libs/core`
+- `libs/durable_store`
 - `.github/workflows`
 - `docs/release`
 
@@ -46,6 +49,7 @@ zig build build-cas -Doptimize=ReleaseFast
 zig build build-cron -Doptimize=ReleaseFast
 zig build build-puff -Doptimize=ReleaseFast
 zig build build-learnings -Doptimize=ReleaseFast
+zig build build-ledger -Doptimize=ReleaseFast
 zig build build-mesh -Doptimize=ReleaseFast
 zig build build-st -Doptimize=ReleaseFast
 zig build build-parse-arch -Doptimize=ReleaseFast
@@ -94,12 +98,13 @@ Per-app VERSION files are the source of truth:
 - `apps/cron/VERSION`
 - `apps/puff/VERSION`
 - `apps/learnings/VERSION`
+- `apps/ledger/VERSION`
 - `apps/mesh/VERSION`
 - `apps/st/VERSION`
 - `apps/parse-arch/VERSION`
 
 PRs that touch release-relevant CLI surfaces must bump the corresponding `VERSION` file.
-The check is conservative: app-local changes count for that app, and shared shipped surfaces such as `build.zig`, `build.zig.zon`, and `libs/core/**` count for every shipped CLI.
+The check is conservative: app-local changes count for that app, broad shared shipped surfaces such as `build.zig`, `build.zig.zon`, and `libs/core/**` count for every shipped CLI, and `libs/durable_store/**` counts for its shipped consumers.
 Do not close release-relevant CLI work with a local `./zig-out/bin` binary alone.
 Release closure means the changed CLI has a tagged GitHub release, the tap formula has been updated, Homebrew audit/test have passed, and the installed Homebrew binary reports the expected version.
 
@@ -111,6 +116,7 @@ Independent tags trigger independent workflows, and each tag must match its app 
 - `cron-v*` -> `.github/workflows/release-cron.yml`
 - `puff-v*` -> `.github/workflows/release-puff.yml`
 - `learnings-v*` -> `.github/workflows/release-learnings.yml`
+- `ledger-v*` -> `.github/workflows/release-ledger.yml`
 - `mesh-v*` -> `.github/workflows/release-mesh.yml`
 - `st-v*` -> `.github/workflows/release-st.yml`
 - `parse-arch-v*` -> `.github/workflows/release-parse-arch.yml`
@@ -126,6 +132,7 @@ Required tag forms:
 - `cron-v<version>` where `<version>` equals `apps/cron/VERSION`
 - `puff-v<version>` where `<version>` equals `apps/puff/VERSION`
 - `learnings-v<version>` where `<version>` equals `apps/learnings/VERSION`
+- `ledger-v<version>` where `<version>` equals `apps/ledger/VERSION`
 - `mesh-v<version>` where `<version>` equals `apps/mesh/VERSION`
 - `st-v<version>` where `<version>` equals `apps/st/VERSION`
 - `parse-arch-v<version>` where `<version>` equals `apps/parse-arch/VERSION`
