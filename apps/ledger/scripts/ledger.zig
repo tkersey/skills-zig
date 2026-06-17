@@ -294,6 +294,7 @@ fn appendCapture(allocator: std.mem.Allocator, args: Args) !CaptureResult {
     else
         try nextNegIdAlloc(allocator, records.items);
     defer allocator.free(neg_id);
+    if (findRecord(records.items, neg_id) != null) return error.DuplicateCaptureId;
 
     const requested_status = jsonStringField(obj, "status") orelse "active";
     const status = if (captureCanRequestStatus(obj, requested_status))
@@ -310,7 +311,7 @@ fn appendCapture(allocator: std.mem.Allocator, args: Args) !CaptureResult {
     try out.writer.writeAll(",\"status\":");
     try writeJsonString(&out.writer, status);
     try out.writer.writeAll(",\"record\":");
-    try out.writer.writeAll(input);
+    try std.json.Stringify.value(parsed.value, .{}, &out.writer);
     try out.writer.writeByte('}');
     const line = try out.toOwnedSlice();
     defer allocator.free(line);
@@ -698,6 +699,9 @@ fn captureCanRequestStatus(obj: std.json.ObjectMap, requested_status: []const u8
 fn validateCaptureInput(obj: std.json.ObjectMap) !void {
     const exclusion_scope = jsonStringField(obj, "exclusion_scope") orelse "route";
     if (!isKnownExclusionScope(exclusion_scope)) return error.InvalidExclusionScope;
+    if (jsonStringField(obj, "status")) |status| {
+        if (!isKnownStatus(status)) return error.InvalidStatus;
+    }
 }
 
 fn captureHasWitness(obj: std.json.ObjectMap) bool {
@@ -1162,4 +1166,78 @@ test "projection validation uses final replayed status" {
     defer reopened_loaded.deinit(std.testing.allocator);
     try std.testing.expect(reopened_loaded.validation.ok());
     try std.testing.expectEqualStrings("reopened", reopened_loaded.records.items[0].status);
+}
+
+test "capture rejects unknown status before append" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const store = try std.fs.path.join(std.testing.allocator, &.{ root, "negative-ledger.jsonl" });
+    defer std.testing.allocator.free(store);
+    const input = try std.fs.path.join(std.testing.allocator, &.{ root, "capture.json" });
+    defer std.testing.allocator.free(input);
+    try durable_store.writeTextAtomic(
+        std.testing.allocator,
+        input,
+        "{\"hypothesis\":\"h\",\"route_id\":\"route-a\",\"status\":\"actve\",\"source_refs\":[{\"kind\":\"test\",\"ref\":\"fixture\"}]}",
+    );
+
+    try std.testing.expectError(error.InvalidStatus, appendCapture(std.testing.allocator, .{ .command = .capture, .file = store, .json_path = input }));
+    try std.testing.expect(!durable_store.fileExists(store));
+}
+
+test "capture rejects duplicate neg_id before append" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const store = try std.fs.path.join(std.testing.allocator, &.{ root, "negative-ledger.jsonl" });
+    defer std.testing.allocator.free(store);
+    const first = try std.fs.path.join(std.testing.allocator, &.{ root, "first.json" });
+    defer std.testing.allocator.free(first);
+    const second = try std.fs.path.join(std.testing.allocator, &.{ root, "second.json" });
+    defer std.testing.allocator.free(second);
+    try durable_store.writeTextAtomic(
+        std.testing.allocator,
+        first,
+        "{\"neg_id\":\"NEG-000001\",\"hypothesis\":\"h1\",\"route_id\":\"route-a\",\"source_refs\":[{\"kind\":\"test\",\"ref\":\"fixture\"}]}",
+    );
+    try durable_store.writeTextAtomic(
+        std.testing.allocator,
+        second,
+        "{\"neg_id\":\"NEG-000001\",\"hypothesis\":\"h2\",\"route_id\":\"route-b\",\"source_refs\":[{\"kind\":\"test\",\"ref\":\"fixture\"}]}",
+    );
+
+    var capture = try appendCapture(std.testing.allocator, .{ .command = .capture, .file = store, .json_path = first });
+    defer capture.deinit(std.testing.allocator);
+    try std.testing.expectError(error.DuplicateCaptureId, appendCapture(std.testing.allocator, .{ .command = .capture, .file = store, .json_path = second }));
+    var loaded = try loadRecordsValidated(std.testing.allocator, store);
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(loaded.validation.ok());
+    try std.testing.expectEqual(@as(usize, 1), loaded.records.items.len);
+}
+
+test "capture compacts multiline input before append" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const store = try std.fs.path.join(std.testing.allocator, &.{ root, "negative-ledger.jsonl" });
+    defer std.testing.allocator.free(store);
+    const input = try std.fs.path.join(std.testing.allocator, &.{ root, "capture.json" });
+    defer std.testing.allocator.free(input);
+    try durable_store.writeTextAtomic(
+        std.testing.allocator,
+        input,
+        "{\n  \"hypothesis\":\"h\",\n  \"route_id\":\"route-a\",\n  \"source_refs\":[{\"kind\":\"test\",\"ref\":\"fixture\"}]\n}\n",
+    );
+
+    var capture = try appendCapture(std.testing.allocator, .{ .command = .capture, .file = store, .json_path = input });
+    defer capture.deinit(std.testing.allocator);
+    var loaded = try loadRecordsValidated(std.testing.allocator, store);
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(loaded.validation.ok());
+    try std.testing.expectEqual(@as(usize, 1), loaded.records.items.len);
+    try std.testing.expectEqualStrings("active", loaded.records.items[0].status);
 }
