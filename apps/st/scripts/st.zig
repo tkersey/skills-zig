@@ -74,6 +74,831 @@ const UsageText =
     \\  -V, --version | version         Show version
 ;
 
+const InitHelpText =
+    \\st init
+    \\
+    \\Initialize plan storage.
+    \\
+    \\usage: st init --file PATH [--replace]
+    \\
+    \\options:
+    \\  --file PATH       Path to plan JSONL file (default: .step/st-plan.jsonl)
+    \\  --replace         Replace existing plan storage
+    \\  -h, --help        Show help for init
+;
+
+const AddHelpText =
+    \\st add
+    \\
+    \\Add or upsert a plan item.
+    \\
+    \\usage: st add --file PATH --id ID --step TEXT [options]
+    \\
+    \\options:
+    \\  --id ID           Durable item id, for example st-001
+    \\  --step TEXT       Task text
+    \\  --status STATUS   pending|in_progress|completed|blocked|deferred|canceled
+    \\  --priority LEVEL  high|medium|low
+    \\  --deps DEPS       Comma-separated dependency list, for example st-001:blocks
+    \\  --backlog-only    Add item outside the mirrored plan projection
+    \\  --file PATH       Path to plan JSONL file
+    \\  -h, --help        Show help for add
+;
+
+const SelectHelpText =
+    \\st select
+    \\
+    \\Add tasks into the mirrored plan projection.
+    \\
+    \\usage: st select --file PATH [--ids IDS] [--status STATUS] [--priority LEVEL]
+    \\
+    \\options:
+    \\  --ids IDS         Comma-separated item ids
+    \\  --status STATUS   Select items with this status
+    \\  --priority LEVEL  Select items with this priority
+    \\  --file PATH       Path to plan JSONL file
+    \\  -h, --help        Show help for select
+;
+
+const DeselectHelpText =
+    \\st deselect
+    \\
+    \\Remove tasks from the mirrored plan projection.
+    \\
+    \\usage: st deselect --file PATH [--ids IDS] [--status STATUS] [--priority LEVEL]
+    \\
+    \\options:
+    \\  --ids IDS         Comma-separated item ids
+    \\  --status STATUS   Deselect items with this status
+    \\  --priority LEVEL  Deselect items with this priority
+    \\  --file PATH       Path to plan JSONL file
+    \\  -h, --help        Show help for deselect
+;
+
+const SetStatusHelpText =
+    \\st set-status
+    \\
+    \\Set item status.
+    \\
+    \\usage: st set-status --file PATH --id ID --status STATUS [options]
+    \\
+    \\options:
+    \\  --id ID             Durable item id
+    \\  --status STATUS     pending|in_progress|completed|blocked|deferred|canceled
+    \\  --allow-unproven    Allow graph-mode completion without proof
+    \\  --reason TEXT       Waiver reason when allowing unproven completion
+    \\  --file PATH         Path to plan JSONL file
+    \\  -h, --help          Show help for set-status
+;
+
+const SetPriorityHelpText =
+    \\st set-priority
+    \\
+    \\Set item priority.
+    \\
+    \\usage: st set-priority --file PATH --id ID --priority high|medium|low
+    \\
+    \\options:
+    \\  --id ID           Durable item id
+    \\  --priority LEVEL  high|medium|low
+    \\  --file PATH       Path to plan JSONL file
+    \\  -h, --help        Show help for set-priority
+;
+
+const SetDepsHelpText =
+    \\st set-deps
+    \\
+    \\Set item dependencies.
+    \\
+    \\usage: st set-deps --file PATH --id ID --deps DEPS
+    \\
+    \\options:
+    \\  --id ID       Durable item id
+    \\  --deps DEPS   Comma-separated dependency list, for example st-001:blocks
+    \\  --file PATH   Path to plan JSONL file
+    \\  -h, --help    Show help for set-deps
+;
+
+const SetNotesHelpText =
+    \\st set-notes
+    \\
+    \\Set item notes.
+    \\
+    \\usage: st set-notes --file PATH --id ID --notes TEXT
+    \\
+    \\options:
+    \\  --id ID       Durable item id
+    \\  --notes TEXT  Notes to store on the item
+    \\  --file PATH   Path to plan JSONL file
+    \\  -h, --help    Show help for set-notes
+;
+
+const AddCommentHelpText =
+    \\st add-comment
+    \\
+    \\Add a comment to an item.
+    \\
+    \\usage: st add-comment --file PATH --id ID --text TEXT [--author NAME]
+    \\
+    \\options:
+    \\  --id ID        Durable item id
+    \\  --text TEXT    Comment text
+    \\  --author NAME  Comment author (default: codex)
+    \\  --file PATH    Path to plan JSONL file
+    \\  -h, --help     Show help for add-comment
+;
+
+const RemoveHelpText =
+    \\st remove
+    \\
+    \\Remove item.
+    \\
+    \\usage: st remove --file PATH --id ID
+    \\
+    \\options:
+    \\  --id ID       Durable item id
+    \\  --file PATH   Path to plan JSONL file
+    \\  -h, --help    Show help for remove
+;
+
+const ShowHelpText =
+    \\st show
+    \\
+    \\Show current plan.
+    \\
+    \\usage: st show --file PATH [--surface plan|all|backlog] [--format markdown|table|json]
+    \\
+    \\options:
+    \\  --surface SURFACE  plan|all|backlog (default: plan)
+    \\  --format FORMAT    markdown|table|json
+    \\  --file PATH        Path to plan JSONL file
+    \\  -h, --help         Show help for show
+;
+
+const ReadyHelpText =
+    \\st ready
+    \\
+    \\Show ready pending items.
+    \\
+    \\usage: st ready --file PATH [--surface plan|all|backlog] [--format markdown|table|json]
+    \\
+    \\options:
+    \\  --surface SURFACE  plan|all|backlog (default: plan)
+    \\  --format FORMAT    markdown|table|json
+    \\  --file PATH        Path to plan JSONL file
+    \\  -h, --help         Show help for ready
+;
+
+const BlockedHelpText =
+    \\st blocked
+    \\
+    \\Show blocked or waiting items.
+    \\
+    \\usage: st blocked --file PATH [--surface plan|all|backlog] [--format markdown|table|json]
+    \\
+    \\options:
+    \\  --surface SURFACE  plan|all|backlog (default: plan)
+    \\  --format FORMAT    markdown|table|json
+    \\  --file PATH        Path to plan JSONL file
+    \\  -h, --help         Show help for blocked
+;
+
+const DoctorHelpText =
+    \\st doctor
+    \\
+    \\Inspect or repair seq contract integrity.
+    \\
+    \\usage: st doctor --file PATH [--repair-seq]
+    \\
+    \\options:
+    \\  --repair-seq   Repair seq contract issues when possible
+    \\  --file PATH    Path to plan JSONL file
+    \\  -h, --help     Show help for doctor
+;
+
+const PrimeHelpText =
+    \\st prime
+    \\
+    \\Select/project the durable frontier and emit plan_sync v3.
+    \\
+    \\usage: st prime --file PATH [options]
+    \\
+    \\options:
+    \\  --mode MODE                    selected|auto-top-up|replace-ready|aperture
+    \\  --limit N                      Projection limit (default: 7)
+    \\  --target codex|opencode|all    Projection target
+    \\  --preview                      Compute output without writing selection changes
+    \\  --allow-multiple-in-progress   Allow multiple in_progress items
+    \\  --file PATH                    Path to plan JSONL file
+    \\  -h, --help                     Show help for prime
+;
+
+const AssertProjectionHelpText =
+    \\st assert-projection
+    \\
+    \\Validate Codex/OpenCode projection invariants.
+    \\
+    \\usage: st assert-projection --file PATH [--strict|--no-strict] [--limit N] [--target codex|opencode|all]
+    \\
+    \\options:
+    \\  --strict       Enforce strict projection invariants (default)
+    \\  --no-strict    Relax strict projection invariants
+    \\  --limit N      Projection limit (default: 7)
+    \\  --target NAME  codex|opencode|all
+    \\  --file PATH    Path to plan JSONL file
+    \\  -h, --help     Show help for assert-projection
+;
+
+const ReconcileCodexHelpText =
+    \\st reconcile-codex
+    \\
+    \\Reconcile Codex update_plan payload or transcript into mirrored durable fields.
+    \\
+    \\usage: st reconcile-codex --file PATH (--input JSON | --transcript-path PATH)
+    \\
+    \\options:
+    \\  --input PATH            JSON update_plan payload
+    \\  --transcript-path PATH  Codex session transcript JSONL
+    \\  --file PATH             Path to plan JSONL file
+    \\  -h, --help              Show help for reconcile-codex
+;
+
+const ImportProposedPlanHelpText =
+    \\st import-proposed-plan
+    \\
+    \\Import Plan Mode Markdown into durable backlog tasks.
+    \\
+    \\usage: st import-proposed-plan --file PATH --input PATH [options]
+    \\
+    \\options:
+    \\  --input PATH          Proposed-plan markdown
+    \\  --replace             Replace existing items
+    \\  --backlog-only        Keep imported items outside projection
+    \\  --select-ready        Select ready imported items
+    \\  --id-prefix PREFIX    Generated id prefix (default: st)
+    \\  --start-at N          First generated id number
+    \\  --infer-linear-deps   Infer linear dependencies
+    \\  --file PATH           Path to plan JSONL file
+    \\  -h, --help            Show help for import-proposed-plan
+;
+
+const GuardSessionStartHelpText =
+    \\st guard-session-start
+    \\
+    \\Register expected SessionStart update_plan payload for a Codex session.
+    \\
+    \\usage: st guard-session-start --session-id ID [--guard-root PATH] [--hook-json]
+    \\
+    \\options:
+    \\  --session-id ID    Codex session id
+    \\  --guard-root PATH  Guard state directory
+    \\  --hook-json        Emit Codex hook JSON
+    \\  -h, --help         Show help for guard-session-start
+;
+
+const GuardPreToolUseHelpText =
+    \\st guard-pre-tool-use
+    \\
+    \\Check whether a SessionStart guard has been satisfied for the current turn.
+    \\
+    \\usage: st guard-pre-tool-use --session-id ID --transcript-path PATH [--guard-root PATH] [--hook-json]
+    \\
+    \\options:
+    \\  --session-id ID         Codex session id
+    \\  --transcript-path PATH  Codex session transcript JSONL
+    \\  --guard-root PATH       Guard state directory
+    \\  --hook-json             Emit Codex hook JSON
+    \\  -h, --help              Show help for guard-pre-tool-use
+;
+
+const ExportHelpText =
+    \\st export
+    \\
+    \\Export snapshot JSON.
+    \\
+    \\usage: st export --file PATH --output PATH
+    \\
+    \\options:
+    \\  --output PATH  Snapshot output path
+    \\  --file PATH    Path to plan JSONL file
+    \\  -h, --help     Show help for export
+;
+
+const ImportPlanHelpText =
+    \\st import-plan
+    \\
+    \\Import snapshot JSON.
+    \\
+    \\usage: st import-plan --file PATH --input PATH [--replace] [--backlog-only]
+    \\
+    \\options:
+    \\  --input PATH    Snapshot JSON path
+    \\  --replace       Replace existing items
+    \\  --backlog-only  Keep imported items outside projection
+    \\  --file PATH     Path to plan JSONL file
+    \\  -h, --help      Show help for import-plan
+;
+
+const ImportOrchplanHelpText =
+    \\st import-orchplan
+    \\
+    \\Import OrchPlan tasks into the durable ledger.
+    \\
+    \\usage: st import-orchplan --file PATH --input PATH [--replace] [--backlog-only]
+    \\
+    \\options:
+    \\  --input PATH    OrchPlan JSON or YAML path
+    \\  --replace       Replace existing items
+    \\  --backlog-only  Keep imported items outside projection
+    \\  --file PATH     Path to plan JSONL file
+    \\  -h, --help      Show help for import-orchplan
+;
+
+const ClaimHelpText =
+    \\st claim
+    \\
+    \\Claim a safe wave or task set with a lease.
+    \\
+    \\usage: st claim --file PATH (--ids IDS | --wave WAVE) --executor NAME [--lease-seconds N]
+    \\
+    \\options:
+    \\  --ids IDS            Comma-separated item ids
+    \\  --wave WAVE          Wave id to claim
+    \\  --executor NAME      Claim owner
+    \\  --lease-seconds N    Lease duration (default: 900)
+    \\  --file PATH          Path to plan JSONL file
+    \\  -h, --help           Show help for claim
+;
+
+const HeartbeatHelpText =
+    \\st heartbeat
+    \\
+    \\Refresh a held claim lease.
+    \\
+    \\usage: st heartbeat --file PATH --id ID
+    \\
+    \\options:
+    \\  --id ID       Durable item id
+    \\  --file PATH   Path to plan JSONL file
+    \\  -h, --help    Show help for heartbeat
+;
+
+const SetRuntimeHelpText =
+    \\st set-runtime
+    \\
+    \\Attach runtime execution metadata to a claimed item.
+    \\
+    \\usage: st set-runtime --file PATH --id ID [options]
+    \\
+    \\options:
+    \\  --id ID              Durable item id
+    \\  --substrate NAME     Runtime substrate
+    \\  --thread-id ID       Thread id
+    \\  --agent-id ID        Agent id
+    \\  --row-id ID          Row id
+    \\  --output-ref REF     Output reference
+    \\  --last-event TEXT    Last runtime event
+    \\  --file PATH          Path to plan JSONL file
+    \\  -h, --help           Show help for set-runtime
+;
+
+const SetProofHelpText =
+    \\st set-proof
+    \\
+    \\Record proof state and evidence for an item.
+    \\
+    \\usage: st set-proof --file PATH --id ID --proof-state pass|fail|not_run [options]
+    \\
+    \\options:
+    \\  --id ID             Durable item id
+    \\  --proof-state STATE pass|fail|not_run
+    \\  --proof-id ID       Proof obligation id
+    \\  --command CMD       Validation command
+    \\  --evidence-ref REF  Evidence path or reference
+    \\  --now ISO8601       Proof timestamp
+    \\  --file PATH         Path to plan JSONL file
+    \\  -h, --help          Show help for set-proof
+;
+
+const CompleteHelpText =
+    \\st complete
+    \\
+    \\Record proof and complete a graph-mode item.
+    \\
+    \\usage: st complete --file PATH --id ID --command CMD --evidence-ref REF [options]
+    \\
+    \\options:
+    \\  --id ID             Durable item id
+    \\  --command CMD       Validation command
+    \\  --evidence-ref REF  Evidence path or reference
+    \\  --proof-id ID       Proof obligation id
+    \\  --now ISO8601       Completion timestamp
+    \\  --file PATH         Path to plan JSONL file
+    \\  -h, --help          Show help for complete
+;
+
+const ProofHelpText =
+    \\st proof
+    \\
+    \\Proof commands.
+    \\
+    \\usage: st proof audit --file PATH --id ID [--format json|markdown]
+    \\
+    \\commands:
+    \\  audit    Audit proof obligations for an item
+    \\
+    \\options:
+    \\  --file PATH   Path to plan JSONL file
+    \\  -h, --help    Show help for proof
+;
+
+const ProofAuditHelpText =
+    \\st proof audit
+    \\
+    \\Audit proof obligations for an item.
+    \\
+    \\usage: st proof audit --file PATH --id ID [--format json|markdown]
+    \\
+    \\options:
+    \\  --id ID         Durable item id
+    \\  --format FORMAT json|markdown
+    \\  --file PATH     Path to plan JSONL file
+    \\  -h, --help      Show help for proof audit
+;
+
+const ReleaseHelpText =
+    \\st release
+    \\
+    \\Release a held claim and normalize task status.
+    \\
+    \\usage: st release --file PATH --id ID [--reason TEXT]
+    \\
+    \\options:
+    \\  --id ID        Durable item id
+    \\  --reason TEXT  Release reason
+    \\  --file PATH    Path to plan JSONL file
+    \\  -h, --help     Show help for release
+;
+
+const ReclaimStaleHelpText =
+    \\st reclaim-stale
+    \\
+    \\Reclaim expired held claims.
+    \\
+    \\usage: st reclaim-stale --file PATH [--now ISO8601]
+    \\
+    \\options:
+    \\  --now ISO8601  Timestamp used for stale-claim comparison
+    \\  --file PATH    Path to plan JSONL file
+    \\  -h, --help     Show help for reclaim-stale
+;
+
+const ImportMeshResultsHelpText =
+    \\st import-mesh-results
+    \\
+    \\Import mesh output CSV results into the ledger.
+    \\
+    \\usage: st import-mesh-results --file PATH --input PATH
+    \\
+    \\options:
+    \\  --input PATH   Mesh output CSV
+    \\  --file PATH    Path to plan JSONL file
+    \\  -h, --help     Show help for import-mesh-results
+;
+
+const IntakeHelpText =
+    \\st intake
+    \\
+    \\Material plan intake commands.
+    \\
+    \\usage: st intake {plan,apply} --file PATH [options]
+    \\
+    \\commands:
+    \\  plan     Scaffold or normalize a Markdown intake file
+    \\  apply    Apply a Markdown intake file into the durable graph
+    \\
+    \\options:
+    \\  --file PATH   Path to plan JSONL file
+    \\  -h, --help    Show help for intake
+;
+
+const IntakePlanHelpText =
+    \\st intake plan
+    \\
+    \\Scaffold or normalize a Markdown intake file.
+    \\
+    \\usage: st intake plan --file PATH --source PATH --out PATH
+    \\
+    \\options:
+    \\  --source PATH  Source plan, spec, or markdown path
+    \\  --out PATH     Intake markdown output path
+    \\  --file PATH    Path to plan JSONL file
+    \\  -h, --help     Show help for intake plan
+;
+
+const IntakeApplyHelpText =
+    \\st intake apply
+    \\
+    \\Apply a Markdown intake file into the durable graph.
+    \\
+    \\usage: st intake apply --file PATH --input PATH [--gate GATE]
+    \\
+    \\options:
+    \\  --input PATH   Intake markdown path
+    \\  --gate GATE    draft|implementation-ready|execution-ready|proof-complete
+    \\  --file PATH    Path to plan JSONL file
+    \\  -h, --help     Show help for intake apply
+;
+
+const GraphHelpText =
+    \\st graph
+    \\
+    \\Graph compiler commands.
+    \\
+    \\usage: st graph {schema,apply,audit,insights,polish} --file PATH [options]
+    \\
+    \\commands:
+    \\  schema    Emit graph patch schema
+    \\  apply     Apply a graph patch
+    \\  audit     Audit graph gates
+    \\  insights  Emit graph insights
+    \\  polish    Fixed-point polish commands
+    \\
+    \\options:
+    \\  --file PATH   Path to plan JSONL file
+    \\  -h, --help    Show help for graph
+;
+
+const GraphSchemaHelpText =
+    \\st graph schema
+    \\
+    \\Emit graph patch schema.
+    \\
+    \\usage: st graph schema
+    \\
+    \\options:
+    \\  -h, --help    Show help for graph schema
+;
+
+const GraphApplyHelpText =
+    \\st graph apply
+    \\
+    \\Apply a graph patch.
+    \\
+    \\usage: st graph apply --file PATH --input PATH [--gate GATE] [--dry-run]
+    \\
+    \\options:
+    \\  --input PATH   Graph patch JSON
+    \\  --gate GATE    draft|implementation-ready|execution-ready|proof-complete
+    \\  --dry-run      Validate without writing
+    \\  --file PATH    Path to plan JSONL file
+    \\  -h, --help     Show help for graph apply
+;
+
+const GraphAuditHelpText =
+    \\st graph audit
+    \\
+    \\Audit graph gates.
+    \\
+    \\usage: st graph audit --file PATH [--gate GATE] [--format markdown|json]
+    \\
+    \\options:
+    \\  --gate GATE      draft|implementation-ready|execution-ready|proof-complete
+    \\  --format FORMAT  markdown|json
+    \\  --file PATH      Path to plan JSONL file
+    \\  -h, --help       Show help for graph audit
+;
+
+const GraphInsightsHelpText =
+    \\st graph insights
+    \\
+    \\Emit graph insights.
+    \\
+    \\usage: st graph insights --file PATH [--format markdown|json]
+    \\
+    \\options:
+    \\  --format FORMAT  markdown|json
+    \\  --file PATH      Path to plan JSONL file
+    \\  -h, --help       Show help for graph insights
+;
+
+const GraphPolishHelpText =
+    \\st graph polish
+    \\
+    \\Fixed-point polish commands.
+    \\
+    \\usage: st graph polish {begin,snapshot,status,gate} --file PATH [options]
+    \\
+    \\commands:
+    \\  begin     Start a polish session
+    \\  snapshot  Record a polish pass
+    \\  status    Show polish status
+    \\  gate      Require stable polish passes and a graph gate
+    \\
+    \\options:
+    \\  --file PATH   Path to plan JSONL file
+    \\  -h, --help    Show help for graph polish
+;
+
+const GraphPolishBeginHelpText =
+    \\st graph polish begin
+    \\
+    \\Start a polish session.
+    \\
+    \\usage: st graph polish begin --file PATH --name NAME
+    \\
+    \\options:
+    \\  --name NAME   Polish session name
+    \\  --file PATH   Path to plan JSONL file
+    \\  -h, --help    Show help for graph polish begin
+;
+
+const GraphPolishSnapshotHelpText =
+    \\st graph polish snapshot
+    \\
+    \\Record a polish pass.
+    \\
+    \\usage: st graph polish snapshot --file PATH --pass N [--gate GATE]
+    \\
+    \\options:
+    \\  --pass N      Pass number
+    \\  --gate GATE   draft|implementation-ready|execution-ready|proof-complete
+    \\  --file PATH   Path to plan JSONL file
+    \\  -h, --help    Show help for graph polish snapshot
+;
+
+const GraphPolishStatusHelpText =
+    \\st graph polish status
+    \\
+    \\Show polish status.
+    \\
+    \\usage: st graph polish status --file PATH [--format markdown|json]
+    \\
+    \\options:
+    \\  --format FORMAT  markdown|json
+    \\  --file PATH      Path to plan JSONL file
+    \\  -h, --help       Show help for graph polish status
+;
+
+const GraphPolishGateHelpText =
+    \\st graph polish gate
+    \\
+    \\Require stable polish passes and a graph gate.
+    \\
+    \\usage: st graph polish gate --file PATH [--min-stable-passes N] [--gate GATE] [--format markdown|json]
+    \\
+    \\options:
+    \\  --min-stable-passes N  Required stable passes (default: 2)
+    \\  --gate GATE            draft|implementation-ready|execution-ready|proof-complete
+    \\  --format FORMAT        markdown|json
+    \\  --file PATH            Path to plan JSONL file
+    \\  -h, --help             Show help for graph polish gate
+;
+
+const ApertureHelpText =
+    \\st aperture
+    \\
+    \\Aperture commands.
+    \\
+    \\usage: st aperture {next,plan,select,explain} --file PATH [options]
+    \\
+    \\commands:
+    \\  next     Emit the next aperture candidate
+    \\  plan     Emit an aperture plan
+    \\  select   Select aperture items into the projection
+    \\  explain  Explain aperture selection
+    \\
+    \\options:
+    \\  --file PATH   Path to plan JSONL file
+    \\  -h, --help    Show help for aperture
+;
+
+const ApertureNextHelpText =
+    \\st aperture next
+    \\
+    \\Emit the next aperture candidate.
+    \\
+    \\usage: st aperture next --file PATH [--format json]
+    \\
+    \\options:
+    \\  --format FORMAT  json
+    \\  --file PATH      Path to plan JSONL file
+    \\  -h, --help       Show help for aperture next
+;
+
+const AperturePlanHelpText =
+    \\st aperture plan
+    \\
+    \\Emit an aperture plan.
+    \\
+    \\usage: st aperture plan --file PATH [--limit N] [--format json|markdown]
+    \\
+    \\options:
+    \\  --limit N        Candidate limit (default: 7)
+    \\  --format FORMAT  json|markdown
+    \\  --file PATH      Path to plan JSONL file
+    \\  -h, --help       Show help for aperture plan
+;
+
+const ApertureSelectHelpText =
+    \\st aperture select
+    \\
+    \\Select aperture items into the projection.
+    \\
+    \\usage: st aperture select --file PATH [--limit N] [--strategy aperture-score]
+    \\
+    \\options:
+    \\  --limit N        Candidate limit (default: 7)
+    \\  --strategy NAME  Selection strategy (default: aperture-score)
+    \\  --file PATH      Path to plan JSONL file
+    \\  -h, --help       Show help for aperture select
+;
+
+const ApertureExplainHelpText =
+    \\st aperture explain
+    \\
+    \\Explain aperture selection.
+    \\
+    \\usage: st aperture explain --file PATH [--limit N] [--format markdown]
+    \\
+    \\options:
+    \\  --limit N        Candidate limit (default: 7)
+    \\  --format FORMAT  markdown
+    \\  --file PATH      Path to plan JSONL file
+    \\  -h, --help       Show help for aperture explain
+;
+
+const CompileHelpText =
+    \\st compile
+    \\
+    \\Compile shortcuts.
+    \\
+    \\usage: st compile {intent,graph,ready,aperture} --file PATH [options]
+    \\
+    \\commands:
+    \\  intent    Compile intent atoms into graph state
+    \\  graph     Apply a graph patch
+    \\  ready     Audit implementation-ready graph state
+    \\  aperture  Select and project the execution aperture
+    \\
+    \\options:
+    \\  --file PATH   Path to plan JSONL file
+    \\  -h, --help    Show help for compile
+;
+
+const CompileIntentHelpText =
+    \\st compile intent
+    \\
+    \\Compile intent atoms into graph state.
+    \\
+    \\usage: st compile intent --file PATH --input PATH
+    \\
+    \\options:
+    \\  --input PATH   Intent JSON path
+    \\  --file PATH    Path to plan JSONL file
+    \\  -h, --help     Show help for compile intent
+;
+
+const CompileGraphHelpText =
+    \\st compile graph
+    \\
+    \\Apply a graph patch.
+    \\
+    \\usage: st compile graph --file PATH --input PATH [--gate GATE]
+    \\
+    \\options:
+    \\  --input PATH   Graph patch JSON
+    \\  --gate GATE    draft|implementation-ready|execution-ready|proof-complete
+    \\  --file PATH    Path to plan JSONL file
+    \\  -h, --help     Show help for compile graph
+;
+
+const CompileReadyHelpText =
+    \\st compile ready
+    \\
+    \\Audit implementation-ready graph state.
+    \\
+    \\usage: st compile ready --file PATH [--format markdown|json]
+    \\
+    \\options:
+    \\  --format FORMAT  markdown|json
+    \\  --file PATH      Path to plan JSONL file
+    \\  -h, --help       Show help for compile ready
+;
+
+const CompileApertureHelpText =
+    \\st compile aperture
+    \\
+    \\Select and project the execution aperture.
+    \\
+    \\usage: st compile aperture --file PATH [--limit N]
+    \\
+    \\options:
+    \\  --limit N    Projection limit (default: 7)
+    \\  --file PATH  Path to plan JSONL file
+    \\  -h, --help   Show help for compile aperture
+;
+
 const Status = enum {
     blocked,
     canceled,
@@ -1056,10 +1881,10 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (argv.len >= 3 and core_cli.isHelpArg(argv[2])) {
+    if (commandHelpTextForArgv(argv)) |help_text| {
         var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
-        try core_cli.printHelpSurface(stdout, HelpSurface, Version);
+        try core_cli.printHelpWithVersion(stdout, help_text, Version);
         return;
     }
 
@@ -1088,6 +1913,137 @@ pub fn main(init: std.process.Init) !void {
 
 fn exitWithError(err: anyerror) !void {
     core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
+}
+
+fn commandHelpTextForArgv(argv: []const []const u8) ?[]const u8 {
+    if (argv.len < 3 or !hasHelpArgFrom(argv, 2)) return null;
+    const command = parseCommand(argv[1]) orelse return null;
+    return switch (command) {
+        .graph => graphHelpTextForArgv(argv),
+        .intake => intakeHelpTextForArgv(argv),
+        .aperture => apertureHelpTextForArgv(argv),
+        .compile => compileHelpTextForArgv(argv),
+        .proof => proofHelpTextForArgv(argv),
+        else => commandHelpText(command),
+    };
+}
+
+fn hasHelpArgFrom(argv: []const []const u8, start: usize) bool {
+    var i = start;
+    while (i < argv.len) : (i += 1) {
+        if (core_cli.isHelpArg(argv[i])) return true;
+    }
+    return false;
+}
+
+fn commandHelpText(command: Command) []const u8 {
+    return switch (command) {
+        .init => InitHelpText,
+        .add => AddHelpText,
+        .select => SelectHelpText,
+        .deselect => DeselectHelpText,
+        .set_status => SetStatusHelpText,
+        .set_priority => SetPriorityHelpText,
+        .set_deps => SetDepsHelpText,
+        .set_notes => SetNotesHelpText,
+        .add_comment => AddCommentHelpText,
+        .remove => RemoveHelpText,
+        .show => ShowHelpText,
+        .ready => ReadyHelpText,
+        .blocked => BlockedHelpText,
+        .doctor => DoctorHelpText,
+        .prime => PrimeHelpText,
+        .assert_projection => AssertProjectionHelpText,
+        .reconcile_codex => ReconcileCodexHelpText,
+        .import_proposed_plan => ImportProposedPlanHelpText,
+        .guard_session_start => GuardSessionStartHelpText,
+        .guard_pre_tool_use => GuardPreToolUseHelpText,
+        .@"export" => ExportHelpText,
+        .import_plan => ImportPlanHelpText,
+        .import_orchplan => ImportOrchplanHelpText,
+        .claim => ClaimHelpText,
+        .heartbeat => HeartbeatHelpText,
+        .set_runtime => SetRuntimeHelpText,
+        .set_proof => SetProofHelpText,
+        .complete => CompleteHelpText,
+        .proof => ProofHelpText,
+        .release => ReleaseHelpText,
+        .reclaim_stale => ReclaimStaleHelpText,
+        .import_mesh_results => ImportMeshResultsHelpText,
+        .intake => IntakeHelpText,
+        .graph => GraphHelpText,
+        .aperture => ApertureHelpText,
+        .compile => CompileHelpText,
+    };
+}
+
+fn graphHelpTextForArgv(argv: []const []const u8) []const u8 {
+    if (argv.len < 4 or core_cli.isHelpArg(argv[2])) return GraphHelpText;
+    const graph_command = parseGraphCommand(argv[2]) orelse return GraphHelpText;
+    if (graph_command == .polish) return graphPolishHelpTextForArgv(argv);
+    return switch (graph_command) {
+        .none => GraphHelpText,
+        .schema => GraphSchemaHelpText,
+        .apply => GraphApplyHelpText,
+        .audit => GraphAuditHelpText,
+        .insights => GraphInsightsHelpText,
+        .polish => GraphPolishHelpText,
+    };
+}
+
+fn graphPolishHelpTextForArgv(argv: []const []const u8) []const u8 {
+    if (argv.len < 5 or core_cli.isHelpArg(argv[3])) return GraphPolishHelpText;
+    const polish_command = parsePolishCommand(argv[3]) orelse return GraphPolishHelpText;
+    return switch (polish_command) {
+        .none => GraphPolishHelpText,
+        .begin => GraphPolishBeginHelpText,
+        .snapshot => GraphPolishSnapshotHelpText,
+        .status => GraphPolishStatusHelpText,
+        .gate => GraphPolishGateHelpText,
+    };
+}
+
+fn intakeHelpTextForArgv(argv: []const []const u8) []const u8 {
+    if (argv.len < 4 or core_cli.isHelpArg(argv[2])) return IntakeHelpText;
+    const intake_command = parseIntakeCommand(argv[2]) orelse return IntakeHelpText;
+    return switch (intake_command) {
+        .none => IntakeHelpText,
+        .plan => IntakePlanHelpText,
+        .apply => IntakeApplyHelpText,
+    };
+}
+
+fn apertureHelpTextForArgv(argv: []const []const u8) []const u8 {
+    if (argv.len < 4 or core_cli.isHelpArg(argv[2])) return ApertureHelpText;
+    const aperture_command = parseApertureCommand(argv[2]) orelse return ApertureHelpText;
+    return switch (aperture_command) {
+        .none => ApertureHelpText,
+        .next => ApertureNextHelpText,
+        .plan => AperturePlanHelpText,
+        .select => ApertureSelectHelpText,
+        .explain => ApertureExplainHelpText,
+    };
+}
+
+fn compileHelpTextForArgv(argv: []const []const u8) []const u8 {
+    if (argv.len < 4 or core_cli.isHelpArg(argv[2])) return CompileHelpText;
+    const compile_command = parseCompileCommand(argv[2]) orelse return CompileHelpText;
+    return switch (compile_command) {
+        .none => CompileHelpText,
+        .intent => CompileIntentHelpText,
+        .graph => CompileGraphHelpText,
+        .ready => CompileReadyHelpText,
+        .aperture => CompileApertureHelpText,
+    };
+}
+
+fn proofHelpTextForArgv(argv: []const []const u8) []const u8 {
+    if (argv.len < 4 or core_cli.isHelpArg(argv[2])) return ProofHelpText;
+    const proof_command = parseProofCommand(argv[2]) orelse return ProofHelpText;
+    return switch (proof_command) {
+        .none => ProofHelpText,
+        .audit => ProofAuditHelpText,
+    };
 }
 
 fn parseArgs(argv: []const []const u8) !Args {
@@ -9542,6 +10498,27 @@ test "parseCommand and parseOutputFormat recognize known values" {
     try std.testing.expectEqual(Surface.all, parseSurface("all").?);
     try std.testing.expectEqual(Surface.backlog, parseSurface("backlog").?);
     try std.testing.expect(parseSurface("queue") == null);
+}
+
+test "commandHelpTextForArgv resolves command-specific help" {
+    const prime_help = commandHelpTextForArgv(&.{ "st", "prime", "--help" }).?;
+    try std.testing.expect(std.mem.indexOf(u8, prime_help, "usage: st prime --file PATH [options]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prime_help, "usage: st {") == null);
+
+    const complete_help = commandHelpTextForArgv(&.{ "st", "complete", "--help" }).?;
+    try std.testing.expect(std.mem.indexOf(u8, complete_help, "usage: st complete --file PATH --id ID --command CMD --evidence-ref REF [options]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, complete_help, "Record proof and complete") != null);
+}
+
+test "commandHelpTextForArgv resolves nested command help" {
+    const graph_help = commandHelpTextForArgv(&.{ "st", "graph", "--help" }).?;
+    try std.testing.expect(std.mem.indexOf(u8, graph_help, "usage: st graph {schema,apply,audit,insights,polish} --file PATH [options]") != null);
+
+    const audit_help = commandHelpTextForArgv(&.{ "st", "graph", "audit", "--help" }).?;
+    try std.testing.expect(std.mem.indexOf(u8, audit_help, "usage: st graph audit --file PATH [--gate GATE] [--format markdown|json]") != null);
+
+    const polish_help = commandHelpTextForArgv(&.{ "st", "graph", "polish", "snapshot", "--help" }).?;
+    try std.testing.expect(std.mem.indexOf(u8, polish_help, "usage: st graph polish snapshot --file PATH --pass N [--gate GATE]") != null);
 }
 
 test "dependencyState maps blocked and waiting statuses" {
