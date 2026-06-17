@@ -1,0 +1,131 @@
+{"version":1,"id":"st-116","ok":true,"missing":null,"proof":null,"required_obligations":[]}
+11/11 tests passed
+test-ledger success
++- run test 11 pass (11 total) 46ms MaxRSS:4M
+   +- compile test Debug native cached 106ms MaxRSS:35M
+      +- options cached
+
+
+zig build build-ledger -Doptimize=ReleaseFast --summary all
+Build Summary: 4/4 steps succeeded
+build-ledger cached
++- install ledger cached
+   +- compile exe ledger ReleaseFast native cached 104ms MaxRSS:35M
+      +- options cached
+
+
+zig build lint --summary all
+Build Summary: 2/2 steps succeeded
+lint success
++- run zig success 902ms
+
+
+zig build test --summary all
+test
++- run test w
+error: unsupported FREQ: MONTHLY (allowed: HOURLY, DAILY, WEEKLY)
+error: invalid label: ../bad (allowed: [A-Za-z0-9._-])
+error: invalid label: bad label (allowed: [A-Za-z0-9._-])
+error: invalid label: ../bad (allowed: [A-Za-z0-9._-])
+error: invalid label: bad label (allowed: [A-Za-z0-9._-])
+error: no automation with id cron-001
+failed command: ./.zig-cache/o/d9a4bd3127178d15eb9c266c487388fc/test --cache-dir=./.zig-cache --seed=0x60cd00cc --listen=-
+
+test
++- run test w
+error: token-cost --pricing api requires an exact known API model; pass --model <name>. Bundled supported models: gpt-5.5, gpt-5.4, gpt-5.4-mini
+error: unknown option --bogus
+error: option --path is not supported for skill_report
+error: option --audit is not supported for skill_report
+error: option --since-cursor is not supported for message_audit
+failed command: cd /Users/tk/workspace/tk/skills-zig/apps/seq && ./../../.zig-cache/o/acafdb59271fc745eedc07d64e5c6ac2/test --cache-dir=./../../.zig-cache --seed=0x60cd00cc --listen=-
+
+Build Summary: 52/52 steps succeeded; 414/414 tests passed
+test success
++- run test 160 pass (160 total) 3s MaxRSS:30M
+|  +- compile test Debug native cached 234ms MaxRSS:36M
+|     +- options cached
++- test-lift success
+|  +- run test 12 pass (12 total) 69ms MaxRSS:28M
+|  |  +- compile test Debug native cached 216ms MaxRSS:35M
+|  |     +- options cached
+|  +- run test 1 pass (1 total) 31ms MaxRSS:2M
+|  |  +- compile test Debug native cached 246ms MaxRSS:35M
+|  |     +- options (reused)
+|  +- run test 16 pass (16 total) 84ms MaxRSS:28M
+|     +- compile test Debug native cached 252ms MaxRSS:35M
+|        +- options (reused)
++- test-cas success
+|  +- run test 3 pass (3 total) 11ms MaxRSS:3M
+|  |  +- compile test Debug native cached 256ms MaxRSS:36M
+|  |     +- options cached
+|  +- run test 16 pass (16 total) 20ms MaxRSS:3M
+|  |  +- compile test Debug native cached 138ms MaxRSS:35M
+|  |     +- options (reused)
+|  +- run test 15 pass (15 total) 13ms MaxRSS:3M
+|  |  +- compile test Debug native cached 144ms MaxRSS:36M
+|  |     +- options (reused)
+|  +- run test 42 pass (42 total) 57ms MaxRSS:4M
+|  |  +- compile test Debug native cached 139ms MaxRSS:35M
+|  |     +- options (reused)
+|  +- run test 8 pass (8 total) 7ms MaxRSS:3M
+|  |  +- compile test Debug native cached 137ms MaxRSS:35M
+|  |     +- options (reused)
+|  +- run test 17 pass (17 total) 31ms MaxRSS:3M
+|  |  +- compile test Debug native cached 196ms MaxRSS:35M
+|  |     +- options (reused)
+|  +- run test 6 pass (6 total) 44ms MaxRSS:3M
+|     +- compile test Debug native cached 231ms MaxRSS:35M
++- run test 16 pass (16 total) 88ms MaxRSS:6M
+|  +- compile test Debug native cached 162ms MaxRSS:36M
+|     +- options cached
++- run test 22 pass (22 total) 33ms MaxRSS:3M
+|  +- compile test Debug native cached 213ms MaxRSS:35M
+|     +- options cached
++- run test 6 pass (6 total) 17ms MaxRSS:3M
+|  +- compile test Debug native cached 141ms MaxRSS:35M
+|     +- options (reused)
++- run test 11 pass (11 total) 93ms MaxRSS:4M
+|  +- compile test Debug native cached 242ms MaxRSS:35M
+|     +- options cached
++- run test 10 pass (10 total) 28ms MaxRSS:3M
+|  +- compile test Debug native cached 254ms MaxRSS:35M
+|     +- options cached
++- run test 37 pass (37 total) 145ms MaxRSS:5M
+|  +- compile test Debug native cached 143ms MaxRSS:35M
+|     +- options cached
++- run test 4 pass (4 total) 9ms MaxRSS:2M
+|  +- compile test Debug native cached 151ms MaxRSS:35M
+|     +- options cached
++- run test 7 pass (7 total) 16ms MaxRSS:3M
+|  +- compile test Debug native cached 163ms MaxRSS:36M
+|     +- options (reused)
+|     +- options (reused)
+|     +- options (reused)
++- run test 5 pass (5 total) 24ms MaxRSS:3M
+   +- compile test Debug native cached 143ms MaxRSS:35M
+
+
+post-completion checks
+
+git diff --check
+
+st assert-projection --file .step/st-plan.jsonl --format json
+
+st proof audit --file .step/st-plan.jsonl --id st-116 --format json
+
+review-fix validation
+
+zig version
+0.16.0
+
+zig build test-ledger --summary all
+
+zig build build-ledger -Doptimize=ReleaseFast --summary all
+
+zig build lint --summary all
+No issues!
+
+zig build test --summary all
+
+git diff --check
