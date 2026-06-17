@@ -71,6 +71,13 @@ const Record = struct {
     route_id: []u8,
     cluster_id: []u8,
     artifact_state_id: []u8,
+    exclusion_scope: []u8,
+    exclusion_rule: []u8,
+    failure_class: []u8,
+    confidence: []u8,
+    next_search_hint: []u8,
+    source_refs_count: usize = 0,
+    applicability_conditions_count: usize = 0,
     evidence_count: usize = 0,
 
     fn deinit(self: *Record, allocator: std.mem.Allocator) void {
@@ -80,6 +87,11 @@ const Record = struct {
         allocator.free(self.route_id);
         allocator.free(self.cluster_id);
         allocator.free(self.artifact_state_id);
+        allocator.free(self.exclusion_scope);
+        allocator.free(self.exclusion_rule);
+        allocator.free(self.failure_class);
+        allocator.free(self.confidence);
+        allocator.free(self.next_search_hint);
     }
 };
 
@@ -96,6 +108,29 @@ const CaptureResult = struct {
 const RouteGate = struct {
     active_match_index: ?usize = null,
     fuzzy_candidates: usize = 0,
+};
+
+const ValidationIssue = struct {
+    issue_count: usize = 0,
+    first_issue: ?[]const u8 = null,
+
+    fn add(self: *ValidationIssue, message: []const u8) void {
+        self.issue_count += 1;
+        if (self.first_issue == null) self.first_issue = message;
+    }
+
+    fn ok(self: ValidationIssue) bool {
+        return self.issue_count == 0;
+    }
+};
+
+const LoadResult = struct {
+    records: std.ArrayList(Record),
+    validation: ValidationIssue = .{},
+
+    fn deinit(self: *LoadResult, allocator: std.mem.Allocator) void {
+        deinitRecords(allocator, &self.records);
+    }
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -260,7 +295,7 @@ fn appendCapture(allocator: std.mem.Allocator, args: Args) !CaptureResult {
     defer allocator.free(neg_id);
 
     const requested_status = jsonStringField(obj, "status") orelse "active";
-    const status = if (captureHasWitness(obj) and !std.mem.eql(u8, requested_status, "user-context"))
+    const status = if (captureCanRequestStatus(obj, requested_status))
         requested_status
     else if (std.mem.eql(u8, requested_status, "active"))
         "need-evidence"
@@ -317,57 +352,99 @@ fn cmdShow(allocator: std.mem.Allocator, path: []const u8, neg_id: []const u8) !
 }
 
 fn cmdMap(allocator: std.mem.Allocator, args: Args) !u8 {
-    if (!durable_store.fileExists(args.file)) {
-        try writeMissingRouteGate(allocator, args.file);
+    if (args.route.len == 0 or args.cluster.len == 0 or args.artifact.len == 0) {
+        try writeRouteGate(allocator, args, .{}, null, 3, false, "invalid_gate_input");
         return 3;
     }
-    var records = try loadRecords(allocator, args.file);
-    defer deinitRecords(allocator, &records);
+    if (!durable_store.fileExists(args.file)) {
+        try writeRouteGate(allocator, args, .{}, null, 3, false, "ledger_missing");
+        return 3;
+    }
+    var loaded = try loadRecordsValidated(allocator, args.file);
+    defer loaded.deinit(allocator);
+    if (!loaded.validation.ok()) {
+        try writeRouteGate(allocator, args, .{}, null, 3, true, "store_invalid");
+        return 3;
+    }
 
-    const gate = evaluateRouteGate(records.items, args);
-
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    try out.writer.writeAll("{\"negative_route_gate\":{\"query_or_map\":\"yes\",\"evidence_source\":\"");
-    try out.writer.writeAll(args.file);
-    try out.writer.writeAll("\",\"active_exclusion_match\":");
-    try out.writer.writeAll(if (gate.active_match_index != null) "true" else "false");
-    try out.writer.writeAll(",\"exclusion_id\":");
-    if (gate.active_match_index) |idx| try writeJsonString(&out.writer, records.items[idx].neg_id) else try out.writer.writeAll("null");
-    try out.writer.writeAll(",\"fuzzy_candidates\":");
-    try out.writer.print("{d}", .{gate.fuzzy_candidates});
-    try out.writer.writeAll(",\"fuzzy_authority\":\"suggest_only\",\"handoff_allowed\":");
-    try out.writer.writeAll(if (gate.active_match_index != null) "false" else "true");
-    try out.writer.writeAll("}}\n");
-    try writeStdoutAlloc(allocator, &out);
-    return if (gate.active_match_index != null) 2 else 0;
+    const gate = evaluateRouteGate(loaded.records.items, args);
+    const exit_code: u8 = if (gate.active_match_index != null) 2 else 0;
+    try writeRouteGate(allocator, args, gate, loaded.records.items, exit_code, true, "none");
+    return exit_code;
 }
 
-fn writeMissingRouteGate(allocator: std.mem.Allocator, path: []const u8) !void {
+fn writeRouteGate(
+    allocator: std.mem.Allocator,
+    args: Args,
+    gate: RouteGate,
+    records: ?[]const Record,
+    exit_code: u8,
+    ledger_available: bool,
+    failure: []const u8,
+) !void {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    try out.writer.writeAll("{\"negative_route_gate\":{\"query_or_map\":\"missing\",\"evidence_source\":");
-    try writeJsonString(&out.writer, path);
-    try out.writer.writeAll(",\"ledger_available\":false,\"active_exclusion_match\":null,\"exclusion_id\":null,\"fuzzy_candidates\":0,\"fuzzy_authority\":\"none\",\"handoff_allowed\":false,\"failure\":\"ledger_missing\"}}\n");
+    const active_match = gate.active_match_index != null;
+    try out.writer.writeAll("{\"negative_route_gate\":{\"checked\":true,\"query_or_map\":\"yes\",\"ledger_cli\":\"ledger\",\"store\":");
+    try writeJsonString(&out.writer, args.file);
+    try out.writer.writeAll(",\"command\":");
+    try writeMapCommandJson(&out.writer, args);
+    try out.writer.print(",\"exit_code\":{d},\"ledger_available\":{s},\"active_exclusion_match\":", .{
+        exit_code,
+        if (ledger_available) "true" else "false",
+    });
+    if (!ledger_available or exit_code == 3) {
+        try out.writer.writeAll("null");
+    } else {
+        try out.writer.writeAll(if (active_match) "true" else "false");
+    }
+    try out.writer.writeAll(",\"exclusion_id\":");
+    if (gate.active_match_index) |idx| {
+        const source_records = records orelse return error.MissingGateRecords;
+        try writeJsonString(&out.writer, source_records[idx].neg_id);
+    } else {
+        try writeJsonString(&out.writer, "none");
+    }
+    try out.writer.writeAll(",\"fuzzy_candidates\":");
+    try out.writer.print("{d}", .{gate.fuzzy_candidates});
+    try out.writer.writeAll(",\"fuzzy_authority\":");
+    try writeJsonString(&out.writer, if (ledger_available) "suggest_only" else "none");
+    try out.writer.writeAll(",\"failure\":");
+    try writeJsonString(&out.writer, failure);
+    try out.writer.writeAll(",\"handoff_allowed\":");
+    try out.writer.writeAll(if (exit_code == 0) "true" else "false");
+    try out.writer.writeAll("}}\n");
     try writeStdoutAlloc(allocator, &out);
+}
+
+fn writeMapCommandJson(writer: anytype, args: Args) !void {
+    try writer.writeByte('"');
+    try writer.writeAll("ledger map --route ");
+    try writeJsonEscapedBare(writer, args.route);
+    try writer.writeAll(" --cluster ");
+    try writeJsonEscapedBare(writer, args.cluster);
+    try writer.writeAll(" --artifact ");
+    try writeJsonEscapedBare(writer, args.artifact);
+    try writer.writeByte('"');
 }
 
 fn mapStatusForStore(allocator: std.mem.Allocator, args: Args) !u8 {
+    if (args.route.len == 0 or args.cluster.len == 0 or args.artifact.len == 0) return 3;
     if (!durable_store.fileExists(args.file)) return 3;
-    var records = try loadRecords(allocator, args.file);
-    defer deinitRecords(allocator, &records);
-    const gate = evaluateRouteGate(records.items, args);
+    var loaded = try loadRecordsValidated(allocator, args.file);
+    defer loaded.deinit(allocator);
+    if (!loaded.validation.ok()) return 3;
+    const gate = evaluateRouteGate(loaded.records.items, args);
     return if (gate.active_match_index != null) 2 else 0;
 }
 
 fn evaluateRouteGate(records: []const Record, args: Args) RouteGate {
     var gate = RouteGate{};
     for (records, 0..) |record, idx| {
-        if (!std.mem.eql(u8, record.status, "active")) continue;
         const exact_route = args.route.len > 0 and record.route_id.len > 0 and std.mem.eql(u8, args.route, record.route_id);
-        const exact_cluster = args.cluster.len > 0 and record.cluster_id.len > 0 and std.mem.eql(u8, args.cluster, record.cluster_id);
+        const exact_cluster = args.cluster.len > 0 and record.cluster_id.len > 0 and std.mem.eql(u8, args.cluster, record.cluster_id) and std.mem.eql(u8, record.exclusion_scope, "cluster");
         const artifact_ok = args.artifact.len == 0 or record.artifact_state_id.len == 0 or std.mem.eql(u8, args.artifact, record.artifact_state_id);
-        if ((exact_route or exact_cluster) and artifact_ok) {
+        if (recordCanBlock(record) and (exact_route or exact_cluster) and artifact_ok) {
             gate.active_match_index = idx;
             return gate;
         }
@@ -377,6 +454,18 @@ fn evaluateRouteGate(records: []const Record, args: Args) RouteGate {
 }
 
 fn cmdStatusEvent(allocator: std.mem.Allocator, path: []const u8, neg_id: []const u8, status: []const u8) !u8 {
+    var loaded = try loadRecordsValidated(allocator, path);
+    defer loaded.deinit(allocator);
+    if (findRecord(loaded.records.items, neg_id) == null) {
+        var missing: std.Io.Writer.Allocating = .init(allocator);
+        defer missing.deinit();
+        try missing.writer.writeAll("{\"command\":\"reopen\",\"id\":");
+        try writeJsonString(&missing.writer, neg_id);
+        try missing.writer.writeAll(",\"found\":false}\n");
+        try writeStdoutAlloc(allocator, &missing);
+        return 1;
+    }
+
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try out.writer.writeAll("{\"v\":1,\"event\":\"status\",\"neg_id\":");
@@ -404,7 +493,7 @@ fn cmdHandoff(allocator: std.mem.Allocator, path: []const u8) !u8 {
     var active = std.ArrayList(Record).empty;
     defer active.deinit(allocator);
     for (records.items) |record| {
-        if (std.mem.eql(u8, record.status, "active")) try active.append(allocator, record);
+        if (recordCanBlock(record)) try active.append(allocator, record);
     }
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -414,73 +503,163 @@ fn cmdHandoff(allocator: std.mem.Allocator, path: []const u8) !u8 {
 }
 
 fn cmdDoctor(allocator: std.mem.Allocator, path: []const u8) !u8 {
-    const result = try durable_store.validateJsonl(allocator, path, MaxStoreBytes);
+    const jsonl_result = try durable_store.validateJsonl(allocator, path, MaxStoreBytes);
+    var loaded = try loadRecordsValidated(allocator, path);
+    defer loaded.deinit(allocator);
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    try out.writer.print("{{\"command\":\"doctor\",\"ok\":{s},\"records\":{d},\"blank_lines\":{d}", .{
-        if (result.ok()) "true" else "false",
-        result.lines,
-        result.blank_lines,
+    const ok = jsonl_result.ok() and loaded.validation.ok();
+    try out.writer.print("{{\"command\":\"doctor\",\"ok\":{s},\"records\":{d},\"blank_lines\":{d},\"issues\":{d}", .{
+        if (ok) "true" else "false",
+        loaded.records.items.len,
+        jsonl_result.blank_lines,
+        loaded.validation.issue_count + if (jsonl_result.ok()) @as(usize, 0) else @as(usize, 1),
     });
-    if (result.first_issue) |issue| {
+    if (jsonl_result.first_issue) |issue| {
         try out.writer.print(",\"first_issue\":{{\"line\":{d},\"message\":", .{issue.line});
         try writeJsonString(&out.writer, issue.message);
+        try out.writer.writeAll("}");
+    } else if (loaded.validation.first_issue) |message| {
+        try out.writer.writeAll(",\"first_issue\":{\"line\":0,\"message\":");
+        try writeJsonString(&out.writer, message);
         try out.writer.writeAll("}");
     }
     try out.writer.writeAll("}\n");
     try writeStdoutAlloc(allocator, &out);
-    return if (result.ok()) 0 else 1;
+    return if (ok) 0 else 1;
 }
 
 fn loadRecords(allocator: std.mem.Allocator, path: []const u8) !std.ArrayList(Record) {
+    const loaded = try loadRecordsValidated(allocator, path);
+    return loaded.records;
+}
+
+fn loadRecordsValidated(allocator: std.mem.Allocator, path: []const u8) !LoadResult {
     var records = std.ArrayList(Record).empty;
     const data = durable_store.readFileAlloc(allocator, path, MaxStoreBytes) catch |err| switch (err) {
-        error.FileNotFound => return records,
+        error.FileNotFound => return .{ .records = records },
         else => return err,
     };
     defer allocator.free(data);
 
+    var validation = ValidationIssue{};
     var lines = std.mem.splitScalar(u8, data, '\n');
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r\n");
         if (line.len == 0) continue;
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch {
+            validation.add("invalid json");
+            continue;
+        };
         defer parsed.deinit();
         const obj = switch (parsed.value) {
             .object => |value| value,
-            else => continue,
+            else => {
+                validation.add("event is not an object");
+                continue;
+            },
         };
-        const event = jsonStringField(obj, "event") orelse continue;
-        const neg_id = jsonStringField(obj, "neg_id") orelse continue;
+        const event = jsonStringField(obj, "event") orelse {
+            validation.add("missing event");
+            continue;
+        };
+        const neg_id = jsonStringField(obj, "neg_id") orelse {
+            validation.add("missing neg_id");
+            continue;
+        };
         if (std.mem.eql(u8, event, "status")) {
-            const status = jsonStringField(obj, "status") orelse continue;
+            const status = jsonStringField(obj, "status") orelse {
+                validation.add("status event missing status");
+                continue;
+            };
+            if (!isKnownStatus(status)) validation.add("unknown status");
             if (findRecord(records.items, neg_id)) |idx| {
                 allocator.free(records.items[idx].status);
                 records.items[idx].status = try allocator.dupe(u8, status);
+            } else {
+                validation.add("status references missing neg_id");
             }
             continue;
         }
-        if (!std.mem.eql(u8, event, "capture")) continue;
-        const record_obj = switch (obj.get("record") orelse continue) {
+        if (!std.mem.eql(u8, event, "capture")) {
+            validation.add("unknown event");
+            continue;
+        }
+        const raw_record = obj.get("record") orelse {
+            validation.add("capture missing record object");
+            continue;
+        };
+        const record_obj = switch (raw_record) {
             .object => |value| value,
-            else => continue,
+            else => {
+                validation.add("capture missing record object");
+                continue;
+            },
         };
         const status = jsonStringField(obj, "status") orelse jsonStringField(record_obj, "status") orelse "unknown";
+        if (!isKnownStatus(status)) validation.add("unknown status");
         if (findRecord(records.items, neg_id)) |idx| {
+            validation.add("duplicate capture neg_id");
             records.items[idx].evidence_count += 1;
             continue;
         }
-        try records.append(allocator, .{
+        const source_refs_count = jsonArrayCount(record_obj, "source_refs") + jsonArrayCount(record_obj, "evidence");
+        const exclusion_scope = jsonStringField(record_obj, "exclusion_scope") orelse "route";
+        const exclusion_rule = jsonStringField(record_obj, "exclusion_rule") orelse "";
+        const route_id = jsonStringField(record_obj, "route_id") orelse jsonStringField(record_obj, "route") orelse "";
+        const cluster_id = jsonStringField(record_obj, "cluster_id") orelse jsonStringField(record_obj, "cluster") orelse "";
+
+        var record = Record{
             .neg_id = try allocator.dupe(u8, neg_id),
             .status = try allocator.dupe(u8, status),
             .hypothesis = try allocator.dupe(u8, jsonStringField(record_obj, "hypothesis") orelse ""),
-            .route_id = try allocator.dupe(u8, jsonStringField(record_obj, "route_id") orelse jsonStringField(record_obj, "route") orelse ""),
-            .cluster_id = try allocator.dupe(u8, jsonStringField(record_obj, "cluster_id") orelse jsonStringField(record_obj, "cluster") orelse ""),
+            .route_id = try allocator.dupe(u8, route_id),
+            .cluster_id = try allocator.dupe(u8, cluster_id),
             .artifact_state_id = try allocator.dupe(u8, jsonStringField(record_obj, "artifact_state_id") orelse jsonStringField(record_obj, "artifact") orelse ""),
+            .exclusion_scope = try allocator.dupe(u8, exclusion_scope),
+            .exclusion_rule = try allocator.dupe(u8, exclusion_rule),
+            .failure_class = try allocator.dupe(u8, jsonStringField(record_obj, "failure_class") orelse "unknown"),
+            .confidence = try allocator.dupe(u8, jsonStringField(record_obj, "confidence") orelse "unknown"),
+            .next_search_hint = try allocator.dupe(u8, jsonStringField(record_obj, "next_search_hint") orelse ""),
+            .source_refs_count = source_refs_count,
+            .applicability_conditions_count = jsonArrayCount(record_obj, "applicability_conditions"),
             .evidence_count = 1,
-        });
+        };
+        errdefer record.deinit(allocator);
+        validateProjectedRecord(record, &validation);
+        try records.append(allocator, record);
     }
-    return records;
+    return .{ .records = records, .validation = validation };
+}
+
+fn validateProjectedRecord(record: Record, validation: *ValidationIssue) void {
+    if (!isKnownStatus(record.status)) validation.add("unknown status");
+    if (!std.mem.eql(u8, record.exclusion_scope, "route") and !std.mem.eql(u8, record.exclusion_scope, "cluster")) {
+        validation.add("unknown exclusion_scope");
+    }
+    if (std.mem.eql(u8, record.status, "active") and !recordCanBlock(record)) {
+        validation.add("active record cannot legally block");
+    }
+}
+
+fn recordCanBlock(record: Record) bool {
+    if (!std.mem.eql(u8, record.status, "active")) return false;
+    if (record.source_refs_count == 0) return false;
+    if (std.mem.eql(u8, record.exclusion_scope, "cluster")) {
+        return record.cluster_id.len > 0 and record.exclusion_rule.len > 0;
+    }
+    if (!std.mem.eql(u8, record.exclusion_scope, "route")) return false;
+    return record.route_id.len > 0;
+}
+
+fn isKnownStatus(status: []const u8) bool {
+    return std.mem.eql(u8, status, "active") or
+        std.mem.eql(u8, status, "need-evidence") or
+        std.mem.eql(u8, status, "stale") or
+        std.mem.eql(u8, status, "superseded") or
+        std.mem.eql(u8, status, "reopened") or
+        std.mem.eql(u8, status, "unknown") or
+        std.mem.eql(u8, status, "user-context");
 }
 
 fn deinitRecords(allocator: std.mem.Allocator, records: *std.ArrayList(Record)) void {
@@ -500,6 +679,20 @@ fn nextNegIdAlloc(allocator: std.mem.Allocator, records: []const Record) ![]u8 {
     defer ids.deinit(allocator);
     for (records) |record| try ids.append(allocator, record.neg_id);
     return durable_store.nextMonotonicIdAlloc(allocator, "NEG-", ids.items);
+}
+
+fn captureCanRequestStatus(obj: std.json.ObjectMap, requested_status: []const u8) bool {
+    if (std.mem.eql(u8, requested_status, "active")) {
+        if (!captureHasWitness(obj)) return false;
+        const route_id = jsonStringField(obj, "route_id") orelse jsonStringField(obj, "route") orelse "";
+        const cluster_id = jsonStringField(obj, "cluster_id") orelse jsonStringField(obj, "cluster") orelse "";
+        const exclusion_scope = jsonStringField(obj, "exclusion_scope") orelse "route";
+        const exclusion_rule = jsonStringField(obj, "exclusion_rule") orelse "";
+        if (std.mem.eql(u8, exclusion_scope, "cluster")) return cluster_id.len > 0 and exclusion_rule.len > 0;
+        if (std.mem.eql(u8, exclusion_scope, "route")) return route_id.len > 0;
+        return false;
+    }
+    return !std.mem.eql(u8, requested_status, "user-context");
 }
 
 fn captureHasWitness(obj: std.json.ObjectMap) bool {
@@ -525,6 +718,14 @@ fn jsonStringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     return switch (value) {
         .string => |text| text,
         else => null,
+    };
+}
+
+fn jsonArrayCount(obj: std.json.ObjectMap, key: []const u8) usize {
+    const value = obj.get(key) orelse return 0;
+    return switch (value) {
+        .array => |array| array.items.len,
+        else => 0,
     };
 }
 
@@ -555,11 +756,30 @@ fn writeRecordJson(writer: anytype, record: Record) !void {
     try writeJsonString(writer, record.cluster_id);
     try writer.writeAll(",\"artifact_state_id\":");
     try writeJsonString(writer, record.artifact_state_id);
-    try writer.print(",\"evidence_count\":{d}}}", .{record.evidence_count});
+    try writer.writeAll(",\"exclusion_scope\":");
+    try writeJsonString(writer, record.exclusion_scope);
+    try writer.writeAll(",\"exclusion_rule\":");
+    try writeJsonString(writer, record.exclusion_rule);
+    try writer.writeAll(",\"failure_class\":");
+    try writeJsonString(writer, record.failure_class);
+    try writer.writeAll(",\"confidence\":");
+    try writeJsonString(writer, record.confidence);
+    try writer.writeAll(",\"next_search_hint\":");
+    try writeJsonString(writer, record.next_search_hint);
+    try writer.print(",\"source_refs_count\":{d},\"applicability_conditions_count\":{d},\"evidence_count\":{d}}}", .{
+        record.source_refs_count,
+        record.applicability_conditions_count,
+        record.evidence_count,
+    });
 }
 
 fn writeJsonString(writer: anytype, text: []const u8) !void {
     try writer.writeByte('"');
+    try writeJsonEscapedBare(writer, text);
+    try writer.writeByte('"');
+}
+
+fn writeJsonEscapedBare(writer: anytype, text: []const u8) !void {
     for (text) |c| switch (c) {
         '\\' => try writer.writeAll("\\\\"),
         '"' => try writer.writeAll("\\\""),
@@ -568,7 +788,6 @@ fn writeJsonString(writer: anytype, text: []const u8) !void {
         '\t' => try writer.writeAll("\\t"),
         else => try writer.writeByte(c),
     };
-    try writer.writeByte('"');
 }
 
 fn printJsonLine(allocator: std.mem.Allocator, command: Command, status: []const u8, subject: []const u8, count: usize) !void {
@@ -745,4 +964,143 @@ test "witnessless capture cannot become active exclusion" {
 
     try std.testing.expectEqualStrings("need-evidence", records.items[0].status);
     try std.testing.expectEqual(@as(?usize, null), gate.active_match_index);
+}
+
+test "route-scoped evidence does not block another route in same cluster" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const store = try std.fs.path.join(std.testing.allocator, &.{ root, "negative-ledger.jsonl" });
+    defer std.testing.allocator.free(store);
+    const input = try std.fs.path.join(std.testing.allocator, &.{ root, "capture.json" });
+    defer std.testing.allocator.free(input);
+    try durable_store.writeTextAtomic(
+        std.testing.allocator,
+        input,
+        "{\"hypothesis\":\"h\",\"route_id\":\"route-a\",\"cluster_id\":\"cluster-a\",\"source_refs\":[{\"kind\":\"test\",\"ref\":\"fixture\"}]}",
+    );
+
+    var capture = try appendCapture(std.testing.allocator, .{ .command = .capture, .file = store, .json_path = input });
+    defer capture.deinit(std.testing.allocator);
+    var records = try loadRecords(std.testing.allocator, store);
+    defer deinitRecords(std.testing.allocator, &records);
+
+    const gate = evaluateRouteGate(records.items, .{
+        .command = .map,
+        .file = store,
+        .route = "route-b",
+        .cluster = "cluster-a",
+        .artifact = "head",
+    });
+    try std.testing.expectEqual(@as(?usize, null), gate.active_match_index);
+}
+
+test "explicit cluster-scoped evidence blocks same cluster" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const store = try std.fs.path.join(std.testing.allocator, &.{ root, "negative-ledger.jsonl" });
+    defer std.testing.allocator.free(store);
+    const input = try std.fs.path.join(std.testing.allocator, &.{ root, "capture.json" });
+    defer std.testing.allocator.free(input);
+    try durable_store.writeTextAtomic(
+        std.testing.allocator,
+        input,
+        "{\"hypothesis\":\"h\",\"cluster_id\":\"cluster-a\",\"exclusion_scope\":\"cluster\",\"exclusion_rule\":\"cluster route family is falsified\",\"source_refs\":[{\"kind\":\"test\",\"ref\":\"fixture\"}]}",
+    );
+
+    var capture = try appendCapture(std.testing.allocator, .{ .command = .capture, .file = store, .json_path = input });
+    defer capture.deinit(std.testing.allocator);
+    var records = try loadRecords(std.testing.allocator, store);
+    defer deinitRecords(std.testing.allocator, &records);
+
+    const gate = evaluateRouteGate(records.items, .{
+        .command = .map,
+        .file = store,
+        .route = "route-b",
+        .cluster = "cluster-a",
+        .artifact = "head",
+    });
+    try std.testing.expectEqual(@as(?usize, 0), gate.active_match_index);
+}
+
+test "reopened evidence no longer blocks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const store = try std.fs.path.join(std.testing.allocator, &.{ root, "negative-ledger.jsonl" });
+    defer std.testing.allocator.free(store);
+    const input = try std.fs.path.join(std.testing.allocator, &.{ root, "capture.json" });
+    defer std.testing.allocator.free(input);
+    try durable_store.writeTextAtomic(
+        std.testing.allocator,
+        input,
+        "{\"hypothesis\":\"h\",\"route_id\":\"route-a\",\"cluster_id\":\"cluster-a\",\"source_refs\":[{\"kind\":\"test\",\"ref\":\"fixture\"}]}",
+    );
+
+    var capture = try appendCapture(std.testing.allocator, .{ .command = .capture, .file = store, .json_path = input });
+    defer capture.deinit(std.testing.allocator);
+    try durable_store.appendLineAtomic(
+        std.testing.allocator,
+        store,
+        "{\"v\":1,\"event\":\"status\",\"neg_id\":\"NEG-000001\",\"status\":\"reopened\"}",
+        MaxStoreBytes,
+    );
+    var records = try loadRecords(std.testing.allocator, store);
+    defer deinitRecords(std.testing.allocator, &records);
+
+    const gate = evaluateRouteGate(records.items, .{
+        .command = .map,
+        .file = store,
+        .route = "route-a",
+        .cluster = "cluster-a",
+        .artifact = "head",
+    });
+    try std.testing.expectEqual(@as(?usize, null), gate.active_match_index);
+}
+
+test "map fails closed for invalid input and malformed store" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const store = try std.fs.path.join(std.testing.allocator, &.{ root, "negative-ledger.jsonl" });
+    defer std.testing.allocator.free(store);
+    try durable_store.writeTextAtomic(std.testing.allocator, store, "{bad json}\n");
+
+    try std.testing.expectEqual(@as(u8, 3), try mapStatusForStore(std.testing.allocator, .{
+        .command = .map,
+        .file = store,
+        .route = "route-a",
+        .cluster = "cluster-a",
+        .artifact = "head",
+    }));
+    try std.testing.expectEqual(@as(u8, 3), try mapStatusForStore(std.testing.allocator, .{
+        .command = .map,
+        .file = store,
+        .route = "route-a",
+        .cluster = "",
+        .artifact = "head",
+    }));
+}
+
+test "doctor reports unsafe active records" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const store = try std.fs.path.join(std.testing.allocator, &.{ root, "negative-ledger.jsonl" });
+    defer std.testing.allocator.free(store);
+    try durable_store.writeTextAtomic(
+        std.testing.allocator,
+        store,
+        "{\"v\":1,\"event\":\"capture\",\"neg_id\":\"NEG-000001\",\"status\":\"active\",\"record\":{\"hypothesis\":\"h\",\"route_id\":\"route-a\"}}\n",
+    );
+
+    var loaded = try loadRecordsValidated(std.testing.allocator, store);
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(!loaded.validation.ok());
 }
