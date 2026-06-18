@@ -5684,12 +5684,6 @@ fn removeGraphLink(allocator: std.mem.Allocator, links: []const GraphLink, link_
     return try out.toOwnedSlice(allocator);
 }
 
-fn itemIdsAlloc(allocator: std.mem.Allocator, state: *const ItemState) ![]const []const u8 {
-    var out = std.ArrayList([]const u8).empty;
-    for (state.items.items) |item| try out.append(allocator, item.id);
-    return try out.toOwnedSlice(allocator);
-}
-
 fn graphDeltaBaselineAlloc(allocator: std.mem.Allocator, state: *const ItemState) !GraphDeltaBaseline {
     var item_ids = std.ArrayList([]const u8).empty;
     var item_fps = std.ArrayList(ItemFingerprint).empty;
@@ -6882,15 +6876,6 @@ fn criticalDepthsAlloc(allocator: std.mem.Allocator, state: *const ItemState, in
     return depths;
 }
 
-fn criticalPathLength(allocator: std.mem.Allocator, state: *const ItemState) !i64 {
-    var index = try buildGraphIndex(allocator, state);
-    defer index.deinit(allocator);
-    try ensureGraphIndexValid(index);
-    const depths = try criticalDepthsAlloc(allocator, state, index);
-    defer allocator.free(depths);
-    return criticalPathLengthFromDepths(depths);
-}
-
 fn criticalPathLengthFromDepths(depths: []const i64) i64 {
     var max_len: i64 = 0;
     for (depths) |len| {
@@ -6899,36 +6884,9 @@ fn criticalPathLengthFromDepths(depths: []const i64) i64 {
     return max_len;
 }
 
-fn criticalPathFrom(allocator: std.mem.Allocator, state: *const ItemState, item_id: []const u8) !i64 {
-    var index = try buildGraphIndex(allocator, state);
-    defer index.deinit(allocator);
-    try ensureGraphIndexValid(index);
-    const depths = try criticalDepthsAlloc(allocator, state, index);
-    defer allocator.free(depths);
-    return criticalPathFromIndex(index, depths, item_id);
-}
-
 fn criticalPathFromIndex(index: GraphIndex, depths: []const i64, item_id: []const u8) i64 {
     const item_idx = index.item_index_by_id.get(item_id) orelse return 0;
     return depths[item_idx];
-}
-
-fn countProofComplete(state: *const ItemState) usize {
-    var count: usize = 0;
-    for (state.items.items) |item| {
-        if (item.proof) |proof| {
-            if (proof.state == .pass) count += 1;
-        }
-    }
-    return count;
-}
-
-fn countItemsWithProofObligations(state: *const ItemState) usize {
-    var count: usize = 0;
-    for (state.items.items) |item| {
-        if (itemHasProofObligations(item)) count += 1;
-    }
-    return count;
 }
 
 const ProofObligationSummary = struct {
