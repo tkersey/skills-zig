@@ -4212,6 +4212,7 @@ const ResolveSessionSignals = struct {
     mutation_after_fuse: bool = false,
     permit_emitted: bool = false,
     fuse_tripped: bool = false,
+    fuse_tripped_at_ms: ?i64 = null,
     distillation_seen: bool = false,
 };
 
@@ -4238,10 +4239,20 @@ const ResolvePathKind = enum {
 
 fn cmdResolveChurnAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
     const repo_raw = opts.repo_text orelse return error.MissingArgValue;
+    try validateResolveAuditBounds(opts);
     const repo_root = try resolveExplicitRepoRoot(allocator, repo_raw);
     defer allocator.free(repo_root);
 
-    const current_thread_id = if (opts.exclude_current) try getEnvVarOwned(allocator, "CODEX_THREAD_ID") else null;
+    const current_thread_id = if (opts.exclude_current)
+        getEnvVarOwned(allocator, "CODEX_THREAD_ID") catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => {
+                printCliError("error: --exclude-current requires CODEX_THREAD_ID in the environment\n", .{});
+                return error.CurrentSessionUnavailable;
+            },
+            else => return err,
+        }
+    else
+        null;
     defer if (current_thread_id) |id| allocator.free(id);
 
     var audit = ResolveChurnAudit{};
@@ -4257,7 +4268,7 @@ fn cmdResolveChurnAudit(allocator: std.mem.Allocator, sessions_root: []const u8,
         if (current_thread_id) |thread_id| {
             if (resolveTraceMatchesThread(parsed, path, thread_id)) continue;
         }
-        if (!timestampSatisfiesBounds(parsed.session.start_time orelse parsed.session.end_time, opts)) continue;
+        if (!resolveSessionOverlapsWindow(parsed.session.start_time, parsed.session.end_time, opts)) continue;
         if (!try resolveTraceMatchesRepo(allocator, repo_root, parsed)) continue;
 
         const content = (try readFileAllocOrSkip(allocator, path)) orelse continue;
@@ -4272,7 +4283,7 @@ fn cmdResolveChurnAudit(allocator: std.mem.Allocator, sessions_root: []const u8,
         }) catch continue;
         defer datasets.messages.freeRows(allocator, messages);
 
-        var signals = summarizeResolveSession(messages, parsed.tools.items, opts);
+        var signals = summarizeResolveSession(messages, parsed, opts);
         if (!signals.candidate) continue;
         audit.denominator.candidate_sessions += 1;
         if (!signals.true_resolve) {
@@ -4282,21 +4293,20 @@ fn cmdResolveChurnAudit(allocator: std.mem.Allocator, sessions_root: []const u8,
 
         audit.denominator.true_resolve_sessions += 1;
         try recordResolveMessages(allocator, &audit, messages, opts, &signals);
-        try recordResolveTools(allocator, &audit, parsed.tools.items, repo_root, &signals);
+        try recordResolveTools(allocator, &audit, parsed, repo_root, opts, &signals);
 
         if (signals.mutation_session) {
             audit.permits.required += 1;
-            if (!signals.permit_emitted) audit.compliance.mutations_without_permit += 1;
+            if (!signals.permit_emitted) {
+                audit.permits.missing += 1;
+                audit.compliance.mutations_without_permit += 1;
+            }
         }
         if (signals.fuse_tripped and signals.mutation_after_fuse and !signals.distillation_seen) {
             audit.compliance.mutations_after_fuse_without_distillation += 1;
         }
     }
 
-    audit.permits.missing = if (audit.permits.required > audit.permits.emitted)
-        audit.permits.required - audit.permits.emitted
-    else
-        0;
     audit.compliance.normal_form_retries_after_falsification = audit.normal_forms.repeated_after_falsification;
 
     const fmt = if (opts.format_set) opts.format else output.Format.markdown;
@@ -4305,6 +4315,39 @@ fn cmdResolveChurnAudit(allocator: std.mem.Allocator, sessions_root: []const u8,
         .markdown => writeResolveChurnAuditMarkdown(allocator, audit, opts.out_path),
         else => error.InvalidFormatForCommand,
     };
+}
+
+fn validateResolveAuditBounds(opts: Options) !void {
+    const since = opts.since orelse return;
+    const until = opts.until orelse return;
+    const since_ms = time_utils.parseIsoTimestampMillis(since) orelse {
+        printCliError("error: resolve-churn-audit --since must be an ISO-8601 timestamp with timezone\n", .{});
+        return error.InvalidTimestampArg;
+    };
+    const until_ms = time_utils.parseIsoTimestampMillis(until) orelse {
+        printCliError("error: resolve-churn-audit --until must be an ISO-8601 timestamp with timezone\n", .{});
+        return error.InvalidTimestampArg;
+    };
+    if (since_ms > until_ms) {
+        printCliError("error: resolve-churn-audit --since must be before or equal to --until\n", .{});
+        return error.InvalidTimestampArg;
+    }
+}
+
+fn resolveSessionOverlapsWindow(start_opt: ?[]const u8, end_opt: ?[]const u8, opts: Options) bool {
+    const start_ms = if (start_opt) |value| time_utils.parseIsoTimestampMillis(value) else null;
+    const end_ms = if (end_opt) |value| time_utils.parseIsoTimestampMillis(value) else start_ms;
+    const effective_start = start_ms orelse end_ms orelse return false;
+    const effective_end = end_ms orelse effective_start;
+    if (opts.since) |since| {
+        const since_ms = time_utils.parseIsoTimestampMillis(since) orelse return false;
+        if (effective_end < since_ms) return false;
+    }
+    if (opts.until) |until| {
+        const until_ms = time_utils.parseIsoTimestampMillis(until) orelse return false;
+        if (effective_start > until_ms) return false;
+    }
+    return true;
 }
 
 fn resolveTraceMatchesThread(parsed: canonical_trace.CanonicalSessionTrace, path: []const u8, thread_id: []const u8) bool {
@@ -4328,7 +4371,7 @@ fn resolveTraceMatchesRepo(allocator: std.mem.Allocator, repo_root: []const u8, 
 
 fn summarizeResolveSession(
     messages: []const datasets.messages.MessageRow,
-    tools: []const canonical_trace.ToolLifecycleRecord,
+    parsed: canonical_trace.CanonicalSessionTrace,
     opts: Options,
 ) ResolveSessionSignals {
     var signals = ResolveSessionSignals{};
@@ -4340,8 +4383,9 @@ fn summarizeResolveSession(
             signals.true_resolve = true;
         }
     }
-    for (tools) |tool| {
-        if (containsTrueResolveToolEvidence(tool)) {
+    for (parsed.tools.items) |tool| {
+        if (!toolTimestampSatisfiesBounds(parsed, tool, opts)) continue;
+        if (toolHasCompletedResolveReviewEvidence(tool)) {
             signals.candidate = true;
             signals.true_resolve = true;
         }
@@ -4370,9 +4414,27 @@ fn containsTrueResolveAssistantEvidence(text: []const u8) bool {
     });
 }
 
-fn containsTrueResolveToolEvidence(tool: canonical_trace.ToolLifecycleRecord) bool {
+fn toolHasCompletedResolveReviewEvidence(tool: canonical_trace.ToolLifecycleRecord) bool {
+    if (tool.lifecycle_status != .completed) return false;
+    if (tool.kind == .exec_command and (tool.exit_code orelse -1) != 0) return false;
     const cmd = tool.command_text orelse tool.input_text orelse tool.arguments_json orelse "";
-    return containsAnyIgnoreCaseAscii(cmd, &.{ "cas review_session", "cas_review_session", "codex review", "review_session" });
+    return commandContainsReviewInvocation(cmd);
+}
+
+fn commandContainsReviewInvocation(cmd: []const u8) bool {
+    var previous: ?[]const u8 = null;
+    var tokens = std.mem.tokenizeAny(u8, cmd, " \t\r\n;&|()");
+    while (tokens.next()) |raw| {
+        const token = std.mem.trim(u8, raw, "\"'`.,{}[]");
+        if (token.len == 0) continue;
+        if (std.ascii.eqlIgnoreCase(token, "cas_review_session")) return true;
+        if (previous) |prev| {
+            if (std.ascii.eqlIgnoreCase(prev, "cas") and std.ascii.eqlIgnoreCase(token, "review_session")) return true;
+            if (std.ascii.eqlIgnoreCase(prev, "codex") and std.ascii.eqlIgnoreCase(token, "review")) return true;
+        }
+        previous = token;
+    }
+    return false;
 }
 
 fn recordResolveMessages(
@@ -4399,7 +4461,7 @@ fn recordResolveMessages(
         if (containsIgnoreCaseAscii(text, "reviewer_preference")) audit.finding_liability.reviewer_preference += 1;
         if (containsIgnoreCaseAscii(text, "finding_liability: unknown") or containsIgnoreCaseAscii(text, "liability: unknown")) audit.finding_liability.unknown += 1;
 
-        if (containsAnyIgnoreCaseAscii(text, &.{ "normal_form_register", "normal_form_id", "status: proposed" })) audit.normal_forms.proposed += 1;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "normal_form_status: proposed", "normal form status: proposed", "status: proposed" })) audit.normal_forms.proposed += 1;
         if (containsIgnoreCaseAscii(text, "falsified")) audit.normal_forms.falsified += 1;
         if (containsAnyIgnoreCaseAscii(text, &.{ "repeated_after_falsification", "same_family_after_normal_form: yes", "family_recurred_after: yes" })) audit.normal_forms.repeated_after_falsification += 1;
 
@@ -4407,6 +4469,11 @@ fn recordResolveMessages(
         if (containsAnyIgnoreCaseAscii(text, &.{ "fuse_state: tripped", "delivery_mutation_frozen: yes" })) {
             audit.fuse.tripped += 1;
             signals.fuse_tripped = true;
+            if (message.timestamp) |ts| {
+                if (time_utils.parseIsoTimestampMillis(ts)) |ms| {
+                    if (signals.fuse_tripped_at_ms == null or ms < signals.fuse_tripped_at_ms.?) signals.fuse_tripped_at_ms = ms;
+                }
+            }
         }
         if (containsIgnoreCaseAscii(text, "review_distillation_receipt")) signals.distillation_seen = true;
 
@@ -4425,14 +4492,16 @@ fn recordResolveMessages(
 fn recordResolveTools(
     allocator: std.mem.Allocator,
     audit: *ResolveChurnAudit,
-    tools: []const canonical_trace.ToolLifecycleRecord,
+    parsed: canonical_trace.CanonicalSessionTrace,
     repo_root: []const u8,
+    opts: Options,
     signals: *ResolveSessionSignals,
 ) !void {
-    for (tools) |tool| {
-        if (!toolIsInRepoScope(allocator, repo_root, tool)) continue;
-        if (containsTrueResolveToolEvidence(tool)) {
-            const head = extractReviewHead(tool.command_text orelse tool.input_text orelse tool.arguments_json orelse "") orelse "unknown";
+    for (parsed.tools.items) |tool| {
+        if (!toolTimestampSatisfiesBounds(parsed, tool, opts)) continue;
+        if (!toolIsInRepoScope(allocator, repo_root, parsed.session.cwd, tool)) continue;
+        if (toolHasCompletedResolveReviewEvidence(tool)) {
+            const head = extractReviewHeadFromTool(tool) orelse "unknown";
             try recordReviewHead(allocator, &audit.review.cas_reviews_by_head, head);
         }
 
@@ -4442,7 +4511,7 @@ fn recordResolveTools(
             const patch_text = tool.input_text orelse tool.arguments_json orelse tool.patch_changes_json orelse "";
             const counts = countResolvePatchLines(patch_text);
             addResolvePatchCounts(&audit.mutation, counts);
-            if (signals.fuse_tripped) {
+            if (toolOccursAfterFuse(parsed, tool, signals)) {
                 audit.fuse.mutations_after_trip += 1;
                 signals.mutation_after_fuse = true;
                 audit.fuse.production_net_after_trip += counts.productionNet();
@@ -4455,7 +4524,7 @@ fn recordResolveTools(
             if (containsGitCommitCommand(cmd)) {
                 audit.mutation.commits += 1;
                 signals.mutation_session = true;
-                if (signals.fuse_tripped) {
+                if (toolOccursAfterFuse(parsed, tool, signals)) {
                     audit.fuse.mutations_after_trip += 1;
                     signals.mutation_after_fuse = true;
                 }
@@ -4465,8 +4534,38 @@ fn recordResolveTools(
     audit.mutation.refreshNet();
 }
 
-fn toolIsInRepoScope(allocator: std.mem.Allocator, repo_root: []const u8, tool: canonical_trace.ToolLifecycleRecord) bool {
-    const cwd = tool.cwd orelse return true;
+fn toolTimestampSatisfiesBounds(parsed: canonical_trace.CanonicalSessionTrace, tool: canonical_trace.ToolLifecycleRecord, opts: Options) bool {
+    const timestamp = toolTimestamp(parsed, tool) orelse return false;
+    return timestampSatisfiesBounds(timestamp, opts);
+}
+
+fn toolTimestampMillis(parsed: canonical_trace.CanonicalSessionTrace, tool: canonical_trace.ToolLifecycleRecord) ?i64 {
+    const timestamp = toolTimestamp(parsed, tool) orelse return null;
+    return time_utils.parseIsoTimestampMillis(timestamp);
+}
+
+fn toolTimestamp(parsed: canonical_trace.CanonicalSessionTrace, tool: canonical_trace.ToolLifecycleRecord) ?[]const u8 {
+    if (tool.completed_at) |value| return value;
+    if (tool.started_at) |value| return value;
+    if (tool.turn_index) |tool_turn_index| {
+        for (parsed.turns.items) |turn| {
+            if (turn.turn_index != tool_turn_index) continue;
+            if (turn.completed_at) |value| return value;
+            if (turn.started_at) |value| return value;
+            break;
+        }
+    }
+    return null;
+}
+
+fn toolOccursAfterFuse(parsed: canonical_trace.CanonicalSessionTrace, tool: canonical_trace.ToolLifecycleRecord, signals: *const ResolveSessionSignals) bool {
+    const fuse_ms = signals.fuse_tripped_at_ms orelse return false;
+    const tool_ms = toolTimestampMillis(parsed, tool) orelse return false;
+    return tool_ms > fuse_ms;
+}
+
+fn toolIsInRepoScope(allocator: std.mem.Allocator, repo_root: []const u8, session_cwd: ?[]const u8, tool: canonical_trace.ToolLifecycleRecord) bool {
+    const cwd = tool.cwd orelse session_cwd orelse return false;
     return pathMatchesRepoScope(allocator, repo_root, cwd) catch false;
 }
 
@@ -4480,11 +4579,30 @@ fn recordReviewHead(allocator: std.mem.Allocator, heads: *std.ArrayList(ResolveC
     try heads.append(allocator, .{ .head = try allocator.dupe(u8, head), .count = 1 });
 }
 
+fn extractReviewHeadFromTool(tool: canonical_trace.ToolLifecycleRecord) ?[]const u8 {
+    if (tool.output_text) |text| {
+        if (extractFlatJsonStringField(text, "headSha")) |head| return head;
+        if (extractFlatJsonStringField(text, "head_sha")) |head| return head;
+        if (extractReviewHead(text)) |head| return head;
+    }
+    if (tool.command_text) |text| {
+        if (extractReviewHead(text)) |head| return head;
+    }
+    if (tool.input_text) |text| {
+        if (extractReviewHead(text)) |head| return head;
+    }
+    if (tool.arguments_json) |text| {
+        if (extractReviewHead(text)) |head| return head;
+    }
+    return null;
+}
+
 fn extractReviewHead(text: []const u8) ?[]const u8 {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line_raw| {
         const line = std.mem.trim(u8, line_raw, " \t\r\n,");
         if (line.len == 0) continue;
+        if (std.mem.indexOf(u8, line, "headSha")) |idx| return tokenAfterMarker(line[idx..], ':');
         if (std.mem.indexOf(u8, line, "head_sha")) |idx| return tokenAfterMarker(line[idx..], ':');
         if (std.mem.indexOf(u8, line, "--head")) |idx| return tokenAfterMarker(line[idx + "--head".len ..], ' ');
     }
@@ -4494,7 +4612,7 @@ fn extractReviewHead(text: []const u8) ?[]const u8 {
 fn tokenAfterMarker(text: []const u8, marker: u8) ?[]const u8 {
     const start_raw = if (std.mem.indexOfScalar(u8, text, marker)) |idx| idx + 1 else 0;
     var start = start_raw;
-    while (start < text.len and std.ascii.isWhitespace(text[start])) : (start += 1) {}
+    while (start < text.len and (std.ascii.isWhitespace(text[start]) or text[start] == '"' or text[start] == '\'')) : (start += 1) {}
     var end = start;
     while (end < text.len and !std.ascii.isWhitespace(text[end]) and text[end] != ',' and text[end] != '}' and text[end] != '"') : (end += 1) {}
     if (end <= start) return null;
@@ -4551,13 +4669,45 @@ fn countResolvePatchLines(patch_text: []const u8) ResolvePatchCounts {
 
 fn classifyResolvePath(path_raw: []const u8) ResolvePathKind {
     const path = std.mem.trim(u8, path_raw, " \t\r\n\"");
-    if (containsAnyIgnoreCaseAscii(path, &.{ "/test", "tests/", "testdata", "fixtures" })) return .tests;
+    if (containsAnyIgnoreCaseAscii(path, &.{ "/test", "tests/", "test/", "testdata", "fixtures", "__tests__", "__fixtures__", "spec/" })) return .tests;
     if (std.mem.startsWith(u8, path, "apps/seq/src/tests")) return .tests;
     if (std.mem.endsWith(u8, path, "_test.zig")) return .tests;
-    if (std.mem.startsWith(u8, path, "apps/seq/src/")) return .production;
-    if (std.mem.startsWith(u8, path, "libs/")) return .production;
+    if (std.mem.endsWith(u8, path, ".test.ts") or
+        std.mem.endsWith(u8, path, ".test.tsx") or
+        std.mem.endsWith(u8, path, ".test.js") or
+        std.mem.endsWith(u8, path, ".test.jsx") or
+        std.mem.endsWith(u8, path, ".spec.ts") or
+        std.mem.endsWith(u8, path, ".spec.tsx") or
+        std.mem.endsWith(u8, path, ".spec.js") or
+        std.mem.endsWith(u8, path, ".spec.jsx"))
+        return .tests;
+    if (containsAnyIgnoreCaseAscii(path, &.{ "src/", "cmd/", "lib/", "libs/", "app/", "apps/", "pkg/", "internal/", "crates/", "packages/", "tools/", "bin/" })) return .production;
+    if (isCodeLikeProductionPath(path)) return .production;
     if (std.mem.eql(u8, path, "build.zig") or std.mem.endsWith(u8, path, "/build.zig")) return .production;
     return .other;
+}
+
+fn isCodeLikeProductionPath(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".zig") or
+        std.mem.endsWith(u8, path, ".zon") or
+        std.mem.endsWith(u8, path, ".c") or
+        std.mem.endsWith(u8, path, ".h") or
+        std.mem.endsWith(u8, path, ".cpp") or
+        std.mem.endsWith(u8, path, ".hpp") or
+        std.mem.endsWith(u8, path, ".rs") or
+        std.mem.endsWith(u8, path, ".go") or
+        std.mem.endsWith(u8, path, ".py") or
+        std.mem.endsWith(u8, path, ".js") or
+        std.mem.endsWith(u8, path, ".jsx") or
+        std.mem.endsWith(u8, path, ".ts") or
+        std.mem.endsWith(u8, path, ".tsx") or
+        std.mem.endsWith(u8, path, ".java") or
+        std.mem.endsWith(u8, path, ".kt") or
+        std.mem.endsWith(u8, path, ".swift") or
+        std.mem.endsWith(u8, path, ".rb") or
+        std.mem.endsWith(u8, path, ".sh") or
+        std.mem.endsWith(u8, path, ".sql") or
+        std.mem.endsWith(u8, path, ".lua");
 }
 
 fn writeResolveChurnAuditMarkdown(allocator: std.mem.Allocator, audit: ResolveChurnAudit, out_path: ?[]const u8) !void {
@@ -17660,6 +17810,65 @@ test "resolve-churn-audit separates raw mentions from true resolve sessions" {
     try std.testing.expect(std.mem.indexOf(u8, got, "\"required\": 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"emitted\": 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"missing\": 0") != null);
+}
+
+test "resolve-churn-audit bounds tools and counts permits per session" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/09");
+    const resolved_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-09T09:50:00Z\",\"payload\":{\"id\":\"resolve-overlap\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-09T10:00:00Z\",\"payload\":{\"type\":\"user_message\",\"turn_id\":\"t1\",\"message\":\"Use $resolve on this branch.\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-09T10:00:01Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"apply_patch\",\"call_id\":\"patch-before-fuse\",\"arguments\":\"*** Update File: src/foo.py\\n+new\\n-old\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-09T10:00:01.500Z\",\"payload\":{\"type\":\"patch_apply_end\",\"turn_id\":\"t1\",\"call_id\":\"patch-before-fuse\",\"success\":true,\"changes\":{\"files\":1}}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-09T10:00:02Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"t1\",\"message\":\"Review Governor RGR-V3-MUTATION-PERMIT\\nnormal_form_register: nf-1 status: proposed\\ngovernor_fuse\\nfuse_state: tripped\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-09T10:00:02.500Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"t1\",\"message\":\"RGR-V3-MUTATION-PERMIT\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-09T10:00:03Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"apply_patch\",\"call_id\":\"patch-after-fuse\",\"arguments\":\"*** Update File: cmd/main.go\\n+main\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-09T10:00:03.500Z\",\"payload\":{\"type\":\"patch_apply_end\",\"turn_id\":\"t1\",\"call_id\":\"patch-after-fuse\",\"success\":true,\"changes\":{\"files\":1}}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-09T10:00:04Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"t1\",\"call_id\":\"cas-ok\",\"command\":\"cas review_session --head cmd-head\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"{\\\"headSha\\\":\\\"out-head\\\"}\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-09T10:00:05Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"t1\",\"call_id\":\"cas-failed\",\"command\":\"cas review_session --head failed-head\",\"cwd\":\"/repo\",\"exit_code\":1,\"stdout\":\"{\\\"headSha\\\":\\\"failed-head\\\"}\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-09T10:00:06Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"t1\",\"call_id\":\"rg-review\",\"command\":\"rg review_session\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"review_session\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-09T12:30:00Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"apply_patch\",\"call_id\":\"patch-after-window\",\"arguments\":\"*** Update File: src/late.py\\n+late\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-09T12:30:01Z\",\"payload\":{\"type\":\"patch_apply_end\",\"turn_id\":\"t1\",\"call_id\":\"patch-after-window\",\"success\":true,\"changes\":{\"files\":1}}}\n";
+    const missing_permit_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-09T10:30:00Z\",\"payload\":{\"id\":\"resolve-missing-permit\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-09T10:30:01Z\",\"payload\":{\"type\":\"user_message\",\"turn_id\":\"t2\",\"message\":\"$resolve please\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-09T10:30:02Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"t2\",\"message\":\"Review Governor\\nnormal_form_register: nf-2 status: falsified\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-09T10:30:03Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"apply_patch\",\"call_id\":\"patch-test\",\"arguments\":\"*** Update File: tests/test_foo.py\\n+test\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-09T10:30:04Z\",\"payload\":{\"type\":\"patch_apply_end\",\"turn_id\":\"t2\",\"call_id\":\"patch-test\",\"success\":true,\"changes\":{\"files\":1}}}\n";
+    const mention_only_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-09T10:40:00Z\",\"payload\":{\"id\":\"resolve-mention\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-09T10:40:01Z\",\"payload\":{\"type\":\"user_message\",\"turn_id\":\"t3\",\"message\":\"I wrote $resolve in prose, but do not run the workflow.\"}}\n";
+
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/09/rollout-resolve-overlap.jsonl", .data = resolved_content });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/09/rollout-resolve-missing-permit.jsonl", .data = missing_permit_content });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/09/rollout-resolve-mention.jsonl", .data = mention_only_content });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "resolve-churn-windowed.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const got = try runCommandWithOutput(std.testing.allocator, .resolve_churn_audit, &.{
+        "--root",   root_abs,
+        "--since",  "2026-05-09T10:00:00Z",
+        "--until",  "2026-05-09T12:00:00Z",
+        "--repo",   "/repo",
+        "--format", "json",
+    }, output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"candidate_sessions\": 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"true_resolve_sessions\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"exclusions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"normal_forms\": { \"proposed\": 1, \"falsified\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"fuse\": { \"required\": 1, \"tripped\": 1, \"mutations_after_trip\": 1, \"production_net_after_trip\": 1 }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"mutation\": { \"apply_patch_calls\": 3, \"commits\": 0, \"production_insertions\": 2, \"production_deletions\": 1, \"production_net\": 1, \"test_insertions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"permits\": { \"required\": 2, \"emitted\": 2, \"missing\": 1 }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"head\": \"out-head\", \"count\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "failed-head") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"mutations_without_permit\": 1") != null);
 }
 
 fn runCommandWithOutput(

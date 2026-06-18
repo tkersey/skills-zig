@@ -165,6 +165,8 @@ pub const ToolLifecycleRecord = struct {
     path: []u8,
     turn_id: ?[]u8 = null,
     turn_index: ?i64 = null,
+    started_at: ?[]u8 = null,
+    completed_at: ?[]u8 = null,
     call_id: ?[]u8 = null,
     kind: ToolKind = .unknown,
     tool_name: ?[]u8 = null,
@@ -191,6 +193,8 @@ pub const ToolLifecycleRecord = struct {
         freeOpt(allocator, self.session_id);
         allocator.free(self.path);
         freeOpt(allocator, self.turn_id);
+        freeOpt(allocator, self.started_at);
+        freeOpt(allocator, self.completed_at);
         freeOpt(allocator, self.call_id);
         freeOpt(allocator, self.tool_name);
         freeOpt(allocator, self.namespace);
@@ -482,10 +486,10 @@ pub fn parseSessionTrace(
                 }
             } else if (root.get("call_id") != null and root.get("arguments") != null and root.get("name") != null) {
                 const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, null);
-                try declareTool(allocator, &trace, idx, root, line_number);
+                try declareTool(allocator, &trace, idx, root, timestamp, line_number);
             } else if (root.get("call_id") != null and root.get("output") != null) {
                 const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, null);
-                try finalizeToolOutput(allocator, &trace, idx, root, "function_call_output", line_number);
+                try finalizeToolOutput(allocator, &trace, idx, root, "function_call_output", timestamp, line_number);
             }
         }
     }
@@ -971,9 +975,9 @@ fn applyResponseItem(
     }
     const idx = try ensureTurn(allocator, trace, path, current_turn_index, synthetic_turns, timestamp, stringField(payload, "turn_id"));
     if (std.mem.eql(u8, payload_type, "function_call") or std.mem.eql(u8, payload_type, "custom_tool_call")) {
-        try declareTool(allocator, trace, idx, payload, line_number);
+        try declareTool(allocator, trace, idx, payload, timestamp, line_number);
     } else if (std.mem.eql(u8, payload_type, "function_call_output") or std.mem.eql(u8, payload_type, "custom_tool_call_output")) {
-        try finalizeToolOutput(allocator, trace, idx, payload, payload_type, line_number);
+        try finalizeToolOutput(allocator, trace, idx, payload, payload_type, timestamp, line_number);
     }
 }
 
@@ -1008,7 +1012,7 @@ fn findToolByCallId(trace: *CanonicalSessionTrace, call_id: []const u8) ?usize {
     return null;
 }
 
-fn declareTool(allocator: std.mem.Allocator, trace: *CanonicalSessionTrace, turn_idx: usize, payload: std.json.ObjectMap, line_number: usize) !void {
+fn declareTool(allocator: std.mem.Allocator, trace: *CanonicalSessionTrace, turn_idx: usize, payload: std.json.ObjectMap, timestamp: ?[]const u8, line_number: usize) !void {
     const call_id = stringField(payload, "call_id") orelse stringField(payload, "id") orelse return;
     if (findToolByCallId(trace, call_id)) |_| return;
     const name = stringField(payload, "name") orelse stringField(payload, "tool_name") orelse "unknown";
@@ -1017,6 +1021,7 @@ fn declareTool(allocator: std.mem.Allocator, trace: *CanonicalSessionTrace, turn
         .path = try allocator.dupe(u8, trace.session.path),
         .turn_id = try allocator.dupe(u8, trace.turns.items[turn_idx].turn_id),
         .turn_index = trace.turns.items[turn_idx].turn_index,
+        .started_at = try dupOpt(allocator, timestamp),
         .call_id = try allocator.dupe(u8, call_id),
         .kind = kindFromName(name),
         .tool_name = try allocator.dupe(u8, name),
@@ -1033,7 +1038,7 @@ fn declareTool(allocator: std.mem.Allocator, trace: *CanonicalSessionTrace, turn
 }
 
 fn finalizeToolEvent(allocator: std.mem.Allocator, trace: *CanonicalSessionTrace, turn_idx: usize, payload: std.json.ObjectMap, event_type: []const u8, timestamp: ?[]const u8, line_number: usize) !void {
-    try finalizeToolOutput(allocator, trace, turn_idx, payload, event_type, line_number);
+    try finalizeToolOutput(allocator, trace, turn_idx, payload, event_type, timestamp, line_number);
     if (std.mem.eql(u8, event_type, "collab_agent_spawn_end")) {
         try appendGraphEdge(allocator, trace, payload, timestamp);
         trace.turns.items[turn_idx].spawned_worker_count += 1;
@@ -1041,7 +1046,7 @@ fn finalizeToolEvent(allocator: std.mem.Allocator, trace: *CanonicalSessionTrace
     }
 }
 
-fn finalizeToolOutput(allocator: std.mem.Allocator, trace: *CanonicalSessionTrace, turn_idx: usize, payload: std.json.ObjectMap, event_type: []const u8, line_number: usize) !void {
+fn finalizeToolOutput(allocator: std.mem.Allocator, trace: *CanonicalSessionTrace, turn_idx: usize, payload: std.json.ObjectMap, event_type: []const u8, timestamp: ?[]const u8, line_number: usize) !void {
     const call_id = stringField(payload, "call_id") orelse stringField(payload, "id") orelse event_type;
     const idx = findToolByCallId(trace, call_id) orelse blk: {
         var record = ToolLifecycleRecord{
@@ -1049,6 +1054,7 @@ fn finalizeToolOutput(allocator: std.mem.Allocator, trace: *CanonicalSessionTrac
             .path = try allocator.dupe(u8, trace.session.path),
             .turn_id = try allocator.dupe(u8, trace.turns.items[turn_idx].turn_id),
             .turn_index = trace.turns.items[turn_idx].turn_index,
+            .completed_at = try dupOpt(allocator, timestamp),
             .call_id = try allocator.dupe(u8, call_id),
             .lifecycle_status = .inferred,
         };
@@ -1060,6 +1066,7 @@ fn finalizeToolOutput(allocator: std.mem.Allocator, trace: *CanonicalSessionTrac
     var rec = &trace.tools.items[idx];
     rec.kind = kindFromEndEvent(event_type, rec.tool_name);
     rec.finalized_line = @intCast(line_number);
+    if (timestamp) |ts| try replaceOpt(allocator, &rec.completed_at, ts);
     try replaceOpt(allocator, &rec.output_text, stringField(payload, "output") orelse stringField(payload, "aggregated_output") orelse stringField(payload, "stdout") orelse "");
     if (stringField(payload, "command")) |v| try replaceOpt(allocator, &rec.command_text, v);
     if (stringField(payload, "cwd")) |v| try replaceOpt(allocator, &rec.cwd, v);
