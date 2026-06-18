@@ -1,0 +1,42 @@
+seq review-compiler-audit validation proof
+
+Environment:
+- zig version: 0.16.0
+- branch: feature/seq-review-compiler-audit
+
+Commands run:
+- zig fmt apps/seq/src/lib.zig apps/seq/src/tests.zig apps/seq/src/commands/mod.zig
+- zig build test-seq --summary all
+  Result: Build Summary: 4/4 steps succeeded; 163/163 tests passed.
+- zig build build-seq
+  Result: succeeded.
+- (cd apps/seq && zig build)
+  Result: succeeded.
+- (cd apps/seq && zig build test --summary all)
+  Result: Build Summary: 4/4 steps succeeded; 163/163 tests passed.
+- zig build test --summary all
+  Result: Build Summary: 54/54 steps succeeded; 442/442 tests passed.
+- apps/seq/scripts/release/command_surface_gate.sh
+  Result: command-surface gate passed for /Users/tk/workspace/tk/skills-zig/apps/seq/zig-out/bin/seq.
+- apps/seq/scripts/release/command_surface_gate.sh ./zig-out/bin/seq
+  Result: command-surface gate passed for ./zig-out/bin/seq.
+- ./apps/seq/zig-out/bin/seq review-compiler-audit --help
+  Result: help exposes required --since/--until/--repo, optional --exclude-current, and markdown|json formats.
+- Bounded empty-root smoke:
+  Command: seq review-compiler-audit --root <temp>/sessions --since 2026-06-18T00:00:00Z --until 2026-06-19T00:00:00Z --repo /Users/tk/workspace/tk/skills-zig --format markdown
+  Result: rendered the required review_compiler_audit tree with zero counters and exclusions: [].
+- git diff --check
+  Result: passed.
+- st assert-projection --target codex
+  Result: projection ok: empty (no_projectable_frontier).
+
+Regression witnesses:
+- parseCommand recognizes review-compiler-audit.
+- review-compiler-audit fixture covers:
+  - raw $resolve mention as candidate exclusion only
+  - assistant cleanroom evidence as true resolve session
+  - ordinary codex review tool call without cleanroom candidate ignored
+  - delivery_freeze, counterexample_contract, delivery_patch_recipe, ablation_certificate, compiled_delivery_permit counters
+  - lab_apply_patch_calls vs delivery_apply_patch_calls
+  - lab_surface_discarded and delivery_surface_shipped
+  - delivery_mutations_before_recipe, review_derived_delivery_patches, missing_recipe, missing_ablation
