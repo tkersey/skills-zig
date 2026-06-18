@@ -19,6 +19,7 @@ const UsageText =
     \\  cas <subcommand> [args...]
     \\
     \\Subcommands:
+    \\  account                            Run cas_account.
     \\  conformance     | conformance-suite  Run cas_conformance_suite.
     \\  goal                                 Run cas_goal.
     \\  instance_runner | instance-runner   Run cas_instance_runner.
@@ -26,6 +27,7 @@ const UsageText =
     \\  smoke_check     | smoke-check       Run cas_smoke_check.
     \\
     \\Examples:
+    \\  cas account status --cwd /path/to/repo --json
     \\  cas conformance --cwd /path/to/repo --json
     \\  cas goal resolve --cwd /path/to/repo --latest --json
     \\  cas instance_runner --cwd /path/to/repo --instances 4
@@ -73,7 +75,7 @@ pub fn main(init: std.process.Init) !void {
         var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stderr = &stderr_writer.interface;
         try stderr.print(
-            "failed to launch {s}: {s}\ninstall or expose the full CAS binary set beside `cas` ({s}, cas_smoke_check, cas_instance_runner, cas_conformance_suite)\n",
+            "failed to launch {s}: {s}\ninstall or expose the full CAS binary set beside `cas` ({s}, cas_account, cas_smoke_check, cas_instance_runner, cas_conformance_suite, cas_goal)\n",
             .{ target_name, @errorName(err), target_name },
         );
         std.process.exit(1);
@@ -158,6 +160,9 @@ fn statusToExitCode(status: u32) u8 {
 }
 
 fn resolveTarget(subcommand: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, subcommand, "account")) {
+        return "cas_account";
+    }
     if (std.mem.eql(u8, subcommand, "conformance") or std.mem.eql(u8, subcommand, "conformance-suite") or std.mem.eql(u8, subcommand, "conformance_suite")) {
         return "cas_conformance_suite";
     }
@@ -177,6 +182,7 @@ fn resolveTarget(subcommand: []const u8) ?[]const u8 {
 }
 
 test "resolveTarget supports supported subcommands" {
+    try std.testing.expectEqualStrings("cas_account", resolveTarget("account").?);
     try std.testing.expectEqualStrings("cas_conformance_suite", resolveTarget("conformance").?);
     try std.testing.expectEqualStrings("cas_conformance_suite", resolveTarget("conformance-suite").?);
     try std.testing.expectEqualStrings("cas_goal", resolveTarget("goal").?);

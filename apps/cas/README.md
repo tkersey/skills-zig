@@ -6,6 +6,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 
 - `scripts/cas.zig`
 - `scripts/budget_governor.zig`
+- `scripts/cas_account.zig`
 - `scripts/cas_conformance_suite.zig`
 - `scripts/cas_goal.zig`
 - `scripts/cas_goal_core.zig`
@@ -16,7 +17,8 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 
 ## Behavior
 
-- `cas` dispatches `conformance`, `goal`, `smoke_check`, `instance_runner`, and `review_session`.
+- `cas` dispatches `account`, `conformance`, `goal`, `smoke_check`, `instance_runner`, and `review_session`.
+- `cas_account` reads account status through safe app-server account APIs. It reports account/auth/rate-limit status, optional usage summary data, and a normalized budget-governor classification. It never requests token-bearing auth data, never refreshes credentials, never mutates account state, and redacts account email unless `--show-email` is supplied.
 - `cas_goal` manages Codex app-server v2 thread goals through `thread/goal/get`, `thread/goal/set`, and `thread/goal/clear`. It adds safe target selection over `thread/list`, explicit `resolve`/`--dry-run` previews, create-by-default `set`, and lifecycle `wait` through `thread/resume` plus goal polling.
 - `cas_conformance_suite` verifies claim-safe wave handling, stale-claim reclaim, mesh result accountability, and bounded overload retry behavior.
 - `cas_smoke_check` verifies the native v2 handshake plus `experimentalFeature/list`, `thread/start`, `thread/resume`, `turn/start`, `turn/interrupt`, and `turn/steer`.
@@ -45,6 +47,18 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 ```bash
 # Run the dispatcher help surface.
 ./zig-out/bin/cas --help
+
+# Read sanitized account/auth/rate-limit status.
+./zig-out/bin/cas account status \
+  --cwd /path/to/workspace \
+  --json
+
+# Include usage summary data and explicitly reveal the account email.
+./zig-out/bin/cas account status \
+  --cwd /path/to/workspace \
+  --usage \
+  --show-email \
+  --json
 
 # Preview the latest materialized goal target for a repository.
 ./zig-out/bin/cas goal resolve \
@@ -160,6 +174,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 ```bash
 zig build test-cas
 zig build build-cas -Doptimize=ReleaseFast
+./zig-out/bin/cas_account --help
 ./zig-out/bin/cas_conformance_suite --help
 ./zig-out/bin/cas goal --help
 bash apps/cas/scripts/perf/budget_governor_gate.sh
