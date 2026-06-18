@@ -76,6 +76,7 @@ jobs:
               - "libs/core/**"
               - "libs/durable_store/**"
               - ".github/scripts/**"
+              - ".github/workflows/pr-ci.yml"
               - ".github/workflows/release-*.yml"
               - ".github/workflows/auto-release.yml"
               - "scripts/perf/**"
@@ -141,18 +142,29 @@ jobs:
     needs: changes
     if: needs.changes.outputs.seq == 'true' || needs.changes.outputs.core == 'true'
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: apps/seq
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache-global
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+      - name: Restore Zig cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            .zig-cache-global
+          key: zig-seq-${{ runner.os }}-0.16.0-${{ hashFiles('build.zig', 'build.zig.zon', 'apps/seq/**', 'libs/core/**', '.github/workflows/pr-ci.yml') }}
+          restore-keys: |
+            zig-seq-${{ runner.os }}-0.16.0-
       - name: Build seq
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build build-seq -Doptimize=ReleaseFast --summary all
+      - name: Build standalone seq
+        working-directory: apps/seq
+        run: zig build -Doptimize=Debug --cache-dir ../../.zig-cache --global-cache-dir ../../.zig-cache-global --summary all
       - name: Test seq
-        run: zig build test
+        run: zig build test-seq --summary all
 
   seq-fuzz-linux:
     needs: changes
