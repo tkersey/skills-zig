@@ -73,6 +73,7 @@ Binary output:
 ./zig-out/bin/seq token-window --window-hours 24 --since 2026-04-01T00:00:00Z --exclude-current --format table
 ./zig-out/bin/seq goal-audit --root ~/.codex/sessions --workflow review,resolve --duration-gte 2h --summary --format table
 ./zig-out/bin/seq adjudication-audit --mode summary --include-root-equivalent resolve,fixed-point-driver --since 2026-05-02T00:00:00-07:00 --format table
+./zig-out/bin/seq resolve-churn-audit --since 2026-05-01T00:00:00-07:00 --until 2026-06-01T00:00:00-07:00 --repo /Users/tk/workspace/tk/skills-zig --exclude-current --format markdown
 ./zig-out/bin/seq workdir-report --workdir /Users/tk/workspace/tk/skills-zig --mode sessions --format table
 ./zig-out/bin/seq memory-provenance --thread-id 019bae5d-7d12-7b01-9cb5-b8bb6046b85b --format table
 ./zig-out/bin/seq memory-provenance --rollout-summary-file rollout_summaries/2026-01-11T18-42-01-jpEf-resolve_merge_pr_11_squash_cleanup.md --format json
@@ -117,6 +118,19 @@ seq workflow-audit --root ~/.codex/sessions --workflow fixed-point-driver --mode
 seq workflow-audit --root ~/.codex/sessions --workflow fixed-point-driver --mode term-summary --term-group additive=add,added,patch --term-group reductive=delete,remove,refactor --format table
 seq workflow-overlap --root ~/.codex/sessions --workflow fixed-point-driver,review-adjudication --mode summary --since 2026-05-02T00:00:00-07:00 --format table
 seq workflow-overlap --root ~/.codex/sessions --workflow fixed-point-driver,review-adjudication --mode sessions --limit 20 --format jsonl
+```
+
+`resolve-churn-audit` emits the native `$resolve` churn ledger requested by the Review Governor loop:
+- requires `--since`, `--until`, and `--repo`
+- supports `--exclude-current` to avoid counting the active audit session
+- emits `markdown` by default or `json` with `--format json`
+- uses transcript/session evidence for workflow attribution and Git/tool lifecycle only as supplemental repo evidence
+- treats raw `$resolve` mentions as denominator candidates only; true resolve sessions require assistant-side workflow or review/tool evidence
+
+Examples:
+```bash
+seq resolve-churn-audit --root ~/.codex/sessions --since 2026-05-01T00:00:00-07:00 --until 2026-06-01T00:00:00-07:00 --repo /Users/tk/workspace/tk/skills-zig --exclude-current --format markdown
+seq resolve-churn-audit --root ~/.codex/sessions --since 2026-05-01T00:00:00Z --until 2026-06-01T00:00:00Z --repo /Users/tk/workspace/tk/skills-zig --format json
 ```
 
 `skill-blocks` is the exact-body surface for injected `<skill>...</skill>` content:

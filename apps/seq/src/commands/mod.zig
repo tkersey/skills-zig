@@ -624,6 +624,7 @@ pub fn run(
         .dataset_schema => try cmdDatasetSchema(allocator, opts),
         .query => try cmdQuery(allocator, sessions_root, opts),
         .adjudication_audit => try cmdAdjudicationAudit(allocator, sessions_root, opts),
+        .resolve_churn_audit => try cmdResolveChurnAudit(allocator, sessions_root, opts),
         .goal_audit => try QueryLiftCommands.cmdGoalAudit(allocator, sessions_root, opts),
         .workflow_audit => try cmdWorkflowAudit(allocator, sessions_root, opts),
         .workflow_overlap => try cmdWorkflowOverlap(allocator, sessions_root, opts),
@@ -806,6 +807,13 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\  --include-root-equivalent <csv> Include root-equivalent workflow names such as resolve,fixed-point-driver
         \\  --bundle-dir <path>            Write reproducible evidence rows beside the main report
         ,
+        .resolve_churn_audit =>
+        \\usage: seq resolve-churn-audit --since <iso> --until <iso> --repo <path> [--exclude-current] [--format markdown|json]
+        \\extra options:
+        \\  --repo <path>             Match session cwd/tool cwd against this repo root or descendants
+        \\  --exclude-current         Exclude the current CODEX_THREAD_ID session
+        \\  raw $resolve mentions are denominator candidates only; true sessions require assistant workflow or tool evidence
+        ,
         .goal_audit =>
         \\usage: seq goal-audit [--mode summary|rows] [--workflow review|resolve|review,resolve] [--duration-gte <seconds|minutes|hours>] [--status <name>] [--contains <text>] [--since <iso>] [--until <iso>] [--path <jsonl>|--session-id <id>] [--exclude-current] [--show-query] [--limit N] [--format table|json|csv|jsonl]
         ,
@@ -903,6 +911,7 @@ fn commandSupportsExcludeCurrent(cmd: lib.Command) bool {
         std.mem.eql(u8, name, "message_search") or
         std.mem.eql(u8, name, "tool_search") or
         std.mem.eql(u8, name, "token_window") or
+        std.mem.eql(u8, name, "resolve_churn_audit") or
         std.mem.eql(u8, name, "workflow_audit") or
         std.mem.eql(u8, name, "goal_audit");
 }
@@ -939,6 +948,9 @@ fn validateFormatForCommand(cmd: lib.Command, opts: Options) !void {
         },
         .adjudication_audit => {
             if (fmt == .dot) return error.InvalidFormatForCommand;
+        },
+        .resolve_churn_audit => {
+            if (fmt != .markdown and fmt != .json) return error.InvalidFormatForCommand;
         },
         .sessions, .turns, .tool_lifecycle, .tail => {
             if (fmt == .csv or fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
@@ -998,7 +1010,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_tool = cmd == .opencode_events or cmd == .artifact_search or cmd == .tool_audit or cmd == .tool_search;
     const supports_executable = cmd == .tool_audit or cmd == .tool_search;
     const supports_workdir = cmd == .artifact_search or cmd == .tool_audit or cmd == .tool_search or cmd == .workdir_report or cmd == .workflow_audit or cmd == .workflow_overlap;
-    const supports_repo = cmd == .plan_search or cmd == .sessions;
+    const supports_repo = cmd == .plan_search or cmd == .sessions or cmd == .resolve_churn_audit;
     const supports_status = cmd == .opencode_events or cmd == .turns or cmd == .goal_audit;
     const supports_mode = switch (cmd) {
         .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .skill_success_rank, .skill_blocks, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit, .workflow_overlap, .adjudication_audit, .goal_audit => true,
@@ -1050,6 +1062,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .workflow_audit,
         .workflow_overlap,
         .adjudication_audit,
+        .resolve_churn_audit,
         .goal_audit,
         .memory_map,
         .memory_history,
@@ -1091,6 +1104,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .workflow_audit,
         .workflow_overlap,
         .adjudication_audit,
+        .resolve_churn_audit,
         .goal_audit,
         .memory_map,
         .memory_history,
@@ -1350,6 +1364,12 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     if (cmd == .adjudication_audit) {
         if (opts.mode) |text| {
             if (!isValidAdjudicationAuditMode(text)) return error.InvalidModeArg;
+        }
+    }
+    if (cmd == .resolve_churn_audit) {
+        if (opts.since == null or opts.until == null or opts.repo_text == null) {
+            printCliError("error: resolve-churn-audit requires --since, --until, and --repo\n", .{});
+            return error.MissingArgValue;
         }
     }
     if (opts.unique_by_text) |text| {
@@ -4077,6 +4097,532 @@ fn writeAdjudicationAuditBundle(allocator: std.mem.Allocator, rows: []const quer
     defer allocator.free(readme_path);
     const readme = "Evidence bundle generated by seq adjudication-audit.\nRows are conservative session-level classifications; legacy prose is flagged as inferred.\n";
     try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = readme_path, .data = readme });
+}
+
+const ResolveChurnAudit = struct {
+    denominator: Denominator = .{},
+    review_horizon: ReviewHorizon = .{},
+    finding_liability: FindingLiability = .{},
+    normal_forms: NormalForms = .{},
+    fuse: Fuse = .{},
+    mutation: Mutation = .{},
+    permits: Permits = .{},
+    negative_ledger: NegativeLedger = .{},
+    review: Review = .{},
+    compliance: Compliance = .{},
+
+    const Denominator = struct {
+        candidate_sessions: usize = 0,
+        true_resolve_sessions: usize = 0,
+        exclusions: usize = 0,
+    };
+
+    const ReviewHorizon = struct {
+        initial_broad: usize = 0,
+        targeted: usize = 0,
+        final_holdout: usize = 0,
+    };
+
+    const FindingLiability = struct {
+        introduced_by_diff: usize = 0,
+        acceptance_required: usize = 0,
+        preexisting_blocker: usize = 0,
+        adjacent_preexisting: usize = 0,
+        reviewer_preference: usize = 0,
+        unknown: usize = 0,
+    };
+
+    const NormalForms = struct {
+        proposed: usize = 0,
+        falsified: usize = 0,
+        repeated_after_falsification: usize = 0,
+    };
+
+    const Fuse = struct {
+        required: usize = 0,
+        tripped: usize = 0,
+        mutations_after_trip: usize = 0,
+        production_net_after_trip: i64 = 0,
+    };
+
+    const Mutation = struct {
+        apply_patch_calls: usize = 0,
+        commits: usize = 0,
+        production_insertions: usize = 0,
+        production_deletions: usize = 0,
+        production_net: i64 = 0,
+        test_insertions: usize = 0,
+        test_deletions: usize = 0,
+        test_net: i64 = 0,
+
+        fn refreshNet(self: *Mutation) void {
+            self.production_net = @as(i64, @intCast(self.production_insertions)) - @as(i64, @intCast(self.production_deletions));
+            self.test_net = @as(i64, @intCast(self.test_insertions)) - @as(i64, @intCast(self.test_deletions));
+        }
+    };
+
+    const Permits = struct {
+        required: usize = 0,
+        emitted: usize = 0,
+        missing: usize = 0,
+    };
+
+    const NegativeLedger = struct {
+        maps_or_gates: usize = 0,
+        captures: usize = 0,
+        route_changes: usize = 0,
+    };
+
+    const Review = struct {
+        cas_reviews_by_head: std.ArrayList(ReviewHeadCount) = .empty,
+        pr_sweeps: usize = 0,
+
+        fn deinit(self: *Review, allocator: std.mem.Allocator) void {
+            for (self.cas_reviews_by_head.items) |item| allocator.free(item.head);
+            self.cas_reviews_by_head.deinit(allocator);
+        }
+    };
+
+    const Compliance = struct {
+        mutations_without_permit: usize = 0,
+        normal_form_retries_after_falsification: usize = 0,
+        mutations_after_fuse_without_distillation: usize = 0,
+    };
+
+    const ReviewHeadCount = struct {
+        head: []u8,
+        count: usize = 0,
+    };
+
+    fn deinit(self: *ResolveChurnAudit, allocator: std.mem.Allocator) void {
+        self.review.deinit(allocator);
+    }
+};
+
+const ResolveSessionSignals = struct {
+    candidate: bool = false,
+    true_resolve: bool = false,
+    mutation_session: bool = false,
+    mutation_after_fuse: bool = false,
+    permit_emitted: bool = false,
+    fuse_tripped: bool = false,
+    distillation_seen: bool = false,
+};
+
+const ResolvePatchCounts = struct {
+    production_insertions: usize = 0,
+    production_deletions: usize = 0,
+    test_insertions: usize = 0,
+    test_deletions: usize = 0,
+
+    fn productionNet(self: ResolvePatchCounts) i64 {
+        return @as(i64, @intCast(self.production_insertions)) - @as(i64, @intCast(self.production_deletions));
+    }
+
+    fn testNet(self: ResolvePatchCounts) i64 {
+        return @as(i64, @intCast(self.test_insertions)) - @as(i64, @intCast(self.test_deletions));
+    }
+};
+
+const ResolvePathKind = enum {
+    other,
+    production,
+    tests,
+};
+
+fn cmdResolveChurnAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    const repo_raw = opts.repo_text orelse return error.MissingArgValue;
+    const repo_root = try resolveExplicitRepoRoot(allocator, repo_raw);
+    defer allocator.free(repo_root);
+
+    const current_thread_id = if (opts.exclude_current) try getEnvVarOwned(allocator, "CODEX_THREAD_ID") else null;
+    defer if (current_thread_id) |id| allocator.free(id);
+
+    var audit = ResolveChurnAudit{};
+    defer audit.deinit(allocator);
+
+    var paths = try collectTraceRolloutPaths(allocator, sessions_root);
+    defer freePathList(allocator, &paths);
+
+    for (paths.items) |path| {
+        var parsed = canonical_trace.parseSessionTrace(allocator, path, traceParseOptions(opts)) catch continue;
+        defer parsed.deinit(allocator);
+
+        if (current_thread_id) |thread_id| {
+            if (resolveTraceMatchesThread(parsed, path, thread_id)) continue;
+        }
+        if (!timestampSatisfiesBounds(parsed.session.start_time orelse parsed.session.end_time, opts)) continue;
+        if (!try resolveTraceMatchesRepo(allocator, repo_root, parsed)) continue;
+
+        const content = (try readFileAllocOrSkip(allocator, path)) orelse continue;
+        defer allocator.free(content);
+        const messages = datasets.messages.parseJsonl(allocator, path, content, .{
+            .include_user = true,
+            .include_assistant = true,
+            .strip_echo_assistant = true,
+            .skip_meta_user_messages = true,
+            .dedupe_by_role_and_text = false,
+            .strip_skill_blocks = true,
+        }) catch continue;
+        defer datasets.messages.freeRows(allocator, messages);
+
+        var signals = summarizeResolveSession(messages, parsed.tools.items, opts);
+        if (!signals.candidate) continue;
+        audit.denominator.candidate_sessions += 1;
+        if (!signals.true_resolve) {
+            audit.denominator.exclusions += 1;
+            continue;
+        }
+
+        audit.denominator.true_resolve_sessions += 1;
+        try recordResolveMessages(allocator, &audit, messages, opts, &signals);
+        try recordResolveTools(allocator, &audit, parsed.tools.items, repo_root, &signals);
+
+        if (signals.mutation_session) {
+            audit.permits.required += 1;
+            if (!signals.permit_emitted) audit.compliance.mutations_without_permit += 1;
+        }
+        if (signals.fuse_tripped and signals.mutation_after_fuse and !signals.distillation_seen) {
+            audit.compliance.mutations_after_fuse_without_distillation += 1;
+        }
+    }
+
+    audit.permits.missing = if (audit.permits.required > audit.permits.emitted)
+        audit.permits.required - audit.permits.emitted
+    else
+        0;
+    audit.compliance.normal_form_retries_after_falsification = audit.normal_forms.repeated_after_falsification;
+
+    const fmt = if (opts.format_set) opts.format else output.Format.markdown;
+    return switch (fmt) {
+        .json => writeResolveChurnAuditJson(allocator, audit, opts.out_path),
+        .markdown => writeResolveChurnAuditMarkdown(allocator, audit, opts.out_path),
+        else => error.InvalidFormatForCommand,
+    };
+}
+
+fn resolveTraceMatchesThread(parsed: canonical_trace.CanonicalSessionTrace, path: []const u8, thread_id: []const u8) bool {
+    if (parsed.session.session_id) |id| {
+        if (std.mem.eql(u8, id, thread_id) or std.mem.containsAtLeast(u8, id, 1, thread_id)) return true;
+    }
+    return std.mem.containsAtLeast(u8, path, 1, thread_id);
+}
+
+fn resolveTraceMatchesRepo(allocator: std.mem.Allocator, repo_root: []const u8, parsed: canonical_trace.CanonicalSessionTrace) !bool {
+    if (parsed.session.cwd) |cwd| {
+        if (try pathMatchesRepoScope(allocator, repo_root, cwd)) return true;
+    }
+    for (parsed.tools.items) |tool| {
+        if (tool.cwd) |cwd| {
+            if (try pathMatchesRepoScope(allocator, repo_root, cwd)) return true;
+        }
+    }
+    return false;
+}
+
+fn summarizeResolveSession(
+    messages: []const datasets.messages.MessageRow,
+    tools: []const canonical_trace.ToolLifecycleRecord,
+    opts: Options,
+) ResolveSessionSignals {
+    var signals = ResolveSessionSignals{};
+    for (messages) |message| {
+        if (!timestampSatisfiesBounds(message.timestamp, opts)) continue;
+        if (containsResolveCandidateCue(message.text)) signals.candidate = true;
+        if (std.mem.eql(u8, message.role, "assistant") and containsTrueResolveAssistantEvidence(message.text)) {
+            signals.candidate = true;
+            signals.true_resolve = true;
+        }
+    }
+    for (tools) |tool| {
+        if (containsTrueResolveToolEvidence(tool)) {
+            signals.candidate = true;
+            signals.true_resolve = true;
+        }
+    }
+    return signals;
+}
+
+fn containsResolveCandidateCue(text: []const u8) bool {
+    return containsDollarWorkflowMention(text, "resolve") or
+        containsAnyIgnoreCaseAscii(text, &.{ "seq resolve-churn-audit", "resolve_churn_audit", "review governor", "review_governor" });
+}
+
+fn containsTrueResolveAssistantEvidence(text: []const u8) bool {
+    return containsAnyIgnoreCaseAscii(text, &.{
+        "using $resolve",
+        "Review Governor",
+        "review_governor_record",
+        "RGR-V3-MUTATION-PERMIT",
+        "RLR-v4",
+        "resolve_learning_report",
+        "review_charter",
+        "finding_liability",
+        "normal_form_register",
+        "governor_fuse",
+        "review_distillation_receipt",
+    });
+}
+
+fn containsTrueResolveToolEvidence(tool: canonical_trace.ToolLifecycleRecord) bool {
+    const cmd = tool.command_text orelse tool.input_text orelse tool.arguments_json orelse "";
+    return containsAnyIgnoreCaseAscii(cmd, &.{ "cas review_session", "cas_review_session", "codex review", "review_session" });
+}
+
+fn recordResolveMessages(
+    allocator: std.mem.Allocator,
+    audit: *ResolveChurnAudit,
+    messages: []const datasets.messages.MessageRow,
+    opts: Options,
+    signals: *ResolveSessionSignals,
+) !void {
+    _ = allocator;
+    for (messages) |message| {
+        if (!timestampSatisfiesBounds(message.timestamp, opts)) continue;
+        if (!std.mem.eql(u8, message.role, "assistant")) continue;
+        const text = message.text;
+
+        if (containsAnyIgnoreCaseAscii(text, &.{ "initial_broad", "initial broad", "broad sensing" })) audit.review_horizon.initial_broad += 1;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "targeted", "charter-clean", "clean current-head" })) audit.review_horizon.targeted += 1;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "final_holdout", "final holdout", "broad holdout" })) audit.review_horizon.final_holdout += 1;
+
+        if (containsAnyIgnoreCaseAscii(text, &.{ "introduced_by_current_diff", "introduced_by_diff" })) audit.finding_liability.introduced_by_diff += 1;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "exposed_and_required_by_current_acceptance", "acceptance_required" })) audit.finding_liability.acceptance_required += 1;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "preexisting_but_blocks_current_invariant", "preexisting_blocker" })) audit.finding_liability.preexisting_blocker += 1;
+        if (containsIgnoreCaseAscii(text, "adjacent_preexisting")) audit.finding_liability.adjacent_preexisting += 1;
+        if (containsIgnoreCaseAscii(text, "reviewer_preference")) audit.finding_liability.reviewer_preference += 1;
+        if (containsIgnoreCaseAscii(text, "finding_liability: unknown") or containsIgnoreCaseAscii(text, "liability: unknown")) audit.finding_liability.unknown += 1;
+
+        if (containsAnyIgnoreCaseAscii(text, &.{ "normal_form_register", "normal_form_id", "status: proposed" })) audit.normal_forms.proposed += 1;
+        if (containsIgnoreCaseAscii(text, "falsified")) audit.normal_forms.falsified += 1;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "repeated_after_falsification", "same_family_after_normal_form: yes", "family_recurred_after: yes" })) audit.normal_forms.repeated_after_falsification += 1;
+
+        if (containsAnyIgnoreCaseAscii(text, &.{ "distillation_required: yes", "same_family_after_normal_form: yes", "normal_form_falsified: yes", "governor_fuse" })) audit.fuse.required += 1;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "fuse_state: tripped", "delivery_mutation_frozen: yes" })) {
+            audit.fuse.tripped += 1;
+            signals.fuse_tripped = true;
+        }
+        if (containsIgnoreCaseAscii(text, "review_distillation_receipt")) signals.distillation_seen = true;
+
+        if (containsIgnoreCaseAscii(text, "RGR-V3-MUTATION-PERMIT")) {
+            audit.permits.emitted += 1;
+            signals.permit_emitted = true;
+        }
+
+        if (containsAnyIgnoreCaseAscii(text, &.{ "ledger map", "ledger gate", "negative_route_gate" })) audit.negative_ledger.maps_or_gates += 1;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "ledger capture", "capture_created: yes" })) audit.negative_ledger.captures += 1;
+        if (containsIgnoreCaseAscii(text, "route_changed_at_leverage_level: yes")) audit.negative_ledger.route_changes += 1;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "reviewThreads", "gh pr view", "PR sweep", "pr_sweeps" })) audit.review.pr_sweeps += 1;
+    }
+}
+
+fn recordResolveTools(
+    allocator: std.mem.Allocator,
+    audit: *ResolveChurnAudit,
+    tools: []const canonical_trace.ToolLifecycleRecord,
+    repo_root: []const u8,
+    signals: *ResolveSessionSignals,
+) !void {
+    for (tools) |tool| {
+        if (!toolIsInRepoScope(allocator, repo_root, tool)) continue;
+        if (containsTrueResolveToolEvidence(tool)) {
+            const head = extractReviewHead(tool.command_text orelse tool.input_text orelse tool.arguments_json orelse "") orelse "unknown";
+            try recordReviewHead(allocator, &audit.review.cas_reviews_by_head, head);
+        }
+
+        if (tool.kind == .patch_apply and tool.lifecycle_status == .completed and tool.patch_success != false) {
+            audit.mutation.apply_patch_calls += 1;
+            signals.mutation_session = true;
+            const patch_text = tool.input_text orelse tool.arguments_json orelse tool.patch_changes_json orelse "";
+            const counts = countResolvePatchLines(patch_text);
+            addResolvePatchCounts(&audit.mutation, counts);
+            if (signals.fuse_tripped) {
+                audit.fuse.mutations_after_trip += 1;
+                signals.mutation_after_fuse = true;
+                audit.fuse.production_net_after_trip += counts.productionNet();
+            }
+            continue;
+        }
+
+        if (tool.kind == .exec_command and tool.lifecycle_status == .completed and (tool.exit_code orelse -1) == 0) {
+            const cmd = tool.command_text orelse "";
+            if (containsGitCommitCommand(cmd)) {
+                audit.mutation.commits += 1;
+                signals.mutation_session = true;
+                if (signals.fuse_tripped) {
+                    audit.fuse.mutations_after_trip += 1;
+                    signals.mutation_after_fuse = true;
+                }
+            }
+        }
+    }
+    audit.mutation.refreshNet();
+}
+
+fn toolIsInRepoScope(allocator: std.mem.Allocator, repo_root: []const u8, tool: canonical_trace.ToolLifecycleRecord) bool {
+    const cwd = tool.cwd orelse return true;
+    return pathMatchesRepoScope(allocator, repo_root, cwd) catch false;
+}
+
+fn recordReviewHead(allocator: std.mem.Allocator, heads: *std.ArrayList(ResolveChurnAudit.ReviewHeadCount), head: []const u8) !void {
+    for (heads.items) |*item| {
+        if (std.mem.eql(u8, item.head, head)) {
+            item.count += 1;
+            return;
+        }
+    }
+    try heads.append(allocator, .{ .head = try allocator.dupe(u8, head), .count = 1 });
+}
+
+fn extractReviewHead(text: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n,");
+        if (line.len == 0) continue;
+        if (std.mem.indexOf(u8, line, "head_sha")) |idx| return tokenAfterMarker(line[idx..], ':');
+        if (std.mem.indexOf(u8, line, "--head")) |idx| return tokenAfterMarker(line[idx + "--head".len ..], ' ');
+    }
+    return null;
+}
+
+fn tokenAfterMarker(text: []const u8, marker: u8) ?[]const u8 {
+    const start_raw = if (std.mem.indexOfScalar(u8, text, marker)) |idx| idx + 1 else 0;
+    var start = start_raw;
+    while (start < text.len and std.ascii.isWhitespace(text[start])) : (start += 1) {}
+    var end = start;
+    while (end < text.len and !std.ascii.isWhitespace(text[end]) and text[end] != ',' and text[end] != '}' and text[end] != '"') : (end += 1) {}
+    if (end <= start) return null;
+    return text[start..end];
+}
+
+fn containsGitCommitCommand(text: []const u8) bool {
+    return containsIgnoreCaseAscii(text, "git commit");
+}
+
+fn addResolvePatchCounts(mutation: *ResolveChurnAudit.Mutation, counts: ResolvePatchCounts) void {
+    mutation.production_insertions += counts.production_insertions;
+    mutation.production_deletions += counts.production_deletions;
+    mutation.test_insertions += counts.test_insertions;
+    mutation.test_deletions += counts.test_deletions;
+}
+
+fn countResolvePatchLines(patch_text: []const u8) ResolvePatchCounts {
+    var counts = ResolvePatchCounts{};
+    var current_kind: ResolvePathKind = .other;
+    var lines = std.mem.splitScalar(u8, patch_text, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "*** Add File: ")) {
+            current_kind = classifyResolvePath(line["*** Add File: ".len..]);
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "*** Update File: ")) {
+            current_kind = classifyResolvePath(line["*** Update File: ".len..]);
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "*** Delete File: ")) {
+            current_kind = classifyResolvePath(line["*** Delete File: ".len..]);
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "+++ ") or std.mem.startsWith(u8, line, "--- ") or std.mem.startsWith(u8, line, "***")) continue;
+        if (line.len == 0) continue;
+
+        if (line[0] == '+') {
+            switch (current_kind) {
+                .production => counts.production_insertions += 1,
+                .tests => counts.test_insertions += 1,
+                .other => {},
+            }
+        } else if (line[0] == '-') {
+            switch (current_kind) {
+                .production => counts.production_deletions += 1,
+                .tests => counts.test_deletions += 1,
+                .other => {},
+            }
+        }
+    }
+    return counts;
+}
+
+fn classifyResolvePath(path_raw: []const u8) ResolvePathKind {
+    const path = std.mem.trim(u8, path_raw, " \t\r\n\"");
+    if (containsAnyIgnoreCaseAscii(path, &.{ "/test", "tests/", "testdata", "fixtures" })) return .tests;
+    if (std.mem.startsWith(u8, path, "apps/seq/src/tests")) return .tests;
+    if (std.mem.endsWith(u8, path, "_test.zig")) return .tests;
+    if (std.mem.startsWith(u8, path, "apps/seq/src/")) return .production;
+    if (std.mem.startsWith(u8, path, "libs/")) return .production;
+    if (std.mem.eql(u8, path, "build.zig") or std.mem.endsWith(u8, path, "/build.zig")) return .production;
+    return .other;
+}
+
+fn writeResolveChurnAuditMarkdown(allocator: std.mem.Allocator, audit: ResolveChurnAudit, out_path: ?[]const u8) !void {
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+
+    try writer.writeAll("# seq resolve-churn-audit\n\n```yaml\nresolve_churn_audit:\n");
+    try writeResolveChurnAuditYamlBody(writer, audit, "  ");
+    try writer.writeAll("```\n");
+
+    const rendered = try writer_alloc.toOwnedSlice();
+    defer allocator.free(rendered);
+    if (out_path) |path| try ensureParentDir(path);
+    try writeTextOutput(rendered, out_path);
+}
+
+fn writeResolveChurnAuditYamlBody(writer: anytype, audit: ResolveChurnAudit, indent: []const u8) !void {
+    try writer.print("{s}denominator:\n", .{indent});
+    try writer.print("{s}  candidate_sessions: {d}\n{s}  true_resolve_sessions: {d}\n{s}  exclusions: {d}\n", .{ indent, audit.denominator.candidate_sessions, indent, audit.denominator.true_resolve_sessions, indent, audit.denominator.exclusions });
+    try writer.print("{s}review_horizon:\n{s}  initial_broad: {d}\n{s}  targeted: {d}\n{s}  final_holdout: {d}\n", .{ indent, indent, audit.review_horizon.initial_broad, indent, audit.review_horizon.targeted, indent, audit.review_horizon.final_holdout });
+    try writer.print("{s}finding_liability:\n{s}  introduced_by_diff: {d}\n{s}  acceptance_required: {d}\n{s}  preexisting_blocker: {d}\n{s}  adjacent_preexisting: {d}\n{s}  reviewer_preference: {d}\n{s}  unknown: {d}\n", .{ indent, indent, audit.finding_liability.introduced_by_diff, indent, audit.finding_liability.acceptance_required, indent, audit.finding_liability.preexisting_blocker, indent, audit.finding_liability.adjacent_preexisting, indent, audit.finding_liability.reviewer_preference, indent, audit.finding_liability.unknown });
+    try writer.print("{s}normal_forms:\n{s}  proposed: {d}\n{s}  falsified: {d}\n{s}  repeated_after_falsification: {d}\n", .{ indent, indent, audit.normal_forms.proposed, indent, audit.normal_forms.falsified, indent, audit.normal_forms.repeated_after_falsification });
+    try writer.print("{s}fuse:\n{s}  required: {d}\n{s}  tripped: {d}\n{s}  mutations_after_trip: {d}\n{s}  production_net_after_trip: {d}\n", .{ indent, indent, audit.fuse.required, indent, audit.fuse.tripped, indent, audit.fuse.mutations_after_trip, indent, audit.fuse.production_net_after_trip });
+    try writer.print("{s}owner_pressure:\n{s}  by_owner: []\n", .{ indent, indent });
+    try writer.print("{s}mutation:\n{s}  apply_patch_calls: {d}\n{s}  commits: {d}\n{s}  production_insertions: {d}\n{s}  production_deletions: {d}\n{s}  production_net: {d}\n{s}  test_insertions: {d}\n{s}  test_deletions: {d}\n{s}  test_net: {d}\n", .{ indent, indent, audit.mutation.apply_patch_calls, indent, audit.mutation.commits, indent, audit.mutation.production_insertions, indent, audit.mutation.production_deletions, indent, audit.mutation.production_net, indent, audit.mutation.test_insertions, indent, audit.mutation.test_deletions, indent, audit.mutation.test_net });
+    try writer.print("{s}permits:\n{s}  required: {d}\n{s}  emitted: {d}\n{s}  missing: {d}\n", .{ indent, indent, audit.permits.required, indent, audit.permits.emitted, indent, audit.permits.missing });
+    try writer.print("{s}negative_ledger:\n{s}  maps_or_gates: {d}\n{s}  captures: {d}\n{s}  route_changes: {d}\n", .{ indent, indent, audit.negative_ledger.maps_or_gates, indent, audit.negative_ledger.captures, indent, audit.negative_ledger.route_changes });
+    try writer.print("{s}review:\n{s}  cas_reviews_by_head:", .{ indent, indent });
+    if (audit.review.cas_reviews_by_head.items.len == 0) {
+        try writer.writeAll(" []\n");
+    } else {
+        try writer.writeByte('\n');
+        for (audit.review.cas_reviews_by_head.items) |item| {
+            try writer.print("{s}    - head: {s}\n{s}      count: {d}\n", .{ indent, item.head, indent, item.count });
+        }
+    }
+    try writer.print("{s}  pr_sweeps: {d}\n", .{ indent, audit.review.pr_sweeps });
+    try writer.print("{s}compliance:\n{s}  mutations_without_permit: {d}\n{s}  normal_form_retries_after_falsification: {d}\n{s}  mutations_after_fuse_without_distillation: {d}\n", .{ indent, indent, audit.compliance.mutations_without_permit, indent, audit.compliance.normal_form_retries_after_falsification, indent, audit.compliance.mutations_after_fuse_without_distillation });
+}
+
+fn writeResolveChurnAuditJson(allocator: std.mem.Allocator, audit: ResolveChurnAudit, out_path: ?[]const u8) !void {
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+
+    try writer.writeAll("{\n  \"resolve_churn_audit\": {\n");
+    try writer.print("    \"denominator\": {{ \"candidate_sessions\": {d}, \"true_resolve_sessions\": {d}, \"exclusions\": {d} }},\n", .{ audit.denominator.candidate_sessions, audit.denominator.true_resolve_sessions, audit.denominator.exclusions });
+    try writer.print("    \"review_horizon\": {{ \"initial_broad\": {d}, \"targeted\": {d}, \"final_holdout\": {d} }},\n", .{ audit.review_horizon.initial_broad, audit.review_horizon.targeted, audit.review_horizon.final_holdout });
+    try writer.print("    \"finding_liability\": {{ \"introduced_by_diff\": {d}, \"acceptance_required\": {d}, \"preexisting_blocker\": {d}, \"adjacent_preexisting\": {d}, \"reviewer_preference\": {d}, \"unknown\": {d} }},\n", .{ audit.finding_liability.introduced_by_diff, audit.finding_liability.acceptance_required, audit.finding_liability.preexisting_blocker, audit.finding_liability.adjacent_preexisting, audit.finding_liability.reviewer_preference, audit.finding_liability.unknown });
+    try writer.print("    \"normal_forms\": {{ \"proposed\": {d}, \"falsified\": {d}, \"repeated_after_falsification\": {d} }},\n", .{ audit.normal_forms.proposed, audit.normal_forms.falsified, audit.normal_forms.repeated_after_falsification });
+    try writer.print("    \"fuse\": {{ \"required\": {d}, \"tripped\": {d}, \"mutations_after_trip\": {d}, \"production_net_after_trip\": {d} }},\n", .{ audit.fuse.required, audit.fuse.tripped, audit.fuse.mutations_after_trip, audit.fuse.production_net_after_trip });
+    try writer.writeAll("    \"owner_pressure\": { \"by_owner\": [] },\n");
+    try writer.print("    \"mutation\": {{ \"apply_patch_calls\": {d}, \"commits\": {d}, \"production_insertions\": {d}, \"production_deletions\": {d}, \"production_net\": {d}, \"test_insertions\": {d}, \"test_deletions\": {d}, \"test_net\": {d} }},\n", .{ audit.mutation.apply_patch_calls, audit.mutation.commits, audit.mutation.production_insertions, audit.mutation.production_deletions, audit.mutation.production_net, audit.mutation.test_insertions, audit.mutation.test_deletions, audit.mutation.test_net });
+    try writer.print("    \"permits\": {{ \"required\": {d}, \"emitted\": {d}, \"missing\": {d} }},\n", .{ audit.permits.required, audit.permits.emitted, audit.permits.missing });
+    try writer.print("    \"negative_ledger\": {{ \"maps_or_gates\": {d}, \"captures\": {d}, \"route_changes\": {d} }},\n", .{ audit.negative_ledger.maps_or_gates, audit.negative_ledger.captures, audit.negative_ledger.route_changes });
+    try writer.writeAll("    \"review\": { \"cas_reviews_by_head\": [");
+    for (audit.review.cas_reviews_by_head.items, 0..) |item, idx| {
+        if (idx > 0) try writer.writeAll(", ");
+        try writer.writeAll("{ \"head\": ");
+        try output.writeJsonString(writer, item.head);
+        try writer.print(", \"count\": {d} }}", .{item.count});
+    }
+    try writer.print("], \"pr_sweeps\": {d} }},\n", .{audit.review.pr_sweeps});
+    try writer.print("    \"compliance\": {{ \"mutations_without_permit\": {d}, \"normal_form_retries_after_falsification\": {d}, \"mutations_after_fuse_without_distillation\": {d} }}\n", .{ audit.compliance.mutations_without_permit, audit.compliance.normal_form_retries_after_falsification, audit.compliance.mutations_after_fuse_without_distillation });
+    try writer.writeAll("  }\n}\n");
+
+    const rendered = try writer_alloc.toOwnedSlice();
+    defer allocator.free(rendered);
+    if (out_path) |path| try ensureParentDir(path);
+    try writeTextOutput(rendered, out_path);
 }
 
 fn ensureParentDir(path: []const u8) !void {
@@ -17067,6 +17613,47 @@ test "skill-evidence gates cursor and json-only output" {
 
 test "skill-audit supports exclude-current option" {
     try validateCommandOptions(.skill_audit, .{ .exclude_current = true });
+}
+
+test "resolve-churn-audit separates raw mentions from true resolve sessions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/09");
+    const true_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-09T10:00:00Z\",\"payload\":{\"id\":\"resolve-true\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-09T10:00:01Z\",\"payload\":{\"type\":\"user_message\",\"turn_id\":\"t1\",\"message\":\"Use $resolve on this branch.\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-09T10:00:02Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"t1\",\"message\":\"Review Governor RGR-V3-MUTATION-PERMIT\\nreview_horizon: initial_broad targeted final_holdout\\nfinding_liability: introduced_by_current_diff\\nnormal_form_register: nf-1 status: proposed\\nfuse_state: tripped\\nledger gate capture_created: yes\\nreviewThreads sweep done\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-09T10:00:03Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"apply_patch\",\"call_id\":\"patch-1\",\"arguments\":\"{}\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-09T10:00:04Z\",\"payload\":{\"type\":\"patch_apply_end\",\"turn_id\":\"t1\",\"call_id\":\"patch-1\",\"success\":true,\"changes\":{\"files\":1}}}\n";
+    const mention_only_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-09T11:00:00Z\",\"payload\":{\"id\":\"resolve-mention\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-09T11:00:01Z\",\"payload\":{\"type\":\"user_message\",\"turn_id\":\"t2\",\"message\":\"I wrote $resolve in prose, but do not run the workflow.\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-09T11:00:02Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"t2\",\"message\":\"No workflow evidence here.\"}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/09/rollout-resolve-true.jsonl", .data = true_content });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/09/rollout-resolve-mention.jsonl", .data = mention_only_content });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "resolve-churn-audit.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const got = try runCommandWithOutput(std.testing.allocator, .resolve_churn_audit, &.{
+        "--root",   root_abs,
+        "--since",  "2026-05-09T00:00:00Z",
+        "--until",  "2026-05-10T00:00:00Z",
+        "--repo",   "/repo",
+        "--format", "json",
+    }, output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"candidate_sessions\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"true_resolve_sessions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"exclusions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"apply_patch_calls\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"required\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"emitted\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"missing\": 0") != null);
 }
 
 fn runCommandWithOutput(
