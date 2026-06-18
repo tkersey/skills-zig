@@ -4354,8 +4354,10 @@ const ReviewCompilerSessionSignals = struct {
     delivery_freeze_seen: bool = false,
     contract_seen: bool = false,
     recipe_seen: bool = false,
+    recipe_seen_at_ms: ?i64 = null,
     ablation_seen: bool = false,
     permit_seen: bool = false,
+    permit_seen_at_ms: ?i64 = null,
     lab_context_seen: bool = false,
     delivery_mutation_seen: bool = false,
     delivery_before_recipe_seen: bool = false,
@@ -4658,15 +4660,7 @@ fn summarizeReviewCompilerSession(
             signals.true_resolve = true;
         }
     }
-    if (signals.candidate and !signals.true_resolve) {
-        for (parsed.tools.items) |tool| {
-            if (!toolTimestampSatisfiesBounds(parsed, tool, opts)) continue;
-            if (toolHasCompletedResolveReviewEvidence(tool)) {
-                signals.true_resolve = true;
-                break;
-            }
-        }
-    }
+    _ = parsed;
     return signals;
 }
 
@@ -4688,17 +4682,11 @@ fn containsReviewCompilerCandidateCue(text: []const u8) bool {
 fn containsTrueReviewCompilerAssistantEvidence(text: []const u8) bool {
     return containsAnyIgnoreCaseAscii(text, &.{
         "Cleanroom Review Compiler",
-        "using $resolve",
-        "delivery_freeze",
         "DF-v1",
-        "counterexample_contract",
         "CEC-v1",
-        "delivery_patch_recipe",
         "DPR-v1",
-        "ablation_certificate",
         "ABL-CERT-v1",
         "RGR-V4-COMPILED-DELIVERY-PERMIT",
-        "compiled_delivery_permit",
     });
 }
 
@@ -4733,6 +4721,7 @@ fn recordReviewCompilerMessages(
         if (containsAnyIgnoreCaseAscii(text, &.{ "delivery_patch_recipe", "DPR-v1", "delivery patch recipe" })) {
             audit.cleanroom.delivery_recipes += 1;
             signals.recipe_seen = true;
+            recordReviewCompilerSignalTime(signals, .recipe, message.timestamp);
         }
         if (containsAnyIgnoreCaseAscii(text, &.{ "ablation_certificate", "ABL-CERT-v1", "ablation certificate" })) {
             audit.cleanroom.ablation_certificates += 1;
@@ -4741,6 +4730,7 @@ fn recordReviewCompilerMessages(
         if (containsAnyIgnoreCaseAscii(text, &.{ "RGR-V4-COMPILED-DELIVERY-PERMIT", "compiled_delivery_permit" })) {
             audit.cleanroom.compiled_delivery_permits += 1;
             signals.permit_seen = true;
+            recordReviewCompilerSignalTime(signals, .permit, message.timestamp);
         }
 
         if (containsAnyIgnoreCaseAscii(text, &.{ "review_lab", "review lab", "disposable lab", "lab worktree", "scratch worktree" })) {
@@ -4752,7 +4742,7 @@ fn recordReviewCompilerMessages(
             audit.liability.non_branch_liabilities += 1;
             signals.non_branch_liability_seen = true;
         }
-        if (containsAnyIgnoreCaseAscii(text, &.{ "followups_captured", "followup captured", "follow-up captured", "holdout_followups_captured" })) audit.liability.followups_captured += 1;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "liability_followups_captured", "liability followup captured", "liability follow-up captured" })) audit.liability.followups_captured += 1;
 
         if (containsAnyIgnoreCaseAscii(text, &.{ "falsified_routes_excluded", "falsified route excluded" })) audit.recipe.falsified_routes_excluded += 1;
         if (containsAnyIgnoreCaseAscii(text, &.{ "surfaces_to_retire", "surface to retire" })) audit.recipe.surfaces_to_retire += 1;
@@ -4763,10 +4753,24 @@ fn recordReviewCompilerMessages(
         if (containsAnyIgnoreCaseAscii(text, &.{ "tests_merged_or_retired", "tests merged", "tests retired" })) audit.ablation.tests_merged_or_retired += 1;
 
         if (containsAnyIgnoreCaseAscii(text, &.{ "initial_broad", "initial broad", "broad review" })) audit.review_horizon.initial_broad_reviews += 1;
-        if (containsAnyIgnoreCaseAscii(text, &.{ "targeted_reviews", "targeted review", "targeted:" })) audit.review_horizon.targeted_reviews += 1;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "targeted_reviews", "targeted review", "targeted:", " targeted " })) audit.review_horizon.targeted_reviews += 1;
         if (containsAnyIgnoreCaseAscii(text, &.{ "final_holdout", "final holdout", "holdout review" })) audit.review_horizon.final_holdout_reviews += 1;
         if (containsAnyIgnoreCaseAscii(text, &.{ "holdout_findings_added_to_scope", "holdout findings added" })) audit.review_horizon.holdout_findings_added_to_scope += 1;
         if (containsAnyIgnoreCaseAscii(text, &.{ "holdout_followups_captured", "holdout followups captured", "holdout follow-ups captured" })) audit.review_horizon.holdout_followups_captured += 1;
+    }
+}
+
+const ReviewCompilerSignalTimeKind = enum { recipe, permit };
+
+fn recordReviewCompilerSignalTime(signals: *ReviewCompilerSessionSignals, kind: ReviewCompilerSignalTimeKind, timestamp: ?[]const u8) void {
+    const ms = time_utils.parseIsoTimestampMillis(timestamp orelse return) orelse return;
+    switch (kind) {
+        .recipe => {
+            if (signals.recipe_seen_at_ms == null or ms < signals.recipe_seen_at_ms.?) signals.recipe_seen_at_ms = ms;
+        },
+        .permit => {
+            if (signals.permit_seen_at_ms == null or ms < signals.permit_seen_at_ms.?) signals.permit_seen_at_ms = ms;
+        },
     }
 }
 
@@ -4795,9 +4799,9 @@ fn recordReviewCompilerTools(
                 audit.lab_vs_delivery.delivery_apply_patch_calls += 1;
                 audit.lab_vs_delivery.delivery_surface_shipped += surface;
                 signals.delivery_mutation_seen = true;
-                if (!signals.recipe_seen) signals.delivery_before_recipe_seen = true;
-                if (!signals.permit_seen) audit.compliance.review_derived_delivery_patches += 1;
-                if (signals.non_branch_liability_seen) audit.liability.non_branch_liabilities_mutated += 1;
+                if (reviewCompilerToolBeforeSignal(parsed, tool, signals.recipe_seen_at_ms)) signals.delivery_before_recipe_seen = true;
+                if (reviewCompilerToolBeforeSignal(parsed, tool, signals.permit_seen_at_ms)) audit.compliance.review_derived_delivery_patches += 1;
+                if (reviewCompilerToolMutatesNonBranchLiability(tool)) audit.liability.non_branch_liabilities_mutated += 1;
             }
             continue;
         }
@@ -4810,13 +4814,24 @@ fn recordReviewCompilerTools(
                 } else {
                     audit.lab_vs_delivery.delivery_commits += 1;
                     signals.delivery_mutation_seen = true;
-                    if (!signals.recipe_seen) signals.delivery_before_recipe_seen = true;
-                    if (!signals.permit_seen) audit.compliance.review_derived_delivery_patches += 1;
-                    if (signals.non_branch_liability_seen) audit.liability.non_branch_liabilities_mutated += 1;
+                    if (reviewCompilerToolBeforeSignal(parsed, tool, signals.recipe_seen_at_ms)) signals.delivery_before_recipe_seen = true;
+                    if (reviewCompilerToolBeforeSignal(parsed, tool, signals.permit_seen_at_ms)) audit.compliance.review_derived_delivery_patches += 1;
+                    if (reviewCompilerToolMutatesNonBranchLiability(tool)) audit.liability.non_branch_liabilities_mutated += 1;
                 }
             }
         }
     }
+}
+
+fn reviewCompilerToolBeforeSignal(parsed: canonical_trace.CanonicalSessionTrace, tool: canonical_trace.ToolLifecycleRecord, signal_ms_opt: ?i64) bool {
+    const signal_ms = signal_ms_opt orelse return true;
+    const tool_ms = toolTimestampMillis(parsed, tool) orelse return false;
+    return tool_ms < signal_ms;
+}
+
+fn reviewCompilerToolMutatesNonBranchLiability(tool: canonical_trace.ToolLifecycleRecord) bool {
+    const text = tool.command_text orelse tool.input_text orelse tool.arguments_json orelse tool.patch_changes_json orelse "";
+    return containsAnyIgnoreCaseAscii(text, &.{ "non_branch_liability", "non_branch_liabilities", "non-branch liability" });
 }
 
 fn toolLooksReviewLab(tool: canonical_trace.ToolLifecycleRecord, signals: ReviewCompilerSessionSignals) bool {
@@ -18381,7 +18396,8 @@ test "review-compiler-audit requires cleanroom evidence and reports lab delivery
     const mention_only_content =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-10T11:00:00Z\",\"payload\":{\"id\":\"compiler-mention\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-10T11:00:01Z\",\"payload\":{\"type\":\"user_message\",\"turn_id\":\"t2\",\"message\":\"Raw $resolve mention only.\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-10T11:00:02Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"t2\",\"message\":\"No assistant-side cleanroom workflow evidence.\"}}\n";
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-10T11:00:02Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"t2\",\"message\":\"No assistant-side cleanroom workflow evidence; pasted fields: delivery_freeze counterexample_contract delivery_patch_recipe.\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-10T11:00:03Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"t2\",\"call_id\":\"review-only\",\"command\":\"codex review --base main\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"ok\"}}\n";
     const missing_recipe_content =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-10T12:00:00Z\",\"payload\":{\"id\":\"compiler-missing-recipe\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-10T12:00:01Z\",\"payload\":{\"type\":\"user_message\",\"turn_id\":\"t3\",\"message\":\"Run the review compiler.\"}}\n" ++
