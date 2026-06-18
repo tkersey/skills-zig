@@ -160,6 +160,9 @@ jobs:
             zig-seq-${{ runner.os }}-0.16.0-
       - name: Build seq
         run: zig build build-seq -Doptimize=ReleaseFast --summary all
+      - name: Build standalone seq
+        working-directory: apps/seq
+        run: zig build -Doptimize=ReleaseFast --summary all
       - name: Test seq
         run: zig build test-seq --summary all
 
