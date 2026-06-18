@@ -108,6 +108,10 @@ if ! "$BIN_PATH" workflow-audit --help | rg -q -- 'term-summary'; then
   echo "workflow-audit help missing term-summary mode" >&2
   exit 1
 fi
+if ! "$BIN_PATH" workflow-audit --help | rg -q -- 'cohort-report'; then
+  echo "workflow-audit help missing cohort-report mode" >&2
+  exit 1
+fi
 if ! "$BIN_PATH" workflow-audit --help | rg -q -- '--term-group <name=csv>'; then
   echo "workflow-audit help missing --term-group support" >&2
   exit 1

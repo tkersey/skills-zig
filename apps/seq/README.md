@@ -43,6 +43,7 @@ Binary output:
 ./zig-out/bin/seq query --root ~/.codex/sessions --spec '{"dataset":"tool_call_args","where":[{"field":"tool_name","op":"eq","value":"exec_command"},{"field":"arg_path","op":"eq","value":"workdir"}],"select":["path","arg_path","value_text"],"sort":["timestamp"],"limit":5,"format":"table"}'
 ./zig-out/bin/seq workflow-audit --workflow fixed-point-driver --since 2026-04-01T00:00:00Z --format table
 ./zig-out/bin/seq workflow-audit --workflow fixed-point-driver --mode report --format markdown
+./zig-out/bin/seq workflow-audit --workflow fixed-point-driver --mode cohort-report --last 7d --format markdown
 ./zig-out/bin/seq workflow-audit --workflow fixed-point-driver --mode term-summary --term-group additive=add,added,patch --term-group reductive=delete,remove,refactor --since 2026-05-02T00:00:00-07:00 --format table
 ./zig-out/bin/seq skill-blocks --skill fixed-point-driver --mode term-summary --term-group ablation=ablative,ablation --term-group isomorphism=isomorphic,isomorphism --since 2026-05-02T00:00:00-07:00 --format table
 ./zig-out/bin/seq workflow-overlap --workflow fixed-point-driver,review-adjudication --since 2026-05-02T00:00:00-07:00 --format table
@@ -108,14 +109,17 @@ seq query --root ~/.codex/sessions --spec '{"dataset":"messages","joins":[{"data
 `workflow-audit` is the high-level surface for workflow utilization reports:
 - selects sessions by exact `$workflow` / skill mention after stripping injected skill blocks
 - preserves signal source breakdown (`user_prompt`, `assistant_text`, `tool_trace`, `session_graph`)
-- emits `summary`, `signals`, `outcomes`, `sessions`, `report`, or `term-summary` modes
+- emits `summary`, `signals`, `outcomes`, `sessions`, `report`, `term-summary`, or `cohort-report` modes
 - `term-summary` accepts repeated `--term-group <name=csv>` flags, `--examples N`, and `--unique-by snippet|path-snippet` for native phrase-bucket rollups without shell `jq`
+- `cohort-report` emits a Markdown-by-default or JSON workflow cohort packet with one direct cohort path selection, summary/outcome/session/evidence sections, and a replaced raw-query map for common `seq query` rollups
 - supports `--since`, `--until`, `--workdir`, `--limit`, and `--format table|json|csv|jsonl|markdown`
 
 Examples:
 ```bash
 seq workflow-audit --root ~/.codex/sessions --workflow fixed-point-driver --mode summary --since 2026-04-01T00:00:00Z --format table
 seq workflow-audit --root ~/.codex/sessions --workflow fixed-point-driver --mode report --since 2026-04-01T00:00:00Z --format markdown
+seq workflow-audit --root ~/.codex/sessions --workflow fixed-point-driver --mode cohort-report --last 7d --format markdown
+seq workflow-audit --root ~/.codex/sessions --workflow fixed-point-driver --mode cohort-report --last 7d --format json
 seq workflow-audit --root ~/.codex/sessions --workflow fixed-point-driver --mode term-summary --term-group additive=add,added,patch --term-group reductive=delete,remove,refactor --format table
 seq workflow-overlap --root ~/.codex/sessions --workflow fixed-point-driver,review-adjudication --mode summary --since 2026-05-02T00:00:00-07:00 --format table
 seq workflow-overlap --root ~/.codex/sessions --workflow fixed-point-driver,review-adjudication --mode sessions --limit 20 --format jsonl
