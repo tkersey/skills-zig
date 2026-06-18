@@ -1,0 +1,48 @@
+$ zig fmt apps/seq/src/lib.zig apps/seq/src/commands/mod.zig apps/seq/src/tests.zig
+
+$ zig build test-seq --summary all
+test-seq
++- run test w
+error: token-cost --pricing api requires an exact known API model; pass --model <name>. Bundled supported models: gpt-5.5, gpt-5.4, gpt-5.4-mini
+error: unknown option --bogus
+error: option --path is not supported for skill_report
+error: option --audit is not supported for skill_report
+error: option --since-cursor is not supported for message_audit
+failed command: cd /Users/tk/workspace/tk/skills-zig/apps/seq && ./../../.zig-cache/o/fa7af66b2c94021017cc33498dbaba67/test --cache-dir=./../../.zig-cache --seed=0x9caf7ddc --listen=-
+
+Build Summary: 4/4 steps succeeded; 162/162 tests passed
+test-seq success
++- run test 162 pass (162 total) 3s MaxRSS:30M
+   +- compile test Debug native cached 115ms MaxRSS:36M
+      +- options cached
+
+
+$ zig build build-seq --summary all
+Build Summary: 6/6 steps succeeded
+build-seq cached
++- install seq cached
+|  +- compile exe seq Debug native cached 117ms MaxRSS:36M
+|     +- options cached
++- install seq-perf cached
+   +- compile exe seq-perf Debug native cached 106ms MaxRSS:35M
+      +- options (reused)
+
+
+$ cd apps/seq && zig build test --summary all
+test
++- run test w
+error: token-cost --pricing api requires an exact known API model; pass --model <name>. Bundled supported models: gpt-5.5, gpt-5.4, gpt-5.4-mini
+error: unknown option --bogus
+error: option --path is not supported for skill_report
+error: option --audit is not supported for skill_report
+error: option --since-cursor is not supported for message_audit
+failed command: ./.zig-cache/o/45797d372cc76152ec6767e43349286e/test --cache-dir=./.zig-cache --seed=0x58398ee7 --listen=-
+
+Build Summary: 4/4 steps succeeded; 162/162 tests passed
+test success
++- run test 162 pass (162 total) 3s MaxRSS:30M
+   +- compile test Debug native cached 115ms MaxRSS:36M
+      +- options cached
+
+
+$ git diff --check
