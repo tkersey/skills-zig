@@ -162,7 +162,7 @@ jobs:
         run: zig build build-seq -Doptimize=ReleaseFast --summary all
       - name: Build standalone seq
         working-directory: apps/seq
-        run: zig build -Doptimize=ReleaseFast --summary all
+        run: zig build -Doptimize=Debug --cache-dir ../../.zig-cache --global-cache-dir ../../.zig-cache-global --summary all
       - name: Test seq
         run: zig build test-seq --summary all
 
