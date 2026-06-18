@@ -1,0 +1,10 @@
+Build Summary: 6/6 steps succeeded
+build-seq cached
++- install seq cached
+|  +- compile exe seq ReleaseFast native cached 116ms MaxRSS:36M
+|     +- options cached
++- install seq-perf cached
+   +- compile exe seq-perf ReleaseFast native cached 112ms MaxRSS:35M
+      +- options (reused)
+
+command-surface gate passed for ./zig-out/bin/seq

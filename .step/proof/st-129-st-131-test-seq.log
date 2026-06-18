@@ -1,0 +1,14 @@
+test-seq
++- run test w
+error: token-cost --pricing api requires an exact known API model; pass --model <name>. Bundled supported models: gpt-5.5, gpt-5.4, gpt-5.4-mini
+error: unknown option --bogus
+error: option --path is not supported for skill_report
+error: option --audit is not supported for skill_report
+error: option --since-cursor is not supported for message_audit
+failed command: cd /Users/tk/workspace/tk/skills-zig/apps/seq && ./../../.zig-cache/o/ccda176c0b0ce75126bdcb5576896988/test --cache-dir=./../../.zig-cache --seed=0x8372e434 --listen=-
+
+Build Summary: 4/4 steps succeeded; 164/164 tests passed
+test-seq success
++- run test 164 pass (164 total) 3s MaxRSS:32M
+   +- compile test Debug native cached 115ms MaxRSS:36M
+      +- options cached

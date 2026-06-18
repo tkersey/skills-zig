@@ -826,7 +826,7 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\usage: seq goal-audit [--mode summary|rows] [--workflow review|resolve|review,resolve] [--duration-gte <seconds|minutes|hours>] [--status <name>] [--contains <text>] [--since <iso>] [--until <iso>] [--path <jsonl>|--session-id <id>] [--exclude-current] [--show-query] [--limit N] [--format table|json|csv|jsonl]
         ,
         .workflow_audit =>
-        \\usage: seq workflow-audit --workflow <name> [--mode summary|signals|outcomes|sessions|report|term-summary] [--term-group <name=csv>] [--examples N] [--unique-by snippet|path-snippet] [--last <Nm|Nh|Nd>|--since <iso>] [--until <iso>] [--exclude-current] [--workdir <path>] [--limit N] [--format table|json|csv|jsonl|markdown]
+        \\usage: seq workflow-audit --workflow <name> [--mode summary|signals|outcomes|sessions|report|term-summary|cohort-report] [--term-group <name=csv>] [--examples N] [--unique-by snippet|path-snippet] [--last <Nm|Nh|Nd>|--since <iso>] [--until <iso>] [--exclude-current] [--workdir <path>] [--limit N] [--format table|json|csv|jsonl|markdown]
         ,
         .workflow_overlap =>
         \\usage: seq workflow-overlap --workflow <a,b> [--mode summary|sessions] [--since <iso>] [--until <iso>] [--workdir <path>] [--limit N] [--format table|json|csv|jsonl]
@@ -953,6 +953,9 @@ fn validateFormatForCommand(cmd: lib.Command, opts: Options) !void {
             if (fmt == .csv or fmt == .markdown) return error.InvalidFormatForCommand;
         },
         .workflow_audit => {
+            if (opts.mode) |mode| {
+                if (std.mem.eql(u8, mode, "cohort-report") and fmt != .markdown and fmt != .json) return error.InvalidFormatForCommand;
+            }
             if (fmt == .dot) return error.InvalidFormatForCommand;
         },
         .adjudication_audit => {
@@ -1457,6 +1460,7 @@ fn commandSupportsSessionId(cmd: lib.Command) bool {
         .session_detail,
         .tool_lifecycle,
         .session_graph,
+        .query_diagnose,
         .tail,
         => true,
         else => false,
@@ -1586,6 +1590,7 @@ fn isValidWorkflowAuditMode(text: []const u8) bool {
         std.mem.eql(u8, text, "outcomes") or
         std.mem.eql(u8, text, "sessions") or
         std.mem.eql(u8, text, "report") or
+        std.mem.eql(u8, text, "cohort-report") or
         std.mem.eql(u8, text, "term-summary");
 }
 
@@ -2794,7 +2799,7 @@ fn cmdWorkflowAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opt
     const mode = opts.mode orelse "summary";
     const fmt = if (opts.format_set)
         opts.format
-    else if (std.mem.eql(u8, mode, "report"))
+    else if (std.mem.eql(u8, mode, "report") or std.mem.eql(u8, mode, "cohort-report"))
         output.Format.markdown
     else
         output.Format.table;
@@ -2806,6 +2811,11 @@ fn cmdWorkflowAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opt
 
     var rows = try collectWorkflowAuditRows(allocator, sessions_root, opts);
     defer deinitQueryRows(allocator, &rows);
+
+    if (std.mem.eql(u8, mode, "cohort-report")) {
+        try writeWorkflowCohortReport(allocator, workflow, rows.items, fmt, opts.limit, opts.out_path);
+        return;
+    }
 
     if (fmt == .markdown and std.mem.eql(u8, mode, "report")) {
         try writeWorkflowAuditMarkdown(allocator, workflow, rows.items, opts.out_path);
@@ -2892,6 +2902,7 @@ fn workflowAuditColumnsForMode(mode: []const u8) ?[]const []const u8 {
     if (std.mem.eql(u8, mode, "outcomes")) return workflow_audit_outcome_columns[0..];
     if (std.mem.eql(u8, mode, "sessions")) return workflow_audit_session_columns[0..];
     if (std.mem.eql(u8, mode, "report")) return workflow_audit_signal_columns[0..];
+    if (std.mem.eql(u8, mode, "cohort-report")) return workflow_audit_signal_columns[0..];
     if (std.mem.eql(u8, mode, "term-summary")) return workflow_audit_term_summary_columns[0..];
     return null;
 }
@@ -3596,6 +3607,175 @@ fn writeWorkflowAuditMarkdown(
     const rendered = try writer_alloc.toOwnedSlice();
     defer allocator.free(rendered);
     try writeTextOutput(rendered, out_path);
+}
+
+const WorkflowCohortReport = struct {
+    workflow: []const u8,
+    rows: []const query.Row,
+    cohort_paths: StringSet,
+    direct_signals: usize = 0,
+
+    fn init(allocator: std.mem.Allocator, workflow: []const u8, rows: []const query.Row) !WorkflowCohortReport {
+        var report = WorkflowCohortReport{
+            .workflow = workflow,
+            .rows = rows,
+            .cohort_paths = StringSet.init(allocator),
+        };
+        errdefer report.deinit();
+
+        for (rows) |row| {
+            if (!isWorkflowCohortSignal(row, workflow)) continue;
+            const path = scalarString(row.valueOrNull("path")) orelse continue;
+            try report.cohort_paths.put(path);
+            report.direct_signals += 1;
+        }
+
+        return report;
+    }
+
+    fn deinit(self: *WorkflowCohortReport) void {
+        self.cohort_paths.deinit();
+    }
+};
+
+fn writeWorkflowCohortReport(
+    allocator: std.mem.Allocator,
+    workflow: []const u8,
+    rows: []const query.Row,
+    fmt: output.Format,
+    limit: usize,
+    out_path: ?[]const u8,
+) !void {
+    var report = try WorkflowCohortReport.init(allocator, workflow, rows);
+    defer report.deinit();
+
+    switch (fmt) {
+        .markdown => try writeWorkflowCohortReportMarkdown(allocator, report, limit, out_path),
+        .json => try writeWorkflowCohortReportJson(allocator, report, limit, out_path),
+        else => return error.InvalidFormatForCommand,
+    }
+}
+
+fn writeWorkflowCohortReportMarkdown(
+    allocator: std.mem.Allocator,
+    report: WorkflowCohortReport,
+    limit: usize,
+    out_path: ?[]const u8,
+) !void {
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+
+    try writer.print("# seq workflow-audit cohort-report: {s}\n\n", .{report.workflow});
+    try writer.print("- cohort_sessions: {d}\n", .{report.cohort_paths.count()});
+    try writer.print("- cohort_signals: {d}\n", .{report.rows.len});
+    try writer.print("- direct_cohort_signals: {d}\n", .{report.direct_signals});
+    try writer.writeAll("- cohort_authority: direct workflow_mention or skill_mention rows selected before derived rows\n\n");
+
+    try writer.writeAll("## Signal Summary\n\n");
+    try writeWorkflowAuditMarkdownSection(allocator, writer, report.rows, "summary");
+
+    try writer.writeAll("\n## Outcomes\n\n");
+    try writeWorkflowAuditMarkdownSection(allocator, writer, report.rows, "outcomes");
+
+    try writer.writeAll("\n## Sessions\n\n");
+    try writeWorkflowAuditMarkdownSection(allocator, writer, report.rows, "sessions");
+
+    try writer.writeAll("\n## Evidence\n\n");
+    const evidence_query = try workflowAuditQueryForMode("signals", if (limit > 0) limit else 25);
+    var evidence = try query.execute(allocator, report.rows, evidence_query);
+    defer evidence.deinit(allocator);
+    try writeMarkdownTable(writer, evidence.rows.items, workflow_audit_signal_columns[0..]);
+
+    try writer.writeAll("\n## Replaced Raw Queries\n\n");
+    try writeWorkflowCohortReplacementTable(writer);
+
+    const rendered = try writer_alloc.toOwnedSlice();
+    defer allocator.free(rendered);
+    try writeTextOutput(rendered, out_path);
+}
+
+fn writeWorkflowCohortReportJson(
+    allocator: std.mem.Allocator,
+    report: WorkflowCohortReport,
+    limit: usize,
+    out_path: ?[]const u8,
+) !void {
+    const summary_query = try workflowAuditQueryForMode("summary", 50);
+    var summary = try query.execute(allocator, report.rows, summary_query);
+    defer summary.deinit(allocator);
+
+    const outcomes_query = try workflowAuditQueryForMode("outcomes", 20);
+    var outcomes = try query.execute(allocator, report.rows, outcomes_query);
+    defer outcomes.deinit(allocator);
+
+    const sessions_query = try workflowAuditQueryForMode("sessions", if (limit > 0) limit else 50);
+    var sessions = try query.execute(allocator, report.rows, sessions_query);
+    defer sessions.deinit(allocator);
+
+    const evidence_query = try workflowAuditQueryForMode("signals", if (limit > 0) limit else 25);
+    var evidence = try query.execute(allocator, report.rows, evidence_query);
+    defer evidence.deinit(allocator);
+
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+
+    try writer.writeAll("{\n  \"command\": \"workflow-audit\",\n  \"mode\": \"cohort-report\",\n  \"workflow\": ");
+    try output.writeJsonString(writer, report.workflow);
+    try writer.writeAll(",\n  \"cohort_selection\": {\n    \"authority\": \"direct workflow_mention or skill_mention rows selected before derived rows\",\n    \"paths\": ");
+    try writeStringSetJsonArray(writer, report.cohort_paths);
+    try writer.writeAll("\n  },\n  \"counts\": {\"cohort_sessions\": ");
+    try writer.print("{d}", .{report.cohort_paths.count()});
+    try writer.writeAll(", \"cohort_signals\": ");
+    try writer.print("{d}", .{report.rows.len});
+    try writer.writeAll(", \"direct_cohort_signals\": ");
+    try writer.print("{d}", .{report.direct_signals});
+    try writer.writeAll("},\n  \"performance_model\": {\"cohort_selection_passes\": 1, \"derived_rows_filtered_by_selected_paths\": true},\n  \"replaced_raw_queries\": ");
+    try writeWorkflowCohortReplacementJson(writer);
+    try writer.writeAll(",\n  \"summary\": ");
+    try writeRowsJsonArray(writer, summary.rows.items, workflow_audit_summary_columns[0..], "    ");
+    try writer.writeAll(",\n  \"outcomes\": ");
+    try writeRowsJsonArray(writer, outcomes.rows.items, workflow_audit_outcome_columns[0..], "    ");
+    try writer.writeAll(",\n  \"sessions\": ");
+    try writeRowsJsonArray(writer, sessions.rows.items, workflow_audit_session_columns[0..], "    ");
+    try writer.writeAll(",\n  \"evidence\": ");
+    try writeRowsJsonArray(writer, evidence.rows.items, workflow_audit_signal_columns[0..], "    ");
+    try writer.writeAll("\n}\n");
+
+    const rendered = try writer_alloc.toOwnedSlice();
+    defer allocator.free(rendered);
+    try writeTextOutput(rendered, out_path);
+}
+
+fn writeStringSetJsonArray(writer: anytype, set: StringSet) !void {
+    try writer.writeAll("[");
+    var it = set.map.keyIterator();
+    var first = true;
+    while (it.next()) |path| {
+        if (!first) try writer.writeAll(", ");
+        first = false;
+        try output.writeJsonString(writer, path.*);
+    }
+    try writer.writeAll("]");
+}
+
+fn writeWorkflowCohortReplacementTable(writer: anytype) !void {
+    try writer.writeAll("| legacy raw query family | cohort-report section |\n");
+    try writer.writeAll("| --- | --- |\n");
+    try writer.writeAll("| `workflow_signals` filtered by name/path | Signal Summary, Evidence |\n");
+    try writer.writeAll("| `workflow_signals` grouped by path | Sessions |\n");
+    try writer.writeAll("| outcome rows grouped by `outcome_kind` | Outcomes |\n");
+    try writer.writeAll("| manual `seq query` plus follow-up table shaping | `--mode cohort-report --format markdown|json` |\n");
+}
+
+fn writeWorkflowCohortReplacementJson(writer: anytype) !void {
+    try writer.writeAll("[\n");
+    try writer.writeAll("    {\"legacy_query_family\": \"workflow_signals filtered by name/path\", \"cohort_report_section\": \"Signal Summary, Evidence\"},\n");
+    try writer.writeAll("    {\"legacy_query_family\": \"workflow_signals grouped by path\", \"cohort_report_section\": \"Sessions\"},\n");
+    try writer.writeAll("    {\"legacy_query_family\": \"outcome rows grouped by outcome_kind\", \"cohort_report_section\": \"Outcomes\"},\n");
+    try writer.writeAll("    {\"legacy_query_family\": \"manual seq query plus follow-up table shaping\", \"cohort_report_section\": \"--mode cohort-report --format markdown|json\"}\n");
+    try writer.writeAll("  ]");
 }
 
 fn writeWorkflowAuditMarkdownSection(
@@ -18654,6 +18834,28 @@ test "workflow-audit reports a workflow cohort without cross-session contaminati
     }
 
     {
+        const got = try runCommandWithOutput(std.testing.allocator, .workflow_audit, &.{ "--root", root_abs, "--workflow", "fixed-point-driver", "--mode", "cohort-report" }, output_path);
+        defer std.testing.allocator.free(got);
+        try std.testing.expect(std.mem.indexOf(u8, got, "# seq workflow-audit cohort-report: fixed-point-driver") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "cohort_sessions: 1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "## Replaced Raw Queries") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "workflow-other") == null);
+    }
+
+    {
+        const got = try runCommandWithOutput(std.testing.allocator, .workflow_audit, &.{ "--root", root_abs, "--workflow", "fixed-point-driver", "--mode", "cohort-report", "--format", "json" }, output_path);
+        defer std.testing.allocator.free(got);
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"mode\": \"cohort-report\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"cohort_sessions\": 1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"cohort_selection_passes\": 1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"replaced_raw_queries\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "workflow-target") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "workflow-other") == null);
+    }
+
+    try std.testing.expectError(error.InvalidFormatForCommand, run(std.testing.allocator, .workflow_audit, &.{ "--root", root_abs, "--workflow", "fixed-point-driver", "--mode", "cohort-report", "--format", "csv" }));
+
+    {
         const got = try runCommandWithOutput(std.testing.allocator, .workflow_audit, &.{ "--root", root_abs, "--workflow", "fixed-point-driver", "--mode", "report", "--format", "json", "--limit", "1" }, output_path);
         defer std.testing.allocator.free(got);
         const first_timestamp = std.mem.indexOf(u8, got, "\"timestamp\"") orelse return error.TestUnexpectedResult;
@@ -19349,9 +19551,16 @@ test "query-diagnose flags strict hangs and supports fail-on-hang" {
     const session_content =
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:00:00Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"q1\",\"arguments\":\"{\\\"cmd\\\":\\\"seq query --spec @spec.json\\\"}\"}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T10:00:12Z\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"q1\",\"output\":\"Chunk ID: aa\\nWall time: 12.250 seconds\\nProcess running with session ID 77\\nOutput:\\n\"}}\n";
+    const other_session_content =
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T11:00:00Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"q2\",\"arguments\":\"{\\\"cmd\\\":\\\"seq query --spec @other.json\\\"}\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-05T11:00:01Z\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"q2\",\"output\":\"Chunk ID: bb\\nWall time: 1.000 seconds\\nProcess exited with code 0\\nOutput:\\n\"}}\n";
     try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
         .sub_path = "2026/03/05/rollout-2026-03-05T00-00-00-019c0000-0000-7000-8000-000000000002.jsonl",
         .data = session_content,
+    });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "2026/03/05/rollout-2026-03-05T00-00-00-019c0000-0000-7000-8000-000000000003.jsonl",
+        .data = other_session_content,
     });
 
     const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
@@ -19375,6 +19584,21 @@ test "query-diagnose flags strict hangs and supports fail-on-hang" {
     try std.testing.expect(std.mem.indexOf(u8, got, "\"hang_flag\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolution_state\": \"running_unresolved\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"next_action\": \"seq session-tooling --path ") != null);
+
+    const session_args = [_][]const u8{
+        "--root",
+        root_abs,
+        "--session-id",
+        "019c0000-0000-7000-8000-000000000002",
+        "--threshold-ms",
+        "10000",
+        "--format",
+        "json",
+    };
+    const session_got = try runCommandWithOutput(std.testing.allocator, .query_diagnose, session_args[0..], output_path);
+    defer std.testing.allocator.free(session_got);
+    try std.testing.expect(std.mem.indexOf(u8, session_got, "\"query_call_id\": \"q1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session_got, "\"query_call_id\": \"q2\"") == null);
 
     const fail_args = [_][]const u8{
         "--root",

@@ -1,0 +1,171 @@
+## zig build test
+test
++- run test w
+error: unsupported FREQ: MONTHLY (allowed: HOURLY, DAILY, WEEKLY)
+error: invalid label: ../bad (allowed: [A-Za-z0-9._-])
+error: invalid label: bad label (allowed: [A-Za-z0-9._-])
+error: invalid label: ../bad (allowed: [A-Za-z0-9._-])
+error: invalid label: bad label (allowed: [A-Za-z0-9._-])
+error: no automation with id cron-001
+failed command: ./.zig-cache/o/d9a4bd3127178d15eb9c266c487388fc/test --cache-dir=./.zig-cache --seed=0x6cd88e1d --listen=-
+
+test
++- run test w
+error: token-cost --pricing api requires an exact known API model; pass --model <name>. Bundled supported models: gpt-5.5, gpt-5.4, gpt-5.4-mini
+error: unknown option --bogus
+error: option --path is not supported for skill_report
+error: option --audit is not supported for skill_report
+error: option --since-cursor is not supported for message_audit
+failed command: cd /Users/tk/workspace/tk/skills-zig/apps/seq && ./../../.zig-cache/o/f65a84cbf886f0726679e83ca08803de/test --cache-dir=./../../.zig-cache --seed=0x6cd88e1d --listen=-
+
+Build Summary: 54/54 steps succeeded; 443/443 tests passed
+test success
++- run test 164 pass (164 total) 3s MaxRSS:32M
+|  +- compile test Debug native success 7s MaxRSS:994M
+|     +- options cached
++- test-lift success
+|  +- run test 12 pass (12 total) 100ms MaxRSS:28M
+|  |  +- compile test Debug native cached 265ms MaxRSS:35M
+|  |     +- options cached
+|  +- run test 1 pass (1 total) 26ms MaxRSS:2M
+|  |  +- compile test Debug native cached 238ms MaxRSS:35M
+|  |     +- options (reused)
+|  +- run test 16 pass (16 total) 119ms MaxRSS:28M
+|     +- compile test Debug native cached 237ms MaxRSS:35M
+|        +- options (reused)
++- test-cas success
+|  +- run test 3 pass (3 total) 25ms MaxRSS:3M
+|  |  +- compile test Debug native cached 276ms MaxRSS:35M
+|  |     +- options cached
+|  +- run test 16 pass (16 total) 27ms MaxRSS:3M
+|  |  +- compile test Debug native cached 150ms MaxRSS:35M
+|  |     +- options (reused)
+|  +- run test 15 pass (15 total) 50ms MaxRSS:3M
+|  |  +- compile test Debug native cached 259ms MaxRSS:35M
+|  |     +- options (reused)
+|  +- run test 42 pass (42 total) 66ms MaxRSS:4M
+|  |  +- compile test Debug native cached 293ms MaxRSS:35M
+|  |     +- options (reused)
+|  +- run test 8 pass (8 total) 38ms MaxRSS:3M
+|  |  +- compile test Debug native cached 241ms MaxRSS:35M
+|  |     +- options (reused)
+|  +- run test 17 pass (17 total) 59ms MaxRSS:3M
+|  |  +- compile test Debug native cached 234ms MaxRSS:35M
+|  |     +- options (reused)
+|  +- run test 20 pass (20 total) 51ms MaxRSS:3M
+|  |  +- compile test Debug native cached 248ms MaxRSS:35M
+|  |     +- options (reused)
+|  +- run test 6 pass (6 total) 24ms MaxRSS:3M
+|     +- compile test Debug native cached 269ms MaxRSS:35M
++- run test 16 pass (16 total) 117ms MaxRSS:6M
+|  +- compile test Debug native cached 127ms MaxRSS:36M
+|     +- options cached
++- run test 22 pass (22 total) 68ms MaxRSS:3M
+|  +- compile test Debug native cached 252ms MaxRSS:36M
+|     +- options cached
++- run test 6 pass (6 total) 42ms MaxRSS:3M
+|  +- compile test Debug native cached 253ms MaxRSS:36M
+|     +- options (reused)
++- run test 16 pass (16 total) 298ms MaxRSS:4M
+|  +- compile test Debug native cached 298ms MaxRSS:35M
+|     +- options cached
++- run test 10 pass (10 total) 66ms MaxRSS:3M
+|  +- compile test Debug native cached 257ms MaxRSS:36M
+|     +- options cached
++- run test 37 pass (37 total) 384ms MaxRSS:5M
+|  +- compile test Debug native cached 308ms MaxRSS:35M
+|     +- options cached
++- run test 4 pass (4 total) 36ms MaxRSS:3M
+|  +- compile test Debug native cached 267ms MaxRSS:35M
+|     +- options cached
++- run test 7 pass (7 total) 45ms MaxRSS:3M
+|  +- compile test Debug native success 2s MaxRSS:316M
+|     +- options (reused)
+|     +- options (reused)
+|     +- options (reused)
++- run test 5 pass (5 total) 41ms MaxRSS:3M
+   +- compile test Debug native cached 248ms MaxRSS:35M
+
+## zig build -Doptimize=ReleaseFast
+Build Summary: 55/55 steps succeeded
+install success
++- install seq cached
+|  +- compile exe seq ReleaseFast native cached 230ms MaxRSS:36M
+|     +- options cached
++- install seq-perf cached
+|  +- compile exe seq-perf ReleaseFast native cached 224ms MaxRSS:35M
+|     +- options (reused)
++- install bench_stats cached
+|  +- compile exe bench_stats ReleaseFast native cached 218ms MaxRSS:35M
+|     +- options cached
++- install perf_report cached
+|  +- compile exe perf_report ReleaseFast native cached 125ms MaxRSS:35M
+|     +- options (reused)
++- install lift-perf-bench-stats cached
+|  +- compile exe lift-perf-bench-stats ReleaseFast native cached 211ms MaxRSS:36M
+|     +- options (reused)
++- install cas_smoke_check cached
+|  +- compile exe cas_smoke_check ReleaseFast native cached 140ms MaxRSS:35M
+|     +- options cached
++- install cas_instance_runner cached
+|  +- compile exe cas_instance_runner ReleaseFast native cached 137ms MaxRSS:35M
+|     +- options (reused)
++- install cas_review_session cached
+|  +- compile exe cas_review_session ReleaseFast native cached 226ms MaxRSS:36M
+|     +- options (reused)
++- install cas_conformance_suite cached
+|  +- compile exe cas_conformance_suite ReleaseFast native cached 217ms MaxRSS:35M
+|     +- options (reused)
++- install cas_goal cached
+|  +- compile exe cas_goal ReleaseFast native cached 139ms MaxRSS:35M
+|     +- options (reused)
++- install cas_account success
+|  +- compile exe cas_account ReleaseFast native success 7s MaxRSS:403M
+|     +- options (reused)
++- install cas-perf-budget-governor cached
+|  +- compile exe cas-perf-budget-governor ReleaseFast native cached 137ms MaxRSS:35M
+|     +- options (reused)
++- install cas cached
+|  +- compile exe cas ReleaseFast native cached 199ms MaxRSS:35M
+|     +- options (reused)
++- install cron cached
+|  +- compile exe cron ReleaseFast native cached 146ms MaxRSS:36M
+|     +- options cached
++- install puff cached
+|  +- compile exe puff ReleaseFast native cached 211ms MaxRSS:35M
+|     +- options cached
++- install learnings cached
+|  +- compile exe learnings ReleaseFast native cached 187ms MaxRSS:36M
+|     +- options cached
++- install append_learning cached
+|  +- compile exe append_learning ReleaseFast native cached 120ms MaxRSS:35M
+|     +- options (reused)
++- install ledger cached
+|  +- compile exe ledger ReleaseFast native cached 139ms MaxRSS:35M
+|     +- options cached
++- install mesh success
+|  +- compile exe mesh ReleaseFast native cached 216ms MaxRSS:35M
+|     +- options cached
++- install st success
+|  +- compile exe st ReleaseFast native success 14s MaxRSS:653M
+|     +- options cached
++- install parse-arch cached
+|  +- compile exe parse-arch ReleaseFast native cached 207ms MaxRSS:35M
+|     +- options cached
++- install perf_hub success
+   +- compile exe perf_hub ReleaseFast native success 53s MaxRSS:2G
+      +- options (reused)
+      +- options (reused)
+      +- options (reused)
+
+## command surface gate
+command-surface gate passed for ./zig-out/bin/seq
+## cohort-report markdown smoke
+real 64.87
+user 51.87
+sys 4.00
+## cohort-report json smoke
+real 62.75
+user 50.96
+sys 3.74
+## git diff check
