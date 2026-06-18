@@ -1009,8 +1009,14 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_role = cmd == .opencode_events;
     const supports_tool = cmd == .opencode_events or cmd == .artifact_search or cmd == .tool_audit or cmd == .tool_search;
     const supports_executable = cmd == .tool_audit or cmd == .tool_search;
-    const supports_workdir = cmd == .artifact_search or cmd == .tool_audit or cmd == .tool_search or cmd == .workdir_report or cmd == .workflow_audit or cmd == .workflow_overlap;
-    const supports_repo = cmd == .plan_search or cmd == .sessions or cmd == .resolve_churn_audit;
+    const supports_workdir = switch (cmd) {
+        .artifact_search, .tool_audit, .tool_search, .workdir_report, .workflow_audit, .workflow_overlap => true,
+        else => false,
+    };
+    const supports_repo = switch (cmd) {
+        .plan_search, .sessions, .resolve_churn_audit => true,
+        else => false,
+    };
     const supports_status = cmd == .opencode_events or cmd == .turns or cmd == .goal_audit;
     const supports_mode = switch (cmd) {
         .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .skill_success_rank, .skill_blocks, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit, .workflow_overlap, .adjudication_audit, .goal_audit => true,
