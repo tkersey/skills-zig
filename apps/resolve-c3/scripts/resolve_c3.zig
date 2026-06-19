@@ -1328,7 +1328,10 @@ fn loadStateParsed(allocator: std.mem.Allocator, root: std.Io.Dir, state_root: [
     defer allocator.free(state_path);
     const bytes = try root.readFileAlloc(Io, state_path, allocator, .limited(MaxFileBytes));
     defer allocator.free(bytes);
-    return std.json.parseFromSlice(State, allocator, bytes, .{ .ignore_unknown_fields = true });
+    return std.json.parseFromSlice(State, allocator, bytes, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
 }
 
 fn statePath(allocator: std.mem.Allocator, state_root: []const u8, child: []const u8) ![]u8 {
@@ -2057,6 +2060,67 @@ test "state lifecycle gates require controller ablation and proof" {
     };
     try std.testing.expect(selectedCandidate(state) != null);
     try std.testing.expect(!optionalEql(state.ablation_authority, "controller"));
+}
+
+test "loaded state strings survive after input buffer is freed and state is rewritten" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try tmp.dir.realPathFileAlloc(Io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    try makePathUnder(std.testing.allocator, cwd, DefaultStateRoot);
+
+    var root = try openRoot(cwd);
+    defer root.close(Io);
+    try saveState(std.testing.allocator, root, DefaultStateRoot, State{
+        .schema = "resolve-c3-state-v1",
+        .state_root = DefaultStateRoot,
+        .legacy_root = LegacyStateRoot,
+        .state_version = 1,
+        .run_id = "C3-owned",
+        .repo_root = "/repo",
+        .branch = "resolve/pr",
+        .base_sha = "abcdef123456",
+        .phase = "collecting",
+        .acceptance_goal = "own state strings",
+        .parent_run_id = null,
+        .counterexample_count = 0,
+        .basis_set = false,
+        .tournament_waiver = null,
+        .candidates = &.{},
+        .selected_candidate_id = null,
+        .ablation_authority = null,
+        .ablation_orphan_edit_atoms = 0,
+        .candidate_holdout_safe = false,
+        .delivery_holdout_safe = false,
+        .proof_authority = null,
+        .proof_passed = false,
+        .proof_patch_stable = false,
+        .delivery_patch_sha = null,
+        .commit_sha = null,
+        .pushed = false,
+        .certificate_stage = null,
+    });
+
+    {
+        var parsed = try loadStateParsed(std.testing.allocator, root, DefaultStateRoot);
+        defer parsed.deinit();
+        var state = parsed.value;
+        state.counterexample_count += 1;
+        try saveState(std.testing.allocator, root, DefaultStateRoot, state);
+    }
+
+    var reparsed = try loadStateParsed(std.testing.allocator, root, DefaultStateRoot);
+    defer reparsed.deinit();
+    try std.testing.expectEqualStrings("resolve-c3-state-v1", reparsed.value.schema);
+    try std.testing.expectEqualStrings(DefaultStateRoot, reparsed.value.state_root);
+    try std.testing.expectEqualStrings(LegacyStateRoot, reparsed.value.legacy_root);
+    try std.testing.expectEqualStrings("C3-owned", reparsed.value.run_id);
+    try std.testing.expectEqualStrings("/repo", reparsed.value.repo_root);
+    try std.testing.expectEqualStrings("resolve/pr", reparsed.value.branch);
+    try std.testing.expectEqualStrings("abcdef123456", reparsed.value.base_sha);
+    try std.testing.expectEqualStrings("collecting", reparsed.value.phase);
+    try std.testing.expectEqualStrings("own state strings", reparsed.value.acceptance_goal);
+    try std.testing.expectEqual(@as(u32, 1), reparsed.value.counterexample_count);
 }
 
 test "MRPC gate enforces stage gates and orphan edit atoms" {
