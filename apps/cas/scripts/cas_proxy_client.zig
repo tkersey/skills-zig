@@ -8,6 +8,47 @@ pub const TransportKind = enum {
     websocket,
 };
 
+pub const MultiAgentMode = enum {
+    explicit_request_only,
+    proactive,
+
+    pub fn parse(raw: []const u8) ?MultiAgentMode {
+        if (std.mem.eql(u8, raw, "explicit-request-only")) return .explicit_request_only;
+        if (std.mem.eql(u8, raw, "proactive")) return .proactive;
+        return null;
+    }
+
+    pub fn configValue(self: MultiAgentMode) []const u8 {
+        return switch (self) {
+            .explicit_request_only => "explicit-request-only",
+            .proactive => "proactive",
+        };
+    }
+
+    pub fn wireValue(self: MultiAgentMode) []const u8 {
+        return switch (self) {
+            .explicit_request_only => "explicitRequestOnly",
+            .proactive => "proactive",
+        };
+    }
+};
+
+pub const MultiAgentModeSupport = enum {
+    not_requested,
+    proven,
+    unproven,
+    unsupported,
+
+    pub fn asString(self: MultiAgentModeSupport) []const u8 {
+        return switch (self) {
+            .not_requested => "not_requested",
+            .proven => "proven",
+            .unproven => "unproven",
+            .unsupported => "unsupported",
+        };
+    }
+};
+
 pub const ClientOptions = struct {
     cwd: []const u8,
     io: std.Io = std.Io.Threaded.global_single_threaded.io(),
