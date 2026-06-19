@@ -44,6 +44,7 @@ const UsageText =
     \\  --commit SHA                     Review a specific commit.
     \\  --title TITLE                    Optional commit title for --commit.
     \\  --custom-instructions VALUE      Custom review instructions, raw text, @file, or - for stdin.
+    \\  --multi-agent-mode MODE          explicit-request-only|proactive for fresh parent request flow.
     \\
     \\Approval/runtime options:
     \\  --exec-approval VALUE            auto|accept|acceptForSession|decline|cancel.
@@ -195,6 +196,7 @@ const ParsedArgs = struct {
     lane_id: ?[]const u8 = null,
     parent_thread_id: ?[]const u8 = null,
     parent_mode: ParentMode = .auto,
+    multi_agent_mode: ?cas.MultiAgentMode = null,
     review_thread_id: ?[]const u8 = null,
     target: ?TargetConfig = null,
     wait_after_start: bool = false,
@@ -262,6 +264,10 @@ const SessionRecord = struct {
     terminal_fallback_error_text: ?[]const u8 = null,
     hook_policy: ?[]const u8 = null,
     hook_log_path: ?[]const u8 = null,
+    requested_multi_agent_mode: ?[]const u8 = null,
+    effective_multi_agent_mode: ?[]const u8 = null,
+    multi_agent_mode_support: ?[]const u8 = null,
+    multi_agent_mode_metric_eligible: bool = false,
 };
 
 const LaneRecord = struct {
@@ -304,12 +310,48 @@ const OutputReceipt = struct {
     orphan_ttl_seconds: ?u32 = null,
     hook_policy: cas.hooks.HookPolicy = .inherit,
     hook_log_path: ?[]const u8 = null,
+    requested_multi_agent_mode: ?cas.MultiAgentMode = null,
+    effective_multi_agent_mode: ?cas.MultiAgentMode = null,
+    multi_agent_mode_support: cas.MultiAgentModeSupport = .not_requested,
+    multi_agent_mode_metric_eligible: bool = false,
 };
 
 const FailureInfo = struct {
     code: []const u8,
     hint: []const u8,
 };
+
+fn applyMultiAgentModeReceipt(
+    receipt: *OutputReceipt,
+    mode: ?cas.MultiAgentMode,
+    support: cas.MultiAgentModeSupport,
+) void {
+    receipt.requested_multi_agent_mode = mode;
+    receipt.multi_agent_mode_support = if (mode == null) .not_requested else support;
+    receipt.effective_multi_agent_mode = if (receipt.multi_agent_mode_support == .proven) mode else null;
+    receipt.multi_agent_mode_metric_eligible = mode == .proactive and receipt.multi_agent_mode_support == .proven;
+}
+
+fn withRecordMultiAgentMode(receipt: OutputReceipt, record: SessionRecord) OutputReceipt {
+    var out = receipt;
+    out.requested_multi_agent_mode = modeFromStoredConfigValue(record.requested_multi_agent_mode);
+    out.effective_multi_agent_mode = modeFromStoredConfigValue(record.effective_multi_agent_mode);
+    out.multi_agent_mode_support = supportFromStoredValue(record.multi_agent_mode_support);
+    out.multi_agent_mode_metric_eligible = record.multi_agent_mode_metric_eligible;
+    return out;
+}
+
+fn modeFromStoredConfigValue(raw: ?[]const u8) ?cas.MultiAgentMode {
+    return if (raw) |value| cas.MultiAgentMode.parse(value) else null;
+}
+
+fn supportFromStoredValue(raw: ?[]const u8) cas.MultiAgentModeSupport {
+    const value = raw orelse return .not_requested;
+    if (std.mem.eql(u8, value, "proven")) return .proven;
+    if (std.mem.eql(u8, value, "unproven")) return .unproven;
+    if (std.mem.eql(u8, value, "unsupported")) return .unsupported;
+    return .not_requested;
+}
 
 const SemverTriplet = struct {
     major: u32,
@@ -546,6 +588,10 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             out.parent_mode = ParentMode.parse(value) orelse return error.InvalidParentMode;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--multi-agent-mode")) {
+            out.multi_agent_mode = cas.MultiAgentMode.parse(value) orelse return error.InvalidMultiAgentMode;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--review-thread-id")) {
             out.review_thread_id = value;
             continue;
@@ -634,6 +680,14 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
     out.receipt_paths = try receipt_paths.toOwnedSlice(allocator);
     out.receipt_globs = try receipt_globs.toOwnedSlice(allocator);
 
+    if (out.multi_agent_mode != null) {
+        switch (out.action.?) {
+            .start => {},
+            .lane => if (out.lane_action != .review) return error.MultiAgentModeUnsupportedAction,
+            .status, .wait, .interrupt, .receipt => return error.MultiAgentModeUnsupportedAction,
+        }
+    }
+
     switch (out.action.?) {
         .start => {
             if (out.cwd == null) return error.MissingCwd;
@@ -711,7 +765,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             },
         );
     };
-    const output_receipt = OutputReceipt{
+    var output_receipt = OutputReceipt{
         .resolved_codex_path = resolved_codex_path,
         .resolved_codex_version = codex_version,
         .compatibility_verdict = "compatible",
@@ -737,6 +791,8 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
     };
     const managed_server_pid = managed_server.processId();
     const managed_server_listen_url = managed_server.listen_url;
+    output_receipt.managed_server_pid = managed_server_pid;
+    output_receipt.managed_server_listen_url = managed_server_listen_url;
 
     var client = connectReviewClient(
         allocator,
@@ -799,7 +855,8 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             );
         }
         break :blk try allocator.dupe(u8, existing);
-    } else try startParentThreadAlloc(allocator, &client, cwd, session_dir);
+    } else try startParentThreadAlloc(allocator, &client, cwd, session_dir, parsed.multi_agent_mode);
+    applyMultiAgentModeReceipt(&output_receipt, parsed.multi_agent_mode, if (created_parent_thread) .proven else .unproven);
     const parent_event_log_path = try parentEventLogPathAlloc(allocator, session_dir, parent_thread_id);
     defer allocator.free(parent_event_log_path);
     const review_params_json = try buildReviewStartParamsJson(allocator, parent_thread_id, target);
@@ -818,6 +875,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             parent_event_log_path,
             parsed.timeout_ms,
             parsed.poll_interval_ms,
+            parsed.multi_agent_mode,
         ) catch {
             try renderErrorAndExit(
                 parsed.json,
@@ -845,6 +903,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                 parent_event_log_path,
                 parsed.timeout_ms,
                 parsed.poll_interval_ms,
+                parsed.multi_agent_mode,
             ) catch {
                 try renderErrorAndExit(
                     parsed.json,
@@ -988,6 +1047,10 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         .orphan_ttl_seconds = managed_server_orphan_ttl_seconds,
         .hook_policy = parsed.hook_policy.asString(),
         .hook_log_path = event_log_path,
+        .requested_multi_agent_mode = if (output_receipt.requested_multi_agent_mode) |mode| mode.configValue() else null,
+        .effective_multi_agent_mode = if (output_receipt.effective_multi_agent_mode) |mode| mode.configValue() else null,
+        .multi_agent_mode_support = output_receipt.multi_agent_mode_support.asString(),
+        .multi_agent_mode_metric_eligible = output_receipt.multi_agent_mode_metric_eligible,
     };
     try writeSessionRecord(allocator, record_path, record);
 
@@ -1015,16 +1078,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                         target_record,
                         record_path,
                         event_log_path,
-                        .{
-                            .resolved_codex_path = resolved_codex_path,
-                            .resolved_codex_version = codex_version,
-                            .compatibility_verdict = "compatible",
-                            .selected_transport = "websocket",
-                            .selection_reason = "detached_review_requires_cross_process_truth",
-                            .managed_server_pid = managed_server_pid,
-                            .managed_server_listen_url = managed_server_listen_url,
-                            .orphan_ttl_seconds = managed_server_orphan_ttl_seconds,
-                        },
+                        output_receipt,
                         timeout_status,
                         true,
                         true,
@@ -1051,6 +1105,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             if (failureInfoForStatus(&latest)) |failure| {
                 if (std.mem.eql(u8, failure.code, "incompatible_codex_review_runtime")) {
                     record.compatibility_verdict = "incompatible";
+                    output_receipt.compatibility_verdict = "incompatible";
                 }
             }
             try writeSessionRecord(allocator, record_path, record);
@@ -1065,11 +1120,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                 target_record,
                 record_path,
                 event_log_path,
-                .{
-                    .resolved_codex_path = resolved_codex_path,
-                    .resolved_codex_version = codex_version,
-                    .compatibility_verdict = record.compatibility_verdict orelse "compatible",
-                },
+                output_receipt,
                 latest,
                 false,
                 true,
@@ -1088,16 +1139,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                     target_record,
                     record_path,
                     event_log_path,
-                    .{
-                        .resolved_codex_path = resolved_codex_path,
-                        .resolved_codex_version = codex_version,
-                        .compatibility_verdict = record.compatibility_verdict orelse "compatible",
-                        .selected_transport = "websocket",
-                        .selection_reason = "detached_review_requires_cross_process_truth",
-                        .managed_server_pid = managed_server_pid,
-                        .managed_server_listen_url = managed_server_listen_url,
-                        .orphan_ttl_seconds = managed_server_orphan_ttl_seconds,
-                    },
+                    output_receipt,
                     latest,
                     false,
                     true,
@@ -1128,16 +1170,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                 target_record,
                 record_path,
                 event_log_path,
-                .{
-                    .resolved_codex_path = resolved_codex_path,
-                    .resolved_codex_version = codex_version,
-                    .compatibility_verdict = "compatible",
-                    .selected_transport = "websocket",
-                    .selection_reason = "detached_review_requires_cross_process_truth",
-                    .managed_server_pid = managed_server_pid,
-                    .managed_server_listen_url = managed_server_listen_url,
-                    .orphan_ttl_seconds = managed_server_orphan_ttl_seconds,
-                },
+                output_receipt,
                 latest,
                 false,
                 true,
@@ -1170,16 +1203,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             target_record,
             record_path,
             event_log_path,
-            .{
-                .resolved_codex_path = resolved_codex_path,
-                .resolved_codex_version = codex_version,
-                .compatibility_verdict = "compatible",
-                .selected_transport = "websocket",
-                .selection_reason = "detached_review_requires_cross_process_truth",
-                .managed_server_pid = managed_server_pid,
-                .managed_server_listen_url = managed_server_listen_url,
-                .orphan_ttl_seconds = managed_server_orphan_ttl_seconds,
-            },
+            output_receipt,
             null,
             false,
             false,
@@ -1222,7 +1246,7 @@ fn cmdStatus(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void
                 record.event_log_path,
                 record.target,
                 identity_opt,
-                .{
+                withRecordMultiAgentMode(.{
                     .resolved_codex_path = record.resolved_codex_path,
                     .resolved_codex_version = record.codex_version,
                     .compatibility_verdict = record.compatibility_verdict orelse "compatible",
@@ -1233,7 +1257,7 @@ fn cmdStatus(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void
                     .managed_server_listen_url = record.managed_server_listen_url,
                     .managed_server_stderr_log_path = record.managed_server_stderr_log_path,
                     .orphan_ttl_seconds = record.orphan_ttl_seconds,
-                },
+                }, record),
                 null,
                 null,
                 null,
@@ -1288,7 +1312,7 @@ fn cmdStatus(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void
             record.event_log_path,
             record.target,
             identity_opt,
-            .{
+            withRecordMultiAgentMode(.{
                 .resolved_codex_path = record.resolved_codex_path,
                 .resolved_codex_version = record.codex_version,
                 .compatibility_verdict = record.compatibility_verdict orelse "not_checked",
@@ -1298,7 +1322,7 @@ fn cmdStatus(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void
                 .managed_server_listen_url = record.managed_server_listen_url,
                 .managed_server_stderr_log_path = record.managed_server_stderr_log_path,
                 .orphan_ttl_seconds = record.orphan_ttl_seconds,
-            },
+            }, record),
             null,
             null,
             failureInfoForStatus(&status),
@@ -1341,7 +1365,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                 record.event_log_path,
                 record.target,
                 identity_opt,
-                .{
+                withRecordMultiAgentMode(.{
                     .resolved_codex_path = record.resolved_codex_path,
                     .resolved_codex_version = record.codex_version,
                     .compatibility_verdict = record.compatibility_verdict orelse "compatible",
@@ -1352,7 +1376,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                     .managed_server_listen_url = record.managed_server_listen_url,
                     .managed_server_stderr_log_path = record.managed_server_stderr_log_path,
                     .orphan_ttl_seconds = record.orphan_ttl_seconds,
-                },
+                }, record),
                 null,
                 false,
                 null,
@@ -1424,7 +1448,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                     record.event_log_path,
                     record.target,
                     identity_opt,
-                    .{
+                    withRecordMultiAgentMode(.{
                         .resolved_codex_path = record.resolved_codex_path,
                         .resolved_codex_version = record.codex_version,
                         .compatibility_verdict = record.compatibility_verdict orelse "not_checked",
@@ -1434,7 +1458,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                         .managed_server_listen_url = record.managed_server_listen_url,
                         .managed_server_stderr_log_path = record.managed_server_stderr_log_path,
                         .orphan_ttl_seconds = record.orphan_ttl_seconds,
-                    },
+                    }, record),
                     parsed.timeout_ms,
                     true,
                     .{
@@ -1503,7 +1527,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                 record.event_log_path,
                 record.target,
                 identity_opt,
-                .{
+                withRecordMultiAgentMode(.{
                     .resolved_codex_path = record.resolved_codex_path,
                     .resolved_codex_version = record.codex_version,
                     .compatibility_verdict = record.compatibility_verdict orelse "not_checked",
@@ -1513,7 +1537,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                     .managed_server_listen_url = record.managed_server_listen_url,
                     .managed_server_stderr_log_path = record.managed_server_stderr_log_path,
                     .orphan_ttl_seconds = record.orphan_ttl_seconds,
-                },
+                }, record),
                 null,
                 false,
                 failureInfoForStatus(&latest) orelse .{
@@ -1546,7 +1570,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
             record.event_log_path,
             record.target,
             identity_opt,
-            .{
+            withRecordMultiAgentMode(.{
                 .resolved_codex_path = record.resolved_codex_path,
                 .resolved_codex_version = record.codex_version,
                 .compatibility_verdict = record.compatibility_verdict orelse "not_checked",
@@ -1556,7 +1580,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                 .managed_server_listen_url = record.managed_server_listen_url,
                 .managed_server_stderr_log_path = record.managed_server_stderr_log_path,
                 .orphan_ttl_seconds = record.orphan_ttl_seconds,
-            },
+            }, record),
             null,
             false,
             null,
@@ -1990,7 +2014,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
             try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, .{
                 .code = "lane_transport_lost",
                 .hint = "persistent CAS lane app-server is not alive; returned explicit native-review fallback",
-            }, parsed.verdict_only);
+            }, parsed.multi_agent_mode, parsed.verdict_only);
             std.process.exit(if (fallback.ok) 0 else 1);
         }
         try renderErrorAndExit(
@@ -2032,7 +2056,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
             try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, .{
                 .code = "lane_transport_lost",
                 .hint = "persistent CAS lane websocket could not be reconnected; returned explicit native-review fallback",
-            }, parsed.verdict_only);
+            }, parsed.multi_agent_mode, parsed.verdict_only);
             std.process.exit(if (fallback.ok) 0 else 1);
         }
         try renderErrorAndExit(
@@ -2063,14 +2087,14 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
     }
 
     const session_dir = try sessionDirAlloc(allocator);
-    const parent_thread_id = startParentThreadAlloc(allocator, &client, lane.cwd, session_dir) catch |err| {
+    const parent_thread_id = startParentThreadAlloc(allocator, &client, lane.cwd, session_dir, parsed.multi_agent_mode) catch |err| {
         if (parsed.fallback_mode == .native_review and isTransportLossError(err)) {
             var fallback = try runNativeReviewFallbackAlloc(allocator, lane.cwd, lane.resolved_codex_path, target_record);
             defer fallback.deinit(allocator);
             try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, .{
                 .code = "lane_transport_lost",
                 .hint = "persistent CAS lane websocket was lost while starting a fresh parent; returned explicit native-review fallback",
-            }, parsed.verdict_only);
+            }, parsed.multi_agent_mode, parsed.verdict_only);
             std.process.exit(if (fallback.ok) 0 else 1);
         }
         if (isTransportLossError(err)) {
@@ -2108,6 +2132,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
             parent_event_log_path,
             parsed.timeout_ms,
             parsed.poll_interval_ms,
+            parsed.multi_agent_mode,
         ) catch |err| {
             if (parsed.fallback_mode == .native_review and isTransportLossError(err)) {
                 var fallback = try runNativeReviewFallbackAlloc(allocator, lane.cwd, lane.resolved_codex_path, target_record);
@@ -2115,7 +2140,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
                 try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, .{
                     .code = "lane_transport_lost",
                     .hint = "persistent CAS lane websocket was lost while materializing a fresh parent; returned explicit native-review fallback",
-                }, parsed.verdict_only);
+                }, parsed.multi_agent_mode, parsed.verdict_only);
                 std.process.exit(if (fallback.ok) 0 else 1);
             }
             if (isTransportLossError(err)) {
@@ -2154,7 +2179,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
             try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, .{
                 .code = "review_failed",
                 .hint = "lane review startup failed; returned explicit native-review fallback",
-            }, parsed.verdict_only);
+            }, parsed.multi_agent_mode, parsed.verdict_only);
             std.process.exit(if (fallback.ok) 0 else 1);
         }
         return err;
@@ -2226,6 +2251,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
                 record_path,
                 event_log_path,
                 parsed.timeout_ms,
+                parsed.multi_agent_mode,
                 parsed.verdict_only,
             );
             std.process.exit(1);
@@ -2237,7 +2263,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
                 try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, .{
                     .code = "lane_transport_lost",
                     .hint = "persistent CAS lane websocket was lost while waiting; returned explicit native-review fallback",
-                }, parsed.verdict_only);
+                }, parsed.multi_agent_mode, parsed.verdict_only);
                 std.process.exit(if (fallback.ok) 0 else 1);
             }
             if (isTransportLossError(err)) {
@@ -2317,7 +2343,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
         if (parsed.fallback_mode == .native_review) {
             var fallback = try runNativeReviewFallbackAlloc(allocator, lane.cwd, lane.resolved_codex_path, target_record);
             defer fallback.deinit(allocator);
-            try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, lane_failure.?, parsed.verdict_only);
+            try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, lane_failure.?, parsed.multi_agent_mode, parsed.verdict_only);
             std.process.exit(if (fallback.ok) 0 else 1);
         }
     }
@@ -2339,6 +2365,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
         archive_status,
         clean,
         lane_failure,
+        parsed.multi_agent_mode,
         parsed.verdict_only,
     );
     if (!clean) std.process.exit(1);
@@ -2741,13 +2768,28 @@ fn failureInfoForParentReuse(status: *const ReviewStatus) ?FailureInfo {
     return null;
 }
 
-fn buildTurnStartParamsJson(allocator: std.mem.Allocator, thread_id: []const u8, text: []const u8) ![]u8 {
-    return stringifyAnyAlloc(allocator, .{
-        .threadId = thread_id,
-        .input = .{
-            .{ .type = "text", .text = text },
-        },
-    });
+fn buildTurnStartParamsJson(
+    allocator: std.mem.Allocator,
+    thread_id: []const u8,
+    text: []const u8,
+    multi_agent_mode: ?cas.MultiAgentMode,
+) ![]u8 {
+    const thread_id_json = try quoteJsonStringAlloc(allocator, thread_id);
+    defer allocator.free(thread_id_json);
+    const text_json = try quoteJsonStringAlloc(allocator, text);
+    defer allocator.free(text_json);
+    if (multi_agent_mode) |mode| {
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"threadId\":{s},\"input\":[{{\"type\":\"text\",\"text\":{s}}}],\"multiAgentMode\":\"{s}\"}}",
+            .{ thread_id_json, text_json, mode.wireValue() },
+        );
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"threadId\":{s},\"input\":[{{\"type\":\"text\",\"text\":{s}}}]}}",
+        .{ thread_id_json, text_json },
+    );
 }
 
 fn waitForThreadTerminalState(
@@ -2775,11 +2817,13 @@ fn materializeParentThreadTurn(
     event_log_path: []const u8,
     timeout_ms: u32,
     poll_interval_ms: u32,
+    multi_agent_mode: ?cas.MultiAgentMode,
 ) !void {
     const params_json = try buildTurnStartParamsJson(
         allocator,
         parent_thread_id,
         parent_materialization_prompt,
+        multi_agent_mode,
     );
     defer allocator.free(params_json);
     const result_json = try client.requestJson("turn/start", params_json);
@@ -2972,11 +3016,9 @@ fn startParentThreadAlloc(
     client: *cas.Client,
     cwd: []const u8,
     session_dir: []const u8,
+    multi_agent_mode: ?cas.MultiAgentMode,
 ) ![]const u8 {
-    const params_json = try stringifyAnyAlloc(allocator, .{
-        .cwd = cwd,
-        .experimentalRawEvents = false,
-    });
+    const params_json = try buildThreadStartParamsJson(allocator, cwd, multi_agent_mode);
     defer allocator.free(params_json);
     const result_json = try client.requestJson("thread/start", params_json);
     defer allocator.free(result_json);
@@ -2986,6 +3028,27 @@ fn startParentThreadAlloc(
     try appendLogRecord(allocator, parent_event_log_path, "thread/start", "request", params_json);
     try appendLogRecord(allocator, parent_event_log_path, "thread/start", "response", result_json);
     return parent_thread_id;
+}
+
+fn buildThreadStartParamsJson(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    multi_agent_mode: ?cas.MultiAgentMode,
+) ![]u8 {
+    const cwd_json = try quoteJsonStringAlloc(allocator, cwd);
+    defer allocator.free(cwd_json);
+    if (multi_agent_mode) |mode| {
+        return std.fmt.allocPrint(
+            allocator,
+            "{{\"cwd\":{s},\"experimentalRawEvents\":false,\"multiAgentMode\":\"{s}\"}}",
+            .{ cwd_json, mode.wireValue() },
+        );
+    }
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"cwd\":{s},\"experimentalRawEvents\":false}}",
+        .{cwd_json},
+    );
 }
 
 fn codexDetachedReviewNeedsLiveConnection(codex_version: []const u8) bool {
@@ -3307,6 +3370,10 @@ fn renderErrorAndExit(
             .resolvedCodexPath = receipt.resolved_codex_path,
             .resolvedCodexVersion = receipt.resolved_codex_version,
             .compatibilityVerdict = receipt.compatibility_verdict,
+            .requestedMultiAgentMode = if (receipt.requested_multi_agent_mode) |mode| mode.configValue() else null,
+            .effectiveMultiAgentMode = if (receipt.effective_multi_agent_mode) |mode| mode.configValue() else null,
+            .multiAgentModeSupport = receipt.multi_agent_mode_support.asString(),
+            .multiAgentModeMetricEligible = receipt.multi_agent_mode_metric_eligible,
             .failureCode = failure.code,
             .failureHint = failure.hint,
             .@"error" = message,
@@ -3415,7 +3482,7 @@ fn maybeRunNativeFallbackAndExitWait(
             record.event_log_path,
             record.target,
             null,
-            .{
+            withRecordMultiAgentMode(.{
                 .resolved_codex_path = record.resolved_codex_path,
                 .resolved_codex_version = record.codex_version,
                 .compatibility_verdict = record.compatibility_verdict orelse "compatible",
@@ -3426,7 +3493,7 @@ fn maybeRunNativeFallbackAndExitWait(
                 .managed_server_listen_url = record.managed_server_listen_url,
                 .managed_server_stderr_log_path = record.managed_server_stderr_log_path,
                 .orphan_ttl_seconds = record.orphan_ttl_seconds,
-            },
+            }, record.*),
             null,
             false,
             failure,
@@ -3512,6 +3579,15 @@ fn stringifyAnyAlloc(allocator: std.mem.Allocator, value: anytype) ![]u8 {
     return out.toOwnedSlice();
 }
 
+fn optionalModeJsonAlloc(allocator: std.mem.Allocator, mode: ?cas.MultiAgentMode) ![]const u8 {
+    if (mode) |value| return quoteJsonStringAlloc(allocator, value.configValue());
+    return "null";
+}
+
+fn modeSupportJsonAlloc(allocator: std.mem.Allocator, support: cas.MultiAgentModeSupport) ![]u8 {
+    return quoteJsonStringAlloc(allocator, support.asString());
+}
+
 fn printJson(value: anytype) !void {
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
@@ -3576,6 +3652,9 @@ fn printStatusJson(
         try std.fmt.allocPrint(allocator, "{d}", .{value})
     else
         "null";
+    const requested_multi_agent_mode_json = try optionalModeJsonAlloc(allocator, receipt.requested_multi_agent_mode);
+    const effective_multi_agent_mode_json = try optionalModeJsonAlloc(allocator, receipt.effective_multi_agent_mode);
+    const multi_agent_mode_support_json = try modeSupportJsonAlloc(allocator, receipt.multi_agent_mode_support);
     const failure_code_json = if (failure) |value| try quoteJsonStringAlloc(allocator, value.code) else "null";
     const failure_hint_json = if (failure) |value| try quoteJsonStringAlloc(allocator, value.hint) else "null";
     const fallback_transport_json = if (fallback != null) "\"native-review\"" else "null";
@@ -3618,7 +3697,7 @@ fn printStatusJson(
         "null";
 
     try stdout.print(
-        "{{\"demo\":\"cas-review-session\",\"action\":\"{s}\",\"cwd\":{s},\"parentThreadId\":{s},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"threadStatus\":{s},\"turnStatus\":{s},\"turnCount\":{d},\"materialized\":{s},\"rolloutPath\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"target\":{s},\"targetFingerprint\":{s},\"headSha\":{s},\"baseSha\":{s},\"resolvedCodexPath\":{s},\"resolvedCodexVersion\":{s},\"compatibilityVerdict\":{s},\"selectedTransport\":{s},\"selectionReason\":{s},\"degradedFallback\":{s},\"managedServerPid\":{s},\"managedServerListenUrl\":{s},\"managedServerStderrLogPath\":{s},\"orphanTtlSeconds\":{s}",
+        "{{\"demo\":\"cas-review-session\",\"action\":\"{s}\",\"cwd\":{s},\"parentThreadId\":{s},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"threadStatus\":{s},\"turnStatus\":{s},\"turnCount\":{d},\"materialized\":{s},\"rolloutPath\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"target\":{s},\"targetFingerprint\":{s},\"headSha\":{s},\"baseSha\":{s},\"resolvedCodexPath\":{s},\"resolvedCodexVersion\":{s},\"compatibilityVerdict\":{s},\"selectedTransport\":{s},\"selectionReason\":{s},\"degradedFallback\":{s},\"managedServerPid\":{s},\"managedServerListenUrl\":{s},\"managedServerStderrLogPath\":{s},\"orphanTtlSeconds\":{s},\"requestedMultiAgentMode\":{s},\"effectiveMultiAgentMode\":{s},\"multiAgentModeSupport\":{s},\"multiAgentModeMetricEligible\":{s}",
         .{
             @tagName(action),
             cwd_json,
@@ -3646,6 +3725,10 @@ fn printStatusJson(
             managed_server_listen_url_json,
             managed_server_stderr_log_path_json,
             orphan_ttl_seconds_json,
+            requested_multi_agent_mode_json,
+            effective_multi_agent_mode_json,
+            multi_agent_mode_support_json,
+            if (receipt.multi_agent_mode_metric_eligible) "true" else "false",
         },
     );
     try stdout.print(
@@ -3729,6 +3812,9 @@ fn printStartJson(
         try std.fmt.allocPrint(allocator, "{d}", .{value})
     else
         "null";
+    const requested_multi_agent_mode_json = try optionalModeJsonAlloc(allocator, receipt.requested_multi_agent_mode);
+    const effective_multi_agent_mode_json = try optionalModeJsonAlloc(allocator, receipt.effective_multi_agent_mode);
+    const multi_agent_mode_support_json = try modeSupportJsonAlloc(allocator, receipt.multi_agent_mode_support);
     const failure_code_json = if (failure) |value| try quoteJsonStringAlloc(allocator, value.code) else "null";
     const failure_hint_json = if (failure) |value| try quoteJsonStringAlloc(allocator, value.hint) else "null";
     const fallback_transport_json = if (fallback != null) "\"native-review\"" else "null";
@@ -3748,7 +3834,7 @@ fn printStartJson(
     const hook_summary_json = try stringifyAnyAlloc(allocator, hook_summary);
 
     try stdout.print(
-        "{{\"demo\":\"cas-review-session\",\"action\":\"start\",\"cwd\":{s},\"parentThreadId\":{s},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"delivery\":\"detached\",\"target\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"codexVersion\":{s},\"resolvedCodexPath\":{s},\"resolvedCodexVersion\":{s},\"compatibilityVerdict\":{s},\"selectedTransport\":{s},\"selectionReason\":{s},\"degradedFallback\":{s},\"managedServerPid\":{s},\"managedServerListenUrl\":{s},\"managedServerStderrLogPath\":{s},\"orphanTtlSeconds\":{s},\"waited\":{s},\"timedOut\":{s},\"threadStatus\":{s},\"turnStatus\":{s}",
+        "{{\"demo\":\"cas-review-session\",\"action\":\"start\",\"cwd\":{s},\"parentThreadId\":{s},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"delivery\":\"detached\",\"target\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"codexVersion\":{s},\"resolvedCodexPath\":{s},\"resolvedCodexVersion\":{s},\"compatibilityVerdict\":{s},\"selectedTransport\":{s},\"selectionReason\":{s},\"degradedFallback\":{s},\"managedServerPid\":{s},\"managedServerListenUrl\":{s},\"managedServerStderrLogPath\":{s},\"orphanTtlSeconds\":{s},\"requestedMultiAgentMode\":{s},\"effectiveMultiAgentMode\":{s},\"multiAgentModeSupport\":{s},\"multiAgentModeMetricEligible\":{s},\"waited\":{s},\"timedOut\":{s},\"threadStatus\":{s},\"turnStatus\":{s}",
         .{
             try quoteJsonStringAlloc(allocator, cwd),
             try quoteJsonStringAlloc(allocator, parent_thread_id),
@@ -3768,6 +3854,10 @@ fn printStartJson(
             managed_server_listen_url_json,
             managed_server_stderr_log_path_json,
             orphan_ttl_seconds_json,
+            requested_multi_agent_mode_json,
+            effective_multi_agent_mode_json,
+            multi_agent_mode_support_json,
+            if (receipt.multi_agent_mode_metric_eligible) "true" else "false",
             waited_json,
             timed_out_json,
             thread_status_json,
@@ -4814,11 +4904,15 @@ fn printLaneFallbackJson(
     identity: TargetIdentity,
     fallback: NativeFallbackResult,
     failure: FailureInfo,
+    multi_agent_mode: ?cas.MultiAgentMode,
     verdict_only: bool,
 ) !void {
     const target_json = try stringifyAnyAlloc(allocator, target);
     const fallback_stdout_json = if (fallback.stdout_text) |text| try quoteJsonStringAlloc(allocator, text) else "null";
     const fallback_stderr_json = if (fallback.stderr_text) |text| try quoteJsonStringAlloc(allocator, text) else "null";
+    const requested_multi_agent_mode_json = try optionalModeJsonAlloc(allocator, multi_agent_mode);
+    const multi_agent_support: cas.MultiAgentModeSupport = if (multi_agent_mode == null) .not_requested else .unsupported;
+    const multi_agent_mode_support_json = try modeSupportJsonAlloc(allocator, multi_agent_support);
     const review_verdict_json = try buildReviewVerdictJsonAlloc(
         allocator,
         "cas-native-fallback",
@@ -4840,7 +4934,7 @@ fn printLaneFallbackJson(
         return;
     }
     try stdout.print(
-        "{{\"demo\":\"cas-review-session\",\"action\":\"lane-review\",\"laneId\":{s},\"cwd\":{s},\"laneRecordPath\":{s},\"target\":{s},\"targetFingerprint\":{s},\"headSha\":{s},\"baseSha\":{s},\"selectedTransport\":\"native-review\",\"fallbackUsed\":true,\"fallbackTransport\":\"native-review\",\"fallbackExitCode\":{d},\"fallbackOutputText\":{s},\"fallbackErrorText\":{s},\"failureCode\":{s},\"failureHint\":{s},\"reviewVerdict\":{s}}}\n",
+        "{{\"demo\":\"cas-review-session\",\"action\":\"lane-review\",\"laneId\":{s},\"cwd\":{s},\"laneRecordPath\":{s},\"target\":{s},\"targetFingerprint\":{s},\"headSha\":{s},\"baseSha\":{s},\"selectedTransport\":\"native-review\",\"fallbackUsed\":true,\"requestedMultiAgentMode\":{s},\"effectiveMultiAgentMode\":null,\"multiAgentModeSupport\":{s},\"multiAgentModeMetricEligible\":false,\"fallbackTransport\":\"native-review\",\"fallbackExitCode\":{d},\"fallbackOutputText\":{s},\"fallbackErrorText\":{s},\"failureCode\":{s},\"failureHint\":{s},\"reviewVerdict\":{s}}}\n",
         .{
             try quoteJsonStringAlloc(allocator, lane.lane_id),
             try quoteJsonStringAlloc(allocator, lane.cwd),
@@ -4849,6 +4943,8 @@ fn printLaneFallbackJson(
             try quoteJsonStringAlloc(allocator, identity.fingerprint),
             if (identity.head_sha) |value| try quoteJsonStringAlloc(allocator, value) else "null",
             if (identity.base_sha) |value| try quoteJsonStringAlloc(allocator, value) else "null",
+            requested_multi_agent_mode_json,
+            multi_agent_mode_support_json,
             fallback.exit_code,
             fallback_stdout_json,
             fallback_stderr_json,
@@ -4874,6 +4970,7 @@ fn printLaneReviewJson(
     archive_status: []const u8,
     clean: bool,
     failure: ?FailureInfo,
+    multi_agent_mode: ?cas.MultiAgentMode,
     verdict_only: bool,
 ) !void {
     const target_json = try stringifyAnyAlloc(allocator, target);
@@ -4882,6 +4979,9 @@ fn printLaneReviewJson(
     const raw_findings_json = if (dual_parse.raw_findings) |value| try std.fmt.allocPrint(allocator, "{d}", .{value}) else "null";
     const failure_code_json = if (failure) |value| try quoteJsonStringAlloc(allocator, value.code) else "null";
     const failure_hint_json = if (failure) |value| try quoteJsonStringAlloc(allocator, value.hint) else "null";
+    const requested_multi_agent_mode_json = try optionalModeJsonAlloc(allocator, multi_agent_mode);
+    const effective_multi_agent_mode_json = try optionalModeJsonAlloc(allocator, multi_agent_mode);
+    const multi_agent_mode_support_json = try modeSupportJsonAlloc(allocator, if (multi_agent_mode == null) .not_requested else .proven);
     const review_verdict_json = try buildReviewVerdictJsonAlloc(
         allocator,
         "cas-lane",
@@ -4903,7 +5003,7 @@ fn printLaneReviewJson(
         return;
     }
     try stdout.print(
-        "{{\"demo\":\"cas-review-session\",\"action\":\"lane-review\",\"laneId\":{s},\"cwd\":{s},\"laneRecordPath\":{s},\"reviewCount\":{d},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"target\":{s},\"targetFingerprint\":{s},\"headSha\":{s},\"baseSha\":{s},\"selectedTransport\":\"websocket\",\"fallbackUsed\":false,\"managedServerPid\":{d},\"managedServerListenUrl\":{s},\"turnStatus\":{s},\"reviewResultAvailable\":{s},\"reviewResultSource\":{s},\"reviewResult\":{s},\"rawReviewText\":{s},\"dualParseVerdict\":{s},\"structuredFindingCount\":{d},\"rawFindingCount\":{s},\"archiveStatus\":{s},\"failureCode\":{s},\"failureHint\":{s},\"clean\":{s},\"reviewVerdict\":{s}}}\n",
+        "{{\"demo\":\"cas-review-session\",\"action\":\"lane-review\",\"laneId\":{s},\"cwd\":{s},\"laneRecordPath\":{s},\"reviewCount\":{d},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"target\":{s},\"targetFingerprint\":{s},\"headSha\":{s},\"baseSha\":{s},\"selectedTransport\":\"websocket\",\"fallbackUsed\":false,\"requestedMultiAgentMode\":{s},\"effectiveMultiAgentMode\":{s},\"multiAgentModeSupport\":{s},\"multiAgentModeMetricEligible\":{s},\"managedServerPid\":{d},\"managedServerListenUrl\":{s},\"turnStatus\":{s},\"reviewResultAvailable\":{s},\"reviewResultSource\":{s},\"reviewResult\":{s},\"rawReviewText\":{s},\"dualParseVerdict\":{s},\"structuredFindingCount\":{d},\"rawFindingCount\":{s},\"archiveStatus\":{s},\"failureCode\":{s},\"failureHint\":{s},\"clean\":{s},\"reviewVerdict\":{s}}}\n",
         .{
             try quoteJsonStringAlloc(allocator, lane.lane_id),
             try quoteJsonStringAlloc(allocator, lane.cwd),
@@ -4917,6 +5017,10 @@ fn printLaneReviewJson(
             try quoteJsonStringAlloc(allocator, identity.fingerprint),
             if (identity.head_sha) |value| try quoteJsonStringAlloc(allocator, value) else "null",
             if (identity.base_sha) |value| try quoteJsonStringAlloc(allocator, value) else "null",
+            requested_multi_agent_mode_json,
+            effective_multi_agent_mode_json,
+            multi_agent_mode_support_json,
+            if (multi_agent_mode == .proactive) "true" else "false",
             lane.managed_server_pid,
             try quoteJsonStringAlloc(allocator, lane.managed_server_listen_url),
             try quoteJsonStringAlloc(allocator, status.turn_status),
@@ -4947,9 +5051,13 @@ fn printLaneReviewTimeoutJson(
     record_path: []const u8,
     event_log_path: []const u8,
     timeout_ms: u32,
+    multi_agent_mode: ?cas.MultiAgentMode,
     verdict_only: bool,
 ) !void {
     const target_json = try stringifyAnyAlloc(allocator, target);
+    const requested_multi_agent_mode_json = try optionalModeJsonAlloc(allocator, multi_agent_mode);
+    const effective_multi_agent_mode_json = try optionalModeJsonAlloc(allocator, multi_agent_mode);
+    const multi_agent_mode_support_json = try modeSupportJsonAlloc(allocator, if (multi_agent_mode == null) .not_requested else .proven);
     const failure = FailureInfo{
         .code = "wait_timed_out",
         .hint = "retry cas review_session wait on the same reviewThreadId or increase --timeout-ms",
@@ -4975,7 +5083,7 @@ fn printLaneReviewTimeoutJson(
         return;
     }
     try stdout.print(
-        "{{\"demo\":\"cas-review-session\",\"action\":\"lane-review\",\"method\":\"review/wait\",\"laneId\":{s},\"cwd\":{s},\"laneRecordPath\":{s},\"reviewCount\":{d},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"target\":{s},\"targetFingerprint\":{s},\"headSha\":{s},\"baseSha\":{s},\"selectedTransport\":\"websocket\",\"fallbackUsed\":false,\"managedServerPid\":{d},\"managedServerListenUrl\":{s},\"timeoutMs\":{d},\"timedOut\":true,\"reviewResultAvailable\":false,\"reviewResultSource\":null,\"reviewResult\":null,\"rawReviewText\":null,\"dualParseVerdict\":\"timeout\",\"structuredFindingCount\":0,\"rawFindingCount\":null,\"archiveStatus\":\"skipped_timeout\",\"failureCode\":\"wait_timed_out\",\"failureHint\":\"retry cas review_session wait --review-thread-id {s} --timeout-ms {d} --json\",\"clean\":false,\"reviewVerdict\":{s}}}\n",
+        "{{\"demo\":\"cas-review-session\",\"action\":\"lane-review\",\"method\":\"review/wait\",\"laneId\":{s},\"cwd\":{s},\"laneRecordPath\":{s},\"reviewCount\":{d},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"target\":{s},\"targetFingerprint\":{s},\"headSha\":{s},\"baseSha\":{s},\"selectedTransport\":\"websocket\",\"fallbackUsed\":false,\"requestedMultiAgentMode\":{s},\"effectiveMultiAgentMode\":{s},\"multiAgentModeSupport\":{s},\"multiAgentModeMetricEligible\":{s},\"managedServerPid\":{d},\"managedServerListenUrl\":{s},\"timeoutMs\":{d},\"timedOut\":true,\"reviewResultAvailable\":false,\"reviewResultSource\":null,\"reviewResult\":null,\"rawReviewText\":null,\"dualParseVerdict\":\"timeout\",\"structuredFindingCount\":0,\"rawFindingCount\":null,\"archiveStatus\":\"skipped_timeout\",\"failureCode\":\"wait_timed_out\",\"failureHint\":\"retry cas review_session wait --review-thread-id {s} --timeout-ms {d} --json\",\"clean\":false,\"reviewVerdict\":{s}}}\n",
         .{
             try quoteJsonStringAlloc(allocator, lane.lane_id),
             try quoteJsonStringAlloc(allocator, lane.cwd),
@@ -4989,6 +5097,10 @@ fn printLaneReviewTimeoutJson(
             try quoteJsonStringAlloc(allocator, identity.fingerprint),
             if (identity.head_sha) |value| try quoteJsonStringAlloc(allocator, value) else "null",
             if (identity.base_sha) |value| try quoteJsonStringAlloc(allocator, value) else "null",
+            requested_multi_agent_mode_json,
+            effective_multi_agent_mode_json,
+            multi_agent_mode_support_json,
+            if (multi_agent_mode == .proactive) "true" else "false",
             lane.managed_server_pid,
             try quoteJsonStringAlloc(allocator, lane.managed_server_listen_url),
             timeout_ms,
@@ -5043,6 +5155,62 @@ test "parseArgs captures start --wait" {
     try std.testing.expect(parsed.wait_after_start);
     try std.testing.expectEqual(Action.start, parsed.action.?);
     try std.testing.expectEqual(TargetKind.base_branch, parsed.target.?.kind);
+}
+
+test "parseArgs accepts multi-agent mode for start and lane review" {
+    const start_argv = [_][]const u8{
+        "cas_review_session",
+        "start",
+        "--cwd",
+        "/tmp/repo",
+        "--base",
+        "main",
+        "--multi-agent-mode",
+        "proactive",
+    };
+    const start = try parseArgs(std.testing.allocator, &start_argv);
+    try std.testing.expectEqual(cas.MultiAgentMode.proactive, start.multi_agent_mode.?);
+
+    const lane_review_argv = [_][]const u8{
+        "cas_review_session",
+        "lane",
+        "review",
+        "--lane-id",
+        "lane_1",
+        "--base",
+        "main",
+        "--multi-agent-mode",
+        "explicit-request-only",
+    };
+    const lane_review = try parseArgs(std.testing.allocator, &lane_review_argv);
+    try std.testing.expectEqual(cas.MultiAgentMode.explicit_request_only, lane_review.multi_agent_mode.?);
+}
+
+test "parseArgs rejects multi-agent mode on unsupported review-session actions" {
+    const argv = [_][]const u8{
+        "cas_review_session",
+        "wait",
+        "--review-thread-id",
+        "thr_1",
+        "--multi-agent-mode",
+        "proactive",
+    };
+
+    try std.testing.expectError(error.MultiAgentModeUnsupportedAction, parseArgs(std.testing.allocator, &argv));
+}
+
+test "request builders include multi-agent mode on fresh parent flow" {
+    const thread_params = try buildThreadStartParamsJson(std.testing.allocator, "/tmp/repo", .proactive);
+    defer std.testing.allocator.free(thread_params);
+    var parsed_thread = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, thread_params, .{});
+    defer parsed_thread.deinit();
+    try std.testing.expectEqualStrings("proactive", parsed_thread.value.object.get("multiAgentMode").?.string);
+
+    const turn_params = try buildTurnStartParamsJson(std.testing.allocator, "thr_1", "hello", .explicit_request_only);
+    defer std.testing.allocator.free(turn_params);
+    var parsed_turn = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, turn_params, .{});
+    defer parsed_turn.deinit();
+    try std.testing.expectEqualStrings("explicitRequestOnly", parsed_turn.value.object.get("multiAgentMode").?.string);
 }
 
 test "parseArgs captures parent mode approvals and fallback" {
