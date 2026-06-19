@@ -520,6 +520,7 @@ const Options = struct {
     worker_kind_text: ?[]const u8 = null,
     events_text: ?[]const u8 = null,
     mode: ?[]const u8 = null,
+    protocol_text: ?[]const u8 = null,
     part_type: ?[]const u8 = null,
     timezone_text: ?[]const u8 = null,
     since: ?[]const u8 = null,
@@ -816,11 +817,12 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\  raw $resolve mentions are denominator candidates only; true sessions require assistant workflow or tool evidence
         ,
         .review_compiler_audit =>
-        \\usage: seq review-compiler-audit --since <iso> --until <iso> --repo <path> [--exclude-current] [--format markdown|json]
+        \\usage: seq review-compiler-audit [--protocol auto|legacy-cleanroom|c3] --since <iso> --until <iso> --repo <path> [--exclude-current] [--format markdown|json]
         \\extra options:
+        \\  --protocol <name>        auto (default) | legacy-cleanroom | c3
         \\  --repo <path>             Match session cwd/tool cwd against this repo root or descendants
         \\  --exclude-current         Exclude the current CODEX_THREAD_ID session
-        \\  raw $resolve mentions are denominator candidates only; true sessions require assistant cleanroom workflow evidence
+        \\  raw $resolve mentions are denominator candidates only; true C3 sessions require assistant/tool C3 controller or MRPC evidence
         ,
         .goal_audit =>
         \\usage: seq goal-audit [--mode summary|rows] [--workflow review|resolve|review,resolve] [--duration-gte <seconds|minutes|hours>] [--status <name>] [--contains <text>] [--since <iso>] [--until <iso>] [--path <jsonl>|--session-id <id>] [--exclude-current] [--show-query] [--limit N] [--format table|json|csv|jsonl]
@@ -1209,6 +1211,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_include_root_equivalent = cmd == .adjudication_audit;
     const supports_bundle_dir = cmd == .adjudication_audit;
     const supports_token_cost_options = cmd == .token_cost;
+    const supports_protocol = cmd == .review_compiler_audit;
 
     try ensureOptionAllowed(opts.path != null, commandSupportsPath(cmd), "--path", cmd);
     try ensureOptionAllowed(opts.session_id != null, commandSupportsSessionId(cmd), "--session-id", cmd);
@@ -1253,6 +1256,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.repo_text != null, supports_repo, "--repo", cmd);
     try ensureOptionAllowed(opts.status != null, supports_status, "--status", cmd);
     try ensureOptionAllowed(opts.mode != null, supports_mode, "--mode", cmd);
+    try ensureOptionAllowed(opts.protocol_text != null, supports_protocol, "--protocol", cmd);
     try ensureOptionAllowed(opts.kind_text != null, supports_kind, "--kind", cmd);
     try ensureOptionAllowed(opts.surface_text != null, supports_surface, "--surface", cmd);
     try ensureOptionAllowed(opts.follow_text != null, supports_follow, "--follow", cmd);
@@ -1399,6 +1403,9 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         if (opts.since == null or opts.until == null or opts.repo_text == null) {
             printCliError("error: review-compiler-audit requires --since, --until, and --repo\n", .{});
             return error.MissingArgValue;
+        }
+        if (opts.protocol_text) |text| {
+            _ = try parseReviewCompilerProtocol(text);
         }
     }
     if (opts.unique_by_text) |text| {
@@ -4437,19 +4444,42 @@ const ResolvePathKind = enum {
     tests,
 };
 
+const ReviewCompilerProtocol = enum {
+    auto,
+    legacy_cleanroom,
+    c3,
+
+    fn label(self: ReviewCompilerProtocol) []const u8 {
+        return switch (self) {
+            .auto => "auto",
+            .legacy_cleanroom => "legacy-cleanroom",
+            .c3 => "c3",
+        };
+    }
+};
+
+fn parseReviewCompilerProtocol(text: []const u8) !ReviewCompilerProtocol {
+    if (std.mem.eql(u8, text, "auto")) return .auto;
+    if (std.mem.eql(u8, text, "legacy-cleanroom")) return .legacy_cleanroom;
+    if (std.mem.eql(u8, text, "c3")) return .c3;
+    printCliError("error: invalid --protocol value {s}; expected auto, legacy-cleanroom, or c3\n", .{text});
+    return error.InvalidModeArg;
+}
+
 const ReviewCompilerAudit = struct {
+    requested_protocol: ReviewCompilerProtocol = .auto,
     denominator: Denominator = .{},
-    cleanroom: Cleanroom = .{},
-    lab_vs_delivery: LabVsDelivery = .{},
-    liability: Liability = .{},
-    recipe: Recipe = .{},
-    ablation: Ablation = .{},
-    review_horizon: ReviewHorizon = .{},
-    compliance: Compliance = .{},
+    legacy_cleanroom: LegacyCleanroom = .{},
+    c3: C3 = .{},
 
     const Denominator = struct {
         candidate_sessions: usize = 0,
         true_resolve_sessions: usize = 0,
+        clean_review_sessions: usize = 0,
+        isolated_waiver_sessions: usize = 0,
+        c3_required_sessions: usize = 0,
+        c3_entered_sessions: usize = 0,
+        c3_closed_sessions: usize = 0,
         exclusions: std.ArrayList(Exclusion) = .empty,
 
         fn deinit(self: *Denominator, allocator: std.mem.Allocator) void {
@@ -4468,6 +4498,16 @@ const ReviewCompilerAudit = struct {
             allocator.free(self.path);
             allocator.free(self.reason);
         }
+    };
+
+    const LegacyCleanroom = struct {
+        cleanroom: Cleanroom = .{},
+        lab_vs_delivery: LabVsDelivery = .{},
+        liability: Liability = .{},
+        recipe: Recipe = .{},
+        ablation: Ablation = .{},
+        review_horizon: ReviewHorizon = .{},
+        compliance: Compliance = .{},
     };
 
     const Cleanroom = struct {
@@ -4523,6 +4563,108 @@ const ReviewCompilerAudit = struct {
         missing_ablation: usize = 0,
     };
 
+    const C3 = struct {
+        controller: Controller = .{},
+        counterexamples: Counterexamples = .{},
+        tournament: Tournament = .{},
+        semantic_cost: SemanticCost = .{},
+        ablation: C3Ablation = .{},
+        lab_vs_delivery: C3LabVsDelivery = .{},
+        holdout: Holdout = .{},
+        delivery: Delivery = .{},
+        compliance: C3Compliance = .{},
+    };
+
+    const Controller = struct {
+        begin_events: usize = 0,
+        state_files: usize = 0,
+        mrpc_apply_certified: usize = 0,
+        mrpc_final_certified: usize = 0,
+        mrpc_committed: usize = 0,
+        mrpc_pushed: usize = 0,
+        mrpc_closed: usize = 0,
+    };
+
+    const Counterexamples = struct {
+        raw_findings: usize = 0,
+        branch_liabilities: usize = 0,
+        non_branch_liabilities: usize = 0,
+        independent_families: usize = 0,
+        subsumed_findings: usize = 0,
+    };
+
+    const Tournament = struct {
+        candidate_records: usize = 0,
+        distinct_route_classes: usize = 0,
+        invalid_candidates: usize = 0,
+        active_negative_routes_excluded: usize = 0,
+        selected_candidates: usize = 0,
+        tournament_waivers: usize = 0,
+        single_candidate_material_violations: usize = 0,
+    };
+
+    const SemanticCost = struct {
+        selected_semantic_cost: usize = 0,
+        global_optimality_overclaims: usize = 0,
+    };
+
+    const C3Ablation = struct {
+        edit_atoms_tested: usize = 0,
+        removed: usize = 0,
+        survived: usize = 0,
+        orphan_edit_atoms: usize = 0,
+        one_minimal_passes: usize = 0,
+        one_minimal_failures: usize = 0,
+    };
+
+    const C3LabVsDelivery = struct {
+        lab_apply_patch_calls: usize = 0,
+        lab_commits: usize = 0,
+        candidate_surface_generated: usize = 0,
+        candidate_surface_discarded: usize = 0,
+        delivery_apply_events: usize = 0,
+        delivery_surface_shipped: usize = 0,
+        raw_delivery_mutations_while_frozen: usize = 0,
+    };
+
+    const Holdout = struct {
+        candidate_holdouts: usize = 0,
+        delivery_holdouts: usize = 0,
+        new_counterexamples: usize = 0,
+        invalidations: usize = 0,
+        recompilations: usize = 0,
+        adjacent_followups: usize = 0,
+    };
+
+    const Delivery = struct {
+        controller_commits: usize = 0,
+        raw_commits_while_active: usize = 0,
+        controller_pushes: usize = 0,
+        raw_pushes_while_active: usize = 0,
+        closed_runs: usize = 0,
+    };
+
+    const C3Compliance = struct {
+        basis_missing: usize = 0,
+        tournament_missing: usize = 0,
+        ablation_missing: usize = 0,
+        proof_missing: usize = 0,
+        holdout_missing: usize = 0,
+        stale_mrpc: usize = 0,
+        direct_review_to_delivery_mutation: usize = 0,
+        commit_or_push_bypass: usize = 0,
+    };
+
+    fn outputProtocol(self: ReviewCompilerAudit) ReviewCompilerProtocol {
+        return switch (self.requested_protocol) {
+            .auto => if (self.denominator.c3_required_sessions > 0 or self.denominator.c3_entered_sessions > 0 or self.c3.controller.state_files > 0 or self.c3.controller.mrpc_apply_certified > 0 or self.c3.controller.mrpc_final_certified > 0)
+                .c3
+            else
+                .legacy_cleanroom,
+            else => |protocol| protocol,
+        };
+    }
+
     fn deinit(self: *ReviewCompilerAudit, allocator: std.mem.Allocator) void {
         self.denominator.deinit(allocator);
     }
@@ -4531,6 +4673,8 @@ const ReviewCompilerAudit = struct {
 const ReviewCompilerSessionSignals = struct {
     candidate: bool = false,
     true_resolve: bool = false,
+    true_legacy: bool = false,
+    true_c3: bool = false,
     delivery_freeze_seen: bool = false,
     contract_seen: bool = false,
     recipe_seen: bool = false,
@@ -4542,6 +4686,25 @@ const ReviewCompilerSessionSignals = struct {
     delivery_mutation_seen: bool = false,
     delivery_before_recipe_seen: bool = false,
     non_branch_liability_seen: bool = false,
+    clean_review_seen: bool = false,
+    isolated_waiver_seen: bool = false,
+    c3_begin_seen: bool = false,
+    c3_begin_at_ms: ?i64 = null,
+    c3_closed_seen: bool = false,
+    c3_closed_at_ms: ?i64 = null,
+    c3_aborted_at_ms: ?i64 = null,
+    c3_basis_seen: bool = false,
+    c3_tournament_seen: bool = false,
+    c3_ablation_seen: bool = false,
+    c3_proof_seen: bool = false,
+    c3_holdout_seen: bool = false,
+    c3_mrpc_seen: bool = false,
+    c3_new_counterexample_seen: bool = false,
+    c3_reset_seen: bool = false,
+    c3_basis_after_reset_seen: bool = false,
+    c3_recompiled_seen: bool = false,
+    c3_raw_delivery_mutation_seen: bool = false,
+    c3_candidate_worktree_context_seen: bool = false,
 };
 
 fn cmdResolveChurnAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
@@ -4675,7 +4838,9 @@ fn cmdReviewCompilerAudit(allocator: std.mem.Allocator, sessions_root: []const u
         null;
     defer if (current_thread_id) |id| allocator.free(id);
 
-    var audit = ReviewCompilerAudit{};
+    var audit = ReviewCompilerAudit{
+        .requested_protocol = if (opts.protocol_text) |text| try parseReviewCompilerProtocol(text) else .auto,
+    };
     defer audit.deinit(allocator);
 
     var paths = try collectTraceRolloutPaths(allocator, sessions_root);
@@ -4706,8 +4871,18 @@ fn cmdReviewCompilerAudit(allocator: std.mem.Allocator, sessions_root: []const u
         var signals = summarizeReviewCompilerSession(messages, parsed, opts);
         if (!signals.candidate) continue;
         audit.denominator.candidate_sessions += 1;
-        if (!signals.true_resolve) {
-            try addReviewCompilerExclusion(allocator, &audit, parsed.session.session_id, path, "candidate_without_assistant_cleanroom_evidence");
+        const protocol_match = switch (audit.requested_protocol) {
+            .auto => signals.true_resolve,
+            .legacy_cleanroom => signals.true_legacy,
+            .c3 => signals.true_c3,
+        };
+        if (!protocol_match) {
+            const reason: []const u8 = switch (audit.requested_protocol) {
+                .auto => "candidate_without_protocol_evidence",
+                .legacy_cleanroom => "candidate_without_assistant_cleanroom_evidence",
+                .c3 => "candidate_without_c3_evidence",
+            };
+            try addReviewCompilerExclusion(allocator, &audit, parsed.session.session_id, path, reason);
             continue;
         }
 
@@ -4835,12 +5010,26 @@ fn summarizeReviewCompilerSession(
     for (messages) |message| {
         if (!timestampSatisfiesBounds(message.timestamp, opts)) continue;
         if (containsReviewCompilerCandidateCue(message.text)) signals.candidate = true;
-        if (std.mem.eql(u8, message.role, "assistant") and containsTrueReviewCompilerAssistantEvidence(message.text)) {
+        if (!std.mem.eql(u8, message.role, "assistant")) continue;
+        if (containsTrueReviewCompilerAssistantEvidence(message.text)) {
             signals.candidate = true;
+            signals.true_legacy = true;
+            signals.true_resolve = true;
+        }
+        if (containsTrueC3Evidence(message.text)) {
+            signals.candidate = true;
+            signals.true_c3 = true;
             signals.true_resolve = true;
         }
     }
-    _ = parsed;
+    for (parsed.tools.items) |tool| {
+        if (!toolTimestampSatisfiesBounds(parsed, tool, opts)) continue;
+        if (toolHasC3Evidence(tool)) {
+            signals.candidate = true;
+            signals.true_c3 = true;
+            signals.true_resolve = true;
+        }
+    }
     return signals;
 }
 
@@ -4850,6 +5039,11 @@ fn containsReviewCompilerCandidateCue(text: []const u8) bool {
             "review compiler",
             "review-compiler-audit",
             "review_compiler_audit",
+            "review_compile.py",
+            ".resolve-c3",
+            "minimal_review_patch_certificate",
+            "MRPC-v1",
+            "Counterexample Compression Compiler",
             "cleanroom",
             "delivery_freeze",
             "counterexample_contract",
@@ -4868,6 +5062,25 @@ fn containsTrueReviewCompilerAssistantEvidence(text: []const u8) bool {
         "ABL-CERT-v1",
         "RGR-V4-COMPILED-DELIVERY-PERMIT",
     });
+}
+
+fn containsTrueC3Evidence(text: []const u8) bool {
+    return containsAnyIgnoreCaseAscii(text, &.{
+        "review_compile.py begin",
+        ".resolve-c3/state.json",
+        "minimal_review_patch_certificate",
+        "MRPC-v1",
+    });
+}
+
+fn toolHasC3Evidence(tool: canonical_trace.ToolLifecycleRecord) bool {
+    if (tool.lifecycle_status != .completed) return false;
+    if (tool.kind == .exec_command and (tool.exit_code orelse -1) != 0) return false;
+    return containsTrueC3Evidence(tool.command_text orelse "") or
+        containsTrueC3Evidence(tool.input_text orelse "") or
+        containsTrueC3Evidence(tool.arguments_json orelse "") or
+        containsTrueC3Evidence(tool.output_text orelse "") or
+        containsTrueC3Evidence(tool.patch_changes_json orelse "");
 }
 
 fn containsReviewCompilerBranchLiabilityCue(text: []const u8) bool {
@@ -4891,24 +5104,24 @@ fn recordReviewCompilerMessages(
         const text = message.text;
 
         if (containsAnyIgnoreCaseAscii(text, &.{ "delivery_freeze", "DF-v1", "delivery freeze" })) {
-            audit.cleanroom.delivery_freezes += 1;
+            audit.legacy_cleanroom.cleanroom.delivery_freezes += 1;
             signals.delivery_freeze_seen = true;
         }
         if (containsAnyIgnoreCaseAscii(text, &.{ "counterexample_contract", "CEC-v1", "counterexample contract" })) {
-            audit.cleanroom.counterexample_contracts += 1;
+            audit.legacy_cleanroom.cleanroom.counterexample_contracts += 1;
             signals.contract_seen = true;
         }
         if (containsAnyIgnoreCaseAscii(text, &.{ "delivery_patch_recipe", "DPR-v1", "delivery patch recipe" })) {
-            audit.cleanroom.delivery_recipes += 1;
+            audit.legacy_cleanroom.cleanroom.delivery_recipes += 1;
             signals.recipe_seen = true;
             recordReviewCompilerSignalTime(signals, .recipe, message.timestamp);
         }
         if (containsAnyIgnoreCaseAscii(text, &.{ "ablation_certificate", "ABL-CERT-v1", "ablation certificate" })) {
-            audit.cleanroom.ablation_certificates += 1;
+            audit.legacy_cleanroom.cleanroom.ablation_certificates += 1;
             signals.ablation_seen = true;
         }
         if (containsAnyIgnoreCaseAscii(text, &.{ "RGR-V4-COMPILED-DELIVERY-PERMIT", "compiled_delivery_permit" })) {
-            audit.cleanroom.compiled_delivery_permits += 1;
+            audit.legacy_cleanroom.cleanroom.compiled_delivery_permits += 1;
             signals.permit_seen = true;
             recordReviewCompilerSignalTime(signals, .permit, message.timestamp);
         }
@@ -4917,30 +5130,144 @@ fn recordReviewCompilerMessages(
             signals.lab_context_seen = true;
         }
 
-        if (containsReviewCompilerBranchLiabilityCue(text)) audit.liability.branch_liabilities += 1;
+        if (containsReviewCompilerBranchLiabilityCue(text)) audit.legacy_cleanroom.liability.branch_liabilities += 1;
         if (containsReviewCompilerNonBranchLiabilityCue(text)) {
-            audit.liability.non_branch_liabilities += 1;
+            audit.legacy_cleanroom.liability.non_branch_liabilities += 1;
             signals.non_branch_liability_seen = true;
         }
-        if (containsAnyIgnoreCaseAscii(text, &.{ "liability_followups_captured", "liability followup captured", "liability follow-up captured" })) audit.liability.followups_captured += 1;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "liability_followups_captured", "liability followup captured", "liability follow-up captured" })) audit.legacy_cleanroom.liability.followups_captured += 1;
 
-        if (containsAnyIgnoreCaseAscii(text, &.{ "falsified_routes_excluded", "falsified route excluded" })) audit.recipe.falsified_routes_excluded += 1;
-        if (containsAnyIgnoreCaseAscii(text, &.{ "surfaces_to_retire", "surface to retire" })) audit.recipe.surfaces_to_retire += 1;
-        if (containsAnyIgnoreCaseAscii(text, &.{ "permitted_new_surface", "permitted new surface" })) audit.recipe.permitted_new_surface += 1;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "falsified_routes_excluded", "falsified route excluded" })) audit.legacy_cleanroom.recipe.falsified_routes_excluded += 1;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "surfaces_to_retire", "surface to retire" })) audit.legacy_cleanroom.recipe.surfaces_to_retire += 1;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "permitted_new_surface", "permitted new surface" })) audit.legacy_cleanroom.recipe.permitted_new_surface += 1;
 
-        if (containsAnyIgnoreCaseAscii(text, &.{ "surfaces_removed", "removed_from_recipe", "removed from recipe" })) audit.ablation.surfaces_removed += 1;
-        if (containsAnyIgnoreCaseAscii(text, &.{ "surfaces_survived", "survived_ablation", "survived ablation" })) audit.ablation.surfaces_survived += 1;
-        if (containsAnyIgnoreCaseAscii(text, &.{ "tests_merged_or_retired", "tests merged", "tests retired" })) audit.ablation.tests_merged_or_retired += 1;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "surfaces_removed", "removed_from_recipe", "removed from recipe" })) audit.legacy_cleanroom.ablation.surfaces_removed += 1;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "surfaces_survived", "survived_ablation", "survived ablation" })) audit.legacy_cleanroom.ablation.surfaces_survived += 1;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "tests_merged_or_retired", "tests merged", "tests retired" })) audit.legacy_cleanroom.ablation.tests_merged_or_retired += 1;
 
-        if (containsAnyIgnoreCaseAscii(text, &.{ "initial_broad", "initial broad", "broad review" })) audit.review_horizon.initial_broad_reviews += 1;
-        if (containsAnyIgnoreCaseAscii(text, &.{ "targeted_reviews", "targeted review", "targeted:", " targeted " })) audit.review_horizon.targeted_reviews += 1;
-        if (containsAnyIgnoreCaseAscii(text, &.{ "final_holdout", "final holdout", "holdout review" })) audit.review_horizon.final_holdout_reviews += 1;
-        if (containsAnyIgnoreCaseAscii(text, &.{ "holdout_findings_added_to_scope", "holdout findings added" })) audit.review_horizon.holdout_findings_added_to_scope += 1;
-        if (containsAnyIgnoreCaseAscii(text, &.{ "holdout_followups_captured", "holdout followups captured", "holdout follow-ups captured" })) audit.review_horizon.holdout_followups_captured += 1;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "initial_broad", "initial broad", "broad review" })) audit.legacy_cleanroom.review_horizon.initial_broad_reviews += 1;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "targeted_reviews", "targeted review", "targeted:", " targeted " })) audit.legacy_cleanroom.review_horizon.targeted_reviews += 1;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "final_holdout", "final holdout", "holdout review" })) audit.legacy_cleanroom.review_horizon.final_holdout_reviews += 1;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "holdout_findings_added_to_scope", "holdout findings added" })) audit.legacy_cleanroom.review_horizon.holdout_findings_added_to_scope += 1;
+        if (containsAnyIgnoreCaseAscii(text, &.{ "holdout_followups_captured", "holdout followups captured", "holdout follow-ups captured" })) audit.legacy_cleanroom.review_horizon.holdout_followups_captured += 1;
+
+        recordReviewCompilerC3Text(audit, text, message.timestamp, signals);
     }
 }
 
 const ReviewCompilerSignalTimeKind = enum { recipe, permit };
+
+fn recordReviewCompilerC3Text(
+    audit: *ReviewCompilerAudit,
+    text: []const u8,
+    timestamp: ?[]const u8,
+    signals: *ReviewCompilerSessionSignals,
+) void {
+    if (containsAnyIgnoreCaseAscii(text, &.{ "clean_review: true", "clean review", "clean_review_session" })) signals.clean_review_seen = true;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "isolated_waiver", "isolated waiver" })) signals.isolated_waiver_seen = true;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "candidate-worktree", "candidate worktree" })) signals.c3_candidate_worktree_context_seen = true;
+
+    if (containsAnyIgnoreCaseAscii(text, &.{ "review_compile.py begin", "\"event\":\"begin\"", "\"event\": \"begin\"", "\nbegin\n" })) {
+        audit.c3.controller.begin_events += 1;
+        signals.c3_begin_seen = true;
+        recordReviewCompilerC3Time(signals, .begin, timestamp);
+    }
+    if (containsIgnoreCaseAscii(text, ".resolve-c3/state.json")) audit.c3.controller.state_files += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "apply-certified", "apply_certified", "mrpc_apply_certified" })) audit.c3.controller.mrpc_apply_certified += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "final-certified", "final_certified", "mrpc_final_certified" })) audit.c3.controller.mrpc_final_certified += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "MRPC-v1", "minimal_review_patch_certificate" })) signals.c3_mrpc_seen = true;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "committed", "mrpc_committed" })) audit.c3.controller.mrpc_committed += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "pushed", "mrpc_pushed" })) audit.c3.controller.mrpc_pushed += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "closed", "mrpc_closed" })) {
+        audit.c3.controller.mrpc_closed += 1;
+        audit.c3.delivery.closed_runs += 1;
+        signals.c3_closed_seen = true;
+        recordReviewCompilerC3Time(signals, .closed, timestamp);
+    }
+    if (containsAnyIgnoreCaseAscii(text, &.{ "aborted", "\"event\":\"aborted\"", "\"event\": \"aborted\"" })) recordReviewCompilerC3Time(signals, .aborted, timestamp);
+
+    if (containsAnyIgnoreCaseAscii(text, &.{ "raw_finding", "raw finding", "counterexample-added", "counterexample_added" })) audit.c3.counterexamples.raw_findings += 1;
+    if (containsReviewCompilerBranchLiabilityCue(text)) audit.c3.counterexamples.branch_liabilities += 1;
+    if (containsReviewCompilerNonBranchLiabilityCue(text)) audit.c3.counterexamples.non_branch_liabilities += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "independent_family", "independent families", "independent_families" })) audit.c3.counterexamples.independent_families += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "subsumed_finding", "subsumed finding", "subsumed_findings" })) audit.c3.counterexamples.subsumed_findings += 1;
+
+    if (containsAnyIgnoreCaseAscii(text, &.{ "basis-set", "basis_set", "basis:" })) {
+        signals.c3_basis_seen = true;
+        if (signals.c3_reset_seen) signals.c3_basis_after_reset_seen = true;
+    }
+    if (containsAnyIgnoreCaseAscii(text, &.{ "candidate-registered", "candidate_registered", "candidate_records" })) {
+        audit.c3.tournament.candidate_records += 1;
+        signals.c3_tournament_seen = true;
+    }
+    if (containsAnyIgnoreCaseAscii(text, &.{ "route_class", "route class" })) audit.c3.tournament.distinct_route_classes += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "invalid_candidate", "invalid candidate", "invalid_candidates" })) audit.c3.tournament.invalid_candidates += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "active_negative_routes_excluded", "active negative route excluded" })) audit.c3.tournament.active_negative_routes_excluded += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "candidate-selected", "candidate_selected", "selected_candidates" })) {
+        audit.c3.tournament.selected_candidates += 1;
+        signals.c3_tournament_seen = true;
+    }
+    if (containsAnyIgnoreCaseAscii(text, &.{ "tournament_waiver", "tournament waiver" })) {
+        audit.c3.tournament.tournament_waivers += 1;
+        signals.isolated_waiver_seen = true;
+    }
+    if (containsAnyIgnoreCaseAscii(text, &.{ "single_candidate_material_violation", "single-candidate material violation" })) audit.c3.tournament.single_candidate_material_violations += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "global_optimality_overclaim", "global optimality overclaim" })) audit.c3.semantic_cost.global_optimality_overclaims += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "selected_semantic_cost:", "selected semantic cost:" })) audit.c3.semantic_cost.selected_semantic_cost += 1;
+
+    if (containsAnyIgnoreCaseAscii(text, &.{ "ablation-recorded", "ablation_recorded" })) signals.c3_ablation_seen = true;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "edit_atoms_tested", "edit atom tested", "edit_atoms:" })) {
+        audit.c3.ablation.edit_atoms_tested += 1;
+        signals.c3_ablation_seen = true;
+    }
+    if (containsAnyIgnoreCaseAscii(text, &.{ "removed_edit_atom", "removed edit atom", "removed:" })) audit.c3.ablation.removed += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "survived_edit_atom", "survived edit atom", "survived:" })) audit.c3.ablation.survived += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "orphan_edit_atom", "orphan edit atom", "orphan_edit_atoms" })) audit.c3.ablation.orphan_edit_atoms += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "one_minimal_pass", "one minimal pass" })) audit.c3.ablation.one_minimal_passes += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "one_minimal_failure", "one minimal failure" })) audit.c3.ablation.one_minimal_failures += 1;
+
+    if (containsAnyIgnoreCaseAscii(text, &.{ "candidate_surface_generated", "candidate surface generated" })) audit.c3.lab_vs_delivery.candidate_surface_generated += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "candidate_surface_discarded", "candidate surface discarded" })) audit.c3.lab_vs_delivery.candidate_surface_discarded += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "patch-applied", "patch_applied" })) audit.c3.lab_vs_delivery.delivery_apply_events += 1;
+
+    if (containsAnyIgnoreCaseAscii(text, &.{ "candidate_holdout", "candidate holdout" })) {
+        audit.c3.holdout.candidate_holdouts += 1;
+        signals.c3_holdout_seen = true;
+    }
+    if (containsAnyIgnoreCaseAscii(text, &.{ "delivery_holdout", "delivery holdout", "holdout-recorded", "holdout_recorded" })) {
+        audit.c3.holdout.delivery_holdouts += 1;
+        signals.c3_holdout_seen = true;
+    }
+    if (containsAnyIgnoreCaseAscii(text, &.{ "new_counterexample", "new counterexample" })) {
+        audit.c3.holdout.new_counterexamples += 1;
+        signals.c3_new_counterexample_seen = true;
+    }
+    if (containsAnyIgnoreCaseAscii(text, &.{ "invalidated", "invalidation", "invalidations" })) audit.c3.holdout.invalidations += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "reset", "basis reset", "recompile", "recompilation" })) signals.c3_reset_seen = true;
+    if (signals.c3_new_counterexample_seen and signals.c3_reset_seen and signals.c3_basis_after_reset_seen and !signals.c3_recompiled_seen) {
+        audit.c3.holdout.recompilations += 1;
+        signals.c3_recompiled_seen = true;
+    }
+    if (containsAnyIgnoreCaseAscii(text, &.{ "adjacent_followup", "adjacent follow-up", "adjacent followup" })) audit.c3.holdout.adjacent_followups += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "proof-recorded", "proof_recorded" })) signals.c3_proof_seen = true;
+}
+
+const ReviewCompilerC3TimeKind = enum { begin, closed, aborted };
+
+fn recordReviewCompilerC3Time(signals: *ReviewCompilerSessionSignals, kind: ReviewCompilerC3TimeKind, timestamp: ?[]const u8) void {
+    const ms = time_utils.parseIsoTimestampMillis(timestamp orelse return) orelse return;
+    switch (kind) {
+        .begin => {
+            if (signals.c3_begin_at_ms == null or ms < signals.c3_begin_at_ms.?) signals.c3_begin_at_ms = ms;
+        },
+        .closed => {
+            if (signals.c3_closed_at_ms == null or ms < signals.c3_closed_at_ms.?) signals.c3_closed_at_ms = ms;
+        },
+        .aborted => {
+            if (signals.c3_aborted_at_ms == null or ms < signals.c3_aborted_at_ms.?) signals.c3_aborted_at_ms = ms;
+        },
+    }
+}
 
 fn recordReviewCompilerSignalTime(signals: *ReviewCompilerSessionSignals, kind: ReviewCompilerSignalTimeKind, timestamp: ?[]const u8) void {
     const ms = time_utils.parseIsoTimestampMillis(timestamp orelse return) orelse return;
@@ -4966,38 +5293,75 @@ fn recordReviewCompilerTools(
         if (!toolTimestampSatisfiesBounds(parsed, tool, opts)) continue;
         if (!toolIsInRepoScope(allocator, repo_root, parsed.session.cwd, tool)) continue;
         const is_lab = toolLooksReviewLab(tool, signals.*);
+        const tool_text = reviewCompilerToolText(tool);
+        if (toolHasC3Evidence(tool) or containsReviewCompilerCandidateCue(tool_text)) {
+            recordReviewCompilerC3Text(audit, tool_text, toolTimestamp(parsed, tool), signals);
+        }
 
         if (tool.kind == .patch_apply and tool.lifecycle_status == .completed and tool.patch_success != false) {
             const patch_text = tool.input_text orelse tool.arguments_json orelse tool.patch_changes_json orelse "";
             const counts = countResolvePatchLines(patch_text);
             const surface = reviewCompilerSurfaceCount(counts);
             if (is_lab) {
-                audit.lab_vs_delivery.lab_apply_patch_calls += 1;
-                audit.lab_vs_delivery.lab_surface_added += surface;
-                audit.lab_vs_delivery.lab_surface_discarded += surface;
+                audit.legacy_cleanroom.lab_vs_delivery.lab_apply_patch_calls += 1;
+                audit.legacy_cleanroom.lab_vs_delivery.lab_surface_added += surface;
+                audit.legacy_cleanroom.lab_vs_delivery.lab_surface_discarded += surface;
+                audit.c3.lab_vs_delivery.lab_apply_patch_calls += 1;
+                audit.c3.lab_vs_delivery.candidate_surface_generated += surface;
+                audit.c3.lab_vs_delivery.candidate_surface_discarded += surface;
             } else {
-                audit.lab_vs_delivery.delivery_apply_patch_calls += 1;
-                audit.lab_vs_delivery.delivery_surface_shipped += surface;
+                audit.legacy_cleanroom.lab_vs_delivery.delivery_apply_patch_calls += 1;
+                audit.legacy_cleanroom.lab_vs_delivery.delivery_surface_shipped += surface;
                 signals.delivery_mutation_seen = true;
                 if (reviewCompilerToolBeforeSignal(parsed, tool, signals.recipe_seen_at_ms)) signals.delivery_before_recipe_seen = true;
-                if (reviewCompilerToolBeforeSignal(parsed, tool, signals.permit_seen_at_ms)) audit.compliance.review_derived_delivery_patches += 1;
-                if (reviewCompilerToolMutatesNonBranchLiability(tool)) audit.liability.non_branch_liabilities_mutated += 1;
+                if (reviewCompilerToolBeforeSignal(parsed, tool, signals.permit_seen_at_ms)) audit.legacy_cleanroom.compliance.review_derived_delivery_patches += 1;
+                if (reviewCompilerToolMutatesNonBranchLiability(tool)) audit.legacy_cleanroom.liability.non_branch_liabilities_mutated += 1;
+                audit.c3.lab_vs_delivery.delivery_surface_shipped += surface;
+                if (reviewCompilerC3ToolWhileActive(parsed, tool, signals.*)) {
+                    audit.c3.lab_vs_delivery.raw_delivery_mutations_while_frozen += 1;
+                    signals.c3_raw_delivery_mutation_seen = true;
+                    audit.c3.compliance.direct_review_to_delivery_mutation += 1;
+                }
             }
             continue;
         }
 
         if (tool.kind == .exec_command and tool.lifecycle_status == .completed and (tool.exit_code orelse -1) == 0) {
             const cmd = tool.command_text orelse "";
+            if (commandContainsReviewCompileController(cmd, "apply")) audit.c3.lab_vs_delivery.delivery_apply_events += 1;
+            if (commandContainsReviewCompileController(cmd, "commit")) {
+                audit.c3.delivery.controller_commits += 1;
+                audit.c3.controller.mrpc_committed += 1;
+            }
+            if (commandContainsReviewCompileController(cmd, "push")) {
+                audit.c3.delivery.controller_pushes += 1;
+                audit.c3.controller.mrpc_pushed += 1;
+            }
+            if (commandContainsReviewCompileController(cmd, "close") or commandContainsReviewCompileController(cmd, "closed")) {
+                audit.c3.delivery.closed_runs += 1;
+                audit.c3.controller.mrpc_closed += 1;
+                signals.c3_closed_seen = true;
+                recordReviewCompilerC3Time(signals, .closed, toolTimestamp(parsed, tool));
+            }
             if (containsGitCommitCommand(cmd)) {
                 if (is_lab) {
-                    audit.lab_vs_delivery.lab_commits += 1;
+                    audit.legacy_cleanroom.lab_vs_delivery.lab_commits += 1;
+                    audit.c3.lab_vs_delivery.lab_commits += 1;
                 } else {
-                    audit.lab_vs_delivery.delivery_commits += 1;
+                    audit.legacy_cleanroom.lab_vs_delivery.delivery_commits += 1;
                     signals.delivery_mutation_seen = true;
                     if (reviewCompilerToolBeforeSignal(parsed, tool, signals.recipe_seen_at_ms)) signals.delivery_before_recipe_seen = true;
-                    if (reviewCompilerToolBeforeSignal(parsed, tool, signals.permit_seen_at_ms)) audit.compliance.review_derived_delivery_patches += 1;
-                    if (reviewCompilerToolMutatesNonBranchLiability(tool)) audit.liability.non_branch_liabilities_mutated += 1;
+                    if (reviewCompilerToolBeforeSignal(parsed, tool, signals.permit_seen_at_ms)) audit.legacy_cleanroom.compliance.review_derived_delivery_patches += 1;
+                    if (reviewCompilerToolMutatesNonBranchLiability(tool)) audit.legacy_cleanroom.liability.non_branch_liabilities_mutated += 1;
+                    if (reviewCompilerC3ToolWhileActive(parsed, tool, signals.*) and !commandContainsReviewCompileController(cmd, "commit")) {
+                        audit.c3.delivery.raw_commits_while_active += 1;
+                        audit.c3.compliance.commit_or_push_bypass += 1;
+                    }
                 }
+            }
+            if (containsGitPushCommand(cmd) and reviewCompilerC3ToolWhileActive(parsed, tool, signals.*) and !commandContainsReviewCompileController(cmd, "push")) {
+                audit.c3.delivery.raw_pushes_while_active += 1;
+                audit.c3.compliance.commit_or_push_bypass += 1;
             }
         }
     }
@@ -5010,16 +5374,46 @@ fn reviewCompilerToolBeforeSignal(parsed: canonical_trace.CanonicalSessionTrace,
 }
 
 fn reviewCompilerToolMutatesNonBranchLiability(tool: canonical_trace.ToolLifecycleRecord) bool {
-    const text = tool.command_text orelse tool.input_text orelse tool.arguments_json orelse tool.patch_changes_json orelse "";
-    return containsAnyIgnoreCaseAscii(text, &.{ "non_branch_liability", "non_branch_liabilities", "non-branch liability" });
+    return reviewCompilerToolContainsAny(tool, &.{ "non_branch_liability", "non_branch_liabilities", "non-branch liability" });
 }
 
 fn toolLooksReviewLab(tool: canonical_trace.ToolLifecycleRecord, signals: ReviewCompilerSessionSignals) bool {
     const cwd = tool.cwd orelse "";
-    const text = tool.command_text orelse tool.input_text orelse tool.arguments_json orelse "";
+    const lab_terms = &.{ "review-lab", "review_lab", "resolve-lab", "scratch worktree", "candidate-worktree", "candidate worktree" };
     return containsAnyIgnoreCaseAscii(cwd, &.{ "review-lab", "review_lab", "resolve-lab", "scratch" }) or
-        containsAnyIgnoreCaseAscii(text, &.{ "review-lab", "review_lab", "resolve-lab", "scratch worktree" }) or
-        (signals.lab_context_seen and containsAnyIgnoreCaseAscii(text, &.{ "lab patch", "lab commit", "review lab" }));
+        reviewCompilerToolContainsAny(tool, lab_terms) or
+        (signals.c3_candidate_worktree_context_seen and tool.kind == .patch_apply) or
+        (signals.lab_context_seen and reviewCompilerToolContainsAny(tool, &.{ "lab patch", "lab commit", "review lab" }));
+}
+
+fn reviewCompilerToolText(tool: canonical_trace.ToolLifecycleRecord) []const u8 {
+    return tool.output_text orelse tool.command_text orelse tool.input_text orelse tool.arguments_json orelse tool.patch_changes_json orelse "";
+}
+
+fn reviewCompilerToolContainsAny(tool: canonical_trace.ToolLifecycleRecord, needles: []const []const u8) bool {
+    return containsAnyIgnoreCaseAscii(tool.command_text orelse "", needles) or
+        containsAnyIgnoreCaseAscii(tool.input_text orelse "", needles) or
+        containsAnyIgnoreCaseAscii(tool.arguments_json orelse "", needles) or
+        containsAnyIgnoreCaseAscii(tool.output_text orelse "", needles) or
+        containsAnyIgnoreCaseAscii(tool.patch_changes_json orelse "", needles);
+}
+
+fn commandContainsReviewCompileController(cmd: []const u8, subcommand: []const u8) bool {
+    if (!containsIgnoreCaseAscii(cmd, "review_compile.py")) return false;
+    return containsIgnoreCaseAscii(cmd, subcommand);
+}
+
+fn reviewCompilerC3ToolWhileActive(parsed: canonical_trace.CanonicalSessionTrace, tool: canonical_trace.ToolLifecycleRecord, signals: ReviewCompilerSessionSignals) bool {
+    const begin_ms = signals.c3_begin_at_ms orelse return false;
+    const tool_ms = toolTimestampMillis(parsed, tool) orelse return false;
+    if (tool_ms < begin_ms) return false;
+    if (signals.c3_closed_at_ms) |closed_ms| {
+        if (tool_ms >= closed_ms) return false;
+    }
+    if (signals.c3_aborted_at_ms) |aborted_ms| {
+        if (tool_ms >= aborted_ms) return false;
+    }
+    return true;
 }
 
 fn reviewCompilerSurfaceCount(counts: ResolvePatchCounts) usize {
@@ -5027,11 +5421,30 @@ fn reviewCompilerSurfaceCount(counts: ResolvePatchCounts) usize {
 }
 
 fn finalizeReviewCompilerCompliance(audit: *ReviewCompilerAudit, signals: ReviewCompilerSessionSignals) void {
-    if (!signals.delivery_mutation_seen) return;
-    if (signals.delivery_before_recipe_seen) audit.compliance.delivery_mutations_before_recipe += 1;
-    if (!signals.contract_seen) audit.compliance.missing_contract += 1;
-    if (!signals.recipe_seen) audit.compliance.missing_recipe += 1;
-    if (!signals.ablation_seen) audit.compliance.missing_ablation += 1;
+    if (signals.clean_review_seen) audit.denominator.clean_review_sessions += 1;
+    if (signals.isolated_waiver_seen) audit.denominator.isolated_waiver_sessions += 1;
+    if (signals.true_c3 and !signals.clean_review_seen and !signals.isolated_waiver_seen) audit.denominator.c3_required_sessions += 1;
+    if (signals.c3_begin_seen) audit.denominator.c3_entered_sessions += 1;
+    if (signals.c3_closed_seen) audit.denominator.c3_closed_sessions += 1;
+
+    if (signals.delivery_mutation_seen) {
+        if (signals.delivery_before_recipe_seen) audit.legacy_cleanroom.compliance.delivery_mutations_before_recipe += 1;
+        if (!signals.contract_seen) audit.legacy_cleanroom.compliance.missing_contract += 1;
+        if (!signals.recipe_seen) audit.legacy_cleanroom.compliance.missing_recipe += 1;
+        if (!signals.ablation_seen) audit.legacy_cleanroom.compliance.missing_ablation += 1;
+    }
+
+    if (!signals.true_c3) return;
+    if (!signals.clean_review_seen and !signals.isolated_waiver_seen) {
+        if (!signals.c3_basis_seen) audit.c3.compliance.basis_missing += 1;
+        if (!signals.c3_tournament_seen) audit.c3.compliance.tournament_missing += 1;
+        if (!signals.c3_ablation_seen) audit.c3.compliance.ablation_missing += 1;
+        if (!signals.c3_proof_seen) audit.c3.compliance.proof_missing += 1;
+        if (!signals.c3_holdout_seen) audit.c3.compliance.holdout_missing += 1;
+    }
+    if (signals.c3_mrpc_seen and signals.c3_raw_delivery_mutation_seen) {
+        audit.c3.compliance.stale_mrpc += 1;
+    }
 }
 
 fn recordResolveMessages(
@@ -5220,6 +5633,10 @@ fn containsGitCommitCommand(text: []const u8) bool {
     return containsIgnoreCaseAscii(text, "git commit");
 }
 
+fn containsGitPushCommand(text: []const u8) bool {
+    return containsIgnoreCaseAscii(text, "git push");
+}
+
 fn addResolvePatchCounts(mutation: *ResolveChurnAudit.Mutation, counts: ResolvePatchCounts) void {
     mutation.production_insertions += counts.production_insertions;
     mutation.production_deletions += counts.production_deletions;
@@ -5394,8 +5811,10 @@ fn writeReviewCompilerAuditMarkdown(allocator: std.mem.Allocator, audit: ReviewC
 }
 
 fn writeReviewCompilerAuditYamlBody(writer: anytype, audit: ReviewCompilerAudit, indent: []const u8) !void {
+    const protocol = audit.outputProtocol();
+    try writer.print("{s}protocol: {s}\n", .{ indent, protocol.label() });
     try writer.print("{s}denominator:\n", .{indent});
-    try writer.print("{s}  candidate_sessions: {d}\n{s}  true_resolve_sessions: {d}\n", .{ indent, audit.denominator.candidate_sessions, indent, audit.denominator.true_resolve_sessions });
+    try writer.print("{s}  candidate_sessions: {d}\n{s}  true_resolve_sessions: {d}\n{s}  clean_review_sessions: {d}\n{s}  isolated_waiver_sessions: {d}\n{s}  c3_required_sessions: {d}\n{s}  c3_entered_sessions: {d}\n{s}  c3_closed_sessions: {d}\n", .{ indent, audit.denominator.candidate_sessions, indent, audit.denominator.true_resolve_sessions, indent, audit.denominator.clean_review_sessions, indent, audit.denominator.isolated_waiver_sessions, indent, audit.denominator.c3_required_sessions, indent, audit.denominator.c3_entered_sessions, indent, audit.denominator.c3_closed_sessions });
     try writer.print("{s}  exclusions:", .{indent});
     if (audit.denominator.exclusions.items.len == 0) {
         try writer.writeAll(" []\n");
@@ -5413,13 +5832,47 @@ fn writeReviewCompilerAuditYamlBody(writer: anytype, audit: ReviewCompilerAudit,
             try writer.writeByte('\n');
         }
     }
-    try writer.print("{s}cleanroom:\n{s}  delivery_freezes: {d}\n{s}  counterexample_contracts: {d}\n{s}  delivery_recipes: {d}\n{s}  ablation_certificates: {d}\n{s}  compiled_delivery_permits: {d}\n", .{ indent, indent, audit.cleanroom.delivery_freezes, indent, audit.cleanroom.counterexample_contracts, indent, audit.cleanroom.delivery_recipes, indent, audit.cleanroom.ablation_certificates, indent, audit.cleanroom.compiled_delivery_permits });
-    try writer.print("{s}lab_vs_delivery:\n{s}  lab_apply_patch_calls: {d}\n{s}  lab_commits: {d}\n{s}  delivery_apply_patch_calls: {d}\n{s}  delivery_commits: {d}\n{s}  lab_surface_added: {d}\n{s}  lab_surface_discarded: {d}\n{s}  delivery_surface_shipped: {d}\n", .{ indent, indent, audit.lab_vs_delivery.lab_apply_patch_calls, indent, audit.lab_vs_delivery.lab_commits, indent, audit.lab_vs_delivery.delivery_apply_patch_calls, indent, audit.lab_vs_delivery.delivery_commits, indent, audit.lab_vs_delivery.lab_surface_added, indent, audit.lab_vs_delivery.lab_surface_discarded, indent, audit.lab_vs_delivery.delivery_surface_shipped });
-    try writer.print("{s}liability:\n{s}  branch_liabilities: {d}\n{s}  non_branch_liabilities: {d}\n{s}  followups_captured: {d}\n{s}  non_branch_liabilities_mutated: {d}\n", .{ indent, indent, audit.liability.branch_liabilities, indent, audit.liability.non_branch_liabilities, indent, audit.liability.followups_captured, indent, audit.liability.non_branch_liabilities_mutated });
-    try writer.print("{s}recipe:\n{s}  falsified_routes_excluded: {d}\n{s}  surfaces_to_retire: {d}\n{s}  permitted_new_surface: {d}\n", .{ indent, indent, audit.recipe.falsified_routes_excluded, indent, audit.recipe.surfaces_to_retire, indent, audit.recipe.permitted_new_surface });
-    try writer.print("{s}ablation:\n{s}  surfaces_removed: {d}\n{s}  surfaces_survived: {d}\n{s}  tests_merged_or_retired: {d}\n", .{ indent, indent, audit.ablation.surfaces_removed, indent, audit.ablation.surfaces_survived, indent, audit.ablation.tests_merged_or_retired });
-    try writer.print("{s}review_horizon:\n{s}  initial_broad_reviews: {d}\n{s}  targeted_reviews: {d}\n{s}  final_holdout_reviews: {d}\n{s}  holdout_findings_added_to_scope: {d}\n{s}  holdout_followups_captured: {d}\n", .{ indent, indent, audit.review_horizon.initial_broad_reviews, indent, audit.review_horizon.targeted_reviews, indent, audit.review_horizon.final_holdout_reviews, indent, audit.review_horizon.holdout_findings_added_to_scope, indent, audit.review_horizon.holdout_followups_captured });
-    try writer.print("{s}compliance:\n{s}  delivery_mutations_before_recipe: {d}\n{s}  review_derived_delivery_patches: {d}\n{s}  missing_contract: {d}\n{s}  missing_recipe: {d}\n{s}  missing_ablation: {d}\n", .{ indent, indent, audit.compliance.delivery_mutations_before_recipe, indent, audit.compliance.review_derived_delivery_patches, indent, audit.compliance.missing_contract, indent, audit.compliance.missing_recipe, indent, audit.compliance.missing_ablation });
+    if (protocol == .c3) try writeReviewCompilerC3YamlBody(writer, audit, indent);
+    try writeReviewCompilerLegacyYamlBody(writer, audit.legacy_cleanroom, indent);
+}
+
+fn writeReviewCompilerC3YamlBody(writer: anytype, audit: ReviewCompilerAudit, indent: []const u8) !void {
+    try writer.print("{s}controller:\n{s}  begin_events: {d}\n{s}  state_files: {d}\n{s}  mrpc_apply_certified: {d}\n{s}  mrpc_final_certified: {d}\n{s}  mrpc_committed: {d}\n{s}  mrpc_pushed: {d}\n{s}  mrpc_closed: {d}\n", .{ indent, indent, audit.c3.controller.begin_events, indent, audit.c3.controller.state_files, indent, audit.c3.controller.mrpc_apply_certified, indent, audit.c3.controller.mrpc_final_certified, indent, audit.c3.controller.mrpc_committed, indent, audit.c3.controller.mrpc_pushed, indent, audit.c3.controller.mrpc_closed });
+    try writer.print("{s}counterexamples:\n{s}  raw_findings: {d}\n{s}  branch_liabilities: {d}\n{s}  non_branch_liabilities: {d}\n{s}  independent_families: {d}\n{s}  subsumed_findings: {d}\n", .{ indent, indent, audit.c3.counterexamples.raw_findings, indent, audit.c3.counterexamples.branch_liabilities, indent, audit.c3.counterexamples.non_branch_liabilities, indent, audit.c3.counterexamples.independent_families, indent, audit.c3.counterexamples.subsumed_findings });
+    try writeYamlRatio(writer, indent, "  compression_ratio", audit.c3.counterexamples.branch_liabilities, audit.c3.counterexamples.independent_families, "independent_families_zero");
+    try writer.print("{s}tournament:\n{s}  candidate_records: {d}\n{s}  distinct_route_classes: {d}\n{s}  invalid_candidates: {d}\n{s}  active_negative_routes_excluded: {d}\n{s}  selected_candidates: {d}\n{s}  tournament_waivers: {d}\n{s}  single_candidate_material_violations: {d}\n", .{ indent, indent, audit.c3.tournament.candidate_records, indent, audit.c3.tournament.distinct_route_classes, indent, audit.c3.tournament.invalid_candidates, indent, audit.c3.tournament.active_negative_routes_excluded, indent, audit.c3.tournament.selected_candidates, indent, audit.c3.tournament.tournament_waivers, indent, audit.c3.tournament.single_candidate_material_violations });
+    try writeYamlRatio(writer, indent, "  candidate_discard_ratio", audit.c3.tournament.candidate_records -| audit.c3.tournament.selected_candidates, audit.c3.tournament.candidate_records, "candidate_records_zero");
+    try writer.print("{s}semantic_cost:\n{s}  selected_cost_vectors: []\n{s}  selected_route_classes: {{}}\n{s}  global_optimality_overclaims: {d}\n", .{ indent, indent, indent, indent, audit.c3.semantic_cost.global_optimality_overclaims });
+    try writeYamlRatio(writer, indent, "  semantic_delivery_efficiency", audit.c3.counterexamples.independent_families, audit.c3.semantic_cost.selected_semantic_cost, "selected_semantic_cost_zero");
+    try writer.print("{s}ablation:\n{s}  edit_atoms_tested: {d}\n{s}  removed: {d}\n{s}  survived: {d}\n{s}  orphan_edit_atoms: {d}\n{s}  one_minimal_passes: {d}\n{s}  one_minimal_failures: {d}\n", .{ indent, indent, audit.c3.ablation.edit_atoms_tested, indent, audit.c3.ablation.removed, indent, audit.c3.ablation.survived, indent, audit.c3.ablation.orphan_edit_atoms, indent, audit.c3.ablation.one_minimal_passes, indent, audit.c3.ablation.one_minimal_failures });
+    try writeYamlRatio(writer, indent, "  ablation_removal_ratio", audit.c3.ablation.removed, audit.c3.ablation.edit_atoms_tested, "edit_atoms_tested_zero");
+    try writer.print("{s}lab_vs_delivery:\n{s}  lab_apply_patch_calls: {d}\n{s}  lab_commits: {d}\n{s}  candidate_surface_generated: {d}\n{s}  candidate_surface_discarded: {d}\n{s}  delivery_apply_events: {d}\n{s}  delivery_surface_shipped: {d}\n{s}  raw_delivery_mutations_while_frozen: {d}\n", .{ indent, indent, audit.c3.lab_vs_delivery.lab_apply_patch_calls, indent, audit.c3.lab_vs_delivery.lab_commits, indent, audit.c3.lab_vs_delivery.candidate_surface_generated, indent, audit.c3.lab_vs_delivery.candidate_surface_discarded, indent, audit.c3.lab_vs_delivery.delivery_apply_events, indent, audit.c3.lab_vs_delivery.delivery_surface_shipped, indent, audit.c3.lab_vs_delivery.raw_delivery_mutations_while_frozen });
+    try writer.print("{s}holdout:\n{s}  candidate_holdouts: {d}\n{s}  delivery_holdouts: {d}\n{s}  new_counterexamples: {d}\n{s}  invalidations: {d}\n{s}  recompilations: {d}\n{s}  adjacent_followups: {d}\n", .{ indent, indent, audit.c3.holdout.candidate_holdouts, indent, audit.c3.holdout.delivery_holdouts, indent, audit.c3.holdout.new_counterexamples, indent, audit.c3.holdout.invalidations, indent, audit.c3.holdout.recompilations, indent, audit.c3.holdout.adjacent_followups });
+    try writer.print("{s}delivery:\n{s}  controller_commits: {d}\n{s}  raw_commits_while_active: {d}\n{s}  controller_pushes: {d}\n{s}  raw_pushes_while_active: {d}\n{s}  closed_runs: {d}\n", .{ indent, indent, audit.c3.delivery.controller_commits, indent, audit.c3.delivery.raw_commits_while_active, indent, audit.c3.delivery.controller_pushes, indent, audit.c3.delivery.raw_pushes_while_active, indent, audit.c3.delivery.closed_runs });
+    try writeYamlRatio(writer, indent, "  controller_adoption", audit.denominator.c3_entered_sessions, audit.denominator.c3_required_sessions, "c3_required_sessions_zero");
+    try writer.print("{s}compliance:\n{s}  basis_missing: {d}\n{s}  tournament_missing: {d}\n{s}  ablation_missing: {d}\n{s}  proof_missing: {d}\n{s}  holdout_missing: {d}\n{s}  stale_mrpc: {d}\n{s}  direct_review_to_delivery_mutation: {d}\n{s}  commit_or_push_bypass: {d}\n", .{ indent, indent, audit.c3.compliance.basis_missing, indent, audit.c3.compliance.tournament_missing, indent, audit.c3.compliance.ablation_missing, indent, audit.c3.compliance.proof_missing, indent, audit.c3.compliance.holdout_missing, indent, audit.c3.compliance.stale_mrpc, indent, audit.c3.compliance.direct_review_to_delivery_mutation, indent, audit.c3.compliance.commit_or_push_bypass });
+}
+
+fn writeReviewCompilerLegacyYamlBody(writer: anytype, legacy: ReviewCompilerAudit.LegacyCleanroom, indent: []const u8) !void {
+    try writer.print("{s}legacy_cleanroom:\n", .{indent});
+    try writer.print("{s}  cleanroom:\n{s}    delivery_freezes: {d}\n{s}    counterexample_contracts: {d}\n{s}    delivery_recipes: {d}\n{s}    ablation_certificates: {d}\n{s}    compiled_delivery_permits: {d}\n", .{ indent, indent, legacy.cleanroom.delivery_freezes, indent, legacy.cleanroom.counterexample_contracts, indent, legacy.cleanroom.delivery_recipes, indent, legacy.cleanroom.ablation_certificates, indent, legacy.cleanroom.compiled_delivery_permits });
+    try writer.print("{s}  lab_vs_delivery:\n{s}    lab_apply_patch_calls: {d}\n{s}    lab_commits: {d}\n{s}    delivery_apply_patch_calls: {d}\n{s}    delivery_commits: {d}\n{s}    lab_surface_added: {d}\n{s}    lab_surface_discarded: {d}\n{s}    delivery_surface_shipped: {d}\n", .{ indent, indent, legacy.lab_vs_delivery.lab_apply_patch_calls, indent, legacy.lab_vs_delivery.lab_commits, indent, legacy.lab_vs_delivery.delivery_apply_patch_calls, indent, legacy.lab_vs_delivery.delivery_commits, indent, legacy.lab_vs_delivery.lab_surface_added, indent, legacy.lab_vs_delivery.lab_surface_discarded, indent, legacy.lab_vs_delivery.delivery_surface_shipped });
+    try writer.print("{s}  liability:\n{s}    branch_liabilities: {d}\n{s}    non_branch_liabilities: {d}\n{s}    followups_captured: {d}\n{s}    non_branch_liabilities_mutated: {d}\n", .{ indent, indent, legacy.liability.branch_liabilities, indent, legacy.liability.non_branch_liabilities, indent, legacy.liability.followups_captured, indent, legacy.liability.non_branch_liabilities_mutated });
+    try writer.print("{s}  recipe:\n{s}    falsified_routes_excluded: {d}\n{s}    surfaces_to_retire: {d}\n{s}    permitted_new_surface: {d}\n", .{ indent, indent, legacy.recipe.falsified_routes_excluded, indent, legacy.recipe.surfaces_to_retire, indent, legacy.recipe.permitted_new_surface });
+    try writer.print("{s}  ablation:\n{s}    surfaces_removed: {d}\n{s}    surfaces_survived: {d}\n{s}    tests_merged_or_retired: {d}\n", .{ indent, indent, legacy.ablation.surfaces_removed, indent, legacy.ablation.surfaces_survived, indent, legacy.ablation.tests_merged_or_retired });
+    try writer.print("{s}  review_horizon:\n{s}    initial_broad_reviews: {d}\n{s}    targeted_reviews: {d}\n{s}    final_holdout_reviews: {d}\n{s}    holdout_findings_added_to_scope: {d}\n{s}    holdout_followups_captured: {d}\n", .{ indent, indent, legacy.review_horizon.initial_broad_reviews, indent, legacy.review_horizon.targeted_reviews, indent, legacy.review_horizon.final_holdout_reviews, indent, legacy.review_horizon.holdout_findings_added_to_scope, indent, legacy.review_horizon.holdout_followups_captured });
+    try writer.print("{s}  compliance:\n{s}    delivery_mutations_before_recipe: {d}\n{s}    review_derived_delivery_patches: {d}\n{s}    missing_contract: {d}\n{s}    missing_recipe: {d}\n{s}    missing_ablation: {d}\n", .{ indent, indent, legacy.compliance.delivery_mutations_before_recipe, indent, legacy.compliance.review_derived_delivery_patches, indent, legacy.compliance.missing_contract, indent, legacy.compliance.missing_recipe, indent, legacy.compliance.missing_ablation });
+}
+
+fn writeYamlRatio(writer: anytype, indent: []const u8, name: []const u8, numerator: usize, denominator: usize, zero_reason: []const u8) !void {
+    if (denominator == 0) {
+        try writer.print("{s}{s}: null\n{s}{s}_reason: ", .{ indent, name, indent, name });
+        try writeYamlInlineString(writer, zero_reason);
+        try writer.writeByte('\n');
+        return;
+    }
+    const value = @as(f64, @floatFromInt(numerator)) / @as(f64, @floatFromInt(denominator));
+    try writer.print("{s}{s}: {d:.6}\n", .{ indent, name, value });
 }
 
 fn writeYamlInlineString(writer: anytype, value: []const u8) !void {
@@ -5443,7 +5896,8 @@ fn writeReviewCompilerAuditJson(allocator: std.mem.Allocator, audit: ReviewCompi
     const writer = &writer_alloc.writer;
 
     try writer.writeAll("{\n  \"review_compiler_audit\": {\n");
-    try writer.print("    \"denominator\": {{ \"candidate_sessions\": {d}, \"true_resolve_sessions\": {d}, \"exclusions\": [", .{ audit.denominator.candidate_sessions, audit.denominator.true_resolve_sessions });
+    try writer.print("    \"protocol\": \"{s}\",\n", .{audit.outputProtocol().label()});
+    try writer.print("    \"denominator\": {{ \"candidate_sessions\": {d}, \"true_resolve_sessions\": {d}, \"clean_review_sessions\": {d}, \"isolated_waiver_sessions\": {d}, \"c3_required_sessions\": {d}, \"c3_entered_sessions\": {d}, \"c3_closed_sessions\": {d}, \"exclusions\": [", .{ audit.denominator.candidate_sessions, audit.denominator.true_resolve_sessions, audit.denominator.clean_review_sessions, audit.denominator.isolated_waiver_sessions, audit.denominator.c3_required_sessions, audit.denominator.c3_entered_sessions, audit.denominator.c3_closed_sessions });
     for (audit.denominator.exclusions.items, 0..) |item, idx| {
         if (idx > 0) try writer.writeAll(", ");
         try writer.writeAll("{ \"session_id\": ");
@@ -5455,19 +5909,52 @@ fn writeReviewCompilerAuditJson(allocator: std.mem.Allocator, audit: ReviewCompi
         try writer.writeAll(" }");
     }
     try writer.writeAll("] },\n");
-    try writer.print("    \"cleanroom\": {{ \"delivery_freezes\": {d}, \"counterexample_contracts\": {d}, \"delivery_recipes\": {d}, \"ablation_certificates\": {d}, \"compiled_delivery_permits\": {d} }},\n", .{ audit.cleanroom.delivery_freezes, audit.cleanroom.counterexample_contracts, audit.cleanroom.delivery_recipes, audit.cleanroom.ablation_certificates, audit.cleanroom.compiled_delivery_permits });
-    try writer.print("    \"lab_vs_delivery\": {{ \"lab_apply_patch_calls\": {d}, \"lab_commits\": {d}, \"delivery_apply_patch_calls\": {d}, \"delivery_commits\": {d}, \"lab_surface_added\": {d}, \"lab_surface_discarded\": {d}, \"delivery_surface_shipped\": {d} }},\n", .{ audit.lab_vs_delivery.lab_apply_patch_calls, audit.lab_vs_delivery.lab_commits, audit.lab_vs_delivery.delivery_apply_patch_calls, audit.lab_vs_delivery.delivery_commits, audit.lab_vs_delivery.lab_surface_added, audit.lab_vs_delivery.lab_surface_discarded, audit.lab_vs_delivery.delivery_surface_shipped });
-    try writer.print("    \"liability\": {{ \"branch_liabilities\": {d}, \"non_branch_liabilities\": {d}, \"followups_captured\": {d}, \"non_branch_liabilities_mutated\": {d} }},\n", .{ audit.liability.branch_liabilities, audit.liability.non_branch_liabilities, audit.liability.followups_captured, audit.liability.non_branch_liabilities_mutated });
-    try writer.print("    \"recipe\": {{ \"falsified_routes_excluded\": {d}, \"surfaces_to_retire\": {d}, \"permitted_new_surface\": {d} }},\n", .{ audit.recipe.falsified_routes_excluded, audit.recipe.surfaces_to_retire, audit.recipe.permitted_new_surface });
-    try writer.print("    \"ablation\": {{ \"surfaces_removed\": {d}, \"surfaces_survived\": {d}, \"tests_merged_or_retired\": {d} }},\n", .{ audit.ablation.surfaces_removed, audit.ablation.surfaces_survived, audit.ablation.tests_merged_or_retired });
-    try writer.print("    \"review_horizon\": {{ \"initial_broad_reviews\": {d}, \"targeted_reviews\": {d}, \"final_holdout_reviews\": {d}, \"holdout_findings_added_to_scope\": {d}, \"holdout_followups_captured\": {d} }},\n", .{ audit.review_horizon.initial_broad_reviews, audit.review_horizon.targeted_reviews, audit.review_horizon.final_holdout_reviews, audit.review_horizon.holdout_findings_added_to_scope, audit.review_horizon.holdout_followups_captured });
-    try writer.print("    \"compliance\": {{ \"delivery_mutations_before_recipe\": {d}, \"review_derived_delivery_patches\": {d}, \"missing_contract\": {d}, \"missing_recipe\": {d}, \"missing_ablation\": {d} }}\n", .{ audit.compliance.delivery_mutations_before_recipe, audit.compliance.review_derived_delivery_patches, audit.compliance.missing_contract, audit.compliance.missing_recipe, audit.compliance.missing_ablation });
+    if (audit.outputProtocol() == .c3) {
+        try writer.print("    \"controller\": {{ \"begin_events\": {d}, \"state_files\": {d}, \"mrpc_apply_certified\": {d}, \"mrpc_final_certified\": {d}, \"mrpc_committed\": {d}, \"mrpc_pushed\": {d}, \"mrpc_closed\": {d} }},\n", .{ audit.c3.controller.begin_events, audit.c3.controller.state_files, audit.c3.controller.mrpc_apply_certified, audit.c3.controller.mrpc_final_certified, audit.c3.controller.mrpc_committed, audit.c3.controller.mrpc_pushed, audit.c3.controller.mrpc_closed });
+        try writer.print("    \"counterexamples\": {{ \"raw_findings\": {d}, \"branch_liabilities\": {d}, \"non_branch_liabilities\": {d}, \"independent_families\": {d}, \"subsumed_findings\": {d}, ", .{ audit.c3.counterexamples.raw_findings, audit.c3.counterexamples.branch_liabilities, audit.c3.counterexamples.non_branch_liabilities, audit.c3.counterexamples.independent_families, audit.c3.counterexamples.subsumed_findings });
+        try writeJsonRatioFields(writer, "compression_ratio", audit.c3.counterexamples.branch_liabilities, audit.c3.counterexamples.independent_families, "independent_families_zero");
+        try writer.writeAll(" },\n");
+        try writer.print("    \"tournament\": {{ \"candidate_records\": {d}, \"distinct_route_classes\": {d}, \"invalid_candidates\": {d}, \"active_negative_routes_excluded\": {d}, \"selected_candidates\": {d}, \"tournament_waivers\": {d}, \"single_candidate_material_violations\": {d}, ", .{ audit.c3.tournament.candidate_records, audit.c3.tournament.distinct_route_classes, audit.c3.tournament.invalid_candidates, audit.c3.tournament.active_negative_routes_excluded, audit.c3.tournament.selected_candidates, audit.c3.tournament.tournament_waivers, audit.c3.tournament.single_candidate_material_violations });
+        try writeJsonRatioFields(writer, "candidate_discard_ratio", audit.c3.tournament.candidate_records -| audit.c3.tournament.selected_candidates, audit.c3.tournament.candidate_records, "candidate_records_zero");
+        try writer.writeAll(" },\n");
+        try writer.print("    \"semantic_cost\": {{ \"selected_cost_vectors\": [], \"selected_route_classes\": {{}}, \"global_optimality_overclaims\": {d}, ", .{audit.c3.semantic_cost.global_optimality_overclaims});
+        try writeJsonRatioFields(writer, "semantic_delivery_efficiency", audit.c3.counterexamples.independent_families, audit.c3.semantic_cost.selected_semantic_cost, "selected_semantic_cost_zero");
+        try writer.writeAll(" },\n");
+        try writer.print("    \"ablation\": {{ \"edit_atoms_tested\": {d}, \"removed\": {d}, \"survived\": {d}, \"orphan_edit_atoms\": {d}, \"one_minimal_passes\": {d}, \"one_minimal_failures\": {d}, ", .{ audit.c3.ablation.edit_atoms_tested, audit.c3.ablation.removed, audit.c3.ablation.survived, audit.c3.ablation.orphan_edit_atoms, audit.c3.ablation.one_minimal_passes, audit.c3.ablation.one_minimal_failures });
+        try writeJsonRatioFields(writer, "ablation_removal_ratio", audit.c3.ablation.removed, audit.c3.ablation.edit_atoms_tested, "edit_atoms_tested_zero");
+        try writer.writeAll(" },\n");
+        try writer.print("    \"lab_vs_delivery\": {{ \"lab_apply_patch_calls\": {d}, \"lab_commits\": {d}, \"candidate_surface_generated\": {d}, \"candidate_surface_discarded\": {d}, \"delivery_apply_events\": {d}, \"delivery_surface_shipped\": {d}, \"raw_delivery_mutations_while_frozen\": {d} }},\n", .{ audit.c3.lab_vs_delivery.lab_apply_patch_calls, audit.c3.lab_vs_delivery.lab_commits, audit.c3.lab_vs_delivery.candidate_surface_generated, audit.c3.lab_vs_delivery.candidate_surface_discarded, audit.c3.lab_vs_delivery.delivery_apply_events, audit.c3.lab_vs_delivery.delivery_surface_shipped, audit.c3.lab_vs_delivery.raw_delivery_mutations_while_frozen });
+        try writer.print("    \"holdout\": {{ \"candidate_holdouts\": {d}, \"delivery_holdouts\": {d}, \"new_counterexamples\": {d}, \"invalidations\": {d}, \"recompilations\": {d}, \"adjacent_followups\": {d} }},\n", .{ audit.c3.holdout.candidate_holdouts, audit.c3.holdout.delivery_holdouts, audit.c3.holdout.new_counterexamples, audit.c3.holdout.invalidations, audit.c3.holdout.recompilations, audit.c3.holdout.adjacent_followups });
+        try writer.print("    \"delivery\": {{ \"controller_commits\": {d}, \"raw_commits_while_active\": {d}, \"controller_pushes\": {d}, \"raw_pushes_while_active\": {d}, \"closed_runs\": {d}, ", .{ audit.c3.delivery.controller_commits, audit.c3.delivery.raw_commits_while_active, audit.c3.delivery.controller_pushes, audit.c3.delivery.raw_pushes_while_active, audit.c3.delivery.closed_runs });
+        try writeJsonRatioFields(writer, "controller_adoption", audit.denominator.c3_entered_sessions, audit.denominator.c3_required_sessions, "c3_required_sessions_zero");
+        try writer.writeAll(" },\n");
+        try writer.print("    \"compliance\": {{ \"basis_missing\": {d}, \"tournament_missing\": {d}, \"ablation_missing\": {d}, \"proof_missing\": {d}, \"holdout_missing\": {d}, \"stale_mrpc\": {d}, \"direct_review_to_delivery_mutation\": {d}, \"commit_or_push_bypass\": {d} }},\n", .{ audit.c3.compliance.basis_missing, audit.c3.compliance.tournament_missing, audit.c3.compliance.ablation_missing, audit.c3.compliance.proof_missing, audit.c3.compliance.holdout_missing, audit.c3.compliance.stale_mrpc, audit.c3.compliance.direct_review_to_delivery_mutation, audit.c3.compliance.commit_or_push_bypass });
+    }
+    const legacy = audit.legacy_cleanroom;
+    try writer.print("    \"legacy_cleanroom\": {{ \"cleanroom\": {{ \"delivery_freezes\": {d}, \"counterexample_contracts\": {d}, \"delivery_recipes\": {d}, \"ablation_certificates\": {d}, \"compiled_delivery_permits\": {d} }}, ", .{ legacy.cleanroom.delivery_freezes, legacy.cleanroom.counterexample_contracts, legacy.cleanroom.delivery_recipes, legacy.cleanroom.ablation_certificates, legacy.cleanroom.compiled_delivery_permits });
+    try writer.print("\"lab_vs_delivery\": {{ \"lab_apply_patch_calls\": {d}, \"lab_commits\": {d}, \"delivery_apply_patch_calls\": {d}, \"delivery_commits\": {d}, \"lab_surface_added\": {d}, \"lab_surface_discarded\": {d}, \"delivery_surface_shipped\": {d} }}, ", .{ legacy.lab_vs_delivery.lab_apply_patch_calls, legacy.lab_vs_delivery.lab_commits, legacy.lab_vs_delivery.delivery_apply_patch_calls, legacy.lab_vs_delivery.delivery_commits, legacy.lab_vs_delivery.lab_surface_added, legacy.lab_vs_delivery.lab_surface_discarded, legacy.lab_vs_delivery.delivery_surface_shipped });
+    try writer.print("\"liability\": {{ \"branch_liabilities\": {d}, \"non_branch_liabilities\": {d}, \"followups_captured\": {d}, \"non_branch_liabilities_mutated\": {d} }}, ", .{ legacy.liability.branch_liabilities, legacy.liability.non_branch_liabilities, legacy.liability.followups_captured, legacy.liability.non_branch_liabilities_mutated });
+    try writer.print("\"recipe\": {{ \"falsified_routes_excluded\": {d}, \"surfaces_to_retire\": {d}, \"permitted_new_surface\": {d} }}, ", .{ legacy.recipe.falsified_routes_excluded, legacy.recipe.surfaces_to_retire, legacy.recipe.permitted_new_surface });
+    try writer.print("\"ablation\": {{ \"surfaces_removed\": {d}, \"surfaces_survived\": {d}, \"tests_merged_or_retired\": {d} }}, ", .{ legacy.ablation.surfaces_removed, legacy.ablation.surfaces_survived, legacy.ablation.tests_merged_or_retired });
+    try writer.print("\"review_horizon\": {{ \"initial_broad_reviews\": {d}, \"targeted_reviews\": {d}, \"final_holdout_reviews\": {d}, \"holdout_findings_added_to_scope\": {d}, \"holdout_followups_captured\": {d} }}, ", .{ legacy.review_horizon.initial_broad_reviews, legacy.review_horizon.targeted_reviews, legacy.review_horizon.final_holdout_reviews, legacy.review_horizon.holdout_findings_added_to_scope, legacy.review_horizon.holdout_followups_captured });
+    try writer.print("\"compliance\": {{ \"delivery_mutations_before_recipe\": {d}, \"review_derived_delivery_patches\": {d}, \"missing_contract\": {d}, \"missing_recipe\": {d}, \"missing_ablation\": {d} }} }}\n", .{ legacy.compliance.delivery_mutations_before_recipe, legacy.compliance.review_derived_delivery_patches, legacy.compliance.missing_contract, legacy.compliance.missing_recipe, legacy.compliance.missing_ablation });
     try writer.writeAll("  }\n}\n");
 
     const rendered = try writer_alloc.toOwnedSlice();
     defer allocator.free(rendered);
     if (out_path) |path| try ensureParentDir(path);
     try writeTextOutput(rendered, out_path);
+}
+
+fn writeJsonRatioFields(writer: anytype, name: []const u8, numerator: usize, denominator: usize, zero_reason: []const u8) !void {
+    try writer.print("\"{s}\": ", .{name});
+    if (denominator == 0) {
+        try writer.print("null, \"{s}_reason\": ", .{name});
+        try output.writeJsonString(writer, zero_reason);
+        return;
+    }
+    const value = @as(f64, @floatFromInt(numerator)) / @as(f64, @floatFromInt(denominator));
+    try writer.print("{d:.6}, \"{s}_reason\": null", .{ value, name });
 }
 
 fn ensureParentDir(path: []const u8) !void {
@@ -16895,6 +17382,10 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.mode = args[i];
+        } else if (std.mem.eql(u8, arg, "--protocol")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.protocol_text = args[i];
         } else if (std.mem.eql(u8, arg, "--part-type")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -17968,6 +18459,8 @@ test "parse options supports common flags" {
         "completed",
         "--mode",
         "normal",
+        "--protocol",
+        "c3",
         "--part-type",
         "file",
         "--tz",
@@ -18054,6 +18547,7 @@ test "parse options supports common flags" {
     try std.testing.expectEqualStrings("/Users/tk/workspace/tk/shift", opts.repo_text.?);
     try std.testing.expectEqualStrings("completed", opts.status.?);
     try std.testing.expectEqualStrings("normal", opts.mode.?);
+    try std.testing.expectEqualStrings("c3", opts.protocol_text.?);
     try std.testing.expectEqualStrings("file", opts.part_type.?);
     try std.testing.expectEqualStrings("local", opts.timezone_text.?);
     try std.testing.expectEqualStrings("ses_abc", opts.session.?);
@@ -18442,6 +18936,22 @@ test "validateCommandOptions rejects unsupported audit on skill-report" {
     try std.testing.expectError(error.UnsupportedOption, validateCommandOptions(.skill_report, opts));
 }
 
+test "validateCommandOptions gates review-compiler-audit protocol" {
+    try validateCommandOptions(.review_compiler_audit, .{
+        .since = "2026-05-10T00:00:00Z",
+        .until = "2026-05-11T00:00:00Z",
+        .repo_text = "/repo",
+        .protocol_text = "c3",
+    });
+    try std.testing.expectError(error.UnsupportedOption, validateCommandOptions(.skill_report, .{ .protocol_text = "c3" }));
+    try std.testing.expectError(error.InvalidModeArg, validateCommandOptions(.review_compiler_audit, .{
+        .since = "2026-05-10T00:00:00Z",
+        .until = "2026-05-11T00:00:00Z",
+        .repo_text = "/repo",
+        .protocol_text = "bad",
+    }));
+}
+
 test "validateFormatForCommand gates skill-blocks formats by mode" {
     try std.testing.expectError(error.InvalidFormatForCommand, validateFormatForCommand(.skill_blocks, .{ .format = .table }));
     try validateFormatForCommand(.skill_blocks, .{ .format = .table, .mode = "term-counts" });
@@ -18600,11 +19110,12 @@ test "review-compiler-audit requires cleanroom evidence and reports lab delivery
     defer std.testing.allocator.free(output_path);
 
     const got = try runCommandWithOutput(std.testing.allocator, .review_compiler_audit, &.{
-        "--root",   root_abs,
-        "--since",  "2026-05-10T00:00:00Z",
-        "--until",  "2026-05-11T00:00:00Z",
-        "--repo",   "/repo",
-        "--format", "json",
+        "--root",     root_abs,
+        "--protocol", "legacy-cleanroom",
+        "--since",    "2026-05-10T00:00:00Z",
+        "--until",    "2026-05-11T00:00:00Z",
+        "--repo",     "/repo",
+        "--format",   "json",
     }, output_path);
     defer std.testing.allocator.free(got);
 
@@ -18623,6 +19134,96 @@ test "review-compiler-audit requires cleanroom evidence and reports lab delivery
     try std.testing.expect(std.mem.indexOf(u8, got, "\"review_derived_delivery_patches\": 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"missing_recipe\": 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"missing_ablation\": 1") != null);
+}
+
+test "review-compiler-audit c3 protocol reports controller, tournament, holdout, and bypass counters" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/12");
+    const raw_resolve_only =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T08:00:00Z\",\"payload\":{\"id\":\"c3-raw-only\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T08:00:01Z\",\"payload\":{\"type\":\"user_message\",\"turn_id\":\"r1\",\"message\":\"Raw $resolve mention only.\"}}\n";
+    const incomplete_begin =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T09:00:00Z\",\"payload\":{\"id\":\"c3-begin\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T09:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"b1\",\"message\":\"review_compile.py begin\\ncounterexample-added raw_finding\\nbranch_liabilities:\\n  - F1\\nindependent_families:\\n  - fam1\\nbasis-set\\ncandidate-registered route_class: owner\\ncandidate-selected\\nablation-recorded\\nedit_atoms_tested\\nremoved_edit_atom\\nsurvived_edit_atom\\norphan_edit_atom\\none_minimal_pass\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n";
+    const stages_and_controller =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T10:00:00Z\",\"payload\":{\"id\":\"c3-stages\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"s1\",\"message\":\"review_compile.py begin\\n.resolve-c3/state.json\\nMRPC-v1 minimal_review_patch_certificate\\napply-certified\\nfinal-certified\\nbasis-set\\ncandidate-registered route_class: typed\\ncandidate-selected\\nablation-recorded edit_atoms_tested removed_edit_atom\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:02Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"s1\",\"call_id\":\"ctl-commit\",\"command\":\"python review_compile.py commit\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"committed\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:03Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"s1\",\"call_id\":\"ctl-push\",\"command\":\"python review_compile.py push\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"pushed\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:04Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"s1\",\"message\":\"closed\"}}\n";
+    const direct_delivery_patch =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T11:00:00Z\",\"payload\":{\"id\":\"c3-direct-patch\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T11:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"p1\",\"message\":\"review_compile.py begin\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-12T11:00:02Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"apply_patch\",\"call_id\":\"bad-patch\",\"arguments\":\"*** Update File: apps/seq/src/lib.zig\\n+bad\\n\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T11:00:03Z\",\"payload\":{\"type\":\"patch_apply_end\",\"turn_id\":\"p1\",\"call_id\":\"bad-patch\",\"success\":true,\"cwd\":\"/repo\",\"changes\":{\"files\":1}}}\n";
+    const lab_patch =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T12:00:00Z\",\"payload\":{\"id\":\"c3-lab-patch\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T12:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"l1\",\"message\":\"review_compile.py begin\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\\ncandidate-worktree lab patch used\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-12T12:00:02Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"apply_patch\",\"call_id\":\"lab-patch\",\"arguments\":\"*** Update File: apps/seq/src/lib.zig\\n+candidate lab patch\\n\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T12:00:03Z\",\"payload\":{\"type\":\"patch_apply_end\",\"turn_id\":\"l1\",\"call_id\":\"lab-patch\",\"success\":true,\"cwd\":\"/repo/.resolve-c3/candidates/candidate-worktree\",\"changes\":{\"files\":1}}}\n";
+    const raw_commit =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T13:00:00Z\",\"payload\":{\"id\":\"c3-raw-commit\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T13:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"g1\",\"message\":\"review_compile.py begin\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T13:00:02Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"g1\",\"call_id\":\"raw-commit\",\"command\":\"git commit -m bad\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"ok\"}}\n";
+    const holdout_recompile =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T14:00:00Z\",\"payload\":{\"id\":\"c3-recompile\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T14:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"h1\",\"message\":\"review_compile.py begin\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T14:00:02Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"h1\",\"message\":\"new_counterexample from delivery holdout\\nreset after invalidation\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T14:00:03Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"h1\",\"message\":\"basis-set\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T14:00:04Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"h1\",\"message\":\"adjacent_followup captured\"}}\n";
+    const waiver_and_violation =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T15:00:00Z\",\"payload\":{\"id\":\"c3-waiver\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T15:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"w1\",\"message\":\"review_compile.py begin\\ntournament_waiver\\nsingle_candidate_material_violation\"}}\n";
+
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/12/rollout-c3-raw.jsonl", .data = raw_resolve_only });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/12/rollout-c3-begin.jsonl", .data = incomplete_begin });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/12/rollout-c3-stages.jsonl", .data = stages_and_controller });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/12/rollout-c3-direct-patch.jsonl", .data = direct_delivery_patch });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/12/rollout-c3-lab-patch.jsonl", .data = lab_patch });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/12/rollout-c3-raw-commit.jsonl", .data = raw_commit });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/12/rollout-c3-recompile.jsonl", .data = holdout_recompile });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/12/rollout-c3-waiver.jsonl", .data = waiver_and_violation });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "review-compiler-c3.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const got = try runCommandWithOutput(std.testing.allocator, .review_compiler_audit, &.{
+        "--root",     root_abs,
+        "--protocol", "c3",
+        "--since",    "2026-05-12T00:00:00Z",
+        "--until",    "2026-05-13T00:00:00Z",
+        "--repo",     "/repo",
+        "--format",   "json",
+    }, output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"protocol\": \"c3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"candidate_sessions\": 8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"true_resolve_sessions\": 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"reason\": \"candidate_without_c3_evidence\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"c3_entered_sessions\": 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"c3_closed_sessions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"mrpc_apply_certified\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"mrpc_final_certified\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"controller_commits\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"controller_pushes\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"raw_delivery_mutations_while_frozen\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"direct_review_to_delivery_mutation\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"lab_apply_patch_calls\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"raw_commits_while_active\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"commit_or_push_bypass\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"new_counterexamples\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"recompilations\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"adjacent_followups\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"orphan_edit_atoms\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"tournament_waivers\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"single_candidate_material_violations\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"compression_ratio\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"legacy_cleanroom\"") != null);
 }
 
 fn runCommandWithOutput(
