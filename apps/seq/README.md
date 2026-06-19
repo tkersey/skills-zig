@@ -75,7 +75,7 @@ Binary output:
 ./zig-out/bin/seq goal-audit --root ~/.codex/sessions --workflow review,resolve --duration-gte 2h --summary --format table
 ./zig-out/bin/seq adjudication-audit --mode summary --include-root-equivalent resolve,fixed-point-driver --since 2026-05-02T00:00:00-07:00 --format table
 ./zig-out/bin/seq resolve-churn-audit --since 2026-05-01T00:00:00-07:00 --until 2026-06-01T00:00:00-07:00 --repo /Users/tk/workspace/tk/skills-zig --exclude-current --format markdown
-./zig-out/bin/seq review-compiler-audit --since 2026-05-01T00:00:00-07:00 --until 2026-06-01T00:00:00-07:00 --repo /Users/tk/workspace/tk/skills-zig --exclude-current --format markdown
+./zig-out/bin/seq review-compiler-audit --protocol auto --since 2026-05-01T00:00:00-07:00 --until 2026-06-01T00:00:00-07:00 --repo /Users/tk/workspace/tk/skills-zig --exclude-current --format markdown
 ./zig-out/bin/seq workdir-report --workdir /Users/tk/workspace/tk/skills-zig --mode sessions --format table
 ./zig-out/bin/seq memory-provenance --thread-id 019bae5d-7d12-7b01-9cb5-b8bb6046b85b --format table
 ./zig-out/bin/seq memory-provenance --rollout-summary-file rollout_summaries/2026-01-11T18-42-01-jpEf-resolve_merge_pr_11_squash_cleanup.md --format json
@@ -138,18 +138,20 @@ seq resolve-churn-audit --root ~/.codex/sessions --since 2026-05-01T00:00:00-07:
 seq resolve-churn-audit --root ~/.codex/sessions --since 2026-05-01T00:00:00Z --until 2026-06-01T00:00:00Z --repo /Users/tk/workspace/tk/skills-zig --format json
 ```
 
-`review-compiler-audit` emits the cleanroom `$resolve` Review Compiler ledger:
+`review-compiler-audit` emits the C3 / legacy-cleanroom `$resolve` Review Compiler ledger:
 - requires `--since`, `--until`, and `--repo`
+- supports `--protocol auto|legacy-cleanroom|c3` (default `auto`)
 - supports `--exclude-current` to avoid counting the active audit session
 - emits `markdown` by default or `json` with `--format json`
 - uses transcript/session evidence as primary workflow attribution and Git/tool lifecycle only as supplemental repo evidence
-- treats raw `$resolve` mentions as denominator candidates only; true resolve sessions require assistant-side cleanroom workflow/tool evidence
-- exposes the key derived metric inputs as `lab_vs_delivery.lab_surface_discarded` and `lab_vs_delivery.delivery_surface_shipped`
+- treats raw `$resolve` mentions as denominator candidates only; true C3 sessions require assistant/tool evidence for `review_compile.py begin`, `.resolve-c3/state.json`, `minimal_review_patch_certificate`, or `MRPC-v1`
+- renders historical cleanroom counters under `legacy_cleanroom` and C3/MRPC counters under protocol-specific sections without combining the families
 
 Examples:
 ```bash
-seq review-compiler-audit --root ~/.codex/sessions --since 2026-05-01T00:00:00-07:00 --until 2026-06-01T00:00:00-07:00 --repo /Users/tk/workspace/tk/skills-zig --exclude-current --format markdown
-seq review-compiler-audit --root ~/.codex/sessions --since 2026-05-01T00:00:00Z --until 2026-06-01T00:00:00Z --repo /Users/tk/workspace/tk/skills-zig --format json
+seq review-compiler-audit --root ~/.codex/sessions --protocol auto --since 2026-05-01T00:00:00-07:00 --until 2026-06-01T00:00:00-07:00 --repo /Users/tk/workspace/tk/skills-zig --exclude-current --format markdown
+seq review-compiler-audit --root ~/.codex/sessions --protocol c3 --since 2026-05-01T00:00:00Z --until 2026-06-01T00:00:00Z --repo /Users/tk/workspace/tk/skills-zig --format json
+seq review-compiler-audit --root ~/.codex/sessions --protocol legacy-cleanroom --since 2026-05-01T00:00:00Z --until 2026-06-01T00:00:00Z --repo /Users/tk/workspace/tk/skills-zig --format json
 ```
 
 `skill-blocks` is the exact-body surface for injected `<skill>...</skill>` content:
