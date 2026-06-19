@@ -990,12 +990,13 @@ const CompileApertureHelpText =
     \\
     \\Select and project the execution aperture.
     \\
-    \\usage: st compile aperture --file PATH [--limit N]
+    \\usage: st compile aperture --file PATH [--limit N] [--parallelism auto]
     \\
     \\options:
-    \\  --limit N    Projection limit (default: 7)
-    \\  --file PATH  Path to plan JSONL file
-    \\  -h, --help   Show help for compile aperture
+    \\  --limit N             Projection limit (default: 7)
+    \\  --parallelism auto    Legacy no-op compatibility alias
+    \\  --file PATH           Path to plan JSONL file
+    \\  -h, --help            Show help for compile aperture
 ;
 
 const CapabilitiesHelpText =
@@ -2667,6 +2668,12 @@ fn parseArgs(argv: []const []const u8) !Args {
                 }
                 if (std.mem.eql(u8, token, "--preview")) {
                     args.preview = true;
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--parallelism") and args.compile_command == .aperture) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    if (!std.mem.eql(u8, argv[i], "auto")) return error.InvalidCompileArg;
                     continue;
                 }
                 return error.InvalidCompileArg;
@@ -12683,6 +12690,38 @@ test "commandHelpTextForArgv resolves nested command help" {
 
     const polish_help = commandHelpTextForArgv(&.{ "st", "graph", "polish", "snapshot", "--help" }).?;
     try std.testing.expect(std.mem.indexOf(u8, polish_help, "usage: st graph polish snapshot --file PATH --pass N [--gate GATE]") != null);
+
+    const compile_aperture_help = commandHelpTextForArgv(&.{ "st", "compile", "aperture", "--help" }).?;
+    try std.testing.expect(std.mem.indexOf(u8, compile_aperture_help, "usage: st compile aperture --file PATH [--limit N] [--parallelism auto]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compile_aperture_help, "Legacy no-op compatibility alias") != null);
+}
+
+test "compile aperture accepts legacy parallelism auto flag" {
+    const args = try parseArgs(&.{
+        "st",
+        "compile",
+        "aperture",
+        "--file",
+        ".step/st-plan.jsonl",
+        "--limit",
+        "7",
+        "--parallelism",
+        "auto",
+    });
+
+    try std.testing.expectEqual(Command.compile, args.command);
+    try std.testing.expectEqual(CompileCommand.aperture, args.compile_command);
+    try std.testing.expectEqual(@as(usize, 7), args.limit);
+}
+
+test "compile aperture rejects unsupported parallelism values" {
+    try std.testing.expectError(error.InvalidCompileArg, parseArgs(&.{
+        "st",
+        "compile",
+        "aperture",
+        "--parallelism",
+        "wide",
+    }));
 }
 
 test "dependencyState maps blocked and waiting statuses" {
