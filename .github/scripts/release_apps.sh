@@ -18,6 +18,7 @@ apps=(
   puff
   learnings
   ledger
+  resolve-c3
   mesh
   st
   parse-arch
@@ -164,6 +165,9 @@ case "$mode" in
         .github/workflows/release-ledger.yml)
           mark_app ledger
           ;;
+        .github/workflows/release-resolve-c3.yml)
+          mark_app resolve-c3
+          ;;
         .github/workflows/release-mesh.yml)
           mark_app mesh
           ;;
@@ -173,7 +177,7 @@ case "$mode" in
         .github/workflows/release-parse-arch.yml)
           mark_app parse-arch
           ;;
-        apps/seq/README.md|apps/lift/README.md|apps/cas/README.md|apps/cron/README.md|apps/puff/README.md|apps/learnings/README.md|apps/ledger/README.md|apps/mesh/README.md|apps/st/README.md|apps/parse-arch/README.md)
+        apps/seq/README.md|apps/lift/README.md|apps/cas/README.md|apps/cron/README.md|apps/puff/README.md|apps/learnings/README.md|apps/ledger/README.md|apps/resolve-c3/README.md|apps/mesh/README.md|apps/st/README.md|apps/parse-arch/README.md)
           ;;
         apps/seq/*)
           mark_app seq
@@ -195,6 +199,9 @@ case "$mode" in
           ;;
         apps/ledger/*)
           mark_app ledger
+          ;;
+        apps/resolve-c3/*)
+          mark_app resolve-c3
           ;;
         apps/mesh/*)
           mark_app mesh

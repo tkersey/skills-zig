@@ -70,6 +70,7 @@ pub fn build(b: *std.Build) void {
     const puff_meta = addVersionModule(b, @embedFile("apps/puff/VERSION"));
     const learnings_meta = addVersionModule(b, @embedFile("apps/learnings/VERSION"));
     const ledger_meta = addVersionModule(b, @embedFile("apps/ledger/VERSION"));
+    const resolve_c3_meta = addVersionModule(b, @embedFile("apps/resolve-c3/VERSION"));
     const mesh_meta = addVersionModule(b, @embedFile("apps/mesh/VERSION"));
     const st_meta = addVersionModule(b, @embedFile("apps/st/VERSION"));
     const parse_arch_meta = addVersionModule(b, @embedFile("apps/parse-arch/VERSION"));
@@ -304,6 +305,15 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = ledger_meta },
         },
     });
+    const resolve_c3_root = b.createModule(.{
+        .root_source_file = b.path("apps/resolve-c3/scripts/resolve_c3.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = resolve_c3_meta },
+        },
+    });
     const mesh_root = b.createModule(.{
         .root_source_file = b.path("apps/mesh/scripts/mesh.zig"),
         .target = target,
@@ -370,6 +380,7 @@ pub fn build(b: *std.Build) void {
     const learnings = addExecutable(b, "learnings", learnings_root);
     const append_learning = addExecutable(b, "append_learning", append_learning_root);
     const ledger = addExecutable(b, "ledger", ledger_root);
+    const resolve_c3 = addExecutable(b, "resolve-c3", resolve_c3_root);
     const mesh = addExecutable(b, "mesh", mesh_root);
     mesh.root_module.linkSystemLibrary("c", .{}); // build-mesh
     const st = addExecutable(b, "st", st_root);
@@ -394,6 +405,7 @@ pub fn build(b: *std.Build) void {
     const learnings_install = addInstallStep(b, learnings);
     const append_learning_install = addInstallStep(b, append_learning);
     const ledger_install = addInstallStep(b, ledger);
+    const resolve_c3_install = addInstallStep(b, resolve_c3);
     const mesh_install = addInstallStep(b, mesh);
     const st_install = addInstallStep(b, st);
     const parse_arch_install = addInstallStep(b, parse_arch);
@@ -418,6 +430,7 @@ pub fn build(b: *std.Build) void {
     install_all.dependOn(&learnings_install.step);
     install_all.dependOn(&append_learning_install.step);
     install_all.dependOn(&ledger_install.step);
+    install_all.dependOn(&resolve_c3_install.step);
     install_all.dependOn(&mesh_install.step);
     install_all.dependOn(&st_install.step);
     install_all.dependOn(&parse_arch_install.step);
@@ -559,6 +572,12 @@ pub fn build(b: *std.Build) void {
         "test-ledger",
         "Run ledger tests",
     );
+    const run_resolve_c3_tests = addTestStep(
+        b,
+        resolve_c3_root,
+        "test-resolve-c3",
+        "Run resolve-c3 tests",
+    );
     const run_mesh_tests = addTestStep(
         b,
         mesh_root,
@@ -641,6 +660,13 @@ pub fn build(b: *std.Build) void {
             .test_deps = &.{&run_ledger_tests.step},
         },
         .{
+            .path = b.path("apps/resolve-c3"),
+            .build_step_name = "build-resolve-c3",
+            .build_description = "Build resolve-c3 binary",
+            .build_deps = &.{&resolve_c3_install.step},
+            .test_deps = &.{&run_resolve_c3_tests.step},
+        },
+        .{
             .path = b.path("apps/mesh"),
             .build_step_name = "build-mesh",
             .build_description = "Build mesh binary",
@@ -693,6 +719,7 @@ pub fn build(b: *std.Build) void {
 
     addRunStep(b, seq, "run-seq", "Run seq", &.{});
     addRunStep(b, ledger, "run-ledger", "Run ledger", &.{"--help"});
+    addRunStep(b, resolve_c3, "run-resolve-c3", "Run resolve-c3", &.{"--help"});
     addRunStep(b, st, "run-st", "Run st", &.{"--help"});
     addRunStep(b, mesh, "run-mesh", "Run mesh", &.{"--help"});
     addRunStep(b, parse_arch, "run-parse-arch", "Run parse-arch", &.{"--help"});

@@ -5044,8 +5044,8 @@ fn containsReviewCompilerCandidateCue(text: []const u8) bool {
             "review compiler",
             "review-compiler-audit",
             "review_compiler_audit",
-            "review_compile.py",
-            ".resolve-c3",
+            "resolve-c3",
+            ".ledger/c3",
             "minimal_review_patch_certificate",
             "MRPC-v1",
             "Counterexample Compression Compiler",
@@ -5071,8 +5071,8 @@ fn containsTrueReviewCompilerAssistantEvidence(text: []const u8) bool {
 
 fn containsTrueC3Evidence(text: []const u8) bool {
     return containsAnyIgnoreCaseAscii(text, &.{
-        "review_compile.py begin",
-        ".resolve-c3/state.json",
+        "resolve-c3 begin",
+        ".ledger/c3/state.json",
         "minimal_review_patch_certificate",
         "MRPC-v1",
     });
@@ -5172,12 +5172,12 @@ fn recordReviewCompilerC3Text(
     if (containsAnyIgnoreCaseAscii(text, &.{ "isolated_waiver", "isolated waiver" })) signals.isolated_waiver_seen = true;
     if (containsAnyIgnoreCaseAscii(text, &.{ "candidate-worktree", "candidate worktree" })) signals.c3_candidate_worktree_context_seen = true;
 
-    if (containsAnyIgnoreCaseAscii(text, &.{ "review_compile.py begin", "\"event\":\"begin\"", "\"event\": \"begin\"", "\nbegin\n" })) {
+    if (containsAnyIgnoreCaseAscii(text, &.{ "resolve-c3 begin", "\"event\":\"begin\"", "\"event\": \"begin\"", "\nbegin\n" })) {
         audit.c3.controller.begin_events += 1;
         signals.c3_begin_seen = true;
         recordReviewCompilerC3Time(signals, .begin, timestamp);
     }
-    if (containsIgnoreCaseAscii(text, ".resolve-c3/state.json")) audit.c3.controller.state_files += 1;
+    if (containsIgnoreCaseAscii(text, ".ledger/c3/state.json")) audit.c3.controller.state_files += 1;
     if (containsAnyIgnoreCaseAscii(text, &.{ "apply-certified", "apply_certified", "mrpc_apply_certified" })) audit.c3.controller.mrpc_apply_certified += 1;
     if (containsAnyIgnoreCaseAscii(text, &.{ "final-certified", "final_certified", "mrpc_final_certified" })) audit.c3.controller.mrpc_final_certified += 1;
     if (containsAnyIgnoreCaseAscii(text, &.{ "MRPC-v1", "minimal_review_patch_certificate" })) signals.c3_mrpc_seen = true;
@@ -5404,7 +5404,7 @@ fn reviewCompilerToolContainsAny(tool: canonical_trace.ToolLifecycleRecord, need
 }
 
 fn commandContainsReviewCompileController(cmd: []const u8, subcommand: []const u8) bool {
-    if (!containsIgnoreCaseAscii(cmd, "review_compile.py")) return false;
+    if (!containsAnyIgnoreCaseAscii(cmd, &.{"resolve-c3"})) return false;
     return containsIgnoreCaseAscii(cmd, subcommand);
 }
 
@@ -19175,36 +19175,36 @@ test "review-compiler-audit c3 protocol reports controller, tournament, holdout,
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T08:00:01Z\",\"payload\":{\"type\":\"user_message\",\"turn_id\":\"r1\",\"message\":\"Raw $resolve mention only.\"}}\n";
     const incomplete_begin =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T09:00:00Z\",\"payload\":{\"id\":\"c3-begin\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T09:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"b1\",\"message\":\"review_compile.py begin\\ncounterexample-added raw_finding\\nbranch_liabilities:\\n  - F1\\nindependent_families:\\n  - fam1\\nbasis-set\\ncandidate-registered route_class: owner\\ncandidate-selected\\nablation-recorded\\nedit_atoms_tested\\nremoved_edit_atom\\nsurvived_edit_atom\\norphan_edit_atom\\none_minimal_pass\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n";
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T09:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"b1\",\"message\":\"resolve-c3 begin\\ncounterexample-added raw_finding\\nbranch_liabilities:\\n  - F1\\nindependent_families:\\n  - fam1\\nbasis-set\\ncandidate-registered route_class: owner\\ncandidate-selected\\nablation-recorded\\nedit_atoms_tested\\nremoved_edit_atom\\nsurvived_edit_atom\\norphan_edit_atom\\none_minimal_pass\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n";
     const stages_and_controller =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T10:00:00Z\",\"payload\":{\"id\":\"c3-stages\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"s1\",\"message\":\"review_compile.py begin\\n.resolve-c3/state.json\\nMRPC-v1 minimal_review_patch_certificate\\napply-certified\\nfinal-certified\\nbasis-set\\ncandidate-registered route_class: typed\\ncandidate-selected\\nablation-recorded edit_atoms_tested removed_edit_atom\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:02Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"s1\",\"call_id\":\"ctl-commit\",\"command\":\"python review_compile.py commit\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"committed\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:03Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"s1\",\"call_id\":\"ctl-push\",\"command\":\"python review_compile.py push\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"pushed\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"s1\",\"message\":\"resolve-c3 begin\\n.ledger/c3/state.json\\nMRPC-v1 minimal_review_patch_certificate\\napply-certified\\nfinal-certified\\nbasis-set\\ncandidate-registered route_class: typed\\ncandidate-selected\\nablation-recorded edit_atoms_tested removed_edit_atom\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:02Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"s1\",\"call_id\":\"ctl-commit\",\"command\":\"resolve-c3 commit\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"committed\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:03Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"s1\",\"call_id\":\"ctl-push\",\"command\":\"resolve-c3 push\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"pushed\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:04Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"s1\",\"message\":\"closed\"}}\n";
     const direct_delivery_patch =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T11:00:00Z\",\"payload\":{\"id\":\"c3-direct-patch\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T11:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"p1\",\"message\":\"review_compile.py begin\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T11:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"p1\",\"message\":\"resolve-c3 begin\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-05-12T11:00:02Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"apply_patch\",\"call_id\":\"bad-patch\",\"arguments\":\"*** Update File: apps/seq/src/lib.zig\\n+bad\\n\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T11:00:03Z\",\"payload\":{\"type\":\"patch_apply_end\",\"turn_id\":\"p1\",\"call_id\":\"bad-patch\",\"success\":true,\"cwd\":\"/repo\",\"changes\":{\"files\":1}}}\n";
     const lab_patch =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T12:00:00Z\",\"payload\":{\"id\":\"c3-lab-patch\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T12:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"l1\",\"message\":\"review_compile.py begin\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\\ncandidate-worktree lab patch used\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T12:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"l1\",\"message\":\"resolve-c3 begin\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\\ncandidate-worktree lab patch used\"}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-05-12T12:00:02Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"apply_patch\",\"call_id\":\"lab-patch\",\"arguments\":\"*** Update File: apps/seq/src/lib.zig\\n+candidate lab patch\\n\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T12:00:03Z\",\"payload\":{\"type\":\"patch_apply_end\",\"turn_id\":\"l1\",\"call_id\":\"lab-patch\",\"success\":true,\"cwd\":\"/repo/.resolve-c3/candidates/candidate-worktree\",\"changes\":{\"files\":1}}}\n";
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T12:00:03Z\",\"payload\":{\"type\":\"patch_apply_end\",\"turn_id\":\"l1\",\"call_id\":\"lab-patch\",\"success\":true,\"cwd\":\"/repo/.ledger/c3/candidates/candidate-worktree\",\"changes\":{\"files\":1}}}\n";
     const raw_commit =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T13:00:00Z\",\"payload\":{\"id\":\"c3-raw-commit\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T13:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"g1\",\"message\":\"review_compile.py begin\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T13:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"g1\",\"message\":\"resolve-c3 begin\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T13:00:02Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"g1\",\"call_id\":\"raw-commit\",\"command\":\"git commit -m bad\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"ok\"}}\n";
     const holdout_recompile =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T14:00:00Z\",\"payload\":{\"id\":\"c3-recompile\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T14:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"h1\",\"message\":\"review_compile.py begin\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T14:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"h1\",\"message\":\"resolve-c3 begin\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T14:00:02Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"h1\",\"message\":\"new_counterexample from delivery holdout\\nreset after invalidation\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T14:00:03Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"h1\",\"message\":\"basis-set\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T14:00:04Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"h1\",\"message\":\"adjacent_followup captured\"}}\n";
     const waiver_and_violation =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T15:00:00Z\",\"payload\":{\"id\":\"c3-waiver\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T15:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"w1\",\"message\":\"review_compile.py begin\\ntournament_waiver\\nsingle_candidate_material_violation\"}}\n";
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T15:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"w1\",\"message\":\"resolve-c3 begin\\ntournament_waiver\\nsingle_candidate_material_violation\"}}\n";
 
     try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/12/rollout-c3-raw.jsonl", .data = raw_resolve_only });
     try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/12/rollout-c3-begin.jsonl", .data = incomplete_begin });

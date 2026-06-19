@@ -13,6 +13,7 @@ on:
       - "apps/puff/**"
       - "apps/learnings/**"
       - "apps/ledger/**"
+      - "apps/resolve-c3/**"
       - "apps/mesh/**"
       - "apps/st/**"
       - "apps/parse-arch/**"
@@ -39,6 +40,7 @@ jobs:
       puff: ${{ steps.filter.outputs.puff }}
       learnings: ${{ steps.filter.outputs.learnings }}
       ledger: ${{ steps.filter.outputs.ledger }}
+      resolve_c3: ${{ steps.filter.outputs.resolve_c3 }}
       mesh: ${{ steps.filter.outputs.mesh }}
       st: ${{ steps.filter.outputs.st }}
       parse_arch: ${{ steps.filter.outputs.parse_arch }}
@@ -63,6 +65,8 @@ jobs:
               - "apps/learnings/**"
             ledger:
               - "apps/ledger/**"
+            resolve_c3:
+              - "apps/resolve-c3/**"
             mesh:
               - "apps/mesh/**"
             st:
@@ -291,6 +295,20 @@ jobs:
         run: zig build build-ledger -Doptimize=ReleaseFast
       - name: Test ledger
         run: zig build test-ledger
+
+  resolve-c3:
+    needs: changes
+    if: needs.changes.outputs.resolve_c3 == 'true' || needs.changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build resolve-c3
+        run: zig build build-resolve-c3 -Doptimize=ReleaseFast
+      - name: Test resolve-c3
+        run: zig build test-resolve-c3
 
   st:
     needs: changes
