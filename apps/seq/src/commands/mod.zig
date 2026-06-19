@@ -685,7 +685,9 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\  --include-raw              Include raw evidence snippets; default output is sanitized summaries only
         ,
         .skill_blocks =>
-        \\usage: seq skill-blocks --skill <name> [--mode blocks|term-counts|term-summary] [--term-group <name=csv>] [--examples N] [--history <distinct|all|latest>] [--session-id <id>|--path <jsonl>|--current] [--last <Nm|Nh|Nd>|--since <iso>] [--until <iso>] [--limit N] [--format table|json|csv|jsonl]
+        \\usage: seq skill-blocks --skill <name> [--mode blocks|body|term-counts|term-summary] [--term-group <name=csv>] [--examples N] [--history <distinct|all|latest>] [--session-id <id>|--path <jsonl>|--current] [--last <Nm|Nh|Nd>|--since <iso>] [--until <iso>] [--limit N] [--format table|json|csv|jsonl]
+        \\extra options:
+        \\  --mode body               Emit the single selected block_text directly; use --history latest or narrower filters if multiple blocks match
         ,
         .artifact_search =>
         \\usage: seq artifact-search [--contains <text>|--contains-any <csv>|--regex <expr>] [--kind <auto|session|memory|orchestration|tooling|prompt>] [--surface <auto|messages|tool_calls|memory_blocks>] [--roles <csv>] [--tool <name>] [--workdir <path>] [--session-id <id>|--path <jsonl>] [--since <iso>] [--until <iso>] [--follow <none|auto>] [--strip-skill-blocks] [--no-dedupe-exact] [--stats] [--limit N] [--format table|json|csv|jsonl]
@@ -936,6 +938,8 @@ fn validateFormatForCommand(cmd: lib.Command, opts: Options) !void {
         .skill_blocks => {
             if (opts.mode == null or std.mem.eql(u8, opts.mode.?, "blocks")) {
                 if (fmt != .json and fmt != .jsonl) return error.InvalidFormatForCommand;
+            } else if (std.mem.eql(u8, opts.mode.?, "body")) {
+                return error.InvalidFormatForCommand;
             } else if (std.mem.eql(u8, opts.mode.?, "term-counts") or std.mem.eql(u8, opts.mode.?, "term-summary")) {
                 if (fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
             } else {
@@ -1603,6 +1607,7 @@ fn isValidWorkflowAuditMode(text: []const u8) bool {
 
 fn isValidSkillBlocksMode(text: []const u8) bool {
     return std.mem.eql(u8, text, "blocks") or
+        std.mem.eql(u8, text, "body") or
         std.mem.eql(u8, text, "term-counts") or
         std.mem.eql(u8, text, "term-summary");
 }
@@ -10205,15 +10210,17 @@ const SkillBlockHistory = enum {
 
 const SkillBlockMode = enum {
     blocks,
+    body,
     term_counts,
     term_summary,
 
     fn parse(raw_opt: ?[]const u8) !SkillBlockMode {
         const raw = raw_opt orelse return .blocks;
         if (std.mem.eql(u8, raw, "blocks")) return .blocks;
+        if (std.mem.eql(u8, raw, "body")) return .body;
         if (std.mem.eql(u8, raw, "term-counts")) return .term_counts;
         if (std.mem.eql(u8, raw, "term-summary")) return .term_summary;
-        printCliError("error: invalid --mode value {s}; expected blocks, term-counts, or term-summary\n", .{raw});
+        printCliError("error: invalid --mode value {s}; expected blocks, body, term-counts, or term-summary\n", .{raw});
         return error.InvalidModeArg;
     }
 };
@@ -10562,13 +10569,29 @@ fn skillBlockTermSummaryRows(
     return out;
 }
 
+fn writeSingleSkillBlockBody(aggregates: []const SkillBlockAggregate, out_path: ?[]const u8) !void {
+    if (aggregates.len == 0) {
+        printCliError("error: no matching skill block found\n", .{});
+        return error.SessionNotFound;
+    }
+    if (aggregates.len != 1) {
+        printCliError(
+            "error: --mode body matched {d} distinct skill blocks; narrow with --history latest, --session-id, --path, --since, --until, or --limit 1\n",
+            .{aggregates.len},
+        );
+        return error.InvalidSessionTarget;
+    }
+    try writeTextOutput(aggregates[0].block_text, out_path);
+}
+
 fn cmdSkillBlocks(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
     const history = try SkillBlockHistory.parse(opts.history_text);
     const mode = try SkillBlockMode.parse(opts.mode);
     const term_mode = mode == .term_counts or mode == .term_summary;
-    if (mode == .blocks and (opts.term_group_count > 0 or opts.examples_set)) return error.InvalidModeArg;
+    if ((mode == .blocks or mode == .body) and (opts.term_group_count > 0 or opts.examples_set)) return error.InvalidModeArg;
     if (mode == .term_counts and opts.examples_set) return error.InvalidModeArg;
     if (term_mode and history == .all) return error.InvalidModeArg;
+    if (mode == .body and history == .all) return error.InvalidModeArg;
     if (term_mode and opts.term_group_count == 0) return error.MissingArgValue;
 
     const day_filter = deriveSessionDayPathFilterFromOptions(opts);
@@ -10604,6 +10627,11 @@ fn cmdSkillBlocks(allocator: std.mem.Allocator, sessions_root: []const u8, opts:
         aggregate_slice = aggregates.items[aggregates.items.len - 1 ..];
     } else if (history == .distinct and opts.limit > 0 and aggregates.items.len > opts.limit) {
         aggregate_slice = aggregates.items[0..opts.limit];
+    }
+
+    if (mode == .body) {
+        try writeSingleSkillBlockBody(aggregate_slice, opts.out_path);
+        return;
     }
 
     if (mode == .term_counts or mode == .term_summary) {
@@ -18954,6 +18982,7 @@ test "validateCommandOptions gates review-compiler-audit protocol" {
 
 test "validateFormatForCommand gates skill-blocks formats by mode" {
     try std.testing.expectError(error.InvalidFormatForCommand, validateFormatForCommand(.skill_blocks, .{ .format = .table }));
+    try std.testing.expectError(error.InvalidFormatForCommand, validateFormatForCommand(.skill_blocks, .{ .format = .json, .mode = "body" }));
     try validateFormatForCommand(.skill_blocks, .{ .format = .table, .mode = "term-counts" });
     try validateFormatForCommand(.skill_blocks, .{ .format = .csv, .mode = "term-summary" });
     try std.testing.expectError(error.InvalidFormatForCommand, validateFormatForCommand(.skill_blocks, .{ .format = .markdown, .mode = "term-summary" }));
@@ -20730,6 +20759,71 @@ test "skill-blocks history all preserves duplicate occurrences" {
     const needle = "\"skill\": \"accretive\"";
     try std.testing.expect(std.mem.indexOf(u8, got, needle) != null);
     try std.testing.expect(std.mem.count(u8, got, needle) == 2);
+}
+
+test "skill-blocks body mode emits one selected block_text without jq" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/03/10");
+    const session_rel = "2026/03/10/rollout-2026-03-10T10-00-00-019c0000-0000-7000-8000-000000000023.jsonl";
+    const block_one = "<skill>\\n<name>accretive</name>\\n# one\\n</skill>";
+    const block_two = "<skill>\\n<name>accretive</name>\\n# two\\n</skill>";
+    const session_content =
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"" ++ block_one ++ "\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:01:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"" ++ block_two ++ "\"}]}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = session_rel, .data = session_content });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "skill-blocks-body.md" });
+    defer std.testing.allocator.free(output_path);
+
+    const args = [_][]const u8{
+        "--root",
+        root_abs,
+        "--skill",
+        "accretive",
+        "--mode",
+        "body",
+        "--history",
+        "latest",
+        "--session-id",
+        "019c0000-0000-7000-8000-000000000023",
+    };
+    const got = try runCommandWithOutput(std.testing.allocator, .skill_blocks, args[0..], output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expectEqualStrings("<skill>\n<name>accretive</name>\n# two\n</skill>", got);
+}
+
+test "skill-blocks body mode fails closed when selection is ambiguous" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/03/10");
+    const session_rel = "2026/03/10/rollout-2026-03-10T10-00-00-019c0000-0000-7000-8000-000000000024.jsonl";
+    const session_content =
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"<skill>\\n<name>accretive</name>\\n# one\\n</skill>\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-03-10T10:01:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"<skill>\\n<name>accretive</name>\\n# two\\n</skill>\"}]}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = session_rel, .data = session_content });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "skill-blocks-body-ambiguous.md" });
+    defer std.testing.allocator.free(output_path);
+
+    const args = [_][]const u8{
+        "--root",
+        root_abs,
+        "--skill",
+        "accretive",
+        "--mode",
+        "body",
+        "--session-id",
+        "019c0000-0000-7000-8000-000000000024",
+    };
+    try std.testing.expectError(error.InvalidSessionTarget, runCommandWithOutput(std.testing.allocator, .skill_blocks, args[0..], output_path));
 }
 
 test "skill-blocks term modes count distinct aggregate block text" {

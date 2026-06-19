@@ -156,13 +156,15 @@ seq review-compiler-audit --root ~/.codex/sessions --protocol legacy-cleanroom -
 
 `skill-blocks` is the exact-body surface for injected `<skill>...</skill>` content:
 - defaults to `--mode blocks --history distinct --format jsonl`, preserving the existing exact block export contract
+- `--mode body` emits exactly one selected `block_text` directly, replacing shell `jq -r '.[0].block_text'`; narrow with `--history latest`, `--session-id`, `--path`, or time filters if more than one distinct body matches
 - `--mode term-counts` emits one row per selected distinct/latest `block_hash + term_group`, including zero-count rows
 - `--mode term-summary` aggregates the same term-count data by `skill + term_group` and caps examples with `--examples N` (default 3, max 10)
 - term modes require repeated `--term-group <name=csv>` flags, count case-insensitive literal terms inside `block_text`, and reject `--history all` for v1
-- term modes support `--format table|json|csv|jsonl`; legacy `blocks` mode remains `json|jsonl`
+- term modes support `--format table|json|csv|jsonl`; legacy `blocks` mode remains `json|jsonl`; `body` mode writes raw text and does not accept `--format`
 
 Examples:
 ```bash
+seq skill-blocks --root ~/.codex/sessions --skill review-adjudication --last 30d --until 2026-06-19T18:54:00Z --history latest --mode body --output ~/Downloads/review-adjudication.md
 seq skill-blocks --root ~/.codex/sessions --skill fixed-point-driver --mode term-counts --term-group ablation=ablative,ablation --format table
 seq skill-blocks --root ~/.codex/sessions --skill fixed-point-driver --mode term-summary --term-group ablation=ablative,ablation --term-group isomorphism=isomorphic,isomorphism --examples 5 --format table
 ```
