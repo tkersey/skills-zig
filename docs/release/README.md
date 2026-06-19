@@ -9,6 +9,7 @@ This monorepo uses independent GitHub Actions release workflows per CLI:
 - `puff`: `.github/workflows/release-puff.yml` on tag `puff-v*`
 - `learnings`: `.github/workflows/release-learnings.yml` on tag `learnings-v*`
 - `ledger`: `.github/workflows/release-ledger.yml` on tag `ledger-v*`
+- `resolve-c3`: `.github/workflows/release-resolve-c3.yml` on tag `resolve-c3-v*`
 - `mesh`: `.github/workflows/release-mesh.yml` on tag `mesh-v*`
 - `st`: `.github/workflows/release-st.yml` on tag `st-v*`
 - `parse-arch`: `.github/workflows/release-parse-arch.yml` on tag `parse-arch-v*`
@@ -22,6 +23,7 @@ Per-app VERSION files:
 - `apps/puff/VERSION`
 - `apps/learnings/VERSION`
 - `apps/ledger/VERSION`
+- `apps/resolve-c3/VERSION`
 - `apps/mesh/VERSION`
 - `apps/st/VERSION`
 - `apps/parse-arch/VERSION`
@@ -46,6 +48,7 @@ Release tags must match file versions:
 - `puff-v<version>` where `<version>` equals `apps/puff/VERSION`
 - `learnings-v<version>` where `<version>` equals `apps/learnings/VERSION`
 - `ledger-v<version>` where `<version>` equals `apps/ledger/VERSION`
+- `resolve-c3-v<version>` where `<version>` equals `apps/resolve-c3/VERSION`
 - `mesh-v<version>` where `<version>` equals `apps/mesh/VERSION`
 - `st-v<version>` where `<version>` equals `apps/st/VERSION`
 - `parse-arch-v<version>` where `<version>` equals `apps/parse-arch/VERSION`
@@ -71,6 +74,8 @@ Examples:
 - `learnings-v1.2.3-darwin-arm64.tar.gz`
 - `ledger-v1.2.3-linux-x86_64.tar.gz`
 - `ledger-v1.2.3-darwin-arm64.tar.gz`
+- `resolve-c3-v1.2.3-linux-x86_64.tar.gz`
+- `resolve-c3-v1.2.3-darwin-arm64.tar.gz`
 - `mesh-v1.2.3-linux-x86_64.tar.gz`
 - `mesh-v1.2.3-darwin-arm64.tar.gz`
 - `st-v1.2.3-linux-x86_64.tar.gz`
