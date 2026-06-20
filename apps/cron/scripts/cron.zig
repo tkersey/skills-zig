@@ -1139,7 +1139,7 @@ fn parseUnixTimestampMs(raw: []const u8) !i64 {
 }
 
 fn nowMs() i64 {
-    return @as(i64, @intCast(@divFloor(std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000)));
+    return @as(i64, @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000)));
 }
 
 fn alignMsToMinute(ms: i64) i64 {
@@ -3231,6 +3231,12 @@ test "computeNextRunAt accepts legacy non-prefixed rrule" {
     try std.testing.expect(next > anchor);
 }
 
+test "nowMs returns unix epoch milliseconds" {
+    const value = nowMs();
+    try std.testing.expect(value > 1_600_000_000_000);
+    try std.testing.expect(value < 4_102_444_800_000);
+}
+
 test "automation rows json uses valid separators for multiple rows" {
     const alloc = std.testing.allocator;
     var rows = [_]AutomationRow{
@@ -3327,6 +3333,62 @@ test "cmdUpdate preserves prompt text until sqlite step" {
     var file_row = try getAutomationById(alloc, &db, "prompt-update-id");
     defer file_row.deinit(alloc);
     try std.testing.expectEqualStrings("file prompt", file_row.prompt);
+}
+
+test "cmdRunNow writes unix epoch milliseconds" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "codex-dev.db", .data = "" });
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", alloc);
+    defer alloc.free(root_abs);
+    const db_path = try std.fs.path.join(alloc, &.{ root_abs, "codex-dev.db" });
+    defer alloc.free(db_path);
+    const automation_root = try std.fs.path.join(alloc, &.{ root_abs, ".codex", "automations" });
+    defer alloc.free(automation_root);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), automation_root);
+
+    perf_automation_root_override = automation_root;
+    defer perf_automation_root_override = null;
+
+    var db = try Db.open(alloc, db_path);
+    defer db.close();
+    try createTestSchema(alloc, &db);
+
+    const created_at: i64 = 1_772_469_600_000;
+    try db.exec(
+        alloc,
+        "insert into automations (id, name, prompt, status, next_run_at, last_run_at, cwds, rrule, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &.{
+            .{ .text = "run-now-id" },
+            .{ .text = "Run Now" },
+            .{ .text = "noop prompt" },
+            .{ .text = "ACTIVE" },
+            .null,
+            .null,
+            .{ .text = "[]" },
+            .{ .text = "RRULE:FREQ=DAILY;BYHOUR=9;BYMINUTE=0" },
+            .{ .int = created_at },
+            .{ .int = created_at },
+        },
+    );
+
+    const before = nowMs();
+    {
+        const stdout_guard = try silenceStdout();
+        defer restoreStdout(stdout_guard);
+        try cmdRunNow(alloc, db_path, .{ .automation_id = "run-now-id" });
+    }
+    const after = nowMs();
+
+    var row = try getAutomationById(alloc, &db, "run-now-id");
+    defer row.deinit(alloc);
+    const next = row.next_run_at orelse return error.TestUnexpectedResult;
+    try std.testing.expect(next >= before);
+    try std.testing.expect(next <= after);
+    try std.testing.expect(row.updated_at >= before);
+    try std.testing.expect(row.updated_at <= after);
 }
 
 test "xmlEscapeAlloc escapes plist string metacharacters" {
