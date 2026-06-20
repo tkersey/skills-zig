@@ -2942,6 +2942,12 @@ fn parseArgs(argv: []const []const u8) !Args {
                     args.proof_state = argv[i];
                     continue;
                 }
+                if (std.mem.eql(u8, token, "--proof-id")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.proof_id = argv[i];
+                    continue;
+                }
                 if (std.mem.eql(u8, token, "--command")) {
                     i += 1;
                     if (i >= argv.len) return error.MissingValue;
@@ -2952,6 +2958,12 @@ fn parseArgs(argv: []const []const u8) !Args {
                     i += 1;
                     if (i >= argv.len) return error.MissingValue;
                     args.evidence_ref = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--now")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.now = argv[i];
                     continue;
                 }
                 return error.InvalidSetProofArg;
@@ -2983,6 +2995,18 @@ fn parseArgs(argv: []const []const u8) !Args {
                     i += 1;
                     if (i >= argv.len) return error.MissingValue;
                     args.evidence_ref = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--proof-id")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.proof_id = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--now")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.now = argv[i];
                     continue;
                 }
                 if (std.mem.eql(u8, token, "--allow-unproven")) {
@@ -6202,12 +6226,36 @@ fn upsertProofReceipt(allocator: std.mem.Allocator, item: *Item, receipt: ProofR
     item.proof_receipts = try out.toOwnedSlice(allocator);
 }
 
-fn maybeLegacyReceiptForCommand(allocator: std.mem.Allocator, item: *Item, proof: ProofMeta) !void {
+fn timestampArgOrNowAlloc(allocator: std.mem.Allocator, raw: ?[]const u8) ![]const u8 {
+    if (raw) |value| return try requireNonEmptyString(allocator, value, "--now");
+    return try nowUtcAlloc(allocator);
+}
+
+fn proofObligationCommandMatches(obligation: ProofObligation, command: []const u8) bool {
+    return obligation.command.len == 0 or std.mem.eql(u8, obligation.command, command);
+}
+
+fn maybeLegacyReceiptForCommand(allocator: std.mem.Allocator, item: *Item, proof: ProofMeta, proof_id: ?[]const u8) !void {
+    if (proof_id) |raw_id| {
+        const obligation_id = try requireNonEmptyString(allocator, raw_id, "--proof-id");
+        const obligation = findProofObligation(item.*, obligation_id) orelse return error.InvalidProofObligation;
+        if (!proofObligationCommandMatches(obligation, proof.command)) return error.InvalidProofObligation;
+        try upsertProofReceipt(allocator, item, .{
+            .obligation_id = obligation.id,
+            .action_id = "legacy-single-proof",
+            .state = proof.state.asString(),
+            .command = proof.command,
+            .evidence_ref = proof.evidence_ref,
+            .recorded_at = proof.last_run_at,
+        });
+        return;
+    }
+
     const obligations = proofObligationsForItem(item.*);
     var matched: ?ProofObligation = null;
     for (obligations) |obligation| {
         if (!obligation.required) continue;
-        if (obligation.command.len == 0 or std.mem.eql(u8, obligation.command, proof.command)) {
+        if (proofObligationCommandMatches(obligation, proof.command)) {
             if (matched != null and !std.mem.eql(u8, matched.?.id, obligation.id)) return;
             matched = obligation;
         }
@@ -7634,9 +7682,9 @@ fn cmdSetProof(allocator: std.mem.Allocator, args: Args) !u8 {
         try requireNonEmptyString(allocator, raw, "--evidence-ref")
     else
         "";
-    proof.last_run_at = try nowUtcAlloc(allocator);
+    proof.last_run_at = try timestampArgOrNowAlloc(allocator, args.now);
     item.proof = proof;
-    try maybeLegacyReceiptForCommand(allocator, item, proof);
+    try maybeLegacyReceiptForCommand(allocator, item, proof, args.proof_id);
 
     try validateState(&state, args.allow_multiple_in_progress);
     const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
@@ -7666,9 +7714,9 @@ fn cmdComplete(allocator: std.mem.Allocator, args: Args) !u8 {
                 try requireNonEmptyString(allocator, raw, "--evidence-ref")
             else
                 "";
-            proof.last_run_at = try nowUtcAlloc(allocator);
+            proof.last_run_at = try timestampArgOrNowAlloc(allocator, args.now);
             item.proof = proof;
-            try maybeLegacyReceiptForCommand(allocator, item, proof);
+            try maybeLegacyReceiptForCommand(allocator, item, proof, args.proof_id);
             missing_reason = proofCompletionMissingReason(item.*);
         }
         if (missing_reason) |missing| {
@@ -7679,7 +7727,7 @@ fn cmdComplete(allocator: std.mem.Allocator, args: Args) !u8 {
                 return 2;
             }
             const waiver_reason = try requireNonEmptyString(allocator, args.reason orelse return error.MissingReason, "--reason");
-            const now = try nowUtcAlloc(allocator);
+            const now = try timestampArgOrNowAlloc(allocator, args.now);
             try addForcedCompletionWaivers(allocator, &state, item_id, waiver_reason, now);
         }
     }
@@ -7688,7 +7736,7 @@ fn cmdComplete(allocator: std.mem.Allocator, args: Args) !u8 {
 
     try validateState(&state, args.allow_multiple_in_progress);
     const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
-    const ts = try nowUtcAlloc(allocator);
+    const ts = try timestampArgOrNowAlloc(allocator, args.now);
     try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, ts, meta, null);
 
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
@@ -7755,10 +7803,21 @@ fn cmdProofRecord(allocator: std.mem.Allocator, args: Args) !u8 {
 
     const item_id = try requireNonEmptyString(allocator, args.id.?, "--id");
     const obligation_id = try requireNonEmptyString(allocator, args.obligation_id.?, "--obligation");
-    const item = state.get(item_id) orelse return error.UnknownItemId;
-    const obligation = findProofObligation(item.*, obligation_id) orelse return error.InvalidProofObligation;
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    const item = state.get(item_id) orelse {
+        try stdout.print("proof record blocked for {s}/{s}: unknown item\n", .{ item_id, obligation_id });
+        return 2;
+    };
+    const obligation = findProofObligation(item.*, obligation_id) orelse {
+        try stdout.print("proof record blocked for {s}/{s}: unknown proof obligation\n", .{ item_id, obligation_id });
+        return 2;
+    };
     const command = try requireNonEmptyString(allocator, args.step.?, "--command");
-    if (obligation.command.len > 0 and !std.mem.eql(u8, obligation.command, command)) return error.InvalidProofObligation;
+    if (!proofObligationCommandMatches(obligation, command)) {
+        try stdout.print("proof record blocked for {s}/{s}: command mismatch; expected \"{s}\", got \"{s}\"\n", .{ item_id, obligation_id, obligation.command, command });
+        return 2;
+    }
     const now = try nowUtcAlloc(allocator);
     try upsertProofReceipt(allocator, item, .{
         .obligation_id = obligation_id,
@@ -7774,8 +7833,6 @@ fn cmdProofRecord(allocator: std.mem.Allocator, args: Args) !u8 {
     const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
     try writeCanonicalRecords(args.file, &state, loaded.latest_seq + 1, now, meta, null);
 
-    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-    const stdout = &stdout_writer.interface;
     try stdout.print("recorded proof receipt for {s}/{s}\n", .{ item_id, obligation_id });
     try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, loaded.latest_seq + 1);
     return 0;
@@ -13745,7 +13802,7 @@ test "graph complete requires proof and demotes completed item" {
     defer blocked.state.deinit();
     try std.testing.expectEqual(Status.pending, blocked.state.getConst("st-001").?.status);
 
-    try std.testing.expectEqual(@as(u8, 0), try cmdComplete(allocator, .{ .command = .complete, .file = plan_path, .id = "st-001", .step = "zig build test-st", .evidence_ref = "proof.log" }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdComplete(allocator, .{ .command = .complete, .file = plan_path, .id = "st-001", .proof_id = "proof-001", .step = "zig build test-st", .evidence_ref = "proof.log", .now = "2026-06-18T01:02:03Z" }));
     var completed = try loadValidatedState(allocator, plan_path, false);
     defer completed.state.deinit();
     const item = completed.state.getConst("st-001").?;
@@ -13753,7 +13810,44 @@ test "graph complete requires proof and demotes completed item" {
     try std.testing.expect(!item.in_plan);
     try std.testing.expectEqual(ProofState.pass, item.proof.?.state);
     try std.testing.expectEqualStrings("proof.log", item.proof.?.evidence_ref);
+    try std.testing.expectEqual(@as(usize, 1), item.proof_receipts.len);
+    try std.testing.expectEqualStrings("proof-001", item.proof_receipts[0].obligation_id);
+    try std.testing.expectEqualStrings("2026-06-18T01:02:03Z", item.proof_receipts[0].recorded_at);
     try std.testing.expectEqual(@as(u8, 0), try cmdProof(allocator, .{ .command = .proof, .proof_command = .audit, .file = plan_path, .id = "st-001", .format = .json }));
+}
+
+test "set-proof records named proof receipt with timestamp" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
+    const patch_path = try std.fs.path.join(allocator, &.{ root, "patch.json" });
+    try writeTextAtomic(allocator, patch_path,
+        \\{"version":1,"author":"test","reason":"named proof fixture","ops":[
+        \\{"op":"upsert-intent","intent":{"id":"intent-001","text":"Completion requires named proof.","category":"requirement","disposition":"covered"}},
+        \\{"op":"upsert-item","item":{"id":"st-001","step":"Implement named proof fixture","status":"pending","priority":"high","in_plan":true,"item_type":"feature","intent_refs":["intent-001"],"acceptance":["Completion is proof-gated"],"validation":["zig build test-st"],"lock_roots":["apps/st"],"contract":{"objective":"Exercise named legacy proof receipt.","proof_obligations":[{"id":"proof-001","kind":"unit","command":"zig build test-st","required":true}]}}}
+        \\]}
+    );
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 0), try cmdGraph(allocator, .{ .command = .graph, .graph_command = .apply, .file = plan_path, .input = patch_path, .gate = .implementation_ready }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdSetProof(allocator, .{ .command = .set_proof, .file = plan_path, .id = "st-001", .proof_state = "pass", .proof_id = "proof-001", .step = "zig build test-st", .evidence_ref = "proof.log", .now = "2026-06-18T01:02:03Z" }));
+
+    var loaded = try loadValidatedState(allocator, plan_path, false);
+    defer loaded.state.deinit();
+    const item = loaded.state.getConst("st-001").?;
+    try std.testing.expectEqual(ProofState.pass, item.proof.?.state);
+    try std.testing.expectEqualStrings("2026-06-18T01:02:03Z", item.proof.?.last_run_at);
+    try std.testing.expectEqual(@as(usize, 1), item.proof_receipts.len);
+    try std.testing.expectEqualStrings("proof-001", item.proof_receipts[0].obligation_id);
+    try std.testing.expectEqualStrings("legacy-single-proof", item.proof_receipts[0].action_id);
+    try std.testing.expectEqualStrings("2026-06-18T01:02:03Z", item.proof_receipts[0].recorded_at);
+    try std.testing.expect(proofCompletionMissingReason(item.*) == null);
 }
 
 test "multiple required proof obligations can be satisfied by multiple receipts" {
@@ -13796,6 +13890,33 @@ test "multiple required proof obligations can be satisfied by multiple receipts"
     try std.testing.expectEqual(Status.completed, completed_item.status);
     try std.testing.expectEqual(@as(usize, 2), completed_item.proof_receipts.len);
     try std.testing.expect(completed_item.proof == null);
+}
+
+test "proof record command mismatch is a blocked result" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
+    const patch_path = try std.fs.path.join(allocator, &.{ root, "patch.json" });
+    try writeTextAtomic(allocator, patch_path,
+        \\{"version":1,"author":"test","reason":"proof mismatch fixture","ops":[
+        \\{"op":"upsert-intent","intent":{"id":"intent-001","text":"Proof command must match.","category":"requirement","disposition":"covered"}},
+        \\{"op":"upsert-item","item":{"id":"st-001","step":"Implement proof mismatch fixture","status":"pending","priority":"high","in_plan":true,"item_type":"feature","intent_refs":["intent-001"],"acceptance":["Completion is proof-gated"],"validation":["zig build test-st"],"lock_roots":["apps/st"],"contract":{"objective":"Exercise proof record diagnostics.","proof_obligations":[{"id":"proof-001","kind":"unit","command":"zig build test-st","required":true}]}}}
+        \\]}
+    );
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 0), try cmdGraph(allocator, .{ .command = .graph, .graph_command = .apply, .file = plan_path, .input = patch_path, .gate = .implementation_ready }));
+    try std.testing.expectEqual(@as(u8, 2), try cmdProofRecord(allocator, .{ .command = .proof, .proof_command = .record, .file = plan_path, .id = "st-001", .obligation_id = "proof-001", .action_id = "proof-action-test", .step = "zig build other", .evidence_ref = "test.log", .artifact_ref = "git:test" }));
+
+    var loaded = try loadValidatedState(allocator, plan_path, false);
+    defer loaded.state.deinit();
+    try std.testing.expectEqual(@as(usize, 0), loaded.state.getConst("st-001").?.proof_receipts.len);
 }
 
 test "legacy proof cannot satisfy multiple distinct required commands" {
@@ -13869,14 +13990,80 @@ test "complete parses legacy positional id and proof evidence alias" {
         "st-982",
         "--proof",
         ".step/proof/st-982.log",
+        "--proof-id",
+        "proof-001",
         "--command",
         "zig build test-st --summary all",
+        "--now",
+        "2026-06-18T01:02:03Z",
     });
 
     try std.testing.expectEqual(Command.complete, args.command);
     try std.testing.expectEqualStrings("st-982", args.id.?);
     try std.testing.expectEqualStrings(".step/proof/st-982.log", args.evidence_ref.?);
+    try std.testing.expectEqualStrings("proof-001", args.proof_id.?);
     try std.testing.expectEqualStrings("zig build test-st --summary all", args.step.?);
+    try std.testing.expectEqualStrings("2026-06-18T01:02:03Z", args.now.?);
+}
+
+test "set-proof parses documented proof id and timestamp flags" {
+    const args = try parseArgs(&.{
+        "st",
+        "set-proof",
+        "--file",
+        ".step/st-plan.jsonl",
+        "--id",
+        "st-982",
+        "--proof-state",
+        "pass",
+        "--proof-id",
+        "proof-001",
+        "--command",
+        "zig build test-st --summary all",
+        "--evidence-ref",
+        ".step/proof/st-982.log",
+        "--now",
+        "2026-06-18T01:02:03Z",
+    });
+
+    try std.testing.expectEqual(Command.set_proof, args.command);
+    try std.testing.expectEqualStrings("st-982", args.id.?);
+    try std.testing.expectEqualStrings("pass", args.proof_state.?);
+    try std.testing.expectEqualStrings("proof-001", args.proof_id.?);
+    try std.testing.expectEqualStrings("zig build test-st --summary all", args.step.?);
+    try std.testing.expectEqualStrings(".step/proof/st-982.log", args.evidence_ref.?);
+    try std.testing.expectEqualStrings("2026-06-18T01:02:03Z", args.now.?);
+}
+
+test "proof record parses documented full flag combination" {
+    const args = try parseArgs(&.{
+        "st",
+        "proof",
+        "record",
+        "--file",
+        ".step/st-plan.jsonl",
+        "--id",
+        "st-001",
+        "--obligation",
+        "proof-001",
+        "--action",
+        "proof-action-test",
+        "--command",
+        "zig build test-st",
+        "--evidence-ref",
+        "test.log",
+        "--artifact-ref",
+        "git:test",
+    });
+
+    try std.testing.expectEqual(Command.proof, args.command);
+    try std.testing.expectEqual(ProofCommand.record, args.proof_command);
+    try std.testing.expectEqualStrings("st-001", args.id.?);
+    try std.testing.expectEqualStrings("proof-001", args.obligation_id.?);
+    try std.testing.expectEqualStrings("proof-action-test", args.action_id.?);
+    try std.testing.expectEqualStrings("zig build test-st", args.step.?);
+    try std.testing.expectEqualStrings("test.log", args.evidence_ref.?);
+    try std.testing.expectEqualStrings("git:test", args.artifact_ref.?);
 }
 
 test "emitPlanSync keeps inventory while filtering mirrored plan projections" {
