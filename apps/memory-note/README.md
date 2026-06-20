@@ -20,6 +20,15 @@ memory-note path --extension harness
 memory-note version
 ```
 
+`doctor` returns JSON and exits `8` when it finds controlled memory-source
+layout issues. Failed extension entries include:
+
+- `issue`: stable machine-readable error name, such as `SymlinkComponent`;
+- `checked_path`: full notes directory path that was checked;
+- `offending_component`: path component that caused the issue, when it can be
+  reproduced during diagnosis;
+- `component_kind`: `symlink`, `not_dir`, or `unknown`.
+
 The CLI writes immutable JSON note envelopes under:
 
 ```text

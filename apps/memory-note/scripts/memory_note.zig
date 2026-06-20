@@ -73,6 +73,17 @@ const ParsedNote = struct {
     fingerprint: []const u8,
 };
 
+const DoctorPathDiagnostic = struct {
+    checked_path: []const u8,
+    offending_component: ?[]u8 = null,
+    component_kind: []const u8 = "unknown",
+
+    fn deinit(self: *DoctorPathDiagnostic, allocator: std.mem.Allocator) void {
+        if (self.offending_component) |component| allocator.free(component);
+        self.* = .{ .checked_path = "" };
+    }
+};
+
 const Date = struct {
     year: i64,
     month: i64,
@@ -366,9 +377,9 @@ fn cmdDoctor(allocator: std.mem.Allocator, env: *std.process.Environ.Map, args: 
         defer allocator.free(notes_dir);
         durable_store.ensureDirectoryPathNoSymlinks(notes_dir) catch |err| {
             issues += 1;
-            try w.print(",\"status\":\"failed\",\"issue\":", .{});
-            try writeJsonString(w, @errorName(err));
-            try w.writeByte('}');
+            var diagnostic = try doctorPathDiagnosticAlloc(allocator, notes_dir, err);
+            defer diagnostic.deinit(allocator);
+            try writeDoctorFailureJson(w, err, diagnostic);
             continue;
         };
         const names = try durable_store.listSortedRegularFilesNoSymlink(allocator, notes_dir, MaxFiles, MaxNoteBytes);
@@ -520,6 +531,30 @@ fn notesDirAlloc(allocator: std.mem.Allocator, env: *std.process.Environ.Map, ov
     const home = try codexHomeAlloc(allocator, env, override);
     defer allocator.free(home);
     return std.fs.path.join(allocator, &.{ home, "memories", "extensions", extension, "notes" });
+}
+
+fn doctorPathDiagnosticAlloc(allocator: std.mem.Allocator, checked_path: []const u8, issue: anyerror) !DoctorPathDiagnostic {
+    var diagnostic = DoctorPathDiagnostic{ .checked_path = checked_path };
+    errdefer diagnostic.deinit(allocator);
+
+    var it = std.fs.path.componentIterator(checked_path);
+    while (it.next()) |component| {
+        const stat = std.Io.Dir.cwd().statFile(Io.io(), component.path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return diagnostic,
+        };
+        if (issue == error.SymlinkComponent and stat.kind == .sym_link) {
+            diagnostic.offending_component = try allocator.dupe(u8, component.path);
+            diagnostic.component_kind = "symlink";
+            return diagnostic;
+        }
+        if (issue == error.NotDir and stat.kind != .directory) {
+            diagnostic.offending_component = try allocator.dupe(u8, component.path);
+            diagnostic.component_kind = "not_dir";
+            return diagnostic;
+        }
+    }
+    return diagnostic;
 }
 
 fn memoryNoteLockPathAlloc(allocator: std.mem.Allocator, env: *std.process.Environ.Map, override: ?[]const u8, extension: []const u8) ![]u8 {
@@ -742,6 +777,20 @@ fn writeNoteSummaryJson(w: *std.Io.Writer, note: ParsedNote, path: []const u8) !
     try w.writeByte('}');
 }
 
+fn writeDoctorFailureJson(w: *std.Io.Writer, issue: anyerror, diagnostic: DoctorPathDiagnostic) !void {
+    try w.writeAll(",\"status\":\"failed\",\"issue\":");
+    try writeJsonString(w, @errorName(issue));
+    try w.writeAll(",\"checked_path\":");
+    try writeJsonString(w, diagnostic.checked_path);
+    if (diagnostic.offending_component) |component| {
+        try w.writeAll(",\"offending_component\":");
+        try writeJsonString(w, component);
+    }
+    try w.writeAll(",\"component_kind\":");
+    try writeJsonString(w, diagnostic.component_kind);
+    try w.writeByte('}');
+}
+
 fn writeJsonString(w: *std.Io.Writer, value: []const u8) !void {
     try std.json.Stringify.value(value, .{}, w);
 }
@@ -831,4 +880,69 @@ test "renders envelope with generated fields" {
     defer std.testing.allocator.free(note);
     try std.testing.expect(std.mem.indexOf(u8, note, "\"schema\":\"memory-source-note/v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, note, "\"extension\":\"harness\"") != null);
+}
+
+test "doctor path diagnostic reports symlink component" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.createDir(Io.io(), "real", .default_dir);
+    try tmp.dir.symLink(Io.io(), "real", "link", .{ .is_directory = true });
+    const checked_path = try std.fs.path.join(std.testing.allocator, &.{ root, "link", "harness", "notes" });
+    defer std.testing.allocator.free(checked_path);
+    const offending = try std.fs.path.join(std.testing.allocator, &.{ root, "link" });
+    defer std.testing.allocator.free(offending);
+
+    var diagnostic = try doctorPathDiagnosticAlloc(std.testing.allocator, checked_path, error.SymlinkComponent);
+    defer diagnostic.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(checked_path, diagnostic.checked_path);
+    try std.testing.expectEqualStrings("symlink", diagnostic.component_kind);
+    try std.testing.expect(diagnostic.offending_component != null);
+    try std.testing.expectEqualStrings(offending, diagnostic.offending_component.?);
+}
+
+test "doctor path diagnostic reports not-dir component" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.writeFile(Io.io(), .{ .sub_path = "file", .data = "payload" });
+    const checked_path = try std.fs.path.join(std.testing.allocator, &.{ root, "file", "notes" });
+    defer std.testing.allocator.free(checked_path);
+    const offending = try std.fs.path.join(std.testing.allocator, &.{ root, "file" });
+    defer std.testing.allocator.free(offending);
+
+    var diagnostic = try doctorPathDiagnosticAlloc(std.testing.allocator, checked_path, error.NotDir);
+    defer diagnostic.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(checked_path, diagnostic.checked_path);
+    try std.testing.expectEqualStrings("not_dir", diagnostic.component_kind);
+    try std.testing.expect(diagnostic.offending_component != null);
+    try std.testing.expectEqualStrings(offending, diagnostic.offending_component.?);
+}
+
+test "doctor failure json includes path diagnostic fields" {
+    const checked_path = "/tmp/codex/memories/extensions/harness/notes";
+    const offending_component = "/tmp/codex/memories/extensions";
+    var diagnostic = DoctorPathDiagnostic{
+        .checked_path = checked_path,
+        .offending_component = try std.testing.allocator.dupe(u8, offending_component),
+        .component_kind = "symlink",
+    };
+    defer diagnostic.deinit(std.testing.allocator);
+
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    const w = &out.writer;
+    try w.writeAll("{\"extension\":\"harness\"");
+    try writeDoctorFailureJson(w, error.SymlinkComponent, diagnostic);
+    const payload = try out.toOwnedSlice();
+    defer std.testing.allocator.free(payload);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"issue\":\"SymlinkComponent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"checked_path\":\"/tmp/codex/memories/extensions/harness/notes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"offending_component\":\"/tmp/codex/memories/extensions\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"component_kind\":\"symlink\"") != null);
 }
