@@ -726,7 +726,7 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\  --include-raw              Include raw evidence snippets; default output is sanitized summaries only
         ,
         .skill_decision_audit =>
-        \\usage: seq skill-decision-audit --skill <name> (--session-id <id>|--path <jsonl>|--repo <path>|--workdir <path>|--last <duration>|--since <iso>|--until <iso>) [--mode summary|episodes|misses|clauses|outcomes|matched-cohort|tune-packet|delta] [--causality explicit|strong|associated|any] [--include-workers] [--include-excerpts] [--format table|json|jsonl|csv|markdown]
+        \\usage: seq skill-decision-audit --skill <name> (--session-id <id>|--path <jsonl>|--repo <path>|--workdir <path>|--last <duration>|--since <iso>|--until <iso>) [--mode summary|episodes|misses|clauses|outcomes|tune-packet|delta] [--causality explicit|strong|associated|any] [--include-workers] [--include-excerpts] [--format table|json|jsonl|csv|markdown]
         \\extra options:
         \\  --contract <path>           Use an explicit SKDC-v1 contract file
         \\  --contract-authority <kind> explicit (default) | inferred
@@ -1012,6 +1012,10 @@ fn validateFormatForCommand(cmd: lib.Command, opts: Options) !void {
         },
         .skill_decision_audit => {
             if (fmt == .dot) return error.InvalidFormatForCommand;
+            if (fmt == .markdown) {
+                const mode = opts.mode orelse "summary";
+                if (!std.mem.eql(u8, mode, "summary")) return error.InvalidFormatForCommand;
+            }
         },
         .skill_contract, .skill_decision_receipt, .capabilities => {
             if (fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
@@ -1731,7 +1735,6 @@ fn isValidSkillDecisionAuditMode(text: []const u8) bool {
         std.mem.eql(u8, text, "misses") or
         std.mem.eql(u8, text, "clauses") or
         std.mem.eql(u8, text, "outcomes") or
-        std.mem.eql(u8, text, "matched-cohort") or
         std.mem.eql(u8, text, "tune-packet") or
         std.mem.eql(u8, text, "delta");
 }
@@ -2820,7 +2823,7 @@ fn cmdSkillDecisionAudit(allocator: std.mem.Allocator, sessions_root: []const u8
         try writeSkillDecisionDeltaJson(allocator, opts, audit);
         return;
     }
-    if (std.mem.eql(u8, mode, "tune-packet") or opts.format == .json) {
+    if (std.mem.eql(u8, mode, "tune-packet")) {
         try writeSkillDecisionTunePacketJson(allocator, opts, audit, mode, causality);
         return;
     }
@@ -2897,16 +2900,21 @@ fn compileSkillDecisionAudit(
     defer freePathList(allocator, &paths);
     const exclude_path = if (opts.exclude_current) try resolveCurrentSessionPathForExclusionLocal(allocator, sessions_root) else null;
     defer if (exclude_path) |path| allocator.free(path);
+    const repo_scope = if (opts.repo_text) |repo| try toAbsolutePath(allocator, repo) else null;
+    defer if (repo_scope) |repo| allocator.free(repo);
+    const workdir_scope = if (opts.workdir_text) |workdir| try toAbsolutePath(allocator, workdir) else null;
+    defer if (workdir_scope) |workdir| allocator.free(workdir);
 
     var activation_sessions = std.StringHashMap(void).init(allocator);
     defer activation_sessions.deinit();
 
-    audit.candidate_sessions = @intCast(paths.items.len);
     for (paths.items) |path| {
         if (exclude_path) |excluded| if (std.mem.eql(u8, path, excluded)) continue;
         const content = try readFileAllocOrSkip(allocator, path);
         if (content == null) continue;
         defer allocator.free(content.?);
+        if (!try sessionContentMatchesSkillDecisionScope(allocator, path, repo_scope, workdir_scope)) continue;
+        audit.candidate_sessions += 1;
         audit.sessions_scanned += 1;
         audit.rows_scanned += countNonEmptyLines(content.?);
 
@@ -2922,15 +2930,55 @@ fn compileSkillDecisionAudit(
     return audit;
 }
 
+fn sessionContentMatchesSkillDecisionScope(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    repo_scope: ?[]const u8,
+    workdir_scope: ?[]const u8,
+) !bool {
+    if (repo_scope == null and workdir_scope == null) return true;
+    var parsed = canonical_trace.parseSessionSummaryTrace(allocator, path, .{}) catch return false;
+    defer parsed.deinit(allocator);
+    if (workdir_scope) |scope| {
+        if (sessionTraceMatchesWorkdirScope(allocator, parsed, scope)) return true;
+    }
+    if (repo_scope) |scope| {
+        if (try resolveTraceMatchesRepo(allocator, scope, parsed)) return true;
+    }
+    return false;
+}
+
+fn sessionTraceMatchesWorkdirScope(
+    allocator: std.mem.Allocator,
+    parsed: canonical_trace.CanonicalSessionTrace,
+    workdir_scope: []const u8,
+) bool {
+    if (parsed.session.cwd) |cwd| {
+        const normalized = normalizeRepoMatchPath(allocator, cwd) catch return false;
+        defer allocator.free(normalized);
+        if (std.mem.eql(u8, normalized, workdir_scope)) return true;
+    }
+    for (parsed.tools.items) |tool| {
+        if (tool.cwd) |cwd| {
+            const normalized = normalizeRepoMatchPath(allocator, cwd) catch continue;
+            defer allocator.free(normalized);
+            if (std.mem.eql(u8, normalized, workdir_scope)) return true;
+        }
+    }
+    return false;
+}
+
 fn loadSkillDecisionContract(allocator: std.mem.Allocator, opts: Options) !LoadedSkillDecisionContract {
     if (opts.contract_text) |path| {
         return loadSkillDecisionContractPath(allocator, path, opts.contract_authority_text orelse "explicit");
     }
     if (opts.skill_root_text) |root| {
-        const yaml_path = try std.fs.path.join(allocator, &.{ root, opts.skill.?, "references", "decision-contract.yaml" });
+        const root_abs = try toAbsolutePath(allocator, root);
+        defer allocator.free(root_abs);
+        const yaml_path = try std.fs.path.join(allocator, &.{ root_abs, opts.skill.?, "references", "decision-contract.yaml" });
         defer allocator.free(yaml_path);
         if (fileExists(yaml_path)) return loadSkillDecisionContractPath(allocator, yaml_path, "explicit");
-        const json_path = try std.fs.path.join(allocator, &.{ root, opts.skill.?, "references", "decision-contract.json" });
+        const json_path = try std.fs.path.join(allocator, &.{ root_abs, opts.skill.?, "references", "decision-contract.json" });
         defer allocator.free(json_path);
         if (fileExists(json_path)) return loadSkillDecisionContractPath(allocator, json_path, "explicit");
     }
@@ -3255,13 +3303,22 @@ fn finalizeContractClauseCompliance(audit: *SkillDecisionAudit) !void {
         var status: []const u8 = "never_exercised";
         for (audit.episodes.items) |episode| {
             const refs = scalarString(episode.valueOrNull("clause_refs")) orelse "";
-            if (refs.len == 0 or std.mem.indexOf(u8, refs, clause_id) == null) continue;
+            if (refs.len == 0 or !commaSeparatedListContainsToken(refs, clause_id)) continue;
             const effect = scalarString(episode.valueOrNull("decision_effect")) orelse "";
             status = if (std.mem.eql(u8, effect, "contrary_to_contract")) "violated" else "followed";
             break;
         }
         try clause_row.putOwnedKey("compliance", .{ .string = status });
     }
+}
+
+fn commaSeparatedListContainsToken(list: []const u8, needle: []const u8) bool {
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |raw| {
+        const token = std.mem.trim(u8, raw, " \t\r\n");
+        if (std.mem.eql(u8, token, needle)) return true;
+    }
+    return false;
 }
 
 fn buildSkillDecisionSummaryRow(
@@ -3474,6 +3531,7 @@ fn writeSkillDecisionDeltaJson(allocator: std.mem.Allocator, opts: Options, audi
     const cursor_json = try skillDecisionCursorJsonAlloc(allocator, opts, audit);
     defer allocator.free(cursor_json);
     const cursor_status = skillDecisionCursorStatus(opts, audit);
+    const counts = try skillDecisionDeltaCounts(allocator, opts, audit, cursor_status);
     try writer.writeAll("{\n  \"skill_decision_delta\": {\n    \"delta_version\": \"SDD-v1\",\n    \"target_skill\": ");
     try output.writeJsonString(writer, opts.skill.?);
     try writer.writeAll(",\n    \"session\": ");
@@ -3492,14 +3550,99 @@ fn writeSkillDecisionDeltaJson(allocator: std.mem.Allocator, opts: Options, audi
         \\    "new_clause_events": {d},
         \\    "new_outcomes": {d},
         \\    "decision_relevant": {},
-        \\    "reason": "bounded deterministic rescan"
+        \\    "reason": "{s}"
         \\  }}
         \\}}
         \\
-    , .{ cursor_json, audit.rows_scanned, audit.episodes.items.len, audit.clauses.items.len, audit.outcomes.items.len, audit.episodes.items.len > 0 });
+    , .{ cursor_json, counts.new_signals, counts.new_episodes, counts.new_clause_events, counts.new_outcomes, counts.decision_relevant, counts.reason });
     const rendered = try writer_alloc.toOwnedSlice();
     defer allocator.free(rendered);
     try writeTextOutput(rendered, opts.out_path);
+}
+
+const SkillDecisionDeltaCounts = struct {
+    new_signals: i64,
+    new_episodes: i64,
+    new_clause_events: i64,
+    new_outcomes: i64,
+    decision_relevant: bool,
+    reason: []const u8,
+};
+
+fn skillDecisionDeltaCounts(
+    allocator: std.mem.Allocator,
+    opts: Options,
+    audit: SkillDecisionAudit,
+    cursor_status: []const u8,
+) !SkillDecisionDeltaCounts {
+    if (opts.since_cursor_text == null or !std.mem.eql(u8, cursor_status, "valid")) {
+        const reason: []const u8 = if (opts.since_cursor_text == null) "initial bounded scan" else "cursor invalidated full bounded rescan";
+        return .{
+            .new_signals = audit.rows_scanned,
+            .new_episodes = @intCast(audit.episodes.items.len),
+            .new_clause_events = @intCast(audit.clauses.items.len),
+            .new_outcomes = @intCast(audit.outcomes.items.len),
+            .decision_relevant = audit.episodes.items.len > 0 or audit.outcomes.items.len > 0,
+            .reason = reason,
+        };
+    }
+
+    const cursor_text = opts.since_cursor_text.?;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, cursor_text, .{}) catch {
+        return .{
+            .new_signals = audit.rows_scanned,
+            .new_episodes = @intCast(audit.episodes.items.len),
+            .new_clause_events = @intCast(audit.clauses.items.len),
+            .new_outcomes = @intCast(audit.outcomes.items.len),
+            .decision_relevant = audit.episodes.items.len > 0 or audit.outcomes.items.len > 0,
+            .reason = "unparseable cursor full bounded rescan",
+        };
+    };
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return .{
+            .new_signals = audit.rows_scanned,
+            .new_episodes = @intCast(audit.episodes.items.len),
+            .new_clause_events = @intCast(audit.clauses.items.len),
+            .new_outcomes = @intCast(audit.outcomes.items.len),
+            .decision_relevant = audit.episodes.items.len > 0 or audit.outcomes.items.len > 0,
+            .reason = "unparseable cursor full bounded rescan",
+        },
+    };
+    const last_offset = stdJsonIntField(root, "last_event_offset") orelse 0;
+    const last_timestamp = stdJsonStringField(root, "last_timestamp");
+    const new_signals = @max(audit.rows_scanned - last_offset, 0);
+    if (new_signals == 0) {
+        return .{
+            .new_signals = 0,
+            .new_episodes = 0,
+            .new_clause_events = 0,
+            .new_outcomes = 0,
+            .decision_relevant = false,
+            .reason = "cursor-filtered bounded rescan",
+        };
+    }
+    const new_episodes = countRowsAfterTimestamp(audit.episodes.items, "start_timestamp", last_timestamp);
+    const new_outcomes = countRowsAfterTimestamp(audit.outcomes.items, "timestamp", last_timestamp);
+    return .{
+        .new_signals = new_signals,
+        .new_episodes = new_episodes,
+        .new_clause_events = new_episodes,
+        .new_outcomes = new_outcomes,
+        .decision_relevant = new_episodes > 0 or new_outcomes > 0,
+        .reason = "cursor-filtered bounded rescan",
+    };
+}
+
+fn countRowsAfterTimestamp(rows: []const query.Row, field: []const u8, since: ?[]const u8) i64 {
+    const timestamp = since orelse return @intCast(rows.len);
+    var count: i64 = 0;
+    for (rows) |row| {
+        const value = scalarString(row.valueOrNull(field)) orelse continue;
+        if (std.mem.order(u8, value, timestamp) == .gt) count += 1;
+    }
+    return count;
 }
 
 fn skillDecisionCursorStatus(opts: Options, audit: SkillDecisionAudit) []const u8 {
@@ -3724,10 +3867,79 @@ fn cmdSkillContract(allocator: std.mem.Allocator, opts: Options) !void {
         return;
     }
     if (std.mem.eql(u8, action, "show")) {
-        try writeSkillCompanionStatus(allocator, opts, "skill_contract", action, "contract_discovery_pending");
+        var loaded = try loadSkillDecisionContract(allocator, opts);
+        defer loaded.deinit(allocator);
+        try writeSkillContractShow(allocator, opts, loaded);
         return;
     }
     try writeSkillCompanionStatus(allocator, opts, "skill_contract", action, "semantic_validation_pending");
+}
+
+fn writeSkillContractShow(
+    allocator: std.mem.Allocator,
+    opts: Options,
+    loaded: LoadedSkillDecisionContract,
+) !void {
+    const contract = loaded.contract() orelse {
+        try writeSkillCompanionStatus(allocator, opts, "skill_contract", "show", "contract_absent");
+        return;
+    };
+    if (opts.format == .json) {
+        var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+        defer writer_alloc.deinit();
+        const writer = &writer_alloc.writer;
+        try writer.writeAll("{\n  \"skill_contract\": {\n    \"action\": \"show\",\n    \"authority\": ");
+        try output.writeJsonString(writer, loaded.authority);
+        try writer.writeAll(",\n    \"fingerprint\": ");
+        if (loaded.fingerprint) |fp| try output.writeJsonString(writer, fp) else try writer.writeAll("null");
+        try writer.writeAll(",\n    \"source_path\": ");
+        if (loaded.source_path) |path| try output.writeJsonString(writer, path) else try writer.writeAll("null");
+        try writer.writeAll(",\n    \"contract_version\": ");
+        try output.writeJsonString(writer, contract.contract_version);
+        try writer.writeAll(",\n    \"skill\": ");
+        try output.writeJsonString(writer, contract.skill_name);
+        try writer.writeAll(",\n    \"skill_kind\": ");
+        try output.writeJsonString(writer, contract.skill_kind);
+        try writer.writeAll(",\n    \"clause_ids\": [");
+        for (contract.clauses, 0..) |clause, idx| {
+            if (idx > 0) try writer.writeAll(", ");
+            try output.writeJsonString(writer, clause.clause_id);
+        }
+        try writer.writeAll("]\n  }\n}\n");
+        const rendered = try writer_alloc.toOwnedSlice();
+        defer allocator.free(rendered);
+        try writeTextOutput(rendered, opts.out_path);
+        return;
+    }
+
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+    try writer.print(
+        \\skill_contract:
+        \\  action: show
+        \\  authority: {s}
+        \\  fingerprint: {s}
+        \\  source_path: {s}
+        \\  contract_version: {s}
+        \\  skill: {s}
+        \\  skill_kind: {s}
+        \\  clause_ids:
+        \\
+    , .{
+        loaded.authority,
+        loaded.fingerprint orelse "",
+        loaded.source_path orelse "",
+        contract.contract_version,
+        contract.skill_name,
+        contract.skill_kind,
+    });
+    for (contract.clauses) |clause| {
+        try writer.print("    - {s}\n", .{clause.clause_id});
+    }
+    const rendered = try writer_alloc.toOwnedSlice();
+    defer allocator.free(rendered);
+    try writeTextOutput(rendered, opts.out_path);
 }
 
 fn cmdSkillDecisionReceipt(allocator: std.mem.Allocator, opts: Options) !void {
@@ -17649,6 +17861,9 @@ fn collectSkillDecisionEpisodeDatasetRows(
             var parsed = skill_decision_receipt.parseText(allocator, row.text) catch continue;
             defer parsed.deinit();
             if (target_skill) |skill| if (!eqlIgnoreCaseAscii(parsed.receipt.skill, skill)) continue;
+            const report = try skill_decision_receipt.validateParsed(allocator, parsed.receipt, target_skill, null);
+            defer report.deinit(allocator);
+            if (!report.valid) continue;
             const outcome = firstOutcomeAfter(messages, row.timestamp);
             var qrow = query.Row.init(allocator);
             errdefer qrow.deinit();
@@ -17686,6 +17901,7 @@ fn collectSkillDecisionEpisodeDatasetRows(
             try qrow.putOwnedKey("evidence_refs", .{ .string = "sdr" });
             try qrow.putOwnedKey("counterevidence_refs", .{ .string = "" });
             try qrow.putOwnedKey("contamination_flags", .{ .string = skill_decision_signals.contaminationFlags(row.text) });
+            try putOptionalString(&qrow, "outcome_timestamp", outcome.timestamp);
             try out_rows.append(allocator, qrow);
         }
     }
@@ -17707,7 +17923,7 @@ fn collectSkillDecisionOutcomeDatasetRows(
         var row = query.Row.init(allocator);
         errdefer row.deinit();
         try row.putOwnedKey("episode_id", episode.valueOrNull("episode_id"));
-        try row.putOwnedKey("timestamp", episode.valueOrNull("end_timestamp"));
+        try row.putOwnedKey("timestamp", episode.valueOrNull("outcome_timestamp"));
         try row.putOwnedKey("outcome_kind", .{ .string = kind });
         try row.putOwnedKey("outcome_value", .{ .string = kind });
         try row.putOwnedKey("proof_ref", .null);
@@ -17784,7 +18000,7 @@ fn collectReceiptDatasetRowsFromSession(
         try qrow.putOwnedKey("selected_route", .{ .string = parsed.receipt.selected_route });
         try qrow.putOwnedKey("rejected_routes", .{ .string = rejected });
         try qrow.putOwnedKey("expected_outcome", .{ .string = parsed.receipt.expected_outcome });
-        try qrow.putOwnedKey("artifact_state_json", .{ .string = if (parsed.receipt.artifact_state_present) "{}" else "null" });
+        try qrow.putOwnedKey("artifact_state_json", .{ .string = if (parsed.receipt.artifact_state_present) parsed.receipt.artifact_state_json else "null" });
         try qrow.putOwnedKey("evidence_refs", .{ .string = evidence });
         try qrow.putOwnedKey("valid", .{ .bool = report.valid });
         try qrow.putOwnedKey("validation_codes", .{ .string = codes });
@@ -21462,8 +21678,10 @@ test "skill-decision-audit gates required skill scope and modes" {
     try std.testing.expectError(error.MissingArgValue, validateCommandOptions(.skill_decision_audit, .{ .session_id = "abc" }));
     try std.testing.expectError(error.MissingArgValue, validateCommandOptions(.skill_decision_audit, .{ .skill = "team-patterns" }));
     try std.testing.expectError(error.InvalidModeArg, validateCommandOptions(.skill_decision_audit, .{ .skill = "team-patterns", .session_id = "abc", .mode = "bad" }));
+    try std.testing.expectError(error.InvalidModeArg, validateCommandOptions(.skill_decision_audit, .{ .skill = "team-patterns", .session_id = "abc", .mode = "matched-cohort" }));
     try std.testing.expectError(error.UnsupportedOption, validateCommandOptions(.message_audit, .{ .contract_text = "contract.yaml" }));
     try validateFormatForCommand(.skill_decision_audit, .{ .format = .markdown });
+    try std.testing.expectError(error.InvalidFormatForCommand, validateFormatForCommand(.skill_decision_audit, .{ .format = .markdown, .mode = "episodes" }));
     try std.testing.expectError(error.InvalidFormatForCommand, validateFormatForCommand(.skill_decision_audit, .{ .format = .dot }));
 }
 
@@ -21478,6 +21696,11 @@ test "skill companion command actions parse and validate" {
     const receipt_opts = try parseOptionsForCommand(.skill_decision_receipt, receipt_args[0..]);
     try std.testing.expect(std.mem.eql(u8, receipt_opts.command_action.?, "validate"));
     try validateCommandOptions(.skill_decision_receipt, receipt_opts);
+
+    const show_args = [_][]const u8{ "show", "--skill", "team-patterns", "--skill-root", "skills" };
+    const show_opts = try parseOptionsForCommand(.skill_contract, show_args[0..]);
+    try std.testing.expect(std.mem.eql(u8, show_opts.command_action.?, "show"));
+    try validateCommandOptions(.skill_contract, show_opts);
 
     try std.testing.expectError(error.UnknownArgument, parseOptionsForCommand(.skill_decision_audit, &.{"validate"}));
     try std.testing.expectError(error.MissingArgValue, validateCommandOptions(.skill_contract, .{}));

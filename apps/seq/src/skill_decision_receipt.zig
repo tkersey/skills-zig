@@ -15,6 +15,7 @@ pub const Receipt = struct {
     rejected_routes: []const []const u8 = &.{},
     expected_outcome: []const u8 = "",
     artifact_state_present: bool = false,
+    artifact_state_json: []const u8 = "null",
     evidence_refs: []const []const u8 = &.{},
 };
 
@@ -86,8 +87,13 @@ pub fn validateParsed(
         var clause_ids = std.StringHashMap(void).init(allocator);
         defer clause_ids.deinit();
         for (c.clauses) |clause| try clause_ids.put(clause.clause_id, {});
+        var route_ids = std.StringHashMap(void).init(allocator);
+        defer route_ids.deinit();
+        for (c.routes) |route| try route_ids.put(route.route_id, {});
         for (receipt.trigger_refs) |id| if (!trigger_ids.contains(id)) try codes.append(allocator, "unknown_trigger_ref");
         for (receipt.clause_refs) |id| if (!clause_ids.contains(id)) try codes.append(allocator, "unknown_clause_ref");
+        if (receipt.selected_route.len > 0 and !route_ids.contains(receipt.selected_route)) try codes.append(allocator, "unknown_selected_route");
+        for (receipt.rejected_routes) |id| if (!route_ids.contains(id)) try codes.append(allocator, "unknown_rejected_route");
     }
 
     const valid = codes.items.len == 0;
@@ -138,6 +144,7 @@ fn parseReceiptValue(allocator: std.mem.Allocator, value: std.json.Value) !Recei
         .rejected_routes = try dupStringArrayField(allocator, obj, "rejected_routes"),
         .expected_outcome = try dupStringField(allocator, obj, "expected_outcome", ""),
         .artifact_state_present = obj.get("artifact_state") != null,
+        .artifact_state_json = try dupJsonFieldCanonical(allocator, obj, "artifact_state", "null"),
         .evidence_refs = try dupStringArrayField(allocator, obj, "evidence_refs"),
     };
 }
@@ -161,7 +168,10 @@ fn parseYamlText(allocator: std.mem.Allocator, text: []const u8) !ParsedReceipt 
         }
         if (!in_receipt or indent != 2) return error.InvalidSpec;
         const kv = splitYamlKeyValue(trimmed) orelse return error.InvalidSpec;
-        if (std.mem.eql(u8, kv.key, "receipt_version")) receipt.receipt_version = try dupYamlScalar(aa, kv.value) else if (std.mem.eql(u8, kv.key, "decision_id")) receipt.decision_id = try dupYamlScalar(aa, kv.value) else if (std.mem.eql(u8, kv.key, "skill")) receipt.skill = try dupYamlScalar(aa, kv.value) else if (std.mem.eql(u8, kv.key, "skill_version")) receipt.skill_version = try dupYamlScalar(aa, kv.value) else if (std.mem.eql(u8, kv.key, "skill_contract_fingerprint")) receipt.skill_contract_fingerprint = try dupYamlScalar(aa, kv.value) else if (std.mem.eql(u8, kv.key, "trigger_refs")) receipt.trigger_refs = try parseYamlInlineList(aa, kv.value) else if (std.mem.eql(u8, kv.key, "clause_refs")) receipt.clause_refs = try parseYamlInlineList(aa, kv.value) else if (std.mem.eql(u8, kv.key, "question")) receipt.question = try dupYamlScalar(aa, kv.value) else if (std.mem.eql(u8, kv.key, "alternatives_considered")) receipt.alternatives_considered = try parseYamlInlineList(aa, kv.value) else if (std.mem.eql(u8, kv.key, "selected_route")) receipt.selected_route = try dupYamlScalar(aa, kv.value) else if (std.mem.eql(u8, kv.key, "rejected_routes")) receipt.rejected_routes = try parseYamlInlineList(aa, kv.value) else if (std.mem.eql(u8, kv.key, "expected_outcome")) receipt.expected_outcome = try dupYamlScalar(aa, kv.value) else if (std.mem.eql(u8, kv.key, "artifact_state")) receipt.artifact_state_present = true else if (std.mem.eql(u8, kv.key, "evidence_refs")) receipt.evidence_refs = try parseYamlInlineList(aa, kv.value);
+        if (std.mem.eql(u8, kv.key, "receipt_version")) receipt.receipt_version = try dupYamlScalar(aa, kv.value) else if (std.mem.eql(u8, kv.key, "decision_id")) receipt.decision_id = try dupYamlScalar(aa, kv.value) else if (std.mem.eql(u8, kv.key, "skill")) receipt.skill = try dupYamlScalar(aa, kv.value) else if (std.mem.eql(u8, kv.key, "skill_version")) receipt.skill_version = try dupYamlScalar(aa, kv.value) else if (std.mem.eql(u8, kv.key, "skill_contract_fingerprint")) receipt.skill_contract_fingerprint = try dupYamlScalar(aa, kv.value) else if (std.mem.eql(u8, kv.key, "trigger_refs")) receipt.trigger_refs = try parseYamlInlineList(aa, kv.value) else if (std.mem.eql(u8, kv.key, "clause_refs")) receipt.clause_refs = try parseYamlInlineList(aa, kv.value) else if (std.mem.eql(u8, kv.key, "question")) receipt.question = try dupYamlScalar(aa, kv.value) else if (std.mem.eql(u8, kv.key, "alternatives_considered")) receipt.alternatives_considered = try parseYamlInlineList(aa, kv.value) else if (std.mem.eql(u8, kv.key, "selected_route")) receipt.selected_route = try dupYamlScalar(aa, kv.value) else if (std.mem.eql(u8, kv.key, "rejected_routes")) receipt.rejected_routes = try parseYamlInlineList(aa, kv.value) else if (std.mem.eql(u8, kv.key, "expected_outcome")) receipt.expected_outcome = try dupYamlScalar(aa, kv.value) else if (std.mem.eql(u8, kv.key, "artifact_state")) {
+            receipt.artifact_state_present = true;
+            receipt.artifact_state_json = try aa.dupe(u8, if (kv.value.len == 0) "{}" else kv.value);
+        } else if (std.mem.eql(u8, kv.key, "evidence_refs")) receipt.evidence_refs = try parseYamlInlineList(aa, kv.value);
     }
     return .{ .arena = arena, .receipt = receipt };
 }
@@ -181,7 +191,7 @@ fn writeCanonicalReceipt(writer: anytype, receipt: Receipt) !void {
     try writer.writeAll("{\"skill_decision_receipt\":{\"alternatives_considered\":");
     try writeJsonStringArray(writer, receipt.alternatives_considered);
     try writer.writeAll(",\"artifact_state\":");
-    try writer.writeAll(if (receipt.artifact_state_present) "{}" else "null");
+    try writer.writeAll(if (receipt.artifact_state_present) receipt.artifact_state_json else "null");
     try writer.writeAll(",\"clause_refs\":");
     try writeJsonStringArray(writer, receipt.clause_refs);
     try writer.writeAll(",\"decision_id\":");
@@ -223,6 +233,11 @@ fn dupStringField(allocator: std.mem.Allocator, obj: std.json.ObjectMap, key: []
         .string => |text| try allocator.dupe(u8, text),
         else => error.InvalidSpec,
     };
+}
+
+fn dupJsonFieldCanonical(allocator: std.mem.Allocator, obj: std.json.ObjectMap, key: []const u8, default: []const u8) ![]const u8 {
+    const value = obj.get(key) orelse return allocator.dupe(u8, default);
+    return std.json.Stringify.valueAlloc(allocator, value, .{});
 }
 
 fn dupStringArrayField(allocator: std.mem.Allocator, obj: std.json.ObjectMap, key: []const u8) ![]const []const u8 {

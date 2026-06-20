@@ -54,7 +54,7 @@ const skill_decision_audit_flags = [_]FlagSpec{
     .{ .name = "--last", .value_kind = .duration, .help = "Relative window" },
     .{ .name = "--since", .value_kind = .string, .help = "Inclusive start timestamp" },
     .{ .name = "--until", .value_kind = .string, .help = "Inclusive end timestamp" },
-    .{ .name = "--mode", .value_kind = .string, .help = "summary, episodes, misses, clauses, outcomes, matched-cohort, tune-packet, or delta" },
+    .{ .name = "--mode", .value_kind = .string, .help = "summary, episodes, misses, clauses, outcomes, tune-packet, or delta" },
     .{ .name = "--causality", .value_kind = .string, .help = "explicit, strong, associated, or any" },
     .{ .name = "--format", .value_kind = .format, .help = "Output format" },
 };
