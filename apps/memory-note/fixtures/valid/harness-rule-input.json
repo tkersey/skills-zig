@@ -1,0 +1,28 @@
+{
+  "operation": "assert",
+  "authority": "explicit-user-correction",
+  "summary": "Proceed with useful grounded work when ambiguity is non-blocking.",
+  "scope": {
+    "kind": "global",
+    "repo": null,
+    "paths": []
+  },
+  "source_refs": [
+    {
+      "kind": "user-correction",
+      "ref": "rollout:019-example",
+      "summary": "User corrected a low-value clarification stall"
+    }
+  ],
+  "related_ids": [],
+  "supersedes_id": null,
+  "payload": {
+    "harness_rule": "When requirements have minor non-blocking gaps, state assumptions and produce the useful grounded portion.",
+    "trigger": "Minor ambiguity that does not block useful progress",
+    "preferred_behavior": "Proceed with explicit assumptions",
+    "failure_avoided": "Unnecessary clarification and stalled delivery",
+    "verification_cue": "The response contains useful work and names material assumptions",
+    "evidence_count": 1,
+    "repetition_count": 1
+  }
+}

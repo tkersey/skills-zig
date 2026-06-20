@@ -11,6 +11,7 @@ Monorepo for Zig CLIs with shared internal libraries and independent release str
 - `puff` (`puff`)
 - `learnings` (`learnings append` primary, `append_learning` compatibility)
 - `ledger` (`ledger`)
+- `memory-note` (`memory-note`)
 - `mesh` (`mesh`)
 - `st` (`st`)
 - `parse-arch` (`parse-arch`)
@@ -26,6 +27,7 @@ No unified umbrella CLI is introduced. Binaries remain separate.
 - `apps/puff`
 - `apps/learnings`
 - `apps/ledger`
+- `apps/memory-note`
 - `apps/mesh`
 - `apps/st`
 - `apps/parse-arch`
@@ -50,6 +52,7 @@ zig build build-cron -Doptimize=ReleaseFast
 zig build build-puff -Doptimize=ReleaseFast
 zig build build-learnings -Doptimize=ReleaseFast
 zig build build-ledger -Doptimize=ReleaseFast
+zig build build-memory-note -Doptimize=ReleaseFast
 zig build build-mesh -Doptimize=ReleaseFast
 zig build build-st -Doptimize=ReleaseFast
 zig build build-parse-arch -Doptimize=ReleaseFast
@@ -99,6 +102,7 @@ Per-app VERSION files are the source of truth:
 - `apps/puff/VERSION`
 - `apps/learnings/VERSION`
 - `apps/ledger/VERSION`
+- `apps/memory-note/VERSION`
 - `apps/mesh/VERSION`
 - `apps/st/VERSION`
 - `apps/parse-arch/VERSION`
@@ -117,6 +121,7 @@ Independent tags trigger independent workflows, and each tag must match its app 
 - `puff-v*` -> `.github/workflows/release-puff.yml`
 - `learnings-v*` -> `.github/workflows/release-learnings.yml`
 - `ledger-v*` -> `.github/workflows/release-ledger.yml`
+- `memory-note-v*` -> `.github/workflows/release-memory-note.yml`
 - `mesh-v*` -> `.github/workflows/release-mesh.yml`
 - `st-v*` -> `.github/workflows/release-st.yml`
 - `parse-arch-v*` -> `.github/workflows/release-parse-arch.yml`
@@ -133,6 +138,7 @@ Required tag forms:
 - `puff-v<version>` where `<version>` equals `apps/puff/VERSION`
 - `learnings-v<version>` where `<version>` equals `apps/learnings/VERSION`
 - `ledger-v<version>` where `<version>` equals `apps/ledger/VERSION`
+- `memory-note-v<version>` where `<version>` equals `apps/memory-note/VERSION`
 - `mesh-v<version>` where `<version>` equals `apps/mesh/VERSION`
 - `st-v<version>` where `<version>` equals `apps/st/VERSION`
 - `parse-arch-v<version>` where `<version>` equals `apps/parse-arch/VERSION`

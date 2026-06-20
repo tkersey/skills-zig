@@ -1,0 +1,57 @@
+{
+  "operation": "assert",
+  "authority": "ledger-cli",
+  "summary": "NEG-000001 active same-leaf batching exclusion.",
+  "scope": {
+    "kind": "repo",
+    "repo": "owner/repo",
+    "paths": ["src/mvcc", "src/btree"]
+  },
+  "source_refs": [
+    {
+      "kind": "negative-ledger",
+      "ref": ".ledger/negative-ledger.jsonl#NEG-000001",
+      "summary": "Canonical full ledger projection"
+    }
+  ],
+  "related_ids": [],
+  "supersedes_id": null,
+  "payload": {
+    "neg_id": "NEG-000001",
+    "record_version": "NER-v2",
+    "ledger_path": ".ledger/negative-ledger.jsonl",
+    "projection_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "status": "active",
+    "kind": "realization_route",
+    "route_or_model_id": "same-leaf-batching",
+    "route_id": "same-leaf-batching",
+    "cluster_id": "mvcc-small-write",
+    "artifact_state_id": "HEAD",
+    "hypothesis": "Same-leaf batching improves small-write throughput.",
+    "attempted_change": "Prototype same-leaf mutation bookkeeping batching.",
+    "observed_outcome": "Representative small-N write loop regressed 7 percent.",
+    "failure_class": "local-regression",
+    "source_refs": [
+      {
+        "kind": "benchmark",
+        "ref": "zig build bench -- write-small-n"
+      }
+    ],
+    "falsifying_evidence": [
+      "write-small-n regressed 7 percent versus baseline"
+    ],
+    "exclusion_scope": "route_family",
+    "exclusion_rule": "Do not retry this same batching route while the old bookkeeping path and benchmark surface still apply.",
+    "applicability_conditions": [
+      "same bookkeeping path",
+      "same representative benchmark surface"
+    ],
+    "reopening_criteria": [
+      "bookkeeping path structurally replaced",
+      "fixture changed and current proof rerun"
+    ],
+    "confidence": "high",
+    "next_search_hint": "Investigate adjacent cursor-open or changed-path costs.",
+    "source_event_count": 1
+  }
+}

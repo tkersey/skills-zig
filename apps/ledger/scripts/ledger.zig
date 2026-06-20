@@ -13,14 +13,16 @@ const HelpText =
     \\
     \\Durable negative-evidence ledger.
     \\
-    \\usage: ledger {init,capture,query,map,reopen,compact,handoff,show,doctor} [options]
+    \\usage: ledger {init,capture,query,map,status,reopen,export,compact,handoff,show,doctor} [options]
     \\
     \\commands:
     \\  init       Create the ledger store if missing
     \\  capture    Append witness-backed negative evidence from --json FILE|-
     \\  query      List projected records
     \\  map        Emit negative_route_gate for a route/cluster
+    \\  status     Append a lifecycle status event
     \\  reopen     Mark a NEG record reopened
+    \\  export     Emit a full or memory-note projection
     \\  compact    Report compaction candidates
     \\  handoff    Emit active exclusions for handoff
     \\  show       Show one NEG record by --id
@@ -29,7 +31,10 @@ const HelpText =
     \\options:
     \\  --file PATH       Store path (default: .ledger/negative-ledger.jsonl)
     \\  --json PATH|-     Capture input JSON
-    \\  --id NEG-ID       Record id for show/reopen
+    \\  --id NEG-ID       Record id for show/reopen/status/export
+    \\  --to STATUS       Target status for status
+    \\  --reason TEXT     Reason for status
+    \\  --format FORMAT   full|memory-note for export
     \\  --cluster ID      Current route cluster for map
     \\  --route ID        Current route id/tag for map
     \\  --artifact ID     Current artifact state id for map
@@ -47,7 +52,9 @@ const Command = enum {
     capture,
     query,
     map,
+    status,
     reopen,
+    @"export",
     compact,
     handoff,
     show,
@@ -59,6 +66,9 @@ const Args = struct {
     file: []const u8 = DefaultStorePath,
     json_path: ?[]const u8 = null,
     id: ?[]const u8 = null,
+    to_status: ?[]const u8 = null,
+    reason: []const u8 = "",
+    format: []const u8 = "full",
     cluster: []const u8 = "",
     route: []const u8 = "",
     artifact: []const u8 = "",
@@ -76,6 +86,7 @@ const Record = struct {
     failure_class: []u8,
     confidence: []u8,
     next_search_hint: []u8,
+    record_json: []u8,
     source_refs_count: usize = 0,
     applicability_conditions_count: usize = 0,
     evidence_count: usize = 0,
@@ -92,6 +103,7 @@ const Record = struct {
         allocator.free(self.failure_class);
         allocator.free(self.confidence);
         allocator.free(self.next_search_hint);
+        allocator.free(self.record_json);
     }
 };
 
@@ -131,6 +143,12 @@ const LoadResult = struct {
     fn deinit(self: *LoadResult, allocator: std.mem.Allocator) void {
         deinitRecords(allocator, &self.records);
     }
+};
+
+const Date = struct {
+    year: i64,
+    month: i64,
+    day: i64,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -203,6 +221,24 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.id = argv[i];
             continue;
         }
+        if (std.mem.eql(u8, token, "--to")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.to_status = argv[i];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--reason")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.reason = argv[i];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--format")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.format = argv[i];
+            continue;
+        }
         if (std.mem.eql(u8, token, "--cluster")) {
             i += 1;
             if (i >= argv.len) return error.MissingValue;
@@ -224,7 +260,8 @@ fn parseArgs(argv: []const []const u8) !Args {
         return error.UnknownOption;
     }
     if (args.command == .capture and args.json_path == null) return error.MissingJsonInput;
-    if ((args.command == .show or args.command == .reopen) and args.id == null) return error.MissingId;
+    if ((args.command == .show or args.command == .reopen or args.command == .status or args.command == .@"export") and args.id == null) return error.MissingId;
+    if (args.command == .status and args.to_status == null) return error.MissingStatus;
     return args;
 }
 
@@ -241,7 +278,9 @@ fn run(allocator: std.mem.Allocator, args: Args) !u8 {
         .capture => cmdCapture(allocator, args),
         .query => cmdQuery(allocator, args.file),
         .map => cmdMap(allocator, args),
-        .reopen => cmdStatusEvent(allocator, args.file, args.id.?, "reopened"),
+        .status => cmdStatusEvent(allocator, args.file, args.id.?, args.to_status.?, args.reason, .status),
+        .reopen => cmdStatusEvent(allocator, args.file, args.id.?, "reopened", "explicit reopen", .reopen),
+        .@"export" => cmdExport(allocator, args),
         .compact => cmdCompact(allocator, args.file),
         .handoff => cmdHandoff(allocator, args.file),
         .show => cmdShow(allocator, args.file, args.id.?),
@@ -286,6 +325,9 @@ fn appendCapture(allocator: std.mem.Allocator, args: Args) !CaptureResult {
         else => return error.InvalidCaptureJson,
     };
     try validateCaptureInput(obj);
+
+    var lock = try durable_store.acquireLock(allocator, args.file);
+    defer lock.release(allocator);
 
     var records = try loadRecords(allocator, args.file);
     defer deinitRecords(allocator, &records);
@@ -340,7 +382,9 @@ fn cmdShow(allocator: std.mem.Allocator, path: []const u8, neg_id: []const u8) !
     defer out.deinit();
     for (records.items) |record| {
         if (std.mem.eql(u8, record.neg_id, neg_id)) {
-            try writeRecordJson(&out.writer, record);
+            const fingerprint = try projectionFingerprintAlloc(allocator, record);
+            defer allocator.free(fingerprint);
+            try writeRecordJson(&out.writer, record, fingerprint);
             try out.writer.writeByte('\n');
             try writeStdoutAlloc(allocator, &out);
             return 0;
@@ -455,7 +499,12 @@ fn evaluateRouteGate(records: []const Record, args: Args) RouteGate {
     return gate;
 }
 
-fn cmdStatusEvent(allocator: std.mem.Allocator, path: []const u8, neg_id: []const u8, status: []const u8) !u8 {
+fn cmdStatusEvent(allocator: std.mem.Allocator, path: []const u8, neg_id: []const u8, status: []const u8, reason: []const u8, command: Command) !u8 {
+    if (!isKnownStatus(status)) return error.InvalidStatus;
+    if (reason.len == 0) return error.MissingReason;
+    var lock = try durable_store.acquireLock(allocator, path);
+    defer lock.release(allocator);
+
     var loaded = try loadRecordsValidated(allocator, path);
     defer loaded.deinit(allocator);
     if (findRecord(loaded.records.items, neg_id) == null) {
@@ -470,15 +519,41 @@ fn cmdStatusEvent(allocator: std.mem.Allocator, path: []const u8, neg_id: []cons
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    try out.writer.writeAll("{\"v\":1,\"event\":\"status\",\"neg_id\":");
+    try out.writer.writeAll("{\"v\":2,\"event\":\"status\",\"neg_id\":");
     try writeJsonString(&out.writer, neg_id);
     try out.writer.writeAll(",\"status\":");
     try writeJsonString(&out.writer, status);
+    try out.writer.writeAll(",\"reason\":");
+    try writeJsonString(&out.writer, reason);
     try out.writer.writeByte('}');
     const line = try out.toOwnedSlice();
     defer allocator.free(line);
     try durable_store.appendLineAtomic(allocator, path, line, MaxStoreBytes);
-    try printJsonLine(allocator, .reopen, status, neg_id, 0);
+    try printJsonLine(allocator, command, status, neg_id, 0);
+    return 0;
+}
+
+fn cmdExport(allocator: std.mem.Allocator, args: Args) !u8 {
+    var records = try loadRecords(allocator, args.file);
+    defer deinitRecords(allocator, &records);
+    const idx = findRecord(records.items, args.id.?) orelse return error.NotFound;
+    const record = records.items[idx];
+    const exported_at = try nowUtcAlloc(allocator);
+    defer allocator.free(exported_at);
+    const fingerprint = try projectionFingerprintAlloc(allocator, record);
+    defer allocator.free(fingerprint);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    if (std.mem.eql(u8, args.format, "full")) {
+        try writeFullProjection(allocator, &out.writer, args.file, record, fingerprint, exported_at);
+    } else if (std.mem.eql(u8, args.format, "memory-note")) {
+        try writeLedgerMemoryNoteInput(allocator, &out.writer, args.file, record, fingerprint);
+    } else {
+        return error.InvalidFormat;
+    }
+    try out.writer.writeByte('\n');
+    try writeStdoutAlloc(allocator, &out);
     return 0;
 }
 
@@ -622,6 +697,7 @@ fn loadRecordsValidated(allocator: std.mem.Allocator, path: []const u8) !LoadRes
             .failure_class = try allocator.dupe(u8, jsonStringField(record_obj, "failure_class") orelse "unknown"),
             .confidence = try allocator.dupe(u8, jsonStringField(record_obj, "confidence") orelse "unknown"),
             .next_search_hint = try allocator.dupe(u8, jsonStringField(record_obj, "next_search_hint") orelse ""),
+            .record_json = try jsonValueAlloc(allocator, raw_record),
             .source_refs_count = source_refs_count,
             .applicability_conditions_count = jsonArrayCount(record_obj, "applicability_conditions"),
             .evidence_count = 1,
@@ -638,13 +714,21 @@ fn validateProjectedRecord(record: Record, validation: *ValidationIssue) void {
     if (!isKnownExclusionScope(record.exclusion_scope)) {
         validation.add("unknown exclusion_scope");
     }
-    if (std.mem.eql(u8, record.status, "active") and !recordCanBlock(record)) {
-        validation.add("active record cannot legally block");
+    if (std.mem.eql(u8, record.status, "active") and !recordActiveComplete(record)) {
+        validation.add("active record lacks required evidence");
     }
+}
+
+fn recordActiveComplete(record: Record) bool {
+    if (record.source_refs_count == 0) return false;
+    return record.route_id.len > 0 or record.cluster_id.len > 0;
 }
 
 fn recordCanBlock(record: Record) bool {
     if (!std.mem.eql(u8, record.status, "active")) return false;
+    if (std.mem.eql(u8, record.exclusion_scope, "exact")) {
+        return record.route_id.len > 0;
+    }
     if (record.source_refs_count == 0) return false;
     if (std.mem.eql(u8, record.exclusion_scope, "cluster")) {
         return record.cluster_id.len > 0 and record.exclusion_rule.len > 0;
@@ -654,13 +738,14 @@ fn recordCanBlock(record: Record) bool {
 }
 
 fn isKnownStatus(status: []const u8) bool {
-    return std.mem.eql(u8, status, "active") or
+    return std.mem.eql(u8, status, "capture_candidate") or
+        std.mem.eql(u8, status, "active") or
         std.mem.eql(u8, status, "need-evidence") or
+        std.mem.eql(u8, status, "accepted_risk") or
         std.mem.eql(u8, status, "stale") or
         std.mem.eql(u8, status, "superseded") or
         std.mem.eql(u8, status, "reopened") or
-        std.mem.eql(u8, status, "unknown") or
-        std.mem.eql(u8, status, "user-context");
+        std.mem.eql(u8, status, "unknown");
 }
 
 fn deinitRecords(allocator: std.mem.Allocator, records: *std.ArrayList(Record)) void {
@@ -690,10 +775,9 @@ fn captureCanRequestStatus(obj: std.json.ObjectMap, requested_status: []const u8
         const exclusion_scope = jsonStringField(obj, "exclusion_scope") orelse "route";
         const exclusion_rule = jsonStringField(obj, "exclusion_rule") orelse "";
         if (std.mem.eql(u8, exclusion_scope, "cluster")) return cluster_id.len > 0 and exclusion_rule.len > 0;
-        if (std.mem.eql(u8, exclusion_scope, "route")) return route_id.len > 0;
-        return false;
+        return route_id.len > 0 or cluster_id.len > 0;
     }
-    return !std.mem.eql(u8, requested_status, "user-context");
+    return true;
 }
 
 fn validateCaptureInput(obj: std.json.ObjectMap) !void {
@@ -739,7 +823,174 @@ fn jsonArrayCount(obj: std.json.ObjectMap, key: []const u8) usize {
 }
 
 fn isKnownExclusionScope(exclusion_scope: []const u8) bool {
-    return std.mem.eql(u8, exclusion_scope, "route") or std.mem.eql(u8, exclusion_scope, "cluster");
+    return std.mem.eql(u8, exclusion_scope, "exact") or
+        std.mem.eql(u8, exclusion_scope, "route") or
+        std.mem.eql(u8, exclusion_scope, "route_family") or
+        std.mem.eql(u8, exclusion_scope, "cluster") or
+        std.mem.eql(u8, exclusion_scope, "authority_model") or
+        std.mem.eql(u8, exclusion_scope, "distinction_pattern") or
+        std.mem.eql(u8, exclusion_scope, "proof_pattern");
+}
+
+fn jsonValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(value, .{}, &out.writer);
+    return out.toOwnedSlice();
+}
+
+fn projectionFingerprintAlloc(allocator: std.mem.Allocator, record: Record) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(record.neg_id);
+    hasher.update("\n");
+    hasher.update(record.status);
+    hasher.update("\n");
+    hasher.update(record.record_json);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    const encoded = std.fmt.bytesToHex(digest, .lower);
+    return allocator.dupe(u8, &encoded);
+}
+
+fn writeFullProjection(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    ledger_path: []const u8,
+    record: Record,
+    projection_fingerprint: []const u8,
+    exported_at: []const u8,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, record.record_json, .{});
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.InvalidCaptureJson,
+    };
+
+    try writer.writeAll("{\"schema\":\"negative-ledger-projection/v2\",\"ledger_path\":");
+    try writeJsonString(writer, ledger_path);
+    try writer.writeAll(",\"neg_id\":");
+    try writeJsonString(writer, record.neg_id);
+    try writer.writeAll(",\"record_version\":");
+    try writeJsonString(writer, jsonStringField(obj, "record_version") orelse "NER-v2");
+    try writer.writeAll(",\"campaign_id\":");
+    try writeJsonString(writer, jsonStringField(obj, "campaign_id") orelse "");
+    try writer.writeAll(",\"status\":");
+    try writeJsonString(writer, record.status);
+    try writer.writeAll(",\"kind\":");
+    try writeJsonString(writer, jsonStringField(obj, "kind") orelse "realization_route");
+    try writer.writeAll(",\"kernel_law_ids\":");
+    try writeJsonArrayField(writer, obj, "kernel_law_ids");
+    try writer.writeAll(",\"counterexample_family_ids\":");
+    try writeJsonArrayField(writer, obj, "counterexample_family_ids");
+    try writer.writeAll(",\"route_or_model_id\":");
+    try writeJsonString(writer, jsonStringField(obj, "route_or_model_id") orelse record.route_id);
+    try writer.writeAll(",\"route_id\":");
+    try writeJsonString(writer, record.route_id);
+    try writer.writeAll(",\"cluster_id\":");
+    try writeJsonString(writer, record.cluster_id);
+    try writer.writeAll(",\"artifact_state_id\":");
+    try writeJsonString(writer, record.artifact_state_id);
+    try writer.writeAll(",\"hypothesis\":");
+    try writeJsonString(writer, record.hypothesis);
+    try writer.writeAll(",\"attempted_change\":");
+    try writeJsonString(writer, jsonStringField(obj, "attempted_change") orelse "");
+    try writer.writeAll(",\"observed_outcome\":");
+    try writeJsonString(writer, jsonStringField(obj, "observed_outcome") orelse "");
+    try writer.writeAll(",\"failure_class\":");
+    try writeJsonString(writer, record.failure_class);
+    try writer.writeAll(",\"source_refs\":");
+    try writeJsonArrayField(writer, obj, "source_refs");
+    try writer.writeAll(",\"falsifying_evidence\":");
+    try writeJsonArrayField(writer, obj, "falsifying_evidence");
+    try writer.writeAll(",\"exclusion_scope\":");
+    try writeJsonString(writer, record.exclusion_scope);
+    try writer.writeAll(",\"exclusion_rule\":");
+    try writeJsonString(writer, record.exclusion_rule);
+    try writer.writeAll(",\"applicability_conditions\":");
+    try writeJsonArrayField(writer, obj, "applicability_conditions");
+    try writer.writeAll(",\"reopening_criteria\":");
+    try writeJsonArrayField(writer, obj, "reopening_criteria");
+    try writer.writeAll(",\"confidence\":");
+    try writeJsonString(writer, record.confidence);
+    try writer.writeAll(",\"next_search_hint\":");
+    try writeJsonString(writer, record.next_search_hint);
+    try writer.print(",\"source_event_count\":{d},\"projection_fingerprint\":", .{record.evidence_count});
+    try writeJsonString(writer, projection_fingerprint);
+    try writer.writeAll(",\"exported_at\":");
+    try writeJsonString(writer, exported_at);
+    try writer.writeByte('}');
+}
+
+fn writeLedgerMemoryNoteInput(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    ledger_path: []const u8,
+    record: Record,
+    projection_fingerprint: []const u8,
+) !void {
+    try writer.writeAll("{\"operation\":");
+    try writeJsonString(writer, if (std.mem.eql(u8, record.status, "reopened")) "reopen" else "assert");
+    try writer.writeAll(",\"authority\":\"ledger-cli\",\"summary\":");
+    const summary = try std.fmt.allocPrint(allocator, "{s} {s} negative-evidence projection", .{ record.neg_id, record.status });
+    defer allocator.free(summary);
+    try writeJsonString(writer, summary);
+    try writer.writeAll(",\"scope\":{\"kind\":\"repo\",\"repo\":null,\"paths\":[]},\"source_refs\":[{\"kind\":\"negative-ledger\",\"ref\":");
+    const ref = try std.fmt.allocPrint(allocator, "{s}#{s}", .{ ledger_path, record.neg_id });
+    defer allocator.free(ref);
+    try writeJsonString(writer, ref);
+    try writer.writeAll(",\"summary\":\"Canonical ledger export\"}],\"related_ids\":[],\"supersedes_id\":null,\"payload\":");
+    const exported_at = try nowUtcAlloc(allocator);
+    defer allocator.free(exported_at);
+    try writeFullProjection(allocator, writer, ledger_path, record, projection_fingerprint, exported_at);
+    try writer.writeByte('}');
+}
+
+fn writeJsonArrayField(writer: anytype, obj: std.json.ObjectMap, key: []const u8) !void {
+    if (obj.get(key)) |value| {
+        if (value == .array) {
+            try std.json.Stringify.value(value, .{}, writer);
+            return;
+        }
+    }
+    try writer.writeAll("[]");
+}
+
+fn nowUtcAlloc(allocator: std.mem.Allocator) ![]u8 {
+    const now_sec: i64 = @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000));
+    var days = @divFloor(now_sec, 86_400);
+    var seconds_of_day = now_sec - days * 86_400;
+    if (seconds_of_day < 0) {
+        seconds_of_day += 86_400;
+        days -= 1;
+    }
+    const date = civilFromDays(days);
+    const hour = @divFloor(seconds_of_day, 3600);
+    const minute = @divFloor(seconds_of_day - hour * 3600, 60);
+    const second = seconds_of_day - hour * 3600 - minute * 60;
+    return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        @as(u32, @intCast(date.year)),
+        @as(u32, @intCast(date.month)),
+        @as(u32, @intCast(date.day)),
+        @as(u32, @intCast(hour)),
+        @as(u32, @intCast(minute)),
+        @as(u32, @intCast(second)),
+    });
+}
+
+fn civilFromDays(days_since_unix_epoch: i64) Date {
+    const z = days_since_unix_epoch + 719_468;
+    const era = @divFloor(if (z >= 0) z else z - 146_096, 146_097);
+    const doe = z - era * 146_097;
+    const yoe = @divFloor(doe - @divFloor(doe, 1_460) + @divFloor(doe, 36_524) - @divFloor(doe, 146_096), 365);
+    var y = yoe + era * 400;
+    const doy = doe - (365 * yoe + @divFloor(yoe, 4) - @divFloor(yoe, 100));
+    const mp = @divFloor(5 * doy + 2, 153);
+    const d = doy - @divFloor(153 * mp + 2, 5) + 1;
+    var m = mp + 3;
+    if (m > 12) m -= 12;
+    if (m <= 2) y += 1;
+    return .{ .year = y, .month = m, .day = d };
 }
 
 fn lexicalOverlap(a: []const u8, b: []const u8) bool {
@@ -751,12 +1002,12 @@ fn writeRecordsJson(writer: anytype, records: []const Record) !void {
     try writer.writeAll("{\"records\":[");
     for (records, 0..) |record, idx| {
         if (idx > 0) try writer.writeByte(',');
-        try writeRecordJson(writer, record);
+        try writeRecordJson(writer, record, null);
     }
     try writer.writeAll("]}\n");
 }
 
-fn writeRecordJson(writer: anytype, record: Record) !void {
+fn writeRecordJson(writer: anytype, record: Record, projection_fingerprint: ?[]const u8) !void {
     try writer.writeAll("{\"neg_id\":");
     try writeJsonString(writer, record.neg_id);
     try writer.writeAll(",\"status\":");
@@ -779,11 +1030,17 @@ fn writeRecordJson(writer: anytype, record: Record) !void {
     try writeJsonString(writer, record.confidence);
     try writer.writeAll(",\"next_search_hint\":");
     try writeJsonString(writer, record.next_search_hint);
-    try writer.print(",\"source_refs_count\":{d},\"applicability_conditions_count\":{d},\"evidence_count\":{d}}}", .{
+    try writer.print(",\"source_refs_count\":{d},\"applicability_conditions_count\":{d},\"evidence_count\":{d},\"source_event_count\":{d}", .{
         record.source_refs_count,
         record.applicability_conditions_count,
         record.evidence_count,
+        record.evidence_count,
     });
+    if (projection_fingerprint) |fingerprint| {
+        try writer.writeAll(",\"projection_fingerprint\":");
+        try writeJsonString(writer, fingerprint);
+    }
+    try writer.writeByte('}');
 }
 
 fn writeJsonString(writer: anytype, text: []const u8) !void {

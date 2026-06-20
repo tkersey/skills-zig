@@ -13,6 +13,7 @@ on:
       - "apps/puff/**"
       - "apps/learnings/**"
       - "apps/ledger/**"
+      - "apps/memory-note/**"
       - "apps/resolve-c3/**"
       - "apps/mesh/**"
       - "apps/st/**"
@@ -40,6 +41,7 @@ jobs:
       puff: ${{ steps.filter.outputs.puff }}
       learnings: ${{ steps.filter.outputs.learnings }}
       ledger: ${{ steps.filter.outputs.ledger }}
+      memory_note: ${{ steps.filter.outputs.memory_note }}
       resolve_c3: ${{ steps.filter.outputs.resolve_c3 }}
       mesh: ${{ steps.filter.outputs.mesh }}
       st: ${{ steps.filter.outputs.st }}
@@ -65,6 +67,8 @@ jobs:
               - "apps/learnings/**"
             ledger:
               - "apps/ledger/**"
+            memory_note:
+              - "apps/memory-note/**"
             resolve_c3:
               - "apps/resolve-c3/**"
             mesh:
@@ -295,6 +299,20 @@ jobs:
         run: zig build build-ledger -Doptimize=ReleaseFast
       - name: Test ledger
         run: zig build test-ledger
+
+  memory-note:
+    needs: changes
+    if: needs.changes.outputs.memory_note == 'true' || needs.changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build memory-note
+        run: zig build build-memory-note -Doptimize=ReleaseFast
+      - name: Test memory-note
+        run: zig build test-memory-note
 
   resolve-c3:
     needs: changes
