@@ -819,9 +819,9 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\  raw $resolve mentions are denominator candidates only; true sessions require assistant workflow or tool evidence
         ,
         .review_compiler_audit =>
-        \\usage: seq review-compiler-audit [--protocol auto|legacy-cleanroom|c3] --since <iso> --until <iso> --repo <path> [--exclude-current] [--format markdown|json]
+        \\usage: seq review-compiler-audit [--protocol auto|legacy-cleanroom|c3|c3-mrpc|mbk] --since <iso> --until <iso> --repo <path> [--exclude-current] [--format markdown|json]
         \\extra options:
-        \\  --protocol <name>        auto (default) | legacy-cleanroom | c3
+        \\  --protocol <name>        auto (default) | legacy-cleanroom | c3 | c3-mrpc | mbk
         \\  --repo <path>             Match session cwd/tool cwd against this repo root or descendants
         \\  --exclude-current         Exclude the current CODEX_THREAD_ID session
         \\  raw $resolve mentions are denominator candidates only; true C3 sessions require assistant/tool C3 controller or MRPC evidence
@@ -4453,12 +4453,16 @@ const ReviewCompilerProtocol = enum {
     auto,
     legacy_cleanroom,
     c3,
+    c3_mrpc,
+    mbk,
 
     fn label(self: ReviewCompilerProtocol) []const u8 {
         return switch (self) {
             .auto => "auto",
             .legacy_cleanroom => "legacy-cleanroom",
             .c3 => "c3",
+            .c3_mrpc => "c3-mrpc",
+            .mbk => "mbk",
         };
     }
 };
@@ -4467,7 +4471,9 @@ fn parseReviewCompilerProtocol(text: []const u8) !ReviewCompilerProtocol {
     if (std.mem.eql(u8, text, "auto")) return .auto;
     if (std.mem.eql(u8, text, "legacy-cleanroom")) return .legacy_cleanroom;
     if (std.mem.eql(u8, text, "c3")) return .c3;
-    printCliError("error: invalid --protocol value {s}; expected auto, legacy-cleanroom, or c3\n", .{text});
+    if (std.mem.eql(u8, text, "c3-mrpc")) return .c3_mrpc;
+    if (std.mem.eql(u8, text, "mbk")) return .mbk;
+    printCliError("error: invalid --protocol value {s}; expected auto, legacy-cleanroom, c3, c3-mrpc, or mbk\n", .{text});
     return error.InvalidModeArg;
 }
 
@@ -4476,6 +4482,7 @@ const ReviewCompilerAudit = struct {
     denominator: Denominator = .{},
     legacy_cleanroom: LegacyCleanroom = .{},
     c3: C3 = .{},
+    mbk: MBK = .{},
 
     const Denominator = struct {
         candidate_sessions: usize = 0,
@@ -4660,9 +4667,165 @@ const ReviewCompilerAudit = struct {
         commit_or_push_bypass: usize = 0,
     };
 
+    const MBK = struct {
+        denominator: MBKDenominator = .{},
+        campaigns: Campaigns = .{},
+        observations: Observations = .{},
+        kernel: Kernel = .{},
+        realization: Realization = .{},
+        semantic_surface: SemanticSurface = .{},
+        git_tree_metrics: GitTreeMetrics = .{},
+        proof: Proof = .{},
+        controller: MBKController = .{},
+        closure: Closure = .{},
+        evidence_ledger: std.ArrayList(EvidenceRow) = .empty,
+
+        fn deinit(self: *MBK, allocator: std.mem.Allocator) void {
+            self.denominator.deinit(allocator);
+            for (self.evidence_ledger.items) |item| item.deinit(allocator);
+            self.evidence_ledger.deinit(allocator);
+        }
+    };
+
+    const MBKDenominator = struct {
+        candidate_sessions: usize = 0,
+        true_resolve_sessions: usize = 0,
+        clean_review_sessions: usize = 0,
+        isolated_conformance_sessions: usize = 0,
+        material_kernel_required_sessions: usize = 0,
+        kernel_campaign_entered_sessions: usize = 0,
+        kernel_accepted_sessions: usize = 0,
+        tuple_closed_sessions: usize = 0,
+        terminal_closed_sessions: usize = 0,
+        exclusions: std.ArrayList(Exclusion) = .empty,
+
+        fn deinit(self: *MBKDenominator, allocator: std.mem.Allocator) void {
+            for (self.exclusions.items) |item| item.deinit(allocator);
+            self.exclusions.deinit(allocator);
+        }
+    };
+
+    const Campaigns = struct {
+        campaign_ids: usize = 0,
+        fixed_base_pass: usize = 0,
+        base_reset_violations: usize = 0,
+        review_ready_baselines: usize = 0,
+        closure_attempts: usize = 0,
+        prior_closure_head_used_as_new_base: usize = 0,
+        rebaseline_decisions: usize = 0,
+    };
+
+    const Observations = struct {
+        raw_findings: usize = 0,
+        branch_liabilities: usize = 0,
+        additional_witnesses: usize = 0,
+        missing_distinctions: usize = 0,
+        scope_expansions: usize = 0,
+        adjacent_followups: usize = 0,
+        preferences_rejected: usize = 0,
+    };
+
+    const Kernel = struct {
+        authorities: usize = 0,
+        observable_state_classes: usize = 0,
+        transitions: usize = 0,
+        laws: usize = 0,
+        local_surface_families: usize = 0,
+        governing_law_families: usize = 0,
+        findings_per_law: usize = 0,
+        distinctions_merged: usize = 0,
+        unwitnessed_distinctions: usize = 0,
+        exact_quotients: usize = 0,
+        witnessed_quotients: usize = 0,
+    };
+
+    const Realization = struct {
+        designs_considered: usize = 0,
+        route_classes: usize = 0,
+        selected_designs: usize = 0,
+        realization_recompilations: usize = 0,
+        realizations_from_campaign_base: usize = 0,
+        realizations_from_prior_head: usize = 0,
+        surfaces_retired: usize = 0,
+        orphan_code_constructs: usize = 0,
+        duplicate_realizations: usize = 0,
+    };
+
+    const SurfaceSnapshot = struct {
+        semantic_surface: usize = 0,
+        governing_laws: usize = 0,
+        realization_surface: usize = 0,
+        proof_families: usize = 0,
+    };
+
+    const SemanticSurface = struct {
+        review_ready_baseline: SurfaceSnapshot = .{},
+        terminal: SurfaceSnapshot = .{},
+        delta: SurfaceSnapshot = .{},
+        hard_dimension_increases: usize = 0,
+        total_description_nonincrease_pass: bool = false,
+        approved_rebaselines: usize = 0,
+        silent_scope_expansions: usize = 0,
+    };
+
+    const GitTreeMetrics = struct {
+        files_changed: usize = 0,
+        insertions: usize = 0,
+        deletions: usize = 0,
+        net_lines: i64 = 0,
+    };
+
+    const Proof = struct {
+        kernel_laws: usize = 0,
+        proof_families: usize = 0,
+        wound_specific_tests: usize = 0,
+        tests_merged_or_retired: usize = 0,
+        property_or_state_machine_families: usize = 0,
+        unmapped_proof_actions: usize = 0,
+        proof_runs: usize = 0,
+        stale_proof: usize = 0,
+    };
+
+    const MBKController = struct {
+        physical_apply_events: usize = 0,
+        state_only_apply_violations: usize = 0,
+        physical_commits: usize = 0,
+        state_only_commit_violations: usize = 0,
+        physical_pushes: usize = 0,
+        state_only_push_violations: usize = 0,
+        raw_delivery_mutations_while_active: usize = 0,
+        backup_refs_created: usize = 0,
+    };
+
+    const Closure = struct {
+        kernel_accepted: usize = 0,
+        conformance_closed_for_tuple: usize = 0,
+        terminal_closed: usize = 0,
+        unqualified_complete_claims: usize = 0,
+        tuple_receipts_missing_horizon: usize = 0,
+        post_push_reopens: usize = 0,
+        terminal_closure_with_new_evidence: usize = 0,
+    };
+
+    const EvidenceRow = struct {
+        session_id: ?[]u8 = null,
+        event: []u8,
+        source: []u8,
+        snippet: []u8,
+
+        fn deinit(self: EvidenceRow, allocator: std.mem.Allocator) void {
+            if (self.session_id) |id| allocator.free(id);
+            allocator.free(self.event);
+            allocator.free(self.source);
+            allocator.free(self.snippet);
+        }
+    };
+
     fn outputProtocol(self: ReviewCompilerAudit) ReviewCompilerProtocol {
         return switch (self.requested_protocol) {
-            .auto => if (self.denominator.c3_required_sessions > 0 or self.denominator.c3_entered_sessions > 0 or self.c3.controller.state_files > 0 or self.c3.controller.mrpc_apply_certified > 0 or self.c3.controller.mrpc_final_certified > 0)
+            .auto => if (self.mbk.denominator.kernel_campaign_entered_sessions > 0 or self.mbk.denominator.kernel_accepted_sessions > 0 or self.mbk.denominator.terminal_closed_sessions > 0)
+                .mbk
+            else if (self.denominator.c3_required_sessions > 0 or self.denominator.c3_entered_sessions > 0 or self.c3.controller.state_files > 0 or self.c3.controller.mrpc_apply_certified > 0 or self.c3.controller.mrpc_final_certified > 0)
                 .c3
             else
                 .legacy_cleanroom,
@@ -4672,6 +4835,7 @@ const ReviewCompilerAudit = struct {
 
     fn deinit(self: *ReviewCompilerAudit, allocator: std.mem.Allocator) void {
         self.denominator.deinit(allocator);
+        self.mbk.deinit(allocator);
     }
 };
 
@@ -4680,6 +4844,7 @@ const ReviewCompilerSessionSignals = struct {
     true_resolve: bool = false,
     true_legacy: bool = false,
     true_c3: bool = false,
+    true_mbk: bool = false,
     delivery_freeze_seen: bool = false,
     contract_seen: bool = false,
     recipe_seen: bool = false,
@@ -4710,6 +4875,15 @@ const ReviewCompilerSessionSignals = struct {
     c3_recompiled_seen: bool = false,
     c3_raw_delivery_mutation_seen: bool = false,
     c3_candidate_worktree_context_seen: bool = false,
+    mbk_begin_seen: bool = false,
+    mbk_begin_at_ms: ?i64 = null,
+    mbk_terminal_at_ms: ?i64 = null,
+    mbk_tuple_closed_seen: bool = false,
+    mbk_terminal_closed_seen: bool = false,
+    mbk_kernel_accepted_seen: bool = false,
+    mbk_clean_review_seen: bool = false,
+    mbk_isolated_conformance_seen: bool = false,
+    mbk_material_kernel_required_seen: bool = false,
 };
 
 fn cmdResolveChurnAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
@@ -4876,23 +5050,27 @@ fn cmdReviewCompilerAudit(allocator: std.mem.Allocator, sessions_root: []const u
         var signals = summarizeReviewCompilerSession(messages, parsed, opts);
         if (!signals.candidate) continue;
         audit.denominator.candidate_sessions += 1;
+        audit.mbk.denominator.candidate_sessions += 1;
         const protocol_match = switch (audit.requested_protocol) {
             .auto => signals.true_resolve,
             .legacy_cleanroom => signals.true_legacy,
-            .c3 => signals.true_c3,
+            .c3, .c3_mrpc => signals.true_c3,
+            .mbk => signals.true_mbk,
         };
         if (!protocol_match) {
             const reason: []const u8 = switch (audit.requested_protocol) {
                 .auto => "candidate_without_protocol_evidence",
                 .legacy_cleanroom => "candidate_without_assistant_cleanroom_evidence",
-                .c3 => "candidate_without_c3_evidence",
+                .c3, .c3_mrpc => "candidate_without_c3_evidence",
+                .mbk => "candidate_without_mbk_evidence",
             };
             try addReviewCompilerExclusion(allocator, &audit, parsed.session.session_id, path, reason);
+            if (audit.requested_protocol == .mbk) try addReviewCompilerMBKExclusion(allocator, &audit, parsed.session.session_id, path, reason);
             continue;
         }
 
         audit.denominator.true_resolve_sessions += 1;
-        recordReviewCompilerMessages(&audit, messages, opts, &signals);
+        try recordReviewCompilerMessages(allocator, &audit, messages, opts, &signals, parsed.session.session_id);
         try recordReviewCompilerTools(allocator, &audit, parsed, repo_root, opts, &signals);
         finalizeReviewCompilerCompliance(&audit, signals);
     }
@@ -4913,6 +5091,20 @@ fn addReviewCompilerExclusion(
     reason: []const u8,
 ) !void {
     try audit.denominator.exclusions.append(allocator, .{
+        .session_id = if (session_id) |id| try allocator.dupe(u8, id) else null,
+        .path = try allocator.dupe(u8, path),
+        .reason = try allocator.dupe(u8, reason),
+    });
+}
+
+fn addReviewCompilerMBKExclusion(
+    allocator: std.mem.Allocator,
+    audit: *ReviewCompilerAudit,
+    session_id: ?[]const u8,
+    path: []const u8,
+    reason: []const u8,
+) !void {
+    try audit.mbk.denominator.exclusions.append(allocator, .{
         .session_id = if (session_id) |id| try allocator.dupe(u8, id) else null,
         .path = try allocator.dupe(u8, path),
         .reason = try allocator.dupe(u8, reason),
@@ -5026,12 +5218,22 @@ fn summarizeReviewCompilerSession(
             signals.true_c3 = true;
             signals.true_resolve = true;
         }
+        if (containsTrueMBKEvidence(message.text)) {
+            signals.candidate = true;
+            signals.true_mbk = true;
+            signals.true_resolve = true;
+        }
     }
     for (parsed.tools.items) |tool| {
         if (!toolTimestampSatisfiesBounds(parsed, tool, opts)) continue;
         if (toolHasC3Evidence(tool)) {
             signals.candidate = true;
             signals.true_c3 = true;
+            signals.true_resolve = true;
+        }
+        if (toolHasMBKEvidence(tool)) {
+            signals.candidate = true;
+            signals.true_mbk = true;
             signals.true_resolve = true;
         }
     }
@@ -5045,6 +5247,10 @@ fn containsReviewCompilerCandidateCue(text: []const u8) bool {
             "review-compiler-audit",
             "review_compiler_audit",
             "resolve-c3",
+            "MBKC-v1",
+            "minimum_behavioral_kernel",
+            "kernel-accepted",
+            "terminal-closed",
             ".ledger/c3",
             "minimal_review_patch_certificate",
             "MRPC-v1",
@@ -5056,6 +5262,26 @@ fn containsReviewCompilerCandidateCue(text: []const u8) bool {
             "ablation_certificate",
             "compiled_delivery_permit",
         });
+}
+
+fn containsTrueMBKEvidence(text: []const u8) bool {
+    return containsAnyIgnoreCaseAscii(text, &.{
+        "MBKC-v1",
+        "minimum_behavioral_kernel",
+        "resolve-c3 campaign begin",
+        "kernel-accepted",
+        "terminal-closed",
+    });
+}
+
+fn toolHasMBKEvidence(tool: canonical_trace.ToolLifecycleRecord) bool {
+    if (tool.lifecycle_status != .completed) return false;
+    if (tool.kind == .exec_command and (tool.exit_code orelse -1) != 0) return false;
+    return containsTrueMBKEvidence(tool.command_text orelse "") or
+        containsTrueMBKEvidence(tool.input_text orelse "") or
+        containsTrueMBKEvidence(tool.arguments_json orelse "") or
+        containsTrueMBKEvidence(tool.output_text orelse "") or
+        containsTrueMBKEvidence(tool.patch_changes_json orelse "");
 }
 
 fn containsTrueReviewCompilerAssistantEvidence(text: []const u8) bool {
@@ -5098,11 +5324,13 @@ fn containsReviewCompilerNonBranchLiabilityCue(text: []const u8) bool {
 }
 
 fn recordReviewCompilerMessages(
+    allocator: std.mem.Allocator,
     audit: *ReviewCompilerAudit,
     messages: []const datasets.messages.MessageRow,
     opts: Options,
     signals: *ReviewCompilerSessionSignals,
-) void {
+    session_id: ?[]const u8,
+) !void {
     for (messages) |message| {
         if (!timestampSatisfiesBounds(message.timestamp, opts)) continue;
         if (!std.mem.eql(u8, message.role, "assistant")) continue;
@@ -5157,6 +5385,7 @@ fn recordReviewCompilerMessages(
         if (containsAnyIgnoreCaseAscii(text, &.{ "holdout_followups_captured", "holdout followups captured", "holdout follow-ups captured" })) audit.legacy_cleanroom.review_horizon.holdout_followups_captured += 1;
 
         recordReviewCompilerC3Text(audit, text, message.timestamp, signals);
+        if (signals.true_mbk) try recordReviewCompilerMBKText(allocator, audit, text, message.timestamp, signals, session_id, "message");
     }
 }
 
@@ -5257,7 +5486,112 @@ fn recordReviewCompilerC3Text(
     if (containsAnyIgnoreCaseAscii(text, &.{ "proof-recorded", "proof_recorded" })) signals.c3_proof_seen = true;
 }
 
+fn recordReviewCompilerMBKText(
+    allocator: std.mem.Allocator,
+    audit: *ReviewCompilerAudit,
+    text: []const u8,
+    timestamp: ?[]const u8,
+    signals: *ReviewCompilerSessionSignals,
+    session_id: ?[]const u8,
+    source: []const u8,
+) !void {
+    if (containsAnyIgnoreCaseAscii(text, &.{ "clean_review_session", "clean review session", "clean_review: true" })) signals.mbk_clean_review_seen = true;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "isolated_conformance_session", "isolated conformance session", "isolated_conformance" })) signals.mbk_isolated_conformance_seen = true;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "material_kernel_required", "material kernel required" })) signals.mbk_material_kernel_required_seen = true;
+
+    if (containsAnyIgnoreCaseAscii(text, &.{ "campaign-began", "campaign_began", "resolve-c3 campaign begin" })) {
+        audit.mbk.campaigns.campaign_ids += 1;
+        signals.mbk_begin_seen = true;
+        recordReviewCompilerMBKTime(signals, .begin, timestamp);
+        try addReviewCompilerMBKEvidence(allocator, audit, session_id, "campaign-began", source, text);
+    }
+    if (containsAnyIgnoreCaseAscii(text, &.{ "fixed_base_pass", "fixed base pass" })) audit.mbk.campaigns.fixed_base_pass += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "base_reset_violation", "base reset violation", "campaign base reset" })) audit.mbk.campaigns.base_reset_violations += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "review_ready_baseline", "review-ready baseline", "review ready baseline" })) audit.mbk.campaigns.review_ready_baselines += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "closure_attempt", "closure attempt" })) audit.mbk.campaigns.closure_attempts += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "prior_closure_head_used_as_new_base", "prior closure head used as new base" })) audit.mbk.campaigns.prior_closure_head_used_as_new_base += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "rebaseline_decision", "rebaseline decision" })) audit.mbk.campaigns.rebaseline_decisions += 1;
+
+    if (containsAnyIgnoreCaseAscii(text, &.{ "observation-added", "observation_added", "raw_finding", "raw finding" })) audit.mbk.observations.raw_findings += 1;
+    if (containsReviewCompilerBranchLiabilityCue(text)) audit.mbk.observations.branch_liabilities += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "additional_witness", "additional witness" })) audit.mbk.observations.additional_witnesses += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "missing_distinction", "missing distinction" })) audit.mbk.observations.missing_distinctions += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "scope_expansion", "scope expansion" })) audit.mbk.observations.scope_expansions += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "adjacent_followup", "adjacent follow-up", "adjacent followup" })) audit.mbk.observations.adjacent_followups += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "preference_rejected", "preference rejected", "preferences_rejected" })) audit.mbk.observations.preferences_rejected += 1;
+
+    if (containsAnyIgnoreCaseAscii(text, &.{ "authority:", "authorities:", "kernel authority" })) audit.mbk.kernel.authorities += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "observable_state_class", "observable state class" })) audit.mbk.kernel.observable_state_classes += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "transition:", "transitions:", "kernel transition" })) audit.mbk.kernel.transitions += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "kernel_law", "kernel law", "law:" })) audit.mbk.kernel.laws += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "local_surface_family", "local-surface family", "local surface family" })) audit.mbk.kernel.local_surface_families += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "governing_law_family", "governing law family" })) audit.mbk.kernel.governing_law_families += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "findings_per_law", "findings per law" })) audit.mbk.kernel.findings_per_law += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "distinction_merged", "distinction merged", "distinctions_merged" })) audit.mbk.kernel.distinctions_merged += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "unwitnessed_distinction", "unwitnessed distinction", "unwitnessed_distinctions" })) audit.mbk.kernel.unwitnessed_distinctions += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "exact_quotient", "exact quotient", "exact_quotients" })) audit.mbk.kernel.exact_quotients += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "witnessed_quotient", "witnessed quotient", "witnessed_quotients" })) audit.mbk.kernel.witnessed_quotients += 1;
+
+    if (containsAnyIgnoreCaseAscii(text, &.{ "design-registered", "design_registered", "design registered" })) audit.mbk.realization.designs_considered += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "route_class", "route class" })) audit.mbk.realization.route_classes += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "design-selected", "design_selected", "design selected" })) audit.mbk.realization.selected_designs += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "realization_recompilation", "realization recompilation", "realization recompiled" })) audit.mbk.realization.realization_recompilations += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "realization_from_campaign_base", "realization from campaign base" })) audit.mbk.realization.realizations_from_campaign_base += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "realization_from_prior_head", "realization from prior head" })) audit.mbk.realization.realizations_from_prior_head += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "surface_retired", "surface retired", "surfaces_retired" })) audit.mbk.realization.surfaces_retired += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "orphan_code_construct", "orphan code construct", "orphan_code_constructs" })) audit.mbk.realization.orphan_code_constructs += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "duplicate_realization", "duplicate realization", "duplicate_realizations" })) audit.mbk.realization.duplicate_realizations += 1;
+
+    recordMBKSurfaceNumbers(&audit.mbk, text);
+
+    if (containsAnyIgnoreCaseAscii(text, &.{ "hard_dimension_increase", "hard dimension increase" })) audit.mbk.semantic_surface.hard_dimension_increases += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "total_description_nonincrease_pass", "total description nonincrease pass" })) audit.mbk.semantic_surface.total_description_nonincrease_pass = true;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "approved_rebaseline", "approved rebaseline" })) audit.mbk.semantic_surface.approved_rebaselines += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "silent_scope_expansion", "silent scope expansion" })) audit.mbk.semantic_surface.silent_scope_expansions += 1;
+
+    if (containsAnyIgnoreCaseAscii(text, &.{ "kernel_laws", "kernel laws" })) audit.mbk.proof.kernel_laws += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "proof_family", "proof family", "proof_families" })) audit.mbk.proof.proof_families += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "wound_specific_test", "wound-specific test", "wound specific test" })) audit.mbk.proof.wound_specific_tests += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "tests_merged_or_retired", "tests merged or retired" })) audit.mbk.proof.tests_merged_or_retired += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "property_or_state_machine_family", "property family", "state machine family" })) audit.mbk.proof.property_or_state_machine_families += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "unmapped_proof_action", "unmapped proof action" })) audit.mbk.proof.unmapped_proof_actions += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "proof_run", "proof run", "proof_runs" })) audit.mbk.proof.proof_runs += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "stale_proof", "stale proof" })) audit.mbk.proof.stale_proof += 1;
+
+    if (containsAnyIgnoreCaseAscii(text, &.{ "delivery-applied", "delivery_applied", "physical_apply_event" })) audit.mbk.controller.physical_apply_events += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "state_only_apply", "state-only apply" })) audit.mbk.controller.state_only_apply_violations += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "committed", "physical_commit" })) audit.mbk.controller.physical_commits += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "state_only_commit", "state-only commit" })) audit.mbk.controller.state_only_commit_violations += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "pushed", "physical_push" })) audit.mbk.controller.physical_pushes += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "state_only_push", "state-only push" })) audit.mbk.controller.state_only_push_violations += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "backup_ref_created", "backup ref created" })) audit.mbk.controller.backup_refs_created += 1;
+
+    if (containsAnyIgnoreCaseAscii(text, &.{ "kernel-accepted", "kernel_accepted", "kernel accepted" })) {
+        audit.mbk.closure.kernel_accepted += 1;
+        signals.mbk_kernel_accepted_seen = true;
+        try addReviewCompilerMBKEvidence(allocator, audit, session_id, "kernel-accepted", source, text);
+    }
+    if (containsAnyIgnoreCaseAscii(text, &.{ "tuple-closed", "tuple_closed", "conformance_closed_for_tuple", "conformance closed for tuple" })) {
+        audit.mbk.closure.conformance_closed_for_tuple += 1;
+        signals.mbk_tuple_closed_seen = true;
+        audit.mbk.campaigns.closure_attempts += 1;
+        try addReviewCompilerMBKEvidence(allocator, audit, session_id, "tuple-closed", source, text);
+    }
+    if (containsAnyIgnoreCaseAscii(text, &.{ "terminal-closed", "terminal_closed", "terminal closed" })) {
+        audit.mbk.closure.terminal_closed += 1;
+        signals.mbk_terminal_closed_seen = true;
+        audit.mbk.campaigns.closure_attempts += 1;
+        recordReviewCompilerMBKTime(signals, .terminal, timestamp);
+        try addReviewCompilerMBKEvidence(allocator, audit, session_id, "terminal-closed", source, text);
+    }
+    if (containsAnyIgnoreCaseAscii(text, &.{ "unqualified_complete_claim", "unqualified complete claim" })) audit.mbk.closure.unqualified_complete_claims += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "tuple_receipt_missing_horizon", "tuple receipt missing horizon" })) audit.mbk.closure.tuple_receipts_missing_horizon += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "post_push_reopen", "post-push reopen", "post push reopen" })) audit.mbk.closure.post_push_reopens += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "terminal_closure_with_new_evidence", "terminal closure with new evidence" })) audit.mbk.closure.terminal_closure_with_new_evidence += 1;
+}
+
 const ReviewCompilerC3TimeKind = enum { begin, closed, aborted };
+const ReviewCompilerMBKTimeKind = enum { begin, terminal };
 
 fn recordReviewCompilerC3Time(signals: *ReviewCompilerSessionSignals, kind: ReviewCompilerC3TimeKind, timestamp: ?[]const u8) void {
     const ms = time_utils.parseIsoTimestampMillis(timestamp orelse return) orelse return;
@@ -5272,6 +5606,69 @@ fn recordReviewCompilerC3Time(signals: *ReviewCompilerSessionSignals, kind: Revi
             if (signals.c3_aborted_at_ms == null or ms < signals.c3_aborted_at_ms.?) signals.c3_aborted_at_ms = ms;
         },
     }
+}
+
+fn recordReviewCompilerMBKTime(signals: *ReviewCompilerSessionSignals, kind: ReviewCompilerMBKTimeKind, timestamp: ?[]const u8) void {
+    const ms = time_utils.parseIsoTimestampMillis(timestamp orelse return) orelse return;
+    switch (kind) {
+        .begin => {
+            if (signals.mbk_begin_at_ms == null or ms < signals.mbk_begin_at_ms.?) signals.mbk_begin_at_ms = ms;
+        },
+        .terminal => {
+            if (signals.mbk_terminal_at_ms == null or ms < signals.mbk_terminal_at_ms.?) signals.mbk_terminal_at_ms = ms;
+        },
+    }
+}
+
+fn addReviewCompilerMBKEvidence(
+    allocator: std.mem.Allocator,
+    audit: *ReviewCompilerAudit,
+    session_id: ?[]const u8,
+    event: []const u8,
+    source: []const u8,
+    text: []const u8,
+) !void {
+    try audit.mbk.evidence_ledger.append(allocator, .{
+        .session_id = if (session_id) |id| try allocator.dupe(u8, id) else null,
+        .event = try allocator.dupe(u8, event),
+        .source = try allocator.dupe(u8, source),
+        .snippet = try allocator.dupe(u8, firstNonEmptyLine(text)),
+    });
+}
+
+fn recordMBKSurfaceNumbers(mbk: *ReviewCompilerAudit.MBK, text: []const u8) void {
+    if (extractReviewCompilerNamedUsize(text, "review_ready_baseline_semantic_surface")) |value| mbk.semantic_surface.review_ready_baseline.semantic_surface = value;
+    if (extractReviewCompilerNamedUsize(text, "review_ready_baseline_governing_laws")) |value| mbk.semantic_surface.review_ready_baseline.governing_laws = value;
+    if (extractReviewCompilerNamedUsize(text, "review_ready_baseline_realization_surface")) |value| mbk.semantic_surface.review_ready_baseline.realization_surface = value;
+    if (extractReviewCompilerNamedUsize(text, "review_ready_baseline_proof_families")) |value| mbk.semantic_surface.review_ready_baseline.proof_families = value;
+
+    if (extractReviewCompilerNamedUsize(text, "terminal_semantic_surface")) |value| mbk.semantic_surface.terminal.semantic_surface = value;
+    if (extractReviewCompilerNamedUsize(text, "terminal_governing_laws")) |value| mbk.semantic_surface.terminal.governing_laws = value;
+    if (extractReviewCompilerNamedUsize(text, "terminal_realization_surface")) |value| mbk.semantic_surface.terminal.realization_surface = value;
+    if (extractReviewCompilerNamedUsize(text, "terminal_proof_families")) |value| mbk.semantic_surface.terminal.proof_families = value;
+
+    if (extractReviewCompilerNamedUsize(text, "delta_semantic_surface")) |value| mbk.semantic_surface.delta.semantic_surface = value;
+    if (extractReviewCompilerNamedUsize(text, "delta_governing_laws")) |value| mbk.semantic_surface.delta.governing_laws = value;
+    if (extractReviewCompilerNamedUsize(text, "delta_realization_surface")) |value| mbk.semantic_surface.delta.realization_surface = value;
+    if (extractReviewCompilerNamedUsize(text, "delta_proof_families")) |value| mbk.semantic_surface.delta.proof_families = value;
+
+    if (extractReviewCompilerNamedUsize(text, "git_files_changed")) |value| mbk.git_tree_metrics.files_changed = value;
+    if (extractReviewCompilerNamedUsize(text, "git_insertions")) |value| mbk.git_tree_metrics.insertions = value;
+    if (extractReviewCompilerNamedUsize(text, "git_deletions")) |value| mbk.git_tree_metrics.deletions = value;
+    mbk.git_tree_metrics.net_lines = @as(i64, @intCast(mbk.git_tree_metrics.insertions)) - @as(i64, @intCast(mbk.git_tree_metrics.deletions));
+}
+
+fn extractReviewCompilerNamedUsize(text: []const u8, key: []const u8) ?usize {
+    var search_start: usize = 0;
+    while (std.mem.indexOfPos(u8, text, search_start, key)) |idx| {
+        var cursor = idx + key.len;
+        while (cursor < text.len and (std.ascii.isWhitespace(text[cursor]) or text[cursor] == ':' or text[cursor] == '=')) : (cursor += 1) {}
+        const start = cursor;
+        while (cursor < text.len and std.ascii.isDigit(text[cursor])) : (cursor += 1) {}
+        if (cursor > start) return std.fmt.parseInt(usize, text[start..cursor], 10) catch null;
+        search_start = idx + key.len;
+    }
+    return null;
 }
 
 fn recordReviewCompilerSignalTime(signals: *ReviewCompilerSessionSignals, kind: ReviewCompilerSignalTimeKind, timestamp: ?[]const u8) void {
@@ -5302,6 +5699,9 @@ fn recordReviewCompilerTools(
         if (toolHasC3Evidence(tool) or containsReviewCompilerCandidateCue(tool_text)) {
             recordReviewCompilerC3Text(audit, tool_text, toolTimestamp(parsed, tool), signals);
         }
+        if (signals.true_mbk and (toolHasMBKEvidence(tool) or containsTrueMBKEvidence(tool_text))) {
+            try recordReviewCompilerMBKText(allocator, audit, tool_text, toolTimestamp(parsed, tool), signals, parsed.session.session_id, "tool");
+        }
 
         if (tool.kind == .patch_apply and tool.lifecycle_status == .completed and tool.patch_success != false) {
             const patch_text = tool.input_text orelse tool.arguments_json orelse tool.patch_changes_json orelse "";
@@ -5327,20 +5727,28 @@ fn recordReviewCompilerTools(
                     signals.c3_raw_delivery_mutation_seen = true;
                     audit.c3.compliance.direct_review_to_delivery_mutation += 1;
                 }
+                if (reviewCompilerMBKToolWhileActive(parsed, tool, signals.*)) {
+                    audit.mbk.controller.raw_delivery_mutations_while_active += 1;
+                }
             }
             continue;
         }
 
         if (tool.kind == .exec_command and tool.lifecycle_status == .completed and (tool.exit_code orelse -1) == 0) {
             const cmd = tool.command_text orelse "";
-            if (commandContainsReviewCompileController(cmd, "apply")) audit.c3.lab_vs_delivery.delivery_apply_events += 1;
+            if (commandContainsReviewCompileController(cmd, "apply")) {
+                audit.c3.lab_vs_delivery.delivery_apply_events += 1;
+                if (signals.true_mbk) audit.mbk.controller.physical_apply_events += 1;
+            }
             if (commandContainsReviewCompileController(cmd, "commit")) {
                 audit.c3.delivery.controller_commits += 1;
                 audit.c3.controller.mrpc_committed += 1;
+                if (signals.true_mbk) audit.mbk.controller.physical_commits += 1;
             }
             if (commandContainsReviewCompileController(cmd, "push")) {
                 audit.c3.delivery.controller_pushes += 1;
                 audit.c3.controller.mrpc_pushed += 1;
+                if (signals.true_mbk) audit.mbk.controller.physical_pushes += 1;
             }
             if (commandContainsReviewCompileController(cmd, "close") or commandContainsReviewCompileController(cmd, "closed")) {
                 audit.c3.delivery.closed_runs += 1;
@@ -5362,11 +5770,19 @@ fn recordReviewCompilerTools(
                         audit.c3.delivery.raw_commits_while_active += 1;
                         audit.c3.compliance.commit_or_push_bypass += 1;
                     }
+                    if (signals.true_mbk and !commandContainsReviewCompileController(cmd, "commit")) {
+                        audit.mbk.controller.physical_commits += 1;
+                        if (reviewCompilerMBKToolWhileActive(parsed, tool, signals.*)) audit.mbk.controller.raw_delivery_mutations_while_active += 1;
+                    }
                 }
             }
             if (containsGitPushCommand(cmd) and reviewCompilerC3ToolWhileActive(parsed, tool, signals.*) and !commandContainsReviewCompileController(cmd, "push")) {
                 audit.c3.delivery.raw_pushes_while_active += 1;
                 audit.c3.compliance.commit_or_push_bypass += 1;
+            }
+            if (signals.true_mbk and containsGitPushCommand(cmd) and !commandContainsReviewCompileController(cmd, "push")) {
+                audit.mbk.controller.physical_pushes += 1;
+                if (reviewCompilerMBKToolWhileActive(parsed, tool, signals.*)) audit.mbk.controller.raw_delivery_mutations_while_active += 1;
             }
         }
     }
@@ -5421,6 +5837,16 @@ fn reviewCompilerC3ToolWhileActive(parsed: canonical_trace.CanonicalSessionTrace
     return true;
 }
 
+fn reviewCompilerMBKToolWhileActive(parsed: canonical_trace.CanonicalSessionTrace, tool: canonical_trace.ToolLifecycleRecord, signals: ReviewCompilerSessionSignals) bool {
+    const begin_ms = signals.mbk_begin_at_ms orelse return false;
+    const tool_ms = toolTimestampMillis(parsed, tool) orelse return false;
+    if (tool_ms < begin_ms) return false;
+    if (signals.mbk_terminal_at_ms) |terminal_ms| {
+        if (tool_ms >= terminal_ms) return false;
+    }
+    return true;
+}
+
 fn reviewCompilerSurfaceCount(counts: ResolvePatchCounts) usize {
     return counts.production_insertions + counts.production_deletions + counts.test_insertions + counts.test_deletions;
 }
@@ -5439,16 +5865,40 @@ fn finalizeReviewCompilerCompliance(audit: *ReviewCompilerAudit, signals: Review
         if (!signals.ablation_seen) audit.legacy_cleanroom.compliance.missing_ablation += 1;
     }
 
-    if (!signals.true_c3) return;
-    if (!signals.clean_review_seen and !signals.isolated_waiver_seen) {
-        if (!signals.c3_basis_seen) audit.c3.compliance.basis_missing += 1;
-        if (!signals.c3_tournament_seen) audit.c3.compliance.tournament_missing += 1;
-        if (!signals.c3_ablation_seen) audit.c3.compliance.ablation_missing += 1;
-        if (!signals.c3_proof_seen) audit.c3.compliance.proof_missing += 1;
-        if (!signals.c3_holdout_seen) audit.c3.compliance.holdout_missing += 1;
+    if (signals.true_c3) {
+        if (!signals.clean_review_seen and !signals.isolated_waiver_seen) {
+            if (!signals.c3_basis_seen) audit.c3.compliance.basis_missing += 1;
+            if (!signals.c3_tournament_seen) audit.c3.compliance.tournament_missing += 1;
+            if (!signals.c3_ablation_seen) audit.c3.compliance.ablation_missing += 1;
+            if (!signals.c3_proof_seen) audit.c3.compliance.proof_missing += 1;
+            if (!signals.c3_holdout_seen) audit.c3.compliance.holdout_missing += 1;
+        }
+        if (signals.c3_mrpc_seen and signals.c3_raw_delivery_mutation_seen) {
+            audit.c3.compliance.stale_mrpc += 1;
+        }
     }
-    if (signals.c3_mrpc_seen and signals.c3_raw_delivery_mutation_seen) {
-        audit.c3.compliance.stale_mrpc += 1;
+
+    if (!signals.true_mbk) return;
+    audit.mbk.denominator.true_resolve_sessions += 1;
+    if (signals.mbk_clean_review_seen) audit.mbk.denominator.clean_review_sessions += 1;
+    if (signals.mbk_isolated_conformance_seen) audit.mbk.denominator.isolated_conformance_sessions += 1;
+    if (signals.mbk_material_kernel_required_seen and !signals.mbk_clean_review_seen and !signals.mbk_isolated_conformance_seen) audit.mbk.denominator.material_kernel_required_sessions += 1;
+    if (signals.mbk_begin_seen) audit.mbk.denominator.kernel_campaign_entered_sessions += 1;
+    if (signals.mbk_kernel_accepted_seen) audit.mbk.denominator.kernel_accepted_sessions += 1;
+    if (signals.mbk_tuple_closed_seen) audit.mbk.denominator.tuple_closed_sessions += 1;
+    if (signals.mbk_terminal_closed_seen) audit.mbk.denominator.terminal_closed_sessions += 1;
+
+    if (audit.mbk.semantic_surface.delta.semantic_surface == 0 and audit.mbk.semantic_surface.terminal.semantic_surface >= audit.mbk.semantic_surface.review_ready_baseline.semantic_surface) {
+        audit.mbk.semantic_surface.delta.semantic_surface = audit.mbk.semantic_surface.terminal.semantic_surface - audit.mbk.semantic_surface.review_ready_baseline.semantic_surface;
+    }
+    if (audit.mbk.semantic_surface.delta.governing_laws == 0 and audit.mbk.semantic_surface.terminal.governing_laws >= audit.mbk.semantic_surface.review_ready_baseline.governing_laws) {
+        audit.mbk.semantic_surface.delta.governing_laws = audit.mbk.semantic_surface.terminal.governing_laws - audit.mbk.semantic_surface.review_ready_baseline.governing_laws;
+    }
+    if (audit.mbk.semantic_surface.delta.realization_surface == 0 and audit.mbk.semantic_surface.terminal.realization_surface >= audit.mbk.semantic_surface.review_ready_baseline.realization_surface) {
+        audit.mbk.semantic_surface.delta.realization_surface = audit.mbk.semantic_surface.terminal.realization_surface - audit.mbk.semantic_surface.review_ready_baseline.realization_surface;
+    }
+    if (audit.mbk.semantic_surface.delta.proof_families == 0 and audit.mbk.semantic_surface.terminal.proof_families >= audit.mbk.semantic_surface.review_ready_baseline.proof_families) {
+        audit.mbk.semantic_surface.delta.proof_families = audit.mbk.semantic_surface.terminal.proof_families - audit.mbk.semantic_surface.review_ready_baseline.proof_families;
     }
 }
 
@@ -5818,6 +6268,10 @@ fn writeReviewCompilerAuditMarkdown(allocator: std.mem.Allocator, audit: ReviewC
 fn writeReviewCompilerAuditYamlBody(writer: anytype, audit: ReviewCompilerAudit, indent: []const u8) !void {
     const protocol = audit.outputProtocol();
     try writer.print("{s}protocol: {s}\n", .{ indent, protocol.label() });
+    if (protocol == .mbk) {
+        try writeReviewCompilerMBKYamlBody(writer, audit.mbk, indent);
+        return;
+    }
     try writer.print("{s}denominator:\n", .{indent});
     try writer.print("{s}  candidate_sessions: {d}\n{s}  true_resolve_sessions: {d}\n{s}  clean_review_sessions: {d}\n{s}  isolated_waiver_sessions: {d}\n{s}  c3_required_sessions: {d}\n{s}  c3_entered_sessions: {d}\n{s}  c3_closed_sessions: {d}\n", .{ indent, audit.denominator.candidate_sessions, indent, audit.denominator.true_resolve_sessions, indent, audit.denominator.clean_review_sessions, indent, audit.denominator.isolated_waiver_sessions, indent, audit.denominator.c3_required_sessions, indent, audit.denominator.c3_entered_sessions, indent, audit.denominator.c3_closed_sessions });
     try writer.print("{s}  exclusions:", .{indent});
@@ -5837,8 +6291,80 @@ fn writeReviewCompilerAuditYamlBody(writer: anytype, audit: ReviewCompilerAudit,
             try writer.writeByte('\n');
         }
     }
-    if (protocol == .c3) try writeReviewCompilerC3YamlBody(writer, audit, indent);
+    if (protocol == .c3 or protocol == .c3_mrpc) try writeReviewCompilerC3YamlBody(writer, audit, indent);
     try writeReviewCompilerLegacyYamlBody(writer, audit.legacy_cleanroom, indent);
+}
+
+fn writeReviewCompilerMBKYamlBody(writer: anytype, mbk: ReviewCompilerAudit.MBK, indent: []const u8) !void {
+    try writer.print("{s}denominator:\n", .{indent});
+    try writer.print("{s}  candidate_sessions: {d}\n{s}  true_resolve_sessions: {d}\n{s}  clean_review_sessions: {d}\n{s}  isolated_conformance_sessions: {d}\n{s}  material_kernel_required_sessions: {d}\n{s}  kernel_campaign_entered_sessions: {d}\n{s}  kernel_accepted_sessions: {d}\n{s}  tuple_closed_sessions: {d}\n{s}  terminal_closed_sessions: {d}\n", .{ indent, mbk.denominator.candidate_sessions, indent, mbk.denominator.true_resolve_sessions, indent, mbk.denominator.clean_review_sessions, indent, mbk.denominator.isolated_conformance_sessions, indent, mbk.denominator.material_kernel_required_sessions, indent, mbk.denominator.kernel_campaign_entered_sessions, indent, mbk.denominator.kernel_accepted_sessions, indent, mbk.denominator.tuple_closed_sessions, indent, mbk.denominator.terminal_closed_sessions });
+    try writer.print("{s}  exclusions:", .{indent});
+    if (mbk.denominator.exclusions.items.len == 0) {
+        try writer.writeAll(" []\n");
+    } else {
+        try writer.writeByte('\n');
+        for (mbk.denominator.exclusions.items) |item| {
+            try writer.print("{s}    - session_id: ", .{indent});
+            if (item.session_id) |id| try writeYamlInlineString(writer, id) else try writer.writeAll("null");
+            try writer.writeByte('\n');
+            try writer.print("{s}      path: ", .{indent});
+            try writeYamlInlineString(writer, item.path);
+            try writer.writeByte('\n');
+            try writer.print("{s}      reason: ", .{indent});
+            try writeYamlInlineString(writer, item.reason);
+            try writer.writeByte('\n');
+        }
+    }
+
+    try writer.print("{s}campaigns:\n{s}  campaign_ids: {d}\n{s}  fixed_base_pass: {d}\n{s}  base_reset_violations: {d}\n{s}  review_ready_baselines: {d}\n{s}  closure_attempts: {d}\n{s}  prior_closure_head_used_as_new_base: {d}\n{s}  rebaseline_decisions: {d}\n", .{ indent, indent, mbk.campaigns.campaign_ids, indent, mbk.campaigns.fixed_base_pass, indent, mbk.campaigns.base_reset_violations, indent, mbk.campaigns.review_ready_baselines, indent, mbk.campaigns.closure_attempts, indent, mbk.campaigns.prior_closure_head_used_as_new_base, indent, mbk.campaigns.rebaseline_decisions });
+    try writer.print("{s}observations:\n{s}  raw_findings: {d}\n{s}  branch_liabilities: {d}\n{s}  additional_witnesses: {d}\n{s}  missing_distinctions: {d}\n{s}  scope_expansions: {d}\n{s}  adjacent_followups: {d}\n{s}  preferences_rejected: {d}\n", .{ indent, indent, mbk.observations.raw_findings, indent, mbk.observations.branch_liabilities, indent, mbk.observations.additional_witnesses, indent, mbk.observations.missing_distinctions, indent, mbk.observations.scope_expansions, indent, mbk.observations.adjacent_followups, indent, mbk.observations.preferences_rejected });
+    try writer.print("{s}kernel:\n{s}  authorities: {d}\n{s}  observable_state_classes: {d}\n{s}  transitions: {d}\n{s}  laws: {d}\n{s}  local_surface_families: {d}\n{s}  governing_law_families: {d}\n{s}  findings_per_law: {d}\n{s}  distinctions_merged: {d}\n{s}  unwitnessed_distinctions: {d}\n{s}  exact_quotients: {d}\n{s}  witnessed_quotients: {d}\n", .{ indent, indent, mbk.kernel.authorities, indent, mbk.kernel.observable_state_classes, indent, mbk.kernel.transitions, indent, mbk.kernel.laws, indent, mbk.kernel.local_surface_families, indent, mbk.kernel.governing_law_families, indent, mbk.kernel.findings_per_law, indent, mbk.kernel.distinctions_merged, indent, mbk.kernel.unwitnessed_distinctions, indent, mbk.kernel.exact_quotients, indent, mbk.kernel.witnessed_quotients });
+    try writer.print("{s}realization:\n{s}  designs_considered: {d}\n{s}  route_classes: {d}\n{s}  selected_designs: {d}\n{s}  realization_recompilations: {d}\n{s}  realizations_from_campaign_base: {d}\n{s}  realizations_from_prior_head: {d}\n{s}  surfaces_retired: {d}\n{s}  orphan_code_constructs: {d}\n{s}  duplicate_realizations: {d}\n", .{ indent, indent, mbk.realization.designs_considered, indent, mbk.realization.route_classes, indent, mbk.realization.selected_designs, indent, mbk.realization.realization_recompilations, indent, mbk.realization.realizations_from_campaign_base, indent, mbk.realization.realizations_from_prior_head, indent, mbk.realization.surfaces_retired, indent, mbk.realization.orphan_code_constructs, indent, mbk.realization.duplicate_realizations });
+
+    try writer.print("{s}semantic_surface:\n{s}  review_ready_baseline:\n", .{ indent, indent });
+    try writeMBKSurfaceSnapshotYaml(writer, mbk.semantic_surface.review_ready_baseline, indent, "    ");
+    try writer.print("{s}  terminal:\n", .{indent});
+    try writeMBKSurfaceSnapshotYaml(writer, mbk.semantic_surface.terminal, indent, "    ");
+    try writer.print("{s}  delta:\n", .{indent});
+    try writeMBKSurfaceSnapshotYaml(writer, mbk.semantic_surface.delta, indent, "    ");
+    try writer.print("{s}  hard_dimension_increases: []\n{s}  hard_dimension_increase_events: {d}\n{s}  total_description_nonincrease_pass: {any}\n{s}  approved_rebaselines: {d}\n{s}  silent_scope_expansions: {d}\n", .{ indent, indent, mbk.semantic_surface.hard_dimension_increases, indent, mbk.semantic_surface.total_description_nonincrease_pass, indent, mbk.semantic_surface.approved_rebaselines, indent, mbk.semantic_surface.silent_scope_expansions });
+    try writer.print("{s}git_tree_metrics:\n{s}  files_changed: {d}\n{s}  insertions: {d}\n{s}  deletions: {d}\n{s}  net_lines: {d}\n", .{ indent, indent, mbk.git_tree_metrics.files_changed, indent, mbk.git_tree_metrics.insertions, indent, mbk.git_tree_metrics.deletions, indent, mbk.git_tree_metrics.net_lines });
+
+    try writer.print("{s}proof:\n{s}  kernel_laws: {d}\n{s}  proof_families: {d}\n{s}  wound_specific_tests: {d}\n{s}  tests_merged_or_retired: {d}\n{s}  property_or_state_machine_families: {d}\n{s}  unmapped_proof_actions: {d}\n{s}  proof_runs: {d}\n{s}  stale_proof: {d}\n", .{ indent, indent, mbk.proof.kernel_laws, indent, mbk.proof.proof_families, indent, mbk.proof.wound_specific_tests, indent, mbk.proof.tests_merged_or_retired, indent, mbk.proof.property_or_state_machine_families, indent, mbk.proof.unmapped_proof_actions, indent, mbk.proof.proof_runs, indent, mbk.proof.stale_proof });
+    try writer.print("{s}controller:\n{s}  physical_apply_events: {d}\n{s}  state_only_apply_violations: {d}\n{s}  physical_commits: {d}\n{s}  state_only_commit_violations: {d}\n{s}  physical_pushes: {d}\n{s}  state_only_push_violations: {d}\n{s}  raw_delivery_mutations_while_active: {d}\n{s}  backup_refs_created: {d}\n", .{ indent, indent, mbk.controller.physical_apply_events, indent, mbk.controller.state_only_apply_violations, indent, mbk.controller.physical_commits, indent, mbk.controller.state_only_commit_violations, indent, mbk.controller.physical_pushes, indent, mbk.controller.state_only_push_violations, indent, mbk.controller.raw_delivery_mutations_while_active, indent, mbk.controller.backup_refs_created });
+    try writer.print("{s}closure:\n{s}  kernel_accepted: {d}\n{s}  conformance_closed_for_tuple: {d}\n{s}  terminal_closed: {d}\n{s}  unqualified_complete_claims: {d}\n{s}  tuple_receipts_missing_horizon: {d}\n{s}  post_push_reopens: {d}\n{s}  terminal_closure_with_new_evidence: {d}\n", .{ indent, indent, mbk.closure.kernel_accepted, indent, mbk.closure.conformance_closed_for_tuple, indent, mbk.closure.terminal_closed, indent, mbk.closure.unqualified_complete_claims, indent, mbk.closure.tuple_receipts_missing_horizon, indent, mbk.closure.post_push_reopens, indent, mbk.closure.terminal_closure_with_new_evidence });
+
+    try writer.print("{s}key_metrics:\n", .{indent});
+    try writeYamlRatio(writer, indent, "  finding_compression", mbk.observations.branch_liabilities, mbk.kernel.governing_law_families, "governing_law_families_zero");
+    try writeYamlRatio(writer, indent, "  semantic_realization_density", mbk.kernel.governing_law_families, mbk.semantic_surface.terminal.realization_surface, "terminal_realization_surface_zero");
+    try writeYamlRatio(writer, indent, "  proof_compression", mbk.observations.raw_findings, mbk.proof.proof_families, "proof_families_zero");
+    try writer.print("{s}  review_growth: {d}\n", .{ indent, @as(i64, @intCast(mbk.semantic_surface.terminal.semantic_surface)) - @as(i64, @intCast(mbk.semantic_surface.review_ready_baseline.semantic_surface)) });
+    try writeYamlRatio(writer, indent, "  base_discipline", mbk.campaigns.fixed_base_pass, mbk.denominator.material_kernel_required_sessions, "material_kernel_required_sessions_zero");
+
+    try writer.print("{s}evidence_ledger:", .{indent});
+    if (mbk.evidence_ledger.items.len == 0) {
+        try writer.writeAll(" []\n");
+    } else {
+        try writer.writeByte('\n');
+        for (mbk.evidence_ledger.items) |item| {
+            try writer.print("{s}  - session_id: ", .{indent});
+            if (item.session_id) |id| try writeYamlInlineString(writer, id) else try writer.writeAll("null");
+            try writer.writeByte('\n');
+            try writer.print("{s}    event: ", .{indent});
+            try writeYamlInlineString(writer, item.event);
+            try writer.writeByte('\n');
+            try writer.print("{s}    source: ", .{indent});
+            try writeYamlInlineString(writer, item.source);
+            try writer.writeByte('\n');
+            try writer.print("{s}    snippet: ", .{indent});
+            try writeYamlInlineString(writer, item.snippet);
+            try writer.writeByte('\n');
+        }
+    }
+}
+
+fn writeMBKSurfaceSnapshotYaml(writer: anytype, snapshot: ReviewCompilerAudit.SurfaceSnapshot, indent: []const u8, extra: []const u8) !void {
+    try writer.print("{s}{s}semantic_surface: {d}\n{s}{s}governing_laws: {d}\n{s}{s}realization_surface: {d}\n{s}{s}proof_families: {d}\n", .{ indent, extra, snapshot.semantic_surface, indent, extra, snapshot.governing_laws, indent, extra, snapshot.realization_surface, indent, extra, snapshot.proof_families });
 }
 
 fn writeReviewCompilerC3YamlBody(writer: anytype, audit: ReviewCompilerAudit, indent: []const u8) !void {
@@ -5902,6 +6428,16 @@ fn writeReviewCompilerAuditJson(allocator: std.mem.Allocator, audit: ReviewCompi
 
     try writer.writeAll("{\n  \"review_compiler_audit\": {\n");
     try writer.print("    \"protocol\": \"{s}\",\n", .{audit.outputProtocol().label()});
+    if (audit.outputProtocol() == .mbk) {
+        try writeReviewCompilerMBKJsonFields(writer, audit.mbk);
+        try writer.writeAll("  }\n}\n");
+
+        const rendered = try writer_alloc.toOwnedSlice();
+        defer allocator.free(rendered);
+        if (out_path) |path| try ensureParentDir(path);
+        try writeTextOutput(rendered, out_path);
+        return;
+    }
     try writer.print("    \"denominator\": {{ \"candidate_sessions\": {d}, \"true_resolve_sessions\": {d}, \"clean_review_sessions\": {d}, \"isolated_waiver_sessions\": {d}, \"c3_required_sessions\": {d}, \"c3_entered_sessions\": {d}, \"c3_closed_sessions\": {d}, \"exclusions\": [", .{ audit.denominator.candidate_sessions, audit.denominator.true_resolve_sessions, audit.denominator.clean_review_sessions, audit.denominator.isolated_waiver_sessions, audit.denominator.c3_required_sessions, audit.denominator.c3_entered_sessions, audit.denominator.c3_closed_sessions });
     for (audit.denominator.exclusions.items, 0..) |item, idx| {
         if (idx > 0) try writer.writeAll(", ");
@@ -5914,7 +6450,8 @@ fn writeReviewCompilerAuditJson(allocator: std.mem.Allocator, audit: ReviewCompi
         try writer.writeAll(" }");
     }
     try writer.writeAll("] },\n");
-    if (audit.outputProtocol() == .c3) {
+    const protocol = audit.outputProtocol();
+    if (protocol == .c3 or protocol == .c3_mrpc) {
         try writer.print("    \"controller\": {{ \"begin_events\": {d}, \"state_files\": {d}, \"mrpc_apply_certified\": {d}, \"mrpc_final_certified\": {d}, \"mrpc_committed\": {d}, \"mrpc_pushed\": {d}, \"mrpc_closed\": {d} }},\n", .{ audit.c3.controller.begin_events, audit.c3.controller.state_files, audit.c3.controller.mrpc_apply_certified, audit.c3.controller.mrpc_final_certified, audit.c3.controller.mrpc_committed, audit.c3.controller.mrpc_pushed, audit.c3.controller.mrpc_closed });
         try writer.print("    \"counterexamples\": {{ \"raw_findings\": {d}, \"branch_liabilities\": {d}, \"non_branch_liabilities\": {d}, \"independent_families\": {d}, \"subsumed_findings\": {d}, ", .{ audit.c3.counterexamples.raw_findings, audit.c3.counterexamples.branch_liabilities, audit.c3.counterexamples.non_branch_liabilities, audit.c3.counterexamples.independent_families, audit.c3.counterexamples.subsumed_findings });
         try writeJsonRatioFields(writer, "compression_ratio", audit.c3.counterexamples.branch_liabilities, audit.c3.counterexamples.independent_families, "independent_families_zero");
@@ -5949,6 +6486,66 @@ fn writeReviewCompilerAuditJson(allocator: std.mem.Allocator, audit: ReviewCompi
     defer allocator.free(rendered);
     if (out_path) |path| try ensureParentDir(path);
     try writeTextOutput(rendered, out_path);
+}
+
+fn writeReviewCompilerMBKJsonFields(writer: anytype, mbk: ReviewCompilerAudit.MBK) !void {
+    try writer.print("    \"denominator\": {{ \"candidate_sessions\": {d}, \"true_resolve_sessions\": {d}, \"clean_review_sessions\": {d}, \"isolated_conformance_sessions\": {d}, \"material_kernel_required_sessions\": {d}, \"kernel_campaign_entered_sessions\": {d}, \"kernel_accepted_sessions\": {d}, \"tuple_closed_sessions\": {d}, \"terminal_closed_sessions\": {d}, \"exclusions\": [", .{ mbk.denominator.candidate_sessions, mbk.denominator.true_resolve_sessions, mbk.denominator.clean_review_sessions, mbk.denominator.isolated_conformance_sessions, mbk.denominator.material_kernel_required_sessions, mbk.denominator.kernel_campaign_entered_sessions, mbk.denominator.kernel_accepted_sessions, mbk.denominator.tuple_closed_sessions, mbk.denominator.terminal_closed_sessions });
+    for (mbk.denominator.exclusions.items, 0..) |item, idx| {
+        if (idx > 0) try writer.writeAll(", ");
+        try writer.writeAll("{ \"session_id\": ");
+        if (item.session_id) |id| try output.writeJsonString(writer, id) else try writer.writeAll("null");
+        try writer.writeAll(", \"path\": ");
+        try output.writeJsonString(writer, item.path);
+        try writer.writeAll(", \"reason\": ");
+        try output.writeJsonString(writer, item.reason);
+        try writer.writeAll(" }");
+    }
+    try writer.writeAll("] },\n");
+    try writer.print("    \"campaigns\": {{ \"campaign_ids\": {d}, \"fixed_base_pass\": {d}, \"base_reset_violations\": {d}, \"review_ready_baselines\": {d}, \"closure_attempts\": {d}, \"prior_closure_head_used_as_new_base\": {d}, \"rebaseline_decisions\": {d} }},\n", .{ mbk.campaigns.campaign_ids, mbk.campaigns.fixed_base_pass, mbk.campaigns.base_reset_violations, mbk.campaigns.review_ready_baselines, mbk.campaigns.closure_attempts, mbk.campaigns.prior_closure_head_used_as_new_base, mbk.campaigns.rebaseline_decisions });
+    try writer.print("    \"observations\": {{ \"raw_findings\": {d}, \"branch_liabilities\": {d}, \"additional_witnesses\": {d}, \"missing_distinctions\": {d}, \"scope_expansions\": {d}, \"adjacent_followups\": {d}, \"preferences_rejected\": {d} }},\n", .{ mbk.observations.raw_findings, mbk.observations.branch_liabilities, mbk.observations.additional_witnesses, mbk.observations.missing_distinctions, mbk.observations.scope_expansions, mbk.observations.adjacent_followups, mbk.observations.preferences_rejected });
+    try writer.print("    \"kernel\": {{ \"authorities\": {d}, \"observable_state_classes\": {d}, \"transitions\": {d}, \"laws\": {d}, \"local_surface_families\": {d}, \"governing_law_families\": {d}, \"findings_per_law\": {d}, \"distinctions_merged\": {d}, \"unwitnessed_distinctions\": {d}, \"exact_quotients\": {d}, \"witnessed_quotients\": {d} }},\n", .{ mbk.kernel.authorities, mbk.kernel.observable_state_classes, mbk.kernel.transitions, mbk.kernel.laws, mbk.kernel.local_surface_families, mbk.kernel.governing_law_families, mbk.kernel.findings_per_law, mbk.kernel.distinctions_merged, mbk.kernel.unwitnessed_distinctions, mbk.kernel.exact_quotients, mbk.kernel.witnessed_quotients });
+    try writer.print("    \"realization\": {{ \"designs_considered\": {d}, \"route_classes\": {d}, \"selected_designs\": {d}, \"realization_recompilations\": {d}, \"realizations_from_campaign_base\": {d}, \"realizations_from_prior_head\": {d}, \"surfaces_retired\": {d}, \"orphan_code_constructs\": {d}, \"duplicate_realizations\": {d} }},\n", .{ mbk.realization.designs_considered, mbk.realization.route_classes, mbk.realization.selected_designs, mbk.realization.realization_recompilations, mbk.realization.realizations_from_campaign_base, mbk.realization.realizations_from_prior_head, mbk.realization.surfaces_retired, mbk.realization.orphan_code_constructs, mbk.realization.duplicate_realizations });
+
+    try writer.writeAll("    \"semantic_surface\": { \"review_ready_baseline\": ");
+    try writeMBKSurfaceSnapshotJson(writer, mbk.semantic_surface.review_ready_baseline);
+    try writer.writeAll(", \"terminal\": ");
+    try writeMBKSurfaceSnapshotJson(writer, mbk.semantic_surface.terminal);
+    try writer.writeAll(", \"delta\": ");
+    try writeMBKSurfaceSnapshotJson(writer, mbk.semantic_surface.delta);
+    try writer.print(", \"hard_dimension_increases\": [], \"hard_dimension_increase_events\": {d}, \"total_description_nonincrease_pass\": {any}, \"approved_rebaselines\": {d}, \"silent_scope_expansions\": {d} }},\n", .{ mbk.semantic_surface.hard_dimension_increases, mbk.semantic_surface.total_description_nonincrease_pass, mbk.semantic_surface.approved_rebaselines, mbk.semantic_surface.silent_scope_expansions });
+    try writer.print("    \"git_tree_metrics\": {{ \"files_changed\": {d}, \"insertions\": {d}, \"deletions\": {d}, \"net_lines\": {d} }},\n", .{ mbk.git_tree_metrics.files_changed, mbk.git_tree_metrics.insertions, mbk.git_tree_metrics.deletions, mbk.git_tree_metrics.net_lines });
+    try writer.print("    \"proof\": {{ \"kernel_laws\": {d}, \"proof_families\": {d}, \"wound_specific_tests\": {d}, \"tests_merged_or_retired\": {d}, \"property_or_state_machine_families\": {d}, \"unmapped_proof_actions\": {d}, \"proof_runs\": {d}, \"stale_proof\": {d} }},\n", .{ mbk.proof.kernel_laws, mbk.proof.proof_families, mbk.proof.wound_specific_tests, mbk.proof.tests_merged_or_retired, mbk.proof.property_or_state_machine_families, mbk.proof.unmapped_proof_actions, mbk.proof.proof_runs, mbk.proof.stale_proof });
+    try writer.print("    \"controller\": {{ \"physical_apply_events\": {d}, \"state_only_apply_violations\": {d}, \"physical_commits\": {d}, \"state_only_commit_violations\": {d}, \"physical_pushes\": {d}, \"state_only_push_violations\": {d}, \"raw_delivery_mutations_while_active\": {d}, \"backup_refs_created\": {d} }},\n", .{ mbk.controller.physical_apply_events, mbk.controller.state_only_apply_violations, mbk.controller.physical_commits, mbk.controller.state_only_commit_violations, mbk.controller.physical_pushes, mbk.controller.state_only_push_violations, mbk.controller.raw_delivery_mutations_while_active, mbk.controller.backup_refs_created });
+    try writer.print("    \"closure\": {{ \"kernel_accepted\": {d}, \"conformance_closed_for_tuple\": {d}, \"terminal_closed\": {d}, \"unqualified_complete_claims\": {d}, \"tuple_receipts_missing_horizon\": {d}, \"post_push_reopens\": {d}, \"terminal_closure_with_new_evidence\": {d} }},\n", .{ mbk.closure.kernel_accepted, mbk.closure.conformance_closed_for_tuple, mbk.closure.terminal_closed, mbk.closure.unqualified_complete_claims, mbk.closure.tuple_receipts_missing_horizon, mbk.closure.post_push_reopens, mbk.closure.terminal_closure_with_new_evidence });
+
+    try writer.writeAll("    \"key_metrics\": { ");
+    try writeJsonRatioFields(writer, "finding_compression", mbk.observations.branch_liabilities, mbk.kernel.governing_law_families, "governing_law_families_zero");
+    try writer.writeAll(", ");
+    try writeJsonRatioFields(writer, "semantic_realization_density", mbk.kernel.governing_law_families, mbk.semantic_surface.terminal.realization_surface, "terminal_realization_surface_zero");
+    try writer.writeAll(", ");
+    try writeJsonRatioFields(writer, "proof_compression", mbk.observations.raw_findings, mbk.proof.proof_families, "proof_families_zero");
+    try writer.print(", \"review_growth\": {d}, ", .{@as(i64, @intCast(mbk.semantic_surface.terminal.semantic_surface)) - @as(i64, @intCast(mbk.semantic_surface.review_ready_baseline.semantic_surface))});
+    try writeJsonRatioFields(writer, "base_discipline", mbk.campaigns.fixed_base_pass, mbk.denominator.material_kernel_required_sessions, "material_kernel_required_sessions_zero");
+    try writer.writeAll(" },\n");
+
+    try writer.writeAll("    \"evidence_ledger\": [");
+    for (mbk.evidence_ledger.items, 0..) |item, idx| {
+        if (idx > 0) try writer.writeAll(", ");
+        try writer.writeAll("{ \"session_id\": ");
+        if (item.session_id) |id| try output.writeJsonString(writer, id) else try writer.writeAll("null");
+        try writer.writeAll(", \"event\": ");
+        try output.writeJsonString(writer, item.event);
+        try writer.writeAll(", \"source\": ");
+        try output.writeJsonString(writer, item.source);
+        try writer.writeAll(", \"snippet\": ");
+        try output.writeJsonString(writer, item.snippet);
+        try writer.writeAll(" }");
+    }
+    try writer.writeAll("]\n");
+}
+
+fn writeMBKSurfaceSnapshotJson(writer: anytype, snapshot: ReviewCompilerAudit.SurfaceSnapshot) !void {
+    try writer.print("{{ \"semantic_surface\": {d}, \"governing_laws\": {d}, \"realization_surface\": {d}, \"proof_families\": {d} }}", .{ snapshot.semantic_surface, snapshot.governing_laws, snapshot.realization_surface, snapshot.proof_families });
 }
 
 fn writeJsonRatioFields(writer: anytype, name: []const u8, numerator: usize, denominator: usize, zero_reason: []const u8) !void {
@@ -18971,6 +19568,18 @@ test "validateCommandOptions gates review-compiler-audit protocol" {
         .repo_text = "/repo",
         .protocol_text = "c3",
     });
+    try validateCommandOptions(.review_compiler_audit, .{
+        .since = "2026-05-10T00:00:00Z",
+        .until = "2026-05-11T00:00:00Z",
+        .repo_text = "/repo",
+        .protocol_text = "c3-mrpc",
+    });
+    try validateCommandOptions(.review_compiler_audit, .{
+        .since = "2026-05-10T00:00:00Z",
+        .until = "2026-05-11T00:00:00Z",
+        .repo_text = "/repo",
+        .protocol_text = "mbk",
+    });
     try std.testing.expectError(error.UnsupportedOption, validateCommandOptions(.skill_report, .{ .protocol_text = "c3" }));
     try std.testing.expectError(error.InvalidModeArg, validateCommandOptions(.review_compiler_audit, .{
         .since = "2026-05-10T00:00:00Z",
@@ -19253,6 +19862,95 @@ test "review-compiler-audit c3 protocol reports controller, tournament, holdout,
     try std.testing.expect(std.mem.indexOf(u8, got, "\"single_candidate_material_violations\": 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"compression_ratio\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"legacy_cleanroom\"") != null);
+
+    const alias_output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "review-compiler-c3-mrpc.json" });
+    defer std.testing.allocator.free(alias_output_path);
+    const alias_got = try runCommandWithOutput(std.testing.allocator, .review_compiler_audit, &.{
+        "--root",     root_abs,
+        "--protocol", "c3-mrpc",
+        "--since",    "2026-05-12T00:00:00Z",
+        "--until",    "2026-05-13T00:00:00Z",
+        "--repo",     "/repo",
+        "--format",   "json",
+    }, alias_output_path);
+    defer std.testing.allocator.free(alias_got);
+
+    try std.testing.expect(std.mem.indexOf(u8, alias_got, "\"protocol\": \"c3-mrpc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, alias_got, "\"candidate_sessions\": 8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, alias_got, "\"true_resolve_sessions\": 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, alias_got, "\"controller_commits\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, alias_got, "\"commit_or_push_bypass\": 1") != null);
+}
+
+test "review-compiler-audit mbk protocol audits kernel, surface, proof, closure, and bypass counters" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/14");
+    const raw_resolve_only =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-14T08:00:00Z\",\"payload\":{\"id\":\"mbk-raw-only\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T08:00:01Z\",\"payload\":{\"type\":\"user_message\",\"turn_id\":\"r1\",\"message\":\"Raw $resolve mention only.\"}}\n";
+    const pasted_labels_only =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-14T09:00:00Z\",\"payload\":{\"id\":\"mbk-labels-only\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T09:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"l1\",\"message\":\"review-compiler-audit pasted labels only: local_surface_family wound_specific_test tuple_closed.\"}}\n";
+    const true_mbk =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-14T10:00:00Z\",\"payload\":{\"id\":\"mbk-true\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T10:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"m1\",\"message\":\"MBKC-v1 minimum_behavioral_kernel\\nresolve-c3 campaign begin\\ncampaign-began\\nmaterial_kernel_required\\nfixed_base_pass\\nbase_reset_violation\\nreview_ready_baseline\\nprior_closure_head_used_as_new_base\\nrebaseline_decision\\nobservation-added raw_finding\\nbranch_liabilities:\\n  - F1\\nadditional_witness\\nlocal_surface_family\\nwound_specific_test\\nkernel_law\\ndesign-registered route_class\\ndesign-selected\\nrealization_from_campaign_base\\nsurface_retired\\nreview_ready_baseline_semantic_surface: 5\\nreview_ready_baseline_governing_laws: 1\\nreview_ready_baseline_realization_surface: 3\\nreview_ready_baseline_proof_families: 1\\nterminal_semantic_surface: 7\\nterminal_governing_laws: 2\\nterminal_realization_surface: 4\\nterminal_proof_families: 2\\ngit_files_changed: 9\\ngit_insertions: 20\\ngit_deletions: 4\\nproof_family\\nproof_run\\nstate_only_apply\\nkernel-accepted\\ntuple-closed\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T10:00:02Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"m1\",\"call_id\":\"ctl-apply\",\"command\":\"resolve-c3 apply\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"applied\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-14T10:00:03Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"apply_patch\",\"call_id\":\"raw-patch\",\"arguments\":\"*** Update File: apps/seq/src/lib.zig\\n+raw\\n\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T10:00:04Z\",\"payload\":{\"type\":\"patch_apply_end\",\"turn_id\":\"m1\",\"call_id\":\"raw-patch\",\"success\":true,\"cwd\":\"/repo\",\"changes\":{\"files\":1}}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T10:00:05Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"m1\",\"call_id\":\"raw-commit\",\"command\":\"git commit -m bypass\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"committed\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T10:00:06Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"m1\",\"call_id\":\"raw-push\",\"command\":\"git push origin HEAD\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"pushed\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T10:00:07Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"m1\",\"message\":\"terminal-closed\"}}\n";
+
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/14/rollout-mbk-raw.jsonl", .data = raw_resolve_only });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/14/rollout-mbk-labels.jsonl", .data = pasted_labels_only });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/14/rollout-mbk-true.jsonl", .data = true_mbk });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "review-compiler-mbk.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const got = try runCommandWithOutput(std.testing.allocator, .review_compiler_audit, &.{
+        "--root",     root_abs,
+        "--protocol", "mbk",
+        "--since",    "2026-05-14T00:00:00Z",
+        "--until",    "2026-05-15T00:00:00Z",
+        "--repo",     "/repo",
+        "--format",   "json",
+    }, output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"protocol\": \"mbk\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"candidate_sessions\": 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"true_resolve_sessions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"reason\": \"candidate_without_mbk_evidence\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"material_kernel_required_sessions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"kernel_campaign_entered_sessions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"kernel_accepted_sessions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"tuple_closed_sessions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"terminal_closed_sessions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"base_reset_violations\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"prior_closure_head_used_as_new_base\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"rebaseline_decisions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"additional_witnesses\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"missing_distinctions\": 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"local_surface_families\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"governing_law_families\": 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"wound_specific_tests\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"review_ready_baseline\": { \"semantic_surface\": 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"terminal\": { \"semantic_surface\": 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"delta\": { \"semantic_surface\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"git_tree_metrics\": { \"files_changed\": 9, \"insertions\": 20, \"deletions\": 4, \"net_lines\": 16 }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"physical_apply_events\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"state_only_apply_violations\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"physical_commits\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"physical_pushes\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"raw_delivery_mutations_while_active\": 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"conformance_closed_for_tuple\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"terminal_closed\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"evidence_ledger\"") != null);
 }
 
 fn runCommandWithOutput(
