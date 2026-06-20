@@ -4823,7 +4823,7 @@ const ReviewCompilerAudit = struct {
 
     fn outputProtocol(self: ReviewCompilerAudit) ReviewCompilerProtocol {
         return switch (self.requested_protocol) {
-            .auto => if (self.mbk.denominator.kernel_campaign_entered_sessions > 0 or self.mbk.denominator.kernel_accepted_sessions > 0 or self.mbk.denominator.terminal_closed_sessions > 0)
+            .auto => if (self.mbk.denominator.true_resolve_sessions > 0 or self.mbk.denominator.material_kernel_required_sessions > 0 or self.mbk.denominator.kernel_campaign_entered_sessions > 0 or self.mbk.denominator.kernel_accepted_sessions > 0 or self.mbk.denominator.terminal_closed_sessions > 0)
                 .mbk
             else if (self.denominator.c3_required_sessions > 0 or self.denominator.c3_entered_sessions > 0 or self.c3.controller.state_files > 0 or self.c3.controller.mrpc_apply_certified > 0 or self.c3.controller.mrpc_final_certified > 0)
                 .c3
@@ -5051,6 +5051,11 @@ fn cmdReviewCompilerAudit(allocator: std.mem.Allocator, sessions_root: []const u
         if (!signals.candidate) continue;
         audit.denominator.candidate_sessions += 1;
         audit.mbk.denominator.candidate_sessions += 1;
+        var mbk_exclusion_recorded = false;
+        if ((audit.requested_protocol == .auto or audit.requested_protocol == .mbk) and !signals.true_mbk) {
+            try addReviewCompilerMBKExclusion(allocator, &audit, parsed.session.session_id, path, "candidate_without_mbk_evidence");
+            mbk_exclusion_recorded = true;
+        }
         const protocol_match = switch (audit.requested_protocol) {
             .auto => signals.true_resolve,
             .legacy_cleanroom => signals.true_legacy,
@@ -5065,7 +5070,7 @@ fn cmdReviewCompilerAudit(allocator: std.mem.Allocator, sessions_root: []const u
                 .mbk => "candidate_without_mbk_evidence",
             };
             try addReviewCompilerExclusion(allocator, &audit, parsed.session.session_id, path, reason);
-            if (audit.requested_protocol == .mbk) try addReviewCompilerMBKExclusion(allocator, &audit, parsed.session.session_id, path, reason);
+            if (audit.requested_protocol == .mbk and !mbk_exclusion_recorded) try addReviewCompilerMBKExclusion(allocator, &audit, parsed.session.session_id, path, reason);
             continue;
         }
 
@@ -5282,6 +5287,38 @@ fn toolHasMBKEvidence(tool: canonical_trace.ToolLifecycleRecord) bool {
         containsTrueMBKEvidence(tool.arguments_json orelse "") or
         containsTrueMBKEvidence(tool.output_text orelse "") or
         containsTrueMBKEvidence(tool.patch_changes_json orelse "");
+}
+
+fn containsReviewCompilerMBKToolAccountingCue(text: []const u8) bool {
+    return containsTrueMBKEvidence(text) or
+        containsAnyIgnoreCaseAscii(text, &.{
+            "campaign-began",
+            "observation-added",
+            "kernel-set",
+            "kernel-minimized",
+            "kernel-reviewed",
+            "design-registered",
+            "design-selected",
+            "realization-captured",
+            "surface-measured",
+            "construct-map-set",
+            "proof-compressed",
+            "realization-minimized",
+            "realization-verified",
+            "delivery-applied",
+            "state_only_apply",
+            "state-only apply",
+            "tuple-closed",
+            "tuple_closed",
+            "proof_run",
+            "proof_family",
+            "review_ready_baseline_",
+            "terminal_",
+            "delta_",
+            "git_files_changed",
+            "git_insertions",
+            "git_deletions",
+        });
 }
 
 fn containsTrueReviewCompilerAssistantEvidence(text: []const u8) bool {
@@ -5637,24 +5674,24 @@ fn addReviewCompilerMBKEvidence(
 }
 
 fn recordMBKSurfaceNumbers(mbk: *ReviewCompilerAudit.MBK, text: []const u8) void {
-    if (extractReviewCompilerNamedUsize(text, "review_ready_baseline_semantic_surface")) |value| mbk.semantic_surface.review_ready_baseline.semantic_surface = value;
-    if (extractReviewCompilerNamedUsize(text, "review_ready_baseline_governing_laws")) |value| mbk.semantic_surface.review_ready_baseline.governing_laws = value;
-    if (extractReviewCompilerNamedUsize(text, "review_ready_baseline_realization_surface")) |value| mbk.semantic_surface.review_ready_baseline.realization_surface = value;
-    if (extractReviewCompilerNamedUsize(text, "review_ready_baseline_proof_families")) |value| mbk.semantic_surface.review_ready_baseline.proof_families = value;
+    if (extractReviewCompilerNamedUsize(text, "review_ready_baseline_semantic_surface")) |value| mbk.semantic_surface.review_ready_baseline.semantic_surface += value;
+    if (extractReviewCompilerNamedUsize(text, "review_ready_baseline_governing_laws")) |value| mbk.semantic_surface.review_ready_baseline.governing_laws += value;
+    if (extractReviewCompilerNamedUsize(text, "review_ready_baseline_realization_surface")) |value| mbk.semantic_surface.review_ready_baseline.realization_surface += value;
+    if (extractReviewCompilerNamedUsize(text, "review_ready_baseline_proof_families")) |value| mbk.semantic_surface.review_ready_baseline.proof_families += value;
 
-    if (extractReviewCompilerNamedUsize(text, "terminal_semantic_surface")) |value| mbk.semantic_surface.terminal.semantic_surface = value;
-    if (extractReviewCompilerNamedUsize(text, "terminal_governing_laws")) |value| mbk.semantic_surface.terminal.governing_laws = value;
-    if (extractReviewCompilerNamedUsize(text, "terminal_realization_surface")) |value| mbk.semantic_surface.terminal.realization_surface = value;
-    if (extractReviewCompilerNamedUsize(text, "terminal_proof_families")) |value| mbk.semantic_surface.terminal.proof_families = value;
+    if (extractReviewCompilerNamedUsize(text, "terminal_semantic_surface")) |value| mbk.semantic_surface.terminal.semantic_surface += value;
+    if (extractReviewCompilerNamedUsize(text, "terminal_governing_laws")) |value| mbk.semantic_surface.terminal.governing_laws += value;
+    if (extractReviewCompilerNamedUsize(text, "terminal_realization_surface")) |value| mbk.semantic_surface.terminal.realization_surface += value;
+    if (extractReviewCompilerNamedUsize(text, "terminal_proof_families")) |value| mbk.semantic_surface.terminal.proof_families += value;
 
-    if (extractReviewCompilerNamedUsize(text, "delta_semantic_surface")) |value| mbk.semantic_surface.delta.semantic_surface = value;
-    if (extractReviewCompilerNamedUsize(text, "delta_governing_laws")) |value| mbk.semantic_surface.delta.governing_laws = value;
-    if (extractReviewCompilerNamedUsize(text, "delta_realization_surface")) |value| mbk.semantic_surface.delta.realization_surface = value;
-    if (extractReviewCompilerNamedUsize(text, "delta_proof_families")) |value| mbk.semantic_surface.delta.proof_families = value;
+    if (extractReviewCompilerNamedUsize(text, "delta_semantic_surface")) |value| mbk.semantic_surface.delta.semantic_surface += value;
+    if (extractReviewCompilerNamedUsize(text, "delta_governing_laws")) |value| mbk.semantic_surface.delta.governing_laws += value;
+    if (extractReviewCompilerNamedUsize(text, "delta_realization_surface")) |value| mbk.semantic_surface.delta.realization_surface += value;
+    if (extractReviewCompilerNamedUsize(text, "delta_proof_families")) |value| mbk.semantic_surface.delta.proof_families += value;
 
-    if (extractReviewCompilerNamedUsize(text, "git_files_changed")) |value| mbk.git_tree_metrics.files_changed = value;
-    if (extractReviewCompilerNamedUsize(text, "git_insertions")) |value| mbk.git_tree_metrics.insertions = value;
-    if (extractReviewCompilerNamedUsize(text, "git_deletions")) |value| mbk.git_tree_metrics.deletions = value;
+    if (extractReviewCompilerNamedUsize(text, "git_files_changed")) |value| mbk.git_tree_metrics.files_changed += value;
+    if (extractReviewCompilerNamedUsize(text, "git_insertions")) |value| mbk.git_tree_metrics.insertions += value;
+    if (extractReviewCompilerNamedUsize(text, "git_deletions")) |value| mbk.git_tree_metrics.deletions += value;
     mbk.git_tree_metrics.net_lines = @as(i64, @intCast(mbk.git_tree_metrics.insertions)) - @as(i64, @intCast(mbk.git_tree_metrics.deletions));
 }
 
@@ -5699,7 +5736,7 @@ fn recordReviewCompilerTools(
         if (toolHasC3Evidence(tool) or containsReviewCompilerCandidateCue(tool_text)) {
             recordReviewCompilerC3Text(audit, tool_text, toolTimestamp(parsed, tool), signals);
         }
-        if (signals.true_mbk and (toolHasMBKEvidence(tool) or containsTrueMBKEvidence(tool_text))) {
+        if (signals.true_mbk and containsReviewCompilerMBKToolAccountingCue(tool_text)) {
             try recordReviewCompilerMBKText(allocator, audit, tool_text, toolTimestamp(parsed, tool), signals, parsed.session.session_id, "tool");
         }
 
@@ -19951,6 +19988,35 @@ test "review-compiler-audit mbk protocol audits kernel, surface, proof, closure,
     try std.testing.expect(std.mem.indexOf(u8, got, "\"conformance_closed_for_tuple\": 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"terminal_closed\": 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"evidence_ledger\"") != null);
+
+    const auto_output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "review-compiler-mbk-auto.json" });
+    defer std.testing.allocator.free(auto_output_path);
+    const auto_got = try runCommandWithOutput(std.testing.allocator, .review_compiler_audit, &.{
+        "--root",     root_abs,
+        "--protocol", "auto",
+        "--since",    "2026-05-14T00:00:00Z",
+        "--until",    "2026-05-15T00:00:00Z",
+        "--repo",     "/repo",
+        "--format",   "json",
+    }, auto_output_path);
+    defer std.testing.allocator.free(auto_got);
+
+    try std.testing.expect(std.mem.indexOf(u8, auto_got, "\"protocol\": \"mbk\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, auto_got, "\"candidate_sessions\": 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, auto_got, "\"true_resolve_sessions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, auto_got, "\"reason\": \"candidate_without_mbk_evidence\"") != null);
+}
+
+test "review-compiler-audit mbk surface snapshots aggregate across evidence rows" {
+    var mbk = ReviewCompilerAudit.MBK{};
+    recordMBKSurfaceNumbers(&mbk, "review_ready_baseline_semantic_surface: 2 terminal_semantic_surface: 5 git_insertions: 7 git_deletions: 3");
+    recordMBKSurfaceNumbers(&mbk, "review_ready_baseline_semantic_surface: 4 terminal_semantic_surface: 6 git_insertions: 11 git_deletions: 5");
+
+    try std.testing.expectEqual(@as(usize, 6), mbk.semantic_surface.review_ready_baseline.semantic_surface);
+    try std.testing.expectEqual(@as(usize, 11), mbk.semantic_surface.terminal.semantic_surface);
+    try std.testing.expectEqual(@as(usize, 18), mbk.git_tree_metrics.insertions);
+    try std.testing.expectEqual(@as(usize, 8), mbk.git_tree_metrics.deletions);
+    try std.testing.expectEqual(@as(i64, 10), mbk.git_tree_metrics.net_lines);
 }
 
 fn runCommandWithOutput(
