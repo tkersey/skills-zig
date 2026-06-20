@@ -454,15 +454,9 @@ fn beginRun(allocator: std.mem.Allocator, args: Args) !u8 {
     try root.createDirPath(Io, args.state_root);
     try ensureLocalExclude(allocator, root, args.state_root);
 
-    var parent_run_id: ?[]const u8 = null;
-    if (loadStateParsed(allocator, root, args.state_root)) |parsed_existing| {
-        var existing = parsed_existing;
-        defer existing.deinit();
-        if (!isTerminalPhase(existing.value.phase) and !std.mem.eql(u8, existing.value.phase, "initialized")) {
-            return error.ActiveRunExists;
-        }
-        if (existing.value.run_id.len > 0) parent_run_id = existing.value.run_id;
-    } else |_| {}
+    const parent_run_id_storage = try loadParentRunId(allocator, root, args.state_root);
+    defer if (parent_run_id_storage) |value| allocator.free(value);
+    const parent_run_id: ?[]const u8 = parent_run_id_storage;
 
     const goal = if (args.acceptance) |path| try acceptanceGoalFromFile(allocator, path) else if (args.goal) |g| g else return error.AcceptanceRequired;
     defer if (args.acceptance != null) allocator.free(goal);
@@ -511,6 +505,18 @@ fn beginRun(allocator: std.mem.Allocator, args: Args) !u8 {
     try appendEvent(allocator, root, args.state_root, "begin", "collecting");
     try printReceipt(allocator, "begin", "success", run_id);
     return 0;
+}
+
+fn loadParentRunId(allocator: std.mem.Allocator, root: std.Io.Dir, state_root: []const u8) !?[]u8 {
+    if (loadStateParsed(allocator, root, state_root)) |parsed_existing| {
+        var existing = parsed_existing;
+        defer existing.deinit();
+        if (!isTerminalPhase(existing.value.phase) and !std.mem.eql(u8, existing.value.phase, "initialized")) {
+            return error.ActiveRunExists;
+        }
+        if (existing.value.run_id.len > 0) return try allocator.dupe(u8, existing.value.run_id);
+    } else |_| {}
+    return null;
 }
 
 fn addCounterexample(allocator: std.mem.Allocator, args: Args) !u8 {
@@ -2203,6 +2209,82 @@ test "loaded state strings survive after input buffer is freed and state is rewr
     try std.testing.expectEqualStrings("collecting", reparsed.value.phase);
     try std.testing.expectEqualStrings("own state strings", reparsed.value.acceptance_goal);
     try std.testing.expectEqual(@as(u32, 1), reparsed.value.counterexample_count);
+}
+
+test "begin duplicates parent run id before parsed state deinit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try tmp.dir.realPathFileAlloc(Io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    try makePathUnder(std.testing.allocator, cwd, DefaultStateRoot);
+
+    var root = try openRoot(cwd);
+    defer root.close(Io);
+    try saveState(std.testing.allocator, root, DefaultStateRoot, State{
+        .schema = "resolve-c3-state-v1",
+        .state_root = DefaultStateRoot,
+        .legacy_root = LegacyStateRoot,
+        .state_version = 1,
+        .run_id = "C3-parent",
+        .repo_root = cwd,
+        .branch = "main",
+        .base_sha = "parent-sha",
+        .phase = "closed",
+        .acceptance_goal = "first run",
+        .parent_run_id = null,
+        .counterexample_count = 0,
+        .basis_set = false,
+        .tournament_waiver = null,
+        .candidates = &.{},
+        .selected_candidate_id = null,
+        .ablation_authority = null,
+        .ablation_orphan_edit_atoms = 0,
+        .candidate_holdout_safe = false,
+        .delivery_holdout_safe = false,
+        .proof_authority = null,
+        .proof_passed = false,
+        .proof_patch_stable = false,
+        .delivery_patch_sha = null,
+        .commit_sha = null,
+        .pushed = false,
+        .certificate_stage = null,
+    });
+
+    const parent_run_id = (try loadParentRunId(std.testing.allocator, root, DefaultStateRoot)).?;
+    defer std.testing.allocator.free(parent_run_id);
+    try saveState(std.testing.allocator, root, DefaultStateRoot, State{
+        .schema = "resolve-c3-state-v1",
+        .state_root = DefaultStateRoot,
+        .legacy_root = LegacyStateRoot,
+        .state_version = 1,
+        .run_id = "C3-child",
+        .repo_root = cwd,
+        .branch = "main",
+        .base_sha = "child-sha",
+        .phase = "collecting",
+        .acceptance_goal = "second run",
+        .parent_run_id = parent_run_id,
+        .counterexample_count = 0,
+        .basis_set = false,
+        .tournament_waiver = null,
+        .candidates = &.{},
+        .selected_candidate_id = null,
+        .ablation_authority = null,
+        .ablation_orphan_edit_atoms = 0,
+        .candidate_holdout_safe = false,
+        .delivery_holdout_safe = false,
+        .proof_authority = null,
+        .proof_passed = false,
+        .proof_patch_stable = false,
+        .delivery_patch_sha = null,
+        .commit_sha = null,
+        .pushed = false,
+        .certificate_stage = null,
+    });
+
+    var parsed = try loadStateParsed(std.testing.allocator, root, DefaultStateRoot);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("C3-parent", parsed.value.parent_run_id.?);
 }
 
 test "git capture reads HEAD refs without spawning git" {
