@@ -1,0 +1,29 @@
+skill_decision_contract:
+  contract_version: SKDC-v1
+  skill:
+    name: team-patterns
+    kind: decision
+    source_fingerprint: fixture-fingerprint
+  triggers:
+    - trigger_id: trigger-review
+      description: Review cue is present.
+      cue_literals: [review]
+      cue_regexes: [^review$]
+      exclusions: []
+  routes:
+    - route_id: route-verify
+      description: Verify before changing behavior.
+      aliases: [verify route]
+      terminal: yes
+  clauses:
+    - clause_id: clause-verify
+      trigger_refs: [trigger-review]
+      expected_routes: [route-verify]
+      prohibited_routes: []
+      required_artifacts: [test-log]
+      success_signals: [proof_pass]
+      failure_signals: [proof_fail]
+      rationale: Require proof when the review trigger appears.
+  instrumentation:
+    decision_receipt: optional
+    rationale: Fixture contract for seq skill decision tests.

@@ -10,6 +10,10 @@ const session_scan = @import("../session_scan.zig");
 const time_utils = @import("../time_utils.zig");
 const canonical_trace = @import("../canonical_trace.zig");
 const token_cost = @import("../token_cost.zig");
+const skill_contract = @import("../skill_contract.zig");
+const skill_decision_receipt = @import("../skill_decision_receipt.zig");
+const skill_decision_signals = @import("../skill_decision_signals.zig");
+const app_meta = @import("app_meta");
 
 var test_codex_thread_id: ?[]const u8 = null;
 
@@ -127,6 +131,31 @@ pub const dataset_meta = [_]DatasetMeta{
         .name = "skill_mentions",
         .description = "Skill mentions via <skill> blocks and $skill tokens",
         .fields = &.{ "path", "timestamp", "day", "week", "month", "role", "skill", "types", "snippet" },
+    },
+    .{
+        .name = "skill_decision_signals",
+        .description = "Normalized privacy-preserving skill decision provenance signals",
+        .fields = &.{ "timestamp", "path", "session_id", "turn_index", "message_index", "tool_call_id", "source_kind", "signal_kind", "skill", "text_digest", "text_preview", "route_id", "clause_id", "trigger_id", "artifact_ref", "confidence", "contamination_flags" },
+    },
+    .{
+        .name = "skill_contract_clauses",
+        .description = "SKDC-v1 contract clauses projected for decision audit queries",
+        .fields = &.{ "skill", "contract_fingerprint", "skill_kind", "trigger_id", "clause_id", "expected_routes", "prohibited_routes", "required_artifacts", "success_signals", "failure_signals", "source_path", "contract_authority" },
+    },
+    .{
+        .name = "skill_decision_receipts",
+        .description = "Parsed SDR-v1 decision receipts with validation diagnostics",
+        .fields = &.{ "timestamp", "path", "session_id", "worker_kind", "decision_id", "skill", "skill_version", "contract_fingerprint", "trigger_refs", "clause_refs", "question", "alternatives_considered", "selected_route", "rejected_routes", "expected_outcome", "artifact_state_json", "evidence_refs", "valid", "validation_codes" },
+    },
+    .{
+        .name = "skill_decision_episodes",
+        .description = "Conservative per-skill decision episodes compiled from deterministic evidence",
+        .fields = &.{ "decision_id", "episode_id", "session_id", "root_session_id", "worker_session_id", "skill", "skill_version", "contract_fingerprint", "contract_authority", "start_timestamp", "end_timestamp", "trigger_observed", "activation_class", "question_preview", "alternatives", "selected_route", "rejected_routes", "clause_refs", "decision_effect", "evidence_strength", "outcome_class", "later_reopened", "later_reversed", "artifact_state", "evidence_refs", "counterevidence_refs", "contamination_flags" },
+    },
+    .{
+        .name = "skill_decision_outcomes",
+        .description = "Downstream outcomes associated to decision episodes without causal overclaim",
+        .fields = &.{ "episode_id", "timestamp", "outcome_kind", "outcome_value", "proof_ref", "artifact_state", "association_method", "distance_turns", "distance_seconds", "causal_claim_allowed" },
     },
     .{
         .name = "token_events",
@@ -500,6 +529,11 @@ const Options = struct {
     dataset: ?[]const u8 = null,
     spec_text: ?[]const u8 = null,
     skill: ?[]const u8 = null,
+    skill_root_text: ?[]const u8 = null,
+    contract_text: ?[]const u8 = null,
+    contract_authority_text: ?[]const u8 = null,
+    causality_text: ?[]const u8 = null,
+    file_text: ?[]const u8 = null,
     history_text: ?[]const u8 = null,
     bucket: ?[]const u8 = null,
     prompt: ?[]const u8 = null,
@@ -572,6 +606,9 @@ const Options = struct {
     debounce_ms: i64 = 300,
     workflow: ?[]const u8 = null,
     index_action: ?[]const u8 = null,
+    command_action: ?[]const u8 = null,
+    include_workers: bool = false,
+    include_excerpts: bool = false,
     index_mode: []const u8 = "auto",
 };
 
@@ -598,6 +635,9 @@ pub fn run(
         .skill_report => try cmdSkillReport(allocator, sessions_root, opts),
         .skill_audit => try QueryLiftCommands.cmdSkillAudit(allocator, sessions_root, opts),
         .skill_evidence => try QueryLiftCommands.cmdSkillEvidence(allocator, sessions_root, opts),
+        .skill_decision_audit => try cmdSkillDecisionAudit(allocator, sessions_root, opts),
+        .skill_contract => try cmdSkillContract(allocator, opts),
+        .skill_decision_receipt => try cmdSkillDecisionReceipt(allocator, opts),
         .skill_blocks => try cmdSkillBlocks(allocator, sessions_root, opts),
         .artifact_search => try cmdArtifactSearch(allocator, sessions_root, opts),
         .tool_audit => try QueryLiftCommands.cmdToolAudit(allocator, sessions_root, opts),
@@ -632,6 +672,7 @@ pub fn run(
         .workflow_overlap => try cmdWorkflowOverlap(allocator, sessions_root, opts),
         .session_tooling => try cmdSessionTooling(allocator, sessions_root, opts),
         .query_diagnose => try cmdQueryDiagnose(allocator, sessions_root, opts),
+        .capabilities => try cmdCapabilities(allocator, opts),
         .memory_provenance => try cmdMemoryProvenance(allocator, opts),
         .memory_map => try cmdMemoryMap(allocator, opts),
         .memory_history => try cmdMemoryHistory(allocator, opts),
@@ -683,6 +724,22 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\extra options:
         \\  --since-cursor <cursor>    Return only evidence after the prior cursor emitted by this command
         \\  --include-raw              Include raw evidence snippets; default output is sanitized summaries only
+        ,
+        .skill_decision_audit =>
+        \\usage: seq skill-decision-audit --skill <name> (--session-id <id>|--path <jsonl>|--repo <path>|--workdir <path>|--last <duration>|--since <iso>|--until <iso>) [--mode summary|episodes|misses|clauses|outcomes|matched-cohort|tune-packet|delta] [--causality explicit|strong|associated|any] [--include-workers] [--include-excerpts] [--format table|json|jsonl|csv|markdown]
+        \\extra options:
+        \\  --contract <path>           Use an explicit SKDC-v1 contract file
+        \\  --contract-authority <kind> explicit (default) | inferred
+        \\  --skill-root <path>         Discover skill decision contracts under this root
+        \\  --since-cursor <cursor>     Return a one-session SDD-v1 delta after a prior cursor
+        ,
+        .skill_contract =>
+        \\usage: seq skill-contract validate --file <decision-contract.yaml> [--format json]
+        \\       seq skill-contract show --skill <name> --skill-root <path> [--format json]
+        \\       seq skill-contract scaffold --skill <name> --kind decision --output <file>
+        ,
+        .skill_decision_receipt =>
+        \\usage: seq skill-decision-receipt validate --file <receipt.json> [--format json]
         ,
         .skill_blocks =>
         \\usage: seq skill-blocks --skill <name> [--mode blocks|body|term-counts|term-summary] [--term-group <name=csv>] [--examples N] [--history <distinct|all|latest>] [--session-id <id>|--path <jsonl>|--current] [--last <Nm|Nh|Nd>|--since <iso>] [--until <iso>] [--limit N] [--format table|json|csv|jsonl]
@@ -841,6 +898,9 @@ fn printCommandHelp(cmd: lib.Command) !void {
         .query_diagnose =>
         \\usage: seq query-diagnose [--session-id <id>|--path <jsonl>] [--since <iso>] [--until <iso>] [--threshold-ms N] [--strict-hang] [--fail-on-hang] [--next-actions] [--summary] [--format table|json|csv|jsonl]
         ,
+        .capabilities =>
+        \\usage: seq capabilities [--format table|json|csv|jsonl]
+        ,
         .memory_provenance =>
         \\usage: seq memory-provenance (--thread-id <id> | --rollout-summary-file <path>) [--state-db-path <path>] [--memory-root <path>] [--extensions-root <path>] [--trace none|auto|always] [--format table|json|csv|jsonl]
         ,
@@ -926,7 +986,8 @@ fn commandSupportsExcludeCurrent(cmd: lib.Command) bool {
         std.mem.eql(u8, name, "resolve_churn_audit") or
         std.mem.eql(u8, name, "review_compiler_audit") or
         std.mem.eql(u8, name, "workflow_audit") or
-        std.mem.eql(u8, name, "goal_audit");
+        std.mem.eql(u8, name, "goal_audit") or
+        std.mem.eql(u8, name, "skill_decision_audit");
 }
 
 fn validateFormatForCommand(cmd: lib.Command, opts: Options) !void {
@@ -948,6 +1009,12 @@ fn validateFormatForCommand(cmd: lib.Command, opts: Options) !void {
         },
         .skill_evidence => {
             if (fmt != .json) return error.InvalidFormatForCommand;
+        },
+        .skill_decision_audit => {
+            if (fmt == .dot) return error.InvalidFormatForCommand;
+        },
+        .skill_contract, .skill_decision_receipt, .capabilities => {
+            if (fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
         .occurrence_export => {
             if (fmt == .table or fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
@@ -1002,7 +1069,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_threshold_ms = cmd == .query_diagnose;
     const supports_strict_hang = cmd == .query_diagnose;
     const supports_skill = switch (cmd) {
-        .skill_trend, .skill_report, .skill_audit, .skill_evidence, .skill_success_rank, .skill_cohort, .occurrence_export, .skill_blocks, .adjudication_audit => true,
+        .skill_trend, .skill_report, .skill_audit, .skill_evidence, .skill_decision_audit, .skill_contract, .skill_success_rank, .skill_cohort, .occurrence_export, .skill_blocks, .adjudication_audit => true,
         else => false,
     };
     const supports_workflow = cmd == .workflow_audit or cmd == .workflow_overlap or cmd == .goal_audit;
@@ -1031,19 +1098,19 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_tool = cmd == .opencode_events or cmd == .artifact_search or cmd == .tool_audit or cmd == .tool_search;
     const supports_executable = cmd == .tool_audit or cmd == .tool_search;
     const supports_workdir = switch (cmd) {
-        .artifact_search, .tool_audit, .tool_search, .workdir_report, .workflow_audit, .workflow_overlap => true,
+        .artifact_search, .tool_audit, .tool_search, .workdir_report, .workflow_audit, .workflow_overlap, .skill_decision_audit => true,
         else => false,
     };
     const supports_repo = switch (cmd) {
-        .plan_search, .sessions, .resolve_churn_audit, .review_compiler_audit => true,
+        .plan_search, .sessions, .resolve_churn_audit, .review_compiler_audit, .skill_decision_audit => true,
         else => false,
     };
     const supports_status = cmd == .opencode_events or cmd == .turns or cmd == .goal_audit;
     const supports_mode = switch (cmd) {
-        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .skill_success_rank, .skill_blocks, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit, .workflow_overlap, .adjudication_audit, .goal_audit => true,
+        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .skill_decision_audit, .skill_success_rank, .skill_blocks, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit, .workflow_overlap, .adjudication_audit, .goal_audit => true,
         else => false,
     };
-    const supports_kind = cmd == .artifact_search;
+    const supports_kind = cmd == .artifact_search or cmd == .skill_contract;
     const supports_surface = cmd == .artifact_search;
     const supports_follow = cmd == .artifact_search;
     const supports_stats = switch (cmd) {
@@ -1066,6 +1133,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .skill_report,
         .skill_audit,
         .skill_evidence,
+        .skill_decision_audit,
         .role_breakdown,
         .occurrence_export,
         .find_session,
@@ -1109,6 +1177,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .skill_report,
         .skill_audit,
         .skill_evidence,
+        .skill_decision_audit,
         .role_breakdown,
         .occurrence_export,
         .find_session,
@@ -1154,7 +1223,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         else => false,
     };
     const supports_term_group = cmd == .workflow_audit or cmd == .skill_blocks;
-    const supports_examples = cmd == .workflow_audit or cmd == .skill_blocks;
+    const supports_examples = cmd == .workflow_audit or cmd == .skill_blocks or cmd == .skill_decision_audit;
     const supports_unique_by = cmd == .workflow_audit;
     const supports_timezone = switch (cmd) {
         .token_usage, .token_cost => true,
@@ -1185,10 +1254,14 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         else => false,
     };
     const supports_index_mode = cmd == .query;
-    const supports_include_raw = switch (cmd) {
-        .opencode_prompts, .opencode_events, .skill_evidence, .session_detail, .tool_lifecycle, .tail => true,
-        else => false,
-    };
+    const cmd_name = @tagName(cmd);
+    const supports_include_raw =
+        std.mem.eql(u8, cmd_name, "opencode_prompts") or
+        std.mem.eql(u8, cmd_name, "opencode_events") or
+        std.mem.eql(u8, cmd_name, "skill_evidence") or
+        std.mem.eql(u8, cmd_name, "session_detail") or
+        std.mem.eql(u8, cmd_name, "tool_lifecycle") or
+        std.mem.eql(u8, cmd_name, "tail");
     const supports_thread_id = cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history;
     const supports_rollout_summary_file = cmd == .memory_provenance;
     const supports_trace = cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history;
@@ -1210,12 +1283,13 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_exclude_current = commandSupportsExcludeCurrent(cmd);
     const supports_window_hours = cmd == .token_window;
     const supports_duration_gte = cmd == .goal_audit;
-    const supports_since_cursor = cmd == .skill_evidence;
-    const supports_last = cmd == .token_usage or cmd == .token_cost or cmd == .skill_audit or cmd == .skill_evidence or cmd == .skill_success_rank or cmd == .skill_cohort or cmd == .workflow_audit or cmd == .adjudication_audit or cmd == .message_audit or cmd == .message_search or cmd == .tool_audit or cmd == .tool_search or cmd == .skill_blocks;
+    const supports_since_cursor = cmd == .skill_evidence or cmd == .skill_decision_audit;
+    const supports_last = cmd == .token_usage or cmd == .token_cost or cmd == .skill_audit or cmd == .skill_evidence or cmd == .skill_decision_audit or cmd == .skill_success_rank or cmd == .skill_cohort or cmd == .workflow_audit or cmd == .adjudication_audit or cmd == .message_audit or cmd == .message_search or cmd == .tool_audit or cmd == .tool_search or cmd == .skill_blocks;
     const supports_include_root_equivalent = cmd == .adjudication_audit;
     const supports_bundle_dir = cmd == .adjudication_audit;
     const supports_token_cost_options = cmd == .token_cost;
     const supports_protocol = cmd == .review_compiler_audit;
+    const supports_skill_decision_inputs = cmd == .skill_decision_audit or cmd == .skill_contract or cmd == .skill_decision_receipt;
 
     try ensureOptionAllowed(opts.path != null, commandSupportsPath(cmd), "--path", cmd);
     try ensureOptionAllowed(opts.session_id != null, commandSupportsSessionId(cmd), "--session-id", cmd);
@@ -1238,6 +1312,11 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.duration_gte_seconds != null, supports_duration_gte, "--duration-gte", cmd);
     try ensureOptionAllowed(!opts.strict_hang, supports_strict_hang, "--no-strict-hang", cmd);
     try ensureOptionAllowed(opts.skill != null, supports_skill, "--skill", cmd);
+    try ensureOptionAllowed(opts.skill_root_text != null, cmd == .skill_decision_audit or cmd == .skill_contract, "--skill-root", cmd);
+    try ensureOptionAllowed(opts.contract_text != null, cmd == .skill_decision_audit, "--contract", cmd);
+    try ensureOptionAllowed(opts.contract_authority_text != null, cmd == .skill_decision_audit, "--contract-authority", cmd);
+    try ensureOptionAllowed(opts.causality_text != null, cmd == .skill_decision_audit, "--causality", cmd);
+    try ensureOptionAllowed(opts.file_text != null, cmd == .skill_contract or cmd == .skill_decision_receipt, "--file", cmd);
     try ensureOptionAllowed(opts.workflow != null, supports_workflow, "--workflow", cmd);
     try ensureOptionAllowed(opts.history_text != null, supports_history, "--history", cmd);
     try ensureOptionAllowed(opts.bucket != null, supports_bucket, "--bucket", cmd);
@@ -1285,6 +1364,8 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.opencode_source_text != null, supports_opencode_source, "--source", cmd);
     try ensureOptionAllowed(!std.mem.eql(u8, opts.index_mode, "auto"), supports_index_mode, "--index", cmd);
     try ensureOptionAllowed(opts.include_raw, supports_include_raw, "--include-raw", cmd);
+    try ensureOptionAllowed(opts.include_workers, cmd == .skill_decision_audit, "--include-workers", cmd);
+    try ensureOptionAllowed(opts.include_excerpts, cmd == .skill_decision_audit, "--include-excerpts", cmd);
     try ensureOptionAllowed(opts.ongoing, cmd == .sessions, "--ongoing", cmd);
     try ensureOptionAllowed(opts.completed, cmd == .sessions, "--completed", cmd);
     try ensureOptionAllowed(opts.include_tools, cmd == .turns or cmd == .session_detail, "--include-tools", cmd);
@@ -1308,6 +1389,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.offline, supports_token_cost_options, "--offline", cmd);
     try ensureOptionAllowed(opts.force_fast, supports_token_cost_options, "--force-fast", cmd);
     try ensureOptionAllowed(opts.force_standard, supports_token_cost_options, "--force-standard", cmd);
+    try ensureOptionAllowed(opts.command_action != null, supports_skill_decision_inputs, "<action>", cmd);
 
     if (opts.ongoing and opts.completed) return error.InvalidModeArg;
     if (opts.force_fast and opts.force_standard) return error.InvalidModeArg;
@@ -1332,6 +1414,35 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         if (opts.mode) |text| {
             if (!isValidSkillBlocksMode(text)) return error.InvalidModeArg;
         }
+    }
+    if (cmd == .skill_decision_audit) {
+        if (opts.mode) |text| {
+            if (!isValidSkillDecisionAuditMode(text)) return error.InvalidModeArg;
+        }
+        if (opts.causality_text) |text| {
+            if (!isValidSkillDecisionCausality(text)) return error.InvalidModeArg;
+        }
+        if (opts.contract_authority_text) |text| {
+            if (!isValidContractAuthority(text)) return error.InvalidModeArg;
+        }
+        if (opts.skill == null) {
+            printCliError("error: skill-decision-audit requires --skill\n", .{});
+            return error.MissingArgValue;
+        }
+        if (!hasSkillDecisionAuditScope(opts)) {
+            printCliError("error: skill-decision-audit requires a scope: --session-id, --path, --repo, --workdir, --since, --until, or --last\n", .{});
+            return error.MissingArgValue;
+        }
+        if (opts.since_cursor_text != null and opts.session_id == null and opts.path == null) {
+            printCliError("error: skill-decision-audit --mode delta/--since-cursor requires --session-id or --path\n", .{});
+            return error.MissingArgValue;
+        }
+    }
+    if (cmd == .skill_contract) {
+        try validateSkillContractArgs(opts);
+    }
+    if (cmd == .skill_decision_receipt) {
+        try validateSkillDecisionReceiptArgs(opts);
     }
     if (cmd == .message_audit) {
         if (opts.mode) |text| {
@@ -1437,6 +1548,7 @@ fn commandSupportsPath(cmd: lib.Command) bool {
         .session_tooling,
         .query_diagnose,
         .skill_evidence,
+        .skill_decision_audit,
         .skill_blocks,
         .token_usage,
         .token_cost,
@@ -1462,6 +1574,7 @@ fn commandSupportsSessionId(cmd: lib.Command) bool {
         .session_prompts,
         .session_tooling,
         .skill_evidence,
+        .skill_decision_audit,
         .skill_blocks,
         .token_usage,
         .token_cost,
@@ -1610,6 +1723,80 @@ fn isValidSkillBlocksMode(text: []const u8) bool {
         std.mem.eql(u8, text, "body") or
         std.mem.eql(u8, text, "term-counts") or
         std.mem.eql(u8, text, "term-summary");
+}
+
+fn isValidSkillDecisionAuditMode(text: []const u8) bool {
+    return std.mem.eql(u8, text, "summary") or
+        std.mem.eql(u8, text, "episodes") or
+        std.mem.eql(u8, text, "misses") or
+        std.mem.eql(u8, text, "clauses") or
+        std.mem.eql(u8, text, "outcomes") or
+        std.mem.eql(u8, text, "matched-cohort") or
+        std.mem.eql(u8, text, "tune-packet") or
+        std.mem.eql(u8, text, "delta");
+}
+
+fn isValidSkillDecisionCausality(text: []const u8) bool {
+    return std.mem.eql(u8, text, "explicit") or
+        std.mem.eql(u8, text, "strong") or
+        std.mem.eql(u8, text, "associated") or
+        std.mem.eql(u8, text, "any");
+}
+
+fn isValidContractAuthority(text: []const u8) bool {
+    return std.mem.eql(u8, text, "explicit") or std.mem.eql(u8, text, "inferred");
+}
+
+fn hasSkillDecisionAuditScope(opts: Options) bool {
+    return opts.session_id != null or
+        opts.path != null or
+        opts.repo_text != null or
+        opts.workdir_text != null or
+        opts.since != null or
+        opts.until != null or
+        opts.last_text != null;
+}
+
+fn validateSkillContractArgs(opts: Options) !void {
+    const action = opts.command_action orelse {
+        printCliError("error: skill-contract requires an action: validate, show, or scaffold\n", .{});
+        return error.MissingArgValue;
+    };
+    if (std.mem.eql(u8, action, "validate")) {
+        if (opts.file_text == null) {
+            printCliError("error: skill-contract validate requires --file\n", .{});
+            return error.MissingArgValue;
+        }
+        return;
+    }
+    if (std.mem.eql(u8, action, "show")) {
+        if (opts.skill == null or opts.skill_root_text == null) {
+            printCliError("error: skill-contract show requires --skill and --skill-root\n", .{});
+            return error.MissingArgValue;
+        }
+        return;
+    }
+    if (std.mem.eql(u8, action, "scaffold")) {
+        if (opts.skill == null or opts.kind_text == null or opts.out_path == null) {
+            printCliError("error: skill-contract scaffold requires --skill, --kind, and --output\n", .{});
+            return error.MissingArgValue;
+        }
+        if (!std.mem.eql(u8, opts.kind_text.?, "decision")) return error.InvalidModeArg;
+        return;
+    }
+    return error.InvalidModeArg;
+}
+
+fn validateSkillDecisionReceiptArgs(opts: Options) !void {
+    const action = opts.command_action orelse {
+        printCliError("error: skill-decision-receipt requires an action: validate\n", .{});
+        return error.MissingArgValue;
+    };
+    if (!std.mem.eql(u8, action, "validate")) return error.InvalidModeArg;
+    if (opts.file_text == null) {
+        printCliError("error: skill-decision-receipt validate requires --file\n", .{});
+        return error.MissingArgValue;
+    }
 }
 
 fn isValidWorkflowOverlapMode(text: []const u8) bool {
@@ -2549,6 +2736,1109 @@ fn cmdDatasetSchema(allocator: std.mem.Allocator, opts: Options) !void {
 
     const cols = [_][]const u8{ "dataset", "field", "index" };
     try output.writeOutput(allocator, opts.format, rows.items, cols[0..], opts.out_path);
+}
+
+fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
+    if (opts.format == .json) {
+        var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+        defer writer_alloc.deinit();
+        const writer = &writer_alloc.writer;
+        try writer.writeAll("{\n  \"seq_capabilities\": {\n    \"version\": ");
+        try output.writeJsonString(writer, app_meta.version);
+        try writer.writeAll(
+            \\,
+            \\    "features": {
+            \\      "skill_decision_audit": true,
+            \\      "skill_decision_delta": true,
+            \\      "skill_contract_v1": true,
+            \\      "skill_decision_receipt_v1": true,
+            \\      "tune_packet_v1": true,
+            \\      "matched_cohort_v1": false
+            \\    }
+            \\  }
+            \\}
+            \\
+        );
+        const rendered = try writer_alloc.toOwnedSlice();
+        defer allocator.free(rendered);
+        try writeTextOutput(rendered, opts.out_path);
+        return;
+    }
+
+    var rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &rows);
+    const features = [_]struct { name: []const u8, enabled: bool }{
+        .{ .name = "skill_decision_audit", .enabled = true },
+        .{ .name = "skill_decision_delta", .enabled = true },
+        .{ .name = "skill_contract_v1", .enabled = true },
+        .{ .name = "skill_decision_receipt_v1", .enabled = true },
+        .{ .name = "tune_packet_v1", .enabled = true },
+        .{ .name = "matched_cohort_v1", .enabled = false },
+    };
+    for (features) |feature| {
+        var row = query.Row.init(allocator);
+        try row.putOwnedKey("version", .{ .string = app_meta.version });
+        try row.putOwnedKey("feature", .{ .string = feature.name });
+        try row.putOwnedKey("enabled", .{ .bool = feature.enabled });
+        try rows.append(allocator, row);
+    }
+    const cols = [_][]const u8{ "version", "feature", "enabled" };
+    try output.writeOutput(allocator, opts.format, rows.items, cols[0..], opts.out_path);
+}
+
+fn cmdSkillDecisionAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    const mode = opts.mode orelse "summary";
+    const causality = opts.causality_text orelse "strong";
+    if (opts.include_excerpts) {
+        printCliError("warning: --include-excerpts may emit bounded transcript excerpts; default output avoids raw transcript text\n", .{});
+    }
+    if (std.mem.eql(u8, mode, "delta") and opts.session_id == null and opts.path == null) {
+        printCliError("error: skill-decision-audit --mode delta requires --session-id or --path\n", .{});
+        return error.MissingArgValue;
+    }
+
+    var audit = try compileSkillDecisionAudit(allocator, sessions_root, opts);
+    defer audit.deinit(allocator);
+
+    if (std.mem.eql(u8, mode, "episodes")) {
+        try output.writeOutput(allocator, opts.format, audit.episodes.items, skill_decision_episode_columns[0..], opts.out_path);
+        return;
+    }
+    if (std.mem.eql(u8, mode, "outcomes")) {
+        try output.writeOutput(allocator, opts.format, audit.outcomes.items, skill_decision_outcome_columns[0..], opts.out_path);
+        return;
+    }
+    if (std.mem.eql(u8, mode, "clauses")) {
+        try output.writeOutput(allocator, opts.format, audit.clauses.items, skill_decision_clause_columns[0..], opts.out_path);
+        return;
+    }
+    if (std.mem.eql(u8, mode, "misses")) {
+        try output.writeOutput(allocator, opts.format, audit.misses.items, skill_decision_miss_columns[0..], opts.out_path);
+        return;
+    }
+    if (std.mem.eql(u8, mode, "delta")) {
+        try writeSkillDecisionDeltaJson(allocator, opts, audit);
+        return;
+    }
+    if (std.mem.eql(u8, mode, "tune-packet") or opts.format == .json) {
+        try writeSkillDecisionTunePacketJson(allocator, opts, audit, mode, causality);
+        return;
+    }
+    if (opts.format == .markdown) {
+        try writeSkillDecisionMarkdown(allocator, opts, audit, mode, causality);
+        return;
+    }
+
+    var rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &rows);
+    try rows.append(allocator, try buildSkillDecisionSummaryRow(allocator, opts, audit, mode, causality));
+    const cols = [_][]const u8{ "target_skill", "mode", "causality", "candidate_sessions", "activation_sessions", "decision_episodes", "explicit_effect_episodes", "associated_outcome_episodes", "contract_authority", "contract_fingerprint", "matched_cohort_v1" };
+    try output.writeOutput(allocator, opts.format, rows.items, cols[0..], opts.out_path);
+}
+
+const skill_decision_episode_columns = [_][]const u8{ "decision_id", "episode_id", "session_id", "root_session_id", "worker_session_id", "skill", "skill_version", "contract_fingerprint", "contract_authority", "start_timestamp", "end_timestamp", "trigger_observed", "activation_class", "question_preview", "alternatives", "selected_route", "rejected_routes", "clause_refs", "decision_effect", "evidence_strength", "outcome_class", "later_reopened", "later_reversed", "artifact_state", "evidence_refs", "counterevidence_refs", "contamination_flags" };
+const skill_decision_outcome_columns = [_][]const u8{ "episode_id", "timestamp", "outcome_kind", "outcome_value", "proof_ref", "artifact_state", "association_method", "distance_turns", "distance_seconds", "causal_claim_allowed" };
+const skill_decision_clause_columns = [_][]const u8{ "skill", "contract_fingerprint", "skill_kind", "trigger_id", "clause_id", "expected_routes", "prohibited_routes", "required_artifacts", "success_signals", "failure_signals", "source_path", "contract_authority", "compliance" };
+const skill_decision_miss_columns = [_][]const u8{ "skill", "trigger_id", "cue_evidence", "window", "confidence", "reason" };
+
+const LoadedSkillDecisionContract = struct {
+    parsed: ?skill_contract.ParsedContract = null,
+    fingerprint: ?[]u8 = null,
+    source_path: ?[]u8 = null,
+    authority: []const u8 = "absent",
+
+    fn deinit(self: *LoadedSkillDecisionContract, allocator: std.mem.Allocator) void {
+        if (self.parsed) |*parsed| parsed.deinit();
+        if (self.fingerprint) |value| allocator.free(value);
+        if (self.source_path) |value| allocator.free(value);
+    }
+
+    fn contract(self: LoadedSkillDecisionContract) ?skill_contract.Contract {
+        return if (self.parsed) |parsed| parsed.contract else null;
+    }
+};
+
+const SkillDecisionAudit = struct {
+    target_skill: []const u8,
+    contract: LoadedSkillDecisionContract,
+    episodes: std.ArrayList(query.Row) = .empty,
+    outcomes: std.ArrayList(query.Row) = .empty,
+    clauses: std.ArrayList(query.Row) = .empty,
+    misses: std.ArrayList(query.Row) = .empty,
+    rows_scanned: i64 = 0,
+    sessions_scanned: i64 = 0,
+    candidate_sessions: i64 = 0,
+    activation_sessions: i64 = 0,
+
+    fn deinit(self: *SkillDecisionAudit, allocator: std.mem.Allocator) void {
+        self.contract.deinit(allocator);
+        deinitQueryRows(allocator, &self.episodes);
+        deinitQueryRows(allocator, &self.outcomes);
+        deinitQueryRows(allocator, &self.clauses);
+        deinitQueryRows(allocator, &self.misses);
+    }
+};
+
+fn compileSkillDecisionAudit(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    opts: Options,
+) !SkillDecisionAudit {
+    var audit = SkillDecisionAudit{
+        .target_skill = opts.skill.?,
+        .contract = try loadSkillDecisionContract(allocator, opts),
+    };
+    errdefer audit.deinit(allocator);
+
+    try appendContractClauseRows(allocator, &audit);
+
+    const day_filter = deriveSessionDayPathFilterFromOptions(opts);
+    var paths = try resolveOrchestrationInputPaths(allocator, sessions_root, opts, day_filter);
+    defer freePathList(allocator, &paths);
+    const exclude_path = if (opts.exclude_current) try resolveCurrentSessionPathForExclusionLocal(allocator, sessions_root) else null;
+    defer if (exclude_path) |path| allocator.free(path);
+
+    var activation_sessions = std.StringHashMap(void).init(allocator);
+    defer activation_sessions.deinit();
+
+    audit.candidate_sessions = @intCast(paths.items.len);
+    for (paths.items) |path| {
+        if (exclude_path) |excluded| if (std.mem.eql(u8, path, excluded)) continue;
+        const content = try readFileAllocOrSkip(allocator, path);
+        if (content == null) continue;
+        defer allocator.free(content.?);
+        audit.sessions_scanned += 1;
+        audit.rows_scanned += countNonEmptyLines(content.?);
+
+        const session_id = inferSessionIdFromPath(path);
+        if (try sessionHasSkillActivation(allocator, path, content.?, audit.target_skill, opts)) {
+            try activation_sessions.put(session_id, {});
+        }
+        try collectReceiptEpisodesForSession(allocator, &audit, path, content.?, opts);
+        try collectExplicitRouteEpisodesForSession(allocator, &audit, path, content.?, opts);
+    }
+    audit.activation_sessions = @intCast(activation_sessions.count());
+    try finalizeContractClauseCompliance(&audit);
+    return audit;
+}
+
+fn loadSkillDecisionContract(allocator: std.mem.Allocator, opts: Options) !LoadedSkillDecisionContract {
+    if (opts.contract_text) |path| {
+        return loadSkillDecisionContractPath(allocator, path, opts.contract_authority_text orelse "explicit");
+    }
+    if (opts.skill_root_text) |root| {
+        const yaml_path = try std.fs.path.join(allocator, &.{ root, opts.skill.?, "references", "decision-contract.yaml" });
+        defer allocator.free(yaml_path);
+        if (fileExists(yaml_path)) return loadSkillDecisionContractPath(allocator, yaml_path, "explicit");
+        const json_path = try std.fs.path.join(allocator, &.{ root, opts.skill.?, "references", "decision-contract.json" });
+        defer allocator.free(json_path);
+        if (fileExists(json_path)) return loadSkillDecisionContractPath(allocator, json_path, "explicit");
+    }
+    return .{};
+}
+
+fn loadSkillDecisionContractPath(allocator: std.mem.Allocator, path: []const u8, authority: []const u8) !LoadedSkillDecisionContract {
+    const absolute = try toAbsolutePath(allocator, path);
+    errdefer allocator.free(absolute);
+    const content = try std.Io.Dir.cwd().readFileAlloc(defaultIo(), absolute, allocator, .limited(4 * 1024 * 1024));
+    defer allocator.free(content);
+    var parsed = try skill_contract.parseText(allocator, content);
+    errdefer parsed.deinit();
+    const report = try skill_contract.validateParsed(allocator, parsed.contract);
+    defer report.deinit(allocator);
+    if (!report.valid) return error.InvalidSpec;
+    return .{
+        .parsed = parsed,
+        .fingerprint = if (report.fingerprint) |fp| try allocator.dupe(u8, fp) else null,
+        .source_path = absolute,
+        .authority = authority,
+    };
+}
+
+fn fileExists(path: []const u8) bool {
+    const file = std.Io.Dir.openFileAbsolute(defaultIo(), path, .{}) catch return false;
+    file.close(defaultIo());
+    return true;
+}
+
+fn resolveCurrentSessionPathForExclusionLocal(allocator: std.mem.Allocator, sessions_root: []const u8) ![]u8 {
+    const current_id = try currentSessionIdFromEnv(allocator);
+    defer allocator.free(current_id);
+    var paths = try collectJsonlPaths(allocator, sessions_root, null);
+    defer freePathList(allocator, &paths);
+    for (paths.items) |path| {
+        if (std.mem.containsAtLeast(u8, path, 1, current_id)) return allocator.dupe(u8, path);
+    }
+    return allocator.dupe(u8, "");
+}
+
+fn countNonEmptyLines(text: []const u8) i64 {
+    var count: i64 = 0;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        if (std.mem.trim(u8, line, " \t\r\n").len > 0) count += 1;
+    }
+    return count;
+}
+
+fn sessionHasSkillActivation(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    content: []const u8,
+    skill: []const u8,
+    opts: Options,
+) !bool {
+    const mentions = try datasets.skill_mentions.parseJsonl(allocator, path, content, .{});
+    defer datasets.skill_mentions.freeRows(allocator, mentions);
+    for (mentions) |row| {
+        if (!timestampSatisfiesBounds(row.timestamp, opts)) continue;
+        if (!eqlIgnoreCaseAscii(row.skill, skill)) continue;
+        const kind = skill_decision_signals.classifySkillMention(row.role, row.types);
+        if (kind == .explicit_user_activation or kind == .assistant_declared_activation) return true;
+    }
+    return false;
+}
+
+fn collectReceiptEpisodesForSession(
+    allocator: std.mem.Allocator,
+    audit: *SkillDecisionAudit,
+    path: []const u8,
+    content: []const u8,
+    opts: Options,
+) !void {
+    const messages = try datasets.messages.parseJsonl(allocator, path, content, .{
+        .strip_skill_blocks = true,
+        .dedupe_by_role_and_text = true,
+    });
+    defer datasets.messages.freeRows(allocator, messages);
+    for (messages) |row| {
+        if (!timestampSatisfiesBounds(row.timestamp, opts)) continue;
+        if (std.mem.indexOf(u8, row.text, "skill_decision_receipt") == null) continue;
+        var parsed = skill_decision_receipt.parseText(allocator, row.text) catch continue;
+        defer parsed.deinit();
+        if (!eqlIgnoreCaseAscii(parsed.receipt.skill, audit.target_skill)) continue;
+        const validation = try skill_decision_receipt.validateParsed(allocator, parsed.receipt, audit.target_skill, audit.contract.contract());
+        defer validation.deinit(allocator);
+        if (!validation.valid) continue;
+
+        const decision_id = if (parsed.receipt.decision_id.len > 0) parsed.receipt.decision_id else "unknown";
+        const episode_id = try std.fmt.allocPrint(allocator, "{s}:receipt:{s}", .{ inferSessionIdFromPath(path), decision_id });
+        defer allocator.free(episode_id);
+        const outcome = firstOutcomeAfter(messages, row.timestamp);
+        const alternatives = try joinStringListSep(allocator, parsed.receipt.alternatives_considered, ",");
+        defer allocator.free(alternatives);
+        const rejected_routes = try joinStringListSep(allocator, parsed.receipt.rejected_routes, ",");
+        defer allocator.free(rejected_routes);
+        const clause_refs = try joinStringListSep(allocator, parsed.receipt.clause_refs, ",");
+        defer allocator.free(clause_refs);
+        try appendSkillDecisionEpisodeRow(allocator, &audit.episodes, audit, .{
+            .decision_id = decision_id,
+            .episode_id = episode_id,
+            .path = path,
+            .session_id = inferSessionIdFromPath(path),
+            .start_timestamp = row.timestamp,
+            .end_timestamp = row.timestamp,
+            .skill_version = parsed.receipt.skill_version,
+            .question_preview = parsed.receipt.question,
+            .alternatives = alternatives,
+            .selected_route = parsed.receipt.selected_route,
+            .rejected_routes = rejected_routes,
+            .clause_refs = clause_refs,
+            .decision_effect = if (parsed.receipt.rejected_routes.len > 0) "explicit_route_change" else "unknown",
+            .evidence_strength = "explicit",
+            .outcome_class = outcome.kind,
+            .artifact_state = if (parsed.receipt.artifact_state_present) "present" else "unknown",
+            .evidence_refs = "sdr",
+            .contamination_flags = skill_decision_signals.contaminationFlags(row.text),
+        });
+        if (outcome.kind.len > 0 and !std.mem.eql(u8, outcome.kind, "unknown")) {
+            try appendSkillDecisionOutcomeRow(allocator, &audit.outcomes, episode_id, outcome, "same_session_after_episode", "not_proven");
+        }
+    }
+}
+
+fn collectExplicitRouteEpisodesForSession(
+    allocator: std.mem.Allocator,
+    audit: *SkillDecisionAudit,
+    path: []const u8,
+    content: []const u8,
+    opts: Options,
+) !void {
+    const messages = try datasets.messages.parseJsonl(allocator, path, content, .{
+        .strip_skill_blocks = true,
+        .dedupe_by_role_and_text = true,
+    });
+    defer datasets.messages.freeRows(allocator, messages);
+    for (messages, 0..) |row, idx| {
+        if (!timestampSatisfiesBounds(row.timestamp, opts)) continue;
+        if (!std.mem.eql(u8, row.role, "assistant")) continue;
+        if (std.mem.indexOf(u8, row.text, "skill_decision_receipt") != null) continue;
+        if (!containsDollarSkillLocal(row.text, audit.target_skill) and !containsBareSkillReferenceLocal(row.text, audit.target_skill)) continue;
+        const selected = extractStructuredRouteValue(row.text, "selected_route") orelse uniqueContractRouteMatch(audit.contract.contract(), row.text) orelse continue;
+        const rejected = extractStructuredRouteValue(row.text, "rejected_route") orelse "";
+        const decision_id = try std.fmt.allocPrint(allocator, "explicit-{d}", .{idx + 1});
+        defer allocator.free(decision_id);
+        const episode_id = try std.fmt.allocPrint(allocator, "{s}:explicit:{d}", .{ inferSessionIdFromPath(path), idx + 1 });
+        defer allocator.free(episode_id);
+        const outcome = firstOutcomeAfter(messages, row.timestamp);
+        const clause_refs = try inferredClauseRefsForRoute(allocator, audit.contract.contract(), selected);
+        defer allocator.free(clause_refs);
+        try appendSkillDecisionEpisodeRow(allocator, &audit.episodes, audit, .{
+            .decision_id = decision_id,
+            .episode_id = episode_id,
+            .path = path,
+            .session_id = inferSessionIdFromPath(path),
+            .start_timestamp = row.timestamp,
+            .end_timestamp = row.timestamp,
+            .activation_class = "assistant_declared_activation",
+            .question_preview = "unknown",
+            .selected_route = selected,
+            .rejected_routes = rejected,
+            .clause_refs = clause_refs,
+            .decision_effect = if (rejected.len > 0) "explicit_route_change" else "unknown",
+            .evidence_strength = "explicit",
+            .outcome_class = outcome.kind,
+            .artifact_state = "unknown",
+            .evidence_refs = "assistant_route_attribution",
+            .contamination_flags = skill_decision_signals.contaminationFlags(row.text),
+        });
+        if (outcome.kind.len > 0 and !std.mem.eql(u8, outcome.kind, "unknown")) {
+            try appendSkillDecisionOutcomeRow(allocator, &audit.outcomes, episode_id, outcome, "same_session_after_episode", "not_proven");
+        }
+    }
+}
+
+const EpisodeInput = struct {
+    decision_id: []const u8,
+    episode_id: []const u8,
+    path: []const u8,
+    session_id: []const u8,
+    start_timestamp: ?[]const u8,
+    end_timestamp: ?[]const u8,
+    skill_version: []const u8 = "",
+    activation_class: []const u8 = "receipt",
+    question_preview: []const u8 = "unknown",
+    alternatives: []const u8 = "",
+    selected_route: []const u8 = "",
+    rejected_routes: []const u8 = "",
+    clause_refs: []const u8 = "",
+    decision_effect: []const u8 = "unknown",
+    evidence_strength: []const u8,
+    outcome_class: []const u8 = "unknown",
+    artifact_state: []const u8 = "unknown",
+    evidence_refs: []const u8 = "",
+    counterevidence_refs: []const u8 = "",
+    contamination_flags: []const u8 = "",
+};
+
+fn appendSkillDecisionEpisodeRow(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(query.Row),
+    audit: *SkillDecisionAudit,
+    input: EpisodeInput,
+) !void {
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    try row.putOwnedKey("decision_id", .{ .string = input.decision_id });
+    try row.putOwnedKey("episode_id", .{ .string = input.episode_id });
+    try row.putOwnedKey("session_id", .{ .string = input.session_id });
+    try row.putOwnedKey("root_session_id", .{ .string = input.session_id });
+    try row.putOwnedKey("worker_session_id", .null);
+    try row.putOwnedKey("skill", .{ .string = audit.target_skill });
+    try row.putOwnedKey("skill_version", .{ .string = input.skill_version });
+    try row.putOwnedKey("contract_fingerprint", if (audit.contract.fingerprint) |fp| .{ .string = fp } else .null);
+    try row.putOwnedKey("contract_authority", .{ .string = audit.contract.authority });
+    try putOptionalString(&row, "start_timestamp", input.start_timestamp);
+    try putOptionalString(&row, "end_timestamp", input.end_timestamp);
+    try row.putOwnedKey("trigger_observed", .{ .bool = false });
+    try row.putOwnedKey("activation_class", .{ .string = input.activation_class });
+    try row.putOwnedKey("question_preview", .{ .string = if (input.question_preview.len > 0) input.question_preview else "unknown" });
+    try row.putOwnedKey("alternatives", .{ .string = input.alternatives });
+    try row.putOwnedKey("selected_route", .{ .string = input.selected_route });
+    try row.putOwnedKey("rejected_routes", .{ .string = input.rejected_routes });
+    try row.putOwnedKey("clause_refs", .{ .string = input.clause_refs });
+    try row.putOwnedKey("decision_effect", .{ .string = input.decision_effect });
+    try row.putOwnedKey("evidence_strength", .{ .string = input.evidence_strength });
+    try row.putOwnedKey("outcome_class", .{ .string = input.outcome_class });
+    try row.putOwnedKey("later_reopened", .{ .bool = std.mem.eql(u8, input.outcome_class, "review_reopen") });
+    try row.putOwnedKey("later_reversed", .{ .bool = std.mem.eql(u8, input.outcome_class, "reversal") });
+    try row.putOwnedKey("artifact_state", .{ .string = input.artifact_state });
+    try row.putOwnedKey("evidence_refs", .{ .string = input.evidence_refs });
+    try row.putOwnedKey("counterevidence_refs", .{ .string = input.counterevidence_refs });
+    try row.putOwnedKey("contamination_flags", .{ .string = input.contamination_flags });
+    try out.append(allocator, row);
+}
+
+const OutcomeSignal = struct {
+    kind: []const u8 = "unknown",
+    timestamp: ?[]const u8 = null,
+    value: []const u8 = "",
+};
+
+fn firstOutcomeAfter(messages: []const datasets.messages.MessageRow, timestamp: ?[]const u8) OutcomeSignal {
+    const start = timestamp orelse "";
+    for (messages) |row| {
+        const ts = row.timestamp orelse "";
+        if (start.len > 0 and std.mem.order(u8, ts, start) != .gt) continue;
+        if (containsIgnoreCaseAscii(row.text, "review reopen")) return .{ .kind = "review_reopen", .timestamp = row.timestamp, .value = "review_reopen" };
+        if (containsIgnoreCaseAscii(row.text, "reversal")) return .{ .kind = "reversal", .timestamp = row.timestamp, .value = "reversal" };
+        if (containsIgnoreCaseAscii(row.text, "proof pass") or containsIgnoreCaseAscii(row.text, "validation pass")) return .{ .kind = "proof_pass", .timestamp = row.timestamp, .value = "pass" };
+        if (containsIgnoreCaseAscii(row.text, "proof fail") or containsIgnoreCaseAscii(row.text, "validation fail")) return .{ .kind = "proof_fail", .timestamp = row.timestamp, .value = "fail" };
+        if (containsIgnoreCaseAscii(row.text, "commit")) return .{ .kind = "commit", .timestamp = row.timestamp, .value = "commit" };
+        if (containsIgnoreCaseAscii(row.text, "push")) return .{ .kind = "push", .timestamp = row.timestamp, .value = "push" };
+        if (containsIgnoreCaseAscii(row.text, "pull request") or containsIgnoreCaseAscii(row.text, "PR #")) return .{ .kind = "pr", .timestamp = row.timestamp, .value = "pr" };
+        if (containsIgnoreCaseAscii(row.text, "closure")) return .{ .kind = "closure", .timestamp = row.timestamp, .value = "closure" };
+    }
+    return .{};
+}
+
+fn appendSkillDecisionOutcomeRow(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(query.Row),
+    episode_id: []const u8,
+    outcome: OutcomeSignal,
+    association_method: []const u8,
+    causal_claim: []const u8,
+) !void {
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    try row.putOwnedKey("episode_id", .{ .string = episode_id });
+    try putOptionalString(&row, "timestamp", outcome.timestamp);
+    try row.putOwnedKey("outcome_kind", .{ .string = outcome.kind });
+    try row.putOwnedKey("outcome_value", .{ .string = outcome.value });
+    try row.putOwnedKey("proof_ref", .null);
+    try row.putOwnedKey("artifact_state", .{ .string = "unknown" });
+    try row.putOwnedKey("association_method", .{ .string = association_method });
+    try row.putOwnedKey("distance_turns", .null);
+    try row.putOwnedKey("distance_seconds", .null);
+    try row.putOwnedKey("causal_claim_allowed", .{ .bool = std.mem.eql(u8, causal_claim, "allowed") });
+    try out.append(allocator, row);
+}
+
+fn appendContractClauseRows(allocator: std.mem.Allocator, audit: *SkillDecisionAudit) !void {
+    const contract = audit.contract.contract() orelse return;
+    for (contract.clauses) |clause| {
+        const trigger_refs = try joinStringListSep(allocator, clause.trigger_refs, ",");
+        defer allocator.free(trigger_refs);
+        const expected = try joinStringListSep(allocator, clause.expected_routes, ",");
+        defer allocator.free(expected);
+        const prohibited = try joinStringListSep(allocator, clause.prohibited_routes, ",");
+        defer allocator.free(prohibited);
+        const required = try joinStringListSep(allocator, clause.required_artifacts, ",");
+        defer allocator.free(required);
+        const success = try joinStringListSep(allocator, clause.success_signals, ",");
+        defer allocator.free(success);
+        const failure = try joinStringListSep(allocator, clause.failure_signals, ",");
+        defer allocator.free(failure);
+        var row = query.Row.init(allocator);
+        errdefer row.deinit();
+        try row.putOwnedKey("skill", .{ .string = audit.target_skill });
+        try row.putOwnedKey("contract_fingerprint", if (audit.contract.fingerprint) |fp| .{ .string = fp } else .null);
+        try row.putOwnedKey("skill_kind", .{ .string = contract.skill_kind });
+        try row.putOwnedKey("trigger_id", .{ .string = trigger_refs });
+        try row.putOwnedKey("clause_id", .{ .string = clause.clause_id });
+        try row.putOwnedKey("expected_routes", .{ .string = expected });
+        try row.putOwnedKey("prohibited_routes", .{ .string = prohibited });
+        try row.putOwnedKey("required_artifacts", .{ .string = required });
+        try row.putOwnedKey("success_signals", .{ .string = success });
+        try row.putOwnedKey("failure_signals", .{ .string = failure });
+        try row.putOwnedKey("source_path", if (audit.contract.source_path) |path| .{ .string = path } else .null);
+        try row.putOwnedKey("contract_authority", .{ .string = audit.contract.authority });
+        try row.putOwnedKey("compliance", .{ .string = "never_exercised" });
+        try audit.clauses.append(allocator, row);
+    }
+}
+
+fn finalizeContractClauseCompliance(audit: *SkillDecisionAudit) !void {
+    for (audit.clauses.items) |*clause_row| {
+        const clause_id = scalarString(clause_row.valueOrNull("clause_id")) orelse continue;
+        var status: []const u8 = "never_exercised";
+        for (audit.episodes.items) |episode| {
+            const refs = scalarString(episode.valueOrNull("clause_refs")) orelse "";
+            if (refs.len == 0 or std.mem.indexOf(u8, refs, clause_id) == null) continue;
+            const effect = scalarString(episode.valueOrNull("decision_effect")) orelse "";
+            status = if (std.mem.eql(u8, effect, "contrary_to_contract")) "violated" else "followed";
+            break;
+        }
+        try clause_row.putOwnedKey("compliance", .{ .string = status });
+    }
+}
+
+fn buildSkillDecisionSummaryRow(
+    allocator: std.mem.Allocator,
+    opts: Options,
+    audit: SkillDecisionAudit,
+    mode: []const u8,
+    causality: []const u8,
+) !query.Row {
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    try row.putOwnedKey("target_skill", .{ .string = opts.skill.? });
+    try row.putOwnedKey("mode", .{ .string = mode });
+    try row.putOwnedKey("causality", .{ .string = causality });
+    try row.putOwnedKey("candidate_sessions", .{ .int = audit.candidate_sessions });
+    try row.putOwnedKey("activation_sessions", .{ .int = audit.activation_sessions });
+    try row.putOwnedKey("decision_episodes", .{ .int = @intCast(audit.episodes.items.len) });
+    try row.putOwnedKey("explicit_effect_episodes", .{ .int = countExplicitEffectEpisodes(audit.episodes.items) });
+    try row.putOwnedKey("associated_outcome_episodes", .{ .int = @intCast(audit.outcomes.items.len) });
+    try row.putOwnedKey("contract_authority", .{ .string = audit.contract.authority });
+    try row.putOwnedKey("contract_fingerprint", if (audit.contract.fingerprint) |fp| .{ .string = fp } else .null);
+    try row.putOwnedKey("matched_cohort_v1", .{ .bool = false });
+    return row;
+}
+
+fn countExplicitEffectEpisodes(rows: []const query.Row) i64 {
+    var count: i64 = 0;
+    for (rows) |row| {
+        const strength = scalarString(row.valueOrNull("evidence_strength")) orelse "";
+        const effect = scalarString(row.valueOrNull("decision_effect")) orelse "";
+        if (std.mem.eql(u8, strength, "explicit") and !std.mem.eql(u8, effect, "unknown") and !std.mem.eql(u8, effect, "no_visible_delta")) count += 1;
+    }
+    return count;
+}
+
+fn countEpisodesWithEffect(rows: []const query.Row, effect: []const u8) i64 {
+    var count: i64 = 0;
+    for (rows) |row| {
+        if (scalarStringEq(row.valueOrNull("decision_effect"), effect)) count += 1;
+    }
+    return count;
+}
+
+fn countOutcomes(rows: []const query.Row, kind: []const u8) i64 {
+    var count: i64 = 0;
+    for (rows) |row| {
+        if (scalarStringEq(row.valueOrNull("outcome_kind"), kind)) count += 1;
+    }
+    return count;
+}
+
+fn writeSkillDecisionTunePacketJson(
+    allocator: std.mem.Allocator,
+    opts: Options,
+    audit: SkillDecisionAudit,
+    mode: []const u8,
+    causality: []const u8,
+) !void {
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+    const cursor_json = try skillDecisionCursorJsonAlloc(allocator, opts, audit);
+    defer allocator.free(cursor_json);
+    try writer.writeAll("{\n  \"skill_tuning_evidence\": {\n    \"packet_version\": \"STE-v1\",\n    \"target_skill\": ");
+    try output.writeJsonString(writer, opts.skill.?);
+    try writer.writeAll(",\n    \"target_kind\": ");
+    try output.writeJsonString(writer, if (audit.contract.contract()) |contract| contract.skill_kind else "unknown");
+    try writer.writeAll(",\n    \"skill_versions_observed\": [],\n    \"contract\": {\n      \"authority\": ");
+    try output.writeJsonString(writer, audit.contract.authority);
+    try writer.writeAll(",\n      \"fingerprint\": ");
+    if (audit.contract.fingerprint) |fp| try output.writeJsonString(writer, fp) else try writer.writeAll("null");
+    try writer.writeAll(",\n      \"clause_ids\": [");
+    for (audit.clauses.items, 0..) |row, idx| {
+        if (idx > 0) try writer.writeAll(", ");
+        try output.writeJsonString(writer, scalarString(row.valueOrNull("clause_id")) orelse "");
+    }
+    try writer.writeAll(
+        \\]
+        \\    },
+        \\    "window": {
+        \\      "since":
+    );
+    try writeOptionalJsonString(writer, opts.since);
+    try writer.writeAll(",\n      \"until\": ");
+    try writeOptionalJsonString(writer, opts.until);
+    try writer.writeAll(",\n      \"repo\": ");
+    try writeOptionalJsonString(writer, opts.repo_text);
+    try writer.writeAll(",\n      \"workdir\": ");
+    try writeOptionalJsonString(writer, opts.workdir_text);
+    try writer.print(
+        \\,
+        \\      "current_session_excluded": {}
+        \\    }},
+        \\    "denominator": {{
+        \\      "candidate_sessions": {d},
+        \\      "activation_sessions": {d},
+        \\      "decision_episodes": {d},
+        \\      "explicit_effect_episodes": {d},
+        \\      "associated_outcome_episodes": {d},
+        \\      "matched_control_episodes": 0
+        \\    }},
+        \\    "trigger_quality": {{
+        \\      "trigger_present": 0,
+        \\      "correctly_activated": 0,
+        \\      "missed": 0,
+        \\      "false_activations": 0,
+        \\      "ambiguous": 0
+        \\    }},
+        \\    "decision_influence": {{
+        \\      "explicit_route_changes": {d},
+        \\      "prevented_actions": {d},
+        \\      "scope_narrowings": {d},
+        \\      "proof_changes": {d},
+        \\      "escalations_or_blocks": {d},
+        \\      "reinforced_existing": {d},
+        \\      "no_visible_delta": {d},
+        \\      "contrary_to_contract": {d},
+        \\      "unknown": {d}
+        \\    }},
+        \\    "contract_compliance": {{
+        \\      "followed": {{}},
+        \\      "violated": {{}},
+        \\      "ambiguous": {{}},
+        \\      "never_exercised": [
+    , .{
+        opts.exclude_current,
+        audit.candidate_sessions,
+        audit.activation_sessions,
+        audit.episodes.items.len,
+        countExplicitEffectEpisodes(audit.episodes.items),
+        audit.outcomes.items.len,
+        countEpisodesWithEffect(audit.episodes.items, "explicit_route_change"),
+        countEpisodesWithEffect(audit.episodes.items, "prevented_action"),
+        countEpisodesWithEffect(audit.episodes.items, "narrowed_scope"),
+        countEpisodesWithEffect(audit.episodes.items, "added_or_changed_proof"),
+        countEpisodesWithEffect(audit.episodes.items, "escalated_or_blocked"),
+        countEpisodesWithEffect(audit.episodes.items, "reinforced_existing_choice"),
+        countEpisodesWithEffect(audit.episodes.items, "no_visible_delta"),
+        countEpisodesWithEffect(audit.episodes.items, "contrary_to_contract"),
+        countEpisodesWithEffect(audit.episodes.items, "unknown"),
+    });
+    var first_never = true;
+    for (audit.clauses.items) |row| {
+        if (!scalarStringEq(row.valueOrNull("compliance"), "never_exercised")) continue;
+        if (!first_never) try writer.writeAll(", ");
+        first_never = false;
+        try output.writeJsonString(writer, scalarString(row.valueOrNull("clause_id")) orelse "");
+    }
+    try writer.print(
+        \\]
+        \\    }},
+        \\    "outcomes": {{
+        \\      "first_pass_success": 0,
+        \\      "proof_pass": {d},
+        \\      "proof_fail": {d},
+        \\      "review_clean": 0,
+        \\      "review_reopens": {d},
+        \\      "reversals": {d},
+        \\      "blocked_correctly": 0,
+        \\      "unknown": 0
+        \\    }},
+        \\    "workarounds": [],
+        \\    "recurrent_gap_signatures": [],
+        \\    "exemplars": {{
+        \\      "positive": [],
+        \\      "negative": []
+        \\    }},
+        \\    "evidence_limitations": [
+        \\      "Outcome association is temporal/artifact-adjacent evidence only; outcome causality is not proven.",
+        \\      "Natural-language episodes are limited to explicit skill plus route markers."
+        \\    ],
+        \\    "cursor_end": {s}
+        \\  }},
+        \\  "seq_receipt": {{
+        \\    "receipt_version": "SEQ-R1",
+        \\    "command": "skill-decision-audit",
+        \\    "outcome": "success",
+        \\    "exit_code": 0,
+        \\    "rows_scanned": {d},
+        \\    "sessions_scanned": {d},
+        \\    "episodes_emitted": {d},
+        \\    "contract_fingerprint":
+    , .{
+        countOutcomes(audit.outcomes.items, "proof_pass"),
+        countOutcomes(audit.outcomes.items, "proof_fail"),
+        countOutcomes(audit.outcomes.items, "review_reopen"),
+        countOutcomes(audit.outcomes.items, "reversal"),
+        cursor_json,
+        audit.rows_scanned,
+        audit.sessions_scanned,
+        audit.episodes.items.len,
+    });
+    if (audit.contract.fingerprint) |fp| try output.writeJsonString(writer, fp) else try writer.writeAll("null");
+    try writer.writeAll(",\n    \"cursor_end\": ");
+    try writer.writeAll(cursor_json);
+    try writer.writeAll(",\n    \"warning_codes\": []\n  },\n  \"metadata\": {\n    \"mode\": ");
+    try output.writeJsonString(writer, mode);
+    try writer.writeAll(",\n    \"causality\": ");
+    try output.writeJsonString(writer, causality);
+    try writer.writeAll("\n  }\n}\n");
+    const rendered = try writer_alloc.toOwnedSlice();
+    defer allocator.free(rendered);
+    try writeTextOutput(rendered, opts.out_path);
+}
+
+fn writeSkillDecisionDeltaJson(allocator: std.mem.Allocator, opts: Options, audit: SkillDecisionAudit) !void {
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+    const cursor_json = try skillDecisionCursorJsonAlloc(allocator, opts, audit);
+    defer allocator.free(cursor_json);
+    const cursor_status = skillDecisionCursorStatus(opts, audit);
+    try writer.writeAll("{\n  \"skill_decision_delta\": {\n    \"delta_version\": \"SDD-v1\",\n    \"target_skill\": ");
+    try output.writeJsonString(writer, opts.skill.?);
+    try writer.writeAll(",\n    \"session\": ");
+    const session_ref: ?[]const u8 = if (opts.session_id) |id| id else opts.path;
+    try writeOptionalJsonString(writer, session_ref);
+    try writer.writeAll(",\n    \"cursor_start\": ");
+    try writeOptionalJsonString(writer, opts.since_cursor_text);
+    try writer.writeAll(",\n    \"cursor_status\": ");
+    try output.writeJsonString(writer, cursor_status);
+    try writer.print(
+        \\,
+        \\    "cursor_end": {s},
+        \\    "state": "scanned",
+        \\    "new_signals": {d},
+        \\    "new_episodes": {d},
+        \\    "new_clause_events": {d},
+        \\    "new_outcomes": {d},
+        \\    "decision_relevant": {},
+        \\    "reason": "bounded deterministic rescan"
+        \\  }}
+        \\}}
+        \\
+    , .{ cursor_json, audit.rows_scanned, audit.episodes.items.len, audit.clauses.items.len, audit.outcomes.items.len, audit.episodes.items.len > 0 });
+    const rendered = try writer_alloc.toOwnedSlice();
+    defer allocator.free(rendered);
+    try writeTextOutput(rendered, opts.out_path);
+}
+
+fn skillDecisionCursorStatus(opts: Options, audit: SkillDecisionAudit) []const u8 {
+    const cursor = opts.since_cursor_text orelse return "initial";
+    if (audit.contract.fingerprint) |fp| {
+        if (std.mem.indexOf(u8, cursor, fp) == null) return "invalidated";
+    }
+    return "valid";
+}
+
+fn skillDecisionCursorJsonAlloc(allocator: std.mem.Allocator, opts: Options, audit: SkillDecisionAudit) ![]u8 {
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+    const file_size = if (opts.path) |path| skillDecisionCursorFileSize(path) else null;
+    try writer.writeAll("{\"cursor_version\":\"SDD-C1\",\"session_path\":");
+    try writeOptionalJsonString(writer, opts.path);
+    try writer.writeAll(",\"session_id\":");
+    try writeOptionalJsonString(writer, opts.session_id);
+    try writer.writeAll(",\"file_size\":");
+    if (file_size) |size| try writer.print("{d}", .{size}) else try writer.writeAll("null");
+    try writer.writeAll(",\"file_identity\":");
+    if (opts.path) |path| {
+        if (file_size) |size| {
+            const identity = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ path, size });
+            defer allocator.free(identity);
+            try output.writeJsonString(writer, identity);
+        } else {
+            try output.writeJsonString(writer, path);
+        }
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"last_timestamp\":");
+    try writeOptionalJsonString(writer, lastSkillDecisionEpisodeTimestamp(audit.episodes.items));
+    try writer.print(",\"last_event_offset\":{d},\"rows_scanned\":{d},\"sessions_scanned\":{d},\"episodes_emitted\":{d},\"contract_fingerprint\":", .{
+        audit.rows_scanned,
+        audit.rows_scanned,
+        audit.sessions_scanned,
+        audit.episodes.items.len,
+    });
+    if (audit.contract.fingerprint) |fp| try output.writeJsonString(writer, fp) else try writer.writeAll("null");
+    try writer.writeAll(",\"seq_version\":");
+    try output.writeJsonString(writer, app_meta.version);
+    try writer.writeAll("}");
+    return writer_alloc.toOwnedSlice();
+}
+
+fn skillDecisionCursorFileSize(path: []const u8) ?i64 {
+    var file = std.Io.Dir.cwd().openFile(defaultIo(), path, .{}) catch return null;
+    defer file.close(defaultIo());
+    const stat = file.stat(defaultIo()) catch return null;
+    return @intCast(stat.size);
+}
+
+fn lastSkillDecisionEpisodeTimestamp(rows: []const query.Row) ?[]const u8 {
+    var latest: ?[]const u8 = null;
+    for (rows) |row| {
+        const ts = scalarString(row.valueOrNull("end_timestamp")) orelse continue;
+        if (latest == null or std.mem.order(u8, ts, latest.?) == .gt) latest = ts;
+    }
+    return latest;
+}
+
+fn writeSkillDecisionMarkdown(
+    allocator: std.mem.Allocator,
+    opts: Options,
+    audit: SkillDecisionAudit,
+    mode: []const u8,
+    causality: []const u8,
+) !void {
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+    try writer.print(
+        \\# skill-decision-audit
+        \\
+        \\## Scope and denominator
+        \\target_skill: {s}
+        \\mode: {s}
+        \\causality: {s}
+        \\candidate_sessions: {d}
+        \\activation_sessions: {d}
+        \\decision_episodes: {d}
+        \\
+        \\## Contract authority/version
+        \\authority: {s}
+        \\
+        \\## Decision influence
+        \\explicit_route_changes: {d}
+        \\unknown: {d}
+        \\
+        \\## Outcomes
+        \\associated_outcome_episodes: {d}
+        \\
+        \\## Limitations
+        \\Outcome causality is not proven. Natural-language attribution is limited to explicit skill plus route markers.
+        \\
+    , .{
+        opts.skill.?,
+        mode,
+        causality,
+        audit.candidate_sessions,
+        audit.activation_sessions,
+        audit.episodes.items.len,
+        audit.contract.authority,
+        countEpisodesWithEffect(audit.episodes.items, "explicit_route_change"),
+        countEpisodesWithEffect(audit.episodes.items, "unknown"),
+        audit.outcomes.items.len,
+    });
+    const rendered = try writer_alloc.toOwnedSlice();
+    defer allocator.free(rendered);
+    try writeTextOutput(rendered, opts.out_path);
+}
+
+fn joinStringListSep(allocator: std.mem.Allocator, items: []const []const u8, sep: []const u8) ![]u8 {
+    if (items.len == 0) return allocator.dupe(u8, "");
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (items, 0..) |item, idx| {
+        if (idx > 0) try out.appendSlice(allocator, sep);
+        try out.appendSlice(allocator, item);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn containsBareSkillReferenceLocal(text: []const u8, skill: []const u8) bool {
+    if (skill.len == 0 or skill.len > text.len) return false;
+    var pos: usize = 0;
+    while (pos + skill.len <= text.len) : (pos += 1) {
+        const end = pos + skill.len;
+        if (!eqlIgnoreCaseAscii(text[pos..end], skill)) continue;
+        if (pos > 0 and (std.ascii.isAlphanumeric(text[pos - 1]) or text[pos - 1] == '-' or text[pos - 1] == '_')) continue;
+        if (end < text.len and (std.ascii.isAlphanumeric(text[end]) or text[end] == '-' or text[end] == '_')) continue;
+        return true;
+    }
+    return false;
+}
+
+fn containsDollarSkillLocal(text: []const u8, skill: []const u8) bool {
+    var cursor: usize = 0;
+    while (skill_decision_signals.nextDollarSkill(text, cursor)) |match| {
+        cursor = match.end;
+        if (eqlIgnoreCaseAscii(match.skill, skill)) return true;
+    }
+    return false;
+}
+
+fn extractStructuredRouteValue(text: []const u8, key: []const u8) ?[]const u8 {
+    const idx = std.mem.indexOf(u8, text, key) orelse return null;
+    var pos = idx + key.len;
+    while (pos < text.len and (text[pos] == ' ' or text[pos] == ':' or text[pos] == '=' or text[pos] == '"' or text[pos] == '\'')) : (pos += 1) {}
+    const start = pos;
+    while (pos < text.len and (std.ascii.isAlphanumeric(text[pos]) or text[pos] == '-' or text[pos] == '_' or text[pos] == '.')) : (pos += 1) {}
+    if (pos == start) return null;
+    return text[start..pos];
+}
+
+fn uniqueContractRouteMatch(contract_opt: ?skill_contract.Contract, text: []const u8) ?[]const u8 {
+    const contract = contract_opt orelse return null;
+    var found: ?[]const u8 = null;
+    for (contract.routes) |route| {
+        var matched = containsBareSkillReferenceLocal(text, route.route_id);
+        for (route.aliases) |alias| {
+            if (!matched and containsIgnoreCaseAscii(text, alias)) matched = true;
+        }
+        if (!matched) continue;
+        if (found != null and !std.mem.eql(u8, found.?, route.route_id)) return null;
+        found = route.route_id;
+    }
+    return found;
+}
+
+fn inferredClauseRefsForRoute(allocator: std.mem.Allocator, contract_opt: ?skill_contract.Contract, route_id: []const u8) ![]u8 {
+    const contract = contract_opt orelse return allocator.dupe(u8, "");
+    var out: std.ArrayList([]const u8) = .empty;
+    defer out.deinit(allocator);
+    for (contract.clauses) |clause| {
+        for (clause.expected_routes) |expected| {
+            if (std.mem.eql(u8, expected, route_id)) {
+                try out.append(allocator, clause.clause_id);
+                break;
+            }
+        }
+    }
+    return joinStringListSep(allocator, out.items, ",");
+}
+
+fn cmdSkillContract(allocator: std.mem.Allocator, opts: Options) !void {
+    const action = opts.command_action.?;
+    if (std.mem.eql(u8, action, "scaffold")) {
+        const scaffold = try std.fmt.allocPrint(allocator,
+            \\skill_decision_contract:
+            \\  contract_version: SKDC-v1
+            \\
+            \\  skill:
+            \\    name: {s}
+            \\    kind: decision
+            \\    source_fingerprint:
+            \\
+            \\  triggers: []
+            \\  routes: []
+            \\  clauses: []
+            \\
+            \\  instrumentation:
+            \\    decision_receipt: optional
+            \\    rationale: Fill in stable decision instrumentation expectations.
+            \\
+        , .{opts.skill.?});
+        defer allocator.free(scaffold);
+        try writeTextOutput(scaffold, opts.out_path);
+        return;
+    }
+
+    if (std.mem.eql(u8, action, "validate")) {
+        const content = try std.Io.Dir.cwd().readFileAlloc(defaultIo(), opts.file_text.?, allocator, .limited(4 * 1024 * 1024));
+        defer allocator.free(content);
+        const report = try skill_contract.validateText(allocator, content);
+        defer report.deinit(allocator);
+        try writeSkillValidationReport(allocator, opts, "skill_contract", action, report.valid, report.codes, report.fingerprint);
+        if (!report.valid) return error.InvalidSpec;
+        return;
+    }
+    if (std.mem.eql(u8, action, "show")) {
+        try writeSkillCompanionStatus(allocator, opts, "skill_contract", action, "contract_discovery_pending");
+        return;
+    }
+    try writeSkillCompanionStatus(allocator, opts, "skill_contract", action, "semantic_validation_pending");
+}
+
+fn cmdSkillDecisionReceipt(allocator: std.mem.Allocator, opts: Options) !void {
+    const content = try std.Io.Dir.cwd().readFileAlloc(defaultIo(), opts.file_text.?, allocator, .limited(4 * 1024 * 1024));
+    defer allocator.free(content);
+    const report = try skill_decision_receipt.validateText(allocator, content, null, null);
+    defer report.deinit(allocator);
+    try writeSkillValidationReport(allocator, opts, "skill_decision_receipt", opts.command_action.?, report.valid, report.codes, report.canonical_hash);
+    if (!report.valid) return error.InvalidSpec;
+}
+
+fn writeSkillValidationReport(
+    allocator: std.mem.Allocator,
+    opts: Options,
+    key: []const u8,
+    action: []const u8,
+    valid: bool,
+    codes: []const []const u8,
+    fingerprint_or_hash: ?[]const u8,
+) !void {
+    if (opts.format == .json) {
+        var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+        defer writer_alloc.deinit();
+        const writer = &writer_alloc.writer;
+        try writer.writeAll("{\n  ");
+        try output.writeJsonString(writer, key);
+        try writer.writeAll(": {\n    \"action\": ");
+        try output.writeJsonString(writer, action);
+        try writer.writeAll(",\n    \"valid\": ");
+        try writer.writeAll(if (valid) "true" else "false");
+        try writer.writeAll(",\n    \"fingerprint\": ");
+        if (fingerprint_or_hash) |fp| try output.writeJsonString(writer, fp) else try writer.writeAll("null");
+        try writer.writeAll(",\n    \"validation_codes\": [");
+        for (codes, 0..) |code, idx| {
+            if (idx > 0) try writer.writeAll(", ");
+            try output.writeJsonString(writer, code);
+        }
+        try writer.writeAll("]\n  }\n}\n");
+        const rendered = try writer_alloc.toOwnedSlice();
+        defer allocator.free(rendered);
+        try writeTextOutput(rendered, opts.out_path);
+        return;
+    }
+
+    var rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &rows);
+    if (codes.len == 0) {
+        var row = query.Row.init(allocator);
+        try row.putOwnedKey("surface", .{ .string = key });
+        try row.putOwnedKey("action", .{ .string = action });
+        try row.putOwnedKey("valid", .{ .bool = valid });
+        try row.putOwnedKey("fingerprint", if (fingerprint_or_hash) |fp| .{ .string = fp } else .null);
+        try row.putOwnedKey("validation_code", .{ .string = "ok" });
+        try rows.append(allocator, row);
+    } else {
+        for (codes) |code| {
+            var row = query.Row.init(allocator);
+            try row.putOwnedKey("surface", .{ .string = key });
+            try row.putOwnedKey("action", .{ .string = action });
+            try row.putOwnedKey("valid", .{ .bool = valid });
+            try row.putOwnedKey("fingerprint", if (fingerprint_or_hash) |fp| .{ .string = fp } else .null);
+            try row.putOwnedKey("validation_code", .{ .string = code });
+            try rows.append(allocator, row);
+        }
+    }
+    const cols = [_][]const u8{ "surface", "action", "valid", "fingerprint", "validation_code" };
+    try output.writeOutput(allocator, opts.format, rows.items, cols[0..], opts.out_path);
+}
+
+fn writeSkillCompanionStatus(
+    allocator: std.mem.Allocator,
+    opts: Options,
+    key: []const u8,
+    action: []const u8,
+    code: []const u8,
+) !void {
+    if (opts.format == .json) {
+        var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+        defer writer_alloc.deinit();
+        const writer = &writer_alloc.writer;
+        try writer.writeAll("{\n  ");
+        try output.writeJsonString(writer, key);
+        try writer.writeAll(": {\n    \"action\": ");
+        try output.writeJsonString(writer, action);
+        try writer.writeAll(",\n    \"valid\": true,\n    \"validation_codes\": [");
+        try output.writeJsonString(writer, code);
+        try writer.writeAll("]\n  }\n}\n");
+        const rendered = try writer_alloc.toOwnedSlice();
+        defer allocator.free(rendered);
+        try writeTextOutput(rendered, opts.out_path);
+        return;
+    }
+
+    var rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &rows);
+    var row = query.Row.init(allocator);
+    try row.putOwnedKey("surface", .{ .string = key });
+    try row.putOwnedKey("action", .{ .string = action });
+    try row.putOwnedKey("valid", .{ .bool = true });
+    try row.putOwnedKey("validation_code", .{ .string = code });
+    try rows.append(allocator, row);
+    const cols = [_][]const u8{ "surface", "action", "valid", "validation_code" };
+    try output.writeOutput(allocator, opts.format, rows.items, cols[0..], opts.out_path);
+}
+
+fn writeOptionalJsonString(writer: anytype, value: ?[]const u8) !void {
+    if (value) |text| {
+        try output.writeJsonString(writer, text);
+    } else {
+        try writer.writeAll("null");
+    }
 }
 
 fn cmdQuery(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
@@ -7436,16 +8726,18 @@ const QueryLiftCommands = struct {
                 if (!csvContainsToken(roles, row.role)) continue;
             }
 
-            const kind: SkillActivationKind = if (std.mem.indexOf(u8, row.types, "block") != null)
-                .injected_skill_block
-            else if (std.mem.eql(u8, row.role, "user"))
-                .explicit_user_call
-            else if (std.mem.eql(u8, row.role, "assistant"))
-                .implicit_assistant_call
-            else
-                .other_reference;
+            const kind = activationKindFromDecisionSignal(skill_decision_signals.classifySkillMention(row.role, row.types));
             try states[activationStateIndex(kind)].record(allocator, row.path, row.timestamp, row.snippet);
         }
+    }
+
+    fn activationKindFromDecisionSignal(kind: skill_decision_signals.SignalKind) SkillActivationKind {
+        return switch (kind) {
+            .explicit_user_activation => .explicit_user_call,
+            .assistant_declared_activation => .implicit_assistant_call,
+            .injected_skill_block => .injected_skill_block,
+            else => .other_reference,
+        };
     }
 
     fn recordSkillActivationReferences(
@@ -7656,14 +8948,17 @@ const QueryLiftCommands = struct {
             if (!eqlIgnoreCaseAscii(row.skill, skill)) continue;
             if (!timestampSatisfiesActivationWindow(row.timestamp, window)) continue;
             if (opts.roles_csv) |roles| if (!csvContainsToken(roles, row.role)) continue;
-            const kind: SkillEvidenceKind = if (std.mem.indexOf(u8, row.types, "block") != null)
-                .injected_skill_block
-            else if (std.mem.eql(u8, row.role, "assistant"))
-                .assistant_declared_skill_use
-            else
-                .raw_mention;
+            const kind = evidenceKindFromDecisionSignal(skill_decision_signals.classifySkillMention(row.role, row.types));
             try appendSkillEvidenceRecord(allocator, out, kind, row.timestamp, row.role, "skill_mentions", row.snippet, opts.include_raw);
         }
+    }
+
+    fn evidenceKindFromDecisionSignal(kind: skill_decision_signals.SignalKind) SkillEvidenceKind {
+        return switch (kind) {
+            .assistant_declared_activation => .assistant_declared_skill_use,
+            .injected_skill_block => .injected_skill_block,
+            else => .raw_mention,
+        };
     }
 
     fn collectSkillEvidenceMessages(
@@ -15902,6 +17197,16 @@ fn collectDatasetRowsTracked(
         }
     } else if (std.mem.eql(u8, dataset_name, "skill_mentions")) {
         try collectSkillMentionsRows(allocator, sessions_root, day_filter, &rows);
+    } else if (std.mem.eql(u8, dataset_name, "skill_decision_signals")) {
+        try collectSkillDecisionSignalRows(allocator, sessions_root, day_filter, query_params, &rows);
+    } else if (std.mem.eql(u8, dataset_name, "skill_contract_clauses")) {
+        try collectSkillContractClauseRows(allocator, query_params, &rows);
+    } else if (std.mem.eql(u8, dataset_name, "skill_decision_receipts")) {
+        try collectSkillDecisionReceiptDatasetRows(allocator, sessions_root, day_filter, query_params, &rows);
+    } else if (std.mem.eql(u8, dataset_name, "skill_decision_episodes")) {
+        try collectSkillDecisionEpisodeDatasetRows(allocator, sessions_root, day_filter, query_params, &rows);
+    } else if (std.mem.eql(u8, dataset_name, "skill_decision_outcomes")) {
+        try collectSkillDecisionOutcomeDatasetRows(allocator, sessions_root, day_filter, query_params, &rows);
     } else if (std.mem.eql(u8, dataset_name, "token_events")) {
         try collectTokenEventsRows(allocator, sessions_root, day_filter, &rows);
     } else if (std.mem.eql(u8, dataset_name, "token_deltas")) {
@@ -16016,6 +17321,474 @@ fn collectSkillMentionsRows(
             try qrow.putStaticKey("snippet", .{ .string = row.snippet });
             try out_rows.append(allocator, qrow);
         }
+    }
+}
+
+fn collectSkillDecisionSignalRows(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    day_filter: ?SessionDayPathFilter,
+    query_params: []const spec.ParamSpec,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    const opts = Options{
+        .path = paramString(query_params, "path"),
+        .session_id = paramString(query_params, "session_id"),
+    };
+    var paths = if (opts.path != null or opts.session_id != null)
+        try resolveSessionPromptInputPaths(allocator, sessions_root, opts, day_filter)
+    else
+        try collectJsonlPaths(allocator, sessions_root, day_filter);
+    defer freePathList(allocator, &paths);
+
+    for (paths.items) |path| {
+        const content = try readFileAllocOrSkip(allocator, path);
+        if (content == null) continue;
+        defer allocator.free(content.?);
+
+        const session_id = inferSessionIdFromPath(path);
+
+        const mentions = try datasets.skill_mentions.parseJsonl(allocator, path, content.?, .{});
+        defer datasets.skill_mentions.freeRows(allocator, mentions);
+        for (mentions) |row| {
+            const signal_kind = skill_decision_signals.classifySkillMention(row.role, row.types);
+            try appendSkillDecisionSignalRow(allocator, out_rows, .{
+                .path = row.path,
+                .session_id = session_id,
+                .timestamp = row.timestamp,
+                .source_kind = "skill_mentions",
+                .signal_kind = signal_kind,
+                .skill = row.skill,
+                .source_text = row.snippet,
+            });
+        }
+
+        const messages = try datasets.messages.parseJsonl(allocator, path, content.?, .{
+            .strip_skill_blocks = true,
+            .dedupe_by_role_and_text = true,
+        });
+        defer datasets.messages.freeRows(allocator, messages);
+        for (messages) |row| {
+            try appendSkillDollarSignalsForMessage(allocator, out_rows, row, session_id);
+            try appendReceiptSignalsForMessage(allocator, out_rows, row, session_id);
+            try appendDecisionMarkerSignalsForMessage(allocator, out_rows, row, session_id);
+        }
+
+        var records: std.ArrayList(InvocationRecord) = .empty;
+        defer deinitInvocationRecords(allocator, &records);
+        try collectInvocationRecordsFromSession(allocator, path, &records);
+        for (records.items) |record| {
+            const skill = skillFromInvocationRecord(record) orelse continue;
+            const source_text = record.command_text orelse record.arguments_text orelse record.input_text orelse skill;
+            try appendSkillDecisionSignalRow(allocator, out_rows, .{
+                .path = record.path,
+                .session_id = record.session_id,
+                .timestamp = record.start_ts,
+                .tool_call_id = record.call_id,
+                .source_kind = "tool_invocations",
+                .signal_kind = .skill_file_read,
+                .skill = skill,
+                .source_text = source_text,
+            });
+        }
+    }
+}
+
+const SkillDecisionSignalInput = struct {
+    path: []const u8,
+    session_id: ?[]const u8 = null,
+    timestamp: ?[]const u8 = null,
+    tool_call_id: ?[]const u8 = null,
+    source_kind: []const u8,
+    signal_kind: skill_decision_signals.SignalKind,
+    skill: []const u8 = "",
+    source_text: []const u8,
+    route_id: ?[]const u8 = null,
+    clause_id: ?[]const u8 = null,
+    trigger_id: ?[]const u8 = null,
+    artifact_ref: ?[]const u8 = null,
+};
+
+fn appendSkillDecisionSignalRow(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    input: SkillDecisionSignalInput,
+) !void {
+    const digest = try sha256HexAlloc(allocator, input.source_text);
+    defer allocator.free(digest);
+    const preview = try buildCollapsedPreviewAlloc(allocator, input.source_text, 180);
+    defer allocator.free(preview);
+
+    var qrow = query.Row.init(allocator);
+    errdefer qrow.deinit();
+    try putOptionalString(&qrow, "timestamp", input.timestamp);
+    try qrow.putOwnedKey("path", .{ .string = input.path });
+    try putOptionalString(&qrow, "session_id", input.session_id);
+    try qrow.putOwnedKey("turn_index", .null);
+    try qrow.putOwnedKey("message_index", .null);
+    try putOptionalString(&qrow, "tool_call_id", input.tool_call_id);
+    try qrow.putOwnedKey("source_kind", .{ .string = input.source_kind });
+    try qrow.putOwnedKey("signal_kind", .{ .string = skill_decision_signals.signalKindName(input.signal_kind) });
+    try qrow.putOwnedKey("skill", .{ .string = input.skill });
+    try qrow.putOwnedKey("text_digest", .{ .string = digest });
+    try qrow.putOwnedKey("text_preview", .{ .string = preview });
+    try putOptionalString(&qrow, "route_id", input.route_id);
+    try putOptionalString(&qrow, "clause_id", input.clause_id);
+    try putOptionalString(&qrow, "trigger_id", input.trigger_id);
+    try putOptionalString(&qrow, "artifact_ref", input.artifact_ref);
+    try qrow.putOwnedKey("confidence", .{ .float = skill_decision_signals.confidenceForSignal(input.signal_kind) });
+    try qrow.putOwnedKey("contamination_flags", .{ .string = skill_decision_signals.contaminationFlags(input.source_text) });
+    try out_rows.append(allocator, qrow);
+}
+
+fn appendSkillDollarSignalsForMessage(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    row: datasets.messages.MessageRow,
+    session_id: []const u8,
+) !void {
+    var cursor: usize = 0;
+    while (skill_decision_signals.nextDollarSkill(row.text, cursor)) |match| {
+        cursor = match.end;
+        const signal_kind = skill_decision_signals.classifySkillMention(row.role, "dollar");
+        try appendSkillDecisionSignalRow(allocator, out_rows, .{
+            .path = row.path,
+            .session_id = session_id,
+            .timestamp = row.timestamp,
+            .source_kind = "messages",
+            .signal_kind = signal_kind,
+            .skill = match.skill,
+            .source_text = row.text,
+        });
+        if (containsTargetLensMarker(row.text)) {
+            try appendSkillDecisionSignalRow(allocator, out_rows, .{
+                .path = row.path,
+                .session_id = session_id,
+                .timestamp = row.timestamp,
+                .source_kind = "messages",
+                .signal_kind = .target_lens_use,
+                .skill = match.skill,
+                .source_text = row.text,
+            });
+        }
+    }
+}
+
+fn containsTargetLensMarker(text: []const u8) bool {
+    return containsIgnoreCaseAscii(text, "target_skill") or
+        containsIgnoreCaseAscii(text, "target skill") or
+        containsIgnoreCaseAscii(text, "skill lens") or
+        containsIgnoreCaseAscii(text, "root-equivalent") or
+        containsIgnoreCaseAscii(text, "root equivalent");
+}
+
+fn appendReceiptSignalsForMessage(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    row: datasets.messages.MessageRow,
+    session_id: []const u8,
+) !void {
+    if (std.mem.indexOf(u8, row.text, "skill_decision_receipt") == null) return;
+    var parsed = skill_decision_receipt.parseText(allocator, row.text) catch return;
+    defer parsed.deinit();
+
+    try appendSkillDecisionSignalRow(allocator, out_rows, .{
+        .path = row.path,
+        .session_id = session_id,
+        .timestamp = row.timestamp,
+        .source_kind = "messages",
+        .signal_kind = .receipt,
+        .skill = parsed.receipt.skill,
+        .source_text = row.text,
+    });
+    if (parsed.receipt.selected_route.len > 0) {
+        try appendSkillDecisionSignalRow(allocator, out_rows, .{
+            .path = row.path,
+            .session_id = session_id,
+            .timestamp = row.timestamp,
+            .source_kind = "messages",
+            .signal_kind = .selected_route,
+            .skill = parsed.receipt.skill,
+            .source_text = row.text,
+            .route_id = parsed.receipt.selected_route,
+        });
+    }
+    for (parsed.receipt.rejected_routes) |route| {
+        try appendSkillDecisionSignalRow(allocator, out_rows, .{
+            .path = row.path,
+            .session_id = session_id,
+            .timestamp = row.timestamp,
+            .source_kind = "messages",
+            .signal_kind = .rejected_route,
+            .skill = parsed.receipt.skill,
+            .source_text = row.text,
+            .route_id = route,
+        });
+    }
+}
+
+fn appendDecisionMarkerSignalsForMessage(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    row: datasets.messages.MessageRow,
+    session_id: []const u8,
+) !void {
+    if (std.mem.indexOf(u8, row.text, "skill_decision_receipt") != null) return;
+    const markers = [_]struct {
+        needle: []const u8,
+        kind: skill_decision_signals.SignalKind,
+    }{
+        .{ .needle = "selected_route", .kind = .selected_route },
+        .{ .needle = "rejected_route", .kind = .rejected_route },
+        .{ .needle = "prevented", .kind = .prevented_action },
+        .{ .needle = "narrowed scope", .kind = .scope_narrowing },
+        .{ .needle = "proof", .kind = .proof_change },
+        .{ .needle = "blocked", .kind = .block_or_escalation },
+        .{ .needle = "validation pass", .kind = .validation_pass },
+        .{ .needle = "validation fail", .kind = .validation_fail },
+        .{ .needle = "commit", .kind = .commit },
+        .{ .needle = "push", .kind = .push },
+        .{ .needle = "pull request", .kind = .pr },
+        .{ .needle = "review reopen", .kind = .review_reopen },
+        .{ .needle = "reversal", .kind = .reversal },
+        .{ .needle = "closure", .kind = .closure },
+    };
+    for (markers) |marker| {
+        if (!containsIgnoreCaseAscii(row.text, marker.needle)) continue;
+        try appendSkillDecisionSignalRow(allocator, out_rows, .{
+            .path = row.path,
+            .session_id = session_id,
+            .timestamp = row.timestamp,
+            .source_kind = "messages",
+            .signal_kind = marker.kind,
+            .source_text = row.text,
+        });
+    }
+}
+
+fn skillFromInvocationRecord(record: InvocationRecord) ?[]const u8 {
+    if (record.command_text) |text| {
+        if (skill_decision_signals.skillFromSkillFileReadText(text)) |skill| return skill;
+    }
+    if (record.arguments_text) |text| {
+        if (skill_decision_signals.skillFromSkillFileReadText(text)) |skill| return skill;
+    }
+    if (record.input_text) |text| {
+        if (skill_decision_signals.skillFromSkillFileReadText(text)) |skill| return skill;
+    }
+    return null;
+}
+
+fn sha256HexAlloc(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(text, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return allocator.dupe(u8, hex[0..]);
+}
+
+fn collectSkillContractClauseRows(
+    allocator: std.mem.Allocator,
+    query_params: []const spec.ParamSpec,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    const contract_path = paramString(query_params, "contract") orelse return;
+    var loaded = try loadSkillDecisionContractPath(allocator, contract_path, paramString(query_params, "contract_authority") orelse "explicit");
+    errdefer loaded.deinit(allocator);
+    const skill_name = if (paramString(query_params, "skill")) |skill| skill else (loaded.contract() orelse return).skill_name;
+    var audit = SkillDecisionAudit{
+        .target_skill = skill_name,
+        .contract = loaded,
+    };
+    defer audit.deinit(allocator);
+    loaded = .{};
+    try appendContractClauseRows(allocator, &audit);
+    for (audit.clauses.items) |*row| {
+        try out_rows.append(allocator, try row.cloneAll(allocator));
+    }
+}
+
+fn collectSkillDecisionReceiptDatasetRows(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    day_filter: ?SessionDayPathFilter,
+    query_params: []const spec.ParamSpec,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    var paths = try collectSkillDecisionDatasetPaths(allocator, sessions_root, day_filter, query_params);
+    defer freePathList(allocator, &paths);
+    const target_skill = paramString(query_params, "skill");
+    for (paths.items) |path| {
+        const content = try readFileAllocOrSkip(allocator, path);
+        if (content == null) continue;
+        defer allocator.free(content.?);
+        try collectReceiptDatasetRowsFromSession(allocator, out_rows, path, content.?, target_skill);
+    }
+}
+
+fn collectSkillDecisionEpisodeDatasetRows(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    day_filter: ?SessionDayPathFilter,
+    query_params: []const spec.ParamSpec,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    var paths = try collectSkillDecisionDatasetPaths(allocator, sessions_root, day_filter, query_params);
+    defer freePathList(allocator, &paths);
+    const target_skill = paramString(query_params, "skill");
+    for (paths.items) |path| {
+        const content = try readFileAllocOrSkip(allocator, path);
+        if (content == null) continue;
+        defer allocator.free(content.?);
+        const messages = try datasets.messages.parseJsonl(allocator, path, content.?, .{
+            .strip_skill_blocks = true,
+            .dedupe_by_role_and_text = true,
+        });
+        defer datasets.messages.freeRows(allocator, messages);
+        for (messages) |row| {
+            if (std.mem.indexOf(u8, row.text, "skill_decision_receipt") == null) continue;
+            var parsed = skill_decision_receipt.parseText(allocator, row.text) catch continue;
+            defer parsed.deinit();
+            if (target_skill) |skill| if (!eqlIgnoreCaseAscii(parsed.receipt.skill, skill)) continue;
+            const outcome = firstOutcomeAfter(messages, row.timestamp);
+            var qrow = query.Row.init(allocator);
+            errdefer qrow.deinit();
+            const decision_id = if (parsed.receipt.decision_id.len > 0) parsed.receipt.decision_id else "unknown";
+            const episode_id = try std.fmt.allocPrint(allocator, "{s}:receipt:{s}", .{ inferSessionIdFromPath(path), decision_id });
+            defer allocator.free(episode_id);
+            const rejected = try joinStringListSep(allocator, parsed.receipt.rejected_routes, ",");
+            defer allocator.free(rejected);
+            const clauses = try joinStringListSep(allocator, parsed.receipt.clause_refs, ",");
+            defer allocator.free(clauses);
+            try qrow.putOwnedKey("decision_id", .{ .string = decision_id });
+            try qrow.putOwnedKey("episode_id", .{ .string = episode_id });
+            try qrow.putOwnedKey("session_id", .{ .string = inferSessionIdFromPath(path) });
+            try qrow.putOwnedKey("root_session_id", .{ .string = inferSessionIdFromPath(path) });
+            try qrow.putOwnedKey("worker_session_id", .null);
+            try qrow.putOwnedKey("skill", .{ .string = parsed.receipt.skill });
+            try qrow.putOwnedKey("skill_version", .{ .string = parsed.receipt.skill_version });
+            try qrow.putOwnedKey("contract_fingerprint", .{ .string = parsed.receipt.skill_contract_fingerprint });
+            try qrow.putOwnedKey("contract_authority", .{ .string = "receipt" });
+            try putOptionalString(&qrow, "start_timestamp", row.timestamp);
+            try putOptionalString(&qrow, "end_timestamp", row.timestamp);
+            try qrow.putOwnedKey("trigger_observed", .{ .bool = parsed.receipt.trigger_refs.len > 0 });
+            try qrow.putOwnedKey("activation_class", .{ .string = "receipt" });
+            try qrow.putOwnedKey("question_preview", .{ .string = if (parsed.receipt.question.len > 0) parsed.receipt.question else "unknown" });
+            try qrow.putOwnedKey("alternatives", .{ .string = "" });
+            try qrow.putOwnedKey("selected_route", .{ .string = parsed.receipt.selected_route });
+            try qrow.putOwnedKey("rejected_routes", .{ .string = rejected });
+            try qrow.putOwnedKey("clause_refs", .{ .string = clauses });
+            try qrow.putOwnedKey("decision_effect", .{ .string = if (parsed.receipt.rejected_routes.len > 0) "explicit_route_change" else "unknown" });
+            try qrow.putOwnedKey("evidence_strength", .{ .string = "explicit" });
+            try qrow.putOwnedKey("outcome_class", .{ .string = outcome.kind });
+            try qrow.putOwnedKey("later_reopened", .{ .bool = std.mem.eql(u8, outcome.kind, "review_reopen") });
+            try qrow.putOwnedKey("later_reversed", .{ .bool = std.mem.eql(u8, outcome.kind, "reversal") });
+            try qrow.putOwnedKey("artifact_state", .{ .string = if (parsed.receipt.artifact_state_present) "present" else "unknown" });
+            try qrow.putOwnedKey("evidence_refs", .{ .string = "sdr" });
+            try qrow.putOwnedKey("counterevidence_refs", .{ .string = "" });
+            try qrow.putOwnedKey("contamination_flags", .{ .string = skill_decision_signals.contaminationFlags(row.text) });
+            try out_rows.append(allocator, qrow);
+        }
+    }
+}
+
+fn collectSkillDecisionOutcomeDatasetRows(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    day_filter: ?SessionDayPathFilter,
+    query_params: []const spec.ParamSpec,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    var episodes: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &episodes);
+    try collectSkillDecisionEpisodeDatasetRows(allocator, sessions_root, day_filter, query_params, &episodes);
+    for (episodes.items) |episode| {
+        const kind = scalarString(episode.valueOrNull("outcome_class")) orelse "unknown";
+        if (std.mem.eql(u8, kind, "unknown")) continue;
+        var row = query.Row.init(allocator);
+        errdefer row.deinit();
+        try row.putOwnedKey("episode_id", episode.valueOrNull("episode_id"));
+        try row.putOwnedKey("timestamp", episode.valueOrNull("end_timestamp"));
+        try row.putOwnedKey("outcome_kind", .{ .string = kind });
+        try row.putOwnedKey("outcome_value", .{ .string = kind });
+        try row.putOwnedKey("proof_ref", .null);
+        try row.putOwnedKey("artifact_state", episode.valueOrNull("artifact_state"));
+        try row.putOwnedKey("association_method", .{ .string = "same_session_after_episode" });
+        try row.putOwnedKey("distance_turns", .null);
+        try row.putOwnedKey("distance_seconds", .null);
+        try row.putOwnedKey("causal_claim_allowed", .{ .bool = false });
+        try out_rows.append(allocator, row);
+    }
+}
+
+fn collectSkillDecisionDatasetPaths(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    day_filter: ?SessionDayPathFilter,
+    query_params: []const spec.ParamSpec,
+) !std.ArrayList([]u8) {
+    const opts = Options{
+        .path = paramString(query_params, "path"),
+        .session_id = paramString(query_params, "session_id"),
+    };
+    if (opts.path != null or opts.session_id != null) {
+        return resolveSessionPromptInputPaths(allocator, sessions_root, opts, day_filter);
+    }
+    return collectJsonlPaths(allocator, sessions_root, day_filter);
+}
+
+fn collectReceiptDatasetRowsFromSession(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    path: []const u8,
+    content: []const u8,
+    target_skill: ?[]const u8,
+) !void {
+    const messages = try datasets.messages.parseJsonl(allocator, path, content, .{
+        .strip_skill_blocks = true,
+        .dedupe_by_role_and_text = true,
+    });
+    defer datasets.messages.freeRows(allocator, messages);
+    for (messages) |row| {
+        if (std.mem.indexOf(u8, row.text, "skill_decision_receipt") == null) continue;
+        var parsed = skill_decision_receipt.parseText(allocator, row.text) catch continue;
+        defer parsed.deinit();
+        if (target_skill) |skill| if (!eqlIgnoreCaseAscii(parsed.receipt.skill, skill)) continue;
+        const report = try skill_decision_receipt.validateParsed(allocator, parsed.receipt, target_skill, null);
+        defer report.deinit(allocator);
+        const triggers = try joinStringListSep(allocator, parsed.receipt.trigger_refs, ",");
+        defer allocator.free(triggers);
+        const clauses = try joinStringListSep(allocator, parsed.receipt.clause_refs, ",");
+        defer allocator.free(clauses);
+        const alternatives = try joinStringListSep(allocator, parsed.receipt.alternatives_considered, ",");
+        defer allocator.free(alternatives);
+        const rejected = try joinStringListSep(allocator, parsed.receipt.rejected_routes, ",");
+        defer allocator.free(rejected);
+        const evidence = try joinStringListSep(allocator, parsed.receipt.evidence_refs, ",");
+        defer allocator.free(evidence);
+        const codes = try joinStringListSep(allocator, report.codes, ",");
+        defer allocator.free(codes);
+        var qrow = query.Row.init(allocator);
+        errdefer qrow.deinit();
+        try putOptionalString(&qrow, "timestamp", row.timestamp);
+        try qrow.putOwnedKey("path", .{ .string = path });
+        try qrow.putOwnedKey("session_id", .{ .string = inferSessionIdFromPath(path) });
+        try qrow.putOwnedKey("worker_kind", .{ .string = "root" });
+        try qrow.putOwnedKey("decision_id", .{ .string = parsed.receipt.decision_id });
+        try qrow.putOwnedKey("skill", .{ .string = parsed.receipt.skill });
+        try qrow.putOwnedKey("skill_version", .{ .string = parsed.receipt.skill_version });
+        try qrow.putOwnedKey("contract_fingerprint", .{ .string = parsed.receipt.skill_contract_fingerprint });
+        try qrow.putOwnedKey("trigger_refs", .{ .string = triggers });
+        try qrow.putOwnedKey("clause_refs", .{ .string = clauses });
+        try qrow.putOwnedKey("question", .{ .string = parsed.receipt.question });
+        try qrow.putOwnedKey("alternatives_considered", .{ .string = alternatives });
+        try qrow.putOwnedKey("selected_route", .{ .string = parsed.receipt.selected_route });
+        try qrow.putOwnedKey("rejected_routes", .{ .string = rejected });
+        try qrow.putOwnedKey("expected_outcome", .{ .string = parsed.receipt.expected_outcome });
+        try qrow.putOwnedKey("artifact_state_json", .{ .string = if (parsed.receipt.artifact_state_present) "{}" else "null" });
+        try qrow.putOwnedKey("evidence_refs", .{ .string = evidence });
+        try qrow.putOwnedKey("valid", .{ .bool = report.valid });
+        try qrow.putOwnedKey("validation_codes", .{ .string = codes });
+        try out_rows.append(allocator, qrow);
     }
 }
 
@@ -17911,6 +19684,11 @@ fn parseOptionsForCommand(cmd: lib.Command, args: []const []const u8) !Options {
         opts.index_action = args[0];
         return opts;
     }
+    if ((cmd == .skill_contract or cmd == .skill_decision_receipt) and args.len > 0 and !std.mem.startsWith(u8, args[0], "-")) {
+        var opts = try parseOptions(args[1..]);
+        opts.command_action = args[0];
+        return opts;
+    }
     return parseOptions(args);
 }
 
@@ -17956,6 +19734,10 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.out_path = args[i];
+        } else if (std.mem.eql(u8, arg, "--file")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.file_text = args[i];
         } else if (std.mem.eql(u8, arg, "--dataset")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -17968,6 +19750,22 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.skill = args[i];
+        } else if (std.mem.eql(u8, arg, "--skill-root")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.skill_root_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--contract")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.contract_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--contract-authority")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.contract_authority_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--causality")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.causality_text = args[i];
         } else if (std.mem.eql(u8, arg, "--workflow")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -18174,6 +19972,10 @@ fn parseOptions(args: []const []const u8) !Options {
             opts.opencode_source_text = args[i];
         } else if (std.mem.eql(u8, arg, "--include-raw")) {
             opts.include_raw = true;
+        } else if (std.mem.eql(u8, arg, "--include-workers")) {
+            opts.include_workers = true;
+        } else if (std.mem.eql(u8, arg, "--include-excerpts")) {
+            opts.include_excerpts = true;
         } else if (std.mem.eql(u8, arg, "--include-parts")) {
             opts.include_raw = true;
         } else if (std.mem.eql(u8, arg, "--include-body")) {
@@ -19639,6 +21441,51 @@ test "skill-evidence gates cursor and json-only output" {
     try std.testing.expectError(error.UnsupportedOption, validateCommandOptions(.message_audit, .{ .since_cursor_text = "{}" }));
     try validateFormatForCommand(.skill_evidence, .{ .format = .json });
     try std.testing.expectError(error.InvalidFormatForCommand, validateFormatForCommand(.skill_evidence, .{ .format = .jsonl }));
+}
+
+test "skill-decision-audit gates required skill scope and modes" {
+    try validateCommandOptions(.skill_decision_audit, .{
+        .skill = "team-patterns",
+        .session_id = "abc",
+        .mode = "tune-packet",
+        .causality_text = "strong",
+        .since_cursor_text = "{}",
+    });
+    try validateCommandOptions(.skill_decision_audit, .{
+        .skill = "team-patterns",
+        .last_text = "30d",
+        .mode = "summary",
+        .contract_authority_text = "inferred",
+        .include_workers = true,
+        .include_excerpts = true,
+    });
+    try std.testing.expectError(error.MissingArgValue, validateCommandOptions(.skill_decision_audit, .{ .session_id = "abc" }));
+    try std.testing.expectError(error.MissingArgValue, validateCommandOptions(.skill_decision_audit, .{ .skill = "team-patterns" }));
+    try std.testing.expectError(error.InvalidModeArg, validateCommandOptions(.skill_decision_audit, .{ .skill = "team-patterns", .session_id = "abc", .mode = "bad" }));
+    try std.testing.expectError(error.UnsupportedOption, validateCommandOptions(.message_audit, .{ .contract_text = "contract.yaml" }));
+    try validateFormatForCommand(.skill_decision_audit, .{ .format = .markdown });
+    try std.testing.expectError(error.InvalidFormatForCommand, validateFormatForCommand(.skill_decision_audit, .{ .format = .dot }));
+}
+
+test "skill companion command actions parse and validate" {
+    const contract_args = [_][]const u8{ "validate", "--file", "contract.yaml", "--format", "json" };
+    const contract_opts = try parseOptionsForCommand(.skill_contract, contract_args[0..]);
+    try std.testing.expect(std.mem.eql(u8, contract_opts.command_action.?, "validate"));
+    try std.testing.expect(std.mem.eql(u8, contract_opts.file_text.?, "contract.yaml"));
+    try validateCommandOptions(.skill_contract, contract_opts);
+
+    const receipt_args = [_][]const u8{ "validate", "--file", "receipt.json" };
+    const receipt_opts = try parseOptionsForCommand(.skill_decision_receipt, receipt_args[0..]);
+    try std.testing.expect(std.mem.eql(u8, receipt_opts.command_action.?, "validate"));
+    try validateCommandOptions(.skill_decision_receipt, receipt_opts);
+
+    try std.testing.expectError(error.UnknownArgument, parseOptionsForCommand(.skill_decision_audit, &.{"validate"}));
+    try std.testing.expectError(error.MissingArgValue, validateCommandOptions(.skill_contract, .{}));
+}
+
+test "capabilities supports json output" {
+    try validateFormatForCommand(.capabilities, .{ .format = .json });
+    try std.testing.expectError(error.InvalidFormatForCommand, validateFormatForCommand(.capabilities, .{ .format = .markdown }));
 }
 
 test "skill-audit supports exclude-current option" {
@@ -21651,6 +23498,143 @@ test "skill-blocks term modes count distinct aggregate block text" {
     try std.testing.expect(std.mem.indexOf(u8, summary_got, "\"blocks_scanned\": 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary_got, "\"matching_blocks\": 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary_got, "\"term_occurrence_count\": 3") != null);
+}
+
+test "skill_decision_signals dataset emits activation receipt route and tool read rows" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/04/01");
+    const session_rel = "2026/04/01/rollout-2026-04-01T10-00-00-019d0000-0000-7000-8000-000000000001.jsonl";
+    const session_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-04-01T10:00:00Z\",\"payload\":{\"id\":\"019d0000-0000-7000-8000-000000000001\",\"cwd\":\"/repo\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-04-01T10:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Use $team-patterns for this decision.\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-04-01T10:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"skill_decision_receipt:\\n  receipt_version: SDR-v1\\n  decision_id: dec-1\\n  skill: team-patterns\\n  selected_route: route-a\\n  rejected_routes: [route-b]\\n  artifact_state: clean\\n\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-04-01T10:00:03Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"tool-1\",\"arguments\":\"{\\\"cmd\\\":\\\"sed -n '1,20p' /Users/tk/.dotfiles/codex/skills/team-patterns/SKILL.md\\\"}\"}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = session_rel, .data = session_content });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+
+    var rows = try collectDatasetRows(std.testing.allocator, "skill_decision_signals", root_abs, &.{}, &.{});
+    defer deinitQueryRows(std.testing.allocator, &rows);
+
+    var saw_activation = false;
+    var saw_receipt = false;
+    var saw_selected_route = false;
+    var saw_rejected_route = false;
+    var saw_tool_read = false;
+    for (rows.items) |row| {
+        if (scalarStringEq(row.valueOrNull("signal_kind"), "explicit_user_activation") and
+            scalarStringEq(row.valueOrNull("skill"), "team-patterns"))
+        {
+            saw_activation = true;
+            try std.testing.expect(scalarString(row.valueOrNull("text_digest")) != null);
+        }
+        if (scalarStringEq(row.valueOrNull("signal_kind"), "receipt") and
+            scalarStringEq(row.valueOrNull("skill"), "team-patterns"))
+        {
+            saw_receipt = true;
+        }
+        if (scalarStringEq(row.valueOrNull("signal_kind"), "selected_route") and
+            scalarStringEq(row.valueOrNull("route_id"), "route-a"))
+        {
+            saw_selected_route = true;
+        }
+        if (scalarStringEq(row.valueOrNull("signal_kind"), "rejected_route") and
+            scalarStringEq(row.valueOrNull("route_id"), "route-b"))
+        {
+            saw_rejected_route = true;
+        }
+        if (scalarStringEq(row.valueOrNull("signal_kind"), "skill_file_read") and
+            scalarStringEq(row.valueOrNull("tool_call_id"), "tool-1") and
+            scalarStringEq(row.valueOrNull("skill"), "team-patterns"))
+        {
+            saw_tool_read = true;
+        }
+    }
+
+    try std.testing.expect(saw_activation);
+    try std.testing.expect(saw_receipt);
+    try std.testing.expect(saw_selected_route);
+    try std.testing.expect(saw_rejected_route);
+    try std.testing.expect(saw_tool_read);
+}
+
+test "skill_decision_episodes keeps outcome association non-causal" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/04/02");
+    const session_rel = "2026/04/02/rollout-2026-04-02T10-00-00-019d0000-0000-7000-8000-000000000002.jsonl";
+    const session_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-04-02T10:00:00Z\",\"payload\":{\"id\":\"019d0000-0000-7000-8000-000000000002\",\"cwd\":\"/repo\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-04-02T10:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"skill_decision_receipt:\\n  receipt_version: SDR-v1\\n  decision_id: dec-2\\n  skill: team-patterns\\n  selected_route: route-a\\n  rejected_routes: [route-b]\\n  artifact_state: clean\\n\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-04-02T10:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"validation pass on the same artifact state\"}]}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = session_rel, .data = session_content });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+
+    var episodes = try collectDatasetRows(std.testing.allocator, "skill_decision_episodes", root_abs, &.{}, &.{});
+    defer deinitQueryRows(std.testing.allocator, &episodes);
+    try std.testing.expectEqual(@as(usize, 1), episodes.items.len);
+    try std.testing.expect(scalarStringEq(episodes.items[0].valueOrNull("decision_effect"), "explicit_route_change"));
+    try std.testing.expect(scalarStringEq(episodes.items[0].valueOrNull("evidence_strength"), "explicit"));
+    try std.testing.expect(scalarStringEq(episodes.items[0].valueOrNull("outcome_class"), "proof_pass"));
+
+    var outcomes = try collectDatasetRows(std.testing.allocator, "skill_decision_outcomes", root_abs, &.{}, &.{});
+    defer deinitQueryRows(std.testing.allocator, &outcomes);
+    try std.testing.expectEqual(@as(usize, 1), outcomes.items.len);
+    try std.testing.expect(scalarStringEq(outcomes.items[0].valueOrNull("outcome_kind"), "proof_pass"));
+    try std.testing.expectEqual(false, outcomes.items[0].valueOrNull("causal_claim_allowed").bool);
+}
+
+test "skill_decision_audit firewall excludes weak presence from episodes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/04/03");
+    const raw_rel = "2026/04/03/rollout-raw-mention.jsonl";
+    const block_rel = "2026/04/03/rollout-block-only.jsonl";
+    const read_rel = "2026/04/03/rollout-read-only.jsonl";
+    const raw_content =
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-04-03T10:00:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"team-patterns is mentioned here, but no decision route is selected.\"}]}}\n";
+    const block_content =
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-04-03T10:01:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"<skill>\\n<name>team-patterns</name>\\nbody\\n</skill>\"}]}}\n";
+    const read_content =
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-04-03T10:02:00Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"read-1\",\"arguments\":\"{\\\"cmd\\\":\\\"sed -n '1,20p' /Users/tk/.dotfiles/codex/skills/team-patterns/SKILL.md\\\"}\"}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = raw_rel, .data = raw_content });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = block_rel, .data = block_content });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = read_rel, .data = read_content });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+
+    var episodes = try collectDatasetRows(std.testing.allocator, "skill_decision_episodes", root_abs, &.{}, &.{});
+    defer deinitQueryRows(std.testing.allocator, &episodes);
+    try std.testing.expectEqual(@as(usize, 0), episodes.items.len);
+
+    const raw_abs = try std.fs.path.join(std.testing.allocator, &.{ root_abs, raw_rel });
+    defer std.testing.allocator.free(raw_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "empty-audit.json" });
+    defer std.testing.allocator.free(output_path);
+    const args = [_][]const u8{
+        "--root",
+        root_abs,
+        "--skill",
+        "team-patterns",
+        "--path",
+        raw_abs,
+        "--mode",
+        "tune-packet",
+        "--format",
+        "json",
+    };
+    const got = try runCommandWithOutput(std.testing.allocator, .skill_decision_audit, args[0..], output_path);
+    defer std.testing.allocator.free(got);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"candidate_sessions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"decision_episodes\": 0") != null);
 }
 
 test "skill-blocks term modes fail closed on missing groups and raw history" {

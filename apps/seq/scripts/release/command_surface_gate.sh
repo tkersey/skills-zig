@@ -52,6 +52,22 @@ if ! "$BIN_PATH" --help | rg -q '^- skill-audit$'; then
   echo "required command missing: skill-audit" >&2
   exit 1
 fi
+if ! "$BIN_PATH" --help | rg -q '^- skill-decision-audit$'; then
+  echo "required command missing: skill-decision-audit" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" --help | rg -q '^- skill-contract$'; then
+  echo "required command missing: skill-contract" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" --help | rg -q '^- skill-decision-receipt$'; then
+  echo "required command missing: skill-decision-receipt" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" --help | rg -q '^- capabilities$'; then
+  echo "required command missing: capabilities" >&2
+  exit 1
+fi
 if ! "$BIN_PATH" --help | rg -q '^- tool-audit$'; then
   echo "required command missing: tool-audit" >&2
   exit 1
@@ -122,6 +138,26 @@ if ! "$BIN_PATH" skill-blocks --help | rg -q -- '--mode blocks|term-counts|term-
 fi
 if ! "$BIN_PATH" skill-blocks --help | rg -q -- '--term-group <name=csv>'; then
   echo "skill-blocks help missing --term-group support" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" skill-decision-audit --help | rg -q -- '--contract <path>'; then
+  echo "skill-decision-audit help missing --contract support" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" skill-decision-audit --help | rg -q -- 'tune-packet'; then
+  echo "skill-decision-audit help missing tune-packet mode" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" skill-contract --help | rg -q -- 'validate --file'; then
+  echo "skill-contract help missing validate surface" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" skill-decision-receipt --help | rg -q -- 'validate --file'; then
+  echo "skill-decision-receipt help missing validate surface" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" capabilities --format json | rg -q -- '"skill_decision_audit": true'; then
+  echo "capabilities missing skill_decision_audit=true" >&2
   exit 1
 fi
 if ! "$BIN_PATH" workflow-overlap --help | rg -q -- '--mode summary|sessions'; then

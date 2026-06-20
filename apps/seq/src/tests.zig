@@ -24,6 +24,9 @@ comptime {
     _ = @import("datasets/token_deltas.zig");
     _ = @import("datasets/token_sessions.zig");
     _ = @import("token_cost.zig");
+    _ = @import("skill_contract.zig");
+    _ = @import("skill_decision_receipt.zig");
+    _ = @import("skill_decision_signals.zig");
     _ = @import("datasets/tool_calls.zig");
     _ = @import("datasets/memory_files.zig");
     _ = @import("datasets/memory_blocks.zig");
@@ -47,6 +50,9 @@ test "bootstrap parse coverage" {
     try std.testing.expectEqual(lib.Command.skill_trend, lib.parseCommand("skill-trend"));
     try std.testing.expectEqual(lib.Command.skill_report, lib.parseCommand("skill-report"));
     try std.testing.expectEqual(lib.Command.skill_audit, lib.parseCommand("skill-audit"));
+    try std.testing.expectEqual(lib.Command.skill_decision_audit, lib.parseCommand("skill-decision-audit"));
+    try std.testing.expectEqual(lib.Command.skill_contract, lib.parseCommand("skill-contract"));
+    try std.testing.expectEqual(lib.Command.skill_decision_receipt, lib.parseCommand("skill-decision-receipt"));
     try std.testing.expectEqual(lib.Command.skill_blocks, lib.parseCommand("skill-blocks"));
     try std.testing.expectEqual(lib.Command.artifact_search, lib.parseCommand("artifact-search"));
     try std.testing.expectEqual(lib.Command.tool_audit, lib.parseCommand("tool-audit"));
@@ -80,6 +86,7 @@ test "bootstrap parse coverage" {
     try std.testing.expectEqual(lib.Command.workflow_overlap, lib.parseCommand("workflow-overlap"));
     try std.testing.expectEqual(lib.Command.session_tooling, lib.parseCommand("session-tooling"));
     try std.testing.expectEqual(lib.Command.query_diagnose, lib.parseCommand("query-diagnose"));
+    try std.testing.expectEqual(lib.Command.capabilities, lib.parseCommand("capabilities"));
     try std.testing.expectEqual(lib.Command.memory_provenance, lib.parseCommand("memory-provenance"));
     try std.testing.expectEqual(lib.Command.memory_map, lib.parseCommand("memory-map"));
     try std.testing.expectEqual(lib.Command.memory_history, lib.parseCommand("memory-history"));
