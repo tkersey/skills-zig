@@ -138,19 +138,22 @@ seq resolve-churn-audit --root ~/.codex/sessions --since 2026-05-01T00:00:00-07:
 seq resolve-churn-audit --root ~/.codex/sessions --since 2026-05-01T00:00:00Z --until 2026-06-01T00:00:00Z --repo /Users/tk/workspace/tk/skills-zig --format json
 ```
 
-`review-compiler-audit` emits the C3 / legacy-cleanroom `$resolve` Review Compiler ledger:
+`review-compiler-audit` emits separate `$resolve` Review Compiler ledgers for MBK, C3/MRPC, and legacy-cleanroom protocols:
 - requires `--since`, `--until`, and `--repo`
-- supports `--protocol auto|legacy-cleanroom|c3` (default `auto`)
+- supports `--protocol auto|legacy-cleanroom|c3|c3-mrpc|mbk` (default `auto`)
 - supports `--exclude-current` to avoid counting the active audit session
 - emits `markdown` by default or `json` with `--format json`
 - uses transcript/session evidence as primary workflow attribution and Git/tool lifecycle only as supplemental repo evidence
-- treats raw `$resolve` mentions as denominator candidates only; true C3 sessions require assistant/tool evidence for `review_compile.py begin`, `.resolve-c3/state.json`, `minimal_review_patch_certificate`, or `MRPC-v1`
-- renders historical cleanroom counters under `legacy_cleanroom` and C3/MRPC counters under protocol-specific sections without combining the families
+- treats raw `$resolve` mentions as candidate sessions only; MBK activation requires MBKC evidence such as `MBKC-v1`, `minimum_behavioral_kernel`, `resolve-c3 campaign begin`, `kernel-accepted`, or `terminal-closed`
+- keeps historical `legacy-cleanroom` and C3/MRPC counts separate; `c3-mrpc` is an explicit alias for the existing MRPC-era `c3` behavior
+- reports MBK semantic-surface metrics separately from base-relative Git tree metrics
 
 Examples:
 ```bash
 seq review-compiler-audit --root ~/.codex/sessions --protocol auto --since 2026-05-01T00:00:00-07:00 --until 2026-06-01T00:00:00-07:00 --repo /Users/tk/workspace/tk/skills-zig --exclude-current --format markdown
 seq review-compiler-audit --root ~/.codex/sessions --protocol c3 --since 2026-05-01T00:00:00Z --until 2026-06-01T00:00:00Z --repo /Users/tk/workspace/tk/skills-zig --format json
+seq review-compiler-audit --root ~/.codex/sessions --protocol c3-mrpc --since 2026-05-01T00:00:00Z --until 2026-06-01T00:00:00Z --repo /Users/tk/workspace/tk/skills-zig --format json
+seq review-compiler-audit --root ~/.codex/sessions --protocol mbk --since 2026-05-01T00:00:00Z --until 2026-06-01T00:00:00Z --repo /Users/tk/workspace/tk/skills-zig --format json
 seq review-compiler-audit --root ~/.codex/sessions --protocol legacy-cleanroom --since 2026-05-01T00:00:00Z --until 2026-06-01T00:00:00Z --repo /Users/tk/workspace/tk/skills-zig --format json
 ```
 
