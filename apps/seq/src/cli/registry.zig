@@ -44,6 +44,35 @@ const session_flags = [_]FlagSpec{
     .{ .name = "--stats", .value_kind = .bool, .help = "Emit SeqStats counters" },
 };
 
+const skill_decision_audit_flags = [_]FlagSpec{
+    .{ .name = "--skill", .value_kind = .string, .required = true, .help = "Target skill name" },
+    .{ .name = "--root", .value_kind = .path, .help = "Codex sessions root" },
+    .{ .name = "--session-id", .value_kind = .string, .help = "Scan one session by id" },
+    .{ .name = "--path", .value_kind = .path, .help = "Scan one rollout JSONL path" },
+    .{ .name = "--repo", .value_kind = .path, .help = "Filter by repository root" },
+    .{ .name = "--workdir", .value_kind = .path, .help = "Filter by workdir" },
+    .{ .name = "--last", .value_kind = .duration, .help = "Relative window" },
+    .{ .name = "--since", .value_kind = .string, .help = "Inclusive start timestamp" },
+    .{ .name = "--until", .value_kind = .string, .help = "Inclusive end timestamp" },
+    .{ .name = "--mode", .value_kind = .string, .help = "summary, episodes, misses, clauses, outcomes, tune-packet, or delta" },
+    .{ .name = "--causality", .value_kind = .string, .help = "explicit, strong, associated, or any" },
+    .{ .name = "--format", .value_kind = .format, .help = "Output format" },
+};
+
+const skill_contract_flags = [_]FlagSpec{
+    .{ .name = "--file", .value_kind = .path, .help = "Contract file for validate" },
+    .{ .name = "--skill", .value_kind = .string, .help = "Skill name for show/scaffold" },
+    .{ .name = "--skill-root", .value_kind = .path, .help = "Skill root for show" },
+    .{ .name = "--kind", .value_kind = .string, .help = "Contract kind for scaffold" },
+    .{ .name = "--output", .value_kind = .path, .help = "Output path for scaffold" },
+    .{ .name = "--format", .value_kind = .format, .help = "Output format" },
+};
+
+const skill_decision_receipt_flags = [_]FlagSpec{
+    .{ .name = "--file", .value_kind = .path, .required = true, .help = "Receipt file for validate" },
+    .{ .name = "--format", .value_kind = .format, .help = "Output format" },
+};
+
 pub fn commandNames() []const lib.CommandDef {
     return lib.commandNames();
 }
@@ -74,6 +103,10 @@ pub fn commandSpec(command: lib.Command) ?CommandSpec {
 fn summaryFor(command: lib.Command) []const u8 {
     return switch (command) {
         .query => "Run a dataset query spec over local session artifacts",
+        .skill_decision_audit => "Compile deterministic per-skill decision episodes and STE-v1 evidence",
+        .skill_contract => "Validate, show, or scaffold SKDC-v1 decision contracts",
+        .skill_decision_receipt => "Validate SDR-v1 skill decision receipts",
+        .capabilities => "Print seq feature capability flags",
         .sessions => "List canonical session summaries",
         .turns => "List canonical session turns",
         .tool_lifecycle => "List canonical tool lifecycle records",
@@ -85,6 +118,10 @@ fn summaryFor(command: lib.Command) []const u8 {
 fn usageFor(command: lib.Command) []const u8 {
     return switch (command) {
         .query => "seq query --spec <json|@path> [--root <path>] [--stats]",
+        .skill_decision_audit => "seq skill-decision-audit --skill <name> (--session-id <id>|--path <jsonl>|--repo <path>|--workdir <path>|--last <duration>|--since <iso>|--until <iso>)",
+        .skill_contract => "seq skill-contract validate --file <path>",
+        .skill_decision_receipt => "seq skill-decision-receipt validate --file <path>",
+        .capabilities => "seq capabilities [--format json]",
         .sessions => "seq sessions [--root <path>] [--limit N] [--stats]",
         else => "seq <command> [options]",
     };
@@ -93,6 +130,9 @@ fn usageFor(command: lib.Command) []const u8 {
 fn flagsFor(command: lib.Command) []const FlagSpec {
     return switch (command) {
         .query => query_flags[0..],
+        .skill_decision_audit => skill_decision_audit_flags[0..],
+        .skill_contract => skill_contract_flags[0..],
+        .skill_decision_receipt => skill_decision_receipt_flags[0..],
         .sessions => session_flags[0..],
         else => &.{},
     };
@@ -101,6 +141,8 @@ fn flagsFor(command: lib.Command) []const FlagSpec {
 fn defaultFormatFor(command: lib.Command) output.Format {
     return switch (command) {
         .query => .jsonl,
+        .capabilities => .table,
+        .skill_decision_audit => .table,
         .sessions => .table,
         else => .table,
     };
@@ -109,6 +151,8 @@ fn defaultFormatFor(command: lib.Command) output.Format {
 fn allowedFormatsFor(command: lib.Command) []const output.Format {
     return switch (command) {
         .session_graph => &.{ .table, .json, .jsonl, .dot },
+        .skill_decision_audit => &.{ .table, .json, .csv, .jsonl, .markdown },
+        .capabilities, .skill_contract, .skill_decision_receipt => &.{ .table, .json, .csv, .jsonl },
         .session_detail => &.{ .json, .markdown },
         .tail => &.{ .table, .jsonl },
         else => &.{ .table, .json, .csv, .jsonl },

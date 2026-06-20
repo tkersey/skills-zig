@@ -37,6 +37,8 @@ Binary output:
 ./zig-out/bin/seq dataset-schema --dataset tool_call_args
 ./zig-out/bin/seq dataset-schema --dataset goal_runs
 ./zig-out/bin/seq dataset-schema --dataset workflow_signals
+./zig-out/bin/seq dataset-schema --dataset skill_decision_signals
+./zig-out/bin/seq dataset-schema --dataset skill_decision_episodes
 ./zig-out/bin/seq role-breakdown --root ~/.codex/sessions --since 2026-03-01T00:00:00Z --format table
 ./zig-out/bin/seq query --spec '{"dataset":"tool_calls","group_by":["tool"],"metrics":[{"op":"count","as":"count"}],"sort":["-count"],"limit":10,"format":"json"}'
 ./zig-out/bin/seq query --root ~/.codex/sessions --spec '{"dataset":"tool_invocations","where":[{"field":"command_text","op":"contains","value":"learnings recall"}],"select":["path","tool_name","command_text","workdir"],"sort":["timestamp"],"limit":5,"format":"table"}'
@@ -61,6 +63,11 @@ Binary output:
 ./zig-out/bin/seq skill-success-rank --root ~/.codex/sessions --last 14d --format table
 ./zig-out/bin/seq skill-success-rank --root ~/.codex/sessions --skill seq --mode sessions --last 14d --format jsonl
 ./zig-out/bin/seq skill-evidence --root ~/.codex/sessions --session-id <session_id> --skill seq --format json
+./zig-out/bin/seq skill-decision-audit --root ~/.codex/sessions --skill team-patterns --last 30d --mode tune-packet --format json
+./zig-out/bin/seq skill-decision-audit --root ~/.codex/sessions --skill team-patterns --session-id <session_id> --mode episodes --format table
+./zig-out/bin/seq skill-decision-audit --root ~/.codex/sessions --skill team-patterns --session-id <session_id> --since-cursor '<cursor-json-or-token>' --mode delta --format json
+./zig-out/bin/seq skill-contract validate --file codex/skills/team-patterns/references/decision-contract.yaml --format json
+./zig-out/bin/seq skill-decision-receipt validate --file receipt.json --format json
 ./zig-out/bin/seq skill-audit --skill seq --mode trend --since 2026-04-01T00:00:00Z --format table
 ./zig-out/bin/seq skill-audit --skill universalist --mode activation --last 36h --exclude-current --format table
 ./zig-out/bin/seq tool-audit --group-by executable --since 2026-04-01T00:00:00Z --limit 20 --format table
@@ -183,6 +190,35 @@ Examples:
 ```bash
 seq skill-evidence --root ~/.codex/sessions --session-id <session_id> --skill seq --format json
 seq skill-evidence --root ~/.codex/sessions --session-id <session_id> --skill seq --since-cursor '<cursor-token>' --format json
+```
+
+`skill-decision-audit` compiles conservative decision episodes for one skill:
+- requires `--skill <name>` plus a bounded scope such as `--session-id`, `--path`, `--last`, `--since`, `--until`, `--repo`, or `--workdir`
+- treats SDR-v1 receipts as the strongest deterministic decision attribution
+- emits STE-v1 with `--mode tune-packet` for `$tune`, and SDD-v1 with `--mode delta` for watched-session deltas
+- supports SKDC-v1 contracts through `--contract <file>` or `--skill-root <path>` discovery under `<skill>/references/decision-contract.yaml`
+- keeps raw transcript text out of output by default; `--include-excerpts` is explicit and prints a privacy warning
+- associates downstream outcomes without claiming the skill caused the outcome
+- leaves matched-cohort analysis disabled in capabilities as P2/deferred
+
+Companion commands:
+- `skill-contract validate --file <decision-contract.yaml>` validates SKDC-v1 and emits the stable contract fingerprint
+- `skill-contract scaffold --skill <name> --kind decision --output <file>` writes a placeholder contract only; it does not infer semantics
+- `skill-decision-receipt validate --file <receipt.json>` validates SDR-v1 receipts
+- `capabilities --format json` reports `skill_decision_audit`, `skill_decision_delta`, `skill_contract_v1`, `skill_decision_receipt_v1`, and `tune_packet_v1`
+
+Examples:
+```bash
+seq skill-decision-audit --root ~/.codex/sessions --skill team-patterns --last 30d --mode tune-packet --format json
+seq skill-decision-audit --root ~/.codex/sessions --skill team-patterns --session-id <session_id> --mode episodes --format table
+seq skill-decision-audit --root ~/.codex/sessions --skill team-patterns --session-id <session_id> --since-cursor '<cursor-json-or-token>' --mode delta --format json
+seq skill-contract validate --file codex/skills/team-patterns/references/decision-contract.yaml --format json
+```
+
+Decision-audit query datasets:
+```bash
+seq query --root ~/.codex/sessions --spec '{"dataset":"skill_decision_episodes","where":[{"field":"skill","op":"eq","value":"team-patterns"}],"group_by":["decision_effect"],"metrics":[{"op":"count","as":"episodes"}],"sort":["-episodes"],"format":"table"}'
+seq query --root ~/.codex/sessions --spec '{"dataset":"skill_decision_outcomes","where":[{"field":"causal_claim_allowed","op":"eq","value":false}],"select":["episode_id","outcome_kind","association_method"],"limit":20,"format":"table"}'
 ```
 
 ## Trace-native session surfaces
