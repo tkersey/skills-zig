@@ -243,7 +243,7 @@ pub fn main(init: std.process.Init) !void {
         core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
     };
 
-    const code = run(allocator, args) catch |err| blk: {
+    const code = run(allocator, args, init.io) catch |err| blk: {
         try printError(allocator, @errorName(err));
         break :blk @as(u8, 2);
     };
@@ -345,7 +345,7 @@ fn parseCommand(value: []const u8) ?Command {
     return null;
 }
 
-fn run(allocator: std.mem.Allocator, args: Args) !u8 {
+fn run(allocator: std.mem.Allocator, args: Args, process_io: std.Io) !u8 {
     return switch (args.command) {
         .doctor => printDoctor(allocator, args),
         .init => initState(allocator, args),
@@ -356,14 +356,14 @@ fn run(allocator: std.mem.Allocator, args: Args) !u8 {
         .set_basis => setBasis(allocator, args),
         .tournament_waiver => setTournamentWaiver(allocator, args),
         .register_candidate => registerCandidate(allocator, args),
-        .verify_candidate => verifyCandidate(allocator, args),
+        .verify_candidate => verifyCandidate(allocator, args, process_io),
         .select => selectCandidate(allocator, args),
         .ablate => ablateCandidate(allocator, args),
         .record_ablation => recordAblation(allocator, args),
         .record_holdout => recordHoldout(allocator, args),
         .certify_apply => certifyApply(allocator, args),
         .apply => applySelected(allocator, args),
-        .run_proof => runProof(allocator, args),
+        .run_proof => runProof(allocator, args, process_io),
         .record_proof => recordProof(allocator, args),
         .certify_final => certifyFinal(allocator, args),
         .commit => commitDelivery(allocator, args),
@@ -466,12 +466,15 @@ fn beginRun(allocator: std.mem.Allocator, args: Args) !u8 {
 
     const goal = if (args.acceptance) |path| try acceptanceGoalFromFile(allocator, path) else if (args.goal) |g| g else return error.AcceptanceRequired;
     defer if (args.acceptance != null) allocator.free(goal);
-    const base_sha = gitCapture(allocator, args.cwd, &.{ "rev-parse", "HEAD" }) catch "unknown";
-    defer if (!std.mem.eql(u8, base_sha, "unknown")) allocator.free(base_sha);
-    const branch = gitCapture(allocator, args.cwd, &.{ "branch", "--show-current" }) catch "unknown";
-    defer if (!std.mem.eql(u8, branch, "unknown")) allocator.free(branch);
-    const repo_root = gitCapture(allocator, args.cwd, &.{ "rev-parse", "--show-toplevel" }) catch args.cwd;
-    defer if (!std.mem.eql(u8, repo_root, args.cwd)) allocator.free(repo_root);
+    const base_sha_capture = gitCapture(allocator, args.cwd, &.{ "rev-parse", "HEAD" }) catch null;
+    defer if (base_sha_capture) |value| allocator.free(value);
+    const base_sha = base_sha_capture orelse "unknown";
+    const branch_capture = gitCapture(allocator, args.cwd, &.{ "branch", "--show-current" }) catch null;
+    defer if (branch_capture) |value| allocator.free(value);
+    const branch = branch_capture orelse "unknown";
+    const repo_root_capture = gitCapture(allocator, args.cwd, &.{ "rev-parse", "--show-toplevel" }) catch null;
+    defer if (repo_root_capture) |value| allocator.free(value);
+    const repo_root = repo_root_capture orelse args.cwd;
     const run_id = try std.fmt.allocPrint(allocator, "C3-{s}", .{base_sha[0..@min(base_sha.len, 12)]});
     defer allocator.free(run_id);
 
@@ -640,7 +643,7 @@ fn registerCandidate(allocator: std.mem.Allocator, args: Args) !u8 {
     return if (valid) 0 else 2;
 }
 
-fn verifyCandidate(allocator: std.mem.Allocator, args: Args) !u8 {
+fn verifyCandidate(allocator: std.mem.Allocator, args: Args, process_io: std.Io) !u8 {
     const input = args.input orelse return error.InputRequired;
     const candidate_id = args.candidate_id orelse return error.CandidateRequired;
     var parsed_input = try parseJsonInput(allocator, input);
@@ -663,7 +666,7 @@ fn verifyCandidate(allocator: std.mem.Allocator, args: Args) !u8 {
     for (check_items) |check| {
         const command = stringField(check, "command") orelse return error.InvalidProofPlan;
         const cwd = state.candidates[idx].worktree orelse args.cwd;
-        const passed = try runShell(allocator, cwd, command);
+        const passed = try runShell(allocator, process_io, cwd, command);
         all_pass = all_pass and passed;
     }
     const verified = Candidate{
@@ -840,7 +843,7 @@ fn applySelected(allocator: std.mem.Allocator, args: Args) !u8 {
     return 0;
 }
 
-fn runProof(allocator: std.mem.Allocator, args: Args) !u8 {
+fn runProof(allocator: std.mem.Allocator, args: Args, process_io: std.Io) !u8 {
     const input = args.input orelse return error.InputRequired;
     var parsed_input = try parseJsonInput(allocator, input);
     defer parsed_input.deinit();
@@ -860,7 +863,7 @@ fn runProof(allocator: std.mem.Allocator, args: Args) !u8 {
     var all_pass = true;
     for (checks) |check| {
         const command = stringField(check, "command") orelse return error.InvalidProofPlan;
-        all_pass = all_pass and try runShell(allocator, args.cwd, command);
+        all_pass = all_pass and try runShell(allocator, process_io, args.cwd, command);
     }
     state.proof_authority = "controller";
     state.proof_passed = all_pass;
@@ -919,8 +922,9 @@ fn commitDelivery(allocator: std.mem.Allocator, args: Args) !u8 {
     defer parsed.deinit();
     var state = parsed.value;
     requirePhase(state, PhaseFinalCertified[0..]) catch return error.InvalidPhase;
-    const head = gitCapture(allocator, args.cwd, &.{ "rev-parse", "HEAD" }) catch state.base_sha;
-    defer if (!std.mem.eql(u8, head, state.base_sha)) allocator.free(head);
+    const head_capture = gitCapture(allocator, args.cwd, &.{ "rev-parse", "HEAD" }) catch null;
+    defer if (head_capture) |value| allocator.free(value);
+    const head = head_capture orelse state.base_sha;
     state.commit_sha = head;
     state.phase = "committed";
     state.certificate_stage = "committed";
@@ -1788,29 +1792,106 @@ fn containsLine(haystack: []const u8, needle: []const u8) bool {
 }
 
 fn gitCapture(allocator: std.mem.Allocator, cwd: []const u8, argv_tail: []const []const u8) ![]const u8 {
-    var argv = std.ArrayList([]const u8).empty;
-    defer argv.deinit(allocator);
-    try argv.append(allocator, "git");
-    for (argv_tail) |arg| try argv.append(allocator, arg);
-    const result = try std.process.run(allocator, Io, .{
-        .argv = argv.items,
-        .cwd = .{ .path = cwd },
-        .stdout_limit = .limited(64 * 1024),
-        .stderr_limit = .limited(64 * 1024),
-    });
-    defer allocator.free(result.stderr);
-    defer allocator.free(result.stdout);
-    const ok = switch (result.term) {
-        .exited => |code| code == 0,
-        else => false,
-    };
-    if (!ok) return error.GitCommandFailed;
-    return allocator.dupe(u8, std.mem.trim(u8, result.stdout, " \t\r\n"));
+    const root = try findGitTopLevel(allocator, cwd);
+    defer allocator.free(root);
+
+    if (argvMatches(argv_tail, &.{ "rev-parse", "--show-toplevel" })) {
+        return allocator.dupe(u8, root);
+    }
+
+    const git_dir = try gitDirForRoot(allocator, root);
+    defer allocator.free(git_dir);
+    const head = try readGitText(allocator, git_dir, "HEAD");
+    defer allocator.free(head);
+    const trimmed_head = std.mem.trim(u8, head, " \t\r\n");
+
+    if (argvMatches(argv_tail, &.{ "branch", "--show-current" })) {
+        const prefix = "ref: refs/heads/";
+        if (!std.mem.startsWith(u8, trimmed_head, prefix)) return allocator.dupe(u8, "");
+        return allocator.dupe(u8, trimmed_head[prefix.len..]);
+    }
+
+    if (argvMatches(argv_tail, &.{ "rev-parse", "HEAD" })) {
+        const ref_prefix = "ref: ";
+        if (!std.mem.startsWith(u8, trimmed_head, ref_prefix)) return allocator.dupe(u8, trimmed_head);
+        return readGitTextTrimmed(allocator, git_dir, trimmed_head[ref_prefix.len..]);
+    }
+
+    return error.UnsupportedGitCapture;
 }
 
-fn runShell(allocator: std.mem.Allocator, cwd: []const u8, command: []const u8) !bool {
+fn argvMatches(actual: []const []const u8, expected: []const []const u8) bool {
+    if (actual.len != expected.len) return false;
+    for (actual, expected) |a, e| {
+        if (!std.mem.eql(u8, a, e)) return false;
+    }
+    return true;
+}
+
+fn findGitTopLevel(allocator: std.mem.Allocator, cwd: []const u8) ![]u8 {
+    const resolved = try std.Io.Dir.cwd().realPathFileAlloc(Io, cwd, allocator);
+    defer allocator.free(resolved);
+    var current = try allocator.dupe(u8, resolved);
+    while (true) {
+        const dot_git = try std.fs.path.join(allocator, &.{ current, ".git" });
+        defer allocator.free(dot_git);
+        std.Io.Dir.cwd().access(Io, dot_git, .{}) catch {
+            if (std.fs.path.dirname(current)) |parent| {
+                if (std.mem.eql(u8, parent, current)) {
+                    allocator.free(current);
+                    return error.NotGitRepository;
+                }
+                const next = try allocator.dupe(u8, parent);
+                allocator.free(current);
+                current = next;
+                continue;
+            }
+            allocator.free(current);
+            return error.NotGitRepository;
+        };
+        return current;
+    }
+}
+
+fn gitDirForRoot(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
+    const dot_git = try std.fs.path.join(allocator, &.{ root, ".git" });
+    errdefer allocator.free(dot_git);
+    if (std.Io.Dir.cwd().openDir(Io, dot_git, .{})) |dir| {
+        var mutable_dir = dir;
+        mutable_dir.close(Io);
+        return dot_git;
+    } else |_| {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(Io, dot_git, allocator, .limited(4096));
+        defer allocator.free(bytes);
+        const line = std.mem.trim(u8, bytes, " \t\r\n");
+        const prefix = "gitdir:";
+        if (!std.mem.startsWith(u8, line, prefix)) return error.InvalidGitDir;
+        const raw_path = std.mem.trim(u8, line[prefix.len..], " \t");
+        if (std.fs.path.isAbsolute(raw_path)) {
+            allocator.free(dot_git);
+            return allocator.dupe(u8, raw_path);
+        }
+        const resolved = try std.fs.path.join(allocator, &.{ root, raw_path });
+        allocator.free(dot_git);
+        return resolved;
+    }
+}
+
+fn readGitTextTrimmed(allocator: std.mem.Allocator, git_dir: []const u8, sub_path: []const u8) ![]u8 {
+    const bytes = try readGitText(allocator, git_dir, sub_path);
+    defer allocator.free(bytes);
+    return allocator.dupe(u8, std.mem.trim(u8, bytes, " \t\r\n"));
+}
+
+fn readGitText(allocator: std.mem.Allocator, git_dir: []const u8, sub_path: []const u8) ![]u8 {
+    const path = try std.fs.path.join(allocator, &.{ git_dir, sub_path });
+    defer allocator.free(path);
+    return std.Io.Dir.cwd().readFileAlloc(Io, path, allocator, .limited(1024 * 1024));
+}
+
+fn runShell(allocator: std.mem.Allocator, process_io: std.Io, cwd: []const u8, command: []const u8) !bool {
     const argv = [_][]const u8{ "/bin/sh", "-c", command };
-    const result = try std.process.run(allocator, Io, .{
+    const result = try std.process.run(allocator, process_io, .{
         .argv = &argv,
         .cwd = .{ .path = cwd },
         .stdout_limit = .limited(256 * 1024),
@@ -1826,7 +1907,8 @@ fn runShell(allocator: std.mem.Allocator, cwd: []const u8, command: []const u8) 
 
 fn findStateRootFrom(allocator: std.mem.Allocator, cwd: []const u8, state_root: []const u8) !?[]u8 {
     const resolved = try std.Io.Dir.cwd().realPathFileAlloc(Io, cwd, allocator);
-    var current: []u8 = resolved;
+    defer allocator.free(resolved);
+    var current = try allocator.dupe(u8, resolved);
     while (true) {
         const candidate = try std.fs.path.join(allocator, &.{ current, state_root, StateFile });
         defer allocator.free(candidate);
@@ -2121,6 +2203,26 @@ test "loaded state strings survive after input buffer is freed and state is rewr
     try std.testing.expectEqualStrings("collecting", reparsed.value.phase);
     try std.testing.expectEqualStrings("own state strings", reparsed.value.acceptance_goal);
     try std.testing.expectEqual(@as(u32, 1), reparsed.value.counterexample_count);
+}
+
+test "git capture reads HEAD refs without spawning git" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try tmp.dir.realPathFileAlloc(Io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    try makePathUnder(std.testing.allocator, cwd, ".git/refs/heads");
+    try tmp.dir.writeFile(Io, .{ .sub_path = ".git/HEAD", .data = "ref: refs/heads/main\n" });
+    try tmp.dir.writeFile(Io, .{ .sub_path = ".git/refs/heads/main", .data = "0123456789abcdef0123456789abcdef01234567\n" });
+
+    const branch = try gitCapture(std.testing.allocator, cwd, &.{ "branch", "--show-current" });
+    defer std.testing.allocator.free(branch);
+    const head = try gitCapture(std.testing.allocator, cwd, &.{ "rev-parse", "HEAD" });
+    defer std.testing.allocator.free(head);
+    const root = try gitCapture(std.testing.allocator, cwd, &.{ "rev-parse", "--show-toplevel" });
+    defer std.testing.allocator.free(root);
+    try std.testing.expectEqualStrings("main", branch);
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef01234567", head);
+    try std.testing.expectEqualStrings(cwd, root);
 }
 
 test "MRPC gate enforces stage gates and orphan edit atoms" {
