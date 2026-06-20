@@ -18,6 +18,7 @@ apps=(
   puff
   learnings
   ledger
+  memory-note
   resolve-c3
   mesh
   st
@@ -54,6 +55,7 @@ case "$mode" in
     mark_durable_store_consumers() {
       mark_app learnings
       mark_app ledger
+      mark_app memory-note
       mark_app st
     }
 
@@ -165,6 +167,9 @@ case "$mode" in
         .github/workflows/release-ledger.yml)
           mark_app ledger
           ;;
+        .github/workflows/release-memory-note.yml)
+          mark_app memory-note
+          ;;
         .github/workflows/release-resolve-c3.yml)
           mark_app resolve-c3
           ;;
@@ -177,7 +182,7 @@ case "$mode" in
         .github/workflows/release-parse-arch.yml)
           mark_app parse-arch
           ;;
-        apps/seq/README.md|apps/lift/README.md|apps/cas/README.md|apps/cron/README.md|apps/puff/README.md|apps/learnings/README.md|apps/ledger/README.md|apps/resolve-c3/README.md|apps/mesh/README.md|apps/st/README.md|apps/parse-arch/README.md)
+        apps/seq/README.md|apps/lift/README.md|apps/cas/README.md|apps/cron/README.md|apps/puff/README.md|apps/learnings/README.md|apps/ledger/README.md|apps/memory-note/README.md|apps/resolve-c3/README.md|apps/mesh/README.md|apps/st/README.md|apps/parse-arch/README.md)
           ;;
         apps/seq/*)
           mark_app seq
@@ -199,6 +204,9 @@ case "$mode" in
           ;;
         apps/ledger/*)
           mark_app ledger
+          ;;
+        apps/memory-note/*)
+          mark_app memory-note
           ;;
         apps/resolve-c3/*)
           mark_app resolve-c3

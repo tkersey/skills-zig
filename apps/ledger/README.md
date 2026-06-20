@@ -18,7 +18,10 @@ ledger capture --json capture.json
 ledger query
 ledger map --route review-route --cluster same-cluster --artifact HEAD
 ledger show --id NEG-000001
+ledger status --id NEG-000001 --to stale --reason "artifact state changed"
 ledger reopen --id NEG-000001
+ledger export --id NEG-000001 --format full
+ledger export --id NEG-000001 --format memory-note
 ledger handoff
 ledger compact
 ledger doctor
@@ -97,3 +100,26 @@ Example shape:
 ```
 
 `doctor` validates both JSONL integrity and projection safety, including malformed events and active records that cannot legally block.
+
+## Lifecycle and memory projection
+
+`status` appends lifecycle events without rewriting historical captures:
+
+```bash
+ledger status \
+  --id NEG-000001 \
+  --to reopened \
+  --reason "The old benchmark fixture was replaced."
+```
+
+Supported projected statuses are `capture_candidate`, `need-evidence`, `unknown`, `active`, `accepted_risk`, `stale`, `reopened`, and `superseded`. Only `active` records can block route selection.
+
+Use `export` for complete current projections:
+
+```bash
+ledger export --id NEG-000001 --format full
+ledger export --id NEG-000001 --format memory-note |
+  memory-note append --extension negative-ledger --kind ledger-projection --json -
+```
+
+`show` remains concise and now includes `source_event_count` and `projection_fingerprint`; memory admission should use `export --format memory-note`.

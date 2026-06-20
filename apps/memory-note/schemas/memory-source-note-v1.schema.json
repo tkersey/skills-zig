@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Memory source note v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "id",
+    "captured_at",
+    "extension",
+    "kind",
+    "operation",
+    "authority",
+    "summary",
+    "scope",
+    "source_refs",
+    "related_ids",
+    "supersedes_id",
+    "fingerprint",
+    "payload"
+  ],
+  "properties": {
+    "schema": {"const": "memory-source-note/v1"},
+    "id": {"type": "string", "pattern": "^MSN-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{16}$"},
+    "captured_at": {"type": "string", "format": "date-time"},
+    "extension": {
+      "enum": ["harness", "learnings", "negative-ledger", "synesthesia"]
+    },
+    "kind": {"type": "string", "minLength": 1, "maxLength": 64},
+    "operation": {
+      "enum": ["assert", "confirm", "supersede", "retract", "reject", "reopen"]
+    },
+    "authority": {"type": "string", "minLength": 1, "maxLength": 128},
+    "summary": {"type": "string", "minLength": 1, "maxLength": 4096},
+    "scope": {"$ref": "#/$defs/scope"},
+    "source_refs": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 128,
+      "items": {"$ref": "#/$defs/sourceRef"}
+    },
+    "related_ids": {
+      "type": "array",
+      "maxItems": 128,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1, "maxLength": 256}
+    },
+    "supersedes_id": {
+      "type": ["string", "null"],
+      "pattern": "^MSN-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{16}$"
+    },
+    "fingerprint": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "payload": {"type": "object", "minProperties": 1}
+  },
+  "$defs": {
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "repo", "paths"],
+      "properties": {
+        "kind": {
+          "enum": ["global", "repo", "path-family", "task-family", "workflow", "tool"]
+        },
+        "repo": {"type": ["string", "null"], "maxLength": 512},
+        "paths": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {"type": "string", "minLength": 1, "maxLength": 4096}
+        }
+      }
+    },
+    "sourceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "ref", "summary"],
+      "properties": {
+        "kind": {"type": "string", "minLength": 1, "maxLength": 128},
+        "ref": {"type": "string", "minLength": 1, "maxLength": 4096},
+        "summary": {"type": "string", "minLength": 1, "maxLength": 4096}
+      }
+    }
+  }
+}

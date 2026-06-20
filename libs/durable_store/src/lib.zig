@@ -17,6 +17,12 @@ pub const JsonlValidation = struct {
     }
 };
 
+pub const CreateNewOptions = struct {
+    reject_symlinks: bool = true,
+    file_mode: ?u32 = 0o600,
+    sync: bool = true,
+};
+
 pub fn lockPathAlloc(allocator: std.mem.Allocator, store_path: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}.lock", .{store_path});
 }
@@ -66,6 +72,160 @@ pub fn ensureParentPath(path: []const u8) !void {
     }
 
     try std.Io.Dir.cwd().createDirPath(Io.io(), parent);
+}
+
+pub fn rejectSymlinkComponents(path: []const u8) !void {
+    var it = std.fs.path.componentIterator(path);
+    while (it.next()) |component| {
+        const stat = std.Io.Dir.cwd().statFile(Io.io(), component.path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        if (stat.kind == .sym_link) return error.SymlinkComponent;
+    }
+}
+
+pub fn ensureDirectoryPathNoSymlinks(path: []const u8) !void {
+    if (path.len == 0 or std.mem.eql(u8, path, ".")) return;
+
+    var it = std.fs.path.componentIterator(path);
+    while (it.next()) |component| {
+        const stat = std.Io.Dir.cwd().statFile(Io.io(), component.path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => {
+                try std.Io.Dir.cwd().createDirPath(Io.io(), component.path);
+                const created_stat = try std.Io.Dir.cwd().statFile(Io.io(), component.path, .{ .follow_symlinks = false });
+                if (created_stat.kind == .sym_link) return error.SymlinkComponent;
+                if (created_stat.kind != .directory) return error.NotDir;
+                continue;
+            },
+            else => return err,
+        };
+        if (stat.kind == .sym_link) return error.SymlinkComponent;
+        if (stat.kind != .directory) return error.NotDir;
+    }
+}
+
+pub fn readRegularFileNoSymlink(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+    const stat = try std.Io.Dir.cwd().statFile(Io.io(), path, .{ .follow_symlinks = false });
+    if (stat.kind == .sym_link) return error.SymlinkComponent;
+    if (stat.kind != .file) return error.NotFile;
+    if (stat.size > max_bytes) return error.FileTooBig;
+
+    var file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(Io.io(), path, .{ .allow_directory = false, .follow_symlinks = false })
+    else
+        try std.Io.Dir.cwd().openFile(Io.io(), path, .{ .allow_directory = false, .follow_symlinks = false });
+    defer file.close(Io.io());
+
+    var reader = file.reader(Io.io(), &.{});
+    return reader.interface.allocRemaining(allocator, .limited(max_bytes + 1));
+}
+
+pub fn freeStringList(allocator: std.mem.Allocator, list: []const []u8) void {
+    for (list) |item| allocator.free(item);
+    allocator.free(list);
+}
+
+pub fn listSortedRegularFilesNoSymlink(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    max_files: usize,
+    max_file_bytes: usize,
+) ![][]u8 {
+    const dir_stat = try std.Io.Dir.cwd().statFile(Io.io(), dir_path, .{ .follow_symlinks = false });
+    if (dir_stat.kind == .sym_link) return error.SymlinkComponent;
+    if (dir_stat.kind != .directory) return error.NotDir;
+
+    var dir = if (std.fs.path.isAbsolute(dir_path))
+        try std.Io.Dir.openDirAbsolute(Io.io(), dir_path, .{ .iterate = true, .follow_symlinks = false })
+    else
+        try std.Io.Dir.cwd().openDir(Io.io(), dir_path, .{ .iterate = true, .follow_symlinks = false });
+    defer dir.close(Io.io());
+
+    var names: std.ArrayList([]u8) = .empty;
+    defer {
+        for (names.items) |name| allocator.free(name);
+        names.deinit(allocator);
+    }
+
+    var iter = dir.iterate();
+    while (try iter.next(Io.io())) |entry| {
+        if (entry.kind == .sym_link) return error.SymlinkComponent;
+        if (entry.kind != .file) continue;
+        if (names.items.len >= max_files) return error.TooManyFiles;
+
+        const entry_path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+        defer allocator.free(entry_path);
+        const stat = try std.Io.Dir.cwd().statFile(Io.io(), entry_path, .{ .follow_symlinks = false });
+        if (stat.kind == .sym_link) return error.SymlinkComponent;
+        if (stat.kind != .file) continue;
+        if (stat.size > max_file_bytes) return error.FileTooBig;
+
+        try names.append(allocator, try allocator.dupe(u8, entry.name));
+    }
+    std.mem.sort([]u8, names.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
+    return names.toOwnedSlice(allocator);
+}
+
+fn filePermissionsFromMode(mode: ?u32) std.Io.File.Permissions {
+    const Permissions = std.Io.File.Permissions;
+    const requested = mode orelse return .default_file;
+    if (@hasDecl(Permissions, "fromMode")) {
+        return Permissions.fromMode(@as(std.posix.mode_t, @intCast(requested)));
+    }
+    return .default_file;
+}
+
+pub fn writeTextCreateNew(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    text: []const u8,
+    options: CreateNewOptions,
+) !void {
+    const parent = std.fs.path.dirname(path) orelse ".";
+    const base = std.fs.path.basename(path);
+    if (parent.len == 0 or base.len == 0 or std.mem.eql(u8, base, ".") or std.mem.eql(u8, base, "..")) {
+        return error.InvalidPath;
+    }
+    if (options.reject_symlinks) {
+        try ensureDirectoryPathNoSymlinks(parent);
+        const existing_stat = std.Io.Dir.cwd().statFile(Io.io(), path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (existing_stat) |stat| {
+            if (stat.kind == .sym_link) return error.SymlinkComponent;
+        }
+    } else {
+        try ensureParentPath(path);
+    }
+
+    var dir = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openDirAbsolute(Io.io(), parent, .{ .follow_symlinks = false })
+    else
+        try std.Io.Dir.cwd().openDir(Io.io(), parent, .{ .follow_symlinks = false });
+    defer dir.close(Io.io());
+
+    var file = try dir.createFile(Io.io(), base, .{
+        .exclusive = true,
+        .read = true,
+        .truncate = false,
+        .permissions = filePermissionsFromMode(options.file_mode),
+    });
+    var close_file = true;
+    errdefer {
+        if (close_file) file.close(Io.io());
+        dir.deleteFile(Io.io(), base) catch {};
+    }
+    try file.writeStreamingAll(Io.io(), text);
+    if (options.sync) try file.sync(Io.io());
+    file.close(Io.io());
+    close_file = false;
+    _ = allocator;
 }
 
 pub fn writeTextAtomic(allocator: std.mem.Allocator, path: []const u8, text: []const u8) !void {
@@ -181,7 +341,11 @@ pub const LockFile = struct {
     path: []u8,
 
     pub fn release(self: *LockFile, allocator: std.mem.Allocator) void {
-        std.Io.Dir.cwd().deleteFile(Io.io(), self.path) catch {};
+        if (std.fs.path.isAbsolute(self.path)) {
+            std.Io.Dir.deleteFileAbsolute(Io.io(), self.path) catch {};
+        } else {
+            std.Io.Dir.cwd().deleteFile(Io.io(), self.path) catch {};
+        }
         allocator.free(self.path);
         self.* = .{ .path = &.{} };
     }
@@ -192,6 +356,24 @@ pub fn acquireLock(allocator: std.mem.Allocator, store_path: []const u8) !LockFi
     errdefer allocator.free(path);
     try ensureParentPath(path);
     var file = try std.Io.Dir.cwd().createFile(Io.io(), path, .{ .exclusive = true, .read = true, .truncate = false });
+    file.close(Io.io());
+    return .{ .path = path };
+}
+
+pub fn acquireAbsoluteExclusiveLock(allocator: std.mem.Allocator, absolute_path: []const u8) !LockFile {
+    if (!std.fs.path.isAbsolute(absolute_path)) return error.NotAbsolute;
+    const path = try allocator.dupe(u8, absolute_path);
+    errdefer allocator.free(path);
+    const parent = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    try ensureDirectoryPathNoSymlinks(parent);
+    const existing_stat = std.Io.Dir.cwd().statFile(Io.io(), path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (existing_stat) |stat| {
+        if (stat.kind == .sym_link) return error.SymlinkComponent;
+    }
+    var file = try std.Io.Dir.createFileAbsolute(Io.io(), path, .{ .exclusive = true, .read = true, .truncate = false });
     file.close(Io.io());
     return .{ .path = path };
 }
@@ -256,6 +438,82 @@ test "writeTextAtomic creates parent directories and replaces content" {
     try std.testing.expectEqualStrings("{\"ok\":false}\n", second);
 }
 
+test "writeTextCreateNew creates once without overwriting" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "nested", "note.md" });
+    defer std.testing.allocator.free(path);
+
+    try writeTextCreateNew(std.testing.allocator, path, "first", .{});
+    try std.testing.expectError(error.PathAlreadyExists, writeTextCreateNew(std.testing.allocator, path, "second", .{}));
+    const data = try tryReadForTest(path);
+    defer std.testing.allocator.free(data);
+    try std.testing.expectEqualStrings("first", data);
+}
+
+test "writeTextCreateNew rejects symlink parent component" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+
+    try tmp.dir.createDir(Io.io(), "real", .default_dir);
+    try tmp.dir.symLink(Io.io(), "real", "link", .{ .is_directory = true });
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "link", "note.md" });
+    defer std.testing.allocator.free(path);
+
+    try std.testing.expectError(error.SymlinkComponent, writeTextCreateNew(std.testing.allocator, path, "payload", .{}));
+}
+
+test "readRegularFileNoSymlink rejects symlink and oversized file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "file.txt" });
+    defer std.testing.allocator.free(path);
+    const link = try std.fs.path.join(std.testing.allocator, &.{ root, "link.txt" });
+    defer std.testing.allocator.free(link);
+
+    try writeTextAtomic(std.testing.allocator, path, "abcd");
+    try tmp.dir.symLink(Io.io(), "file.txt", "link.txt", .{});
+    const data = try readRegularFileNoSymlink(std.testing.allocator, path, 4);
+    defer std.testing.allocator.free(data);
+    try std.testing.expectEqualStrings("abcd", data);
+    try std.testing.expectError(error.FileTooBig, readRegularFileNoSymlink(std.testing.allocator, path, 3));
+    try std.testing.expectError(error.SymlinkComponent, readRegularFileNoSymlink(std.testing.allocator, link, 4));
+}
+
+test "listSortedRegularFilesNoSymlink sorts and rejects symlink entries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const dir_path = try std.fs.path.join(std.testing.allocator, &.{ root, "notes" });
+    defer std.testing.allocator.free(dir_path);
+    try ensureDirectoryPathNoSymlinks(dir_path);
+
+    const b = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "b.md" });
+    defer std.testing.allocator.free(b);
+    const a = try std.fs.path.join(std.testing.allocator, &.{ dir_path, "a.md" });
+    defer std.testing.allocator.free(a);
+    try writeTextCreateNew(std.testing.allocator, b, "b", .{});
+    try writeTextCreateNew(std.testing.allocator, a, "a", .{});
+
+    const names = try listSortedRegularFilesNoSymlink(std.testing.allocator, dir_path, 10, 10);
+    defer freeStringList(std.testing.allocator, names);
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings("a.md", names[0]);
+    try std.testing.expectEqualStrings("b.md", names[1]);
+
+    var dir = try std.Io.Dir.openDirAbsolute(Io.io(), dir_path, .{});
+    defer dir.close(Io.io());
+    try dir.symLink(Io.io(), "a.md", "link.md", .{});
+    try std.testing.expectError(error.SymlinkComponent, listSortedRegularFilesNoSymlink(std.testing.allocator, dir_path, 10, 10));
+}
+
 test "appendLineAtomic appends newline-delimited records" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -300,6 +558,21 @@ test "acquireLock is exclusive until released" {
     try std.testing.expectError(error.PathAlreadyExists, acquireLock(std.testing.allocator, path));
     lock.release(std.testing.allocator);
     var second = try acquireLock(std.testing.allocator, path);
+    second.release(std.testing.allocator);
+}
+
+test "acquireAbsoluteExclusiveLock is exclusive until released" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "locks", "store.lock" });
+    defer std.testing.allocator.free(path);
+
+    var lock = try acquireAbsoluteExclusiveLock(std.testing.allocator, path);
+    try std.testing.expectError(error.PathAlreadyExists, acquireAbsoluteExclusiveLock(std.testing.allocator, path));
+    lock.release(std.testing.allocator);
+    var second = try acquireAbsoluteExclusiveLock(std.testing.allocator, path);
     second.release(std.testing.allocator);
 }
 
