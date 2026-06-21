@@ -3309,10 +3309,22 @@ test "forkPolicyProofFromResponse requires response-backed proof" {
 
 test "detached lane handle round-trips persisted fork turn handle" {
     const allocator = std.testing.allocator;
-    var unique: u8 = 0;
-    const path = try std.fmt.allocPrint(allocator, "/private/tmp/cas-session-inquiry-lane-{d}-{x}.json", .{ nowMillis(), @intFromPtr(&unique) });
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
+    defer allocator.free(tmp_path);
+
+    const path = try std.fmt.allocPrint(allocator, "{s}/lane.json", .{tmp_path});
     defer allocator.free(path);
-    defer std.Io.Dir.deleteFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path) catch {};
+    const lane_events = try std.fmt.allocPrint(allocator, "{s}/lane.events.jsonl", .{tmp_path});
+    defer allocator.free(lane_events);
+    const lane_final = try std.fmt.allocPrint(allocator, "{s}/lane.final.txt", .{tmp_path});
+    defer allocator.free(lane_final);
+    const lane_receipt = try std.fmt.allocPrint(allocator, "{s}/lane-receipt.json", .{tmp_path});
+    defer allocator.free(lane_receipt);
+    const workspace_cwd = try std.fmt.allocPrint(allocator, "{s}/work", .{tmp_path});
+    defer allocator.free(workspace_cwd);
 
     const handle = LaneHandle{
         .inquiry_id = "INQ-TEST",
@@ -3326,11 +3338,11 @@ test "detached lane handle round-trips persisted fork turn handle" {
         .forked_from_id = "src",
         .turn_id = "turn",
         .client_user_message_id = "msg",
-        .lane_events = "/private/tmp/lane.events.jsonl",
-        .lane_final = "/private/tmp/lane.final.txt",
-        .lane_receipt = "/private/tmp/lane.json",
+        .lane_events = lane_events,
+        .lane_final = lane_final,
+        .lane_receipt = lane_receipt,
         .lane_state_ref = path,
-        .workspace_cwd = "/private/tmp/work",
+        .workspace_cwd = workspace_cwd,
         .model = "gpt-test",
         .model_provider = "openai",
         .service_tier = "",
