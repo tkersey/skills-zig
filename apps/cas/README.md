@@ -13,11 +13,12 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - `scripts/cas_smoke_check.zig`
 - `scripts/cas_instance_runner.zig`
 - `scripts/cas_review_session.zig`
+- `scripts/cas_session_inquiry.zig`
 - `scripts/cas_proxy_client.zig`
 
 ## Behavior
 
-- `cas` dispatches `account`, `conformance`, `goal`, `smoke_check`, `instance_runner`, and `review_session`.
+- `cas` dispatches `account`, `capabilities`, `conformance`, `goal`, `smoke_check`, `instance_runner`, `review_session`, and `session_inquiry`.
 - `cas_account` reads account status through safe app-server account APIs. It reports account/auth/rate-limit status, optional usage summary data, and a normalized budget-governor classification. It never requests token-bearing auth data, never refreshes credentials, never mutates account state, and redacts account email unless `--show-email` is supplied.
 - `cas_goal` manages Codex app-server v2 thread goals through `thread/goal/get`, `thread/goal/set`, and `thread/goal/clear`. It adds safe target selection over `thread/list`, explicit `resolve`/`--dry-run` previews, create-by-default `set`, and lifecycle `wait` through `thread/resume` plus goal polling.
 - `cas_conformance_suite` verifies claim-safe wave handling, stale-claim reclaim, mesh result accountability, and bounded overload retry behavior.
@@ -43,6 +44,9 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - Terminal review failures are now classified more precisely: `review_interrupted`, `approval_denied`, `review_failed`, `review_output_missing`, `parent_thread_not_materialized`, and `unsafe_parent_thread_state`.
 - If a websocket-backed detached review already exists and `wait` cannot reconnect to its managed transport, `--fallback native-review` now returns an explicit degraded native-review success and persists that terminal fallback in the review-session record. It is not detached-review proof.
 - Repo-owned first-party callers should keep native fallback caller-owned: treat `start -> wait` as one detached CAS attempt, and switch to native `codex review` outside CAS after inspecting the JSON verdict when the resolved runtime is incompatible.
+- `cas_session_inquiry` is the experimental controller for `$retrace` historical decision replay. It validates DCP-v1/RIP-v1 inputs, derives app-server compatibility from generated Codex schemas, enforces read-only/no-network/no-approval policy, persists SIR/FIR-oriented audit artifacts, and fails closed when source, permission, budget, or exact-anchor gates are not satisfied. It never calls `thread/shellCommand`.
+- `cas session_inquiry preflight --json` generates or reuses the Codex app-server schema cache under `~/.cache/cas/app-server-schema/<codex-version>/`, fingerprints it, and reports whether exact fork/rollback anchoring is available for inquiry execution.
+- `cas capabilities --json` includes compiled feature flags for `session_inquiry_v1`, `dcp_v1`, `rip_v1`, `fir_v1`, exact fork/rollback anchoring, ephemeral forks, read-only inquiry, and detached inquiry.
 
 ## API Examples
 
@@ -146,6 +150,25 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
   --fallback none \
   --json
 
+# Check runtime compatibility before historical replay.
+./zig-out/bin/cas session_inquiry preflight --json
+
+# Run a bounded inquiry from DCP/RIP inputs.
+./zig-out/bin/cas session_inquiry run \
+  --capsule capsule.json \
+  --plan plan.json \
+  --receipt-dir .retrace/INQ-001 \
+  --sandbox read-only \
+  --json
+
+# Start detached state and inspect the persisted handle.
+./zig-out/bin/cas session_inquiry start \
+  --capsule capsule.json \
+  --plan plan.json \
+  --receipt-dir .retrace/INQ-001 \
+  --json
+./zig-out/bin/cas session_inquiry status --inquiry-id INQ-001 --json
+
 # Run one conformance scenario with JSON output.
 ./zig-out/bin/cas conformance --cwd /path/to/workspace --scenario mesh_row_accountability --json
 
@@ -188,7 +211,10 @@ zig build test-cas
 zig build build-cas -Doptimize=ReleaseFast
 ./zig-out/bin/cas_account --help
 ./zig-out/bin/cas_conformance_suite --help
+./zig-out/bin/cas_session_inquiry --help
 ./zig-out/bin/cas goal --help
+./zig-out/bin/cas session_inquiry preflight --json
+zig build test-cas-session-inquiry
 bash apps/cas/scripts/perf/budget_governor_gate.sh
 
 # Linux-only bounded fuzz smoke (matches CI behavior).

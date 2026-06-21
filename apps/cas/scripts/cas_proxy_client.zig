@@ -93,6 +93,7 @@ pub const Client = struct {
     elicitation_content_json: ?[]const u8,
     dynamic_tool_response_json: ?[]const u8,
     read_only: bool,
+    blocking_server_request_count: u64 = 0,
 
     pub fn start(allocator: std.mem.Allocator, opts: ClientOptions) !Client {
         if (opts.websocket_url) |url| {
@@ -144,6 +145,7 @@ pub const Client = struct {
             .elicitation_content_json = opts.elicitation_content_json,
             .dynamic_tool_response_json = opts.dynamic_tool_response_json,
             .read_only = opts.read_only,
+            .blocking_server_request_count = 0,
         };
         try client.handshake(opts);
         return client;
@@ -175,6 +177,7 @@ pub const Client = struct {
             .elicitation_content_json = opts.elicitation_content_json,
             .dynamic_tool_response_json = opts.dynamic_tool_response_json,
             .read_only = opts.read_only,
+            .blocking_server_request_count = 0,
         };
         try client.handshake(opts);
         return client;
@@ -196,6 +199,10 @@ pub const Client = struct {
 
     pub fn lastError(self: *const Client) ?[]const u8 {
         return self.last_error;
+    }
+
+    pub fn blockingServerRequestCount(self: *const Client) u64 {
+        return self.blocking_server_request_count;
     }
 
     pub fn requestJson(self: *Client, method: []const u8, params_json: ?[]const u8) ![]u8 {
@@ -415,6 +422,8 @@ pub const Client = struct {
             break :blk parsed_id;
         };
 
+        if (isBlockingServerRequest(method)) self.blocking_server_request_count += 1;
+
         if (std.mem.eql(u8, method, "item/commandExecution/requestApproval")) {
             const decision = self.resolveExecDecision();
             if (std.mem.eql(u8, decision, "acceptForSession")) {
@@ -461,6 +470,17 @@ pub const Client = struct {
 
         // Reject unknown server requests to avoid deadlocking request/response calls.
         try self.sendServerError(id, -32601, "Unsupported server request in native cas client");
+    }
+
+    fn isBlockingServerRequest(method: []const u8) bool {
+        return std.mem.eql(u8, method, "item/commandExecution/requestApproval") or
+            std.mem.eql(u8, method, "item/fileChange/requestApproval") or
+            std.mem.eql(u8, method, "item/permissions/requestApproval") or
+            std.mem.eql(u8, method, "item/tool/requestUserInput") or
+            std.mem.eql(u8, method, "mcpServer/elicitation/request") or
+            std.mem.eql(u8, method, "item/tool/call") or
+            std.mem.eql(u8, method, "execCommandApproval") or
+            std.mem.eql(u8, method, "applyPatchApproval");
     }
 
     fn sendApprovalDecision(self: *Client, id: i64, decision: []const u8) !void {

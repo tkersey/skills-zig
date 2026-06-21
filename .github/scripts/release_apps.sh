@@ -73,7 +73,7 @@ case "$mode" in
             ;;
         esac
         case "$raw" in
-          *".target = target,"*|*".optimize = optimize,"*|*".imports = &.{"*|*".{ .name = \"core_"*)
+          *".target = target,"*|*".optimize = optimize,"*|*".imports = &.{"*|*".{ .name = \"core_"*|*".link_libc = true"*)
             return 0
             ;;
           *\"Build\ *|*\"Run\ *|*\"Test\ *)

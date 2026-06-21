@@ -179,18 +179,96 @@ pub fn startManagedLoopbackServer(
     try argv.append(allocator, codex_path);
     try hooks.appendAppServerArgs(allocator, &argv, hook_policy, listen_url);
 
-    const child = try std.process.spawn(io, .{
-        .argv = argv.items,
+    const child = try spawnDetachedProcess(allocator, cwd, argv.items, io);
+
+    return .{
+        .child = child,
+        .listen_url = listen_url,
+    };
+}
+
+pub fn spawnDetachedProcess(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    argv: []const []const u8,
+    io: std.Io,
+) !std.process.Child {
+    if (builtin.os.tag == .macos and builtin.link_libc) return spawnManagedServerPosix(allocator, cwd, argv);
+    return std.process.spawn(io, .{
+        .argv = argv,
         .cwd = .{ .path = cwd },
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
         .pgid = if (builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
     });
+}
+
+fn spawnManagedServerPosix(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    argv: []const []const u8,
+) !std.process.Child {
+    if (argv.len == 0) return error.FileNotFound;
+
+    var actions: std.c.posix_spawn_file_actions_t = undefined;
+    if (std.c.posix_spawn_file_actions_init(&actions) != 0) return error.SpawnFileActionsFailed;
+    defer _ = std.c.posix_spawn_file_actions_destroy(&actions);
+
+    const cwd_storage = try allocator.dupeZ(u8, cwd);
+    defer allocator.free(cwd_storage);
+    if (std.c.posix_spawn_file_actions_addchdir_np(&actions, cwd_storage.ptr) != 0) return error.SpawnFileActionsFailed;
+    const read_null: c_int = @bitCast(std.c.O{ .ACCMODE = .RDONLY });
+    const write_null: c_int = @bitCast(std.c.O{ .ACCMODE = .WRONLY });
+    if (std.c.posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", read_null, 0) != 0) return error.SpawnFileActionsFailed;
+    if (std.c.posix_spawn_file_actions_addopen(&actions, 1, "/dev/null", write_null, 0) != 0) return error.SpawnFileActionsFailed;
+    if (std.c.posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", write_null, 0) != 0) return error.SpawnFileActionsFailed;
+
+    var argv_buf = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
+    defer allocator.free(argv_buf);
+    var arg_storage = try allocator.alloc([:0]u8, argv.len);
+    var arg_count: usize = 0;
+    defer {
+        for (arg_storage[0..arg_count]) |arg| allocator.free(arg);
+        allocator.free(arg_storage);
+    }
+    for (argv, 0..) |arg, i| {
+        arg_storage[i] = try allocator.dupeZ(u8, arg);
+        arg_count += 1;
+        argv_buf[i] = arg_storage[i].ptr;
+    }
+
+    var pid: std.c.pid_t = undefined;
+    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+    const spawn_rc = if (std.mem.indexOfScalar(u8, argv[0], '/') == null)
+        std.c.posix_spawnp(&pid, argv_buf[0].?, &actions, null, argv_buf.ptr, envp)
+    else
+        std.c.posix_spawn(&pid, argv_buf[0].?, &actions, null, argv_buf.ptr, envp);
+    if (spawn_rc != 0) return posixSpawnError(spawn_rc);
 
     return .{
-        .child = child,
-        .listen_url = listen_url,
+        .id = pid,
+        .thread_handle = {},
+        .stdin = null,
+        .stdout = null,
+        .stderr = null,
+        .request_resource_usage_statistics = false,
+    };
+}
+
+fn posixSpawnError(rc: c_int) anyerror {
+    const err: std.c.E = @enumFromInt(@as(u16, @intCast(rc)));
+    return switch (err) {
+        .NOMEM, .@"2BIG" => error.SystemResources,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        .ACCES => error.AccessDenied,
+        .PERM => error.PermissionDenied,
+        .NOEXEC => error.InvalidExe,
+        .NOENT => error.FileNotFound,
+        .NOTDIR => error.NotDir,
+        .NAMETOOLONG => error.NameTooLong,
+        else => error.SpawnFailed,
     };
 }
 
