@@ -57,6 +57,11 @@ pub fn validateValue(allocator: std.mem.Allocator, value: std.json.Value) !Valid
     if (!stringFieldEq(packet, "packet_version", version)) try appendCode(allocator, &errors, "packet_version");
     const packet_id = stringField(packet, "packet_id");
     if (packet_id == null or packet_id.?.len == 0) try appendCode(allocator, &errors, "packet_id");
+    if (packet_id) |id| {
+        const expected = try packetIdForValueExcludingPacketId(allocator, value);
+        defer allocator.free(expected);
+        if (!std.mem.eql(u8, id, expected)) try appendCode(allocator, &errors, "packet_id:mismatch");
+    }
 
     const source = objectField(packet, "source") orelse blk: {
         try appendCode(allocator, &errors, "source:must-be-object");
@@ -181,6 +186,70 @@ pub fn packetIdForCanonicalBody(allocator: std.mem.Allocator, body_without_packe
     std.crypto.hash.sha2.Sha256.hash(body_without_packet_id, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
     return std.fmt.allocPrint(allocator, "DCP-{s}", .{hex});
+}
+
+pub fn packetIdForTextExcludingPacketId(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
+    defer parsed.deinit();
+    return packetIdForValueExcludingPacketId(allocator, parsed.value);
+}
+
+pub fn packetIdForValueExcludingPacketId(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    const canonical = try canonicalJsonAlloc(allocator, value, true);
+    defer allocator.free(canonical);
+    return packetIdForCanonicalBody(allocator, canonical);
+}
+
+pub fn canonicalJsonText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
+    defer parsed.deinit();
+    return canonicalJsonAlloc(allocator, parsed.value, false);
+}
+
+pub fn canonicalJsonAlloc(allocator: std.mem.Allocator, value: std.json.Value, omit_packet_id: bool) ![]u8 {
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try writeCanonicalJson(allocator, &out.writer, value, omit_packet_id);
+    return out.toOwnedSlice();
+}
+
+fn writeCanonicalJson(allocator: std.mem.Allocator, writer: anytype, value: std.json.Value, omit_packet_id: bool) !void {
+    switch (value) {
+        .object => |obj| {
+            var keys = try allocator.alloc([]const u8, obj.count());
+            defer allocator.free(keys);
+            var key_count: usize = 0;
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                if (omit_packet_id and std.mem.eql(u8, key, "packet_id")) continue;
+                keys[key_count] = key;
+                key_count += 1;
+            }
+            std.mem.sort([]const u8, keys[0..key_count], {}, struct {
+                fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                    return std.mem.lessThan(u8, a, b);
+                }
+            }.lessThan);
+            try writer.writeByte('{');
+            for (keys[0..key_count], 0..) |key, idx| {
+                if (idx > 0) try writer.writeByte(',');
+                try std.json.Stringify.value(std.json.Value{ .string = key }, .{}, writer);
+                try writer.writeByte(':');
+                try writeCanonicalJson(allocator, writer, obj.get(key).?, omit_packet_id);
+            }
+            try writer.writeByte('}');
+        },
+        .array => |array| {
+            try writer.writeByte('[');
+            for (array.items, 0..) |item, idx| {
+                if (idx > 0) try writer.writeByte(',');
+                try writeCanonicalJson(allocator, writer, item, omit_packet_id);
+            }
+            try writer.writeByte(']');
+        },
+        else => try std.json.Stringify.value(value, .{}, writer),
+    }
 }
 
 fn finishReport(
@@ -332,6 +401,24 @@ test "DCP validation catches bad anchor arithmetic" {
     defer report.deinit(std.testing.allocator);
     try std.testing.expect(!report.valid);
     try std.testing.expect(containsCode(report.errors, "anchors.pre_decision:must-end-before-decision"));
+}
+
+test "DCP validation rejects stale packet id after content edit" {
+    const text =
+        \\{"decision_context_packet":{
+        \\"packet_version":"DCP-v1","packet_id":"DCP-stale",
+        \\"source":{"session_id":"s","decision_id":"d"},
+        \\"artifact_state":{"reconstructability":"transcript_only"},
+        \\"episode":{"question":"q","selected_route":"r","rejected_routes":[],"explicit_rationale":[],"explicit_assumptions":[],"evidence_refs":[],"tools_and_artifacts":[],"skills_and_instructions":[],"outcome_refs":[]},
+        \\"turns":{"total_turns":1,"decision_turn_index":1,"decision_turn_id":"t1","source_turn_digest":"sha256:x"},
+        \\"anchors":{"pre_decision":{"available":false,"keep_through_turn_index":null,"drop_last_n_turns":null,"anchor_digest":null},"post_decision_pre_outcome":{"available":true,"keep_through_turn_index":1,"drop_last_n_turns":0,"anchor_digest":"sha256:b"},"outcome_aware":{"available":true,"keep_through_turn_index":1,"drop_last_n_turns":0,"anchor_digest":"sha256:c"}},
+        \\"contamination":{"injected_skill_blocks":false,"generated_reports":false,"current_audit_prompt":false,"quoted_material":false},
+        \\"limitations":[]}}
+    ;
+    var report = try validateText(std.testing.allocator, text);
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expect(!report.valid);
+    try std.testing.expect(containsCode(report.errors, "packet_id:mismatch"));
 }
 
 fn containsCode(codes: []const []u8, needle: []const u8) bool {

@@ -1,5 +1,6 @@
 const std = @import("std");
 const canonical_trace = @import("canonical_trace.zig");
+const query_engine = @import("query/engine.zig");
 const skill_decision_receipt = @import("skill_decision_receipt.zig");
 const skill_decision_signals = @import("skill_decision_signals.zig");
 
@@ -59,6 +60,8 @@ pub const Filters = struct {
 pub fn compileCandidates(allocator: std.mem.Allocator, trace: canonical_trace.CanonicalSessionTrace, filters: Filters) ![]Candidate {
     var out: std.ArrayList(Candidate) = .empty;
     errdefer deinitCandidates(allocator, out.items);
+    const regex_atoms = if (filters.regex) |pattern| try query_engine.compileTextPatternAtoms(allocator, pattern) else null;
+    defer if (regex_atoms) |atoms| allocator.free(atoms);
 
     for (trace.turns.items) |turn| {
         if (filters.turn_index) |wanted| {
@@ -74,18 +77,19 @@ pub fn compileCandidates(allocator: std.mem.Allocator, trace: canonical_trace.Ca
 
         const text = turn.final_answer orelse turn.assistant_preview orelse "";
         if (text.len == 0) continue;
-        if (!passesTextFilters(text, filters)) continue;
+        if (!passesTextFilters(text, filters, regex_atoms)) continue;
 
         if (std.mem.indexOf(u8, text, "skill_decision_receipt") != null) {
             if (skill_decision_receipt.parseText(allocator, text)) |parsed_value| {
                 var parsed = parsed_value;
                 defer parsed.deinit();
                 if (filters.skill) |skill| if (!eqlIgnoreCase(parsed.receipt.skill, skill)) continue;
-                const decision_id = if (parsed.receipt.decision_id.len > 0)
-                    parsed.receipt.decision_id
-                else
-                    tryHashDecisionId(allocator, trace, turn, parsed.receipt.selected_route, parsed.receipt.question) catch "unknown";
-                defer if (std.mem.startsWith(u8, decision_id, "DEC-")) allocator.free(@constCast(decision_id));
+                var generated_decision_id: ?[]u8 = null;
+                defer if (generated_decision_id) |id| allocator.free(id);
+                const decision_id = if (parsed.receipt.decision_id.len > 0) parsed.receipt.decision_id else blk: {
+                    generated_decision_id = try tryHashDecisionId(allocator, trace, turn, parsed.receipt.selected_route, parsed.receipt.question);
+                    break :blk generated_decision_id.?;
+                };
                 const rejected = try cloneStringList(allocator, parsed.receipt.rejected_routes);
                 defer freeStringSlice(allocator, rejected);
                 const evidence = try singletonList(allocator, "sdr");
@@ -153,7 +157,7 @@ pub fn compileCandidates(allocator: std.mem.Allocator, trace: canonical_trace.Ca
         }
     }
 
-    filterByDecisionId(&out, filters.decision_id);
+    filterByDecisionId(allocator, &out, filters.decision_id);
     return out.toOwnedSlice(allocator);
 }
 
@@ -223,9 +227,9 @@ fn appendTurnSelectorCandidate(
     }));
 }
 
-fn passesTextFilters(text: []const u8, filters: Filters) bool {
+fn passesTextFilters(text: []const u8, filters: Filters, regex_atoms: ?[]const query_engine.RegexAtom) bool {
     if (filters.contains) |needle| if (!containsIgnoreCase(text, needle)) return false;
-    if (filters.regex) |needle| if (!containsIgnoreCase(text, needle)) return false;
+    if (regex_atoms) |atoms| if (!query_engine.textMatchesPatternAtoms(text, atoms, true)) return false;
     if (filters.skill) |skill| if (!containsIgnoreCase(text, skill)) return false;
     return true;
 }
@@ -343,13 +347,15 @@ fn tryHashDecisionId(allocator: std.mem.Allocator, trace: canonical_trace.Canoni
     return std.fmt.allocPrint(allocator, "DEC-{s}", .{hex[0..16]});
 }
 
-fn filterByDecisionId(out: *std.ArrayList(Candidate), wanted: ?[]const u8) void {
+fn filterByDecisionId(allocator: std.mem.Allocator, out: *std.ArrayList(Candidate), wanted: ?[]const u8) void {
     const id = wanted orelse return;
     var write_idx: usize = 0;
     for (out.items, 0..) |*candidate, idx| {
         if (std.mem.eql(u8, candidate.decision_id, id)) {
             if (write_idx != idx) out.items[write_idx] = candidate.*;
             write_idx += 1;
+        } else {
+            candidate.deinit(allocator);
         }
     }
     out.items.len = write_idx;
@@ -433,4 +439,23 @@ test "outcome prose is not promoted to decision candidate" {
     const candidates = try compileCandidates(std.testing.allocator, trace, .{});
     defer deinitCandidates(std.testing.allocator, candidates);
     try std.testing.expectEqual(@as(usize, 0), candidates.len);
+}
+
+test "regex filter uses pattern alternatives" {
+    var trace = canonical_trace.CanonicalSessionTrace{
+        .session = try canonical_trace.SessionRecord.init(std.testing.allocator, "rollout-demo.jsonl"),
+    };
+    defer trace.deinit(std.testing.allocator);
+    try trace.turns.append(std.testing.allocator, .{
+        .path = try std.testing.allocator.dupe(u8, "rollout-demo.jsonl"),
+        .turn_id = try std.testing.allocator.dupe(u8, "t1"),
+        .turn_index = 1,
+        .status = .complete,
+        .user_message = try std.testing.allocator.dupe(u8, "Which route?"),
+        .final_answer = try std.testing.allocator.dupe(u8, "Chosen route: canonical parser"),
+    });
+
+    const candidates = try compileCandidates(std.testing.allocator, trace, .{ .regex = "selected route|chosen route" });
+    defer deinitCandidates(std.testing.allocator, candidates);
+    try std.testing.expectEqual(@as(usize, 1), candidates.len);
 }
