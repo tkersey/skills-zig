@@ -1045,6 +1045,8 @@ fn validateFormatForCommand(cmd: lib.Command, opts: Options) !void {
         },
         .decision_capsule => {
             if (fmt == .dot) return error.InvalidFormatForCommand;
+            const mode = decision_capsule.Mode.parse(opts.mode) catch return error.InvalidModeArg;
+            if (fmt == .markdown and mode != .capsule) return error.InvalidFormatForCommand;
         },
         .skill_contract, .skill_decision_receipt, .capabilities => {
             if (fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
@@ -2909,8 +2911,10 @@ fn cmdDecisionCapsule(allocator: std.mem.Allocator, sessions_root: []const u8, o
         .jsonl => {
             var rendered = std.Io.Writer.Allocating.init(allocator);
             defer rendered.deinit();
-            try rendered.writer.writeAll(capsule.json);
-            if (!std.mem.endsWith(u8, capsule.json, "\n")) try rendered.writer.writeByte('\n');
+            const compact = try dcp_schema.canonicalJsonText(allocator, capsule.json);
+            defer allocator.free(compact);
+            try rendered.writer.writeAll(compact);
+            try rendered.writer.writeByte('\n');
             const text = try rendered.toOwnedSlice();
             defer allocator.free(text);
             try writeTextOutput(text, opts.out_path);
@@ -2980,7 +2984,9 @@ fn writeDecisionCandidateRows(allocator: std.mem.Allocator, candidates: []histor
 fn writeDecisionAnchorRows(allocator: std.mem.Allocator, capsule: decision_capsule.CapsuleResult, opts: Options) !void {
     var row = query.Row.init(allocator);
     defer row.deinit();
-    const anchors = try joinStringListSep(allocator, capsule.anchors_available, ",");
+    const selected_anchors = try selectedAnchorNames(allocator, capsule.anchors_available, opts.anchor_text);
+    defer freeStringSlice(allocator, selected_anchors);
+    const anchors = try joinStringListSep(allocator, selected_anchors, ",");
     defer allocator.free(anchors);
     const warnings = try joinStringListSep(allocator, capsule.warning_codes, ",");
     defer allocator.free(warnings);
@@ -2991,6 +2997,24 @@ fn writeDecisionAnchorRows(allocator: std.mem.Allocator, capsule: decision_capsu
     var rows = [_]query.Row{row};
     const cols = [_][]const u8{ "packet_id", "decision_id", "anchors_available", "warning_codes" };
     try output.writeOutput(allocator, opts.format, rows[0..], cols[0..], opts.out_path);
+}
+
+fn selectedAnchorNames(allocator: std.mem.Allocator, available: []const []u8, anchor_text: ?[]const u8) ![]const []u8 {
+    const wanted = anchor_text orelse "all";
+    if (std.mem.eql(u8, wanted, "all")) return cloneConstStringList(allocator, available);
+    const canonical = if (std.mem.eql(u8, wanted, "pre"))
+        "pre_decision"
+    else if (std.mem.eql(u8, wanted, "post"))
+        "post_decision_pre_outcome"
+    else if (std.mem.eql(u8, wanted, "outcome"))
+        "outcome_aware"
+    else
+        return error.InvalidModeArg;
+    for (available) |name| {
+        if (!std.mem.eql(u8, name, canonical)) continue;
+        return singletonStringList(allocator, canonical);
+    }
+    return allocator.alloc([]u8, 0);
 }
 
 fn writeDecisionCapsuleSummaryRow(allocator: std.mem.Allocator, capsule: decision_capsule.CapsuleResult, opts: Options) !void {
@@ -4148,6 +4172,29 @@ fn joinStringListSep(allocator: std.mem.Allocator, items: []const []const u8, se
         try out.appendSlice(allocator, item);
     }
     return out.toOwnedSlice(allocator);
+}
+
+fn singletonStringList(allocator: std.mem.Allocator, value: []const u8) ![]const []u8 {
+    const out = try allocator.alloc([]u8, 1);
+    out[0] = try allocator.dupe(u8, value);
+    return out;
+}
+
+fn cloneConstStringList(allocator: std.mem.Allocator, items: []const []const u8) ![]const []u8 {
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer freeStringListLocal(allocator, &out);
+    for (items) |item| try out.append(allocator, try allocator.dupe(u8, item));
+    return out.toOwnedSlice(allocator);
+}
+
+fn freeStringSlice(allocator: std.mem.Allocator, items: []const []u8) void {
+    for (items) |item| allocator.free(item);
+    allocator.free(items);
+}
+
+fn freeStringListLocal(allocator: std.mem.Allocator, list: *std.ArrayList([]u8)) void {
+    for (list.items) |item| allocator.free(item);
+    list.deinit(allocator);
 }
 
 fn containsBareSkillReferenceLocal(text: []const u8, skill: []const u8) bool {
@@ -18401,21 +18448,75 @@ fn collectDecisionCapsuleRows(
         if (content == null) continue;
         defer allocator.free(content.?);
         if (std.mem.indexOf(u8, content.?, "decision_context_packet") == null) continue;
-        var report = dcp_schema.validateText(allocator, content.?) catch continue;
-        defer report.deinit(allocator);
-        const errors = try joinStringListSep(allocator, report.errors, ",");
-        defer allocator.free(errors);
-        var row = query.Row.init(allocator);
-        errdefer row.deinit();
-        try row.putOwnedKey("path", .{ .string = path });
-        try row.putOwnedKey("session_id", .{ .string = inferSessionIdFromPath(path) });
-        try putOptionalString(&row, "packet_id", report.packet_id);
-        try row.putOwnedKey("decision_id", .{ .string = "" });
-        try row.putOwnedKey("source_kind", .{ .string = if (std.mem.endsWith(u8, path, ".json")) "file" else "session_text" });
-        try row.putOwnedKey("valid", .{ .bool = report.valid });
-        try row.putOwnedKey("errors", .{ .string = errors });
-        try out_rows.append(allocator, row);
+        if (std.mem.endsWith(u8, path, ".json")) {
+            _ = try appendDecisionCapsuleRowFromText(allocator, out_rows, path, "file", content.?);
+            continue;
+        }
+        var lines = std.mem.splitScalar(u8, content.?, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.indexOf(u8, line, "decision_context_packet") == null) continue;
+            _ = try appendDecisionCapsuleRowFromText(allocator, out_rows, path, "session_text", line);
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+            defer parsed.deinit();
+            try appendDecisionCapsuleRowsFromValueStrings(allocator, out_rows, path, parsed.value);
+        }
     }
+}
+
+fn appendDecisionCapsuleRowsFromValueStrings(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    path: []const u8,
+    value: std.json.Value,
+) !void {
+    switch (value) {
+        .string => |text| {
+            if (std.mem.indexOf(u8, text, "decision_context_packet") == null) return;
+            _ = try appendDecisionCapsuleRowFromText(allocator, out_rows, path, "session_text", text);
+        },
+        .array => |array| {
+            for (array.items) |item| try appendDecisionCapsuleRowsFromValueStrings(allocator, out_rows, path, item);
+        },
+        .object => |obj| {
+            var it = obj.iterator();
+            while (it.next()) |entry| try appendDecisionCapsuleRowsFromValueStrings(allocator, out_rows, path, entry.value_ptr.*);
+        },
+        else => {},
+    }
+}
+
+fn appendDecisionCapsuleRowFromText(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    path: []const u8,
+    source_kind: []const u8,
+    text: []const u8,
+) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch return false;
+    defer parsed.deinit();
+    if (!jsonValueIsDcpPacket(parsed.value)) return false;
+    var report = try dcp_schema.validateValue(allocator, parsed.value);
+    defer report.deinit(allocator);
+    const errors = try joinStringListSep(allocator, report.errors, ",");
+    defer allocator.free(errors);
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    try row.putOwnedKey("path", .{ .string = path });
+    try row.putOwnedKey("session_id", .{ .string = inferSessionIdFromPath(path) });
+    try putOptionalString(&row, "packet_id", report.packet_id);
+    try row.putOwnedKey("decision_id", .{ .string = "" });
+    try row.putOwnedKey("source_kind", .{ .string = source_kind });
+    try row.putOwnedKey("valid", .{ .bool = report.valid });
+    try row.putOwnedKey("errors", .{ .string = errors });
+    try out_rows.append(allocator, row);
+    return true;
+}
+
+fn jsonValueIsDcpPacket(value: std.json.Value) bool {
+    return switch (value) {
+        .object => |obj| obj.get("decision_context_packet") != null or stdJsonFieldEq(obj, "packet_version", dcp_schema.version),
+        else => false,
+    };
 }
 
 fn collectSkillDecisionDatasetPaths(

@@ -88,7 +88,7 @@ pub fn buildCapsuleJson(
     try writePacketBody(&body_without_id.writer, trace, rollout_path, selected, anchors, source_digest, outcome, null, opts);
     const canonical_body = try body_without_id.toOwnedSlice();
     defer allocator.free(canonical_body);
-    const packet_id = try dcp_schema.packetIdForCanonicalBody(allocator, canonical_body);
+    const packet_id = try dcp_schema.packetIdForTextExcludingPacketId(allocator, canonical_body);
     errdefer allocator.free(packet_id);
 
     var full = std.Io.Writer.Allocating.init(allocator);
