@@ -4687,6 +4687,10 @@ fn cmdIntakeApply(allocator: std.mem.Allocator, args: Args) !u8 {
         .last_audited_seq = loaded.latest_seq + 1,
         .last_audit_gate = args.gate.asString(),
     };
+    const intent_conflicts = try collectIntakeIntentConflictDiagnostics(allocator, state.graph, intake.intents, input_path);
+    if (countIntakeDiagnostics(intent_conflicts, "error") != 0) {
+        return writeIntakeDiagnosticsExit(allocator, args, intent_conflicts);
+    }
     for (intake.intents) |intent| try upsertIntentAtom(allocator, &state.graph, intent);
     for (intake.items) |item| {
         var backlog_item = item;
@@ -5631,6 +5635,55 @@ fn upsertIntentAtom(allocator: std.mem.Allocator, graph: *GraphEnvelope, atom: I
     graph.intent = try out.toOwnedSlice(allocator);
 }
 
+fn findIntentAtom(graph: GraphEnvelope, id: []const u8) ?IntentAtom {
+    for (graph.intent) |atom| {
+        if (std.mem.eql(u8, atom.id, id)) return atom;
+    }
+    return null;
+}
+
+fn intentSourceEqual(lhs: ?IntentSource, rhs: ?IntentSource) bool {
+    if (lhs == null and rhs == null) return true;
+    if (lhs == null or rhs == null) return false;
+    return std.mem.eql(u8, lhs.?.kind, rhs.?.kind) and
+        std.mem.eql(u8, lhs.?.locator, rhs.?.locator) and
+        std.mem.eql(u8, lhs.?.anchor, rhs.?.anchor);
+}
+
+fn intentAtomEqual(lhs: IntentAtom, rhs: IntentAtom) bool {
+    return std.mem.eql(u8, lhs.id, rhs.id) and
+        intentSourceEqual(lhs.source, rhs.source) and
+        std.mem.eql(u8, lhs.text, rhs.text) and
+        std.mem.eql(u8, lhs.category, rhs.category) and
+        std.mem.eql(u8, lhs.disposition, rhs.disposition) and
+        std.mem.eql(u8, lhs.reason, rhs.reason);
+}
+
+fn collectIntakeIntentConflictDiagnostics(
+    allocator: std.mem.Allocator,
+    graph: GraphEnvelope,
+    intents: []const IntentAtom,
+    path: []const u8,
+) ![]const IntakeDiagnostic {
+    var diagnostics = std.ArrayList(IntakeDiagnostic).empty;
+    for (intents) |intent| {
+        const existing = findIntentAtom(graph, intent.id) orelse continue;
+        if (intentAtomEqual(existing, intent)) continue;
+        const message = try std.fmt.allocPrint(allocator, "intake intent id '{s}' conflicts with an existing graph intent atom", .{intent.id});
+        try appendIntakeDiagnostic(
+            allocator,
+            &diagnostics,
+            "error",
+            "conflicting-intent-id",
+            1,
+            path,
+            message,
+            "Use a new intent id or submit an identical atom.",
+        );
+    }
+    return try diagnostics.toOwnedSlice(allocator);
+}
+
 fn upsertWaiver(allocator: std.mem.Allocator, graph: *GraphEnvelope, waiver: Waiver) !void {
     var out = std.ArrayList(Waiver).empty;
     var replaced = false;
@@ -5918,13 +5971,13 @@ fn auditDraftGraph(allocator: std.mem.Allocator, state: *const ItemState, gate: 
                 try addFinding(allocator, state, gate, findings, "unknown-intent-ref", .@"error", item.id, "Item references an unknown intent atom.");
             }
         }
-        if (isExecutableItem(item) and item.contract == null) {
+        if (itemRequiresImplementationReadyCapsule(item) and item.contract == null) {
             try addFinding(allocator, state, gate, findings, "missing-contract", .warning, item.id, "Executable item has no structured contract.");
         }
-        if (isExecutableItem(item) and item.acceptance.len == 0) {
+        if (itemRequiresImplementationReadyCapsule(item) and item.acceptance.len == 0) {
             try addFinding(allocator, state, gate, findings, "missing-acceptance", .warning, item.id, "Executable item has no acceptance criteria.");
         }
-        if (isExecutableItem(item) and item.validation.len == 0 and !itemHasProofObligations(item)) {
+        if (itemRequiresImplementationReadyCapsule(item) and item.validation.len == 0 and !itemHasProofObligations(item)) {
             try addFinding(allocator, state, gate, findings, "missing-validation", .warning, item.id, "Executable item has no validation or proof obligations.");
         }
     }
@@ -5954,7 +6007,7 @@ fn auditImplementationReadyGraph(allocator: std.mem.Allocator, state: *const Ite
         }
     }
     for (state.items.items) |item| {
-        if (!isExecutableItem(item)) continue;
+        if (!itemRequiresImplementationReadyCapsule(item)) continue;
         if (item.contract == null) {
             try addFinding(allocator, state, gate, findings, "executable-item-missing-contract", .@"error", item.id, "Executable item is missing a structured contract.");
         }
@@ -6098,6 +6151,10 @@ fn matchingWaiver(state: *const ItemState, gate: AuditGate, code: []const u8, ta
 
 fn isExecutableItem(item: Item) bool {
     return item.item_type != .epic and item.item_type != .decision;
+}
+
+fn itemRequiresImplementationReadyCapsule(item: Item) bool {
+    return isExecutableItem(item) and !isTerminalStatus(item.status);
 }
 
 fn itemHasProofObligations(item: Item) bool {
@@ -13106,6 +13163,157 @@ test "intake apply compiles markdown into graph state" {
     try std.testing.expectEqualStrings("apps/st/scripts/st.zig", item.lock_roots[0]);
     try std.testing.expectEqualStrings("proof-001", item.contract.?.proof_obligations[0].id);
     try std.testing.expect(std.mem.indexOf(u8, item.contract.?.proof_obligations[0].command, "| tee .step/proof/st-001.log") != null);
+}
+
+test "implementation-ready audit treats completed legacy capsule debt as historical" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var state = ItemState.init(allocator);
+    defer state.deinit();
+    state.graph_active = true;
+    state.graph.intent = &.{.{ .id = "intent-001", .text = "Covered by active work", .category = "requirement", .disposition = "covered" }};
+    try state.upsert(.{
+        .id = "st-legacy",
+        .step = "Completed legacy row without capsule fields",
+        .status = .completed,
+        .priority = .medium,
+        .in_plan = false,
+        .deps = &.{},
+        .notes = "",
+        .comments = &.{},
+        .item_type = .feature,
+    });
+    try state.upsert(.{
+        .id = "st-active",
+        .step = "Active row with full capsule",
+        .status = .pending,
+        .priority = .high,
+        .in_plan = false,
+        .deps = &.{},
+        .notes = "",
+        .comments = &.{},
+        .item_type = .feature,
+        .intent_refs = &.{"intent-001"},
+        .acceptance = &.{"behavior is implemented"},
+        .validation = &.{"zig build test-st"},
+        .contract = .{ .objective = "Exercise implementation-ready capsule checks." },
+    });
+
+    const audit = try auditGraph(allocator, &state, .implementation_ready);
+    try std.testing.expectEqual(@as(usize, 0), audit.errors);
+    try std.testing.expectEqual(@as(usize, 0), audit.warnings);
+}
+
+test "implementation-ready audit rejects active malformed executable rows" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var state = ItemState.init(allocator);
+    defer state.deinit();
+    state.graph_active = true;
+    try state.upsert(.{
+        .id = "st-active",
+        .step = "Active malformed row",
+        .status = .pending,
+        .priority = .high,
+        .in_plan = false,
+        .deps = &.{},
+        .notes = "",
+        .comments = &.{},
+        .item_type = .feature,
+    });
+
+    const audit = try auditGraph(allocator, &state, .implementation_ready);
+    try std.testing.expect(audit.errors > 0);
+    var saw_missing_contract = false;
+    for (audit.findings) |finding| {
+        if (std.mem.eql(u8, finding.code, "executable-item-missing-contract") and
+            std.mem.eql(u8, finding.target, "st-active"))
+        {
+            saw_missing_contract = true;
+        }
+    }
+    try std.testing.expect(saw_missing_contract);
+}
+
+test "intake apply rejects conflicting existing intent id atomically" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const plan_path = try std.fs.path.join(allocator, &.{ root, "st-plan.jsonl" });
+    const intake_path = try std.fs.path.join(allocator, &.{ root, "st-intake.md" });
+
+    var state = ItemState.init(allocator);
+    defer state.deinit();
+    state.graph_active = true;
+    state.graph.intent = &.{.{ .id = "intent-001", .text = "Original graph intent", .category = "requirement", .disposition = "covered" }};
+    try state.upsert(.{
+        .id = "st-existing",
+        .step = "Existing covering item",
+        .status = .completed,
+        .priority = .medium,
+        .in_plan = false,
+        .deps = &.{},
+        .notes = "",
+        .comments = &.{},
+        .item_type = .feature,
+        .intent_refs = &.{"intent-001"},
+    });
+    const now = try nowUtcAlloc(allocator);
+    try writeCanonicalRecords(plan_path, &state, 1, now, buildMutationMeta(allocator, false), null);
+
+    try writeTextAtomic(allocator, intake_path,
+        \\# st graph intake
+        \\
+        \\Source: PLAN.md
+        \\
+        \\## Intent
+        \\
+        \\- intent-001 | requirement | covered
+        \\  Text: Different intake intent
+        \\
+        \\## Items
+        \\
+        \\### st-001 | feature | high
+        \\
+        \\Step: Attempt conflicting intake
+        \\
+        \\Covers:
+        \\- intent-001
+        \\
+        \\Depends:
+        \\- none
+        \\
+        \\Acceptance:
+        \\- Intake is rejected.
+        \\
+        \\Validation:
+        \\- zig build test-st
+        \\
+        \\Contract:
+        \\Objective:
+        \\Exercise conflict rejection.
+        \\
+    );
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 2), try cmdIntake(allocator, .{ .command = .intake, .intake_command = .apply, .file = plan_path, .input = intake_path, .gate = .implementation_ready }));
+
+    const parsed = try readRecords(allocator, plan_path);
+    try std.testing.expectEqual(@as(i64, 1), parsed.latest_seq);
+    var loaded = try loadValidatedState(allocator, plan_path, false);
+    defer loaded.state.deinit();
+    try std.testing.expectEqual(@as(usize, 1), loaded.state.graph.intent.len);
+    try std.testing.expectEqualStrings("Original graph intent", loaded.state.graph.intent[0].text);
+    try std.testing.expect(loaded.state.getConst("st-001") == null);
 }
 
 test "intake diagnostics report placeholders and unknown dependencies" {
