@@ -34,6 +34,8 @@ source intent -> intent atoms -> contracted task capsules -> graph audit
 
 The graph is durable state in `.step/st-plan.jsonl`. Codex `update_plan` and OpenCode todos receive only the bounded aperture projection, never the full graph envelope.
 
+Material intake and graph patches must use the canonical `.step/st-plan.jsonl`. A second durable plan file is not a compatibility workaround for legacy graph debt; the CLI should repair or reject the canonical graph instead.
+
 ## JSONL v4 Graph Envelope
 
 Legacy v3 files remain readable. Non-graph commands may keep writing v3 until graph mode is activated. The first graph mutation writes v4 canonical records with a graph envelope:
@@ -73,7 +75,7 @@ Graph-mode items extend existing tasks with optional capsule fields:
 - `acceptance`, `validation`, `location`, `scope`, `labels`, `lock_roots`, `uncertainty`, `non_goals`.
 - `contract`: structured objective, background, implementation approach, success criteria, proof obligations, and risks.
 
-`epic` and `decision` are non-executable by default. Executable items are expected to carry acceptance criteria plus validation or proof obligations before implementation-ready graph audit passes.
+`epic` and `decision` are non-executable by default. Active executable items are expected to carry acceptance criteria plus validation or proof obligations before implementation-ready graph audit passes. Completed, deferred, and canceled legacy rows remain subject to global structural validity checks, but their missing implementation-ready capsule fields are historical debt rather than an intake blocker.
 
 ## Intent Coverage
 
