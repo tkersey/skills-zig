@@ -337,6 +337,7 @@ const LaneHandle = struct {
     anchor_digest_expected: []const u8,
     anchor_digest_observed: []const u8,
     expected_hindsight: bool,
+    policy_request_count_before: u64,
     fork_policy: ForkPolicyProof,
 };
 
@@ -464,6 +465,16 @@ fn parsePositiveU64(raw: []const u8) !u64 {
 fn isOneOf(value: []const u8, choices: []const []const u8) bool {
     for (choices) |choice| if (std.mem.eql(u8, value, choice)) return true;
     return false;
+}
+
+fn isSafePathComponent(value: []const u8) bool {
+    if (value.len == 0) return false;
+    if (std.mem.eql(u8, value, ".") or std.mem.eql(u8, value, "..")) return false;
+    for (value) |ch| {
+        if (std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-' or ch == '.') continue;
+        return false;
+    }
+    return true;
 }
 
 fn cmdPreflight(allocator: std.mem.Allocator, options: Options) !void {
@@ -1156,6 +1167,7 @@ fn deinitRip(allocator: std.mem.Allocator, rip: Rip) void {
 }
 
 fn validateLane(lane: Lane) !void {
+    if (!isSafePathComponent(lane.lane_id)) return error.BadLaneId;
     if (!isOneOf(lane.temporal_horizon, &.{ "pre_decision", "post_decision_pre_outcome", "outcome_aware" })) return error.BadHorizon;
     if (!isOneOf(lane.inquiry_mode, &.{ "rationale", "counterfactual", "alternative_challenge", "assumption_probe", "evidence_ablation", "retrospective" })) return error.BadMode;
     if (lane.fork_count < 1) return error.BadForkCount;
@@ -1165,8 +1177,8 @@ fn validateLane(lane: Lane) !void {
 }
 
 fn validateInquiryInputs(dcp: Dcp, rip: Rip, options: Options) GateResult {
-    if (dcp.source_thread_id == null and dcp.source_rollout_path == null) {
-        return .{ .valid = false, .failure_code = .source_not_found, .hint = "DCP has neither source thread_id nor rollout_path" };
+    if (dcp.source_thread_id == null) {
+        return .{ .valid = false, .failure_code = .source_not_found, .hint = "DCP source thread_id is required; rollout_path fallback is not implemented in v1" };
     }
     if (!rip.permission_read_only or rip.permission_network) {
         return .{ .valid = false, .failure_code = .permission_mismatch, .hint = "RIP must require read_only=true and network=false" };
@@ -1246,6 +1258,7 @@ fn executeLiveInquiry(
     const summary_path = try std.fmt.allocPrint(allocator, "{s}/summary.json", .{receipt_dir});
     const state_path = try stateRecordPath(allocator, options.home, rip.inquiry_id);
 
+    const hook_policy = cas_client.hooks.HookPolicy.parse(options.hooks) orelse .inherit;
     var client = try cas_client.Client.start(allocator, .{
         .cwd = inquiry_cwd,
         .codex_path = options.codex_path,
@@ -1258,6 +1271,7 @@ fn executeLiveInquiry(
         .elicitation_action = "decline",
         .dynamic_tool_response_json = "{\"contentItems\":[{\"type\":\"inputText\",\"text\":\"Dynamic tools are disabled for CAS session inquiry\"}],\"success\":false}",
         .read_only = true,
+        .hook_policy = hook_policy,
     });
     defer {
         client.close();
@@ -1362,7 +1376,8 @@ fn startDetachedInquiry(
 ) !RunOutput {
     const source_thread_id = dcp.source_thread_id orelse return error.SourceNotFound;
     try ensureDir(receipt_dir);
-    const lanes_dir = try std.fmt.allocPrint(allocator, "{s}/lanes", .{receipt_dir});
+    const receipt_root = try absoluteDirPathAlloc(allocator, receipt_dir);
+    const lanes_dir = try std.fmt.allocPrint(allocator, "{s}/lanes", .{receipt_root});
     defer allocator.free(lanes_dir);
     try ensureDir(lanes_dir);
     const state_lanes_dir = try inquiryPathJoin(allocator, options.home, rip.inquiry_id, "lanes");
@@ -1371,8 +1386,8 @@ fn startDetachedInquiry(
     try persistInputCopies(allocator, options, rip.inquiry_id);
     const inquiry_cwd = try inquiryWorkspaceCwdAlloc(allocator, options, rip);
     defer allocator.free(inquiry_cwd);
-    const events_path = try std.fmt.allocPrint(allocator, "{s}/events.jsonl", .{receipt_dir});
-    const summary_path = try std.fmt.allocPrint(allocator, "{s}/summary.json", .{receipt_dir});
+    const events_path = try std.fmt.allocPrint(allocator, "{s}/events.jsonl", .{receipt_root});
+    const summary_path = try std.fmt.allocPrint(allocator, "{s}/summary.json", .{receipt_root});
     const state_path = try stateRecordPath(allocator, options.home, rip.inquiry_id);
 
     const hook_policy = cas_client.hooks.HookPolicy.parse(options.hooks) orelse .inherit;
@@ -1415,7 +1430,7 @@ fn startDetachedInquiry(
         while (ordinal < lane.fork_count) : (ordinal += 1) {
             if (launched >= rip.max_forks) return error.BudgetExhausted;
             launched += 1;
-            _ = try startLaneFork(allocator, &client, options, inquiry_cwd, dcp, rip, lane, ordinal, receipt_dir, events_path, preflight);
+            _ = try startLaneFork(allocator, &client, options, inquiry_cwd, dcp, rip, lane, ordinal, receipt_root, events_path, preflight);
         }
     }
 
@@ -1430,7 +1445,7 @@ fn startDetachedInquiry(
             .codex_path = preflight.codex_path,
             .codex_version = preflight.codex_version,
             .cwd = inquiry_cwd,
-            .receipt_dir = receipt_dir,
+            .receipt_dir = receipt_root,
             .schema_fingerprint = preflight.schema_fingerprint,
         },
     });
@@ -1442,7 +1457,7 @@ fn startDetachedInquiry(
         rip,
         source_thread_id,
         @tagName(InquiryState.turn_running),
-        receipt_dir,
+        receipt_root,
         events_path,
         summary_path,
         preflight,
@@ -1461,7 +1476,7 @@ fn startDetachedInquiry(
     return .{
         .inquiry_id = rip.inquiry_id,
         .state = @tagName(InquiryState.turn_running),
-        .receipt_dir = receipt_dir,
+        .receipt_dir = receipt_root,
         .state_ref = state_path,
         .events_ref = events_path,
         .summary_ref = summary_path,
@@ -1645,6 +1660,56 @@ fn interruptDetachedInquiry(allocator: std.mem.Allocator, options: Options, inqu
         try appendLine(handle.lane_events, result);
         try writeLaneHandle(allocator, handle, @tagName(InquiryState.interrupted));
         interrupted += 1;
+    }
+    if (interrupted > 0) {
+        const capsule_path = try inquiryPathJoin(allocator, options.home, inquiry_id, "capsule.json");
+        defer allocator.free(capsule_path);
+        const plan_path = try inquiryPathJoin(allocator, options.home, inquiry_id, "plan.json");
+        defer allocator.free(plan_path);
+        const dcp = try loadDcp(allocator, capsule_path);
+        defer deinitDcp(allocator, dcp);
+        const rip = try loadRip(allocator, plan_path);
+        defer deinitRip(allocator, rip);
+        try writeSummary(
+            allocator,
+            record.summary_ref,
+            inquiry_id,
+            @tagName(InquiryState.interrupted),
+            0,
+            interrupted,
+            record.schema_fingerprint,
+            FailureCode.fork_interrupted.asString(),
+            "active inquiry turns were interrupted",
+        );
+        try writeInquiryState(
+            allocator,
+            record.state_ref,
+            dcp,
+            rip,
+            dcp.source_thread_id orelse "",
+            @tagName(InquiryState.interrupted),
+            record.receipt_dir,
+            record.events_ref,
+            record.summary_ref,
+            .{
+                .compatibility_verdict = "compatible",
+                .codex_path = record.codex_path,
+                .codex_version = record.codex_version,
+                .schema_fingerprint = record.schema_fingerprint,
+                .cache_dir = "",
+                .selected_transport = "websocket",
+                .capabilities = zeroCapabilities(),
+                .missing = &.{},
+                .inquiry_allowed = true,
+            },
+            true,
+            record.managed_server_pid,
+            record.listen_url,
+            record.cwd,
+            FailureCode.fork_interrupted.asString(),
+            "active inquiry turns were interrupted",
+            nowMillis(),
+        );
     }
     return .{
         .session_inquiry_interrupt = .{
@@ -1864,12 +1929,18 @@ fn startLaneFork(
     const fork_thread_id = try threadIdFromResponse(allocator, fork_json);
     const forked_from = forkedFromIdFromResponse(allocator, fork_json) catch null;
     const fork_policy = try forkPolicyProofFromResponse(allocator, fork_json, options.permissions);
+    const before_digest = try turnDigestFromThreadRead(allocator, fork_json);
     if (forked_from) |value| {
-        if (!std.mem.eql(u8, value, source_thread_id)) return error.LineageMismatch;
+        if (!std.mem.eql(u8, value, source_thread_id)) {
+            try persistLaneHandleSnapshot(allocator, options, inquiry_cwd, dcp, rip, lane, ordinal, lane_events, lane_final, lane_receipt, lane_state_ref, fork_thread_id, forked_from, "", "", before_digest, before_digest, anchor, fork_policy, preflight, client.blockingServerRequestCount(), @tagName(InquiryState.failed));
+            return error.LineageMismatch;
+        }
     }
 
-    const before_digest = try turnDigestFromThreadRead(allocator, fork_json);
-    if (before_digest.count != dcp.total_turns) return error.SourceStale;
+    if (before_digest.count != dcp.total_turns) {
+        try persistLaneHandleSnapshot(allocator, options, inquiry_cwd, dcp, rip, lane, ordinal, lane_events, lane_final, lane_receipt, lane_state_ref, fork_thread_id, forked_from, "", "", before_digest, before_digest, anchor, fork_policy, preflight, client.blockingServerRequestCount(), @tagName(InquiryState.failed));
+        return error.SourceStale;
+    }
 
     var anchored_digest: TurnDigest = before_digest;
     if (anchor.drop_last_n_turns > 0) {
@@ -1877,6 +1948,7 @@ fn startLaneFork(
         defer allocator.free(rollback_params);
         const rollback_json = client.requestJson("thread/rollback", rollback_params) catch {
             if (client.lastError()) |detail| try appendLine(lane_events, detail);
+            try persistLaneHandleSnapshot(allocator, options, inquiry_cwd, dcp, rip, lane, ordinal, lane_events, lane_final, lane_receipt, lane_state_ref, fork_thread_id, forked_from, "", "", before_digest, anchored_digest, anchor, fork_policy, preflight, client.blockingServerRequestCount(), @tagName(InquiryState.failed));
             return error.RollbackFailed;
         };
         defer allocator.free(rollback_json);
@@ -1885,7 +1957,10 @@ fn startLaneFork(
     }
 
     const anchor_valid = std.mem.eql(u8, anchored_digest.digest, anchor.anchor_digest orelse "");
-    if (!anchor_valid) return error.AnchorDigestMismatch;
+    if (!anchor_valid) {
+        try persistLaneHandleSnapshot(allocator, options, inquiry_cwd, dcp, rip, lane, ordinal, lane_events, lane_final, lane_receipt, lane_state_ref, fork_thread_id, forked_from, "", "", before_digest, anchored_digest, anchor, fork_policy, preflight, client.blockingServerRequestCount(), @tagName(InquiryState.failed));
+        return error.AnchorDigestMismatch;
+    }
 
     const client_msg_id = try std.fmt.allocPrint(allocator, "cas-{s}-{s}-{d}", .{ rip.inquiry_id, lane.lane_id, ordinal + 1 });
     const turn_text = try buildInquiryPromptAlloc(allocator, rip, lane);
@@ -1901,6 +1976,7 @@ fn startLaneFork(
         .runtimeWorkspaceRoots = [_][]const u8{},
     });
     defer allocator.free(turn_params);
+    const policy_request_count_before_turn = client.blockingServerRequestCount();
     var notifications: std.ArrayList([]u8) = .empty;
     defer {
         for (notifications.items) |line| allocator.free(line);
@@ -1915,7 +1991,67 @@ fn startLaneFork(
     for (notifications.items) |line| try appendLine(lane_events, line);
     const turn_id = try turnIdFromStartResponse(allocator, turn_json);
 
-    const handle = LaneHandle{
+    const handle = try buildLaneHandleSnapshot(allocator, options, inquiry_cwd, dcp, rip, lane, ordinal, lane_events, lane_final, lane_receipt, lane_state_ref, fork_thread_id, forked_from, turn_id, client_msg_id, before_digest, anchored_digest, anchor, fork_policy, preflight, policy_request_count_before_turn);
+    writeLaneHandle(allocator, handle, @tagName(InquiryState.turn_running)) catch |err| {
+        std.debug.print("writeLaneHandle failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    return handle;
+}
+
+fn persistLaneHandleSnapshot(
+    allocator: std.mem.Allocator,
+    options: Options,
+    inquiry_cwd: []const u8,
+    dcp: Dcp,
+    rip: Rip,
+    lane: Lane,
+    ordinal: u64,
+    lane_events: []const u8,
+    lane_final: []const u8,
+    lane_receipt: []const u8,
+    lane_state_ref: []const u8,
+    fork_thread_id: []const u8,
+    forked_from: ?[]const u8,
+    turn_id: []const u8,
+    client_msg_id: []const u8,
+    before_digest: TurnDigest,
+    anchored_digest: TurnDigest,
+    anchor: Anchor,
+    fork_policy: ForkPolicyProof,
+    preflight: PreflightResult,
+    policy_request_count_before: u64,
+    state: []const u8,
+) !void {
+    const handle = try buildLaneHandleSnapshot(allocator, options, inquiry_cwd, dcp, rip, lane, ordinal, lane_events, lane_final, lane_receipt, lane_state_ref, fork_thread_id, forked_from, turn_id, client_msg_id, before_digest, anchored_digest, anchor, fork_policy, preflight, policy_request_count_before);
+    try writeLaneHandle(allocator, handle, state);
+}
+
+fn buildLaneHandleSnapshot(
+    allocator: std.mem.Allocator,
+    options: Options,
+    inquiry_cwd: []const u8,
+    dcp: Dcp,
+    rip: Rip,
+    lane: Lane,
+    ordinal: u64,
+    lane_events: []const u8,
+    lane_final: []const u8,
+    lane_receipt: []const u8,
+    lane_state_ref: []const u8,
+    fork_thread_id: []const u8,
+    forked_from: ?[]const u8,
+    turn_id: []const u8,
+    client_msg_id: []const u8,
+    before_digest: TurnDigest,
+    anchored_digest: TurnDigest,
+    anchor: Anchor,
+    fork_policy: ForkPolicyProof,
+    preflight: PreflightResult,
+    policy_request_count_before: u64,
+) !LaneHandle {
+    const source_thread_id = dcp.source_thread_id orelse return error.SourceNotFound;
+    return .{
         .inquiry_id = try allocator.dupe(u8, rip.inquiry_id),
         .lane_id = try allocator.dupe(u8, lane.lane_id),
         .inquiry_mode = try allocator.dupe(u8, lane.inquiry_mode),
@@ -1923,33 +2059,29 @@ fn startLaneFork(
         .question = try allocator.dupe(u8, lane.prompt_template),
         .ordinal = ordinal + 1,
         .source_thread_id = try allocator.dupe(u8, source_thread_id),
-        .fork_thread_id = fork_thread_id,
-        .forked_from_id = if (forked_from) |value| value else try allocator.dupe(u8, source_thread_id),
-        .turn_id = turn_id,
-        .client_user_message_id = client_msg_id,
-        .lane_events = lane_events,
-        .lane_final = lane_final,
-        .lane_receipt = lane_receipt,
-        .lane_state_ref = lane_state_ref,
+        .fork_thread_id = try allocator.dupe(u8, fork_thread_id),
+        .forked_from_id = if (forked_from) |value| try allocator.dupe(u8, value) else try allocator.dupe(u8, source_thread_id),
+        .turn_id = try allocator.dupe(u8, turn_id),
+        .client_user_message_id = try allocator.dupe(u8, client_msg_id),
+        .lane_events = try allocator.dupe(u8, lane_events),
+        .lane_final = try allocator.dupe(u8, lane_final),
+        .lane_receipt = try allocator.dupe(u8, lane_receipt),
+        .lane_state_ref = try allocator.dupe(u8, lane_state_ref),
         .workspace_cwd = try allocator.dupe(u8, inquiry_cwd),
         .model = try allocator.dupe(u8, options.model orelse dcp.source_model orelse ""),
         .model_provider = try allocator.dupe(u8, options.model_provider orelse dcp.source_model_provider orelse ""),
         .service_tier = try allocator.dupe(u8, options.service_tier orelse ""),
         .codex_version = try allocator.dupe(u8, preflight.codex_version),
         .schema_fingerprint = try allocator.dupe(u8, preflight.schema_fingerprint),
+        .policy_request_count_before = policy_request_count_before,
         .turns_before = before_digest.count,
         .turns_dropped = anchor.drop_last_n_turns,
         .turns_after = anchored_digest.count,
         .anchor_digest_expected = try allocator.dupe(u8, anchor.anchor_digest orelse ""),
-        .anchor_digest_observed = anchored_digest.digest,
+        .anchor_digest_observed = try allocator.dupe(u8, anchored_digest.digest),
         .expected_hindsight = std.mem.eql(u8, lane.temporal_horizon, "outcome_aware"),
         .fork_policy = fork_policy,
     };
-    writeLaneHandle(allocator, handle, @tagName(InquiryState.turn_running)) catch |err| {
-        std.debug.print("writeLaneHandle failed: {s}\n", .{@errorName(err)});
-        return err;
-    };
-    return handle;
 }
 
 fn collectLaneFork(
@@ -1963,7 +2095,9 @@ fn collectLaneFork(
     const final_text = if (observed.final_text.len > 0) observed.final_text else "";
     try writeTextAtomic(allocator, handle.lane_final, final_text);
     const parsed_answer = parseFiaAnswerAlloc(allocator, final_text, handle.expected_hindsight) catch null;
-    const answer_complete = parsed_answer != null and observed.terminal and std.mem.eql(u8, observed.status, "completed") and !observed.blocking_event;
+    const policy_request_observed = client.blockingServerRequestCount() > handle.policy_request_count_before;
+    const blocking_event = observed.blocking_event or policy_request_observed;
+    const answer_complete = parsed_answer != null and observed.terminal and std.mem.eql(u8, observed.status, "completed") and !blocking_event;
     const anchor_valid = std.mem.eql(u8, handle.anchor_digest_observed, handle.anchor_digest_expected);
     const receipt_valid = answer_complete and anchor_valid and handle.fork_policy.safe();
 
@@ -2049,6 +2183,7 @@ fn collectLaneFork(
                 .lineage_valid = true,
                 .anchor_valid = anchor_valid,
                 .permissions_valid = handle.fork_policy.safe(),
+                .approval_or_tool_request_observed = blocking_event,
                 .hindsight_label_valid = parsed_answer != null,
                 .answer_complete = answer_complete,
                 .receipt_valid = receipt_valid,
@@ -2083,6 +2218,7 @@ fn writeLaneHandle(allocator: std.mem.Allocator, handle: LaneHandle, state: []co
             .service_tier = handle.service_tier,
             .codex_version = handle.codex_version,
             .schema_fingerprint = handle.schema_fingerprint,
+            .policy_request_count_before = handle.policy_request_count_before,
             .lane_events_ref = handle.lane_events,
             .final_text_ref = handle.lane_final,
             .receipt_ref = handle.lane_receipt,
@@ -2138,6 +2274,7 @@ fn loadLaneHandleAlloc(allocator: std.mem.Allocator, path: []const u8) !LaneHand
         .service_tier = try allocator.dupe(u8, optionalString(lane_obj, "service_tier") orelse ""),
         .codex_version = try allocator.dupe(u8, try requiredString(lane_obj, "codex_version")),
         .schema_fingerprint = try allocator.dupe(u8, try requiredString(lane_obj, "schema_fingerprint")),
+        .policy_request_count_before = optionalU64(lane_obj, "policy_request_count_before") orelse 0,
         .turns_before = try requiredU64(anchor, "turns_before"),
         .turns_dropped = try requiredU64(anchor, "turns_dropped"),
         .turns_after = try requiredU64(anchor, "turns_after"),
@@ -2440,9 +2577,6 @@ fn forkPolicyProofFromResponse(allocator: std.mem.Allocator, raw: []const u8, re
             proof.read_only = std.mem.indexOf(u8, sandbox_json, "read-only") != null or std.mem.indexOf(u8, sandbox_json, "readOnly") != null;
         }
     }
-    if (!proof.read_only and std.mem.indexOf(u8, requested_permissions, "read") != null) {
-        proof.read_only = true;
-    }
     return proof;
 }
 
@@ -2604,6 +2738,17 @@ fn persistInvalidRunArtifacts(
     try appendLine(events_path, gate_event);
     const summary_path = try std.fmt.allocPrint(allocator, "{s}/summary.json", .{receipt_dir});
     defer allocator.free(summary_path);
+    try writeSummary(
+        allocator,
+        summary_path,
+        rip.inquiry_id,
+        @tagName(InquiryState.failed),
+        0,
+        1,
+        "",
+        if (gate.failure_code) |code| code.asString() else FailureCode.receipt_invalid.asString(),
+        gate.hint,
+    );
     const state = .{
         .session_inquiry_record = .{
             .record_version = "SIR-v1",
@@ -2920,6 +3065,18 @@ fn ensureParentDir(path: []const u8) !void {
     try ensureDir(parent);
 }
 
+fn absoluteDirPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    if (std.fs.path.isAbsolute(path)) {
+        var dir = try std.Io.Dir.openDirAbsolute(io, path, .{});
+        defer dir.close(io);
+        return dir.realPathFileAlloc(io, ".", allocator);
+    }
+    var dir = try std.Io.Dir.cwd().openDir(io, path, .{});
+    defer dir.close(io);
+    return dir.realPathFileAlloc(io, ".", allocator);
+}
+
 fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]const u8 {
     const io = std.Io.Threaded.global_single_threaded.io();
     var file = if (std.fs.path.isAbsolute(path))
@@ -2946,14 +3103,78 @@ fn fileExists(path: []const u8) bool {
 }
 
 fn expandSimpleGlobAlloc(allocator: std.mem.Allocator, pattern: []const u8) ![]const []const u8 {
-    const star = std.mem.indexOfScalar(u8, pattern, '*') orelse {
+    if (std.mem.indexOfScalar(u8, pattern, '*') == null) {
         var one = try allocator.alloc([]const u8, 1);
         one[0] = try allocator.dupe(u8, pattern);
         return one;
-    };
+    }
     const dir_name = std.fs.path.dirname(pattern) orelse ".";
     const base = std.fs.path.basename(pattern);
-    const base_star = star - (pattern.len - base.len);
+    const dirs = try expandDirectoryGlobAlloc(allocator, dir_name);
+    defer {
+        for (dirs) |dir_path| allocator.free(dir_path);
+        allocator.free(dirs);
+    }
+    var out: std.ArrayList([]const u8) = .empty;
+    for (dirs) |dir_path| {
+        try appendFileGlobMatches(allocator, &out, dir_path, base);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn expandDirectoryGlobAlloc(allocator: std.mem.Allocator, pattern: []const u8) ![]const []const u8 {
+    if (std.mem.indexOfScalar(u8, pattern, '*') == null) {
+        var one = try allocator.alloc([]const u8, 1);
+        one[0] = try allocator.dupe(u8, pattern);
+        return one;
+    }
+    const parent = std.fs.path.dirname(pattern) orelse ".";
+    const base = std.fs.path.basename(pattern);
+    const parents = try expandDirectoryGlobAlloc(allocator, parent);
+    defer {
+        for (parents) |parent_path| allocator.free(parent_path);
+        allocator.free(parents);
+    }
+
+    var out: std.ArrayList([]const u8) = .empty;
+    for (parents) |parent_path| {
+        if (std.mem.indexOfScalar(u8, base, '*')) |base_star| {
+            var dir = if (std.fs.path.isAbsolute(parent_path))
+                try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), parent_path, .{ .iterate = true })
+            else
+                try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), parent_path, .{ .iterate = true });
+            defer dir.close(std.Io.Threaded.global_single_threaded.io());
+            var iter = dir.iterate();
+            const prefix = base[0..base_star];
+            const suffix = base[base_star + 1 ..];
+            while (try iter.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
+                if (entry.kind != .directory) continue;
+                if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
+                if (!std.mem.endsWith(u8, entry.name, suffix)) continue;
+                try out.append(allocator, try joinPathAlloc(allocator, parent_path, entry.name));
+            }
+        } else {
+            const candidate = try joinPathAlloc(allocator, parent_path, base);
+            if (dirExists(candidate)) {
+                try out.append(allocator, candidate);
+            } else {
+                allocator.free(candidate);
+            }
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendFileGlobMatches(allocator: std.mem.Allocator, out: *std.ArrayList([]const u8), dir_name: []const u8, base: []const u8) !void {
+    const base_star = std.mem.indexOfScalar(u8, base, '*') orelse {
+        const candidate = try joinPathAlloc(allocator, dir_name, base);
+        if (fileExists(candidate)) {
+            try out.append(allocator, candidate);
+        } else {
+            allocator.free(candidate);
+        }
+        return;
+    };
     const prefix = base[0..base_star];
     const suffix = base[base_star + 1 ..];
     var dir = if (std.fs.path.isAbsolute(dir_name))
@@ -2962,14 +3183,28 @@ fn expandSimpleGlobAlloc(allocator: std.mem.Allocator, pattern: []const u8) ![]c
         try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), dir_name, .{ .iterate = true });
     defer dir.close(std.Io.Threaded.global_single_threaded.io());
     var iter = dir.iterate();
-    var out: std.ArrayList([]const u8) = .empty;
     while (try iter.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
         if (!std.mem.endsWith(u8, entry.name, suffix)) continue;
-        try out.append(allocator, try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_name, entry.name }));
+        try out.append(allocator, try joinPathAlloc(allocator, dir_name, entry.name));
     }
-    return out.toOwnedSlice(allocator);
+}
+
+fn dirExists(path: []const u8) bool {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = if (std.fs.path.isAbsolute(path))
+        std.Io.Dir.openDirAbsolute(io, path, .{}) catch return false
+    else
+        std.Io.Dir.cwd().openDir(io, path, .{}) catch return false;
+    dir.close(io);
+    return true;
+}
+
+fn joinPathAlloc(allocator: std.mem.Allocator, parent: []const u8, child: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, parent, ".")) return allocator.dupe(u8, child);
+    if (std.mem.eql(u8, parent, "/")) return std.fmt.allocPrint(allocator, "/{s}", .{child});
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ parent, child });
 }
 
 fn readFirReceiptValid(allocator: std.mem.Allocator, path: []const u8) !bool {
@@ -3226,6 +3461,44 @@ test "sanitizeInquiryId rejects path traversal" {
     try std.testing.expectError(error.InvalidInquiryId, sanitizeInquiryIdAlloc(allocator, "../bad"));
 }
 
+test "validateLane rejects path traversal lane ids" {
+    try validateLane(.{
+        .lane_id = "rationale-1",
+        .inquiry_mode = "rationale",
+        .temporal_horizon = "pre_decision",
+        .prompt_template = "why",
+        .fork_count = 1,
+        .evidence_allowed_count = 0,
+        .evidence_withheld_count = 0,
+    });
+    try std.testing.expectError(error.BadLaneId, validateLane(.{
+        .lane_id = "../../escape",
+        .inquiry_mode = "rationale",
+        .temporal_horizon = "pre_decision",
+        .prompt_template = "why",
+        .fork_count = 1,
+        .evidence_allowed_count = 0,
+        .evidence_withheld_count = 0,
+    }));
+}
+
+test "expandSimpleGlobAlloc supports wildcard directories" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "INQ-1/lanes");
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "INQ-2/lanes");
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "INQ-1/lanes/a.json", .data = "{}" });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "INQ-2/lanes/b.json", .data = "{}" });
+    const tmp_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
+    defer allocator.free(tmp_path);
+    const pattern = try std.fmt.allocPrint(allocator, "{s}/*/lanes/*.json", .{tmp_path});
+    defer allocator.free(pattern);
+    const matches = try expandSimpleGlobAlloc(allocator, pattern);
+    defer freeStringList(allocator, matches);
+    try std.testing.expectEqual(@as(usize, 2), matches.len);
+}
+
 test "sha256HexAlloc prefixes digest" {
     const allocator = std.testing.allocator;
     const digest = try sha256HexAlloc(allocator, "abc");
@@ -3305,6 +3578,12 @@ test "forkPolicyProofFromResponse requires response-backed proof" {
     ;
     const unsafe_proof = try forkPolicyProofFromResponse(allocator, unsafe, "read-only");
     try std.testing.expect(!unsafe_proof.valid());
+
+    const no_readonly_proof =
+        \\{"approvalPolicy":"never","thread":{"id":"thr_1","ephemeral":true}}
+    ;
+    const unproven = try forkPolicyProofFromResponse(allocator, no_readonly_proof, "read-only");
+    try std.testing.expect(!unproven.safe());
 }
 
 test "detached lane handle round-trips persisted fork turn handle" {
@@ -3354,6 +3633,7 @@ test "detached lane handle round-trips persisted fork turn handle" {
         .anchor_digest_expected = "sha256:anchor",
         .anchor_digest_observed = "sha256:anchor",
         .expected_hindsight = false,
+        .policy_request_count_before = 7,
         .fork_policy = .{ .ephemeral = true, .read_only = true, .approval_never = true },
     };
 
@@ -3364,6 +3644,7 @@ test "detached lane handle round-trips persisted fork turn handle" {
     try std.testing.expectEqualStrings("fork", loaded.fork_thread_id);
     try std.testing.expectEqualStrings("turn", loaded.turn_id);
     try std.testing.expectEqual(@as(u64, 2), loaded.turns_dropped);
+    try std.testing.expectEqual(@as(u64, 7), loaded.policy_request_count_before);
     try std.testing.expect(loaded.fork_policy.valid());
 }
 
