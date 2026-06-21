@@ -43,6 +43,7 @@ const UsageText =
     \\  --hooks MODE                        Hook policy: inherit|off|require-observed (default: inherit).
     \\  --client-prefix NAME                Instance client prefix (default: cas-instance).
     \\  --sample N                          Sample count in output (default: 3).
+    \\  --raw-sample                        Include raw app-server result JSON for sampled responses.
     \\  --json                              Emit JSON.
     \\  --verbose                           Emit per-instance status to stderr.
     \\  --help                              Show help.
@@ -76,6 +77,7 @@ const ParsedArgs = struct {
     hook_policy: cas.hooks.HookPolicy = .inherit,
     client_prefix: []const u8 = "cas-instance",
     sample: usize = 3,
+    raw_sample: bool = false,
     json: bool = false,
     verbose: bool = false,
     show_help: bool = false,
@@ -92,6 +94,7 @@ const RequestResult = struct {
     ok: bool,
     transport: []const u8,
     summary: ?[]const u8 = null,
+    raw_result: ?[]const u8 = null,
     @"error": ?[]const u8 = null,
 };
 
@@ -322,6 +325,7 @@ pub fn main(init: std.process.Init) !void {
             .ok = true,
             .transport = slot.transport,
             .summary = summary,
+            .raw_result = if (opts.raw_sample) try allocator.dupe(u8, result_json) else null,
         });
         if (opts.verbose) {
             var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
@@ -444,6 +448,10 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
         }
         if (std.mem.eql(u8, arg, "--verbose")) {
             out.verbose = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--raw-sample")) {
+            out.raw_sample = true;
             continue;
         }
 
@@ -775,6 +783,7 @@ test "parseArgs accepts core options and collects opt-out methods" {
         "thread/item/stream",
         "--hooks",
         "off",
+        "--raw-sample",
         "--json",
     };
 
@@ -784,6 +793,7 @@ test "parseArgs accepts core options and collects opt-out methods" {
     try std.testing.expectEqual(@as(?[]const u8, "/tmp/repo"), parsed.cwd);
     try std.testing.expectEqual(@as(usize, 4), parsed.instances);
     try std.testing.expectEqualStrings("thread/read", parsed.method);
+    try std.testing.expect(parsed.raw_sample);
     try std.testing.expect(parsed.json);
     try std.testing.expectEqual(@as(usize, 1), parsed.opt_out_methods.len);
     try std.testing.expectEqualStrings("thread/item/stream", parsed.opt_out_methods[0]);

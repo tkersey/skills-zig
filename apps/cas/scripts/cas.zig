@@ -20,18 +20,22 @@ const UsageText =
     \\
     \\Subcommands:
     \\  account                            Run cas_account.
+    \\  capabilities                       Print compiled CAS feature flags.
     \\  conformance     | conformance-suite  Run cas_conformance_suite.
     \\  goal                                 Run cas_goal.
     \\  instance_runner | instance-runner   Run cas_instance_runner.
     \\  review_session  | review-session    Run cas_review_session.
+    \\  session_inquiry | session-inquiry   Run cas_session_inquiry.
     \\  smoke_check     | smoke-check       Run cas_smoke_check.
     \\
     \\Examples:
+    \\  cas capabilities --json
     \\  cas account status --cwd /path/to/repo --json
     \\  cas conformance --cwd /path/to/repo --json
     \\  cas goal resolve --cwd /path/to/repo --latest --json
     \\  cas instance_runner --cwd /path/to/repo --instances 4
     \\  cas review_session start --cwd /path/to/repo --uncommitted --json
+    \\  cas session_inquiry preflight --json
     \\  cas smoke_check --cwd /path/to/repo --json
     \\
     \\Options:
@@ -56,6 +60,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (std.mem.eql(u8, argv[1], "capabilities")) {
+        try printCapabilities(argv[2..]);
+        return;
+    }
+
     const target_name = resolveTarget(argv[1]) orelse {
         core_cli.exitUsageFailure(HelpSurface, Version, "UnknownSubcommand", argv[1]);
     };
@@ -75,7 +84,7 @@ pub fn main(init: std.process.Init) !void {
         var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stderr = &stderr_writer.interface;
         try stderr.print(
-            "failed to launch {s}: {s}\ninstall or expose the full CAS binary set beside `cas` ({s}, cas_account, cas_smoke_check, cas_instance_runner, cas_conformance_suite, cas_goal)\n",
+            "failed to launch {s}: {s}\ninstall or expose the full CAS binary set beside `cas` ({s}, cas_account, cas_smoke_check, cas_instance_runner, cas_review_session, cas_session_inquiry, cas_conformance_suite, cas_goal)\n",
             .{ target_name, @errorName(err), target_name },
         );
         std.process.exit(1);
@@ -175,10 +184,58 @@ fn resolveTarget(subcommand: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, subcommand, "review_session") or std.mem.eql(u8, subcommand, "review-session")) {
         return "cas_review_session";
     }
+    if (std.mem.eql(u8, subcommand, "session_inquiry") or std.mem.eql(u8, subcommand, "session-inquiry")) {
+        return "cas_session_inquiry";
+    }
     if (std.mem.eql(u8, subcommand, "smoke_check") or std.mem.eql(u8, subcommand, "smoke-check")) {
         return "cas_smoke_check";
     }
     return null;
+}
+
+fn printCapabilities(args: []const []const u8) !void {
+    var json = false;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--json")) {
+            json = true;
+        } else if (core_cli.isHelpArg(arg)) {
+            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+            const stdout = &stdout_writer.interface;
+            try stdout.writeAll(
+                \\cas capabilities
+                \\
+                \\Usage:
+                \\  cas capabilities [--json]
+                \\
+            );
+            return;
+        } else {
+            core_cli.exitUsageFailure(HelpSurface, Version, "UnknownFlag", arg);
+        }
+    }
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    if (!json) {
+        try stdout.writeAll("session_inquiry_v1=true\n");
+        return;
+    }
+    try stdout.writeAll(
+        \\{
+        \\  "cas_capabilities": {
+        \\    "features": {
+        \\      "session_inquiry_v1": true,
+        \\      "dcp_v1": true,
+        \\      "rip_v1": true,
+        \\      "fir_v1": true,
+        \\      "exact_fork_rollback_anchor": true,
+        \\      "ephemeral_fork": true,
+        \\      "read_only_inquiry": true,
+        \\      "detached_inquiry": true
+        \\    }
+        \\  }
+        \\}
+        \\
+    );
 }
 
 test "resolveTarget supports supported subcommands" {
@@ -190,7 +247,13 @@ test "resolveTarget supports supported subcommands" {
     try std.testing.expectEqualStrings("cas_instance_runner", resolveTarget("instance-runner").?);
     try std.testing.expectEqualStrings("cas_review_session", resolveTarget("review_session").?);
     try std.testing.expectEqualStrings("cas_review_session", resolveTarget("review-session").?);
+    try std.testing.expectEqualStrings("cas_session_inquiry", resolveTarget("session_inquiry").?);
+    try std.testing.expectEqualStrings("cas_session_inquiry", resolveTarget("session-inquiry").?);
     try std.testing.expectEqualStrings("cas_smoke_check", resolveTarget("smoke_check").?);
     try std.testing.expectEqualStrings("cas_smoke_check", resolveTarget("smoke-check").?);
     try std.testing.expect(resolveTarget("unknown") == null);
+}
+
+test "capabilities accepts json flag" {
+    try printCapabilities(&.{"--json"});
 }

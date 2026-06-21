@@ -180,6 +180,16 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = cas_meta },
         },
     });
+    const cas_session_inquiry_root = b.createModule(.{
+        .root_source_file = b.path("apps/cas/scripts/cas_session_inquiry.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_json", .module = core_json },
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "app_meta", .module = cas_meta },
+        },
+    });
     const cas_conformance_root = b.createModule(.{
         .root_source_file = b.path("apps/cas/scripts/cas_conformance_suite.zig"),
         .target = target,
@@ -378,7 +388,11 @@ pub fn build(b: *std.Build) void {
     const lift_bench_perf = addExecutable(b, "lift-perf-bench-stats", lift_bench_perf_root);
     const cas_smoke_check = addExecutable(b, "cas_smoke_check", cas_smoke_root);
     const cas_instance_runner = addExecutable(b, "cas_instance_runner", cas_runner_root);
+    cas_instance_runner.root_module.linkSystemLibrary("c", .{});
     const cas_review_session = addExecutable(b, "cas_review_session", cas_review_session_root);
+    cas_review_session.root_module.linkSystemLibrary("c", .{});
+    const cas_session_inquiry = addExecutable(b, "cas_session_inquiry", cas_session_inquiry_root);
+    cas_session_inquiry.root_module.linkSystemLibrary("c", .{});
     const cas_conformance_suite = addExecutable(b, "cas_conformance_suite", cas_conformance_root);
     const cas_goal = addExecutable(b, "cas_goal", cas_goal_root);
     const cas_account = addExecutable(b, "cas_account", cas_account_root);
@@ -407,6 +421,7 @@ pub fn build(b: *std.Build) void {
     const cas_smoke_check_install = addInstallStep(b, cas_smoke_check);
     const cas_instance_runner_install = addInstallStep(b, cas_instance_runner);
     const cas_review_session_install = addInstallStep(b, cas_review_session);
+    const cas_session_inquiry_install = addInstallStep(b, cas_session_inquiry);
     const cas_conformance_suite_install = addInstallStep(b, cas_conformance_suite);
     const cas_goal_install = addInstallStep(b, cas_goal);
     const cas_account_install = addInstallStep(b, cas_account);
@@ -433,6 +448,7 @@ pub fn build(b: *std.Build) void {
     install_all.dependOn(&cas_smoke_check_install.step);
     install_all.dependOn(&cas_instance_runner_install.step);
     install_all.dependOn(&cas_review_session_install.step);
+    install_all.dependOn(&cas_session_inquiry_install.step);
     install_all.dependOn(&cas_conformance_suite_install.step);
     install_all.dependOn(&cas_goal_install.step);
     install_all.dependOn(&cas_account_install.step);
@@ -511,17 +527,26 @@ pub fn build(b: *std.Build) void {
         "test-cas-smoke-check",
         "Run cas_smoke_check tests",
     );
-    const run_cas_runner_tests = addTestStep(
+    const run_cas_runner_tests = addTestStepWithOptions(
         b,
         cas_runner_root,
         "test-cas-instance-runner",
         "Run cas_instance_runner tests",
+        .{ .link_libc = true },
     );
-    const run_cas_review_session_tests = addTestStep(
+    const run_cas_review_session_tests = addTestStepWithOptions(
         b,
         cas_review_session_root,
         "test-cas-review-session",
         "Run cas_review_session tests",
+        .{ .link_libc = true },
+    );
+    const run_cas_session_inquiry_tests = addTestStepWithOptions(
+        b,
+        cas_session_inquiry_root,
+        "test-cas-session-inquiry",
+        "Run cas_session_inquiry tests",
+        .{ .link_libc = true },
     );
     const run_cas_conformance_tests = addTestStep(
         b,
@@ -552,6 +577,7 @@ pub fn build(b: *std.Build) void {
     test_cas.dependOn(&run_cas_smoke_tests.step);
     test_cas.dependOn(&run_cas_runner_tests.step);
     test_cas.dependOn(&run_cas_review_session_tests.step);
+    test_cas.dependOn(&run_cas_session_inquiry_tests.step);
     test_cas.dependOn(&run_cas_conformance_tests.step);
     test_cas.dependOn(&run_cas_goal_tests.step);
     test_cas.dependOn(&run_cas_account_tests.step);
@@ -648,7 +674,7 @@ pub fn build(b: *std.Build) void {
             .path = b.path("apps/cas"),
             .build_step_name = "build-cas",
             .build_description = "Build cas binaries",
-            .build_deps = &.{ &cas_smoke_check_install.step, &cas_instance_runner_install.step, &cas_review_session_install.step, &cas_conformance_suite_install.step, &cas_goal_install.step, &cas_account_install.step, &cas_budget_perf_install.step, &cas_install.step },
+            .build_deps = &.{ &cas_smoke_check_install.step, &cas_instance_runner_install.step, &cas_review_session_install.step, &cas_session_inquiry_install.step, &cas_conformance_suite_install.step, &cas_goal_install.step, &cas_account_install.step, &cas_budget_perf_install.step, &cas_install.step },
             .test_deps = &.{test_cas},
         },
         .{
@@ -754,6 +780,7 @@ pub fn build(b: *std.Build) void {
     addRunStep(b, bench_stats, "run-bench-stats", "Run bench_stats", &.{"--help"});
     addRunStep(b, cas_smoke_check, "run-cas-smoke-check", "Run cas_smoke_check", &.{"--help"});
     addRunStep(b, cas_conformance_suite, "run-cas-conformance-suite", "Run cas_conformance_suite", &.{"--help"});
+    addRunStep(b, cas_session_inquiry, "run-cas-session-inquiry", "Run cas_session_inquiry", &.{"--help"});
     addRunStep(b, cas_goal, "run-cas-goal", "Run cas_goal", &.{"--help"});
     addRunStep(b, cas_account, "run-cas-account", "Run cas_account", &.{"--help"});
     addRunStepPrefixed(b, perf_hub, "perf-list-local", "List local perf cases", &.{"list"});
