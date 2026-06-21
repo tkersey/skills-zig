@@ -39,6 +39,8 @@ Binary output:
 ./zig-out/bin/seq dataset-schema --dataset workflow_signals
 ./zig-out/bin/seq dataset-schema --dataset skill_decision_signals
 ./zig-out/bin/seq dataset-schema --dataset skill_decision_episodes
+./zig-out/bin/seq dataset-schema --dataset historical_decisions
+./zig-out/bin/seq dataset-schema --dataset decision_capsules
 ./zig-out/bin/seq role-breakdown --root ~/.codex/sessions --since 2026-03-01T00:00:00Z --format table
 ./zig-out/bin/seq query --spec '{"dataset":"tool_calls","group_by":["tool"],"metrics":[{"op":"count","as":"count"}],"sort":["-count"],"limit":10,"format":"json"}'
 ./zig-out/bin/seq query --root ~/.codex/sessions --spec '{"dataset":"tool_invocations","where":[{"field":"command_text","op":"contains","value":"learnings recall"}],"select":["path","tool_name","command_text","workdir"],"sort":["timestamp"],"limit":5,"format":"table"}'
@@ -205,7 +207,8 @@ Companion commands:
 - `skill-contract validate --file <decision-contract.yaml>` validates SKDC-v1 and emits the stable contract fingerprint
 - `skill-contract scaffold --skill <name> --kind decision --output <file>` writes a placeholder contract only; it does not infer semantics
 - `skill-decision-receipt validate --file <receipt.json>` validates SDR-v1 receipts
-- `capabilities --format json` reports `skill_decision_audit`, `skill_decision_delta`, `skill_contract_v1`, `skill_decision_receipt_v1`, and `tune_packet_v1`
+- `decision-capsule` freezes one visible historical decision as DCP-v1 for controlled replay
+- `capabilities --format json` reports `skill_decision_audit`, `skill_decision_delta`, `skill_contract_v1`, `skill_decision_receipt_v1`, `tune_packet_v1`, `decision_capsule_v1`, `decision_anchor_v1`, `historical_decisions_dataset_v1`, and `dcp_validation_v1`
 
 Examples:
 ```bash
@@ -213,12 +216,16 @@ seq skill-decision-audit --root ~/.codex/sessions --skill team-patterns --last 3
 seq skill-decision-audit --root ~/.codex/sessions --skill team-patterns --session-id <session_id> --mode episodes --format table
 seq skill-decision-audit --root ~/.codex/sessions --skill team-patterns --session-id <session_id> --since-cursor '<cursor-json-or-token>' --mode delta --format json
 seq skill-contract validate --file codex/skills/team-patterns/references/decision-contract.yaml --format json
+seq decision-capsule --root ~/.codex/sessions --session-id <session_id> --turn-index 4 --format json
+seq decision-capsule --path rollout.jsonl --mode candidates --format table
+seq decision-capsule --mode validate --file capsule.json --format json
 ```
 
 Decision-audit query datasets:
 ```bash
 seq query --root ~/.codex/sessions --spec '{"dataset":"skill_decision_episodes","where":[{"field":"skill","op":"eq","value":"team-patterns"}],"group_by":["decision_effect"],"metrics":[{"op":"count","as":"episodes"}],"sort":["-episodes"],"format":"table"}'
 seq query --root ~/.codex/sessions --spec '{"dataset":"skill_decision_outcomes","where":[{"field":"causal_claim_allowed","op":"eq","value":false}],"select":["episode_id","outcome_kind","association_method"],"limit":20,"format":"table"}'
+seq query --root ~/.codex/sessions --spec '{"dataset":"historical_decisions","params":{"path":"rollout.jsonl"},"select":["decision_id","turn_index","selected_route","confidence"],"format":"table"}'
 ```
 
 ## Trace-native session surfaces

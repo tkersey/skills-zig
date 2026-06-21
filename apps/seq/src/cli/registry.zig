@@ -73,6 +73,24 @@ const skill_decision_receipt_flags = [_]FlagSpec{
     .{ .name = "--format", .value_kind = .format, .help = "Output format" },
 };
 
+const decision_capsule_flags = [_]FlagSpec{
+    .{ .name = "--session-id", .value_kind = .string, .help = "Source session id" },
+    .{ .name = "--path", .value_kind = .path, .help = "Source rollout JSONL path, or capsule path in validate mode" },
+    .{ .name = "--decision-id", .value_kind = .string, .help = "Select a specific decision id" },
+    .{ .name = "--turn-id", .value_kind = .string, .help = "Select a decision turn id" },
+    .{ .name = "--turn-index", .value_kind = .int, .help = "Select a one-based decision turn index" },
+    .{ .name = "--skill", .value_kind = .string, .help = "Filter by visible skill reference" },
+    .{ .name = "--contains", .value_kind = .string, .help = "Filter visible candidate text" },
+    .{ .name = "--regex", .value_kind = .string, .help = "Filter visible candidate text by pattern text" },
+    .{ .name = "--mode", .value_kind = .string, .help = "capsule, candidates, anchors, or validate" },
+    .{ .name = "--anchor", .value_kind = .string, .help = "pre, post, outcome, or all" },
+    .{ .name = "--outcome-policy", .value_kind = .string, .help = "explicit, conservative, or none" },
+    .{ .name = "--include-workers", .value_kind = .bool, .help = "Reserve worker lineage fields when available" },
+    .{ .name = "--include-excerpts", .value_kind = .bool, .help = "Allow bounded visible excerpts" },
+    .{ .name = "--excerpt-chars", .value_kind = .int, .help = "Maximum excerpt characters" },
+    .{ .name = "--format", .value_kind = .format, .help = "Output format" },
+};
+
 pub fn commandNames() []const lib.CommandDef {
     return lib.commandNames();
 }
@@ -104,6 +122,7 @@ fn summaryFor(command: lib.Command) []const u8 {
     return switch (command) {
         .query => "Run a dataset query spec over local session artifacts",
         .skill_decision_audit => "Compile deterministic per-skill decision episodes and STE-v1 evidence",
+        .decision_capsule => "Freeze one visible historical decision as DCP-v1",
         .skill_contract => "Validate, show, or scaffold SKDC-v1 decision contracts",
         .skill_decision_receipt => "Validate SDR-v1 skill decision receipts",
         .capabilities => "Print seq feature capability flags",
@@ -119,6 +138,7 @@ fn usageFor(command: lib.Command) []const u8 {
     return switch (command) {
         .query => "seq query --spec <json|@path> [--root <path>] [--stats]",
         .skill_decision_audit => "seq skill-decision-audit --skill <name> (--session-id <id>|--path <jsonl>|--repo <path>|--workdir <path>|--last <duration>|--since <iso>|--until <iso>)",
+        .decision_capsule => "seq decision-capsule (--session-id <id>|--path <jsonl>) [--decision-id <id>|--turn-id <id>|--turn-index N] [--mode capsule|candidates|anchors|validate]",
         .skill_contract => "seq skill-contract validate --file <path>",
         .skill_decision_receipt => "seq skill-decision-receipt validate --file <path>",
         .capabilities => "seq capabilities [--format json]",
@@ -131,6 +151,7 @@ fn flagsFor(command: lib.Command) []const FlagSpec {
     return switch (command) {
         .query => query_flags[0..],
         .skill_decision_audit => skill_decision_audit_flags[0..],
+        .decision_capsule => decision_capsule_flags[0..],
         .skill_contract => skill_contract_flags[0..],
         .skill_decision_receipt => skill_decision_receipt_flags[0..],
         .sessions => session_flags[0..],
@@ -142,6 +163,7 @@ fn defaultFormatFor(command: lib.Command) output.Format {
     return switch (command) {
         .query => .jsonl,
         .capabilities => .table,
+        .decision_capsule => .json,
         .skill_decision_audit => .table,
         .sessions => .table,
         else => .table,
@@ -151,6 +173,7 @@ fn defaultFormatFor(command: lib.Command) output.Format {
 fn allowedFormatsFor(command: lib.Command) []const output.Format {
     return switch (command) {
         .session_graph => &.{ .table, .json, .jsonl, .dot },
+        .decision_capsule => &.{ .table, .json, .csv, .jsonl, .markdown },
         .skill_decision_audit => &.{ .table, .json, .csv, .jsonl, .markdown },
         .capabilities, .skill_contract, .skill_decision_receipt => &.{ .table, .json, .csv, .jsonl },
         .session_detail => &.{ .json, .markdown },
