@@ -64,6 +64,10 @@ if ! "$BIN_PATH" --help | rg -q '^- skill-decision-receipt$'; then
   echo "required command missing: skill-decision-receipt" >&2
   exit 1
 fi
+if ! "$BIN_PATH" --help | rg -q '^- decision-capsule$'; then
+  echo "required command missing: decision-capsule" >&2
+  exit 1
+fi
 if ! "$BIN_PATH" --help | rg -q '^- capabilities$'; then
   echo "required command missing: capabilities" >&2
   exit 1
@@ -156,8 +160,24 @@ if ! "$BIN_PATH" skill-decision-receipt --help | rg -q -- 'validate --file'; the
   echo "skill-decision-receipt help missing validate surface" >&2
   exit 1
 fi
+if ! "$BIN_PATH" decision-capsule --help | rg -q -- '--decision-id <id>'; then
+  echo "decision-capsule help missing decision selector support" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" decision-capsule --help | rg -q -- 'capsule|candidates|anchors|validate'; then
+  echo "decision-capsule help missing mode surface" >&2
+  exit 1
+fi
 if ! "$BIN_PATH" capabilities --format json | rg -q -- '"skill_decision_audit": true'; then
   echo "capabilities missing skill_decision_audit=true" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" capabilities --format json | rg -q -- '"decision_capsule_v1": true'; then
+  echo "capabilities missing decision_capsule_v1=true" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" capabilities --format json | rg -q -- '"historical_decisions_dataset_v1": true'; then
+  echo "capabilities missing historical_decisions_dataset_v1=true" >&2
   exit 1
 fi
 if ! "$BIN_PATH" workflow-overlap --help | rg -q -- '--mode summary|sessions'; then

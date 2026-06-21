@@ -1,0 +1,12 @@
+{"type":"session_meta","timestamp":"2026-04-01T10:00:00Z","payload":{"id":"dcp-basic","cwd":"/repo","originator":"codex_cli","cli_version":"0.44.0","model":"gpt-5","model_provider":"openai","git":{"branch":"main","commit_hash":"abc123","repository_url":"https://example.invalid/repo.git"}}}
+{"type":"event_msg","timestamp":"2026-04-01T10:00:01Z","payload":{"type":"task_started","turn_id":"turn-pre"}}
+{"type":"event_msg","timestamp":"2026-04-01T10:00:02Z","payload":{"type":"user_message","turn_id":"turn-pre","message":"Inspect the available parser context."}}
+{"type":"event_msg","timestamp":"2026-04-01T10:00:03Z","payload":{"type":"agent_message","turn_id":"turn-pre","message":"I inspected the session parser context."}}
+{"type":"event_msg","timestamp":"2026-04-01T10:00:04Z","payload":{"type":"task_complete","turn_id":"turn-pre","duration_ms":3000}}
+{"type":"event_msg","timestamp":"2026-04-01T10:01:01Z","payload":{"type":"task_started","turn_id":"turn-decision"}}
+{"type":"event_msg","timestamp":"2026-04-01T10:01:02Z","payload":{"type":"user_message","turn_id":"turn-decision","message":"Which route should the DCP feature use for turn identity?"}}
+{"type":"event_msg","timestamp":"2026-04-01T10:01:03Z","payload":{"type":"agent_message","turn_id":"turn-decision","message":"I will use the canonical trace parser because it already owns session and turn identity. Assuming the rollout is readable, this keeps anchors deterministic."}}
+{"type":"event_msg","timestamp":"2026-04-01T10:01:04Z","payload":{"type":"task_complete","turn_id":"turn-decision","duration_ms":3000}}
+{"type":"event_msg","timestamp":"2026-04-01T10:02:01Z","payload":{"type":"task_started","turn_id":"turn-outcome"}}
+{"type":"event_msg","timestamp":"2026-04-01T10:02:02Z","payload":{"type":"agent_message","turn_id":"turn-outcome","message":"Tests passed for the selected route."}}
+{"type":"event_msg","timestamp":"2026-04-01T10:02:03Z","payload":{"type":"task_complete","turn_id":"turn-outcome","duration_ms":2000}}

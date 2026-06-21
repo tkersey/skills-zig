@@ -27,6 +27,10 @@ comptime {
     _ = @import("skill_contract.zig");
     _ = @import("skill_decision_receipt.zig");
     _ = @import("skill_decision_signals.zig");
+    _ = @import("dcp_schema.zig");
+    _ = @import("decision_anchor.zig");
+    _ = @import("historical_decisions.zig");
+    _ = @import("decision_capsule.zig");
     _ = @import("datasets/tool_calls.zig");
     _ = @import("datasets/memory_files.zig");
     _ = @import("datasets/memory_blocks.zig");
@@ -53,6 +57,7 @@ test "bootstrap parse coverage" {
     try std.testing.expectEqual(lib.Command.skill_decision_audit, lib.parseCommand("skill-decision-audit"));
     try std.testing.expectEqual(lib.Command.skill_contract, lib.parseCommand("skill-contract"));
     try std.testing.expectEqual(lib.Command.skill_decision_receipt, lib.parseCommand("skill-decision-receipt"));
+    try std.testing.expectEqual(lib.Command.decision_capsule, lib.parseCommand("decision-capsule"));
     try std.testing.expectEqual(lib.Command.skill_blocks, lib.parseCommand("skill-blocks"));
     try std.testing.expectEqual(lib.Command.artifact_search, lib.parseCommand("artifact-search"));
     try std.testing.expectEqual(lib.Command.tool_audit, lib.parseCommand("tool-audit"));

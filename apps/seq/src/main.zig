@@ -34,6 +34,9 @@ fn shouldSuppressCliError(err: anyerror) bool {
         error.InvalidRoleArg,
         error.InvalidModeArg,
         error.QueryHangDetected,
+        error.NoDecisionCandidate,
+        error.DecisionAmbiguous,
+        error.InvalidPacket,
         => true,
         else => false,
     };

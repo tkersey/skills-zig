@@ -9,6 +9,9 @@ const stats_mod = @import("../stats.zig");
 const session_scan = @import("../session_scan.zig");
 const time_utils = @import("../time_utils.zig");
 const canonical_trace = @import("../canonical_trace.zig");
+const decision_capsule = @import("../decision_capsule.zig");
+const dcp_schema = @import("../dcp_schema.zig");
+const historical_decisions = @import("../historical_decisions.zig");
 const token_cost = @import("../token_cost.zig");
 const skill_contract = @import("../skill_contract.zig");
 const skill_decision_receipt = @import("../skill_decision_receipt.zig");
@@ -156,6 +159,16 @@ pub const dataset_meta = [_]DatasetMeta{
         .name = "skill_decision_outcomes",
         .description = "Downstream outcomes associated to decision episodes without causal overclaim",
         .fields = &.{ "episode_id", "timestamp", "outcome_kind", "outcome_value", "proof_ref", "artifact_state", "association_method", "distance_turns", "distance_seconds", "causal_claim_allowed" },
+    },
+    .{
+        .name = "historical_decisions",
+        .description = "Generic visible historical decision candidates compiled for decision-capsule",
+        .fields = &.{ "decision_id", "session_id", "turn_index", "turn_id", "question", "selected_route", "rejected_routes", "explicit_rationale", "explicit_assumptions", "evidence_refs", "source_kind", "confidence", "contamination_flags", "path" },
+    },
+    .{
+        .name = "decision_capsules",
+        .description = "Persisted or transcript-embedded DCP-v1 packet references",
+        .fields = &.{ "path", "session_id", "packet_id", "decision_id", "source_kind", "valid", "errors" },
     },
     .{
         .name = "token_events",
@@ -554,6 +567,13 @@ const Options = struct {
     worker_kind_text: ?[]const u8 = null,
     events_text: ?[]const u8 = null,
     mode: ?[]const u8 = null,
+    anchor_text: ?[]const u8 = null,
+    outcome_policy_text: ?[]const u8 = null,
+    decision_id: ?[]const u8 = null,
+    turn_id: ?[]const u8 = null,
+    turn_index: ?i64 = null,
+    episode_file: ?[]const u8 = null,
+    excerpt_chars: usize = 240,
     protocol_text: ?[]const u8 = null,
     part_type: ?[]const u8 = null,
     timezone_text: ?[]const u8 = null,
@@ -610,6 +630,7 @@ const Options = struct {
     include_workers: bool = false,
     include_excerpts: bool = false,
     index_mode: []const u8 = "auto",
+    strict: bool = true,
 };
 
 pub fn run(
@@ -617,7 +638,8 @@ pub fn run(
     cmd: lib.Command,
     args: []const []const u8,
 ) !void {
-    const opts = try parseOptionsForCommand(cmd, args);
+    var opts = try parseOptionsForCommand(cmd, args);
+    if (cmd == .decision_capsule and !opts.format_set) opts.format = .json;
     if (opts.help) {
         try printCommandHelp(cmd);
         return;
@@ -638,6 +660,7 @@ pub fn run(
         .skill_decision_audit => try cmdSkillDecisionAudit(allocator, sessions_root, opts),
         .skill_contract => try cmdSkillContract(allocator, opts),
         .skill_decision_receipt => try cmdSkillDecisionReceipt(allocator, opts),
+        .decision_capsule => try cmdDecisionCapsule(allocator, sessions_root, opts),
         .skill_blocks => try cmdSkillBlocks(allocator, sessions_root, opts),
         .artifact_search => try cmdArtifactSearch(allocator, sessions_root, opts),
         .tool_audit => try QueryLiftCommands.cmdToolAudit(allocator, sessions_root, opts),
@@ -861,6 +884,9 @@ fn printCommandHelp(cmd: lib.Command) !void {
         .query =>
         \\usage: seq query --spec <json|@path>
         ,
+        .decision_capsule =>
+        \\usage: seq decision-capsule (--session-id <id>|--path <rollout.jsonl>) [--decision-id <id>|--turn-id <id>|--turn-index <n>|--contains <text>|--regex <pattern>|--skill <name>] [--mode capsule|candidates|anchors|validate] [--format table|json|jsonl|csv|markdown]
+        ,
         .adjudication_audit =>
         \\usage: seq adjudication-audit [--mode summary|rows|report] [--skill <name>] [--last <Nm|Nh|Nd>|--since <iso>] [--until <iso>] [--include-root-equivalent <csv>] [--bundle-dir <path>] [--limit N] [--format table|markdown|json|csv|jsonl]
         \\extra options:
@@ -1017,6 +1043,9 @@ fn validateFormatForCommand(cmd: lib.Command, opts: Options) !void {
                 if (!std.mem.eql(u8, mode, "summary")) return error.InvalidFormatForCommand;
             }
         },
+        .decision_capsule => {
+            if (fmt == .dot) return error.InvalidFormatForCommand;
+        },
         .skill_contract, .skill_decision_receipt, .capabilities => {
             if (fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
@@ -1073,7 +1102,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_threshold_ms = cmd == .query_diagnose;
     const supports_strict_hang = cmd == .query_diagnose;
     const supports_skill = switch (cmd) {
-        .skill_trend, .skill_report, .skill_audit, .skill_evidence, .skill_decision_audit, .skill_contract, .skill_success_rank, .skill_cohort, .occurrence_export, .skill_blocks, .adjudication_audit => true,
+        .skill_trend, .skill_report, .skill_audit, .skill_evidence, .skill_decision_audit, .skill_contract, .skill_success_rank, .skill_cohort, .occurrence_export, .skill_blocks, .adjudication_audit, .decision_capsule => true,
         else => false,
     };
     const supports_workflow = cmd == .workflow_audit or cmd == .workflow_overlap or cmd == .goal_audit;
@@ -1089,13 +1118,13 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         else => false,
     };
     const supports_contains = switch (cmd) {
-        .artifact_search, .tool_audit, .memory_inventory, .message_search, .message_audit, .skill_cohort, .tool_search, .memory_extension_audit, .workdir_report, .plan_search, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .sessions, .turns, .goal_audit => true,
+        .artifact_search, .tool_audit, .memory_inventory, .message_search, .message_audit, .skill_cohort, .tool_search, .memory_extension_audit, .workdir_report, .plan_search, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .sessions, .turns, .goal_audit, .decision_capsule => true,
         else => false,
     };
     const supports_contains_any = cmd == .artifact_search or cmd == .message_search or cmd == .message_audit or cmd == .skill_cohort or cmd == .tool_search or cmd == .workdir_report;
     const supports_contains_all = cmd == .message_search or cmd == .message_audit;
     const supports_regex = switch (cmd) {
-        .artifact_search, .memory_inventory, .message_search, .message_audit, .skill_cohort, .tool_search, .memory_extension_audit, .plan_search, .memory_map, .memory_history, .opencode_prompts, .opencode_events => true,
+        .artifact_search, .memory_inventory, .message_search, .message_audit, .skill_cohort, .tool_search, .memory_extension_audit, .plan_search, .memory_map, .memory_history, .opencode_prompts, .opencode_events, .decision_capsule => true,
         else => false,
     };
     const supports_role = cmd == .opencode_events;
@@ -1106,12 +1135,12 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         else => false,
     };
     const supports_repo = switch (cmd) {
-        .plan_search, .sessions, .resolve_churn_audit, .review_compiler_audit, .skill_decision_audit => true,
+        .plan_search, .sessions, .resolve_churn_audit, .review_compiler_audit, .skill_decision_audit, .decision_capsule => true,
         else => false,
     };
     const supports_status = cmd == .opencode_events or cmd == .turns or cmd == .goal_audit;
     const supports_mode = switch (cmd) {
-        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .skill_decision_audit, .skill_success_rank, .skill_blocks, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit, .workflow_overlap, .adjudication_audit, .goal_audit => true,
+        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .skill_decision_audit, .skill_success_rank, .skill_blocks, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit, .workflow_overlap, .adjudication_audit, .goal_audit, .decision_capsule => true,
         else => false,
     };
     const supports_kind = cmd == .artifact_search or cmd == .skill_contract;
@@ -1320,7 +1349,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.contract_text != null, cmd == .skill_decision_audit, "--contract", cmd);
     try ensureOptionAllowed(opts.contract_authority_text != null, cmd == .skill_decision_audit, "--contract-authority", cmd);
     try ensureOptionAllowed(opts.causality_text != null, cmd == .skill_decision_audit, "--causality", cmd);
-    try ensureOptionAllowed(opts.file_text != null, cmd == .skill_contract or cmd == .skill_decision_receipt, "--file", cmd);
+    try ensureOptionAllowed(opts.file_text != null, cmd == .skill_contract or cmd == .skill_decision_receipt or cmd == .decision_capsule, "--file", cmd);
     try ensureOptionAllowed(opts.workflow != null, supports_workflow, "--workflow", cmd);
     try ensureOptionAllowed(opts.history_text != null, supports_history, "--history", cmd);
     try ensureOptionAllowed(opts.bucket != null, supports_bucket, "--bucket", cmd);
@@ -1343,6 +1372,14 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.repo_text != null, supports_repo, "--repo", cmd);
     try ensureOptionAllowed(opts.status != null, supports_status, "--status", cmd);
     try ensureOptionAllowed(opts.mode != null, supports_mode, "--mode", cmd);
+    try ensureOptionAllowed(opts.anchor_text != null, cmd == .decision_capsule, "--anchor", cmd);
+    try ensureOptionAllowed(opts.outcome_policy_text != null, cmd == .decision_capsule, "--outcome-policy", cmd);
+    try ensureOptionAllowed(opts.decision_id != null, cmd == .decision_capsule, "--decision-id", cmd);
+    try ensureOptionAllowed(opts.turn_id != null, cmd == .decision_capsule, "--turn-id", cmd);
+    try ensureOptionAllowed(opts.turn_index != null, cmd == .decision_capsule, "--turn-index", cmd);
+    try ensureOptionAllowed(opts.episode_file != null, cmd == .decision_capsule, "--episode-file", cmd);
+    try ensureOptionAllowed(opts.excerpt_chars != 240, cmd == .decision_capsule, "--excerpt-chars", cmd);
+    try ensureOptionAllowed(!opts.strict, cmd == .decision_capsule, "--no-strict", cmd);
     try ensureOptionAllowed(opts.protocol_text != null, supports_protocol, "--protocol", cmd);
     try ensureOptionAllowed(opts.kind_text != null, supports_kind, "--kind", cmd);
     try ensureOptionAllowed(opts.surface_text != null, supports_surface, "--surface", cmd);
@@ -1368,8 +1405,8 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.opencode_source_text != null, supports_opencode_source, "--source", cmd);
     try ensureOptionAllowed(!std.mem.eql(u8, opts.index_mode, "auto"), supports_index_mode, "--index", cmd);
     try ensureOptionAllowed(opts.include_raw, supports_include_raw, "--include-raw", cmd);
-    try ensureOptionAllowed(opts.include_workers, cmd == .skill_decision_audit, "--include-workers", cmd);
-    try ensureOptionAllowed(opts.include_excerpts, cmd == .skill_decision_audit, "--include-excerpts", cmd);
+    try ensureOptionAllowed(opts.include_workers, cmd == .skill_decision_audit or cmd == .decision_capsule, "--include-workers", cmd);
+    try ensureOptionAllowed(opts.include_excerpts, cmd == .skill_decision_audit or cmd == .decision_capsule, "--include-excerpts", cmd);
     try ensureOptionAllowed(opts.ongoing, cmd == .sessions, "--ongoing", cmd);
     try ensureOptionAllowed(opts.completed, cmd == .sessions, "--completed", cmd);
     try ensureOptionAllowed(opts.include_tools, cmd == .turns or cmd == .session_detail, "--include-tools", cmd);
@@ -1439,6 +1476,26 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         }
         if (opts.since_cursor_text != null and opts.session_id == null and opts.path == null) {
             printCliError("error: skill-decision-audit --mode delta/--since-cursor requires --session-id or --path\n", .{});
+            return error.MissingArgValue;
+        }
+    }
+    if (cmd == .decision_capsule) {
+        const mode = try decision_capsule.Mode.parse(opts.mode);
+        _ = try decision_capsule.OutcomePolicy.parse(opts.outcome_policy_text);
+        if (opts.anchor_text) |anchor| {
+            if (!std.mem.eql(u8, anchor, "pre") and
+                !std.mem.eql(u8, anchor, "post") and
+                !std.mem.eql(u8, anchor, "outcome") and
+                !std.mem.eql(u8, anchor, "all"))
+            {
+                return error.InvalidModeArg;
+            }
+        }
+        const source_count: u8 = @intFromBool(opts.path != null) + @intFromBool(opts.session_id != null);
+        if (mode == .validate) {
+            if (opts.path == null and opts.file_text == null) return error.MissingArgValue;
+        } else if (source_count != 1) {
+            printCliError("error: decision-capsule requires exactly one source selector: --session-id or --path\n", .{});
             return error.MissingArgValue;
         }
     }
@@ -1553,6 +1610,7 @@ fn commandSupportsPath(cmd: lib.Command) bool {
         .query_diagnose,
         .skill_evidence,
         .skill_decision_audit,
+        .decision_capsule,
         .skill_blocks,
         .token_usage,
         .token_cost,
@@ -1579,6 +1637,7 @@ fn commandSupportsSessionId(cmd: lib.Command) bool {
         .session_tooling,
         .skill_evidence,
         .skill_decision_audit,
+        .decision_capsule,
         .skill_blocks,
         .token_usage,
         .token_cost,
@@ -2756,6 +2815,10 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
             \\      "skill_contract_v1": true,
             \\      "skill_decision_receipt_v1": true,
             \\      "tune_packet_v1": true,
+            \\      "decision_capsule_v1": true,
+            \\      "decision_anchor_v1": true,
+            \\      "historical_decisions_dataset_v1": true,
+            \\      "dcp_validation_v1": true,
             \\      "matched_cohort_v1": false
             \\    }
             \\  }
@@ -2776,6 +2839,10 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
         .{ .name = "skill_contract_v1", .enabled = true },
         .{ .name = "skill_decision_receipt_v1", .enabled = true },
         .{ .name = "tune_packet_v1", .enabled = true },
+        .{ .name = "decision_capsule_v1", .enabled = true },
+        .{ .name = "decision_anchor_v1", .enabled = true },
+        .{ .name = "historical_decisions_dataset_v1", .enabled = true },
+        .{ .name = "dcp_validation_v1", .enabled = true },
         .{ .name = "matched_cohort_v1", .enabled = false },
     };
     for (features) |feature| {
@@ -2787,6 +2854,320 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
     }
     const cols = [_][]const u8{ "version", "feature", "enabled" };
     try output.writeOutput(allocator, opts.format, rows.items, cols[0..], opts.out_path);
+}
+
+fn cmdDecisionCapsule(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    const mode = try decision_capsule.Mode.parse(opts.mode);
+    if (mode == .validate) {
+        const path = opts.file_text orelse opts.path orelse return error.MissingArgValue;
+        const text = try std.Io.Dir.cwd().readFileAlloc(defaultIo(), path, allocator, .limited(8 * 1024 * 1024));
+        defer allocator.free(text);
+        var report = try dcp_schema.validateText(allocator, text);
+        defer report.deinit(allocator);
+        try writeDcpValidationReport(allocator, report, opts);
+        if (!report.valid) return error.InvalidPacket;
+        return;
+    }
+
+    var paths = try resolveTraceTargetPaths(allocator, sessions_root, opts, true);
+    defer freePathList(allocator, &paths);
+    var trace = try canonical_trace.parseSessionTrace(allocator, paths.items[0], traceParseOptions(opts));
+    defer trace.deinit(allocator);
+
+    const filters = historical_decisions.Filters{
+        .decision_id = opts.decision_id,
+        .turn_id = opts.turn_id,
+        .turn_index = opts.turn_index,
+        .skill = opts.skill,
+        .contains = opts.contains,
+        .regex = opts.regex,
+    };
+
+    if (mode == .candidates) {
+        const candidates = try decision_capsule.compileCandidates(allocator, trace, filters);
+        defer decision_capsule.deinitCandidates(allocator, candidates);
+        try writeDecisionCandidateRows(allocator, candidates, opts);
+        return;
+    }
+
+    var capsule = try decision_capsule.buildCapsuleJson(allocator, trace, paths.items[0], .{
+        .filters = filters,
+        .outcome_policy = try decision_capsule.OutcomePolicy.parse(opts.outcome_policy_text),
+        .strict = opts.strict,
+        .include_excerpts = opts.include_excerpts,
+        .excerpt_chars = opts.excerpt_chars,
+    });
+    defer capsule.deinit(allocator);
+
+    if (mode == .anchors) {
+        try writeDecisionAnchorRows(allocator, capsule, opts);
+        return;
+    }
+
+    switch (opts.format) {
+        .json => try writeTextOutput(capsule.json, opts.out_path),
+        .jsonl => {
+            var rendered = std.Io.Writer.Allocating.init(allocator);
+            defer rendered.deinit();
+            try rendered.writer.writeAll(capsule.json);
+            if (!std.mem.endsWith(u8, capsule.json, "\n")) try rendered.writer.writeByte('\n');
+            const text = try rendered.toOwnedSlice();
+            defer allocator.free(text);
+            try writeTextOutput(text, opts.out_path);
+        },
+        .markdown => {
+            const text = try renderDecisionCapsuleMarkdown(allocator, capsule);
+            defer allocator.free(text);
+            try writeTextOutput(text, opts.out_path);
+        },
+        .table, .csv => try writeDecisionCapsuleSummaryRow(allocator, capsule, opts),
+        .dot => return error.InvalidFormatForCommand,
+    }
+}
+
+fn writeDcpValidationReport(allocator: std.mem.Allocator, report: dcp_schema.ValidationReport, opts: Options) !void {
+    var row = query.Row.init(allocator);
+    defer row.deinit();
+    const errors = try joinStringListSep(allocator, report.errors, ",");
+    defer allocator.free(errors);
+    const warnings = try joinStringListSep(allocator, report.warnings, ",");
+    defer allocator.free(warnings);
+    const anchors = try joinStringListSep(allocator, report.anchors_available, ",");
+    defer allocator.free(anchors);
+    try row.putOwnedKey("verdict", .{ .string = if (report.valid) "pass" else "fail" });
+    try putOptionalString(&row, "packet_id", report.packet_id);
+    try row.putOwnedKey("anchors_available", .{ .string = anchors });
+    try row.putOwnedKey("errors", .{ .string = errors });
+    try row.putOwnedKey("warnings", .{ .string = warnings });
+    var rows = [_]query.Row{row};
+    const cols = [_][]const u8{ "verdict", "packet_id", "anchors_available", "errors", "warnings" };
+    try output.writeOutput(allocator, opts.format, rows[0..], cols[0..], opts.out_path);
+}
+
+fn writeDecisionCandidateRows(allocator: std.mem.Allocator, candidates: []historical_decisions.Candidate, opts: Options) !void {
+    var rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &rows);
+    for (candidates) |candidate| {
+        const rejected = try joinStringListSep(allocator, candidate.rejected_routes, ",");
+        defer allocator.free(rejected);
+        const rationale = try joinStringListSep(allocator, candidate.explicit_rationale, " | ");
+        defer allocator.free(rationale);
+        const assumptions = try joinStringListSep(allocator, candidate.explicit_assumptions, " | ");
+        defer allocator.free(assumptions);
+        const evidence = try joinStringListSep(allocator, candidate.evidence_refs, ",");
+        defer allocator.free(evidence);
+        var row = query.Row.init(allocator);
+        errdefer row.deinit();
+        try row.putOwnedKey("decision_id", .{ .string = candidate.decision_id });
+        try row.putOwnedKey("session_id", .{ .string = candidate.session_id });
+        try row.putOwnedKey("turn_index", .{ .int = candidate.turn_index });
+        try row.putOwnedKey("turn_id", .{ .string = candidate.turn_id });
+        try row.putOwnedKey("question", .{ .string = candidate.question });
+        try row.putOwnedKey("selected_route", .{ .string = candidate.selected_route });
+        try row.putOwnedKey("rejected_routes", .{ .string = rejected });
+        try row.putOwnedKey("explicit_rationale", .{ .string = rationale });
+        try row.putOwnedKey("explicit_assumptions", .{ .string = assumptions });
+        try row.putOwnedKey("evidence_refs", .{ .string = evidence });
+        try row.putOwnedKey("source_kind", .{ .string = candidate.source_kind });
+        try row.putOwnedKey("confidence", .{ .float = candidate.confidence.score() });
+        try row.putOwnedKey("contamination_flags", .{ .string = candidate.contamination_flags });
+        try rows.append(allocator, row);
+    }
+    const cols = [_][]const u8{ "decision_id", "session_id", "turn_index", "turn_id", "question", "selected_route", "source_kind", "confidence", "contamination_flags" };
+    try output.writeOutput(allocator, opts.format, rows.items, cols[0..], opts.out_path);
+}
+
+fn writeDecisionAnchorRows(allocator: std.mem.Allocator, capsule: decision_capsule.CapsuleResult, opts: Options) !void {
+    var row = query.Row.init(allocator);
+    defer row.deinit();
+    const anchors = try joinStringListSep(allocator, capsule.anchors_available, ",");
+    defer allocator.free(anchors);
+    const warnings = try joinStringListSep(allocator, capsule.warning_codes, ",");
+    defer allocator.free(warnings);
+    try row.putOwnedKey("packet_id", .{ .string = capsule.packet_id });
+    try row.putOwnedKey("decision_id", .{ .string = capsule.decision_id });
+    try row.putOwnedKey("anchors_available", .{ .string = anchors });
+    try row.putOwnedKey("warning_codes", .{ .string = warnings });
+    var rows = [_]query.Row{row};
+    const cols = [_][]const u8{ "packet_id", "decision_id", "anchors_available", "warning_codes" };
+    try output.writeOutput(allocator, opts.format, rows[0..], cols[0..], opts.out_path);
+}
+
+fn writeDecisionCapsuleSummaryRow(allocator: std.mem.Allocator, capsule: decision_capsule.CapsuleResult, opts: Options) !void {
+    var row = query.Row.init(allocator);
+    defer row.deinit();
+    const anchors = try joinStringListSep(allocator, capsule.anchors_available, ",");
+    defer allocator.free(anchors);
+    const warnings = try joinStringListSep(allocator, capsule.warning_codes, ",");
+    defer allocator.free(warnings);
+    try row.putOwnedKey("packet_id", .{ .string = capsule.packet_id });
+    try row.putOwnedKey("decision_id", .{ .string = capsule.decision_id });
+    try row.putOwnedKey("anchors_available", .{ .string = anchors });
+    try row.putOwnedKey("warning_codes", .{ .string = warnings });
+    var rows = [_]query.Row{row};
+    const cols = [_][]const u8{ "packet_id", "decision_id", "anchors_available", "warning_codes" };
+    try output.writeOutput(allocator, opts.format, rows[0..], cols[0..], opts.out_path);
+}
+
+fn renderDecisionCapsuleMarkdown(allocator: std.mem.Allocator, capsule: decision_capsule.CapsuleResult) ![]u8 {
+    const anchors = try joinStringListSep(allocator, capsule.anchors_available, ", ");
+    defer allocator.free(anchors);
+    const warnings = try joinStringListSep(allocator, capsule.warning_codes, ", ");
+    defer allocator.free(warnings);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, capsule.json, .{});
+    defer parsed.deinit();
+    const packet = switch (parsed.value) {
+        .object => |obj| stdJsonObjectField(obj, "decision_context_packet") orelse return error.InvalidPacket,
+        else => return error.InvalidPacket,
+    };
+    const source = stdJsonObjectField(packet, "source");
+    const turns = stdJsonObjectField(packet, "turns");
+    const episode = stdJsonObjectField(packet, "episode");
+    const artifact_state = stdJsonObjectField(packet, "artifact_state");
+    const contamination = stdJsonObjectField(packet, "contamination");
+    const anchors_obj = stdJsonObjectField(packet, "anchors");
+
+    var rendered = std.Io.Writer.Allocating.init(allocator);
+    errdefer rendered.deinit();
+    const writer = &rendered.writer;
+
+    try writer.writeAll("# Decision Capsule\n\n");
+    try writer.print("- packet_id: `{s}`\n", .{capsule.packet_id});
+    try writer.print("- decision_id: `{s}`\n", .{capsule.decision_id});
+    try writer.print("- anchors_available: {s}\n", .{if (anchors.len == 0) "none" else anchors});
+    try writer.print("- warning_codes: {s}\n", .{if (warnings.len == 0) "none" else warnings});
+
+    try writer.writeAll("\n## Source\n\n");
+    if (source) |obj| {
+        try writer.print("- session_id: `{s}`\n", .{jsonStringFieldOr(obj, "session_id", "unknown")});
+        try writer.print("- root_session_id: `{s}`\n", .{jsonStringFieldOr(obj, "root_session_id", "unknown")});
+        try writer.print("- rollout_path: `{s}`\n", .{jsonStringFieldOr(obj, "rollout_path", "unknown")});
+        try writer.print("- model: `{s}`\n", .{jsonStringFieldOr(obj, "source_model", "unknown")});
+        try writer.print("- codex_version: `{s}`\n", .{jsonStringFieldOr(obj, "source_codex_version", "unknown")});
+    } else {
+        try writer.writeAll("- unavailable\n");
+    }
+
+    try writer.writeAll("\n## Decision\n\n");
+    if (turns) |obj| {
+        try writer.print("- decision_turn_index: {d}\n", .{jsonIntFieldOr(obj, "decision_turn_index", 0)});
+        try writer.print("- decision_turn_id: `{s}`\n", .{jsonStringFieldOr(obj, "decision_turn_id", "unknown")});
+        try writer.print("- first_outcome_turn_index: {d}\n", .{jsonIntFieldOr(obj, "first_outcome_turn_index", 0)});
+        try writer.print("- source_turn_digest: `{s}`\n", .{jsonStringFieldOr(obj, "source_turn_digest", "unknown")});
+    }
+    if (episode) |obj| {
+        try writer.print("- question: {s}\n", .{jsonStringFieldOr(obj, "question", "unknown")});
+        try writer.print("- selected_route: {s}\n", .{jsonStringFieldOr(obj, "selected_route", "unknown")});
+    }
+
+    try writer.writeAll("\n## Explicit Evidence\n\n");
+    if (episode) |obj| {
+        try writeMarkdownStringArray(writer, obj, "explicit_rationale", "explicit_rationale");
+        try writeMarkdownStringArray(writer, obj, "explicit_assumptions", "explicit_assumptions");
+        try writeMarkdownStringArray(writer, obj, "rejected_routes", "rejected_routes");
+        try writeMarkdownStringArray(writer, obj, "evidence_refs", "evidence_refs");
+        try writeMarkdownStringArray(writer, obj, "outcome_refs", "outcome_refs");
+        try writeMarkdownStringArray(writer, obj, "skills_and_instructions", "skills_and_instructions");
+        try writeMarkdownStringArray(writer, obj, "tools_and_artifacts", "tools_and_artifacts");
+    } else {
+        try writer.writeAll("- unavailable\n");
+    }
+
+    try writer.writeAll("\n## Anchors\n\n");
+    if (anchors_obj) |obj| {
+        try writeMarkdownAnchor(writer, obj, "pre_decision");
+        try writeMarkdownAnchor(writer, obj, "post_decision_pre_outcome");
+        try writeMarkdownAnchor(writer, obj, "outcome_aware");
+    } else {
+        try writer.writeAll("- unavailable\n");
+    }
+
+    try writer.writeAll("\n## Artifact State\n\n");
+    if (artifact_state) |obj| {
+        try writer.print("- reconstructability: `{s}`\n", .{jsonStringFieldOr(obj, "reconstructability", "unknown")});
+        try writer.print("- cwd: `{s}`\n", .{jsonStringFieldOr(obj, "cwd", "unknown")});
+        try writer.print("- repository_root: `{s}`\n", .{jsonStringFieldOr(obj, "repository_root", "unknown")});
+        try writer.print("- branch: `{s}`\n", .{jsonStringFieldOr(obj, "branch", "unknown")});
+        try writer.print("- head: `{s}`\n", .{jsonStringFieldOr(obj, "head", "unknown")});
+    } else {
+        try writer.writeAll("- unavailable\n");
+    }
+
+    try writer.writeAll("\n## Contamination\n\n");
+    if (contamination) |obj| {
+        try writer.print("- injected_skill_blocks: {}\n", .{jsonBoolFieldOr(obj, "injected_skill_blocks", false)});
+        try writer.print("- developer_system_instructions: {}\n", .{jsonBoolFieldOr(obj, "developer_system_instructions", false)});
+        try writer.print("- generated_reports: {}\n", .{jsonBoolFieldOr(obj, "generated_reports", false)});
+        try writer.print("- current_audit_prompt: {}\n", .{jsonBoolFieldOr(obj, "current_audit_prompt", false)});
+        try writer.print("- quoted_material: {}\n", .{jsonBoolFieldOr(obj, "quoted_material", false)});
+    } else {
+        try writer.writeAll("- unavailable\n");
+    }
+
+    try writer.writeAll("\n## Limitations\n\n");
+    try writeMarkdownStringArray(writer, packet, "limitations", "limitations");
+
+    try writer.writeAll("\n## Reproduction\n\n");
+    try writer.writeAll("Run `seq decision-capsule --mode validate --file <capsule.json> --format json`.\n");
+
+    return rendered.toOwnedSlice();
+}
+
+fn jsonStringFieldOr(obj: std.json.ObjectMap, key: []const u8, fallback: []const u8) []const u8 {
+    return stdJsonStringField(obj, key) orelse fallback;
+}
+
+fn jsonIntFieldOr(obj: std.json.ObjectMap, key: []const u8, fallback: i64) i64 {
+    return stdJsonIntField(obj, key) orelse fallback;
+}
+
+fn jsonBoolFieldOr(obj: std.json.ObjectMap, key: []const u8, fallback: bool) bool {
+    const value = obj.get(key) orelse return fallback;
+    return switch (value) {
+        .bool => |flag| flag,
+        else => fallback,
+    };
+}
+
+fn writeMarkdownStringArray(writer: anytype, obj: std.json.ObjectMap, key: []const u8, label: []const u8) !void {
+    try writer.print("- {s}:", .{label});
+    const value = obj.get(key) orelse {
+        try writer.writeAll(" none\n");
+        return;
+    };
+    const items = switch (value) {
+        .array => |array| array.items,
+        else => {
+            try writer.writeAll(" none\n");
+            return;
+        },
+    };
+    if (items.len == 0) {
+        try writer.writeAll(" none\n");
+        return;
+    }
+    try writer.writeByte('\n');
+    for (items) |item| {
+        switch (item) {
+            .string => |text| try writer.print("  - {s}\n", .{text}),
+            else => {},
+        }
+    }
+}
+
+fn writeMarkdownAnchor(writer: anytype, anchors_obj: std.json.ObjectMap, key: []const u8) !void {
+    const anchor = stdJsonObjectField(anchors_obj, key) orelse {
+        try writer.print("- {s}: unavailable\n", .{key});
+        return;
+    };
+    try writer.print("- {s}: available={}, keep_through_turn_index={d}, drop_last_n_turns={d}, digest=`{s}`\n", .{
+        key,
+        jsonBoolFieldOr(anchor, "available", false),
+        jsonIntFieldOr(anchor, "keep_through_turn_index", 0),
+        jsonIntFieldOr(anchor, "drop_last_n_turns", 0),
+        jsonStringFieldOr(anchor, "anchor_digest", "unknown"),
+    });
 }
 
 fn cmdSkillDecisionAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
@@ -17419,6 +17800,10 @@ fn collectDatasetRowsTracked(
         try collectSkillDecisionEpisodeDatasetRows(allocator, sessions_root, day_filter, query_params, &rows);
     } else if (std.mem.eql(u8, dataset_name, "skill_decision_outcomes")) {
         try collectSkillDecisionOutcomeDatasetRows(allocator, sessions_root, day_filter, query_params, &rows);
+    } else if (std.mem.eql(u8, dataset_name, "historical_decisions")) {
+        try collectHistoricalDecisionRows(allocator, sessions_root, day_filter, query_params, &rows);
+    } else if (std.mem.eql(u8, dataset_name, "decision_capsules")) {
+        try collectDecisionCapsuleRows(allocator, sessions_root, day_filter, query_params, &rows);
     } else if (std.mem.eql(u8, dataset_name, "token_events")) {
         try collectTokenEventsRows(allocator, sessions_root, day_filter, &rows);
     } else if (std.mem.eql(u8, dataset_name, "token_deltas")) {
@@ -17932,6 +18317,103 @@ fn collectSkillDecisionOutcomeDatasetRows(
         try row.putOwnedKey("distance_turns", .null);
         try row.putOwnedKey("distance_seconds", .null);
         try row.putOwnedKey("causal_claim_allowed", .{ .bool = false });
+        try out_rows.append(allocator, row);
+    }
+}
+
+fn collectHistoricalDecisionRows(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    day_filter: ?SessionDayPathFilter,
+    query_params: []const spec.ParamSpec,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    const opts = Options{
+        .path = paramString(query_params, "path"),
+        .session_id = paramString(query_params, "session_id"),
+        .skill = paramString(query_params, "skill"),
+        .contains = paramString(query_params, "contains"),
+        .regex = paramString(query_params, "regex"),
+        .decision_id = paramString(query_params, "decision_id"),
+    };
+    var paths = if (opts.path != null or opts.session_id != null)
+        try resolveTraceTargetPaths(allocator, sessions_root, opts, false)
+    else
+        try collectJsonlPaths(allocator, sessions_root, day_filter);
+    defer freePathList(allocator, &paths);
+
+    for (paths.items) |path| {
+        var trace = canonical_trace.parseSessionTrace(allocator, path, traceParseOptions(opts)) catch continue;
+        defer trace.deinit(allocator);
+        const candidates = try decision_capsule.compileCandidates(allocator, trace, .{
+            .decision_id = opts.decision_id,
+            .skill = opts.skill,
+            .contains = opts.contains,
+            .regex = opts.regex,
+        });
+        defer decision_capsule.deinitCandidates(allocator, candidates);
+        for (candidates) |candidate| {
+            const rejected = try joinStringListSep(allocator, candidate.rejected_routes, ",");
+            defer allocator.free(rejected);
+            const rationale = try joinStringListSep(allocator, candidate.explicit_rationale, " | ");
+            defer allocator.free(rationale);
+            const assumptions = try joinStringListSep(allocator, candidate.explicit_assumptions, " | ");
+            defer allocator.free(assumptions);
+            const evidence = try joinStringListSep(allocator, candidate.evidence_refs, ",");
+            defer allocator.free(evidence);
+            var row = query.Row.init(allocator);
+            errdefer row.deinit();
+            try row.putOwnedKey("path", .{ .string = path });
+            try row.putOwnedKey("decision_id", .{ .string = candidate.decision_id });
+            try row.putOwnedKey("session_id", .{ .string = candidate.session_id });
+            try row.putOwnedKey("turn_index", .{ .int = candidate.turn_index });
+            try row.putOwnedKey("turn_id", .{ .string = candidate.turn_id });
+            try row.putOwnedKey("question", .{ .string = candidate.question });
+            try row.putOwnedKey("selected_route", .{ .string = candidate.selected_route });
+            try row.putOwnedKey("rejected_routes", .{ .string = rejected });
+            try row.putOwnedKey("explicit_rationale", .{ .string = rationale });
+            try row.putOwnedKey("explicit_assumptions", .{ .string = assumptions });
+            try row.putOwnedKey("evidence_refs", .{ .string = evidence });
+            try row.putOwnedKey("source_kind", .{ .string = candidate.source_kind });
+            try row.putOwnedKey("confidence", .{ .float = candidate.confidence.score() });
+            try row.putOwnedKey("contamination_flags", .{ .string = candidate.contamination_flags });
+            try out_rows.append(allocator, row);
+        }
+    }
+}
+
+fn collectDecisionCapsuleRows(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    day_filter: ?SessionDayPathFilter,
+    query_params: []const spec.ParamSpec,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    var paths = if (paramString(query_params, "path")) |path| blk: {
+        var single: std.ArrayList([]u8) = .empty;
+        try single.append(allocator, try toAbsolutePath(allocator, path));
+        break :blk single;
+    } else try collectJsonlPaths(allocator, sessions_root, day_filter);
+    defer freePathList(allocator, &paths);
+
+    for (paths.items) |path| {
+        const content = try readFileAllocOrSkip(allocator, path);
+        if (content == null) continue;
+        defer allocator.free(content.?);
+        if (std.mem.indexOf(u8, content.?, "decision_context_packet") == null) continue;
+        var report = dcp_schema.validateText(allocator, content.?) catch continue;
+        defer report.deinit(allocator);
+        const errors = try joinStringListSep(allocator, report.errors, ",");
+        defer allocator.free(errors);
+        var row = query.Row.init(allocator);
+        errdefer row.deinit();
+        try row.putOwnedKey("path", .{ .string = path });
+        try row.putOwnedKey("session_id", .{ .string = inferSessionIdFromPath(path) });
+        try putOptionalString(&row, "packet_id", report.packet_id);
+        try row.putOwnedKey("decision_id", .{ .string = "" });
+        try row.putOwnedKey("source_kind", .{ .string = if (std.mem.endsWith(u8, path, ".json")) "file" else "session_text" });
+        try row.putOwnedKey("valid", .{ .bool = report.valid });
+        try row.putOwnedKey("errors", .{ .string = errors });
         try out_rows.append(allocator, row);
     }
 }
@@ -20058,6 +20540,38 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.mode = args[i];
+        } else if (std.mem.eql(u8, arg, "--anchor")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.anchor_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--outcome-policy")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.outcome_policy_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--decision-id")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.decision_id = args[i];
+        } else if (std.mem.eql(u8, arg, "--turn-id")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.turn_id = args[i];
+        } else if (std.mem.eql(u8, arg, "--turn-index")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            const n = try std.fmt.parseInt(i64, args[i], 10);
+            if (n < 1) return error.InvalidLimit;
+            opts.turn_index = n;
+        } else if (std.mem.eql(u8, arg, "--episode-file")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.episode_file = args[i];
+        } else if (std.mem.eql(u8, arg, "--excerpt-chars")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            const n = try std.fmt.parseInt(i64, args[i], 10);
+            if (n < 0) return error.InvalidLimit;
+            opts.excerpt_chars = @intCast(n);
         } else if (std.mem.eql(u8, arg, "--protocol")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -20234,6 +20748,10 @@ fn parseOptions(args: []const []const u8) !Options {
             opts.strict_hang = true;
         } else if (std.mem.eql(u8, arg, "--no-strict-hang")) {
             opts.strict_hang = false;
+        } else if (std.mem.eql(u8, arg, "--strict")) {
+            opts.strict = true;
+        } else if (std.mem.eql(u8, arg, "--no-strict")) {
+            opts.strict = false;
         } else if (std.mem.eql(u8, arg, "--sections")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
