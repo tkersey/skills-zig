@@ -227,9 +227,10 @@ const ShowHelpText =
     \\
     \\Show current plan.
     \\
-    \\usage: st show --file PATH [--surface plan|all|backlog] [--format markdown|table|json]
+    \\usage: st show --file PATH [--id ID] [--surface plan|all|backlog] [--format markdown|table|json]
     \\
     \\options:
+    \\  --id ID            Show one durable item by id
     \\  --surface SURFACE  plan|all|backlog (default: plan)
     \\  --format FORMAT    markdown|table|json
     \\  --file PATH        Path to plan JSONL file
@@ -2567,7 +2568,16 @@ fn parseArgs(argv: []const []const u8) !Args {
                 }
                 return error.InvalidRemoveArg;
             },
-            .show, .ready, .blocked, .capabilities => {
+            .show => {
+                if (std.mem.eql(u8, token, "--id")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingIdValue;
+                    args.id = argv[i];
+                    continue;
+                }
+                return error.InvalidListArg;
+            },
+            .ready, .blocked, .capabilities => {
                 return error.InvalidListArg;
             },
             .graph => {
@@ -3927,7 +3937,7 @@ fn cmdShow(allocator: std.mem.Allocator, args: Args) !u8 {
 
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
-    try renderShow(allocator, stdout, &state, args.format, args.surface);
+    try renderShow(allocator, stdout, &state, args.format, args.surface, args.id);
     return 0;
 }
 
@@ -10119,9 +10129,13 @@ fn renderShow(
     state: *const ItemState,
     format: OutputFormat,
     surface: Surface,
+    item_id: ?[]const u8,
 ) !void {
     const enriched = try enrichItems(allocator, state);
-    const filtered = try filterRowsBySurface(allocator, enriched, surface);
+    const filtered = if (item_id) |id|
+        try filterRowsById(allocator, enriched, id)
+    else
+        try filterRowsBySurface(allocator, enriched, surface);
 
     switch (format) {
         .markdown => try renderShowMarkdown(allocator, writer, filtered, surface),
@@ -11271,6 +11285,22 @@ fn filterRowsBySurface(
             try filtered.append(allocator, row);
         }
     }
+    return filtered.toOwnedSlice(allocator);
+}
+
+fn filterRowsById(
+    allocator: std.mem.Allocator,
+    rows: []const EnrichedItem,
+    item_id: []const u8,
+) ![]EnrichedItem {
+    var filtered = std.ArrayList(EnrichedItem).empty;
+    for (rows) |row| {
+        if (std.mem.eql(u8, row.item.id, item_id)) {
+            try filtered.append(allocator, row);
+            break;
+        }
+    }
+    if (filtered.items.len == 0) return error.UnknownItemId;
     return filtered.toOwnedSlice(allocator);
 }
 
@@ -12790,9 +12820,29 @@ test "commandHelpTextForArgv resolves command-specific help" {
     try std.testing.expect(std.mem.indexOf(u8, prime_help, "usage: st prime --file PATH [options]") != null);
     try std.testing.expect(std.mem.indexOf(u8, prime_help, "usage: st {") == null);
 
+    const show_help = commandHelpTextForArgv(&.{ "st", "show", "--help" }).?;
+    try std.testing.expect(std.mem.indexOf(u8, show_help, "usage: st show --file PATH [--id ID]") != null);
+
     const complete_help = commandHelpTextForArgv(&.{ "st", "complete", "--help" }).?;
     try std.testing.expect(std.mem.indexOf(u8, complete_help, "usage: st complete --file PATH --id ID [--command CMD --evidence-ref REF] [options]") != null);
     try std.testing.expect(std.mem.indexOf(u8, complete_help, "using current proof receipts") != null);
+}
+
+test "show parses item id selector" {
+    const args = try parseArgs(&.{
+        "st",
+        "show",
+        "--file",
+        ".step/st-plan.jsonl",
+        "--id",
+        "st-001",
+        "--format",
+        "json",
+    });
+
+    try std.testing.expectEqual(Command.show, args.command);
+    try std.testing.expectEqual(OutputFormat.json, args.format);
+    try std.testing.expectEqualStrings("st-001", args.id.?);
 }
 
 test "commandHelpTextForArgv resolves nested command help" {
@@ -12836,6 +12886,45 @@ test "compile aperture rejects unsupported parallelism values" {
         "--parallelism",
         "wide",
     }));
+}
+
+test "show id selector returns one matching item across surfaces" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var state = ItemState.init(allocator);
+    defer state.deinit();
+    try state.upsert(.{
+        .id = "st-001",
+        .step = "Selected task",
+        .status = .pending,
+        .priority = .high,
+        .in_plan = true,
+        .deps = &.{},
+        .notes = "",
+        .comments = &.{},
+    });
+    try state.upsert(.{
+        .id = "st-002",
+        .step = "Backlog task",
+        .status = .pending,
+        .priority = .medium,
+        .in_plan = false,
+        .deps = &.{},
+        .notes = "",
+        .comments = &.{},
+    });
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try renderShow(allocator, &out.writer, &state, .json, .plan, "st-002");
+    try out.writer.writeByte('\n');
+    const actual = try out.toOwnedSlice();
+
+    try std.testing.expect(std.mem.indexOf(u8, actual, "\"id\":\"st-002\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, actual, "\"id\":\"st-001\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, actual, "\"in_plan\":false") != null);
 }
 
 test "dependencyState maps blocked and waiting statuses" {
