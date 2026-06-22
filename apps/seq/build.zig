@@ -20,6 +20,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const retrace_core = b.createModule(.{
+        .root_source_file = b.path("../../libs/retrace_core/src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const seq_meta = addVersionModule(b, @embedFile("VERSION"));
 
     const root_module = b.createModule(.{
@@ -29,6 +34,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "core_path", .module = core_path },
             .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "retrace_core", .module = retrace_core },
             .{ .name = "app_meta", .module = seq_meta },
         },
     });
@@ -56,6 +62,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "core_path", .module = core_path },
             .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "retrace_core", .module = retrace_core },
             .{ .name = "app_meta", .module = seq_meta },
         },
     });

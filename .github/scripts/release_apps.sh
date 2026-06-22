@@ -59,6 +59,11 @@ case "$mode" in
       mark_app st
     }
 
+    mark_retrace_core_consumers() {
+      mark_app seq
+      mark_app cas
+    }
+
     mark_build_zig() {
       local changed=0
       local ambiguous=0
@@ -120,6 +125,10 @@ case "$mode" in
               mark_durable_store_consumers
               matched=1
               ;;
+            *"retrace_core"*|*"libs/retrace_core/"*)
+              mark_retrace_core_consumers
+              matched=1
+              ;;
           esac
         fi
 
@@ -145,6 +154,9 @@ case "$mode" in
           ;;
         libs/durable_store/*)
           mark_durable_store_consumers
+          ;;
+        libs/retrace_core/*)
+          mark_retrace_core_consumers
           ;;
         .github/workflows/release-seq.yml)
           mark_app seq
