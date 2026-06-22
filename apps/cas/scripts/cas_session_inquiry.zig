@@ -2071,7 +2071,7 @@ fn startLaneFork(
     const lane_state_leaf = try std.fmt.allocPrint(allocator, "lanes/{s}.json", .{lane_stem});
     defer allocator.free(lane_state_leaf);
     const lane_state_ref = try inquiryPathJoin(allocator, options.home, rip.inquiry_id, lane_state_leaf);
-    const fork_ephemeral = anchor.drop_last_n_turns == 0;
+    const fork_ephemeral = false;
 
     const fork_params = try stringifyAnyAlloc(allocator, .{
         .threadId = source_thread_id,
@@ -2349,7 +2349,10 @@ fn collectLaneFork(
     const blocking_event = observed.blocking_event or policy_request_observed;
     const answer_complete = parsed_answer != null and observed.terminal and std.mem.eql(u8, observed.status, "completed") and !blocking_event;
     const anchor_valid = std.mem.eql(u8, handle.anchor_digest_observed, handle.anchor_digest_expected);
-    const receipt_valid = answer_complete and anchor_valid and handle.fork_policy.safe();
+    const fork_deleted = !handle.fork_policy.ephemeral and cleanupForkWithMethod(allocator, client, handle, "thread/delete");
+    const fork_archived = !handle.fork_policy.ephemeral and !fork_deleted and cleanupForkWithMethod(allocator, client, handle, "thread/archive");
+    const cleanup_valid = handle.fork_policy.ephemeral or fork_deleted or fork_archived;
+    const receipt_valid = answer_complete and anchor_valid and handle.fork_policy.safe() and cleanup_valid;
 
     const receipt = .{
         .fork_inquiry_receipt = .{
@@ -2429,9 +2432,9 @@ fn collectLaneFork(
             .lifecycle = .{
                 .event_log_ref = handle.lane_events,
                 .interrupted = false,
-                .archived = false,
-                .deleted = false,
-                .cleanup_status = if (handle.fork_policy.ephemeral) "ephemeral_runtime_closed" else "cleanup_pending",
+                .archived = fork_archived,
+                .deleted = fork_deleted,
+                .cleanup_status = if (handle.fork_policy.ephemeral) "ephemeral_runtime_closed" else if (cleanup_valid) "persisted_fallback_cleaned" else "cleanup_failed",
             },
             .gate = .{
                 .lineage_valid = true,
@@ -3010,12 +3013,89 @@ fn turnDigestFromThreadRead(allocator: std.mem.Allocator, raw: []const u8) !Turn
         .array => |arr| arr,
         else => return error.SourceStale,
     };
-    const turns_json = try canonicalTurnsJsonAlloc(allocator, turns.items);
-    defer allocator.free(turns_json);
+    var trace = canonical_trace.CanonicalSessionTrace{
+        .session = try canonical_trace.SessionRecord.init(allocator, core_json.stringField(thread, "path") orelse ""),
+    };
+    defer trace.deinit(allocator);
+    if (core_json.stringField(thread, "id")) |id| trace.session.session_id = try allocator.dupe(u8, id);
+    for (turns.items, 0..) |turn_value, index| {
+        const turn = switch (turn_value) {
+            .object => |obj| obj,
+            else => return error.SourceStale,
+        };
+        var record = canonical_trace.TurnRecord{
+            .path = try allocator.dupe(u8, trace.session.path),
+            .turn_id = try allocator.dupe(u8, core_json.stringField(turn, "id") orelse return error.SourceStale),
+            .turn_index = @intCast(index + 1),
+            .status = mapThreadReadTurnStatus(core_json.stringField(turn, "status") orelse ""),
+            .user_message = try messageTextFromThreadItems(allocator, turn, "userMessage"),
+            .final_answer = try messageTextFromThreadItems(allocator, turn, "agentMessage"),
+        };
+        errdefer record.deinit(allocator);
+        try trace.turns.append(allocator, record);
+    }
+    const digest = try decision_anchor.digestRetained(allocator, trace, @intCast(turns.items.len));
     return .{
         .count = turns.items.len,
-        .digest = try sha256HexAlloc(allocator, turns_json),
+        .digest = digest,
     };
+}
+
+fn mapThreadReadTurnStatus(status: []const u8) canonical_trace.TurnStatus {
+    if (std.mem.eql(u8, status, "completed")) return .complete;
+    if (std.mem.eql(u8, status, "failed")) return .@"error";
+    if (std.mem.eql(u8, status, "interrupted")) return .aborted;
+    if (std.mem.eql(u8, status, "aborted")) return .aborted;
+    return .ongoing;
+}
+
+fn messageTextFromThreadItems(allocator: std.mem.Allocator, turn: std.json.ObjectMap, item_type: []const u8) !?[]u8 {
+    const items_value = turn.get("items") orelse return null;
+    const items = switch (items_value) {
+        .array => |arr| arr,
+        else => return error.SourceStale,
+    };
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var any = false;
+    for (items.items) |item_value| {
+        const item = switch (item_value) {
+            .object => |obj| obj,
+            else => return error.SourceStale,
+        };
+        if (!std.mem.eql(u8, core_json.stringField(item, "type") orelse "", item_type)) continue;
+        if (std.mem.eql(u8, item_type, "agentMessage")) {
+            if (core_json.stringField(item, "text")) |text| {
+                if (any) try out.append(allocator, '\n');
+                try out.appendSlice(allocator, text);
+                any = true;
+            }
+            continue;
+        }
+        const content_value = item.get("content") orelse continue;
+        const content_items = switch (content_value) {
+            .array => |arr| arr,
+            else => return error.SourceStale,
+        };
+        for (content_items.items) |content_item_value| {
+            const content_item = switch (content_item_value) {
+                .object => |obj| obj,
+                else => return error.SourceStale,
+            };
+            if (!std.mem.eql(u8, core_json.stringField(content_item, "type") orelse "", "text")) continue;
+            if (core_json.stringField(content_item, "text")) |text| {
+                if (any) try out.append(allocator, '\n');
+                try out.appendSlice(allocator, text);
+                any = true;
+            }
+        }
+    }
+    if (!any) {
+        out.deinit(allocator);
+        return null;
+    }
+    const text = try out.toOwnedSlice(allocator);
+    return text;
 }
 
 fn appendSourceDigestMismatchEvent(

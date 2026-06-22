@@ -75,10 +75,6 @@ pub fn digestRetained(allocator: std.mem.Allocator, trace: canonical_trace.Canon
     for (trace.turns.items) |turn| {
         if (turn.turn_index > keep_through_turn_index) continue;
         try writer.print("{d}|{s}|{s}|", .{ turn.turn_index, turn.turn_id, @tagName(turn.status) });
-        if (turn.started_at) |value| try writer.writeAll(value);
-        try writer.writeByte('|');
-        if (turn.completed_at) |value| try writer.writeAll(value);
-        try writer.writeByte('|');
         if (turn.user_message) |value| try writeContentDigest(writer, value);
         try writer.writeByte('|');
         if (turn.final_answer) |value| try writeContentDigest(writer, value);

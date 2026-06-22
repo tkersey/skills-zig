@@ -42,6 +42,7 @@ pub const BuildOptions = struct {
     strict: bool = true,
     include_excerpts: bool = false,
     excerpt_chars: usize = 240,
+    source_thread_id: ?[]const u8 = null,
 };
 
 pub const CapsuleResult = struct {
@@ -168,7 +169,6 @@ fn writePacketBody(
     packet_id: ?[]const u8,
     opts: BuildOptions,
 ) !void {
-    _ = opts;
     try writer.writeAll("{\n  \"decision_context_packet\": {\n");
     try writer.writeAll("    \"anchors\": {\n");
     try writeAnchor(writer, "pre_decision", anchors.pre_decision, true);
@@ -219,7 +219,7 @@ fn writePacketBody(
     try writeJsonFieldOpt(writer, "source_codex_version", trace.session.cli_version, true, 6);
     try writeJsonFieldOpt(writer, "source_model", trace.session.model, true, 6);
     try writeJsonFieldOpt(writer, "source_model_provider", trace.session.model_provider, true, 6);
-    try writeJsonFieldOpt(writer, "thread_id", trace.session.thread_name, true, 6);
+    try writeJsonFieldOpt(writer, "thread_id", opts.source_thread_id, true, 6);
     try writeJsonFieldNull(writer, "worker_session_id", false, 6, false);
     try writer.writeAll("    },\n");
 
@@ -423,4 +423,37 @@ test "capsule output validates against native schema" {
     var report = try dcp_schema.validateText(std.testing.allocator, result.json);
     defer report.deinit(std.testing.allocator);
     try std.testing.expect(report.valid);
+}
+
+test "capsule emits explicit source thread id override" {
+    var trace = canonical_trace.CanonicalSessionTrace{
+        .session = try canonical_trace.SessionRecord.init(std.testing.allocator, "rollout-demo.jsonl"),
+    };
+    defer trace.deinit(std.testing.allocator);
+    trace.session.session_id = try std.testing.allocator.dupe(u8, "demo");
+    trace.session.thread_name = try std.testing.allocator.dupe(u8, "Display Name");
+    try trace.turns.append(std.testing.allocator, .{
+        .path = try std.testing.allocator.dupe(u8, "rollout-demo.jsonl"),
+        .turn_id = try std.testing.allocator.dupe(u8, "t1"),
+        .turn_index = 1,
+        .status = .complete,
+        .user_message = try std.testing.allocator.dupe(u8, "Which route?"),
+        .final_answer = try std.testing.allocator.dupe(u8, "I will use route A because it is explicit."),
+    });
+    try trace.turns.append(std.testing.allocator, .{
+        .path = try std.testing.allocator.dupe(u8, "rollout-demo.jsonl"),
+        .turn_id = try std.testing.allocator.dupe(u8, "t2"),
+        .turn_index = 2,
+        .status = .complete,
+        .final_answer = try std.testing.allocator.dupe(u8, "Tests passed."),
+    });
+
+    var without_override = try buildCapsuleJson(std.testing.allocator, trace, "rollout-demo.jsonl", .{ .strict = true });
+    defer without_override.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, without_override.json, "\"thread_id\": null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, without_override.json, "\"thread_id\": \"Display Name\"") == null);
+
+    var with_override = try buildCapsuleJson(std.testing.allocator, trace, "rollout-demo.jsonl", .{ .strict = true, .source_thread_id = "thread-123" });
+    defer with_override.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, with_override.json, "\"thread_id\": \"thread-123\"") != null);
 }
