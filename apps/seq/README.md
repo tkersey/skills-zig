@@ -156,6 +156,8 @@ seq resolve-churn-audit --root ~/.codex/sessions --since 2026-05-01T00:00:00Z --
 - treats raw `$resolve` mentions as candidate sessions only; MBK activation requires MBKC evidence such as `MBKC-v1`, `minimum_behavioral_kernel`, `resolve-c3 campaign begin`, `kernel-accepted`, or `terminal-closed`
 - keeps historical `legacy-cleanroom` and C3/MRPC counts separate; `c3-mrpc` is an explicit alias for the existing MRPC-era `c3` behavior
 - reports C3/MRPC `closure_compression` state for closed runs, including `CLOSED_UNCOMPRESSED` when material closed sessions lack basis, tournament, ablation, proof, holdout, permit, or bypass-free MRPC evidence
+- emits C3/MRPC `denominator.included_sessions` rows so each true C3 session carries its `session_id`, path, protocol, classification, `c3_required` / `c3_entered` / `c3_closed` booleans, and evidence refs for the native count and closure-compression decisions
+- marks absence-derived evidence explicitly with `source: "absent"` and deterministic reasons such as `no_c3_begin_signal`; aggregate `closure_compression` remains the cohort summary
 - reports MBK semantic-surface metrics separately from base-relative Git tree metrics
 
 Examples:
