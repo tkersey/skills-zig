@@ -1,3 +1,5 @@
+const retrace_core = @import("retrace_core");
+
 comptime {
     _ = @import("lib.zig");
     _ = @import("tests/correctness_golden.zig");
@@ -12,7 +14,7 @@ comptime {
     _ = @import("cli/options.zig");
     _ = @import("cli/help.zig");
     _ = @import("cli/validate.zig");
-    _ = @import("canonical_trace.zig");
+    _ = retrace_core.canonical_trace;
     _ = @import("scan_plan.zig");
     _ = @import("session_scan.zig");
     _ = @import("datasets/mod.zig");
@@ -27,8 +29,8 @@ comptime {
     _ = @import("skill_contract.zig");
     _ = @import("skill_decision_receipt.zig");
     _ = @import("skill_decision_signals.zig");
-    _ = @import("dcp_schema.zig");
-    _ = @import("decision_anchor.zig");
+    _ = retrace_core.dcp_schema;
+    _ = retrace_core.decision_anchor;
     _ = @import("historical_decisions.zig");
     _ = @import("decision_capsule.zig");
     _ = @import("datasets/tool_calls.zig");
@@ -99,4 +101,10 @@ test "bootstrap parse coverage" {
     try std.testing.expectEqual(lib.Command.opencode_events, lib.parseCommand("opencode-events"));
     try std.testing.expectEqual(lib.Command.index, lib.parseCommand("index"));
     try std.testing.expectEqual(lib.Command.unknown, lib.parseCommand("invalid"));
+}
+
+test "retrace core exposes DCP capsule primitives" {
+    try std.testing.expectEqualStrings("DCP-v1", retrace_core.dcp_schema.version);
+    _ = retrace_core.canonical_trace.CanonicalSessionTrace;
+    _ = retrace_core.decision_anchor.Anchors;
 }
