@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const version = "DCP-v1";
+pub const version = "DCP-v2";
 
 pub const AnchorName = enum {
     pre_decision,
@@ -388,7 +388,7 @@ fn freeStringList(allocator: std.mem.Allocator, list: *std.ArrayList([]u8)) void
 test "DCP validation catches bad anchor arithmetic" {
     const text =
         \\{"decision_context_packet":{
-        \\"packet_version":"DCP-v1","packet_id":"DCP-test",
+        \\"packet_version":"DCP-v2","packet_id":"DCP-test",
         \\"source":{"session_id":"s","decision_id":"d"},
         \\"artifact_state":{"reconstructability":"transcript_only"},
         \\"episode":{"question":"q","selected_route":"r","rejected_routes":[],"explicit_rationale":[],"explicit_assumptions":[],"evidence_refs":[],"tools_and_artifacts":[],"skills_and_instructions":[],"outcome_refs":[]},
@@ -406,7 +406,7 @@ test "DCP validation catches bad anchor arithmetic" {
 test "DCP validation rejects stale packet id after content edit" {
     const text =
         \\{"decision_context_packet":{
-        \\"packet_version":"DCP-v1","packet_id":"DCP-stale",
+        \\"packet_version":"DCP-v2","packet_id":"DCP-stale",
         \\"source":{"session_id":"s","decision_id":"d"},
         \\"artifact_state":{"reconstructability":"transcript_only"},
         \\"episode":{"question":"q","selected_route":"r","rejected_routes":[],"explicit_rationale":[],"explicit_assumptions":[],"evidence_refs":[],"tools_and_artifacts":[],"skills_and_instructions":[],"outcome_refs":[]},

@@ -168,7 +168,7 @@ pub const dataset_meta = [_]DatasetMeta{
     },
     .{
         .name = "decision_capsules",
-        .description = "Persisted or transcript-embedded DCP-v1 packet references",
+        .description = "Persisted or transcript-embedded DCP-v2 packet references",
         .fields = &.{ "path", "session_id", "packet_id", "decision_id", "source_kind", "valid", "errors" },
     },
     .{

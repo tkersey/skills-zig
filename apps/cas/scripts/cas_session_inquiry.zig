@@ -8,6 +8,7 @@ const cas_client = @import("cas_proxy_client.zig");
 const cas_websocket = @import("cas_websocket_transport.zig");
 const canonical_trace = retrace_core.canonical_trace;
 const decision_anchor = retrace_core.decision_anchor;
+const dcp_schema = retrace_core.dcp_schema;
 
 const Version = core_cli.normalizeVersion(app_meta.version);
 const MaxInputBytes = 8 * 1024 * 1024;
@@ -368,6 +369,7 @@ const LaneHandle = struct {
     expected_hindsight: bool,
     policy_request_count_before: u64,
     fork_policy: ForkPolicyProof,
+    fork_cleaned: bool = false,
 };
 
 const DetachedRecord = struct {
@@ -767,7 +769,7 @@ fn cleanupPersistedForks(
             continue;
         };
         defer freeLaneHandle(allocator, handle);
-        if (handle.fork_policy.ephemeral) continue;
+        if (handle.fork_policy.ephemeral or handle.fork_cleaned) continue;
         result.persisted_forks += 1;
         if (cleanupForkWithMethod(allocator, &client, handle, "thread/delete")) {
             result.deleted += 1;
@@ -787,23 +789,33 @@ fn cleanupForkWithMethod(
     handle: LaneHandle,
     method: []const u8,
 ) bool {
-    const params = stringifyAnyAlloc(allocator, .{ .threadId = handle.fork_thread_id }) catch return false;
+    return cleanupForkThreadIdWithMethod(allocator, client, handle.lane_events, handle.fork_thread_id, method);
+}
+
+fn cleanupForkThreadIdWithMethod(
+    allocator: std.mem.Allocator,
+    client: *cas_client.Client,
+    lane_events: []const u8,
+    fork_thread_id: []const u8,
+    method: []const u8,
+) bool {
+    const params = stringifyAnyAlloc(allocator, .{ .threadId = fork_thread_id }) catch return false;
     defer allocator.free(params);
-    const request_event = stringifyAnyAlloc(allocator, .{ .event = method, .thread_id = handle.fork_thread_id }) catch return false;
+    const request_event = stringifyAnyAlloc(allocator, .{ .event = method, .thread_id = fork_thread_id }) catch return false;
     defer allocator.free(request_event);
-    appendLine(handle.lane_events, request_event) catch return false;
+    appendLine(lane_events, request_event) catch return false;
     const response = client.requestJson(method, params) catch |err| {
         const error_event = stringifyAnyAlloc(allocator, .{
             .event = method,
-            .thread_id = handle.fork_thread_id,
+            .thread_id = fork_thread_id,
             .failure = client.lastError() orelse @errorName(err),
         }) catch return false;
         defer allocator.free(error_event);
-        appendLine(handle.lane_events, error_event) catch {};
+        appendLine(lane_events, error_event) catch {};
         return false;
     };
     defer allocator.free(response);
-    appendLine(handle.lane_events, response) catch return false;
+    appendLine(lane_events, response) catch return false;
     return true;
 }
 
@@ -1055,7 +1067,7 @@ fn loadDcp(allocator: std.mem.Allocator, path: []const u8) !Dcp {
         else => return error.NotObject,
     };
     const packet = rootObject(root, "decision_context_packet") orelse root;
-    if (!std.mem.eql(u8, try requiredString(packet, "packet_version"), "DCP-v1")) return error.BadVersion;
+    if (!std.mem.eql(u8, try requiredString(packet, "packet_version"), dcp_schema.version)) return error.BadVersion;
     const packet_id = try requiredString(packet, "packet_id");
     const source = rootObject(packet, "source") orelse return error.MissingSource;
     const artifact = rootObject(packet, "artifact_state") orelse return error.MissingArtifactState;
@@ -2077,7 +2089,6 @@ fn isRetryableLaneError(err: anyerror) bool {
         error.EndOfStream,
         error.InquiryTransportLost,
         error.ForkFailed,
-        error.TurnStartFailed,
         => true,
         else => false,
     };
@@ -2197,6 +2208,7 @@ fn startLaneFork(
     }
     const turn_json = client.requestJsonCaptureNotifications("turn/start", turn_params, &notifications) catch {
         if (client.lastError()) |detail| try appendLine(lane_events, detail);
+        _ = cleanupForkThreadIdWithMethod(allocator, client, lane_events, fork_thread_id, "thread/delete") or cleanupForkThreadIdWithMethod(allocator, client, lane_events, fork_thread_id, "thread/archive");
         return error.TurnStartFailed;
     };
     defer allocator.free(turn_json);
@@ -2394,8 +2406,10 @@ fn collectLaneFork(
     const anchor_valid = std.mem.eql(u8, handle.anchor_digest_observed, handle.anchor_digest_expected);
     const fork_deleted = !handle.fork_policy.ephemeral and cleanupForkWithMethod(allocator, client, handle, "thread/delete");
     const fork_archived = !handle.fork_policy.ephemeral and !fork_deleted and cleanupForkWithMethod(allocator, client, handle, "thread/archive");
-    const cleanup_valid = handle.fork_policy.ephemeral or fork_deleted or fork_archived;
+    const cleanup_valid = handle.fork_policy.ephemeral or handle.fork_cleaned or fork_deleted or fork_archived;
     const receipt_valid = answer_complete and anchor_valid and handle.fork_policy.safe() and cleanup_valid;
+    var completed_handle = handle;
+    completed_handle.fork_cleaned = cleanup_valid;
 
     const receipt = .{
         .fork_inquiry_receipt = .{
@@ -2477,7 +2491,7 @@ fn collectLaneFork(
                 .interrupted = false,
                 .archived = fork_archived,
                 .deleted = fork_deleted,
-                .cleanup_status = if (handle.fork_policy.ephemeral) "ephemeral_runtime_closed" else if (cleanup_valid) "persisted_fallback_cleaned" else "cleanup_failed",
+                .cleanup_status = if (handle.fork_policy.ephemeral) "ephemeral_runtime_closed" else if (handle.fork_cleaned) "already_cleaned" else if (cleanup_valid) "persisted_fallback_cleaned" else "cleanup_failed",
             },
             .gate = .{
                 .lineage_valid = true,
@@ -2491,7 +2505,7 @@ fn collectLaneFork(
         },
     };
     try writeJsonFile(allocator, handle.lane_receipt, receipt);
-    try writeLaneHandle(allocator, handle, if (receipt_valid) @tagName(InquiryState.completed) else @tagName(InquiryState.failed));
+    try writeLaneHandle(allocator, completed_handle, if (receipt_valid) @tagName(InquiryState.completed) else @tagName(InquiryState.failed));
     return .{
         .receipt_valid = receipt_valid,
         .retryable = !receipt_valid and observed.terminal and std.mem.eql(u8, observed.status, "interrupted") and final_text.len == 0 and !blocking_event,
@@ -2538,6 +2552,7 @@ fn writeLaneHandle(allocator: std.mem.Allocator, handle: LaneHandle, state: []co
                 .ephemeral = handle.fork_policy.ephemeral,
                 .read_only = handle.fork_policy.read_only,
                 .approval_never = handle.fork_policy.approval_never,
+                .cleaned = handle.fork_cleaned,
             },
         },
     };
@@ -2590,6 +2605,7 @@ fn loadLaneHandleAlloc(allocator: std.mem.Allocator, path: []const u8) !LaneHand
             .read_only = try requiredBool(policy, "read_only"),
             .approval_never = try requiredBool(policy, "approval_never"),
         },
+        .fork_cleaned = optionalBool(policy, "cleaned") orelse false,
     };
 }
 
@@ -3114,12 +3130,125 @@ fn turnDigestFromThreadRead(allocator: std.mem.Allocator, raw: []const u8) !Turn
         };
         errdefer record.deinit(allocator);
         try trace.turns.append(allocator, record);
+        try appendToolRecordsFromThreadItems(allocator, &trace, turn, @intCast(index + 1));
     }
     const digest = try decision_anchor.digestRetained(allocator, trace, @intCast(turns.items.len));
     return .{
         .count = turns.items.len,
         .digest = digest,
     };
+}
+
+fn appendToolRecordsFromThreadItems(
+    allocator: std.mem.Allocator,
+    trace: *canonical_trace.CanonicalSessionTrace,
+    turn: std.json.ObjectMap,
+    turn_index: i64,
+) !void {
+    const items_value = turn.get("items") orelse return;
+    const items = switch (items_value) {
+        .array => |arr| arr,
+        else => return error.SourceStale,
+    };
+    for (items.items) |item_value| {
+        const item = switch (item_value) {
+            .object => |obj| obj,
+            else => return error.SourceStale,
+        };
+        const item_type = core_json.stringField(item, "type") orelse "";
+        if (std.mem.eql(u8, item_type, "function_call") or std.mem.eql(u8, item_type, "custom_tool_call")) {
+            try appendLiveToolDeclaration(allocator, trace, turn, item, turn_index);
+        } else if (std.mem.eql(u8, item_type, "function_call_output") or std.mem.eql(u8, item_type, "custom_tool_call_output")) {
+            try appendLiveToolOutput(allocator, trace, turn, item, turn_index);
+        }
+    }
+}
+
+fn appendLiveToolDeclaration(
+    allocator: std.mem.Allocator,
+    trace: *canonical_trace.CanonicalSessionTrace,
+    turn: std.json.ObjectMap,
+    item: std.json.ObjectMap,
+    turn_index: i64,
+) !void {
+    const call_id = core_json.stringField(item, "call_id") orelse core_json.stringField(item, "id") orelse return;
+    if (findLiveToolByCallId(trace, call_id)) |_| return;
+    const name = core_json.stringField(item, "name") orelse core_json.stringField(item, "tool_name") orelse "unknown";
+    var record = canonical_trace.ToolLifecycleRecord{
+        .session_id = try dupeOptionalConst(allocator, trace.session.session_id),
+        .path = try allocator.dupe(u8, trace.session.path),
+        .turn_id = try allocator.dupe(u8, core_json.stringField(turn, "id") orelse ""),
+        .turn_index = turn_index,
+        .call_id = try allocator.dupe(u8, call_id),
+        .tool_name = try allocator.dupe(u8, name),
+        .arguments_json = if (core_json.stringField(item, "arguments")) |value| try allocator.dupe(u8, value) else null,
+        .input_text = if (core_json.stringField(item, "input")) |value| try allocator.dupe(u8, value) else null,
+        .lifecycle_status = .declared,
+    };
+    errdefer record.deinit(allocator);
+    if (record.arguments_json) |args| try parseExecArgsIntoLiveTool(allocator, &record, args);
+    try trace.tools.append(allocator, record);
+}
+
+fn appendLiveToolOutput(
+    allocator: std.mem.Allocator,
+    trace: *canonical_trace.CanonicalSessionTrace,
+    turn: std.json.ObjectMap,
+    item: std.json.ObjectMap,
+    turn_index: i64,
+) !void {
+    const call_id = core_json.stringField(item, "call_id") orelse core_json.stringField(item, "id") orelse return;
+    const idx = findLiveToolByCallId(trace, call_id) orelse blk: {
+        var record = canonical_trace.ToolLifecycleRecord{
+            .session_id = try dupeOptionalConst(allocator, trace.session.session_id),
+            .path = try allocator.dupe(u8, trace.session.path),
+            .turn_id = try allocator.dupe(u8, core_json.stringField(turn, "id") orelse ""),
+            .turn_index = turn_index,
+            .call_id = try allocator.dupe(u8, call_id),
+            .lifecycle_status = .inferred,
+        };
+        errdefer record.deinit(allocator);
+        try trace.tools.append(allocator, record);
+        break :blk trace.tools.items.len - 1;
+    };
+    const output = core_json.stringField(item, "output") orelse core_json.stringField(item, "aggregated_output") orelse core_json.stringField(item, "stdout") orelse "";
+    if (output.len > 0) try replaceLiveOpt(allocator, &trace.tools.items[idx].output_text, output);
+    if (core_json.stringField(item, "command")) |value| try replaceLiveOpt(allocator, &trace.tools.items[idx].command_text, value);
+    if (core_json.stringField(item, "cwd")) |value| try replaceLiveOpt(allocator, &trace.tools.items[idx].cwd, value);
+    if (core_json.intField(item, "exit_code")) |value| trace.tools.items[idx].exit_code = value;
+    trace.tools.items[idx].lifecycle_status = if (trace.tools.items[idx].exit_code) |code| if (code == 0) .completed else .failed else .completed;
+}
+
+fn findLiveToolByCallId(trace: *canonical_trace.CanonicalSessionTrace, call_id: []const u8) ?usize {
+    var idx = trace.tools.items.len;
+    while (idx > 0) {
+        idx -= 1;
+        const existing = trace.tools.items[idx].call_id orelse continue;
+        if (std.mem.eql(u8, existing, call_id)) return idx;
+    }
+    return null;
+}
+
+fn parseExecArgsIntoLiveTool(allocator: std.mem.Allocator, record: *canonical_trace.ToolLifecycleRecord, args: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, args, .{}) catch return;
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |value| value,
+        else => return,
+    };
+    if (core_json.stringField(obj, "cmd")) |value| try replaceLiveOpt(allocator, &record.command_text, value);
+    if (core_json.stringField(obj, "command")) |value| try replaceLiveOpt(allocator, &record.command_text, value);
+    if (core_json.stringField(obj, "cwd")) |value| try replaceLiveOpt(allocator, &record.cwd, value);
+}
+
+fn dupeOptionalConst(allocator: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
+    if (value) |text| return try allocator.dupe(u8, text);
+    return null;
+}
+
+fn replaceLiveOpt(allocator: std.mem.Allocator, slot: *?[]u8, value: []const u8) !void {
+    if (slot.*) |old| allocator.free(old);
+    slot.* = try allocator.dupe(u8, value);
 }
 
 fn mapThreadReadTurnStatus(status: []const u8) canonical_trace.TurnStatus {
@@ -3469,6 +3598,14 @@ fn requiredBool(obj: std.json.ObjectMap, key: []const u8) !bool {
     return switch (value) {
         .bool => |b| b,
         else => error.MissingRequiredBool,
+    };
+}
+
+fn optionalBool(obj: std.json.ObjectMap, key: []const u8) ?bool {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .bool => |b| b,
+        else => null,
     };
 }
 
@@ -4468,6 +4605,7 @@ test "detached lane handle round-trips persisted fork turn handle" {
         .expected_hindsight = false,
         .policy_request_count_before = 7,
         .fork_policy = .{ .ephemeral = true, .read_only = true, .approval_never = true },
+        .fork_cleaned = true,
     };
 
     try writeLaneHandle(allocator, handle, @tagName(InquiryState.turn_running));
@@ -4479,6 +4617,46 @@ test "detached lane handle round-trips persisted fork turn handle" {
     try std.testing.expectEqual(@as(u64, 2), loaded.turns_dropped);
     try std.testing.expectEqual(@as(u64, 7), loaded.policy_request_count_before);
     try std.testing.expect(loaded.fork_policy.valid());
+    try std.testing.expect(loaded.fork_cleaned);
+}
+
+test "turnDigestFromThreadRead includes live function call records" {
+    const allocator = std.testing.allocator;
+    const raw =
+        \\{"thread":{"id":"thread-1","path":"rollout.jsonl","turns":[{"id":"turn-1","status":"completed","items":[{"type":"userMessage","content":[{"type":"text","text":"run ls"}]},{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"ls\",\"cwd\":\"/repo\"}"},{"type":"function_call_output","call_id":"call-1","output":"README.md","command":"ls","cwd":"/repo","exit_code":0},{"type":"agentMessage","text":"done","phase":"final_answer"}]}]}}
+    ;
+    const observed = try turnDigestFromThreadRead(allocator, raw);
+    defer allocator.free(observed.digest);
+
+    var trace = canonical_trace.CanonicalSessionTrace{
+        .session = try canonical_trace.SessionRecord.init(allocator, "rollout.jsonl"),
+    };
+    defer trace.deinit(allocator);
+    try trace.turns.append(allocator, .{
+        .path = try allocator.dupe(u8, "rollout.jsonl"),
+        .turn_id = try allocator.dupe(u8, "turn-1"),
+        .turn_index = 1,
+        .status = .complete,
+        .user_message = try allocator.dupe(u8, "run ls"),
+        .final_answer = try allocator.dupe(u8, "done"),
+    });
+    try trace.tools.append(allocator, .{
+        .path = try allocator.dupe(u8, "rollout.jsonl"),
+        .turn_id = try allocator.dupe(u8, "turn-1"),
+        .turn_index = 1,
+        .call_id = try allocator.dupe(u8, "call-1"),
+        .tool_name = try allocator.dupe(u8, "exec_command"),
+        .arguments_json = try allocator.dupe(u8, "{\"cmd\":\"ls\",\"cwd\":\"/repo\"}"),
+        .output_text = try allocator.dupe(u8, "README.md"),
+        .command_text = try allocator.dupe(u8, "ls"),
+        .cwd = try allocator.dupe(u8, "/repo"),
+        .exit_code = 0,
+        .lifecycle_status = .completed,
+    });
+    const expected = try decision_anchor.sourceTurnDigest(allocator, trace);
+    defer allocator.free(expected);
+    try std.testing.expectEqual(@as(usize, 1), observed.count);
+    try std.testing.expectEqualStrings(expected, observed.digest);
 }
 
 fn freeStringList(allocator: std.mem.Allocator, list: []const []const u8) void {

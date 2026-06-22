@@ -104,7 +104,7 @@ test "bootstrap parse coverage" {
 }
 
 test "retrace core exposes DCP capsule primitives" {
-    try std.testing.expectEqualStrings("DCP-v1", retrace_core.dcp_schema.version);
+    try std.testing.expectEqualStrings("DCP-v2", retrace_core.dcp_schema.version);
     _ = retrace_core.canonical_trace.CanonicalSessionTrace;
     _ = retrace_core.decision_anchor.Anchors;
 }

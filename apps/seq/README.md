@@ -210,7 +210,7 @@ Companion commands:
 - `skill-contract validate --file <decision-contract.yaml>` validates SKDC-v1 and emits the stable contract fingerprint
 - `skill-contract scaffold --skill <name> --kind decision --output <file>` writes a placeholder contract only; it does not infer semantics
 - `skill-decision-receipt validate --file <receipt.json>` validates SDR-v1 receipts
-- `decision-capsule` freezes one visible historical decision as DCP-v1 for controlled replay
+- `decision-capsule` freezes one visible historical decision as DCP-v2 for controlled replay
 - `capabilities --format json` reports `skill_decision_audit`, `skill_decision_delta`, `skill_contract_v1`, `skill_decision_receipt_v1`, `tune_packet_v1`, `decision_capsule_v1`, `decision_anchor_v1`, `historical_decisions_dataset_v1`, and `dcp_validation_v1`
 
 Examples:
