@@ -172,6 +172,21 @@ pub const dataset_meta = [_]DatasetMeta{
         .fields = &.{ "path", "session_id", "packet_id", "decision_id", "source_kind", "valid", "errors" },
     },
     .{
+        .name = "review_compiler_runs",
+        .description = "Provenance-aware review-compiler run classifications",
+        .fields = &.{ "session_id", "path", "protocol", "classification", "source_governance.state", "lifecycle.state", "c3_required", "c3_entered", "c3_closed", "delivery_closure.closed", "compression.summary_state" },
+    },
+    .{
+        .name = "review_compiler_events",
+        .description = "Review-compiler lifecycle events projected from provenance-aware runs",
+        .fields = &.{ "session_id", "path", "sequence", "kind", "source", "authoritative", "campaign_id", "mrpc_id", "head" },
+    },
+    .{
+        .name = "review_compiler_evidence",
+        .description = "Flattened review-compiler evidence refs",
+        .fields = &.{ "session_id", "path", "evidence_id", "present", "source", "provenance_role", "reason", "excerpt" },
+    },
+    .{
         .name = "token_events",
         .description = "Raw token_count events",
         .fields = &.{
@@ -903,12 +918,13 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\  raw $resolve mentions are denominator candidates only; true sessions require assistant workflow or tool evidence
         ,
         .review_compiler_audit =>
-        \\usage: seq review-compiler-audit [--protocol auto|legacy-cleanroom|c3|c3-mrpc|mbk] --since <iso> --until <iso> --repo <path> [--exclude-current] [--format markdown|json]
+        \\usage: seq review-compiler-audit [--protocol auto|legacy-cleanroom|c3|c3-mrpc|mbk] [--mode summary|runs|evidence] --since <iso> --until <iso> --repo <path> [--exclude-current] [--format table|json|jsonl|markdown]
         \\extra options:
         \\  --protocol <name>        auto (default) | legacy-cleanroom | c3 | c3-mrpc | mbk
+        \\  --mode <name>            summary (default) | runs | evidence
         \\  --repo <path>             Match session cwd/tool cwd against this repo root or descendants
         \\  --exclude-current         Exclude the current CODEX_THREAD_ID session
-        \\  raw $resolve mentions are denominator candidates only; true C3 sessions require assistant/tool C3 controller or MRPC evidence
+        \\  path mentions are candidates only; true C3 governance requires controller evidence or explicit workflow declaration
         ,
         .goal_audit =>
         \\usage: seq goal-audit [--mode summary|rows] [--workflow review|resolve|review,resolve] [--duration-gte <seconds|minutes|hours>] [--status <name>] [--contains <text>] [--since <iso>] [--until <iso>] [--path <jsonl>|--session-id <id>] [--exclude-current] [--show-query] [--limit N] [--format table|json|csv|jsonl]
@@ -1074,7 +1090,7 @@ fn validateFormatForCommand(cmd: lib.Command, opts: Options) !void {
             if (fmt != .markdown and fmt != .json) return error.InvalidFormatForCommand;
         },
         .review_compiler_audit => {
-            if (fmt != .markdown and fmt != .json) return error.InvalidFormatForCommand;
+            if (fmt != .markdown and fmt != .json and fmt != .table and fmt != .jsonl) return error.InvalidFormatForCommand;
         },
         .sessions, .turns, .tool_lifecycle, .tail => {
             if (fmt == .csv or fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
@@ -1143,7 +1159,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     };
     const supports_status = cmd == .opencode_events or cmd == .turns or cmd == .goal_audit;
     const supports_mode = switch (cmd) {
-        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .skill_decision_audit, .skill_success_rank, .skill_blocks, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit, .workflow_overlap, .adjudication_audit, .goal_audit, .decision_capsule => true,
+        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .skill_decision_audit, .skill_success_rank, .skill_blocks, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit, .workflow_overlap, .adjudication_audit, .review_compiler_audit, .goal_audit, .decision_capsule => true,
         else => false,
     };
     const supports_kind = cmd == .artifact_search or cmd == .skill_contract;
@@ -1586,6 +1602,9 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         if (opts.protocol_text) |text| {
             _ = try parseReviewCompilerProtocol(text);
         }
+        if (opts.mode) |text| {
+            if (!isValidReviewCompilerAuditMode(text)) return error.InvalidModeArg;
+        }
     }
     if (opts.unique_by_text) |text| {
         if (!std.mem.eql(u8, text, "snippet") and !std.mem.eql(u8, text, "path-snippet")) return error.InvalidModeArg;
@@ -1873,6 +1892,12 @@ fn isValidAdjudicationAuditMode(text: []const u8) bool {
     return std.mem.eql(u8, text, "summary") or
         std.mem.eql(u8, text, "rows") or
         std.mem.eql(u8, text, "report");
+}
+
+fn isValidReviewCompilerAuditMode(text: []const u8) bool {
+    return std.mem.eql(u8, text, "summary") or
+        std.mem.eql(u8, text, "runs") or
+        std.mem.eql(u8, text, "evidence");
 }
 
 fn isValidWorkflowOverlapCsv(text: []const u8) bool {
@@ -2822,6 +2847,10 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
             \\      "decision_anchor_v1": true,
             \\      "historical_decisions_dataset_v1": true,
             \\      "dcp_validation_v1": true,
+            \\      "review_compiler_provenance_v1": true,
+            \\      "review_compiler_run_ledger_v1": true,
+            \\      "source_governance_projection_v1": true,
+            \\      "c3_structured_closure_v1": true,
             \\      "matched_cohort_v1": false
             \\    }
             \\  }
@@ -2846,6 +2875,10 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
         .{ .name = "decision_anchor_v1", .enabled = true },
         .{ .name = "historical_decisions_dataset_v1", .enabled = true },
         .{ .name = "dcp_validation_v1", .enabled = true },
+        .{ .name = "review_compiler_provenance_v1", .enabled = true },
+        .{ .name = "review_compiler_run_ledger_v1", .enabled = true },
+        .{ .name = "source_governance_projection_v1", .enabled = true },
+        .{ .name = "c3_structured_closure_v1", .enabled = true },
         .{ .name = "matched_cohort_v1", .enabled = false },
     };
     for (features) |feature| {
@@ -6419,6 +6452,11 @@ const ReviewCompilerAudit = struct {
     const Denominator = struct {
         candidate_sessions: usize = 0,
         true_resolve_sessions: usize = 0,
+        authoritative_sessions: usize = 0,
+        declared_uncontrolled_sessions: usize = 0,
+        incidental_sessions: usize = 0,
+        ambiguous_sessions: usize = 0,
+        excluded_sessions: usize = 0,
         clean_review_sessions: usize = 0,
         isolated_waiver_sessions: usize = 0,
         c3_required_sessions: usize = 0,
@@ -6439,11 +6477,14 @@ const ReviewCompilerAudit = struct {
         session_id: ?[]u8 = null,
         path: []u8,
         reason: []u8,
+        governance: []u8,
+        delivery_closed: bool = false,
 
         fn deinit(self: Exclusion, allocator: std.mem.Allocator) void {
             if (self.session_id) |id| allocator.free(id);
             allocator.free(self.path);
             allocator.free(self.reason);
+            allocator.free(self.governance);
         }
     };
 
@@ -6455,6 +6496,10 @@ const ReviewCompilerAudit = struct {
         c3_required: bool,
         c3_entered: bool,
         c3_closed: bool,
+        governance: []u8,
+        lifecycle: []u8,
+        delivery_closed: bool,
+        compression: []u8,
         evidence: IncludedSessionEvidence,
 
         fn deinit(self: IncludedSession, allocator: std.mem.Allocator) void {
@@ -6462,6 +6507,9 @@ const ReviewCompilerAudit = struct {
             allocator.free(self.path);
             allocator.free(self.protocol);
             allocator.free(self.classification);
+            allocator.free(self.governance);
+            allocator.free(self.lifecycle);
+            allocator.free(self.compression);
             self.evidence.deinit(allocator);
         }
     };
@@ -6885,6 +6933,46 @@ const ReviewCompilerBorrowedEvidenceRef = struct {
     snippet: []const u8,
 };
 
+const ReviewCompilerGovernanceState = enum {
+    absent,
+    incidental,
+    declared_uncontrolled,
+    authoritative,
+    ambiguous,
+
+    fn label(self: ReviewCompilerGovernanceState) []const u8 {
+        return switch (self) {
+            .absent => "absent",
+            .incidental => "incidental",
+            .declared_uncontrolled => "declared_uncontrolled",
+            .authoritative => "authoritative",
+            .ambiguous => "ambiguous",
+        };
+    }
+};
+
+const ReviewCompilerLifecycleState = enum {
+    incidental,
+    declared_uncontrolled,
+    open,
+    valid,
+    orphan_close,
+    imported_state,
+    contradictory,
+
+    fn label(self: ReviewCompilerLifecycleState) []const u8 {
+        return switch (self) {
+            .incidental => "incidental",
+            .declared_uncontrolled => "declared_uncontrolled",
+            .open => "open",
+            .valid => "valid",
+            .orphan_close => "orphan_close",
+            .imported_state => "imported_state",
+            .contradictory => "contradictory",
+        };
+    }
+};
+
 const ReviewCompilerSessionSignals = struct {
     candidate: bool = false,
     true_resolve: bool = false,
@@ -6904,6 +6992,15 @@ const ReviewCompilerSessionSignals = struct {
     non_branch_liability_seen: bool = false,
     clean_review_seen: bool = false,
     isolated_waiver_seen: bool = false,
+    governance_state: ReviewCompilerGovernanceState = .absent,
+    governance_provenance: []const u8 = "absent",
+    closure_provenance: []const u8 = "absent",
+    incidental_reason: []const u8 = "none",
+    authoritative_c3_seen: bool = false,
+    declared_c3_seen: bool = false,
+    incidental_c3_seen: bool = false,
+    imported_c3_state_seen: bool = false,
+    delivery_closed_seen: bool = false,
     true_c3_evidence: ?ReviewCompilerBorrowedEvidenceRef = null,
     c3_begin_seen: bool = false,
     c3_begin_evidence: ?ReviewCompilerBorrowedEvidenceRef = null,
@@ -7102,6 +7199,13 @@ fn cmdReviewCompilerAudit(allocator: std.mem.Allocator, sessions_root: []const u
         var signals = summarizeReviewCompilerSession(messages, parsed, opts);
         if (!signals.candidate) continue;
         audit.denominator.candidate_sessions += 1;
+        switch (signals.governance_state) {
+            .authoritative => audit.denominator.authoritative_sessions += 1,
+            .declared_uncontrolled => audit.denominator.declared_uncontrolled_sessions += 1,
+            .incidental => audit.denominator.incidental_sessions += 1,
+            .ambiguous => audit.denominator.ambiguous_sessions += 1,
+            .absent => {},
+        }
         audit.mbk.denominator.candidate_sessions += 1;
         var mbk_exclusion_recorded = false;
         if ((audit.requested_protocol == .auto or audit.requested_protocol == .mbk) and !signals.true_mbk) {
@@ -7118,10 +7222,10 @@ fn cmdReviewCompilerAudit(allocator: std.mem.Allocator, sessions_root: []const u
             const reason: []const u8 = switch (audit.requested_protocol) {
                 .auto => "candidate_without_protocol_evidence",
                 .legacy_cleanroom => "candidate_without_assistant_cleanroom_evidence",
-                .c3, .c3_mrpc => "candidate_without_c3_evidence",
+                .c3, .c3_mrpc => if (signals.governance_state == .incidental) signals.incidental_reason else "candidate_without_c3_evidence",
                 .mbk => "candidate_without_mbk_evidence",
             };
-            try addReviewCompilerExclusion(allocator, &audit, parsed.session.session_id, path, reason);
+            try addReviewCompilerExclusionWithGovernance(allocator, &audit, parsed.session.session_id, path, reason, signals.governance_state.label(), signals.delivery_closed_seen);
             if (audit.requested_protocol == .mbk and !mbk_exclusion_recorded) try addReviewCompilerMBKExclusion(allocator, &audit, parsed.session.session_id, path, reason);
             continue;
         }
@@ -7133,25 +7237,35 @@ fn cmdReviewCompilerAudit(allocator: std.mem.Allocator, sessions_root: []const u
         if (signals.true_c3) try addReviewCompilerC3IncludedSession(allocator, &audit, signals, parsed.session.session_id, path);
     }
 
-    const fmt = if (opts.format_set) opts.format else output.Format.markdown;
+    const mode = opts.mode orelse "summary";
+    const fmt = if (opts.format_set) opts.format else if (std.mem.eql(u8, mode, "summary")) output.Format.markdown else output.Format.table;
+    if (std.mem.eql(u8, mode, "runs")) return writeReviewCompilerRunsMode(allocator, audit, fmt, opts.out_path);
+    if (std.mem.eql(u8, mode, "evidence")) return writeReviewCompilerEvidenceMode(allocator, audit, fmt, opts.out_path);
     return switch (fmt) {
         .json => writeReviewCompilerAuditJson(allocator, audit, opts.out_path),
         .markdown => writeReviewCompilerAuditMarkdown(allocator, audit, opts.out_path),
+        .table => writeReviewCompilerRunsMode(allocator, audit, fmt, opts.out_path),
+        .jsonl => writeReviewCompilerRunsJsonl(allocator, audit, opts.out_path),
         else => error.InvalidFormatForCommand,
     };
 }
 
-fn addReviewCompilerExclusion(
+fn addReviewCompilerExclusionWithGovernance(
     allocator: std.mem.Allocator,
     audit: *ReviewCompilerAudit,
     session_id: ?[]const u8,
     path: []const u8,
     reason: []const u8,
+    governance: []const u8,
+    delivery_closed: bool,
 ) !void {
+    audit.denominator.excluded_sessions += 1;
     try audit.denominator.exclusions.append(allocator, .{
         .session_id = if (session_id) |id| try allocator.dupe(u8, id) else null,
         .path = try allocator.dupe(u8, path),
         .reason = try allocator.dupe(u8, reason),
+        .governance = try allocator.dupe(u8, governance),
+        .delivery_closed = delivery_closed,
     });
 }
 
@@ -7166,7 +7280,86 @@ fn addReviewCompilerMBKExclusion(
         .session_id = if (session_id) |id| try allocator.dupe(u8, id) else null,
         .path = try allocator.dupe(u8, path),
         .reason = try allocator.dupe(u8, reason),
+        .governance = try allocator.dupe(u8, "absent"),
+        .delivery_closed = false,
     });
+}
+
+fn writeReviewCompilerRunsMode(allocator: std.mem.Allocator, audit: ReviewCompilerAudit, fmt: output.Format, out_path: ?[]const u8) !void {
+    if (fmt == .markdown) return writeReviewCompilerAuditMarkdown(allocator, audit, out_path);
+    if (fmt == .jsonl) return writeReviewCompilerRunsJsonl(allocator, audit, out_path);
+    var rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &rows);
+    try appendReviewCompilerRunRows(allocator, &rows, audit);
+    const cols = [_][]const u8{ "session_id", "governance", "lifecycle", "delivery_closed", "c3_closed", "compression", "c3_required", "c3_entered", "protocol", "classification", "path" };
+    try output.writeOutput(allocator, fmt, rows.items, cols[0..], out_path);
+}
+
+fn writeReviewCompilerEvidenceMode(allocator: std.mem.Allocator, audit: ReviewCompilerAudit, fmt: output.Format, out_path: ?[]const u8) !void {
+    if (fmt == .markdown) return writeReviewCompilerAuditMarkdown(allocator, audit, out_path);
+    var rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &rows);
+    for (audit.denominator.included_sessions.items) |row| {
+        try appendReviewCompilerEvidenceRow(allocator, &rows, row, "true_c3", row.evidence.true_c3);
+        try appendReviewCompilerEvidenceRow(allocator, &rows, row, "required", row.evidence.required);
+        try appendReviewCompilerEvidenceRow(allocator, &rows, row, "entered", row.evidence.entered);
+        try appendReviewCompilerEvidenceRow(allocator, &rows, row, "closed", row.evidence.closed);
+    }
+    const cols = [_][]const u8{ "session_id", "path", "signal", "present", "source", "timestamp", "reason", "snippet" };
+    try output.writeOutput(allocator, fmt, rows.items, cols[0..], out_path);
+}
+
+fn writeReviewCompilerRunsJsonl(allocator: std.mem.Allocator, audit: ReviewCompilerAudit, out_path: ?[]const u8) !void {
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+    for (audit.denominator.included_sessions.items) |row| {
+        try writeReviewCompilerIncludedSessionJson(writer, row);
+        try writer.writeByte('\n');
+    }
+    const rendered = try writer_alloc.toOwnedSlice();
+    defer allocator.free(rendered);
+    if (out_path) |path| try ensureParentDir(path);
+    try writeTextOutput(rendered, out_path);
+}
+
+fn appendReviewCompilerRunRows(allocator: std.mem.Allocator, rows: *std.ArrayList(query.Row), audit: ReviewCompilerAudit) !void {
+    for (audit.denominator.included_sessions.items) |item| {
+        var row = query.Row.init(allocator);
+        errdefer row.deinit();
+        try putOptionalString(&row, "session_id", item.session_id);
+        try row.putStaticKey("path", .{ .string = item.path });
+        try row.putStaticKey("protocol", .{ .string = item.protocol });
+        try row.putStaticKey("classification", .{ .string = item.classification });
+        try row.putStaticKey("governance", .{ .string = item.governance });
+        try row.putStaticKey("lifecycle", .{ .string = item.lifecycle });
+        try row.putStaticKey("delivery_closed", .{ .bool = item.delivery_closed });
+        try row.putStaticKey("c3_required", .{ .bool = item.c3_required });
+        try row.putStaticKey("c3_entered", .{ .bool = item.c3_entered });
+        try row.putStaticKey("c3_closed", .{ .bool = item.c3_closed });
+        try row.putStaticKey("compression", .{ .string = item.compression });
+        try rows.append(allocator, row);
+    }
+}
+
+fn appendReviewCompilerEvidenceRow(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayList(query.Row),
+    included_run: ReviewCompilerAudit.IncludedSession,
+    signal: []const u8,
+    evidence: ReviewCompilerAudit.SignalEvidenceRef,
+) !void {
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    try putOptionalString(&row, "session_id", included_run.session_id);
+    try row.putStaticKey("path", .{ .string = included_run.path });
+    try row.putStaticKey("signal", .{ .string = signal });
+    try row.putStaticKey("present", .{ .bool = evidence.present });
+    try row.putStaticKey("source", .{ .string = evidence.source });
+    try putOptionalString(&row, "timestamp", evidence.timestamp);
+    try row.putStaticKey("reason", .{ .string = evidence.reason });
+    try putOptionalString(&row, "snippet", evidence.snippet);
+    try rows.append(allocator, row);
 }
 
 fn resolveTraceMatchesThread(parsed: canonical_trace.CanonicalSessionTrace, path: []const u8, thread_id: []const u8) bool {
@@ -7265,14 +7458,29 @@ fn summarizeReviewCompilerSession(
     for (messages) |message| {
         if (!timestampSatisfiesBounds(message.timestamp, opts)) continue;
         if (containsReviewCompilerCandidateCue(message.text)) signals.candidate = true;
+        if (containsIncidentalC3ArtifactMention(message.text)) {
+            signals.candidate = true;
+            noteReviewCompilerIncidentalC3(&signals, "filename_or_path_mention");
+        }
+        if (containsGenericDeliveryClosure(message.text)) {
+            signals.delivery_closed_seen = true;
+            signals.closure_provenance = "generic_delivery_closure";
+        }
         if (!std.mem.eql(u8, message.role, "assistant")) continue;
         if (containsTrueReviewCompilerAssistantEvidence(message.text)) {
             signals.candidate = true;
             signals.true_legacy = true;
             signals.true_resolve = true;
         }
-        if (containsTrueC3Evidence(message.text)) {
+        if (containsAuthoritativeC3EventText(message.text)) {
             signals.candidate = true;
+            noteReviewCompilerAuthoritativeC3(&signals, "controller_event");
+            signals.true_c3 = true;
+            signals.true_resolve = true;
+            recordReviewCompilerEvidenceRef(&signals.true_c3_evidence, "message", message.timestamp, message.text);
+        } else if (containsDeclaredC3WorkflowEvidence(message.text)) {
+            signals.candidate = true;
+            noteReviewCompilerDeclaredC3(&signals);
             signals.true_c3 = true;
             signals.true_resolve = true;
             recordReviewCompilerEvidenceRef(&signals.true_c3_evidence, "message", message.timestamp, message.text);
@@ -7285,12 +7493,17 @@ fn summarizeReviewCompilerSession(
     }
     for (parsed.tools.items) |tool| {
         if (!toolTimestampSatisfiesBounds(parsed, tool, opts)) continue;
-        if (toolHasC3Evidence(tool)) {
+        if (toolHasIncidentalC3Mention(tool)) {
             signals.candidate = true;
+            noteReviewCompilerIncidentalC3(&signals, if (tool.kind == .patch_apply) "artifact_under_repair" else "filename_or_path_mention");
+        }
+        if (reviewCompilerToolIsCompletedC3Controller(tool)) {
+            signals.candidate = true;
+            noteReviewCompilerAuthoritativeC3(&signals, "controller_invocation");
             signals.true_c3 = true;
             signals.true_resolve = true;
-            const tool_text = reviewCompilerToolText(tool);
-            recordReviewCompilerEvidenceRef(&signals.true_c3_evidence, "tool", toolTimestamp(parsed, tool), tool_text);
+            const tool_text = tool.command_text orelse reviewCompilerToolText(tool);
+            recordReviewCompilerEvidenceRef(&signals.true_c3_evidence, "tool_call", toolTimestamp(parsed, tool), tool_text);
         }
         if (toolHasMBKEvidence(tool)) {
             signals.candidate = true;
@@ -7299,6 +7512,42 @@ fn summarizeReviewCompilerSession(
         }
     }
     return signals;
+}
+
+fn noteReviewCompilerAuthoritativeC3(signals: *ReviewCompilerSessionSignals, provenance: []const u8) void {
+    signals.authoritative_c3_seen = true;
+    signals.governance_state = .authoritative;
+    signals.governance_provenance = provenance;
+}
+
+fn noteReviewCompilerDeclaredC3(signals: *ReviewCompilerSessionSignals) void {
+    signals.declared_c3_seen = true;
+    if (signals.governance_state != .authoritative) {
+        signals.governance_state = .declared_uncontrolled;
+        signals.governance_provenance = "explicit_workflow_declaration";
+    }
+}
+
+fn noteReviewCompilerIncidentalC3(signals: *ReviewCompilerSessionSignals, reason: []const u8) void {
+    signals.incidental_c3_seen = true;
+    if (std.mem.eql(u8, reason, "artifact_under_repair") or std.mem.eql(u8, signals.incidental_reason, "none")) {
+        signals.incidental_reason = reason;
+    }
+    if (signals.governance_state == .absent) {
+        signals.governance_state = .incidental;
+        signals.governance_provenance = reason;
+    } else if (signals.governance_state == .incidental and std.mem.eql(u8, reason, "artifact_under_repair")) {
+        signals.governance_provenance = reason;
+    }
+}
+
+fn toolHasIncidentalC3Mention(tool: canonical_trace.ToolLifecycleRecord) bool {
+    if (reviewCompilerToolIsCompletedC3Controller(tool)) return false;
+    return containsIncidentalC3ArtifactMention(tool.command_text orelse "") or
+        containsIncidentalC3ArtifactMention(tool.input_text orelse "") or
+        containsIncidentalC3ArtifactMention(tool.arguments_json orelse "") or
+        containsIncidentalC3ArtifactMention(tool.output_text orelse "") or
+        containsIncidentalC3ArtifactMention(tool.patch_changes_json orelse "");
 }
 
 fn containsReviewCompilerCandidateCue(text: []const u8) bool {
@@ -7345,6 +7594,63 @@ fn toolHasMBKEvidence(tool: canonical_trace.ToolLifecycleRecord) bool {
         containsTrueMBKEvidence(tool.patch_changes_json orelse "");
 }
 
+fn containsDeclaredC3WorkflowEvidence(text: []const u8) bool {
+    return containsAnyIgnoreCaseAscii(text, &.{
+        "using $resolve / resolve-c3",
+        "using resolve-c3",
+        "use resolve-c3",
+        "resolve-c3 for this material review",
+        "resolve-c3 workflow",
+        "C3/MRPC",
+        "MRPC-v1",
+        "minimal_review_patch_certificate",
+    });
+}
+
+fn containsAuthoritativeC3EventText(text: []const u8) bool {
+    return containsAnyIgnoreCaseAscii(text, &.{
+        "\"event\":\"begin\"",
+        "\"event\": \"begin\"",
+        "event=begin",
+        "\"event\":\"campaign-began\"",
+        "\"event\": \"campaign-began\"",
+        "event=campaign-began",
+        "\"event\":\"terminal-closed\"",
+        "\"event\": \"terminal-closed\"",
+        "event=terminal-closed",
+        "\"event\":\"tuple-closed\"",
+        "\"event\": \"tuple-closed\"",
+        "event=tuple-closed",
+        "\"controller\":\"resolve-c3\"",
+        "\"controller\": \"resolve-c3\"",
+        ".ledger/c3/state.json",
+    });
+}
+
+fn containsIncidentalC3ArtifactMention(text: []const u8) bool {
+    return containsAnyIgnoreCaseAscii(text, &.{
+        ".step/resolve-c3-st-plan.jsonl",
+        "resolve-c3-st-plan.jsonl",
+        ".ledger/c3",
+        "resolve-c3",
+    });
+}
+
+fn containsGenericDeliveryClosure(text: []const u8) bool {
+    return containsAnyIgnoreCaseAscii(text, &.{
+        "goal complete",
+        "goal_complete",
+        "generic_delivery_closure",
+        "pr merged",
+        "PR merged",
+        "merged PR",
+        "worktree clean",
+        "threads clean",
+        "$land complete",
+        "landed",
+    });
+}
+
 fn containsReviewCompilerMBKToolAccountingCue(text: []const u8) bool {
     return containsTrueMBKEvidence(text) or
         containsAnyIgnoreCaseAscii(text, &.{
@@ -7388,15 +7694,6 @@ fn containsTrueReviewCompilerAssistantEvidence(text: []const u8) bool {
     });
 }
 
-fn containsTrueC3Evidence(text: []const u8) bool {
-    return containsAnyIgnoreCaseAscii(text, &.{
-        "resolve-c3 begin",
-        ".ledger/c3/state.json",
-        "minimal_review_patch_certificate",
-        "MRPC-v1",
-    });
-}
-
 fn recordReviewCompilerEvidenceRef(slot: *?ReviewCompilerBorrowedEvidenceRef, source: []const u8, timestamp: ?[]const u8, text: []const u8) void {
     if (slot.* != null) return;
     slot.* = .{
@@ -7404,16 +7701,6 @@ fn recordReviewCompilerEvidenceRef(slot: *?ReviewCompilerBorrowedEvidenceRef, so
         .timestamp = timestamp,
         .snippet = firstNonEmptyLine(text),
     };
-}
-
-fn toolHasC3Evidence(tool: canonical_trace.ToolLifecycleRecord) bool {
-    if (tool.lifecycle_status != .completed) return false;
-    if (tool.kind == .exec_command and (tool.exit_code orelse -1) != 0) return false;
-    return containsTrueC3Evidence(tool.command_text orelse "") or
-        containsTrueC3Evidence(tool.input_text orelse "") or
-        containsTrueC3Evidence(tool.arguments_json orelse "") or
-        containsTrueC3Evidence(tool.output_text orelse "") or
-        containsTrueC3Evidence(tool.patch_changes_json orelse "");
 }
 
 fn containsReviewCompilerBranchLiabilityCue(text: []const u8) bool {
@@ -7486,7 +7773,8 @@ fn recordReviewCompilerMessages(
         if (containsAnyIgnoreCaseAscii(text, &.{ "holdout_findings_added_to_scope", "holdout findings added" })) audit.legacy_cleanroom.review_horizon.holdout_findings_added_to_scope += 1;
         if (containsAnyIgnoreCaseAscii(text, &.{ "holdout_followups_captured", "holdout followups captured", "holdout follow-ups captured" })) audit.legacy_cleanroom.review_horizon.holdout_followups_captured += 1;
 
-        recordReviewCompilerC3Text(audit, text, message.timestamp, "message", signals);
+        const c3_source: []const u8 = if (containsAuthoritativeC3EventText(text)) "controller_event" else "message";
+        recordReviewCompilerC3Text(audit, text, message.timestamp, c3_source, signals);
         if (signals.true_mbk) try recordReviewCompilerMBKText(allocator, audit, text, message.timestamp, signals, session_id, "message");
     }
 }
@@ -7500,11 +7788,16 @@ fn recordReviewCompilerC3Text(
     source: []const u8,
     signals: *ReviewCompilerSessionSignals,
 ) void {
+    const controller_source = std.mem.eql(u8, source, "controller_tool") or std.mem.eql(u8, source, "controller_receipt") or std.mem.eql(u8, source, "controller_event");
     if (containsAnyIgnoreCaseAscii(text, &.{ "clean_review: true", "clean review", "clean_review_session" })) signals.clean_review_seen = true;
     if (containsAnyIgnoreCaseAscii(text, &.{ "isolated_waiver", "isolated waiver" })) signals.isolated_waiver_seen = true;
     if (containsAnyIgnoreCaseAscii(text, &.{ "candidate-worktree", "candidate worktree" })) signals.c3_candidate_worktree_context_seen = true;
+    if (containsGenericDeliveryClosure(text)) {
+        signals.delivery_closed_seen = true;
+        signals.closure_provenance = "generic_delivery_closure";
+    }
 
-    if (containsAnyIgnoreCaseAscii(text, &.{ "resolve-c3 begin", "\"event\":\"begin\"", "\"event\": \"begin\"", "\nbegin\n" })) {
+    if (controller_source and containsAnyIgnoreCaseAscii(text, &.{ "\"event\":\"begin\" controller=resolve-c3", "event=begin", "resolve-c3 campaign begin", "\"event\":\"begin\"", "\"event\": \"begin\"", "\"event\":\"campaign-began\"", "\"event\": \"campaign-began\"", "event=campaign-began", "\nbegin\n" })) {
         audit.c3.controller.begin_events += 1;
         signals.c3_begin_seen = true;
         recordReviewCompilerEvidenceRef(&signals.c3_begin_evidence, source, timestamp, text);
@@ -7520,12 +7813,13 @@ fn recordReviewCompilerC3Text(
         signals.c3_final_certified_seen = true;
     }
     if (containsAnyIgnoreCaseAscii(text, &.{ "MRPC-v1", "minimal_review_patch_certificate" })) signals.c3_mrpc_seen = true;
-    if (containsAnyIgnoreCaseAscii(text, &.{ "committed", "mrpc_committed" })) audit.c3.controller.mrpc_committed += 1;
-    if (containsAnyIgnoreCaseAscii(text, &.{ "pushed", "mrpc_pushed" })) audit.c3.controller.mrpc_pushed += 1;
-    if (containsAnyIgnoreCaseAscii(text, &.{ "closed", "mrpc_closed" })) {
+    if (controller_source and containsAnyIgnoreCaseAscii(text, &.{ "committed", "mrpc_committed" })) audit.c3.controller.mrpc_committed += 1;
+    if (controller_source and containsAnyIgnoreCaseAscii(text, &.{ "pushed", "mrpc_pushed" })) audit.c3.controller.mrpc_pushed += 1;
+    if (controller_source and containsAnyIgnoreCaseAscii(text, &.{ "resolve-c3 close", "\"event\":\"terminal-closed\"", "\"event\": \"terminal-closed\"", "event=terminal-closed", "\"event\":\"tuple-closed\"", "\"event\": \"tuple-closed\"", "event=tuple-closed", "mrpc_closed", "terminal-closed", "tuple-closed" })) {
         audit.c3.controller.mrpc_closed += 1;
         audit.c3.delivery.closed_runs += 1;
         signals.c3_closed_seen = true;
+        signals.closure_provenance = "controller_close";
         recordReviewCompilerEvidenceRef(&signals.c3_closed_evidence, source, timestamp, text);
         recordReviewCompilerC3Time(signals, .closed, timestamp);
     }
@@ -7807,8 +8101,15 @@ fn recordReviewCompilerTools(
         if (!toolIsInRepoScope(allocator, repo_root, parsed.session.cwd, tool)) continue;
         const is_lab = toolLooksReviewLab(tool, signals.*);
         const tool_text = reviewCompilerToolText(tool);
-        if (toolHasC3Evidence(tool) or containsReviewCompilerCandidateCue(tool_text)) {
-            recordReviewCompilerC3Text(audit, tool_text, toolTimestamp(parsed, tool), "tool", signals);
+        if (reviewCompilerToolIsCompletedC3Controller(tool)) {
+            recordReviewCompilerC3Text(audit, tool.command_text orelse tool_text, toolTimestamp(parsed, tool), "controller_tool", signals);
+            if (tool.output_text) |out| {
+                if (containsAuthoritativeC3EventText(out) or containsAnyIgnoreCaseAscii(out, &.{ "terminal-closed", "tuple-closed", "mrpc_closed" })) {
+                    recordReviewCompilerC3Text(audit, out, toolTimestamp(parsed, tool), "controller_receipt", signals);
+                }
+            }
+        } else if (toolHasIncidentalC3Mention(tool)) {
+            noteReviewCompilerIncidentalC3(signals, if (tool.kind == .patch_apply) "artifact_under_repair" else "filename_or_path_mention");
         }
         if (signals.true_mbk and containsReviewCompilerMBKToolAccountingCue(tool_text)) {
             try recordReviewCompilerMBKText(allocator, audit, tool_text, toolTimestamp(parsed, tool), signals, parsed.session.session_id, "tool");
@@ -7925,6 +8226,43 @@ fn reviewCompilerToolText(tool: canonical_trace.ToolLifecycleRecord) []const u8 
     return tool.output_text orelse tool.command_text orelse tool.input_text orelse tool.arguments_json orelse tool.patch_changes_json orelse "";
 }
 
+fn reviewCompilerToolIsCompletedC3Controller(tool: canonical_trace.ToolLifecycleRecord) bool {
+    if (tool.kind != .exec_command) return false;
+    if (tool.lifecycle_status != .completed) return false;
+    if ((tool.exit_code orelse -1) != 0) return false;
+    return commandInvokesResolveC3Controller(tool.command_text orelse "");
+}
+
+fn commandInvokesResolveC3Controller(cmd: []const u8) bool {
+    var split = std.mem.tokenizeAny(u8, cmd, " \t\r\n'\"");
+    var index: usize = 0;
+    while (split.next()) |token_raw| : (index += 1) {
+        const token = trimCommandPunctuation(token_raw);
+        if (token.len == 0) continue;
+        const base = pathBasenameSlice(token);
+        if (std.mem.eql(u8, base, "resolve-c3")) return true;
+        if ((std.mem.eql(u8, base, "seq") or std.mem.eql(u8, base, "skills-zig") or std.mem.eql(u8, base, "zig-out/bin/seq")) and index <= 2) {
+            while (split.next()) |next_raw| {
+                const next = trimCommandPunctuation(next_raw);
+                if (next.len == 0 or std.mem.startsWith(u8, next, "-")) continue;
+                if (std.mem.eql(u8, pathBasenameSlice(next), "resolve-c3")) return true;
+                break;
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
+fn trimCommandPunctuation(text: []const u8) []const u8 {
+    return std.mem.trim(u8, text, " \t\r\n;|&(){}[]'\",");
+}
+
+fn pathBasenameSlice(text: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, text, '/')) |idx| return text[idx + 1 ..];
+    return text;
+}
+
 fn reviewCompilerToolContainsAny(tool: canonical_trace.ToolLifecycleRecord, needles: []const []const u8) bool {
     return containsAnyIgnoreCaseAscii(tool.command_text orelse "", needles) or
         containsAnyIgnoreCaseAscii(tool.input_text orelse "", needles) or
@@ -7934,7 +8272,7 @@ fn reviewCompilerToolContainsAny(tool: canonical_trace.ToolLifecycleRecord, need
 }
 
 fn commandContainsReviewCompileController(cmd: []const u8, subcommand: []const u8) bool {
-    if (!containsAnyIgnoreCaseAscii(cmd, &.{"resolve-c3"})) return false;
+    if (!commandInvokesResolveC3Controller(cmd)) return false;
     return containsIgnoreCaseAscii(cmd, subcommand);
 }
 
@@ -8368,10 +8706,6 @@ fn writeResolveChurnAuditJson(allocator: std.mem.Allocator, audit: ResolveChurnA
 fn finalizeReviewCompilerC3ClosureCompression(audit: *ReviewCompilerAudit, signals: ReviewCompilerSessionSignals) void {
     const material_c3 = signals.true_c3 and !signals.clean_review_seen and !signals.isolated_waiver_seen;
     const closed = signals.c3_closed_seen;
-    if (!closed and material_c3) {
-        audit.c3.closure_compression.blocked += 1;
-        return;
-    }
     if (!closed) return;
 
     audit.c3.closure_compression.closed_total += 1;
@@ -8426,6 +8760,9 @@ fn addReviewCompilerC3IncludedSession(
     else
         "material_c3";
     const protocol: []const u8 = if (signals.c3_mrpc_seen) "c3-mrpc" else "c3";
+    const lifecycle = reviewCompilerLifecycleState(signals);
+    const compression = (try reviewCompilerC3ClosureEvidence(allocator, signals));
+    errdefer compression.deinit(allocator);
 
     try audit.denominator.included_sessions.append(allocator, .{
         .session_id = if (session_id) |id| try allocator.dupe(u8, id) else null,
@@ -8435,14 +8772,33 @@ fn addReviewCompilerC3IncludedSession(
         .c3_required = required,
         .c3_entered = signals.c3_begin_seen,
         .c3_closed = signals.c3_closed_seen,
+        .governance = try allocator.dupe(u8, signals.governance_state.label()),
+        .lifecycle = try allocator.dupe(u8, lifecycle.label()),
+        .delivery_closed = signals.delivery_closed_seen,
+        .compression = try allocator.dupe(u8, compression.summary_state.label()),
         .evidence = .{
             .true_c3 = try reviewCompilerOwnedEvidenceFromSignal(allocator, signals.true_c3_evidence, "true_c3_signal_present", "missing_true_c3_signal"),
             .required = try reviewCompilerOwnedDerivedEvidence(allocator, required, if (required) "true_c3 && !clean_review_seen && !isolated_waiver_seen" else if (signals.clean_review_seen) "clean_review_session" else if (signals.isolated_waiver_seen) "isolated_waiver_session" else "no_true_c3_signal"),
             .entered = try reviewCompilerOwnedEvidenceFromSignal(allocator, signals.c3_begin_evidence, "c3_begin_signal_present", "no_c3_begin_signal"),
             .closed = try reviewCompilerOwnedEvidenceFromSignal(allocator, signals.c3_closed_evidence, "c3_closed_signal_present", "no_c3_closed_signal"),
-            .closure_compression = try reviewCompilerC3ClosureEvidence(allocator, signals),
+            .closure_compression = compression,
         },
     });
+}
+
+fn reviewCompilerLifecycleState(signals: ReviewCompilerSessionSignals) ReviewCompilerLifecycleState {
+    if (signals.governance_state == .incidental) return .incidental;
+    if (signals.governance_state == .declared_uncontrolled and !signals.c3_begin_seen and !signals.c3_closed_seen) return .declared_uncontrolled;
+    if (signals.c3_closed_seen and !signals.c3_begin_seen and signals.imported_c3_state_seen) return .imported_state;
+    if (signals.c3_closed_seen and !signals.c3_begin_seen) return .orphan_close;
+    if (signals.c3_begin_seen and signals.c3_closed_seen) return .valid;
+    if (signals.c3_begin_seen) return .open;
+    return switch (signals.governance_state) {
+        .authoritative => .open,
+        .declared_uncontrolled => .declared_uncontrolled,
+        .ambiguous => .contradictory,
+        else => .incidental,
+    };
 }
 
 fn reviewCompilerC3Material(signals: ReviewCompilerSessionSignals) bool {
@@ -8513,17 +8869,10 @@ fn reviewCompilerC3ClosureEvidence(
 ) !ReviewCompilerAudit.ClosureCompressionEvidence {
     const material_c3 = reviewCompilerC3Material(signals);
     const closed = signals.c3_closed_seen;
-    if (!closed and material_c3) {
-        return .{
-            .summary_state = .blocked,
-            .reason = try allocator.dupe(u8, "material_c3_not_closed"),
-            .missing_compression_evidence = reviewCompilerC3MissingCompressionEvidence(signals),
-        };
-    }
     if (!closed) {
         return .{
             .summary_state = .none,
-            .reason = try allocator.dupe(u8, "not_closed_and_compression_not_required"),
+            .reason = try allocator.dupe(u8, if (material_c3) "c3_not_closed" else "not_closed_and_compression_not_required"),
         };
     }
     if (!material_c3) {
@@ -8807,7 +9156,7 @@ fn writeReviewCompilerAuditJson(allocator: std.mem.Allocator, audit: ReviewCompi
         try writeTextOutput(rendered, out_path);
         return;
     }
-    try writer.print("    \"denominator\": {{ \"candidate_sessions\": {d}, \"true_resolve_sessions\": {d}, \"clean_review_sessions\": {d}, \"isolated_waiver_sessions\": {d}, \"c3_required_sessions\": {d}, \"c3_entered_sessions\": {d}, \"c3_closed_sessions\": {d}, \"exclusions\": [", .{ audit.denominator.candidate_sessions, audit.denominator.true_resolve_sessions, audit.denominator.clean_review_sessions, audit.denominator.isolated_waiver_sessions, audit.denominator.c3_required_sessions, audit.denominator.c3_entered_sessions, audit.denominator.c3_closed_sessions });
+    try writer.print("    \"denominator\": {{ \"candidate_sessions\": {d}, \"true_resolve_sessions\": {d}, \"authoritative_sessions\": {d}, \"declared_uncontrolled_sessions\": {d}, \"incidental_sessions\": {d}, \"ambiguous_sessions\": {d}, \"excluded_sessions\": {d}, \"clean_review_sessions\": {d}, \"isolated_waiver_sessions\": {d}, \"c3_required_sessions\": {d}, \"c3_entered_sessions\": {d}, \"c3_closed_sessions\": {d}, \"exclusions\": [", .{ audit.denominator.candidate_sessions, audit.denominator.true_resolve_sessions, audit.denominator.authoritative_sessions, audit.denominator.declared_uncontrolled_sessions, audit.denominator.incidental_sessions, audit.denominator.ambiguous_sessions, audit.denominator.excluded_sessions, audit.denominator.clean_review_sessions, audit.denominator.isolated_waiver_sessions, audit.denominator.c3_required_sessions, audit.denominator.c3_entered_sessions, audit.denominator.c3_closed_sessions });
     for (audit.denominator.exclusions.items, 0..) |item, idx| {
         if (idx > 0) try writer.writeAll(", ");
         try writer.writeAll("{ \"session_id\": ");
@@ -8816,6 +9165,9 @@ fn writeReviewCompilerAuditJson(allocator: std.mem.Allocator, audit: ReviewCompi
         try output.writeJsonString(writer, item.path);
         try writer.writeAll(", \"reason\": ");
         try output.writeJsonString(writer, item.reason);
+        try writer.writeAll(", \"governance\": ");
+        try output.writeJsonString(writer, item.governance);
+        try writer.print(", \"delivery_closed\": {any}", .{item.delivery_closed});
         try writer.writeAll(" }");
     }
     try writer.writeAll("], \"included_sessions\": [");
@@ -8872,7 +9224,7 @@ fn writeReviewCompilerClosureCompressionJson(writer: anytype, closure: ReviewCom
 }
 
 fn writeReviewCompilerIncludedSessionJson(writer: anytype, row: ReviewCompilerAudit.IncludedSession) !void {
-    try writer.writeAll("{ \"session_id\": ");
+    try writer.writeAll("{ \"run_version\": \"RCRUN-v1\", \"identity\": { \"session_id\": ");
     if (row.session_id) |id| try output.writeJsonString(writer, id) else try writer.writeAll("null");
     try writer.writeAll(", \"path\": ");
     try output.writeJsonString(writer, row.path);
@@ -8880,7 +9232,45 @@ fn writeReviewCompilerIncludedSessionJson(writer: anytype, row: ReviewCompilerAu
     try output.writeJsonString(writer, row.protocol);
     try writer.writeAll(", \"classification\": ");
     try output.writeJsonString(writer, row.classification);
-    try writer.print(", \"c3_required\": {any}, \"c3_entered\": {any}, \"c3_closed\": {any}, \"evidence\": {{ ", .{ row.c3_required, row.c3_entered, row.c3_closed });
+    try writer.writeAll(" }, \"candidate\": { \"candidate_c3\": true, \"candidate_reasons\": [\"review_compiler_candidate\"] }, \"source_governance\": { \"state\": ");
+    try output.writeJsonString(writer, row.governance);
+    try writer.writeAll(", \"governance_provenance\": ");
+    try output.writeJsonString(writer, row.governance);
+    try writer.writeAll(", \"closure_provenance\": ");
+    try output.writeJsonString(writer, if (row.c3_closed) "controller_close" else if (row.delivery_closed) "generic_delivery_closure" else "absent");
+    try writer.print(", \"replay_allowed\": {any}, \"reason\": ", .{std.mem.eql(u8, row.governance, "authoritative") or std.mem.eql(u8, row.governance, "declared_uncontrolled")});
+    try output.writeJsonString(writer, row.governance);
+    try writer.writeAll(" }, \"denominator\": { \"included_authoritative\": ");
+    try writer.print("{any}, \"included_declared_uncontrolled\": {any}, \"excluded\": false, \"exclusion_reason\": null }}", .{ std.mem.eql(u8, row.governance, "authoritative"), std.mem.eql(u8, row.governance, "declared_uncontrolled") });
+    try writer.writeAll(", \"lifecycle\": { \"state\": ");
+    try output.writeJsonString(writer, row.lifecycle);
+    try writer.print(", \"c3_required\": {any}, \"c3_entered\": {any}, \"c3_closed\": {any}, \"events\": [] }}", .{ row.c3_required, row.c3_entered, row.c3_closed });
+    try writer.print(", \"delivery_closure\": {{ \"closed\": {any}, \"evidence_refs\": [] }}", .{row.delivery_closed});
+    try writer.writeAll(", \"c3_closure\": { \"closed\": ");
+    try writer.print("{any}, \"horizon\": ", .{row.c3_closed});
+    try output.writeJsonString(writer, if (row.c3_closed) "terminal" else "none");
+    try writer.writeAll(", \"campaign_id\": null, \"mrpc_id\": null, \"evidence_refs\": [] }");
+    try writer.writeAll(", \"compression\": { \"required\": ");
+    try writer.print("{any}, \"summary_state\": ", .{row.c3_closed and row.c3_required});
+    try output.writeJsonString(writer, row.compression);
+    try writer.writeAll(", \"reason\": ");
+    try output.writeJsonString(writer, if (std.mem.eql(u8, row.compression, "NONE")) "workflow_not_governing_or_not_closed" else "classified_from_c3_closure");
+    try writer.writeAll(" }, \"artifact_tuple\": { \"campaign_base_sha\": null, \"review_ready_baseline_sha\": null, \"delivery_head\": null, \"pr_number\": null }, \"limitations\": []");
+    try writer.writeAll(", \"session_id\": ");
+    if (row.session_id) |id2| try output.writeJsonString(writer, id2) else try writer.writeAll("null");
+    try writer.writeAll(", \"path\": ");
+    try output.writeJsonString(writer, row.path);
+    try writer.writeAll(", \"protocol\": ");
+    try output.writeJsonString(writer, row.protocol);
+    try writer.writeAll(", \"classification\": ");
+    try output.writeJsonString(writer, row.classification);
+    try writer.print(", \"c3_required\": {any}, \"c3_entered\": {any}, \"c3_closed\": {any}, \"governance\": ", .{ row.c3_required, row.c3_entered, row.c3_closed });
+    try output.writeJsonString(writer, row.governance);
+    try writer.writeAll(", \"lifecycle_state\": ");
+    try output.writeJsonString(writer, row.lifecycle);
+    try writer.print(", \"delivery_closed\": {any}, \"compression_state\": ", .{row.delivery_closed});
+    try output.writeJsonString(writer, row.compression);
+    try writer.writeAll(", \"evidence\": { ");
     try writer.writeAll("\"true_c3\": ");
     try writeReviewCompilerSignalEvidenceJson(writer, row.evidence.true_c3);
     try writer.writeAll(", \"required\": ");
@@ -18311,6 +18701,11 @@ fn collectDatasetRowsTracked(
         try collectHistoricalDecisionRows(allocator, sessions_root, day_filter, query_params, &rows);
     } else if (std.mem.eql(u8, dataset_name, "decision_capsules")) {
         try collectDecisionCapsuleRows(allocator, sessions_root, day_filter, query_params, &rows);
+    } else if (std.mem.eql(u8, dataset_name, "review_compiler_runs") or
+        std.mem.eql(u8, dataset_name, "review_compiler_events") or
+        std.mem.eql(u8, dataset_name, "review_compiler_evidence"))
+    {
+        try collectReviewCompilerDatasetRows(allocator, dataset_name, sessions_root, day_filter, query_params, &rows);
     } else if (std.mem.eql(u8, dataset_name, "token_events")) {
         try collectTokenEventsRows(allocator, sessions_root, day_filter, &rows);
     } else if (std.mem.eql(u8, dataset_name, "token_deltas")) {
@@ -18397,6 +18792,132 @@ fn collectMessagesRowsFromPathTracked(
         try qrow.putStaticKey("text_len", .{ .int = @intCast(row.text_len) });
         try out_rows.append(allocator, qrow);
     }
+}
+
+fn collectReviewCompilerDatasetRows(
+    allocator: std.mem.Allocator,
+    dataset_name: []const u8,
+    sessions_root: []const u8,
+    day_filter: ?SessionDayPathFilter,
+    query_params: []const spec.ParamSpec,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    const repo_raw = paramString(query_params, "repo") orelse "/";
+    const repo_root = try resolveExplicitRepoRoot(allocator, repo_raw);
+    defer allocator.free(repo_root);
+    const opts = Options{
+        .since = paramString(query_params, "since"),
+        .until = paramString(query_params, "until"),
+        .protocol_text = paramString(query_params, "protocol"),
+    };
+    const protocol = if (opts.protocol_text) |text| try parseReviewCompilerProtocol(text) else ReviewCompilerProtocol.auto;
+
+    var paths = try collectJsonlPaths(allocator, sessions_root, day_filter);
+    defer freePathList(allocator, &paths);
+    for (paths.items) |path| {
+        var parsed = canonical_trace.parseSessionTrace(allocator, path, traceParseOptions(opts)) catch continue;
+        defer parsed.deinit(allocator);
+        if (!resolveSessionOverlapsWindow(parsed.session.start_time, parsed.session.end_time, opts)) continue;
+        if (!try resolveTraceMatchesRepo(allocator, repo_root, parsed)) continue;
+        const content = (try readFileAllocOrSkip(allocator, path)) orelse continue;
+        defer allocator.free(content);
+        const messages = datasets.messages.parseJsonl(allocator, path, content, .{
+            .include_user = true,
+            .include_assistant = true,
+            .strip_echo_assistant = true,
+            .skip_meta_user_messages = true,
+            .dedupe_by_role_and_text = false,
+            .strip_skill_blocks = true,
+        }) catch continue;
+        defer datasets.messages.freeRows(allocator, messages);
+        const signals = summarizeReviewCompilerSession(messages, parsed, opts);
+        if (!signals.candidate) continue;
+        const protocol_match = switch (protocol) {
+            .auto => signals.true_resolve or signals.governance_state == .incidental,
+            .legacy_cleanroom => signals.true_legacy,
+            .c3, .c3_mrpc => signals.true_c3 or signals.governance_state == .incidental,
+            .mbk => signals.true_mbk,
+        };
+        if (!protocol_match) continue;
+        if (std.mem.eql(u8, dataset_name, "review_compiler_runs")) {
+            try appendReviewCompilerDatasetRunRow(allocator, out_rows, parsed.session.session_id, path, protocol, signals);
+        } else if (std.mem.eql(u8, dataset_name, "review_compiler_events")) {
+            try appendReviewCompilerDatasetEventRows(allocator, out_rows, parsed.session.session_id, path, signals);
+        } else {
+            try appendReviewCompilerDatasetEvidenceRows(allocator, out_rows, parsed.session.session_id, path, signals);
+        }
+    }
+}
+
+fn appendReviewCompilerDatasetRunRow(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayList(query.Row),
+    session_id: ?[]const u8,
+    path: []const u8,
+    protocol: ReviewCompilerProtocol,
+    signals: ReviewCompilerSessionSignals,
+) !void {
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    try putOptionalString(&row, "session_id", session_id);
+    try row.putStaticKey("path", .{ .string = path });
+    try row.putStaticKey("protocol", .{ .string = protocol.label() });
+    try row.putStaticKey("classification", .{ .string = if (reviewCompilerC3Material(signals)) "material_c3" else if (signals.clean_review_seen) "clean_review" else if (signals.isolated_waiver_seen) "isolated_waiver" else signals.governance_state.label() });
+    try row.putStaticKey("source_governance.state", .{ .string = signals.governance_state.label() });
+    try row.putStaticKey("lifecycle.state", .{ .string = reviewCompilerLifecycleState(signals).label() });
+    try row.putStaticKey("c3_required", .{ .bool = reviewCompilerC3Material(signals) });
+    try row.putStaticKey("c3_entered", .{ .bool = signals.c3_begin_seen });
+    try row.putStaticKey("c3_closed", .{ .bool = signals.c3_closed_seen });
+    try row.putStaticKey("delivery_closure.closed", .{ .bool = signals.delivery_closed_seen });
+    try row.putStaticKey("compression.summary_state", .{ .string = if (signals.c3_closed_seen and reviewCompilerC3Material(signals)) (if (reviewCompilerC3CompressionOk(signals)) "CLOSED" else "CLOSED_UNCOMPRESSED") else "NONE" });
+    try rows.append(allocator, row);
+}
+
+fn appendReviewCompilerDatasetEventRows(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayList(query.Row),
+    session_id: ?[]const u8,
+    path: []const u8,
+    signals: ReviewCompilerSessionSignals,
+) !void {
+    if (signals.candidate) try appendReviewCompilerDatasetEventRow(allocator, rows, session_id, path, 0, "candidate", "derived", false);
+    if (signals.c3_begin_seen) try appendReviewCompilerDatasetEventRow(allocator, rows, session_id, path, 1, "begin", "controller", true);
+    if (signals.c3_closed_seen) try appendReviewCompilerDatasetEventRow(allocator, rows, session_id, path, 2, "terminal_close", "controller", true);
+    if (signals.delivery_closed_seen) try appendReviewCompilerDatasetEventRow(allocator, rows, session_id, path, 3, "generic_delivery_close", "message", false);
+}
+
+fn appendReviewCompilerDatasetEventRow(allocator: std.mem.Allocator, rows: *std.ArrayList(query.Row), session_id: ?[]const u8, path: []const u8, sequence: i64, kind: []const u8, source: []const u8, authoritative: bool) !void {
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    try putOptionalString(&row, "session_id", session_id);
+    try row.putStaticKey("path", .{ .string = path });
+    try row.putStaticKey("sequence", .{ .int = sequence });
+    try row.putStaticKey("kind", .{ .string = kind });
+    try row.putStaticKey("source", .{ .string = source });
+    try row.putStaticKey("authoritative", .{ .bool = authoritative });
+    try row.putStaticKey("campaign_id", .null);
+    try row.putStaticKey("mrpc_id", .null);
+    try row.putStaticKey("head", .null);
+    try rows.append(allocator, row);
+}
+
+fn appendReviewCompilerDatasetEvidenceRows(allocator: std.mem.Allocator, rows: *std.ArrayList(query.Row), session_id: ?[]const u8, path: []const u8, signals: ReviewCompilerSessionSignals) !void {
+    try appendReviewCompilerDatasetEvidenceRow(allocator, rows, session_id, path, "E-GOV-1", signals.governance_state != .absent, if (signals.governance_state == .incidental) "tool_call" else "message", signals.governance_state.label(), signals.governance_provenance, signals.true_c3_evidence);
+    if (signals.delivery_closed_seen) try appendReviewCompilerDatasetEvidenceRow(allocator, rows, session_id, path, "E-DELIVERY-1", true, "message", "generic_delivery_closure", signals.closure_provenance, null);
+}
+
+fn appendReviewCompilerDatasetEvidenceRow(allocator: std.mem.Allocator, rows: *std.ArrayList(query.Row), session_id: ?[]const u8, path: []const u8, evidence_id: []const u8, present: bool, source: []const u8, role: []const u8, reason: []const u8, evidence: ?ReviewCompilerBorrowedEvidenceRef) !void {
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    try putOptionalString(&row, "session_id", session_id);
+    try row.putStaticKey("path", .{ .string = path });
+    try row.putStaticKey("evidence_id", .{ .string = evidence_id });
+    try row.putStaticKey("present", .{ .bool = present });
+    try row.putStaticKey("source", .{ .string = source });
+    try row.putStaticKey("provenance_role", .{ .string = role });
+    try row.putStaticKey("reason", .{ .string = reason });
+    try row.putStaticKey("excerpt", .{ .string = if (evidence) |ref| ref.snippet else reason });
+    try rows.append(allocator, row);
 }
 
 fn collectSkillMentionsRows(
@@ -22970,36 +23491,36 @@ test "review-compiler-audit c3 protocol reports controller, tournament, holdout,
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T08:00:01Z\",\"payload\":{\"type\":\"user_message\",\"turn_id\":\"r1\",\"message\":\"Raw $resolve mention only.\"}}\n";
     const incomplete_begin =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T09:00:00Z\",\"payload\":{\"id\":\"c3-begin\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T09:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"b1\",\"message\":\"resolve-c3 begin\\ncounterexample-added raw_finding\\nbranch_liabilities:\\n  - F1\\nindependent_families:\\n  - fam1\\nbasis-set\\ncandidate-registered route_class: owner\\ncandidate-selected\\nablation-recorded\\nedit_atoms_tested\\nremoved_edit_atom\\nsurvived_edit_atom\\norphan_edit_atom\\none_minimal_pass\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n";
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T09:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"b1\",\"message\":\"event=begin controller=resolve-c3\\ncounterexample-added raw_finding\\nbranch_liabilities:\\n  - F1\\nindependent_families:\\n  - fam1\\nbasis-set\\ncandidate-registered route_class: owner\\ncandidate-selected\\nablation-recorded\\nedit_atoms_tested\\nremoved_edit_atom\\nsurvived_edit_atom\\norphan_edit_atom\\none_minimal_pass\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n";
     const stages_and_controller =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T10:00:00Z\",\"payload\":{\"id\":\"c3-stages\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"s1\",\"message\":\"resolve-c3 begin\\n.ledger/c3/state.json\\nMRPC-v1 minimal_review_patch_certificate\\napply-certified\\nfinal-certified\\nbasis-set\\ncandidate-registered route_class: typed\\ncandidate-selected\\nablation-recorded edit_atoms_tested removed_edit_atom\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"s1\",\"message\":\"event=begin controller=resolve-c3\\n.ledger/c3/state.json\\nMRPC-v1 minimal_review_patch_certificate\\napply-certified\\nfinal-certified\\nbasis-set\\ncandidate-registered route_class: typed\\ncandidate-selected\\nablation-recorded edit_atoms_tested removed_edit_atom\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:02Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"s1\",\"call_id\":\"ctl-commit\",\"command\":\"resolve-c3 commit\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"committed\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:03Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"s1\",\"call_id\":\"ctl-push\",\"command\":\"resolve-c3 push\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"pushed\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:04Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"s1\",\"message\":\"closed\"}}\n";
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:04Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"s1\",\"call_id\":\"ctl-close\",\"command\":\"resolve-c3 close --campaign C3-test\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"event=terminal-closed campaign=C3-test head=abc\"}}\n";
     const direct_delivery_patch =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T11:00:00Z\",\"payload\":{\"id\":\"c3-direct-patch\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T11:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"p1\",\"message\":\"resolve-c3 begin\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T11:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"p1\",\"message\":\"event=begin controller=resolve-c3\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-05-12T11:00:02Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"apply_patch\",\"call_id\":\"bad-patch\",\"arguments\":\"*** Update File: apps/seq/src/lib.zig\\n+bad\\n\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T11:00:03Z\",\"payload\":{\"type\":\"patch_apply_end\",\"turn_id\":\"p1\",\"call_id\":\"bad-patch\",\"success\":true,\"cwd\":\"/repo\",\"changes\":{\"files\":1}}}\n";
     const lab_patch =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T12:00:00Z\",\"payload\":{\"id\":\"c3-lab-patch\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T12:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"l1\",\"message\":\"resolve-c3 begin\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\\ncandidate-worktree lab patch used\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T12:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"l1\",\"message\":\"event=begin controller=resolve-c3\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\\ncandidate-worktree lab patch used\"}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-05-12T12:00:02Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"apply_patch\",\"call_id\":\"lab-patch\",\"arguments\":\"*** Update File: apps/seq/src/lib.zig\\n+candidate lab patch\\n\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T12:00:03Z\",\"payload\":{\"type\":\"patch_apply_end\",\"turn_id\":\"l1\",\"call_id\":\"lab-patch\",\"success\":true,\"cwd\":\"/repo/.ledger/c3/candidates/candidate-worktree\",\"changes\":{\"files\":1}}}\n";
     const raw_commit =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T13:00:00Z\",\"payload\":{\"id\":\"c3-raw-commit\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T13:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"g1\",\"message\":\"resolve-c3 begin\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T13:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"g1\",\"message\":\"event=begin controller=resolve-c3\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T13:00:02Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"g1\",\"call_id\":\"raw-commit\",\"command\":\"git commit -m bad\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"ok\"}}\n";
     const holdout_recompile =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T14:00:00Z\",\"payload\":{\"id\":\"c3-recompile\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T14:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"h1\",\"message\":\"resolve-c3 begin\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T14:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"h1\",\"message\":\"event=begin controller=resolve-c3\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T14:00:02Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"h1\",\"message\":\"new_counterexample from delivery holdout\\nreset after invalidation\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T14:00:03Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"h1\",\"message\":\"basis-set\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T14:00:04Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"h1\",\"message\":\"adjacent_followup captured\"}}\n";
     const waiver_and_violation =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T15:00:00Z\",\"payload\":{\"id\":\"c3-waiver\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T15:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"w1\",\"message\":\"resolve-c3 begin\\ntournament_waiver\\nsingle_candidate_material_violation\"}}\n";
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T15:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"w1\",\"message\":\"event=begin controller=resolve-c3\\ntournament_waiver\\nsingle_candidate_material_violation\"}}\n";
 
     try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/12/rollout-c3-raw.jsonl", .data = raw_resolve_only });
     try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/12/rollout-c3-begin.jsonl", .data = incomplete_begin });
@@ -23075,16 +23596,16 @@ test "review-compiler-audit c3 protocol reports closure compression state" {
     try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/13");
     const clean_closed =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-13T08:00:00Z\",\"payload\":{\"id\":\"c3-clean-closed\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T08:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"c1\",\"message\":\"resolve-c3 begin\\nclean_review: true\\nclosed\"}}\n";
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T08:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"c1\",\"message\":\"event=begin controller=resolve-c3\\nclean_review: true\\nevent=terminal-closed campaign=C3-test head=abc\"}}\n";
     const compressed_closed =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-13T09:00:00Z\",\"payload\":{\"id\":\"c3-compressed-closed\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T09:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"f1\",\"message\":\"resolve-c3 begin\\nMRPC-v1 minimal_review_patch_certificate\\napply-certified\\nfinal-certified\\nbasis-set\\ncandidate-registered route_class: typed\\ncandidate-selected\\nablation-recorded edit_atoms_tested removed_edit_atom\\nholdout-recorded delivery_holdout\\nproof-recorded\\nclosed\"}}\n";
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T09:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"f1\",\"message\":\"event=begin controller=resolve-c3\\nMRPC-v1 minimal_review_patch_certificate\\napply-certified\\nfinal-certified\\nbasis-set\\ncandidate-registered route_class: typed\\ncandidate-selected\\nablation-recorded edit_atoms_tested removed_edit_atom\\nholdout-recorded delivery_holdout\\nproof-recorded\\nevent=terminal-closed campaign=C3-test head=abc\"}}\n";
     const uncompressed_closed =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-13T10:00:00Z\",\"payload\":{\"id\":\"c3-uncompressed-closed\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T10:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"u1\",\"message\":\"resolve-c3 begin\\nMRPC-v1 minimal_review_patch_certificate\\nclosed\"}}\n";
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T10:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"u1\",\"message\":\"event=begin controller=resolve-c3\\nMRPC-v1 minimal_review_patch_certificate\\nevent=terminal-closed campaign=C3-test head=abc\"}}\n";
     const open_material =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-13T11:00:00Z\",\"payload\":{\"id\":\"c3-open-material\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T11:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"o1\",\"message\":\"resolve-c3 begin\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n";
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T11:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"o1\",\"message\":\"event=begin controller=resolve-c3\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n";
 
     try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/13/rollout-c3-clean-closed.jsonl", .data = clean_closed });
     try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/13/rollout-c3-compressed-closed.jsonl", .data = compressed_closed });
@@ -23111,7 +23632,7 @@ test "review-compiler-audit c3 protocol reports closure compression state" {
     try std.testing.expect(std.mem.indexOf(u8, got, "\"closed_total\": 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"closed_compressed\": 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"closed_uncompressed\": 1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, got, "\"blocked\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"blocked\": 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"compression_not_required\": 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"missing_compression_evidence\": { \"basis\": 1, \"tournament\": 1, \"ablation\": 1, \"proof\": 1, \"holdout\": 1, \"permit\": 1, \"stale_mrpc\": 0, \"direct_review_to_delivery_mutation\": 0, \"commit_or_push_bypass\": 0 }") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"included_sessions\"") != null);
@@ -23120,7 +23641,7 @@ test "review-compiler-audit c3 protocol reports closure compression state" {
     try std.testing.expect(std.mem.indexOf(u8, got, "\"c3_required\": true, \"c3_entered\": true, \"c3_closed\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"reason\": \"closed_material_c3_missing_compression_evidence\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"session_id\": \"c3-open-material\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, got, "\"reason\": \"material_c3_not_closed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"reason\": \"c3_not_closed\"") != null);
 
     const markdown_output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "review-compiler-c3-closure.md" });
     defer std.testing.allocator.free(markdown_output_path);
@@ -23149,7 +23670,7 @@ test "review-compiler-audit c3 protocol attributes orphan closure counts" {
     try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/13");
     const orphan_closed =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-13T12:00:00Z\",\"payload\":{\"id\":\"c3-orphan-closed\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T12:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"x1\",\"message\":\"MRPC-v1 minimal_review_patch_certificate\\nclosed\"}}\n";
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T12:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"x1\",\"message\":\"MRPC-v1 minimal_review_patch_certificate\\nevent=terminal-closed campaign=C3-test head=abc\"}}\n";
     try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/13/rollout-c3-orphan-closed.jsonl", .data = orphan_closed });
 
     const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
@@ -23173,8 +23694,53 @@ test "review-compiler-audit c3 protocol attributes orphan closure counts" {
     try std.testing.expect(std.mem.indexOf(u8, got, "\"session_id\": \"c3-orphan-closed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"c3_required\": true, \"c3_entered\": false, \"c3_closed\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"entered\": { \"present\": false, \"source\": \"absent\", \"timestamp\": null, \"snippet\": null, \"reason\": \"no_c3_begin_signal\" }") != null);
-    try std.testing.expect(std.mem.indexOf(u8, got, "\"closed\": { \"present\": true, \"source\": \"message\", \"timestamp\": \"2026-05-13T12:00:01+00:00\", \"snippet\": \"MRPC-v1 minimal_review_patch_certificate\", \"reason\": \"c3_closed_signal_present\" }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"closed\": { \"present\": true, \"source\": \"controller_event\", \"timestamp\": \"2026-05-13T12:00:01+00:00\", \"snippet\": \"MRPC-v1 minimal_review_patch_certificate\", \"reason\": \"c3_closed_signal_present\" }") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"reason\": \"closed_material_c3_missing_compression_evidence\"") != null);
+}
+
+test "review-compiler-audit c3 protocol treats resolve-c3 artifact repair as incidental" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/15");
+    const incidental =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-15T08:00:00Z\",\"payload\":{\"id\":\"c3-artifact-repair\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:01Z\",\"payload\":{\"type\":\"user_message\",\"turn_id\":\"r1\",\"message\":\"Canonical $st intake should replace the retired resolve-c3 staged plan.\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:02Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"r1\",\"message\":\"Retiring .step/resolve-c3-st-plan.jsonl in favor of canonical .step/st-plan.jsonl.\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-15T08:00:03Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"apply_patch\",\"call_id\":\"delete-old-plan\",\"arguments\":\"*** Delete File: .step/resolve-c3-st-plan.jsonl\\n\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:04Z\",\"payload\":{\"type\":\"patch_apply_end\",\"turn_id\":\"r1\",\"call_id\":\"delete-old-plan\",\"success\":true,\"cwd\":\"/repo\",\"changes\":{\"files\":1}}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:05Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"r1\",\"call_id\":\"jq-read\",\"command\":\"jq -c . .step/resolve-c3-st-plan.jsonl\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"{}\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:06Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"r1\",\"call_id\":\"git-diff\",\"command\":\"git diff -- .step/resolve-c3-st-plan.jsonl .step/st-plan.jsonl\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"diff\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:07Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"r1\",\"call_id\":\"git-add\",\"command\":\"git add .step/resolve-c3-st-plan.jsonl .step/st-plan.jsonl\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:08Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"r1\",\"message\":\"$actuating $land complete; PR merged; goal complete; worktree clean.\"}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/15/rollout-c3-artifact-repair.jsonl", .data = incidental });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "review-compiler-c3-incidental.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const got = try runCommandWithOutput(std.testing.allocator, .review_compiler_audit, &.{
+        "--root",     root_abs,
+        "--protocol", "c3",
+        "--since",    "2026-05-15T00:00:00Z",
+        "--until",    "2026-05-16T00:00:00Z",
+        "--repo",     "/repo",
+        "--format",   "json",
+    }, output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"candidate_sessions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"true_resolve_sessions\": 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"incidental_sessions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"c3_required_sessions\": 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"c3_entered_sessions\": 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"c3_closed_sessions\": 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"reason\": \"artifact_under_repair\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"governance\": \"incidental\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"delivery_closed\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"included_sessions\": []") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"summary_state\": \"NONE\"") != null);
 }
 
 test "review-compiler-audit mbk protocol audits kernel, surface, proof, closure, and bypass counters" {
