@@ -48,6 +48,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const retrace_core = b.createModule(.{
+        .root_source_file = b.path("libs/retrace_core/src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const seq_bundle = b.createModule(.{
         .root_source_file = b.path("apps/seq/src/bundle.zig"),
         .target = target,
@@ -96,6 +101,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "core_path", .module = core_path },
             .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "retrace_core", .module = retrace_core },
             .{ .name = "app_meta", .module = seq_meta },
         },
     });
@@ -115,6 +121,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "core_path", .module = core_path },
             .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "retrace_core", .module = retrace_core },
             .{ .name = "app_meta", .module = seq_meta },
         },
     });
@@ -187,6 +194,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "core_json", .module = core_json },
             .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "retrace_core", .module = retrace_core },
             .{ .name = "app_meta", .module = cas_meta },
         },
     });

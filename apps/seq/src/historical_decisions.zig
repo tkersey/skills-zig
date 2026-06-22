@@ -1,5 +1,6 @@
 const std = @import("std");
-const canonical_trace = @import("canonical_trace.zig");
+const retrace_core = @import("retrace_core");
+const canonical_trace = retrace_core.canonical_trace;
 const query_engine = @import("query/engine.zig");
 const skill_decision_receipt = @import("skill_decision_receipt.zig");
 const skill_decision_signals = @import("skill_decision_signals.zig");

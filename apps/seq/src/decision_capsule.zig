@@ -1,8 +1,9 @@
 const std = @import("std");
-const canonical_trace = @import("canonical_trace.zig");
-const decision_anchor = @import("decision_anchor.zig");
+const retrace_core = @import("retrace_core");
+const canonical_trace = retrace_core.canonical_trace;
+const decision_anchor = retrace_core.decision_anchor;
 const historical_decisions = @import("historical_decisions.zig");
-const dcp_schema = @import("dcp_schema.zig");
+const dcp_schema = retrace_core.dcp_schema;
 const output = @import("output/mod.zig");
 
 pub const Mode = enum {

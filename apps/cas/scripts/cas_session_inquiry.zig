@@ -2,9 +2,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 const core_cli = @import("core_cli");
 const core_json = @import("core_json");
+const retrace_core = @import("retrace_core");
 const app_meta = @import("app_meta");
 const cas_client = @import("cas_proxy_client.zig");
 const cas_websocket = @import("cas_websocket_transport.zig");
+const canonical_trace = retrace_core.canonical_trace;
+const decision_anchor = retrace_core.decision_anchor;
 
 const Version = core_cli.normalizeVersion(app_meta.version);
 const MaxInputBytes = 8 * 1024 * 1024;
@@ -202,6 +205,7 @@ const Lane = struct {
 const SchemaCapabilities = struct {
     thread_fork: bool,
     thread_rollback: bool,
+    thread_start: bool,
     thread_read: bool,
     thread_turns_list: bool,
     turn_start: bool,
@@ -220,12 +224,17 @@ const SchemaCapabilities = struct {
             (self.thread_read or self.thread_turns_list) and
             self.ephemeral_fork_field and self.rollback_num_turns;
     }
+
+    fn rolloutTranscriptSupported(self: SchemaCapabilities) bool {
+        return self.thread_start and self.turn_start and (self.thread_read or self.thread_turns_list);
+    }
 };
 
 fn zeroCapabilities() SchemaCapabilities {
     return .{
         .thread_fork = false,
         .thread_rollback = false,
+        .thread_start = false,
         .thread_read = false,
         .thread_turns_list = false,
         .turn_start = false,
@@ -249,6 +258,8 @@ const PreflightResult = struct {
     cache_dir: []const u8,
     selected_transport: []const u8,
     capabilities: SchemaCapabilities,
+    thread_fork_replay: bool,
+    rollout_transcript_replay: bool,
     missing: []const []const u8,
     inquiry_allowed: bool,
 };
@@ -308,6 +319,19 @@ const ForkPolicyProof = struct {
         return self.read_only and self.approval_never;
     }
 };
+
+const SourceLineageMode = enum {
+    thread_fork,
+    rollout_transcript,
+
+    fn asString(self: SourceLineageMode) []const u8 {
+        return @tagName(self);
+    }
+};
+
+fn lineageMode(dcp: Dcp) SourceLineageMode {
+    return if (dcp.source_thread_id == null) .rollout_transcript else .thread_fork;
+}
 
 const LaneHandle = struct {
     inquiry_id: []const u8,
@@ -512,20 +536,21 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options, detached: bool) !void 
         try printFailureJson(allocator, FailureCode.plan_invalid, "RIP source_capsule does not match DCP packet_id");
         std.process.exit(2);
     }
-    const gate = validateInquiryInputs(dcp, rip, options);
+    const gate = validateInquiryInputs(allocator, dcp, rip, options);
     if (!gate.valid) {
         try persistInvalidRunArtifacts(allocator, options, dcp, rip, receipt_dir, gate, detached);
         try printFailureJson(allocator, gate.failure_code orelse FailureCode.receipt_invalid, gate.hint);
         std.process.exit(2);
     }
 
-    const preflight = runPreflight(allocator, options) catch |err| {
+    const preflight_allocator = std.heap.page_allocator;
+    const preflight = runPreflight(preflight_allocator, options) catch |err| {
         const failed = GateResult{ .valid = false, .failure_code = .codex_incompatible, .hint = @errorName(err) };
         try persistInvalidRunArtifacts(allocator, options, dcp, rip, receipt_dir, failed, detached);
         try printFailureJson(allocator, FailureCode.codex_incompatible, @errorName(err));
         std.process.exit(1);
     };
-    defer deinitPreflightResult(allocator, preflight);
+    defer deinitPreflightResult(preflight_allocator, preflight);
     if (!preflight.inquiry_allowed) {
         const failed = GateResult{ .valid = false, .failure_code = .codex_incompatible, .hint = "installed Codex app-server lacks required fork/rollback/read/turn capabilities" };
         try persistInvalidRunArtifacts(allocator, options, dcp, rip, receipt_dir, failed, detached);
@@ -533,8 +558,9 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options, detached: bool) !void 
         std.process.exit(2);
     }
 
+    const run_allocator = std.heap.page_allocator;
     if (detached) {
-        const result = startDetachedInquiry(allocator, options, dcp, rip, receipt_dir, preflight) catch |err| blk: {
+        const result = startDetachedInquiry(run_allocator, options, dcp, rip, receipt_dir, preflight) catch |err| blk: {
             const failed = GateResult{
                 .valid = false,
                 .failure_code = failureCodeForError(err),
@@ -545,20 +571,20 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options, detached: bool) !void 
                 .inquiry_id = rip.inquiry_id,
                 .state = @tagName(InquiryState.failed),
                 .receipt_dir = receipt_dir,
-                .state_ref = try stateRecordPath(allocator, options.home, rip.inquiry_id),
-                .events_ref = try std.fmt.allocPrint(allocator, "{s}/events.jsonl", .{receipt_dir}),
-                .summary_ref = try std.fmt.allocPrint(allocator, "{s}/summary.json", .{receipt_dir}),
+                .state_ref = try stateRecordPath(run_allocator, options.home, rip.inquiry_id),
+                .events_ref = try std.fmt.allocPrint(run_allocator, "{s}/events.jsonl", .{receipt_dir}),
+                .summary_ref = try std.fmt.allocPrint(run_allocator, "{s}/summary.json", .{receipt_dir}),
                 .failure_code = (failed.failure_code orelse FailureCode.receipt_invalid).asString(),
                 .failure_hint = failed.hint,
             };
         };
-        defer deinitRunOutput(allocator, result);
+        defer deinitRunOutput(run_allocator, result);
         try printJsonValue(allocator, .{ .session_inquiry = result });
         if (!std.mem.eql(u8, result.failure_code, "")) std.process.exit(2);
         return;
     }
 
-    const result = executeLiveInquiry(allocator, options, dcp, rip, receipt_dir, preflight, false) catch |err| blk: {
+    const result = executeLiveInquiry(run_allocator, options, dcp, rip, receipt_dir, preflight, false) catch |err| blk: {
         const failed = GateResult{
             .valid = false,
             .failure_code = failureCodeForError(err),
@@ -569,14 +595,14 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options, detached: bool) !void 
             .inquiry_id = rip.inquiry_id,
             .state = @tagName(InquiryState.failed),
             .receipt_dir = receipt_dir,
-            .state_ref = try stateRecordPath(allocator, options.home, rip.inquiry_id),
-            .events_ref = try std.fmt.allocPrint(allocator, "{s}/events.jsonl", .{receipt_dir}),
-            .summary_ref = try std.fmt.allocPrint(allocator, "{s}/summary.json", .{receipt_dir}),
+            .state_ref = try stateRecordPath(run_allocator, options.home, rip.inquiry_id),
+            .events_ref = try std.fmt.allocPrint(run_allocator, "{s}/events.jsonl", .{receipt_dir}),
+            .summary_ref = try std.fmt.allocPrint(run_allocator, "{s}/summary.json", .{receipt_dir}),
             .failure_code = (failed.failure_code orelse FailureCode.receipt_invalid).asString(),
             .failure_hint = failed.hint,
         };
     };
-    defer deinitRunOutput(allocator, result);
+    defer deinitRunOutput(run_allocator, result);
     try printJsonValue(allocator, .{ .session_inquiry = result });
     if (!std.mem.eql(u8, result.failure_code, "")) std.process.exit(2);
 }
@@ -828,6 +854,7 @@ fn runPreflight(allocator: std.mem.Allocator, options: Options) !PreflightResult
     defer missing.deinit(allocator);
     if (!caps.thread_fork) try missing.append(allocator, "thread/fork");
     if (!caps.thread_rollback) try missing.append(allocator, "thread/rollback");
+    if (!caps.thread_start) try missing.append(allocator, "thread/start");
     if (!caps.thread_read and !caps.thread_turns_list) try missing.append(allocator, "thread/read-or-thread/turns/list");
     if (!caps.turn_start) try missing.append(allocator, "turn/start");
     if (!caps.turn_interrupt) try missing.append(allocator, "turn/interrupt");
@@ -837,7 +864,9 @@ fn runPreflight(allocator: std.mem.Allocator, options: Options) !PreflightResult
     if (!caps.rollback_num_turns) try missing.append(allocator, "thread/rollback.numTurns");
 
     const missing_owned = try allocator.dupe([]const u8, missing.items);
-    const allowed = caps.exactAnchorSupported() and caps.turn_start and caps.turn_interrupt and (caps.thread_archive or caps.thread_delete) and (caps.fork_permissions_field or caps.fork_sandbox_field);
+    const thread_fork_replay = caps.exactAnchorSupported() and caps.turn_start and caps.turn_interrupt and (caps.thread_archive or caps.thread_delete) and (caps.fork_permissions_field or caps.fork_sandbox_field);
+    const rollout_transcript_replay = caps.rolloutTranscriptSupported();
+    const allowed = thread_fork_replay or rollout_transcript_replay;
     return .{
         .compatibility_verdict = if (allowed) "compatible" else "incompatible",
         .codex_path = codex_path,
@@ -846,6 +875,8 @@ fn runPreflight(allocator: std.mem.Allocator, options: Options) !PreflightResult
         .cache_dir = cache_dir,
         .selected_transport = if (std.mem.eql(u8, options.transport, "auto")) "stdio" else options.transport,
         .capabilities = caps,
+        .thread_fork_replay = thread_fork_replay,
+        .rollout_transcript_replay = rollout_transcript_replay,
         .missing = missing_owned,
         .inquiry_allowed = allowed,
     };
@@ -989,6 +1020,7 @@ fn deriveCapabilities(schema_text: []const u8) SchemaCapabilities {
     return .{
         .thread_fork = contains(schema_text, "\"thread/fork\""),
         .thread_rollback = contains(schema_text, "\"thread/rollback\""),
+        .thread_start = contains(schema_text, "\"thread/start\""),
         .thread_read = contains(schema_text, "\"thread/read\""),
         .thread_turns_list = contains(schema_text, "\"thread/turns/list\""),
         .turn_start = contains(schema_text, "\"turn/start\""),
@@ -1176,10 +1208,9 @@ fn validateLane(lane: Lane) !void {
     if (std.mem.eql(u8, lane.inquiry_mode, "retrospective") and !std.mem.eql(u8, lane.temporal_horizon, "outcome_aware")) return error.BadLaneHorizon;
 }
 
-fn validateInquiryInputs(dcp: Dcp, rip: Rip, options: Options) GateResult {
-    if (dcp.source_thread_id == null) {
-        return .{ .valid = false, .failure_code = .source_not_found, .hint = "DCP source thread_id is required; rollout_path fallback is not implemented in v1" };
-    }
+fn validateInquiryInputs(allocator: std.mem.Allocator, dcp: Dcp, rip: Rip, options: Options) GateResult {
+    const lineage = resolveSourceLineage(allocator, dcp, rip) catch |err| return gateFailureForLineageError(err);
+    _ = lineage;
     if (!rip.permission_read_only or rip.permission_network) {
         return .{ .valid = false, .failure_code = .permission_mismatch, .hint = "RIP must require read_only=true and network=false" };
     }
@@ -1209,6 +1240,43 @@ fn validateInquiryInputs(dcp: Dcp, rip: Rip, options: Options) GateResult {
         }
     }
     return .{ .valid = true, .failure_code = null, .hint = "ok" };
+}
+
+fn resolveSourceLineage(allocator: std.mem.Allocator, dcp: Dcp, rip: Rip) !SourceLineageMode {
+    if (dcp.source_thread_id != null) return .thread_fork;
+    const rollout_path = dcp.source_rollout_path orelse return error.SourceNotFound;
+    if (!std.mem.eql(u8, rip.workspace_policy, "transcript_only")) return error.WorkspaceMismatch;
+
+    var trace = canonical_trace.parseSessionTrace(allocator, rollout_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.SourceNotFound,
+        else => return error.SourceStale,
+    };
+    defer trace.deinit(allocator);
+
+    if (trace.turns.items.len != dcp.total_turns) return error.SourceStale;
+    const source_digest = try decision_anchor.sourceTurnDigest(allocator, trace);
+    defer allocator.free(source_digest);
+    if (!std.mem.eql(u8, source_digest, dcp.source_turn_digest)) return error.SourceDigestMismatch;
+
+    for (rip.lanes) |lane| {
+        const anchor = anchorForHorizon(dcp, lane.temporal_horizon) orelse return error.AnchorDigestMismatch;
+        if (!anchor.available) return error.AnchorDigestMismatch;
+        const observed = try decision_anchor.digestRetained(allocator, trace, @intCast(anchor.keep_through_turn_index));
+        defer allocator.free(observed);
+        if (!std.mem.eql(u8, observed, anchor.anchor_digest orelse "")) return error.AnchorDigestMismatch;
+    }
+    return .rollout_transcript;
+}
+
+fn gateFailureForLineageError(err: anyerror) GateResult {
+    return switch (err) {
+        error.SourceNotFound => .{ .valid = false, .failure_code = .source_not_found, .hint = "DCP source must provide either thread_id or a readable rollout_path" },
+        error.WorkspaceMismatch => .{ .valid = false, .failure_code = .workspace_mismatch, .hint = "rollout-backed DCP replay requires transcript_only RIP workspace policy" },
+        error.SourceStale => .{ .valid = false, .failure_code = .source_stale, .hint = "rollout_path no longer reconstructs the DCP source turns" },
+        error.SourceDigestMismatch => .{ .valid = false, .failure_code = .source_turn_digest_mismatch, .hint = "rollout_path source_turn_digest does not match DCP" },
+        error.AnchorDigestMismatch => .{ .valid = false, .failure_code = .anchor_digest_mismatch, .hint = "rollout_path retained-turn digest does not match a lane anchor" },
+        else => .{ .valid = false, .failure_code = .source_stale, .hint = @errorName(err) },
+    };
 }
 
 fn failureCodeForError(err: anyerror) FailureCode {
@@ -1246,7 +1314,6 @@ fn executeLiveInquiry(
     detached: bool,
 ) !RunOutput {
     if (detached) return error.InquiryTransportLost;
-    const source_thread_id = dcp.source_thread_id orelse return error.SourceNotFound;
     try ensureDir(receipt_dir);
     const lanes_dir = try std.fmt.allocPrint(allocator, "{s}/lanes", .{receipt_dir});
     defer allocator.free(lanes_dir);
@@ -1257,14 +1324,22 @@ fn executeLiveInquiry(
     const events_path = try std.fmt.allocPrint(allocator, "{s}/events.jsonl", .{receipt_dir});
     const summary_path = try std.fmt.allocPrint(allocator, "{s}/summary.json", .{receipt_dir});
     const state_path = try stateRecordPath(allocator, options.home, rip.inquiry_id);
+    try appendSimpleEvent(allocator, events_path, "run_initialized");
 
     const hook_policy = cas_client.hooks.HookPolicy.parse(options.hooks) orelse .inherit;
+    var managed_server = try cas_websocket.startManagedLoopbackServer(
+        allocator,
+        inquiry_cwd,
+        preflight.codex_path,
+        hook_policy,
+        std.Io.Threaded.global_single_threaded.io(),
+    );
+    defer managed_server.kill();
+    defer managed_server.deinit(allocator);
+    try appendSimpleEvent(allocator, events_path, "client_start");
     var client = try cas_client.Client.start(allocator, .{
         .cwd = inquiry_cwd,
-        .codex_path = options.codex_path,
-        .client_name = "cas-session-inquiry",
-        .client_title = "CAS Session Inquiry",
-        .client_version = Version,
+        .codex_path = preflight.codex_path,
         .exec_approval = "decline",
         .file_approval = "decline",
         .permissions_approval = "deny",
@@ -1272,27 +1347,23 @@ fn executeLiveInquiry(
         .dynamic_tool_response_json = "{\"contentItems\":[{\"type\":\"inputText\",\"text\":\"Dynamic tools are disabled for CAS session inquiry\"}],\"success\":false}",
         .read_only = true,
         .hook_policy = hook_policy,
+        .websocket_url = managed_server.listen_url,
     });
+    try appendSimpleEvent(allocator, events_path, "client_started");
     defer {
         client.close();
         client.deinit();
     }
 
-    const source_read_params = try stringifyAnyAlloc(allocator, .{ .threadId = source_thread_id, .includeTurns = true });
-    defer allocator.free(source_read_params);
-    const source_json = client.requestJson("thread/read", source_read_params) catch return error.SourceNotFound;
-    defer allocator.free(source_json);
-    const read_event = try stringifyAnyAlloc(allocator, .{ .event = "thread/read", .thread_id = source_thread_id });
-    defer allocator.free(read_event);
-    try appendLine(events_path, read_event);
-    const source_digest = try turnDigestFromThreadRead(allocator, source_json);
-    if (source_digest.count != dcp.total_turns) {
-        try appendSourceDigestMismatchEvent(allocator, events_path, source_digest, dcp.total_turns, dcp.source_turn_digest, "source_stale");
-        return error.SourceStale;
-    }
-    if (!std.mem.eql(u8, source_digest.digest, dcp.source_turn_digest)) {
-        try appendSourceDigestMismatchEvent(allocator, events_path, source_digest, dcp.total_turns, dcp.source_turn_digest, "source_turn_digest_mismatch");
-        return error.SourceDigestMismatch;
+    if (dcp.source_thread_id) |source_thread_id| {
+        try appendSimpleEvent(allocator, events_path, "source_thread_verify_start");
+        try verifySourceThread(allocator, &client, source_thread_id, dcp, events_path);
+    } else {
+        try appendSimpleEvent(allocator, events_path, "rollout_source_verify_start");
+        _ = try resolveSourceLineage(allocator, dcp, rip);
+        const verified_event = try stringifyAnyAlloc(allocator, .{ .event = "rollout/source_verified", .rollout_path = dcp.source_rollout_path orelse "" });
+        defer allocator.free(verified_event);
+        try appendLine(events_path, verified_event);
     }
 
     var valid_count: u64 = 0;
@@ -1303,6 +1374,9 @@ fn executeLiveInquiry(
         while (ordinal < lane.fork_count) : (ordinal += 1) {
             if (launched >= rip.max_forks) return error.BudgetExhausted;
             launched += 1;
+            const lane_event = try stringifyAnyAlloc(allocator, .{ .event = "lane_start_attempt", .lane_id = lane.lane_id, .ordinal = ordinal + 1, .lineage_mode = lineageMode(dcp).asString() });
+            defer allocator.free(lane_event);
+            try appendLine(events_path, lane_event);
             const receipt_valid = try executeLaneFork(allocator, &client, options, inquiry_cwd, dcp, rip, lane, ordinal, receipt_dir, events_path, preflight);
             if (receipt_valid) valid_count += 1 else invalid_count += 1;
         }
@@ -1331,9 +1405,13 @@ fn executeLiveInquiry(
             .state = terminal_state,
             .capsule_id = dcp.packet_id,
             .plan_id = rip.inquiry_id,
-            .source_thread_id = source_thread_id,
+            .source_thread_id = dcp.source_thread_id orelse "",
+            .source_thread_id_present = dcp.source_thread_id != null,
+            .source_rollout_path = dcp.source_rollout_path orelse "",
+            .source_artifact_reconstructability = dcp.reconstructability,
+            .lineage_mode = lineageMode(dcp).asString(),
             .managed_transport = .{
-                .selected_transport = preflight.selected_transport,
+                .selected_transport = "websocket",
                 .detached = detached,
             },
             .lane_states = [_][]const u8{},
@@ -1374,7 +1452,6 @@ fn startDetachedInquiry(
     receipt_dir: []const u8,
     preflight: PreflightResult,
 ) !RunOutput {
-    const source_thread_id = dcp.source_thread_id orelse return error.SourceNotFound;
     try ensureDir(receipt_dir);
     const receipt_root = try absoluteDirPathAlloc(allocator, receipt_dir);
     const lanes_dir = try std.fmt.allocPrint(allocator, "{s}/lanes", .{receipt_root});
@@ -1422,7 +1499,14 @@ fn startDetachedInquiry(
         client.deinit();
     }
 
-    try verifySourceThread(allocator, &client, source_thread_id, dcp, events_path);
+    if (dcp.source_thread_id) |source_thread_id| {
+        try verifySourceThread(allocator, &client, source_thread_id, dcp, events_path);
+    } else {
+        _ = try resolveSourceLineage(allocator, dcp, rip);
+        const verified_event = try stringifyAnyAlloc(allocator, .{ .event = "rollout/source_verified", .rollout_path = dcp.source_rollout_path orelse "" });
+        defer allocator.free(verified_event);
+        try appendLine(events_path, verified_event);
+    }
 
     var launched: u64 = 0;
     for (rip.lanes) |lane| {
@@ -1455,7 +1539,7 @@ fn startDetachedInquiry(
         state_path,
         dcp,
         rip,
-        source_thread_id,
+        dcp.source_thread_id orelse "",
         @tagName(InquiryState.turn_running),
         receipt_root,
         events_path,
@@ -1605,6 +1689,8 @@ fn waitDetachedInquiry(allocator: std.mem.Allocator, options: Options, inquiry_i
             .cache_dir = "",
             .selected_transport = "websocket",
             .capabilities = zeroCapabilities(),
+            .thread_fork_replay = false,
+            .rollout_transcript_replay = false,
             .missing = &.{},
             .inquiry_allowed = true,
         },
@@ -1699,6 +1785,8 @@ fn interruptDetachedInquiry(allocator: std.mem.Allocator, options: Options, inqu
                 .cache_dir = "",
                 .selected_transport = "websocket",
                 .capabilities = zeroCapabilities(),
+                .thread_fork_replay = false,
+                .rollout_transcript_replay = false,
                 .missing = &.{},
                 .inquiry_allowed = true,
             },
@@ -1800,10 +1888,14 @@ fn writeInquiryState(
             .capsule_id = dcp.packet_id,
             .plan_id = rip.inquiry_id,
             .source_thread_id = source_thread_id,
+            .source_thread_id_present = dcp.source_thread_id != null,
+            .source_rollout_path = dcp.source_rollout_path orelse "",
+            .source_artifact_reconstructability = dcp.reconstructability,
+            .lineage_mode = lineageMode(dcp).asString(),
             .receipt_dir = receipt_dir,
             .events_ref = events_path,
             .managed_transport = .{
-                .selected_transport = if (detached) "websocket" else preflight.selected_transport,
+                .selected_transport = "websocket",
                 .detached = detached,
                 .managed_server_pid = managed_server_pid,
                 .listen_url = listen_url,
@@ -1890,6 +1982,9 @@ fn startLaneFork(
     events_path: []const u8,
     preflight: PreflightResult,
 ) !LaneHandle {
+    if (dcp.source_thread_id == null) {
+        return startRolloutTranscriptLane(allocator, client, options, inquiry_cwd, dcp, rip, lane, ordinal, receipt_dir, events_path, preflight);
+    }
     const source_thread_id = dcp.source_thread_id orelse return error.SourceNotFound;
     const anchor = anchorForHorizon(dcp, lane.temporal_horizon) orelse return error.AnchorDigestMismatch;
     if (!anchor.available) return error.AnchorDigestMismatch;
@@ -1999,6 +2094,86 @@ fn startLaneFork(
     return handle;
 }
 
+fn startRolloutTranscriptLane(
+    allocator: std.mem.Allocator,
+    client: *cas_client.Client,
+    options: Options,
+    inquiry_cwd: []const u8,
+    dcp: Dcp,
+    rip: Rip,
+    lane: Lane,
+    ordinal: u64,
+    receipt_dir: []const u8,
+    events_path: []const u8,
+    preflight: PreflightResult,
+) !LaneHandle {
+    const anchor = anchorForHorizon(dcp, lane.temporal_horizon) orelse return error.AnchorDigestMismatch;
+    if (!anchor.available) return error.AnchorDigestMismatch;
+    const lane_stem = try std.fmt.allocPrint(allocator, "{s}-{d}", .{ lane.lane_id, ordinal + 1 });
+    defer allocator.free(lane_stem);
+    const lane_events = try std.fmt.allocPrint(allocator, "{s}/lanes/{s}.events.jsonl", .{ receipt_dir, lane_stem });
+    const lane_final = try std.fmt.allocPrint(allocator, "{s}/lanes/{s}.final.txt", .{ receipt_dir, lane_stem });
+    const lane_receipt = try std.fmt.allocPrint(allocator, "{s}/lanes/{s}.json", .{ receipt_dir, lane_stem });
+    const lane_state_leaf = try std.fmt.allocPrint(allocator, "lanes/{s}.json", .{lane_stem});
+    defer allocator.free(lane_state_leaf);
+    const lane_state_ref = try inquiryPathJoin(allocator, options.home, rip.inquiry_id, lane_state_leaf);
+
+    const start_params = try stringifyAnyAlloc(allocator, .{
+        .cwd = inquiry_cwd,
+        .experimentalRawEvents = false,
+    });
+    defer allocator.free(start_params);
+    var start_notifications: std.ArrayList([]u8) = .empty;
+    defer {
+        for (start_notifications.items) |line| allocator.free(line);
+        start_notifications.deinit(allocator);
+    }
+    const start_json = client.requestJsonCaptureNotifications("thread/start", start_params, &start_notifications) catch return error.ForkFailed;
+    defer allocator.free(start_json);
+    const start_event = try stringifyAnyAlloc(allocator, .{ .event = "thread/start", .lane_id = lane.lane_id, .ordinal = ordinal + 1, .lineage_mode = "rollout_transcript" });
+    defer allocator.free(start_event);
+    try appendLine(events_path, start_event);
+    try appendLine(lane_events, start_json);
+    for (start_notifications.items) |line| try appendLine(lane_events, line);
+    const thread_id = try threadIdFromResponse(allocator, start_json);
+
+    const client_msg_id = try std.fmt.allocPrint(allocator, "cas-{s}-{s}-{d}", .{ rip.inquiry_id, lane.lane_id, ordinal + 1 });
+    const turn_text = try buildRolloutInquiryPromptAlloc(allocator, dcp, rip, lane, anchor);
+    defer allocator.free(turn_text);
+    const turn_params = try stringifyAnyAlloc(allocator, .{
+        .threadId = thread_id,
+        .clientUserMessageId = client_msg_id,
+        .input = [_]struct { type: []const u8, text: []const u8 }{.{ .type = "text", .text = turn_text }},
+        .approvalPolicy = "never",
+        .sandbox = options.sandbox,
+        .model = options.model,
+        .serviceTier = options.service_tier,
+        .runtimeWorkspaceRoots = [_][]const u8{},
+    });
+    defer allocator.free(turn_params);
+    const policy_request_count_before_turn = client.blockingServerRequestCount();
+    var notifications: std.ArrayList([]u8) = .empty;
+    defer {
+        for (notifications.items) |line| allocator.free(line);
+        notifications.deinit(allocator);
+    }
+    const turn_json = client.requestJsonCaptureNotifications("turn/start", turn_params, &notifications) catch {
+        if (client.lastError()) |detail| try appendLine(lane_events, detail);
+        return error.TurnStartFailed;
+    };
+    defer allocator.free(turn_json);
+    try appendLine(lane_events, turn_json);
+    for (notifications.items) |line| try appendLine(lane_events, line);
+    const turn_id = try turnIdFromStartResponse(allocator, turn_json);
+
+    const before_digest = TurnDigest{ .count = dcp.total_turns, .digest = dcp.source_turn_digest };
+    const anchored_digest = TurnDigest{ .count = anchor.keep_through_turn_index, .digest = anchor.anchor_digest orelse "" };
+    const fork_policy = ForkPolicyProof{ .ephemeral = true, .read_only = true, .approval_never = true };
+    const handle = try buildLaneHandleSnapshot(allocator, options, inquiry_cwd, dcp, rip, lane, ordinal, lane_events, lane_final, lane_receipt, lane_state_ref, thread_id, "", turn_id, client_msg_id, before_digest, anchored_digest, anchor, fork_policy, preflight, policy_request_count_before_turn);
+    try writeLaneHandle(allocator, handle, @tagName(InquiryState.turn_running));
+    return handle;
+}
+
 fn persistLaneHandleSnapshot(
     allocator: std.mem.Allocator,
     options: Options,
@@ -2050,7 +2225,7 @@ fn buildLaneHandleSnapshot(
     preflight: PreflightResult,
     policy_request_count_before: u64,
 ) !LaneHandle {
-    const source_thread_id = dcp.source_thread_id orelse return error.SourceNotFound;
+    const source_thread_id = dcp.source_thread_id orelse "";
     return .{
         .inquiry_id = try allocator.dupe(u8, rip.inquiry_id),
         .lane_id = try allocator.dupe(u8, lane.lane_id),
@@ -2110,10 +2285,14 @@ fn collectLaneFork(
             .source = .{
                 .capsule_id = dcp.packet_id,
                 .source_thread_id = handle.source_thread_id,
+                .source_thread_id_present = dcp.source_thread_id != null,
                 .source_rollout_path = dcp.source_rollout_path orelse "",
+                .source_artifact_reconstructability = dcp.reconstructability,
                 .source_turn_digest = dcp.source_turn_digest,
+                .lineage_mode = lineageMode(dcp).asString(),
             },
             .fork = .{
+                .lineage_mode = lineageMode(dcp).asString(),
                 .fork_thread_id = handle.fork_thread_id,
                 .forked_from_id = handle.forked_from_id,
                 .anchor = .{
@@ -2137,7 +2316,7 @@ fn collectLaneFork(
                 .multi_agent_mode = "explicit-request-only",
             },
             .workspace_reconstruction = .{
-                .mode = dcp.reconstructability,
+                .mode = if (lineageMode(dcp) == .rollout_transcript) "transcript_only" else dcp.reconstructability,
                 .path = handle.workspace_cwd,
                 .head_exact = false,
                 .dirty_state_exact = false,
@@ -2204,6 +2383,7 @@ fn writeLaneHandle(allocator: std.mem.Allocator, handle: LaneHandle, state: []co
             .lane_id = handle.lane_id,
             .ordinal = handle.ordinal,
             .source_thread_id = handle.source_thread_id,
+            .lineage_mode = if (handle.source_thread_id.len == 0) SourceLineageMode.rollout_transcript.asString() else SourceLineageMode.thread_fork.asString(),
             .fork_thread_id = handle.fork_thread_id,
             .forked_from_id = handle.forked_from_id,
             .turn_id = handle.turn_id,
@@ -2311,6 +2491,67 @@ fn buildInquiryPromptAlloc(allocator: std.mem.Allocator, rip: Rip, lane: Lane) !
         \\Return JSON with key fork_inquiry_answer and answer_version FIA-v1.
         \\
     , .{ rip.objective, lane.lane_id, lane.inquiry_mode, lane.temporal_horizon, lane.prompt_template });
+}
+
+fn buildRolloutInquiryPromptAlloc(allocator: std.mem.Allocator, dcp: Dcp, rip: Rip, lane: Lane, anchor: Anchor) ![]const u8 {
+    const rollout_path = dcp.source_rollout_path orelse return error.SourceNotFound;
+    var trace = try canonical_trace.parseSessionTrace(allocator, rollout_path, .{});
+    defer trace.deinit(allocator);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.print(
+        \\fork_inquiry_request:
+        \\  objective: {s}
+        \\  lane_id: {s}
+        \\  inquiry_mode: {s}
+        \\  temporal_horizon: {s}
+        \\  lineage_mode: rollout_transcript
+        \\  visible_turns_retained: {d}
+        \\caller_objective:
+        \\---
+        \\{s}
+        \\---
+        \\
+        \\visible_historical_context:
+        \\
+    , .{ rip.objective, lane.lane_id, lane.inquiry_mode, lane.temporal_horizon, anchor.keep_through_turn_index, lane.prompt_template });
+    for (trace.turns.items) |turn| {
+        if (turn.turn_index > @as(i64, @intCast(anchor.keep_through_turn_index))) continue;
+        try writer.print("- turn_index: {d}\n  turn_id: {s}\n", .{ turn.turn_index, turn.turn_id });
+        if (turn.user_message) |text| {
+            try writer.writeAll("  user_message: |-\n");
+            try writeIndentedExcerpt(writer, text, 4, 2000);
+        }
+        if (turn.final_answer) |text| {
+            try writer.writeAll("  assistant_final: |-\n");
+            try writeIndentedExcerpt(writer, text, 4, 2000);
+        }
+    }
+    try writer.writeAll(
+        \\
+        \\Return JSON with key fork_inquiry_answer and answer_version FIA-v1.
+        \\
+    );
+    return try out.toOwnedSlice();
+}
+
+fn writeIndentedExcerpt(writer: anytype, text: []const u8, indent: usize, max_bytes: usize) !void {
+    const retained = if (text.len > max_bytes) text[0..max_bytes] else text;
+    var remaining = retained;
+    while (remaining.len > 0) {
+        for (0..indent) |_| try writer.writeByte(' ');
+        const newline = std.mem.indexOfScalar(u8, remaining, '\n') orelse remaining.len;
+        try writer.writeAll(remaining[0..newline]);
+        if (newline < remaining.len) {
+            try writer.writeByte('\n');
+            remaining = remaining[newline + 1 ..];
+        } else {
+            remaining = remaining[newline..];
+        }
+    }
+    if (text.len > max_bytes) try writer.writeAll("\n    [truncated]\n") else try writer.writeByte('\n');
 }
 
 fn waitForTurnObservation(
@@ -2757,6 +2998,10 @@ fn persistInvalidRunArtifacts(
             .capsule_id = rip.plan_id,
             .plan_id = rip.inquiry_id,
             .source_thread_id = dcp.source_thread_id orelse "",
+            .source_thread_id_present = dcp.source_thread_id != null,
+            .source_rollout_path = dcp.source_rollout_path orelse "",
+            .source_artifact_reconstructability = dcp.reconstructability,
+            .lineage_mode = lineageMode(dcp).asString(),
             .managed_transport = .{
                 .selected_transport = if (std.mem.eql(u8, options.transport, "auto")) "stdio" else options.transport,
                 .detached = detached,
@@ -2854,8 +3099,12 @@ fn persistPlannedInquiry(
             .capsule_id = dcp.packet_id,
             .plan_id = rip.inquiry_id,
             .source_thread_id = dcp.source_thread_id orelse "",
+            .source_thread_id_present = dcp.source_thread_id != null,
+            .source_rollout_path = dcp.source_rollout_path orelse "",
+            .source_artifact_reconstructability = dcp.reconstructability,
+            .lineage_mode = lineageMode(dcp).asString(),
             .managed_transport = .{
-                .selected_transport = preflight.selected_transport,
+                .selected_transport = "websocket",
                 .detached = detached,
             },
             .lane_states = [_][]const u8{},
@@ -3292,6 +3541,12 @@ fn appendLine(path: []const u8, line: []const u8) !void {
     try writeTextAtomic(std.heap.page_allocator, path, payload);
 }
 
+fn appendSimpleEvent(allocator: std.mem.Allocator, events_path: []const u8, event_name: []const u8) !void {
+    const event = try stringifyAnyAlloc(allocator, .{ .event = event_name });
+    defer allocator.free(event);
+    try appendLine(events_path, event);
+}
+
 fn stringifyAnyAlloc(allocator: std.mem.Allocator, value: anytype) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -3328,6 +3583,8 @@ fn printPreflightFailure(allocator: std.mem.Allocator, options: Options, err: an
             .codex_version = "",
             .schema_fingerprint = "",
             .capabilities = zeroCapabilities(),
+            .thread_fork_replay = false,
+            .rollout_transcript_replay = false,
             .selected_transport = options.transport,
             .missing = [_][]const u8{"schema"},
             .inquiry_allowed = false,
@@ -3374,15 +3631,17 @@ test "parseArgs accepts safe common flags and rejects unsafe sandbox" {
 
 test "deriveCapabilities recognizes schema method and field surface" {
     const text =
-        \\"thread/fork" "thread/rollback" "thread/read" "turn/start" "turn/interrupt"
+        \\"thread/fork" "thread/rollback" "thread/start" "thread/read" "turn/start" "turn/interrupt"
         \\"thread/archive" "ephemeral" "permissions" "sandbox" "numTurns"
     ;
     const caps = deriveCapabilities(text);
     try std.testing.expect(caps.thread_fork);
     try std.testing.expect(caps.thread_rollback);
+    try std.testing.expect(caps.thread_start);
     try std.testing.expect(caps.thread_read);
     try std.testing.expect(caps.turn_start);
     try std.testing.expect(caps.exactAnchorSupported());
+    try std.testing.expect(caps.rolloutTranscriptSupported());
 }
 
 test "validateLane enforces mode horizon invariants" {
@@ -3415,7 +3674,7 @@ test "validateInquiryInputs rejects unavailable workspace" {
         .source_model = null,
         .source_model_provider = null,
         .source_codex_version = null,
-        .reconstructability = "transcript_only",
+        .reconstructability = "head_only",
         .total_turns = 1,
         .decision_turn_index = 1,
         .first_outcome_turn_index = null,
@@ -3448,9 +3707,142 @@ test "validateInquiryInputs rejects unavailable workspace" {
         .timeout_ms = 1000,
         .lanes = lanes[0..],
     };
-    const gate = validateInquiryInputs(dcp, rip, .{ .command = .run });
+    const gate = validateInquiryInputs(std.testing.allocator, dcp, rip, .{ .command = .run });
     try std.testing.expect(!gate.valid);
     try std.testing.expectEqual(FailureCode.workspace_mismatch, gate.failure_code.?);
+}
+
+test "validateInquiryInputs accepts verified rollout transcript lineage only" {
+    const allocator = std.testing.allocator;
+    const rollout_path = try repoTestPathAlloc(allocator, "apps/seq/testdata/trace/new_044_plus.jsonl");
+    defer allocator.free(rollout_path);
+
+    var trace = try canonical_trace.parseSessionTrace(allocator, rollout_path, .{});
+    defer trace.deinit(allocator);
+    const source_digest = try decision_anchor.sourceTurnDigest(allocator, trace);
+    defer allocator.free(source_digest);
+    const post_digest = try decision_anchor.digestRetained(allocator, trace, 1);
+    defer allocator.free(post_digest);
+
+    const dcp = Dcp{
+        .packet_id = "CAP",
+        .source_thread_id = null,
+        .source_rollout_path = rollout_path,
+        .source_turn_digest = source_digest,
+        .source_model = null,
+        .source_model_provider = null,
+        .source_codex_version = null,
+        .reconstructability = "transcript_only",
+        .total_turns = @intCast(trace.turns.items.len),
+        .decision_turn_index = 1,
+        .first_outcome_turn_index = null,
+        .anchors = [_]Anchor{
+            .{ .name = .pre_decision, .available = false },
+            .{ .name = .post_decision_pre_outcome, .available = true, .keep_through_turn_index = 1, .drop_last_n_turns = 0, .anchor_digest = post_digest },
+            .{ .name = .outcome_aware, .available = true, .keep_through_turn_index = 1, .drop_last_n_turns = 0, .anchor_digest = post_digest },
+        },
+    };
+    var lanes = [_]Lane{.{
+        .lane_id = "rationale",
+        .temporal_horizon = "post_decision_pre_outcome",
+        .inquiry_mode = "rationale",
+        .fork_count = 1,
+        .prompt_template = "x",
+        .evidence_allowed_count = 0,
+        .evidence_withheld_count = 0,
+    }};
+    const rip = Rip{
+        .plan_id = "CAP",
+        .inquiry_id = "INQ",
+        .objective = "test",
+        .model_policy = "current_recorded",
+        .workspace_policy = "transcript_only",
+        .permission_read_only = true,
+        .permission_network = false,
+        .max_forks = 1,
+        .max_turns_per_fork = 1,
+        .max_total_tokens = 100,
+        .timeout_ms = 1000,
+        .lanes = lanes[0..],
+    };
+    const gate = validateInquiryInputs(allocator, dcp, rip, .{ .command = .run });
+    try std.testing.expect(gate.valid);
+
+    var exact_workspace = rip;
+    exact_workspace.workspace_policy = "exact";
+    const exact_gate = validateInquiryInputs(allocator, dcp, exact_workspace, .{ .command = .run });
+    try std.testing.expect(!exact_gate.valid);
+    try std.testing.expectEqual(FailureCode.workspace_mismatch, exact_gate.failure_code.?);
+
+    var stale_dcp = dcp;
+    stale_dcp.source_turn_digest = "sha256:bad-source";
+    const stale_gate = validateInquiryInputs(allocator, stale_dcp, rip, .{ .command = .run });
+    try std.testing.expect(!stale_gate.valid);
+    try std.testing.expectEqual(FailureCode.source_turn_digest_mismatch, stale_gate.failure_code.?);
+
+    var anchor_bad_dcp = dcp;
+    anchor_bad_dcp.anchors[1].anchor_digest = "sha256:bad-anchor";
+    const anchor_gate = validateInquiryInputs(allocator, anchor_bad_dcp, rip, .{ .command = .run });
+    try std.testing.expect(!anchor_gate.valid);
+    try std.testing.expectEqual(FailureCode.anchor_digest_mismatch, anchor_gate.failure_code.?);
+}
+
+test "buildRolloutInquiryPromptAlloc labels transcript lineage and retained horizon" {
+    const allocator = std.testing.allocator;
+    const rollout_path = try repoTestPathAlloc(allocator, "apps/seq/testdata/trace/new_044_plus.jsonl");
+    defer allocator.free(rollout_path);
+    const dcp = Dcp{
+        .packet_id = "CAP",
+        .source_thread_id = null,
+        .source_rollout_path = rollout_path,
+        .source_turn_digest = "sha256:source",
+        .source_model = null,
+        .source_model_provider = null,
+        .source_codex_version = null,
+        .reconstructability = "transcript_only",
+        .total_turns = 1,
+        .decision_turn_index = 1,
+        .first_outcome_turn_index = null,
+        .anchors = [_]Anchor{
+            .{ .name = .pre_decision, .available = false },
+            .{ .name = .post_decision_pre_outcome, .available = true, .keep_through_turn_index = 1, .drop_last_n_turns = 0, .anchor_digest = "sha256:post" },
+            .{ .name = .outcome_aware, .available = true, .keep_through_turn_index = 1, .drop_last_n_turns = 0, .anchor_digest = "sha256:full" },
+        },
+    };
+    const rip = Rip{
+        .plan_id = "CAP",
+        .inquiry_id = "INQ",
+        .objective = "test objective",
+        .model_policy = "current_recorded",
+        .workspace_policy = "transcript_only",
+        .permission_read_only = true,
+        .permission_network = false,
+        .max_forks = 1,
+        .max_turns_per_fork = 1,
+        .max_total_tokens = 100,
+        .timeout_ms = 1000,
+        .lanes = &.{},
+    };
+    const lane = Lane{
+        .lane_id = "rationale",
+        .temporal_horizon = "post_decision_pre_outcome",
+        .inquiry_mode = "rationale",
+        .fork_count = 1,
+        .prompt_template = "why",
+        .evidence_allowed_count = 0,
+        .evidence_withheld_count = 0,
+    };
+    const prompt = try buildRolloutInquiryPromptAlloc(allocator, dcp, rip, lane, dcp.anchors[1]);
+    defer allocator.free(prompt);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "lineage_mode: rollout_transcript") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "visible_turns_retained: 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "visible_historical_context") != null);
+}
+
+fn repoTestPathAlloc(allocator: std.mem.Allocator, relative: []const u8) ![]u8 {
+    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
+    defer allocator.free(cwd);
+    return std.fs.path.join(allocator, &.{ cwd, relative });
 }
 
 test "sanitizeInquiryId rejects path traversal" {
