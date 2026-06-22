@@ -6514,6 +6514,7 @@ const ReviewCompilerAudit = struct {
         lab_vs_delivery: C3LabVsDelivery = .{},
         holdout: Holdout = .{},
         delivery: Delivery = .{},
+        closure_compression: ClosureCompression = .{},
         compliance: C3Compliance = .{},
     };
 
@@ -6584,6 +6585,50 @@ const ReviewCompilerAudit = struct {
         controller_pushes: usize = 0,
         raw_pushes_while_active: usize = 0,
         closed_runs: usize = 0,
+    };
+
+    const ClosureCompression = struct {
+        closed_total: usize = 0,
+        closed_compressed: usize = 0,
+        closed_uncompressed: usize = 0,
+        blocked: usize = 0,
+        compression_not_required: usize = 0,
+        missing_compression_evidence: MissingCompressionEvidence = .{},
+
+        fn summaryState(self: ClosureCompression) ClosureCompressionState {
+            if (self.closed_uncompressed > 0) return .closed_uncompressed;
+            if (self.blocked > 0) return .blocked;
+            if (self.closed_compressed > 0) return .closed;
+            return .none;
+        }
+    };
+
+    const ClosureCompressionState = enum {
+        none,
+        closed,
+        closed_uncompressed,
+        blocked,
+
+        fn label(self: ClosureCompressionState) []const u8 {
+            return switch (self) {
+                .none => "NONE",
+                .closed => "CLOSED",
+                .closed_uncompressed => "CLOSED_UNCOMPRESSED",
+                .blocked => "BLOCKED",
+            };
+        }
+    };
+
+    const MissingCompressionEvidence = struct {
+        basis: usize = 0,
+        tournament: usize = 0,
+        ablation: usize = 0,
+        proof: usize = 0,
+        holdout: usize = 0,
+        permit: usize = 0,
+        stale_mrpc: usize = 0,
+        direct_review_to_delivery_mutation: usize = 0,
+        commit_or_push_bypass: usize = 0,
     };
 
     const C3Compliance = struct {
@@ -6799,11 +6844,14 @@ const ReviewCompilerSessionSignals = struct {
     c3_proof_seen: bool = false,
     c3_holdout_seen: bool = false,
     c3_mrpc_seen: bool = false,
+    c3_apply_certified_seen: bool = false,
+    c3_final_certified_seen: bool = false,
     c3_new_counterexample_seen: bool = false,
     c3_reset_seen: bool = false,
     c3_basis_after_reset_seen: bool = false,
     c3_recompiled_seen: bool = false,
     c3_raw_delivery_mutation_seen: bool = false,
+    c3_commit_or_push_bypass_seen: bool = false,
     c3_candidate_worktree_context_seen: bool = false,
     mbk_begin_seen: bool = false,
     mbk_begin_at_ms: ?i64 = null,
@@ -7374,8 +7422,14 @@ fn recordReviewCompilerC3Text(
         recordReviewCompilerC3Time(signals, .begin, timestamp);
     }
     if (containsIgnoreCaseAscii(text, ".ledger/c3/state.json")) audit.c3.controller.state_files += 1;
-    if (containsAnyIgnoreCaseAscii(text, &.{ "apply-certified", "apply_certified", "mrpc_apply_certified" })) audit.c3.controller.mrpc_apply_certified += 1;
-    if (containsAnyIgnoreCaseAscii(text, &.{ "final-certified", "final_certified", "mrpc_final_certified" })) audit.c3.controller.mrpc_final_certified += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "apply-certified", "apply_certified", "mrpc_apply_certified" })) {
+        audit.c3.controller.mrpc_apply_certified += 1;
+        signals.c3_apply_certified_seen = true;
+    }
+    if (containsAnyIgnoreCaseAscii(text, &.{ "final-certified", "final_certified", "mrpc_final_certified" })) {
+        audit.c3.controller.mrpc_final_certified += 1;
+        signals.c3_final_certified_seen = true;
+    }
     if (containsAnyIgnoreCaseAscii(text, &.{ "MRPC-v1", "minimal_review_patch_certificate" })) signals.c3_mrpc_seen = true;
     if (containsAnyIgnoreCaseAscii(text, &.{ "committed", "mrpc_committed" })) audit.c3.controller.mrpc_committed += 1;
     if (containsAnyIgnoreCaseAscii(text, &.{ "pushed", "mrpc_pushed" })) audit.c3.controller.mrpc_pushed += 1;
@@ -7736,6 +7790,7 @@ fn recordReviewCompilerTools(
                     if (reviewCompilerC3ToolWhileActive(parsed, tool, signals.*) and !commandContainsReviewCompileController(cmd, "commit")) {
                         audit.c3.delivery.raw_commits_while_active += 1;
                         audit.c3.compliance.commit_or_push_bypass += 1;
+                        signals.c3_commit_or_push_bypass_seen = true;
                     }
                     if (signals.true_mbk and !commandContainsReviewCompileController(cmd, "commit")) {
                         audit.mbk.controller.physical_commits += 1;
@@ -7746,6 +7801,7 @@ fn recordReviewCompilerTools(
             if (containsGitPushCommand(cmd) and reviewCompilerC3ToolWhileActive(parsed, tool, signals.*) and !commandContainsReviewCompileController(cmd, "push")) {
                 audit.c3.delivery.raw_pushes_while_active += 1;
                 audit.c3.compliance.commit_or_push_bypass += 1;
+                signals.c3_commit_or_push_bypass_seen = true;
             }
             if (signals.true_mbk and containsGitPushCommand(cmd) and !commandContainsReviewCompileController(cmd, "push")) {
                 audit.mbk.controller.physical_pushes += 1;
@@ -7843,6 +7899,7 @@ fn finalizeReviewCompilerCompliance(audit: *ReviewCompilerAudit, signals: Review
         if (signals.c3_mrpc_seen and signals.c3_raw_delivery_mutation_seen) {
             audit.c3.compliance.stale_mrpc += 1;
         }
+        finalizeReviewCompilerC3ClosureCompression(audit, signals);
     }
 
     if (!signals.true_mbk) return;
@@ -8217,6 +8274,52 @@ fn writeResolveChurnAuditJson(allocator: std.mem.Allocator, audit: ResolveChurnA
     try writeTextOutput(rendered, out_path);
 }
 
+fn finalizeReviewCompilerC3ClosureCompression(audit: *ReviewCompilerAudit, signals: ReviewCompilerSessionSignals) void {
+    const material_c3 = signals.true_c3 and !signals.clean_review_seen and !signals.isolated_waiver_seen;
+    const closed = signals.c3_closed_seen;
+    if (!closed and material_c3) {
+        audit.c3.closure_compression.blocked += 1;
+        return;
+    }
+    if (!closed) return;
+
+    audit.c3.closure_compression.closed_total += 1;
+    if (!material_c3) {
+        audit.c3.closure_compression.closed_compressed += 1;
+        audit.c3.closure_compression.compression_not_required += 1;
+        return;
+    }
+
+    const permit_ok = signals.c3_apply_certified_seen or signals.c3_final_certified_seen;
+    const stale_mrpc = signals.c3_mrpc_seen and signals.c3_raw_delivery_mutation_seen;
+    const compression_ok = signals.c3_basis_seen and
+        signals.c3_tournament_seen and
+        signals.c3_ablation_seen and
+        signals.c3_proof_seen and
+        signals.c3_holdout_seen and
+        permit_ok and
+        !stale_mrpc and
+        !signals.c3_raw_delivery_mutation_seen and
+        !signals.c3_commit_or_push_bypass_seen;
+
+    if (compression_ok) {
+        audit.c3.closure_compression.closed_compressed += 1;
+        return;
+    }
+
+    audit.c3.closure_compression.closed_uncompressed += 1;
+    const missing = &audit.c3.closure_compression.missing_compression_evidence;
+    if (!signals.c3_basis_seen) missing.basis += 1;
+    if (!signals.c3_tournament_seen) missing.tournament += 1;
+    if (!signals.c3_ablation_seen) missing.ablation += 1;
+    if (!signals.c3_proof_seen) missing.proof += 1;
+    if (!signals.c3_holdout_seen) missing.holdout += 1;
+    if (!permit_ok) missing.permit += 1;
+    if (stale_mrpc) missing.stale_mrpc += 1;
+    if (signals.c3_raw_delivery_mutation_seen) missing.direct_review_to_delivery_mutation += 1;
+    if (signals.c3_commit_or_push_bypass_seen) missing.commit_or_push_bypass += 1;
+}
+
 fn writeReviewCompilerAuditMarkdown(allocator: std.mem.Allocator, audit: ReviewCompilerAudit, out_path: ?[]const u8) !void {
     var writer_alloc = std.Io.Writer.Allocating.init(allocator);
     defer writer_alloc.deinit();
@@ -8348,7 +8451,14 @@ fn writeReviewCompilerC3YamlBody(writer: anytype, audit: ReviewCompilerAudit, in
     try writer.print("{s}holdout:\n{s}  candidate_holdouts: {d}\n{s}  delivery_holdouts: {d}\n{s}  new_counterexamples: {d}\n{s}  invalidations: {d}\n{s}  recompilations: {d}\n{s}  adjacent_followups: {d}\n", .{ indent, indent, audit.c3.holdout.candidate_holdouts, indent, audit.c3.holdout.delivery_holdouts, indent, audit.c3.holdout.new_counterexamples, indent, audit.c3.holdout.invalidations, indent, audit.c3.holdout.recompilations, indent, audit.c3.holdout.adjacent_followups });
     try writer.print("{s}delivery:\n{s}  controller_commits: {d}\n{s}  raw_commits_while_active: {d}\n{s}  controller_pushes: {d}\n{s}  raw_pushes_while_active: {d}\n{s}  closed_runs: {d}\n", .{ indent, indent, audit.c3.delivery.controller_commits, indent, audit.c3.delivery.raw_commits_while_active, indent, audit.c3.delivery.controller_pushes, indent, audit.c3.delivery.raw_pushes_while_active, indent, audit.c3.delivery.closed_runs });
     try writeYamlRatio(writer, indent, "  controller_adoption", audit.denominator.c3_entered_sessions, audit.denominator.c3_required_sessions, "c3_required_sessions_zero");
+    try writeReviewCompilerClosureCompressionYaml(writer, audit.c3.closure_compression, indent);
     try writer.print("{s}compliance:\n{s}  basis_missing: {d}\n{s}  tournament_missing: {d}\n{s}  ablation_missing: {d}\n{s}  proof_missing: {d}\n{s}  holdout_missing: {d}\n{s}  stale_mrpc: {d}\n{s}  direct_review_to_delivery_mutation: {d}\n{s}  commit_or_push_bypass: {d}\n", .{ indent, indent, audit.c3.compliance.basis_missing, indent, audit.c3.compliance.tournament_missing, indent, audit.c3.compliance.ablation_missing, indent, audit.c3.compliance.proof_missing, indent, audit.c3.compliance.holdout_missing, indent, audit.c3.compliance.stale_mrpc, indent, audit.c3.compliance.direct_review_to_delivery_mutation, indent, audit.c3.compliance.commit_or_push_bypass });
+}
+
+fn writeReviewCompilerClosureCompressionYaml(writer: anytype, closure: ReviewCompilerAudit.ClosureCompression, indent: []const u8) !void {
+    const missing = closure.missing_compression_evidence;
+    try writer.print("{s}closure_compression:\n{s}  summary_state: {s}\n{s}  closed_total: {d}\n{s}  closed_compressed: {d}\n{s}  closed_uncompressed: {d}\n{s}  blocked: {d}\n{s}  compression_not_required: {d}\n", .{ indent, indent, closure.summaryState().label(), indent, closure.closed_total, indent, closure.closed_compressed, indent, closure.closed_uncompressed, indent, closure.blocked, indent, closure.compression_not_required });
+    try writer.print("{s}  missing_compression_evidence:\n{s}    basis: {d}\n{s}    tournament: {d}\n{s}    ablation: {d}\n{s}    proof: {d}\n{s}    holdout: {d}\n{s}    permit: {d}\n{s}    stale_mrpc: {d}\n{s}    direct_review_to_delivery_mutation: {d}\n{s}    commit_or_push_bypass: {d}\n", .{ indent, indent, missing.basis, indent, missing.tournament, indent, missing.ablation, indent, missing.proof, indent, missing.holdout, indent, missing.permit, indent, missing.stale_mrpc, indent, missing.direct_review_to_delivery_mutation, indent, missing.commit_or_push_bypass });
 }
 
 fn writeReviewCompilerLegacyYamlBody(writer: anytype, legacy: ReviewCompilerAudit.LegacyCleanroom, indent: []const u8) !void {
@@ -8437,6 +8547,8 @@ fn writeReviewCompilerAuditJson(allocator: std.mem.Allocator, audit: ReviewCompi
         try writer.print("    \"delivery\": {{ \"controller_commits\": {d}, \"raw_commits_while_active\": {d}, \"controller_pushes\": {d}, \"raw_pushes_while_active\": {d}, \"closed_runs\": {d}, ", .{ audit.c3.delivery.controller_commits, audit.c3.delivery.raw_commits_while_active, audit.c3.delivery.controller_pushes, audit.c3.delivery.raw_pushes_while_active, audit.c3.delivery.closed_runs });
         try writeJsonRatioFields(writer, "controller_adoption", audit.denominator.c3_entered_sessions, audit.denominator.c3_required_sessions, "c3_required_sessions_zero");
         try writer.writeAll(" },\n");
+        try writeReviewCompilerClosureCompressionJson(writer, audit.c3.closure_compression);
+        try writer.writeAll(",\n");
         try writer.print("    \"compliance\": {{ \"basis_missing\": {d}, \"tournament_missing\": {d}, \"ablation_missing\": {d}, \"proof_missing\": {d}, \"holdout_missing\": {d}, \"stale_mrpc\": {d}, \"direct_review_to_delivery_mutation\": {d}, \"commit_or_push_bypass\": {d} }},\n", .{ audit.c3.compliance.basis_missing, audit.c3.compliance.tournament_missing, audit.c3.compliance.ablation_missing, audit.c3.compliance.proof_missing, audit.c3.compliance.holdout_missing, audit.c3.compliance.stale_mrpc, audit.c3.compliance.direct_review_to_delivery_mutation, audit.c3.compliance.commit_or_push_bypass });
     }
     const legacy = audit.legacy_cleanroom;
@@ -8453,6 +8565,13 @@ fn writeReviewCompilerAuditJson(allocator: std.mem.Allocator, audit: ReviewCompi
     defer allocator.free(rendered);
     if (out_path) |path| try ensureParentDir(path);
     try writeTextOutput(rendered, out_path);
+}
+
+fn writeReviewCompilerClosureCompressionJson(writer: anytype, closure: ReviewCompilerAudit.ClosureCompression) !void {
+    const missing = closure.missing_compression_evidence;
+    try writer.print("    \"closure_compression\": {{ \"summary_state\": ", .{});
+    try output.writeJsonString(writer, closure.summaryState().label());
+    try writer.print(", \"closed_total\": {d}, \"closed_compressed\": {d}, \"closed_uncompressed\": {d}, \"blocked\": {d}, \"compression_not_required\": {d}, \"missing_compression_evidence\": {{ \"basis\": {d}, \"tournament\": {d}, \"ablation\": {d}, \"proof\": {d}, \"holdout\": {d}, \"permit\": {d}, \"stale_mrpc\": {d}, \"direct_review_to_delivery_mutation\": {d}, \"commit_or_push_bypass\": {d} }} }}", .{ closure.closed_total, closure.closed_compressed, closure.closed_uncompressed, closure.blocked, closure.compression_not_required, missing.basis, missing.tournament, missing.ablation, missing.proof, missing.holdout, missing.permit, missing.stale_mrpc, missing.direct_review_to_delivery_mutation, missing.commit_or_push_bypass });
 }
 
 fn writeReviewCompilerMBKJsonFields(writer: anytype, mbk: ReviewCompilerAudit.MBK) !void {
@@ -22606,6 +22725,70 @@ test "review-compiler-audit c3 protocol reports controller, tournament, holdout,
     try std.testing.expect(std.mem.indexOf(u8, alias_got, "\"true_resolve_sessions\": 7") != null);
     try std.testing.expect(std.mem.indexOf(u8, alias_got, "\"controller_commits\": 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, alias_got, "\"commit_or_push_bypass\": 1") != null);
+}
+
+test "review-compiler-audit c3 protocol reports closure compression state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/13");
+    const clean_closed =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-13T08:00:00Z\",\"payload\":{\"id\":\"c3-clean-closed\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T08:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"c1\",\"message\":\"resolve-c3 begin\\nclean_review: true\\nclosed\"}}\n";
+    const compressed_closed =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-13T09:00:00Z\",\"payload\":{\"id\":\"c3-compressed-closed\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T09:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"f1\",\"message\":\"resolve-c3 begin\\nMRPC-v1 minimal_review_patch_certificate\\napply-certified\\nfinal-certified\\nbasis-set\\ncandidate-registered route_class: typed\\ncandidate-selected\\nablation-recorded edit_atoms_tested removed_edit_atom\\nholdout-recorded delivery_holdout\\nproof-recorded\\nclosed\"}}\n";
+    const uncompressed_closed =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-13T10:00:00Z\",\"payload\":{\"id\":\"c3-uncompressed-closed\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T10:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"u1\",\"message\":\"resolve-c3 begin\\nMRPC-v1 minimal_review_patch_certificate\\nclosed\"}}\n";
+    const open_material =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-13T11:00:00Z\",\"payload\":{\"id\":\"c3-open-material\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T11:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"o1\",\"message\":\"resolve-c3 begin\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n";
+
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/13/rollout-c3-clean-closed.jsonl", .data = clean_closed });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/13/rollout-c3-compressed-closed.jsonl", .data = compressed_closed });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/13/rollout-c3-uncompressed-closed.jsonl", .data = uncompressed_closed });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/13/rollout-c3-open-material.jsonl", .data = open_material });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "review-compiler-c3-closure.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const got = try runCommandWithOutput(std.testing.allocator, .review_compiler_audit, &.{
+        "--root",     root_abs,
+        "--protocol", "c3",
+        "--since",    "2026-05-13T00:00:00Z",
+        "--until",    "2026-05-14T00:00:00Z",
+        "--repo",     "/repo",
+        "--format",   "json",
+    }, output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"closure_compression\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"summary_state\": \"CLOSED_UNCOMPRESSED\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"closed_total\": 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"closed_compressed\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"closed_uncompressed\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"blocked\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"compression_not_required\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"missing_compression_evidence\": { \"basis\": 1, \"tournament\": 1, \"ablation\": 1, \"proof\": 1, \"holdout\": 1, \"permit\": 1, \"stale_mrpc\": 0, \"direct_review_to_delivery_mutation\": 0, \"commit_or_push_bypass\": 0 }") != null);
+
+    const markdown_output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "review-compiler-c3-closure.md" });
+    defer std.testing.allocator.free(markdown_output_path);
+    const markdown = try runCommandWithOutput(std.testing.allocator, .review_compiler_audit, &.{
+        "--root",     root_abs,
+        "--protocol", "c3-mrpc",
+        "--since",    "2026-05-13T00:00:00Z",
+        "--until",    "2026-05-14T00:00:00Z",
+        "--repo",     "/repo",
+        "--format",   "markdown",
+    }, markdown_output_path);
+    defer std.testing.allocator.free(markdown);
+
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "closure_compression:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "summary_state: CLOSED_UNCOMPRESSED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "missing_compression_evidence:") != null);
 }
 
 test "review-compiler-audit mbk protocol audits kernel, surface, proof, closure, and bypass counters" {

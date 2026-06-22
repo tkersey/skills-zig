@@ -155,6 +155,7 @@ seq resolve-churn-audit --root ~/.codex/sessions --since 2026-05-01T00:00:00Z --
 - uses transcript/session evidence as primary workflow attribution and Git/tool lifecycle only as supplemental repo evidence
 - treats raw `$resolve` mentions as candidate sessions only; MBK activation requires MBKC evidence such as `MBKC-v1`, `minimum_behavioral_kernel`, `resolve-c3 campaign begin`, `kernel-accepted`, or `terminal-closed`
 - keeps historical `legacy-cleanroom` and C3/MRPC counts separate; `c3-mrpc` is an explicit alias for the existing MRPC-era `c3` behavior
+- reports C3/MRPC `closure_compression` state for closed runs, including `CLOSED_UNCOMPRESSED` when material closed sessions lack basis, tournament, ablation, proof, holdout, permit, or bypass-free MRPC evidence
 - reports MBK semantic-surface metrics separately from base-relative Git tree metrics
 
 Examples:
