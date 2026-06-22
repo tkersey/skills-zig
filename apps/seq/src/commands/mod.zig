@@ -168,7 +168,7 @@ pub const dataset_meta = [_]DatasetMeta{
     },
     .{
         .name = "decision_capsules",
-        .description = "Persisted or transcript-embedded DCP-v1 packet references",
+        .description = "Persisted or transcript-embedded DCP-v2 packet references",
         .fields = &.{ "path", "session_id", "packet_id", "decision_id", "source_kind", "valid", "errors" },
     },
     .{
@@ -886,7 +886,7 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\usage: seq query --spec <json|@path>
         ,
         .decision_capsule =>
-        \\usage: seq decision-capsule (--session-id <id>|--path <rollout.jsonl>) [--decision-id <id>|--turn-id <id>|--turn-index <n>|--contains <text>|--regex <pattern>|--skill <name>] [--mode capsule|candidates|anchors|validate] [--format table|json|jsonl|csv|markdown]
+        \\usage: seq decision-capsule (--session-id <id>|--path <rollout.jsonl>) [--thread-id <id>] [--decision-id <id>|--turn-id <id>|--turn-index <n>|--contains <text>|--regex <pattern>|--skill <name>] [--mode capsule|candidates|anchors|validate] [--format table|json|jsonl|csv|markdown]
         ,
         .adjudication_audit =>
         \\usage: seq adjudication-audit [--mode summary|rows|report] [--skill <name>] [--last <Nm|Nh|Nd>|--since <iso>] [--until <iso>] [--include-root-equivalent <csv>] [--bundle-dir <path>] [--limit N] [--format table|markdown|json|csv|jsonl]
@@ -1298,7 +1298,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         std.mem.eql(u8, cmd_name, "session_detail") or
         std.mem.eql(u8, cmd_name, "tool_lifecycle") or
         std.mem.eql(u8, cmd_name, "tail");
-    const supports_thread_id = cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history;
+    const supports_thread_id = cmd == .decision_capsule or cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history;
     const supports_rollout_summary_file = cmd == .memory_provenance;
     const supports_trace = cmd == .memory_provenance or cmd == .memory_map or cmd == .memory_history;
     const supports_show_query = switch (cmd) {
@@ -2899,6 +2899,7 @@ fn cmdDecisionCapsule(allocator: std.mem.Allocator, sessions_root: []const u8, o
         .strict = opts.strict,
         .include_excerpts = opts.include_excerpts,
         .excerpt_chars = opts.excerpt_chars,
+        .source_thread_id = opts.thread_id,
     });
     defer capsule.deinit(allocator);
 

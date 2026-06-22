@@ -122,7 +122,7 @@ fn summaryFor(command: lib.Command) []const u8 {
     return switch (command) {
         .query => "Run a dataset query spec over local session artifacts",
         .skill_decision_audit => "Compile deterministic per-skill decision episodes and STE-v1 evidence",
-        .decision_capsule => "Freeze one visible historical decision as DCP-v1",
+        .decision_capsule => "Freeze one visible historical decision as DCP-v2",
         .skill_contract => "Validate, show, or scaffold SKDC-v1 decision contracts",
         .skill_decision_receipt => "Validate SDR-v1 skill decision receipts",
         .capabilities => "Print seq feature capability flags",

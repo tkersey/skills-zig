@@ -421,7 +421,7 @@ pub fn parseSessionTrace(
                     } else if (std.mem.eql(u8, event_type, "user_message")) {
                         const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, stringField(p, "turn_id"));
                         const msg = stringField(p, "message") orelse stringField(p, "text") orelse "";
-                        try attachUserMessage(allocator, &trace.turns.items[idx], msg);
+                        try replaceUserMessage(allocator, &trace.turns.items[idx], msg);
                     } else if (std.mem.eql(u8, event_type, "agent_message")) {
                         const idx = try ensureTurn(allocator, &trace, path, &current_turn_index, &synthetic_turns, timestamp, stringField(p, "turn_id"));
                         const msg = stringField(p, "message") orelse stringField(p, "text") orelse "";
@@ -903,6 +903,13 @@ fn attachUserMessage(allocator: std.mem.Allocator, turn: *TurnRecord, text: []co
         turn.user_message = try allocator.dupe(u8, text);
         turn.user_preview = try previewAlloc(allocator, text);
     }
+}
+
+fn replaceUserMessage(allocator: std.mem.Allocator, turn: *TurnRecord, text: []const u8) !void {
+    if (turn.user_message) |old| allocator.free(old);
+    turn.user_message = try allocator.dupe(u8, text);
+    if (turn.user_preview) |old| allocator.free(old);
+    turn.user_preview = try previewAlloc(allocator, text);
 }
 
 fn attachAssistantMessage(allocator: std.mem.Allocator, turn: *TurnRecord, text: []const u8) !void {
