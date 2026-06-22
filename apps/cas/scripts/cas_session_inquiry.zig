@@ -306,6 +306,11 @@ const FiaAnswer = struct {
     unsupported_claims: []const []const u8,
 };
 
+const LaneExecutionResult = struct {
+    receipt_valid: bool,
+    retryable: bool,
+};
+
 const ForkPolicyProof = struct {
     ephemeral: bool = false,
     read_only: bool = false,
@@ -1377,7 +1382,7 @@ fn executeLiveInquiry(
             const lane_event = try stringifyAnyAlloc(allocator, .{ .event = "lane_start_attempt", .lane_id = lane.lane_id, .ordinal = ordinal + 1, .lineage_mode = lineageMode(dcp).asString() });
             defer allocator.free(lane_event);
             try appendLine(events_path, lane_event);
-            const receipt_valid = try executeLaneFork(allocator, &client, options, inquiry_cwd, dcp, rip, lane, ordinal, receipt_dir, events_path, preflight);
+            const receipt_valid = try executeLaneForkWithRetries(allocator, &client, options, inquiry_cwd, dcp, rip, lane, ordinal, receipt_dir, events_path, preflight);
             if (receipt_valid) valid_count += 1 else invalid_count += 1;
         }
     }
@@ -1663,8 +1668,8 @@ fn waitDetachedInquiry(allocator: std.mem.Allocator, options: Options, inquiry_i
     var invalid_count: u64 = 0;
     for (lane_files) |lane_path| {
         const handle = try loadLaneHandleAlloc(allocator, lane_path);
-        const lane_valid = try collectLaneFork(allocator, &client, options, dcp, handle);
-        if (lane_valid) valid_count += 1 else invalid_count += 1;
+        const lane_result = try collectLaneFork(allocator, &client, options, dcp, handle);
+        if (lane_result.receipt_valid) valid_count += 1 else invalid_count += 1;
     }
 
     const terminal_state = if (invalid_count == 0) @tagName(InquiryState.completed) else if (valid_count > 0) @tagName(InquiryState.partially_completed) else @tagName(InquiryState.failed);
@@ -1964,9 +1969,79 @@ fn executeLaneFork(
     receipt_dir: []const u8,
     events_path: []const u8,
     preflight: PreflightResult,
-) !bool {
+) !LaneExecutionResult {
     const handle = try startLaneFork(allocator, client, options, inquiry_cwd, dcp, rip, lane, ordinal, receipt_dir, events_path, preflight);
     return collectLaneFork(allocator, client, options, dcp, handle);
+}
+
+fn executeLaneForkWithRetries(
+    allocator: std.mem.Allocator,
+    client: *cas_client.Client,
+    options: Options,
+    inquiry_cwd: []const u8,
+    dcp: Dcp,
+    rip: Rip,
+    lane: Lane,
+    ordinal: u64,
+    receipt_dir: []const u8,
+    events_path: []const u8,
+    preflight: PreflightResult,
+) !bool {
+    const max_attempts: u64 = 3;
+    var attempt: u64 = 0;
+    while (attempt < max_attempts) : (attempt += 1) {
+        const result = executeLaneFork(allocator, client, options, inquiry_cwd, dcp, rip, lane, ordinal, receipt_dir, events_path, preflight) catch |err| {
+            if (attempt + 1 < max_attempts and isRetryableLaneError(err)) {
+                try appendLaneRetryEvent(allocator, events_path, lane.lane_id, ordinal, attempt + 1, @errorName(err));
+                std.Io.sleep(std.Io.Threaded.global_single_threaded.io(), .fromMilliseconds(1500), .awake) catch {};
+                continue;
+            }
+            return err;
+        };
+        if (result.receipt_valid) return true;
+        if (result.retryable and attempt + 1 < max_attempts) {
+            try appendLaneRetryEvent(allocator, events_path, lane.lane_id, ordinal, attempt + 1, "empty_interrupted_turn");
+            std.Io.sleep(std.Io.Threaded.global_single_threaded.io(), .fromMilliseconds(1500), .awake) catch {};
+            continue;
+        }
+        return false;
+    }
+    return false;
+}
+
+fn appendLaneRetryEvent(
+    allocator: std.mem.Allocator,
+    events_path: []const u8,
+    lane_id: []const u8,
+    ordinal: u64,
+    attempt: u64,
+    reason: []const u8,
+) !void {
+    const event = try stringifyAnyAlloc(allocator, .{
+        .event = "lane_retry",
+        .lane_id = lane_id,
+        .ordinal = ordinal + 1,
+        .attempt = attempt,
+        .next_attempt = attempt + 1,
+        .reason = reason,
+    });
+    defer allocator.free(event);
+    try appendLine(events_path, event);
+}
+
+fn isRetryableLaneError(err: anyerror) bool {
+    return switch (err) {
+        error.RequestFailed,
+        error.AppServerClosed,
+        error.ConnectionResetByPeer,
+        error.BrokenPipe,
+        error.EndOfStream,
+        error.InquiryTransportLost,
+        error.ForkFailed,
+        error.TurnStartFailed,
+        => true,
+        else => false,
+    };
 }
 
 fn startLaneFork(
@@ -2265,7 +2340,7 @@ fn collectLaneFork(
     options: Options,
     dcp: Dcp,
     handle: LaneHandle,
-) !bool {
+) !LaneExecutionResult {
     const observed = try waitForTurnObservation(allocator, client, handle.fork_thread_id, handle.turn_id, options.timeout_ms, handle.lane_events);
     const final_text = if (observed.final_text.len > 0) observed.final_text else "";
     try writeTextAtomic(allocator, handle.lane_final, final_text);
@@ -2371,7 +2446,10 @@ fn collectLaneFork(
     };
     try writeJsonFile(allocator, handle.lane_receipt, receipt);
     try writeLaneHandle(allocator, handle, if (receipt_valid) @tagName(InquiryState.completed) else @tagName(InquiryState.failed));
-    return receipt_valid;
+    return .{
+        .receipt_valid = receipt_valid,
+        .retryable = !receipt_valid and observed.terminal and std.mem.eql(u8, observed.status, "interrupted") and final_text.len == 0 and !blocking_event,
+    };
 }
 
 fn writeLaneHandle(allocator: std.mem.Allocator, handle: LaneHandle, state: []const u8) !void {
@@ -2477,6 +2555,7 @@ const baseInquiryInstructions =
 ;
 
 fn buildInquiryPromptAlloc(allocator: std.mem.Allocator, rip: Rip, lane: Lane) ![]const u8 {
+    const hindsight_literal = if (std.mem.eql(u8, lane.temporal_horizon, "outcome_aware")) "true" else "false";
     return std.fmt.allocPrint(allocator,
         \\fork_inquiry_request:
         \\  objective: {s}
@@ -2488,15 +2567,32 @@ fn buildInquiryPromptAlloc(allocator: std.mem.Allocator, rip: Rip, lane: Lane) !
         \\{s}
         \\---
         \\
-        \\Return JSON with key fork_inquiry_answer and answer_version FIA-v1.
+        \\Return only one JSON object. Do not include Echo, markdown fences, prose, or private reasoning.
+        \\The JSON must match this shape exactly:
+        \\{{
+        \\  "fork_inquiry_answer": {{
+        \\    "answer_version": "FIA-v1",
+        \\    "reconstructed_decision": "<concise answer to the lane question>",
+        \\    "selected_route": "<selected route, verdict, or closure decision>",
+        \\    "rejected_routes": [],
+        \\    "evidence_refs": [],
+        \\    "assumptions": [],
+        \\    "alternatives": [],
+        \\    "route_flip_conditions": [],
+        \\    "uncertainty": "low|medium|high",
+        \\    "hindsight_available": {s},
+        \\    "unsupported_claims": []
+        \\  }}
+        \\}}
         \\
-    , .{ rip.objective, lane.lane_id, lane.inquiry_mode, lane.temporal_horizon, lane.prompt_template });
+    , .{ rip.objective, lane.lane_id, lane.inquiry_mode, lane.temporal_horizon, lane.prompt_template, hindsight_literal });
 }
 
 fn buildRolloutInquiryPromptAlloc(allocator: std.mem.Allocator, dcp: Dcp, rip: Rip, lane: Lane, anchor: Anchor) ![]const u8 {
     const rollout_path = dcp.source_rollout_path orelse return error.SourceNotFound;
     var trace = try canonical_trace.parseSessionTrace(allocator, rollout_path, .{});
     defer trace.deinit(allocator);
+    const hindsight_literal = if (std.mem.eql(u8, lane.temporal_horizon, "outcome_aware")) "true" else "false";
 
     var out = std.Io.Writer.Allocating.init(allocator);
     errdefer out.deinit();
@@ -2531,9 +2627,27 @@ fn buildRolloutInquiryPromptAlloc(allocator: std.mem.Allocator, dcp: Dcp, rip: R
     }
     try writer.writeAll(
         \\
-        \\Return JSON with key fork_inquiry_answer and answer_version FIA-v1.
-        \\
+        \\Return only one JSON object. Do not include Echo, markdown fences, prose, or private reasoning.
+        \\The JSON must match this shape exactly:
     );
+    try writer.print(
+        \\{{
+        \\  "fork_inquiry_answer": {{
+        \\    "answer_version": "FIA-v1",
+        \\    "reconstructed_decision": "<concise answer to the lane question>",
+        \\    "selected_route": "<selected route, verdict, or closure decision>",
+        \\    "rejected_routes": [],
+        \\    "evidence_refs": [],
+        \\    "assumptions": [],
+        \\    "alternatives": [],
+        \\    "route_flip_conditions": [],
+        \\    "uncertainty": "low|medium|high",
+        \\    "hindsight_available": {s},
+        \\    "unsupported_claims": []
+        \\  }}
+        \\}}
+        \\
+    , .{hindsight_literal});
     return try out.toOwnedSlice();
 }
 
@@ -2696,7 +2810,7 @@ fn isTerminalTurnStatus(status: []const u8) bool {
 
 fn parseFiaAnswerAlloc(allocator: std.mem.Allocator, final_text: []const u8, expected_hindsight: bool) !FiaAnswer {
     const json_text = try extractJsonAnswerText(allocator, final_text);
-    defer if (json_text.ptr != final_text.ptr) allocator.free(json_text);
+    defer allocator.free(json_text);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_text, .{});
     defer parsed.deinit();
     const root = switch (parsed.value) {
@@ -2704,7 +2818,8 @@ fn parseFiaAnswerAlloc(allocator: std.mem.Allocator, final_text: []const u8, exp
         else => return error.AnswerParseFailed,
     };
     const answer = core_json.objectField(root, "fork_inquiry_answer") orelse root;
-    if (!std.mem.eql(u8, try requiredString(answer, "answer_version"), "FIA-v1")) return error.AnswerParseFailed;
+    const answer_version = optionalString(answer, "answer_version") orelse optionalString(root, "answer_version") orelse return error.AnswerParseFailed;
+    if (!std.mem.eql(u8, answer_version, "FIA-v1")) return error.AnswerParseFailed;
     if (answer.get("private_reasoning") != null or answer.get("chain_of_thought") != null) return error.AnswerParseFailed;
     const hindsight = parseHindsight(answer) orelse return error.HindsightMismatch;
     if (hindsight != expected_hindsight) return error.HindsightMismatch;
@@ -2722,16 +2837,50 @@ fn parseFiaAnswerAlloc(allocator: std.mem.Allocator, final_text: []const u8, exp
     };
 }
 
-fn extractJsonAnswerText(allocator: std.mem.Allocator, final_text: []const u8) ![]const u8 {
+fn extractJsonAnswerText(allocator: std.mem.Allocator, final_text: []const u8) ![]u8 {
     const trimmed = std.mem.trim(u8, final_text, " \t\r\n");
-    if (trimmed.len > 0 and trimmed[0] == '{') return trimmed;
-    const fence = std.mem.indexOf(u8, trimmed, "```") orelse return error.AnswerParseFailed;
-    const after_open = trimmed[fence + 3 ..];
-    const line_end = std.mem.indexOfScalar(u8, after_open, '\n') orelse return error.AnswerParseFailed;
-    const body_start = fence + 3 + line_end + 1;
-    const rest = trimmed[body_start..];
-    const close_rel = std.mem.indexOf(u8, rest, "```") orelse return error.AnswerParseFailed;
-    return allocator.dupe(u8, std.mem.trim(u8, rest[0..close_rel], " \t\r\n"));
+    if (try extractBalancedJsonObjectAlloc(allocator, trimmed)) |json| return json;
+    if (std.mem.indexOf(u8, trimmed, "```")) |fence| {
+        const after_open = trimmed[fence + 3 ..];
+        const line_end = std.mem.indexOfScalar(u8, after_open, '\n') orelse return error.AnswerParseFailed;
+        const body_start = fence + 3 + line_end + 1;
+        const rest = trimmed[body_start..];
+        const close_rel = std.mem.indexOf(u8, rest, "```") orelse return error.AnswerParseFailed;
+        const fenced = std.mem.trim(u8, rest[0..close_rel], " \t\r\n");
+        if (try extractBalancedJsonObjectAlloc(allocator, fenced)) |json| return json;
+    }
+    return error.AnswerParseFailed;
+}
+
+fn extractBalancedJsonObjectAlloc(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
+    const start = std.mem.indexOfScalar(u8, text, '{') orelse return null;
+    var depth: usize = 0;
+    var in_string = false;
+    var escaped = false;
+    for (text[start..], 0..) |ch, rel_index| {
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (ch == '\\') {
+                escaped = true;
+            } else if (ch == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (ch == '"') {
+            in_string = true;
+        } else if (ch == '{') {
+            depth += 1;
+        } else if (ch == '}') {
+            if (depth == 0) return error.AnswerParseFailed;
+            depth -= 1;
+            if (depth == 0) {
+                return try allocator.dupe(u8, text[start .. start + rel_index + 1]);
+            }
+        }
+    }
+    return null;
 }
 
 fn parseHindsight(answer: std.json.ObjectMap) ?bool {
@@ -2759,7 +2908,7 @@ fn stringListAlloc(allocator: std.mem.Allocator, obj: std.json.ObjectMap, key: [
     for (arr, 0..) |item, index| {
         out[index] = switch (item) {
             .string => |text| try allocator.dupe(u8, text),
-            else => return error.AnswerParseFailed,
+            else => try core_json.stringifyValueAlloc(allocator, item),
         };
     }
     return out;
@@ -3947,6 +4096,64 @@ test "parseFiaAnswerAlloc accepts exact FIA JSON" {
     try std.testing.expectEqualStrings("route-a", answer.selected_route);
     try std.testing.expect(!answer.hindsight_available);
     try std.testing.expectEqual(@as(usize, 1), answer.evidence_refs.len);
+}
+
+test "parseFiaAnswerAlloc accepts root FIA version and leading text" {
+    const allocator = std.testing.allocator;
+    const raw =
+        \\Echo: user prompt
+        \\
+        \\{
+        \\  "answer_version": "FIA-v1",
+        \\  "fork_inquiry_answer": {
+        \\    "reconstructed_decision": "decide",
+        \\    "selected_route": "route-a",
+        \\    "rejected_routes": [],
+        \\    "evidence_refs": [],
+        \\    "assumptions": [],
+        \\    "alternatives": [],
+        \\    "route_flip_conditions": [],
+        \\    "uncertainty": "low",
+        \\    "hindsight_available": false,
+        \\    "unsupported_claims": []
+        \\  }
+        \\}
+    ;
+    const answer = try parseFiaAnswerAlloc(allocator, raw, false);
+    defer {
+        allocator.free(answer.reconstructed_decision);
+        allocator.free(answer.selected_route);
+        allocator.free(answer.uncertainty);
+        freeStringList(allocator, answer.rejected_routes);
+        freeStringList(allocator, answer.evidence_refs);
+        freeStringList(allocator, answer.assumptions);
+        freeStringList(allocator, answer.alternatives);
+        freeStringList(allocator, answer.route_flip_conditions);
+        freeStringList(allocator, answer.unsupported_claims);
+    }
+    try std.testing.expectEqualStrings("route-a", answer.selected_route);
+    try std.testing.expect(!answer.hindsight_available);
+}
+
+test "parseFiaAnswerAlloc normalizes structured list items" {
+    const allocator = std.testing.allocator;
+    const raw =
+        \\{"fork_inquiry_answer":{"answer_version":"FIA-v1","reconstructed_decision":"d","selected_route":"r","rejected_routes":[],"evidence_refs":[],"assumptions":[],"alternatives":[{"route":"isolated_conformance","why":"smaller"}],"route_flip_conditions":[],"uncertainty":"low","hindsight_available":false,"unsupported_claims":[]}}
+    ;
+    const answer = try parseFiaAnswerAlloc(allocator, raw, false);
+    defer {
+        allocator.free(answer.reconstructed_decision);
+        allocator.free(answer.selected_route);
+        allocator.free(answer.uncertainty);
+        freeStringList(allocator, answer.rejected_routes);
+        freeStringList(allocator, answer.evidence_refs);
+        freeStringList(allocator, answer.assumptions);
+        freeStringList(allocator, answer.alternatives);
+        freeStringList(allocator, answer.route_flip_conditions);
+        freeStringList(allocator, answer.unsupported_claims);
+    }
+    try std.testing.expectEqual(@as(usize, 1), answer.alternatives.len);
+    try std.testing.expect(std.mem.indexOf(u8, answer.alternatives[0], "\"isolated_conformance\"") != null);
 }
 
 test "parseFiaAnswerAlloc rejects hindsight mismatch" {
