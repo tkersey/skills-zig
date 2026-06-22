@@ -6422,9 +6422,12 @@ const ReviewCompilerAudit = struct {
         c3_required_sessions: usize = 0,
         c3_entered_sessions: usize = 0,
         c3_closed_sessions: usize = 0,
+        included_sessions: std.ArrayList(IncludedSession) = .empty,
         exclusions: std.ArrayList(Exclusion) = .empty,
 
         fn deinit(self: *Denominator, allocator: std.mem.Allocator) void {
+            for (self.included_sessions.items) |item| item.deinit(allocator);
+            self.included_sessions.deinit(allocator);
             for (self.exclusions.items) |item| item.deinit(allocator);
             self.exclusions.deinit(allocator);
         }
@@ -6438,6 +6441,66 @@ const ReviewCompilerAudit = struct {
         fn deinit(self: Exclusion, allocator: std.mem.Allocator) void {
             if (self.session_id) |id| allocator.free(id);
             allocator.free(self.path);
+            allocator.free(self.reason);
+        }
+    };
+
+    const IncludedSession = struct {
+        session_id: ?[]u8 = null,
+        path: []u8,
+        protocol: []u8,
+        classification: []u8,
+        c3_required: bool,
+        c3_entered: bool,
+        c3_closed: bool,
+        evidence: IncludedSessionEvidence,
+
+        fn deinit(self: IncludedSession, allocator: std.mem.Allocator) void {
+            if (self.session_id) |id| allocator.free(id);
+            allocator.free(self.path);
+            allocator.free(self.protocol);
+            allocator.free(self.classification);
+            self.evidence.deinit(allocator);
+        }
+    };
+
+    const IncludedSessionEvidence = struct {
+        true_c3: SignalEvidenceRef,
+        required: SignalEvidenceRef,
+        entered: SignalEvidenceRef,
+        closed: SignalEvidenceRef,
+        closure_compression: ClosureCompressionEvidence,
+
+        fn deinit(self: IncludedSessionEvidence, allocator: std.mem.Allocator) void {
+            self.true_c3.deinit(allocator);
+            self.required.deinit(allocator);
+            self.entered.deinit(allocator);
+            self.closed.deinit(allocator);
+            self.closure_compression.deinit(allocator);
+        }
+    };
+
+    const SignalEvidenceRef = struct {
+        present: bool,
+        source: []u8,
+        timestamp: ?[]u8 = null,
+        snippet: ?[]u8 = null,
+        reason: []u8,
+
+        fn deinit(self: SignalEvidenceRef, allocator: std.mem.Allocator) void {
+            allocator.free(self.source);
+            if (self.timestamp) |value| allocator.free(value);
+            if (self.snippet) |value| allocator.free(value);
+            allocator.free(self.reason);
+        }
+    };
+
+    const ClosureCompressionEvidence = struct {
+        summary_state: ClosureCompressionState,
+        reason: []u8,
+        missing_compression_evidence: MissingCompressionEvidence = .{},
+
+        fn deinit(self: ClosureCompressionEvidence, allocator: std.mem.Allocator) void {
             allocator.free(self.reason);
         }
     };
@@ -6814,6 +6877,12 @@ const ReviewCompilerAudit = struct {
     }
 };
 
+const ReviewCompilerBorrowedEvidenceRef = struct {
+    source: []const u8,
+    timestamp: ?[]const u8 = null,
+    snippet: []const u8,
+};
+
 const ReviewCompilerSessionSignals = struct {
     candidate: bool = false,
     true_resolve: bool = false,
@@ -6833,9 +6902,12 @@ const ReviewCompilerSessionSignals = struct {
     non_branch_liability_seen: bool = false,
     clean_review_seen: bool = false,
     isolated_waiver_seen: bool = false,
+    true_c3_evidence: ?ReviewCompilerBorrowedEvidenceRef = null,
     c3_begin_seen: bool = false,
+    c3_begin_evidence: ?ReviewCompilerBorrowedEvidenceRef = null,
     c3_begin_at_ms: ?i64 = null,
     c3_closed_seen: bool = false,
+    c3_closed_evidence: ?ReviewCompilerBorrowedEvidenceRef = null,
     c3_closed_at_ms: ?i64 = null,
     c3_aborted_at_ms: ?i64 = null,
     c3_basis_seen: bool = false,
@@ -7056,6 +7128,7 @@ fn cmdReviewCompilerAudit(allocator: std.mem.Allocator, sessions_root: []const u
         try recordReviewCompilerMessages(allocator, &audit, messages, opts, &signals, parsed.session.session_id);
         try recordReviewCompilerTools(allocator, &audit, parsed, repo_root, opts, &signals);
         finalizeReviewCompilerCompliance(&audit, signals);
+        if (signals.true_c3) try addReviewCompilerC3IncludedSession(allocator, &audit, signals, parsed.session.session_id, path);
     }
 
     const fmt = if (opts.format_set) opts.format else output.Format.markdown;
@@ -7200,6 +7273,7 @@ fn summarizeReviewCompilerSession(
             signals.candidate = true;
             signals.true_c3 = true;
             signals.true_resolve = true;
+            recordReviewCompilerEvidenceRef(&signals.true_c3_evidence, "message", message.timestamp, message.text);
         }
         if (containsTrueMBKEvidence(message.text)) {
             signals.candidate = true;
@@ -7213,6 +7287,8 @@ fn summarizeReviewCompilerSession(
             signals.candidate = true;
             signals.true_c3 = true;
             signals.true_resolve = true;
+            const tool_text = reviewCompilerToolText(tool);
+            recordReviewCompilerEvidenceRef(&signals.true_c3_evidence, "tool", toolTimestamp(parsed, tool), tool_text);
         }
         if (toolHasMBKEvidence(tool)) {
             signals.candidate = true;
@@ -7319,6 +7395,15 @@ fn containsTrueC3Evidence(text: []const u8) bool {
     });
 }
 
+fn recordReviewCompilerEvidenceRef(slot: *?ReviewCompilerBorrowedEvidenceRef, source: []const u8, timestamp: ?[]const u8, text: []const u8) void {
+    if (slot.* != null) return;
+    slot.* = .{
+        .source = source,
+        .timestamp = timestamp,
+        .snippet = firstNonEmptyLine(text),
+    };
+}
+
 fn toolHasC3Evidence(tool: canonical_trace.ToolLifecycleRecord) bool {
     if (tool.lifecycle_status != .completed) return false;
     if (tool.kind == .exec_command and (tool.exit_code orelse -1) != 0) return false;
@@ -7399,7 +7484,7 @@ fn recordReviewCompilerMessages(
         if (containsAnyIgnoreCaseAscii(text, &.{ "holdout_findings_added_to_scope", "holdout findings added" })) audit.legacy_cleanroom.review_horizon.holdout_findings_added_to_scope += 1;
         if (containsAnyIgnoreCaseAscii(text, &.{ "holdout_followups_captured", "holdout followups captured", "holdout follow-ups captured" })) audit.legacy_cleanroom.review_horizon.holdout_followups_captured += 1;
 
-        recordReviewCompilerC3Text(audit, text, message.timestamp, signals);
+        recordReviewCompilerC3Text(audit, text, message.timestamp, "message", signals);
         if (signals.true_mbk) try recordReviewCompilerMBKText(allocator, audit, text, message.timestamp, signals, session_id, "message");
     }
 }
@@ -7410,6 +7495,7 @@ fn recordReviewCompilerC3Text(
     audit: *ReviewCompilerAudit,
     text: []const u8,
     timestamp: ?[]const u8,
+    source: []const u8,
     signals: *ReviewCompilerSessionSignals,
 ) void {
     if (containsAnyIgnoreCaseAscii(text, &.{ "clean_review: true", "clean review", "clean_review_session" })) signals.clean_review_seen = true;
@@ -7419,6 +7505,7 @@ fn recordReviewCompilerC3Text(
     if (containsAnyIgnoreCaseAscii(text, &.{ "resolve-c3 begin", "\"event\":\"begin\"", "\"event\": \"begin\"", "\nbegin\n" })) {
         audit.c3.controller.begin_events += 1;
         signals.c3_begin_seen = true;
+        recordReviewCompilerEvidenceRef(&signals.c3_begin_evidence, source, timestamp, text);
         recordReviewCompilerC3Time(signals, .begin, timestamp);
     }
     if (containsIgnoreCaseAscii(text, ".ledger/c3/state.json")) audit.c3.controller.state_files += 1;
@@ -7437,6 +7524,7 @@ fn recordReviewCompilerC3Text(
         audit.c3.controller.mrpc_closed += 1;
         audit.c3.delivery.closed_runs += 1;
         signals.c3_closed_seen = true;
+        recordReviewCompilerEvidenceRef(&signals.c3_closed_evidence, source, timestamp, text);
         recordReviewCompilerC3Time(signals, .closed, timestamp);
     }
     if (containsAnyIgnoreCaseAscii(text, &.{ "aborted", "\"event\":\"aborted\"", "\"event\": \"aborted\"" })) recordReviewCompilerC3Time(signals, .aborted, timestamp);
@@ -7718,7 +7806,7 @@ fn recordReviewCompilerTools(
         const is_lab = toolLooksReviewLab(tool, signals.*);
         const tool_text = reviewCompilerToolText(tool);
         if (toolHasC3Evidence(tool) or containsReviewCompilerCandidateCue(tool_text)) {
-            recordReviewCompilerC3Text(audit, tool_text, toolTimestamp(parsed, tool), signals);
+            recordReviewCompilerC3Text(audit, tool_text, toolTimestamp(parsed, tool), "tool", signals);
         }
         if (signals.true_mbk and containsReviewCompilerMBKToolAccountingCue(tool_text)) {
             try recordReviewCompilerMBKText(allocator, audit, tool_text, toolTimestamp(parsed, tool), signals, parsed.session.session_id, "tool");
@@ -7775,6 +7863,7 @@ fn recordReviewCompilerTools(
                 audit.c3.delivery.closed_runs += 1;
                 audit.c3.controller.mrpc_closed += 1;
                 signals.c3_closed_seen = true;
+                recordReviewCompilerEvidenceRef(&signals.c3_closed_evidence, "tool", toolTimestamp(parsed, tool), cmd);
                 recordReviewCompilerC3Time(signals, .closed, toolTimestamp(parsed, tool));
             }
             if (containsGitCommitCommand(cmd)) {
@@ -8320,6 +8409,154 @@ fn finalizeReviewCompilerC3ClosureCompression(audit: *ReviewCompilerAudit, signa
     if (signals.c3_commit_or_push_bypass_seen) missing.commit_or_push_bypass += 1;
 }
 
+fn addReviewCompilerC3IncludedSession(
+    allocator: std.mem.Allocator,
+    audit: *ReviewCompilerAudit,
+    signals: ReviewCompilerSessionSignals,
+    session_id: ?[]const u8,
+    path: []const u8,
+) !void {
+    const required = reviewCompilerC3Material(signals);
+    const classification: []const u8 = if (signals.clean_review_seen)
+        "clean_review"
+    else if (signals.isolated_waiver_seen)
+        "isolated_waiver"
+    else
+        "material_c3";
+    const protocol: []const u8 = if (signals.c3_mrpc_seen) "c3-mrpc" else "c3";
+
+    try audit.denominator.included_sessions.append(allocator, .{
+        .session_id = if (session_id) |id| try allocator.dupe(u8, id) else null,
+        .path = try allocator.dupe(u8, path),
+        .protocol = try allocator.dupe(u8, protocol),
+        .classification = try allocator.dupe(u8, classification),
+        .c3_required = required,
+        .c3_entered = signals.c3_begin_seen,
+        .c3_closed = signals.c3_closed_seen,
+        .evidence = .{
+            .true_c3 = try reviewCompilerOwnedEvidenceFromSignal(allocator, signals.true_c3_evidence, "true_c3_signal_present", "missing_true_c3_signal"),
+            .required = try reviewCompilerOwnedDerivedEvidence(allocator, required, if (required) "true_c3 && !clean_review_seen && !isolated_waiver_seen" else if (signals.clean_review_seen) "clean_review_session" else if (signals.isolated_waiver_seen) "isolated_waiver_session" else "no_true_c3_signal"),
+            .entered = try reviewCompilerOwnedEvidenceFromSignal(allocator, signals.c3_begin_evidence, "c3_begin_signal_present", "no_c3_begin_signal"),
+            .closed = try reviewCompilerOwnedEvidenceFromSignal(allocator, signals.c3_closed_evidence, "c3_closed_signal_present", "no_c3_closed_signal"),
+            .closure_compression = try reviewCompilerC3ClosureEvidence(allocator, signals),
+        },
+    });
+}
+
+fn reviewCompilerC3Material(signals: ReviewCompilerSessionSignals) bool {
+    return signals.true_c3 and !signals.clean_review_seen and !signals.isolated_waiver_seen;
+}
+
+fn reviewCompilerC3PermitOk(signals: ReviewCompilerSessionSignals) bool {
+    return signals.c3_apply_certified_seen or signals.c3_final_certified_seen;
+}
+
+fn reviewCompilerC3StaleMRPC(signals: ReviewCompilerSessionSignals) bool {
+    return signals.c3_mrpc_seen and signals.c3_raw_delivery_mutation_seen;
+}
+
+fn reviewCompilerC3CompressionOk(signals: ReviewCompilerSessionSignals) bool {
+    return signals.c3_basis_seen and
+        signals.c3_tournament_seen and
+        signals.c3_ablation_seen and
+        signals.c3_proof_seen and
+        signals.c3_holdout_seen and
+        reviewCompilerC3PermitOk(signals) and
+        !reviewCompilerC3StaleMRPC(signals) and
+        !signals.c3_raw_delivery_mutation_seen and
+        !signals.c3_commit_or_push_bypass_seen;
+}
+
+fn reviewCompilerOwnedEvidenceFromSignal(
+    allocator: std.mem.Allocator,
+    evidence: ?ReviewCompilerBorrowedEvidenceRef,
+    present_reason: []const u8,
+    absent_reason: []const u8,
+) !ReviewCompilerAudit.SignalEvidenceRef {
+    if (evidence) |ref| {
+        return .{
+            .present = true,
+            .source = try allocator.dupe(u8, ref.source),
+            .timestamp = if (ref.timestamp) |timestamp| try allocator.dupe(u8, timestamp) else null,
+            .snippet = try allocator.dupe(u8, ref.snippet),
+            .reason = try allocator.dupe(u8, present_reason),
+        };
+    }
+    return .{
+        .present = false,
+        .source = try allocator.dupe(u8, "absent"),
+        .timestamp = null,
+        .snippet = null,
+        .reason = try allocator.dupe(u8, absent_reason),
+    };
+}
+
+fn reviewCompilerOwnedDerivedEvidence(
+    allocator: std.mem.Allocator,
+    present: bool,
+    reason: []const u8,
+) !ReviewCompilerAudit.SignalEvidenceRef {
+    return .{
+        .present = present,
+        .source = try allocator.dupe(u8, "derived"),
+        .timestamp = null,
+        .snippet = null,
+        .reason = try allocator.dupe(u8, reason),
+    };
+}
+
+fn reviewCompilerC3ClosureEvidence(
+    allocator: std.mem.Allocator,
+    signals: ReviewCompilerSessionSignals,
+) !ReviewCompilerAudit.ClosureCompressionEvidence {
+    const material_c3 = reviewCompilerC3Material(signals);
+    const closed = signals.c3_closed_seen;
+    if (!closed and material_c3) {
+        return .{
+            .summary_state = .blocked,
+            .reason = try allocator.dupe(u8, "material_c3_not_closed"),
+            .missing_compression_evidence = reviewCompilerC3MissingCompressionEvidence(signals),
+        };
+    }
+    if (!closed) {
+        return .{
+            .summary_state = .none,
+            .reason = try allocator.dupe(u8, "not_closed_and_compression_not_required"),
+        };
+    }
+    if (!material_c3) {
+        return .{
+            .summary_state = .closed,
+            .reason = try allocator.dupe(u8, "closed_compression_not_required"),
+        };
+    }
+    if (reviewCompilerC3CompressionOk(signals)) {
+        return .{
+            .summary_state = .closed,
+            .reason = try allocator.dupe(u8, "closed_with_required_compression_evidence"),
+        };
+    }
+    return .{
+        .summary_state = .closed_uncompressed,
+        .reason = try allocator.dupe(u8, "closed_material_c3_missing_compression_evidence"),
+        .missing_compression_evidence = reviewCompilerC3MissingCompressionEvidence(signals),
+    };
+}
+
+fn reviewCompilerC3MissingCompressionEvidence(signals: ReviewCompilerSessionSignals) ReviewCompilerAudit.MissingCompressionEvidence {
+    var missing: ReviewCompilerAudit.MissingCompressionEvidence = .{};
+    if (!signals.c3_basis_seen) missing.basis += 1;
+    if (!signals.c3_tournament_seen) missing.tournament += 1;
+    if (!signals.c3_ablation_seen) missing.ablation += 1;
+    if (!signals.c3_proof_seen) missing.proof += 1;
+    if (!signals.c3_holdout_seen) missing.holdout += 1;
+    if (!reviewCompilerC3PermitOk(signals)) missing.permit += 1;
+    if (reviewCompilerC3StaleMRPC(signals)) missing.stale_mrpc += 1;
+    if (signals.c3_raw_delivery_mutation_seen) missing.direct_review_to_delivery_mutation += 1;
+    if (signals.c3_commit_or_push_bypass_seen) missing.commit_or_push_bypass += 1;
+    return missing;
+}
+
 fn writeReviewCompilerAuditMarkdown(allocator: std.mem.Allocator, audit: ReviewCompilerAudit, out_path: ?[]const u8) !void {
     var writer_alloc = std.Io.Writer.Allocating.init(allocator);
     defer writer_alloc.deinit();
@@ -8361,6 +8598,7 @@ fn writeReviewCompilerAuditYamlBody(writer: anytype, audit: ReviewCompilerAudit,
             try writer.writeByte('\n');
         }
     }
+    if (protocol == .c3 or protocol == .c3_mrpc) try writeReviewCompilerIncludedSessionsYaml(writer, audit.denominator.included_sessions.items, indent);
     if (protocol == .c3 or protocol == .c3_mrpc) try writeReviewCompilerC3YamlBody(writer, audit, indent);
     try writeReviewCompilerLegacyYamlBody(writer, audit.legacy_cleanroom, indent);
 }
@@ -8461,6 +8699,58 @@ fn writeReviewCompilerClosureCompressionYaml(writer: anytype, closure: ReviewCom
     try writer.print("{s}  missing_compression_evidence:\n{s}    basis: {d}\n{s}    tournament: {d}\n{s}    ablation: {d}\n{s}    proof: {d}\n{s}    holdout: {d}\n{s}    permit: {d}\n{s}    stale_mrpc: {d}\n{s}    direct_review_to_delivery_mutation: {d}\n{s}    commit_or_push_bypass: {d}\n", .{ indent, indent, missing.basis, indent, missing.tournament, indent, missing.ablation, indent, missing.proof, indent, missing.holdout, indent, missing.permit, indent, missing.stale_mrpc, indent, missing.direct_review_to_delivery_mutation, indent, missing.commit_or_push_bypass });
 }
 
+fn writeReviewCompilerIncludedSessionsYaml(writer: anytype, rows: []const ReviewCompilerAudit.IncludedSession, indent: []const u8) !void {
+    try writer.print("{s}  included_sessions:", .{indent});
+    if (rows.len == 0) {
+        try writer.writeAll(" []\n");
+        return;
+    }
+    try writer.writeByte('\n');
+    for (rows) |row| {
+        try writer.print("{s}    - session_id: ", .{indent});
+        if (row.session_id) |id| try writeYamlInlineString(writer, id) else try writer.writeAll("null");
+        try writer.writeByte('\n');
+        try writer.print("{s}      path: ", .{indent});
+        try writeYamlInlineString(writer, row.path);
+        try writer.writeByte('\n');
+        try writer.print("{s}      protocol: ", .{indent});
+        try writeYamlInlineString(writer, row.protocol);
+        try writer.writeByte('\n');
+        try writer.print("{s}      classification: ", .{indent});
+        try writeYamlInlineString(writer, row.classification);
+        try writer.writeByte('\n');
+        try writer.print("{s}      c3_required: {any}\n{s}      c3_entered: {any}\n{s}      c3_closed: {any}\n{s}      evidence:\n", .{ indent, row.c3_required, indent, row.c3_entered, indent, row.c3_closed, indent });
+        try writeReviewCompilerSignalEvidenceYaml(writer, "true_c3", row.evidence.true_c3, indent, "        ");
+        try writeReviewCompilerSignalEvidenceYaml(writer, "required", row.evidence.required, indent, "        ");
+        try writeReviewCompilerSignalEvidenceYaml(writer, "entered", row.evidence.entered, indent, "        ");
+        try writeReviewCompilerSignalEvidenceYaml(writer, "closed", row.evidence.closed, indent, "        ");
+        try writeReviewCompilerClosureEvidenceYaml(writer, row.evidence.closure_compression, indent, "        ");
+    }
+}
+
+fn writeReviewCompilerSignalEvidenceYaml(writer: anytype, name: []const u8, evidence: ReviewCompilerAudit.SignalEvidenceRef, indent: []const u8, extra: []const u8) !void {
+    try writer.print("{s}{s}{s}:\n{s}{s}  present: {any}\n{s}{s}  source: ", .{ indent, extra, name, indent, extra, evidence.present, indent, extra });
+    try writeYamlInlineString(writer, evidence.source);
+    try writer.writeByte('\n');
+    try writer.print("{s}{s}  timestamp: ", .{ indent, extra });
+    if (evidence.timestamp) |timestamp| try writeYamlInlineString(writer, timestamp) else try writer.writeAll("null");
+    try writer.writeByte('\n');
+    try writer.print("{s}{s}  snippet: ", .{ indent, extra });
+    if (evidence.snippet) |snippet| try writeYamlInlineString(writer, snippet) else try writer.writeAll("null");
+    try writer.writeByte('\n');
+    try writer.print("{s}{s}  reason: ", .{ indent, extra });
+    try writeYamlInlineString(writer, evidence.reason);
+    try writer.writeByte('\n');
+}
+
+fn writeReviewCompilerClosureEvidenceYaml(writer: anytype, evidence: ReviewCompilerAudit.ClosureCompressionEvidence, indent: []const u8, extra: []const u8) !void {
+    const missing = evidence.missing_compression_evidence;
+    try writer.print("{s}{s}closure_compression:\n{s}{s}  summary_state: {s}\n{s}{s}  reason: ", .{ indent, extra, indent, extra, evidence.summary_state.label(), indent, extra });
+    try writeYamlInlineString(writer, evidence.reason);
+    try writer.writeByte('\n');
+    try writer.print("{s}{s}  missing_compression_evidence:\n{s}{s}    basis: {d}\n{s}{s}    tournament: {d}\n{s}{s}    ablation: {d}\n{s}{s}    proof: {d}\n{s}{s}    holdout: {d}\n{s}{s}    permit: {d}\n{s}{s}    stale_mrpc: {d}\n{s}{s}    direct_review_to_delivery_mutation: {d}\n{s}{s}    commit_or_push_bypass: {d}\n", .{ indent, extra, indent, extra, missing.basis, indent, extra, missing.tournament, indent, extra, missing.ablation, indent, extra, missing.proof, indent, extra, missing.holdout, indent, extra, missing.permit, indent, extra, missing.stale_mrpc, indent, extra, missing.direct_review_to_delivery_mutation, indent, extra, missing.commit_or_push_bypass });
+}
+
 fn writeReviewCompilerLegacyYamlBody(writer: anytype, legacy: ReviewCompilerAudit.LegacyCleanroom, indent: []const u8) !void {
     try writer.print("{s}legacy_cleanroom:\n", .{indent});
     try writer.print("{s}  cleanroom:\n{s}    delivery_freezes: {d}\n{s}    counterexample_contracts: {d}\n{s}    delivery_recipes: {d}\n{s}    ablation_certificates: {d}\n{s}    compiled_delivery_permits: {d}\n", .{ indent, indent, legacy.cleanroom.delivery_freezes, indent, legacy.cleanroom.counterexample_contracts, indent, legacy.cleanroom.delivery_recipes, indent, legacy.cleanroom.ablation_certificates, indent, legacy.cleanroom.compiled_delivery_permits });
@@ -8526,6 +8816,11 @@ fn writeReviewCompilerAuditJson(allocator: std.mem.Allocator, audit: ReviewCompi
         try output.writeJsonString(writer, item.reason);
         try writer.writeAll(" }");
     }
+    try writer.writeAll("], \"included_sessions\": [");
+    for (audit.denominator.included_sessions.items, 0..) |item, idx| {
+        if (idx > 0) try writer.writeAll(", ");
+        try writeReviewCompilerIncludedSessionJson(writer, item);
+    }
     try writer.writeAll("] },\n");
     const protocol = audit.outputProtocol();
     if (protocol == .c3 or protocol == .c3_mrpc) {
@@ -8572,6 +8867,50 @@ fn writeReviewCompilerClosureCompressionJson(writer: anytype, closure: ReviewCom
     try writer.print("    \"closure_compression\": {{ \"summary_state\": ", .{});
     try output.writeJsonString(writer, closure.summaryState().label());
     try writer.print(", \"closed_total\": {d}, \"closed_compressed\": {d}, \"closed_uncompressed\": {d}, \"blocked\": {d}, \"compression_not_required\": {d}, \"missing_compression_evidence\": {{ \"basis\": {d}, \"tournament\": {d}, \"ablation\": {d}, \"proof\": {d}, \"holdout\": {d}, \"permit\": {d}, \"stale_mrpc\": {d}, \"direct_review_to_delivery_mutation\": {d}, \"commit_or_push_bypass\": {d} }} }}", .{ closure.closed_total, closure.closed_compressed, closure.closed_uncompressed, closure.blocked, closure.compression_not_required, missing.basis, missing.tournament, missing.ablation, missing.proof, missing.holdout, missing.permit, missing.stale_mrpc, missing.direct_review_to_delivery_mutation, missing.commit_or_push_bypass });
+}
+
+fn writeReviewCompilerIncludedSessionJson(writer: anytype, row: ReviewCompilerAudit.IncludedSession) !void {
+    try writer.writeAll("{ \"session_id\": ");
+    if (row.session_id) |id| try output.writeJsonString(writer, id) else try writer.writeAll("null");
+    try writer.writeAll(", \"path\": ");
+    try output.writeJsonString(writer, row.path);
+    try writer.writeAll(", \"protocol\": ");
+    try output.writeJsonString(writer, row.protocol);
+    try writer.writeAll(", \"classification\": ");
+    try output.writeJsonString(writer, row.classification);
+    try writer.print(", \"c3_required\": {any}, \"c3_entered\": {any}, \"c3_closed\": {any}, \"evidence\": {{ ", .{ row.c3_required, row.c3_entered, row.c3_closed });
+    try writer.writeAll("\"true_c3\": ");
+    try writeReviewCompilerSignalEvidenceJson(writer, row.evidence.true_c3);
+    try writer.writeAll(", \"required\": ");
+    try writeReviewCompilerSignalEvidenceJson(writer, row.evidence.required);
+    try writer.writeAll(", \"entered\": ");
+    try writeReviewCompilerSignalEvidenceJson(writer, row.evidence.entered);
+    try writer.writeAll(", \"closed\": ");
+    try writeReviewCompilerSignalEvidenceJson(writer, row.evidence.closed);
+    try writer.writeAll(", \"closure_compression\": ");
+    try writeReviewCompilerClosureEvidenceJson(writer, row.evidence.closure_compression);
+    try writer.writeAll(" } }");
+}
+
+fn writeReviewCompilerSignalEvidenceJson(writer: anytype, evidence: ReviewCompilerAudit.SignalEvidenceRef) !void {
+    try writer.print("{{ \"present\": {any}, \"source\": ", .{evidence.present});
+    try output.writeJsonString(writer, evidence.source);
+    try writer.writeAll(", \"timestamp\": ");
+    if (evidence.timestamp) |timestamp| try output.writeJsonString(writer, timestamp) else try writer.writeAll("null");
+    try writer.writeAll(", \"snippet\": ");
+    if (evidence.snippet) |snippet| try output.writeJsonString(writer, snippet) else try writer.writeAll("null");
+    try writer.writeAll(", \"reason\": ");
+    try output.writeJsonString(writer, evidence.reason);
+    try writer.writeAll(" }");
+}
+
+fn writeReviewCompilerClosureEvidenceJson(writer: anytype, evidence: ReviewCompilerAudit.ClosureCompressionEvidence) !void {
+    const missing = evidence.missing_compression_evidence;
+    try writer.writeAll("{ \"summary_state\": ");
+    try output.writeJsonString(writer, evidence.summary_state.label());
+    try writer.writeAll(", \"reason\": ");
+    try output.writeJsonString(writer, evidence.reason);
+    try writer.print(", \"missing_compression_evidence\": {{ \"basis\": {d}, \"tournament\": {d}, \"ablation\": {d}, \"proof\": {d}, \"holdout\": {d}, \"permit\": {d}, \"stale_mrpc\": {d}, \"direct_review_to_delivery_mutation\": {d}, \"commit_or_push_bypass\": {d} }} }}", .{ missing.basis, missing.tournament, missing.ablation, missing.proof, missing.holdout, missing.permit, missing.stale_mrpc, missing.direct_review_to_delivery_mutation, missing.commit_or_push_bypass });
 }
 
 fn writeReviewCompilerMBKJsonFields(writer: anytype, mbk: ReviewCompilerAudit.MBK) !void {
@@ -22773,6 +23112,13 @@ test "review-compiler-audit c3 protocol reports closure compression state" {
     try std.testing.expect(std.mem.indexOf(u8, got, "\"blocked\": 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"compression_not_required\": 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"missing_compression_evidence\": { \"basis\": 1, \"tournament\": 1, \"ablation\": 1, \"proof\": 1, \"holdout\": 1, \"permit\": 1, \"stale_mrpc\": 0, \"direct_review_to_delivery_mutation\": 0, \"commit_or_push_bypass\": 0 }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"included_sessions\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"session_id\": \"c3-uncompressed-closed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"classification\": \"material_c3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"c3_required\": true, \"c3_entered\": true, \"c3_closed\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"reason\": \"closed_material_c3_missing_compression_evidence\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"session_id\": \"c3-open-material\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"reason\": \"material_c3_not_closed\"") != null);
 
     const markdown_output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "review-compiler-c3-closure.md" });
     defer std.testing.allocator.free(markdown_output_path);
@@ -22789,6 +23135,44 @@ test "review-compiler-audit c3 protocol reports closure compression state" {
     try std.testing.expect(std.mem.indexOf(u8, markdown, "closure_compression:") != null);
     try std.testing.expect(std.mem.indexOf(u8, markdown, "summary_state: CLOSED_UNCOMPRESSED") != null);
     try std.testing.expect(std.mem.indexOf(u8, markdown, "missing_compression_evidence:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "included_sessions:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "session_id: \"c3-uncompressed-closed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "reason: \"closed_material_c3_missing_compression_evidence\"") != null);
+}
+
+test "review-compiler-audit c3 protocol attributes orphan closure counts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/13");
+    const orphan_closed =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-13T12:00:00Z\",\"payload\":{\"id\":\"c3-orphan-closed\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T12:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"x1\",\"message\":\"MRPC-v1 minimal_review_patch_certificate\\nclosed\"}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/13/rollout-c3-orphan-closed.jsonl", .data = orphan_closed });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "review-compiler-c3-orphan.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const got = try runCommandWithOutput(std.testing.allocator, .review_compiler_audit, &.{
+        "--root",     root_abs,
+        "--protocol", "c3",
+        "--since",    "2026-05-13T00:00:00Z",
+        "--until",    "2026-05-14T00:00:00Z",
+        "--repo",     "/repo",
+        "--format",   "json",
+    }, output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"c3_required_sessions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"c3_entered_sessions\": 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"c3_closed_sessions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"session_id\": \"c3-orphan-closed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"c3_required\": true, \"c3_entered\": false, \"c3_closed\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"entered\": { \"present\": false, \"source\": \"absent\", \"timestamp\": null, \"snippet\": null, \"reason\": \"no_c3_begin_signal\" }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"closed\": { \"present\": true, \"source\": \"message\", \"timestamp\": \"2026-05-13T12:00:01+00:00\", \"snippet\": \"MRPC-v1 minimal_review_patch_certificate\", \"reason\": \"c3_closed_signal_present\" }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"reason\": \"closed_material_c3_missing_compression_evidence\"") != null);
 }
 
 test "review-compiler-audit mbk protocol audits kernel, surface, proof, closure, and bypass counters" {
