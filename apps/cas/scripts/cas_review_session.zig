@@ -1101,6 +1101,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             else => return err,
         };
         record.last_observed_status = latest.turn_status;
+        persistTerminalReviewResult(&record, latest);
         if (!latest.review_result_available) {
             if (failureInfoForStatus(&latest)) |failure| {
                 if (std.mem.eql(u8, failure.code, "incompatible_codex_review_runtime")) {
@@ -1496,6 +1497,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     };
 
     record.last_observed_status = latest.turn_status;
+    persistTerminalReviewResult(&record, latest);
     if (!latest.review_result_available) {
         if (failureInfoForStatus(&latest)) |failure| {
             if (std.mem.eql(u8, failure.code, "incompatible_codex_review_runtime")) {
@@ -2295,6 +2297,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
     defer latest.deinit(allocator);
 
     record.last_observed_status = latest.turn_status;
+    persistTerminalReviewResult(&record, latest);
     try writeSessionRecord(allocator, record_path, record);
 
     const dual_parse = try dualParseVerdictAlloc(allocator, latest);
@@ -3262,6 +3265,12 @@ fn makeStoredFallbackStatus(allocator: std.mem.Allocator, record: SessionRecord)
         .review_text = null,
         .raw_response_json = try allocator.dupe(u8, "{}"),
     };
+}
+
+fn persistTerminalReviewResult(record: *SessionRecord, status: ReviewStatus) void {
+    if (!status.review_result_available) return;
+    record.terminal_review_result_source = status.review_result_source;
+    record.terminal_review_result_json = status.review_result_json;
 }
 
 fn applyRecordedStatusOverlay(allocator: std.mem.Allocator, record: SessionRecord, status: *ReviewStatus) !void {
@@ -4437,6 +4446,43 @@ fn readReviewTextFromEventLogAlloc(allocator: std.mem.Allocator, event_log_path:
     return latest_review_text;
 }
 
+fn readRolloutReviewResultFromEventLogAlloc(allocator: std.mem.Allocator, event_log_path: []const u8) !?[]u8 {
+    const raw = try readFileAlloc(allocator, event_log_path, 16 * 1024 * 1024);
+    defer allocator.free(raw);
+
+    var latest_review_result: ?[]u8 = null;
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch continue;
+        defer parsed.deinit();
+        const root_obj = switch (parsed.value) {
+            .object => |obj| obj,
+            else => continue,
+        };
+        const method = jsonStringField(root_obj, "method") orelse continue;
+        if (!std.mem.eql(u8, method, "thread/read")) continue;
+        const direction = jsonStringField(root_obj, "direction") orelse continue;
+        if (!std.mem.eql(u8, direction, "response")) continue;
+
+        const payload_text = jsonStringField(root_obj, "payload") orelse continue;
+        var payload_parsed = std.json.parseFromSlice(std.json.Value, allocator, payload_text, .{}) catch continue;
+        defer payload_parsed.deinit();
+        const payload_obj = switch (payload_parsed.value) {
+            .object => |obj| obj,
+            else => continue,
+        };
+        const thread_obj = core_json.objectField(payload_obj, "thread") orelse continue;
+        const rollout_path = core_json.stringField(thread_obj, "path") orelse continue;
+        const review_result = (try readReviewResultJsonFromRolloutAlloc(allocator, rollout_path)) orelse continue;
+        if (latest_review_result) |existing| allocator.free(existing);
+        latest_review_result = review_result;
+    }
+    return latest_review_result;
+}
+
 fn normalizeReceiptFromPathAlloc(allocator: std.mem.Allocator, path: []const u8, recover_event_logs: bool) !NormalizedReceipt {
     const raw = try readFileAlloc(allocator, path, 8 * 1024 * 1024);
     defer allocator.free(raw);
@@ -4492,7 +4538,7 @@ fn normalizeStoredSessionRecordReceiptAlloc(allocator: std.mem.Allocator, source
     const review_thread_id = jsonStringField(root, "review_thread_id") orelse return error.NotReviewReceipt;
     const review_turn_id = jsonStringField(root, "review_turn_id");
     const event_log_path = jsonStringField(root, "event_log_path");
-    const result_source = jsonStringField(root, "terminal_review_result_source");
+    var result_source = jsonStringField(root, "terminal_review_result_source");
 
     var review_result_json: ?[]u8 = null;
     defer if (review_result_json) |value| allocator.free(value);
@@ -4500,10 +4546,14 @@ fn normalizeStoredSessionRecordReceiptAlloc(allocator: std.mem.Allocator, source
         review_result_json = try allocator.dupe(u8, json);
     } else if (recover_event_logs) {
         if (event_log_path) |path| {
-            if (try readReviewTextFromEventLogAlloc(allocator, path)) |review_text| {
+            if (try readRolloutReviewResultFromEventLogAlloc(allocator, path)) |rollout_result| {
+                review_result_json = rollout_result;
+                result_source = "rollout_exited_review_mode";
+            } else if (try readReviewTextFromEventLogAlloc(allocator, path)) |review_text| {
                 defer allocator.free(review_text);
                 if (!std.mem.eql(u8, review_text, review_fallback_text)) {
                     review_result_json = try buildReviewResultJsonFromRenderedTextAlloc(allocator, review_text);
+                    result_source = "notification_exited_review_mode";
                 }
             }
         }
@@ -5450,6 +5500,54 @@ test "receipt normalizer recovers findings from stored review session event log"
     try std.testing.expectEqualStrings("thr_event", receipt.review_thread_id.?);
     try std.testing.expect(std.mem.indexOf(u8, receipt.findings_json, "Keep idempotency keys aligned") != null);
     try std.testing.expect(std.mem.indexOf(u8, receipt.findings_json, "raw finding body") != null);
+}
+
+test "receipt normalizer recovers clean stored receipt from rollout-backed event log" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rollout =
+        \\{"type":"session_meta","payload":{"id":"thr_clean"}}
+        \\{"type":"event_msg","payload":{"type":"exited_review_mode","review_output":{"findings":[],"overall_correctness":"patch is correct","overall_explanation":"No issues found.","overall_confidence_score":0.88}}}
+    ;
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "rollout.jsonl", .data = rollout });
+    const rollout_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "rollout.jsonl", std.testing.allocator);
+    defer std.testing.allocator.free(rollout_path);
+
+    const thread_read_payload = try stringifyAnyAlloc(std.testing.allocator, .{
+        .thread = .{
+            .id = "thr_clean",
+            .path = rollout_path,
+        },
+    });
+    defer std.testing.allocator.free(thread_read_payload);
+    const thread_read_payload_json = try quoteJsonStringAlloc(std.testing.allocator, thread_read_payload);
+    defer std.testing.allocator.free(thread_read_payload_json);
+    const line = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"recordedAtUnixS\":1,\"method\":\"thread/read\",\"direction\":\"response\",\"payload\":{s}}}\n",
+        .{thread_read_payload_json},
+    );
+    defer std.testing.allocator.free(line);
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "review.events.ndjson", .data = line });
+    const event_log_path = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "review.events.ndjson", std.testing.allocator);
+    defer std.testing.allocator.free(event_log_path);
+    const event_log_path_json = try quoteJsonStringAlloc(std.testing.allocator, event_log_path);
+    defer std.testing.allocator.free(event_log_path_json);
+
+    const raw = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema_version\":3,\"cwd\":\"/tmp\",\"parent_thread_id\":\"parent\",\"review_thread_id\":\"thr_clean\",\"review_turn_id\":\"turn_clean\",\"delivery\":\"detached\",\"target\":{{\"type\":\"baseBranch\",\"branch\":\"main\"}},\"event_log_path\":{s},\"created_at_unix_s\":1,\"last_observed_status\":\"completed\",\"codex_version\":\"0.140.0\",\"compatibility_verdict\":\"compatible\",\"transport_kind\":\"websocket\",\"terminal_review_result_source\":null,\"terminal_review_result_json\":null}}",
+        .{event_log_path_json},
+    );
+    defer std.testing.allocator.free(raw);
+    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "stored-clean.json", raw, true);
+    defer receipt.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("clean", receipt.status);
+    try std.testing.expect(receipt.clean);
+    try std.testing.expectEqual(@as(usize, 0), receipt.finding_count);
+    try std.testing.expectEqualStrings("cas-lane", receipt.backend_class);
+    try std.testing.expectEqualStrings("thr_clean", receipt.review_thread_id.?);
 }
 
 test "receipt normalizer bounds broad stored session recovery" {
