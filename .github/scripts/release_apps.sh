@@ -105,7 +105,11 @@ case "$mode" in
 
       while IFS= read -r line; do
         case "$line" in
-          "+++"*|"---"*|"@@"*) continue ;;
+          "+++"*|"---"*) continue ;;
+          "@@"*)
+            current_app=""
+            continue
+            ;;
           "+"*|"-"*) ;;
           " "*)
             raw="${line:1}"

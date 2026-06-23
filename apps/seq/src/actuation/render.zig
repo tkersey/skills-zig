@@ -10,7 +10,7 @@ pub fn diagnosticQueryJson(allocator: std.mem.Allocator, session_id: []const u8,
     try output.writeJsonString(writer, session_id);
     try writer.writeAll("},{\"field\":\"path\",\"op\":\"eq\",\"value\":");
     try output.writeJsonString(writer, path);
-    try writer.writeAll("}],\"select\":[\"run_id\",\"session_id\",\"path\",\"classification.true_actuating\",\"evidence_refs\"],\"format\":\"json\"}");
+    try writer.writeAll("}],\"select\":[\"run_id\",\"session_id\",\"path\",\"true_actuating\",\"verdict\"],\"format\":\"json\"}");
     return writer_alloc.toOwnedSlice();
 }
 

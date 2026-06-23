@@ -46,7 +46,7 @@ pub fn collectProofs(allocator: std.mem.Allocator, trace: canonical_trace.Canoni
             .command = try allocator.dupe(u8, command),
             .scope = classified[0],
             .classification_source = classified[1],
-            .current = !mutation_after_last_proof,
+            .current = !mutation_after_last_proof and proofSucceeded(tool),
         });
     }
     std.mem.reverse(ProofRow, rows.items);
@@ -65,6 +65,11 @@ fn scopeFromText(text: []const u8) ?ProofScope {
 
 fn isProofCommand(command: []const u8) bool {
     return contains(command, "zig build") or contains(command, "command_surface_gate") or contains(command, "test ");
+}
+
+fn proofSucceeded(tool: canonical_trace.ToolLifecycleRecord) bool {
+    if (tool.exit_code) |code| return code == 0;
+    return false;
 }
 
 fn isMaterialMutation(tool: canonical_trace.ToolLifecycleRecord) bool {
@@ -97,6 +102,24 @@ test "proof currentness is stale after later mutation" {
     defer trace.deinit(std.testing.allocator);
     try trace.tools.append(std.testing.allocator, .{ .path = try std.testing.allocator.dupe(u8, "/tmp/run.jsonl"), .kind = .exec_command, .command_text = try std.testing.allocator.dupe(u8, "zig build test --summary all") });
     try trace.tools.append(std.testing.allocator, .{ .path = try std.testing.allocator.dupe(u8, "/tmp/run.jsonl"), .kind = .patch_apply, .tool_name = try std.testing.allocator.dupe(u8, "apply_patch") });
+    const rows = try collectProofs(std.testing.allocator, trace);
+    defer {
+        for (rows) |*row| row.deinit(std.testing.allocator);
+        std.testing.allocator.free(rows);
+    }
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expect(!rows[0].current);
+}
+
+test "proof currentness requires successful proof command" {
+    var trace = canonical_trace.CanonicalSessionTrace{ .session = try canonical_trace.SessionRecord.init(std.testing.allocator, "/tmp/run.jsonl") };
+    defer trace.deinit(std.testing.allocator);
+    try trace.tools.append(std.testing.allocator, .{
+        .path = try std.testing.allocator.dupe(u8, "/tmp/run.jsonl"),
+        .kind = .exec_command,
+        .command_text = try std.testing.allocator.dupe(u8, "zig build test --summary all"),
+        .exit_code = 1,
+    });
     const rows = try collectProofs(std.testing.allocator, trace);
     defer {
         for (rows) |*row| row.deinit(std.testing.allocator);

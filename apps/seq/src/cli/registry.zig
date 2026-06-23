@@ -102,7 +102,6 @@ const actuation_audit_flags = [_]FlagSpec{
     .{ .name = "--last", .value_kind = .duration, .help = "Relative time window" },
     .{ .name = "--exclude-current", .value_kind = .bool, .help = "Exclude the current CODEX_THREAD_ID session" },
     .{ .name = "--include-workers", .value_kind = .bool, .help = "Include linked worker sessions" },
-    .{ .name = "--artifact-root", .value_kind = .path, .help = "Additional actuation artifact root" },
     .{ .name = "--mode", .value_kind = .string, .help = "summary, runs, slices, proof, compactions, decisions, or report" },
     .{ .name = "--strict", .value_kind = .bool, .help = "Exit 2 on actuation control violations" },
     .{ .name = "--include-excerpts", .value_kind = .bool, .help = "Allow bounded sanitized excerpts" },
@@ -244,12 +243,12 @@ test "registry exposes actuation-audit command surface" {
     try std.testing.expect(std.mem.eql(u8, spec.name, "actuation-audit"));
     try std.testing.expectEqual(output.Format.table, spec.default_format);
 
-    var has_artifact_root = false;
+    var has_include_workers = false;
     var has_strict = false;
     for (spec.flags) |flag| {
-        if (std.mem.eql(u8, flag.name, "--artifact-root")) has_artifact_root = true;
+        if (std.mem.eql(u8, flag.name, "--include-workers")) has_include_workers = true;
         if (std.mem.eql(u8, flag.name, "--strict")) has_strict = true;
     }
-    try std.testing.expect(has_artifact_root);
+    try std.testing.expect(has_include_workers);
     try std.testing.expect(has_strict);
 }
