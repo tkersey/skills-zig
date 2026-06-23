@@ -91,6 +91,24 @@ const decision_capsule_flags = [_]FlagSpec{
     .{ .name = "--format", .value_kind = .format, .help = "Output format" },
 };
 
+const actuation_audit_flags = [_]FlagSpec{
+    .{ .name = "--root", .value_kind = .path, .help = "Codex sessions root" },
+    .{ .name = "--session-id", .value_kind = .string, .help = "Scan one session by id" },
+    .{ .name = "--path", .value_kind = .path, .help = "Scan one rollout JSONL path" },
+    .{ .name = "--repo", .value_kind = .path, .help = "Require repo/workdir lineage under this path" },
+    .{ .name = "--workdir", .value_kind = .path, .help = "Require session/tool cwd under this path" },
+    .{ .name = "--since", .value_kind = .string, .help = "Inclusive start timestamp" },
+    .{ .name = "--until", .value_kind = .string, .help = "Inclusive end timestamp" },
+    .{ .name = "--last", .value_kind = .duration, .help = "Relative time window" },
+    .{ .name = "--exclude-current", .value_kind = .bool, .help = "Exclude the current CODEX_THREAD_ID session" },
+    .{ .name = "--include-workers", .value_kind = .bool, .help = "Include linked worker sessions" },
+    .{ .name = "--artifact-root", .value_kind = .path, .help = "Additional actuation artifact root" },
+    .{ .name = "--mode", .value_kind = .string, .help = "summary, runs, slices, proof, compactions, decisions, or report" },
+    .{ .name = "--strict", .value_kind = .bool, .help = "Exit 2 on actuation control violations" },
+    .{ .name = "--include-excerpts", .value_kind = .bool, .help = "Allow bounded sanitized excerpts" },
+    .{ .name = "--format", .value_kind = .format, .help = "Output format" },
+};
+
 pub fn commandNames() []const lib.CommandDef {
     return lib.commandNames();
 }
@@ -123,6 +141,7 @@ fn summaryFor(command: lib.Command) []const u8 {
         .query => "Run a dataset query spec over local session artifacts",
         .skill_decision_audit => "Compile deterministic per-skill decision episodes and STE-v1 evidence",
         .decision_capsule => "Freeze one visible historical decision as DCP-v2",
+        .actuation_audit => "Audit plan-to-PR actuation control, frontier, proof, compaction, and ship lineage",
         .skill_contract => "Validate, show, or scaffold SKDC-v1 decision contracts",
         .skill_decision_receipt => "Validate SDR-v1 skill decision receipts",
         .capabilities => "Print seq feature capability flags",
@@ -139,6 +158,7 @@ fn usageFor(command: lib.Command) []const u8 {
         .query => "seq query --spec <json|@path> [--root <path>] [--stats]",
         .skill_decision_audit => "seq skill-decision-audit --skill <name> (--session-id <id>|--path <jsonl>|--repo <path>|--workdir <path>|--last <duration>|--since <iso>|--until <iso>)",
         .decision_capsule => "seq decision-capsule (--session-id <id>|--path <jsonl>) [--decision-id <id>|--turn-id <id>|--turn-index N] [--mode capsule|candidates|anchors|validate]",
+        .actuation_audit => "seq actuation-audit --root <path> (--session-id <id>|--path <jsonl>|(--repo <path>|--workdir <path>) (--last <duration>|--since <iso>|--until <iso>))",
         .skill_contract => "seq skill-contract validate --file <path>",
         .skill_decision_receipt => "seq skill-decision-receipt validate --file <path>",
         .capabilities => "seq capabilities [--format json]",
@@ -152,6 +172,7 @@ fn flagsFor(command: lib.Command) []const FlagSpec {
         .query => query_flags[0..],
         .skill_decision_audit => skill_decision_audit_flags[0..],
         .decision_capsule => decision_capsule_flags[0..],
+        .actuation_audit => actuation_audit_flags[0..],
         .skill_contract => skill_contract_flags[0..],
         .skill_decision_receipt => skill_decision_receipt_flags[0..],
         .sessions => session_flags[0..],
@@ -164,6 +185,7 @@ fn defaultFormatFor(command: lib.Command) output.Format {
         .query => .jsonl,
         .capabilities => .table,
         .decision_capsule => .json,
+        .actuation_audit => .table,
         .skill_decision_audit => .table,
         .sessions => .table,
         else => .table,
@@ -174,6 +196,7 @@ fn allowedFormatsFor(command: lib.Command) []const output.Format {
     return switch (command) {
         .session_graph => &.{ .table, .json, .jsonl, .dot },
         .decision_capsule => &.{ .table, .json, .csv, .jsonl, .markdown },
+        .actuation_audit => &.{ .table, .json, .csv, .jsonl, .markdown },
         .skill_decision_audit => &.{ .table, .json, .csv, .jsonl, .markdown },
         .capabilities, .skill_contract, .skill_decision_receipt => &.{ .table, .json, .csv, .jsonl },
         .session_detail => &.{ .json, .markdown },
@@ -214,4 +237,19 @@ test "registry exposes listed flags for query and sessions" {
         if (std.mem.eql(u8, flag.name, "--stats")) has_stats = true;
     }
     try std.testing.expect(has_stats);
+}
+
+test "registry exposes actuation-audit command surface" {
+    const spec = commandSpec(.actuation_audit) orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.eql(u8, spec.name, "actuation-audit"));
+    try std.testing.expectEqual(output.Format.table, spec.default_format);
+
+    var has_artifact_root = false;
+    var has_strict = false;
+    for (spec.flags) |flag| {
+        if (std.mem.eql(u8, flag.name, "--artifact-root")) has_artifact_root = true;
+        if (std.mem.eql(u8, flag.name, "--strict")) has_strict = true;
+    }
+    try std.testing.expect(has_artifact_root);
+    try std.testing.expect(has_strict);
 }

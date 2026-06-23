@@ -72,6 +72,10 @@ if ! "$BIN_PATH" --help | rg -q '^- capabilities$'; then
   echo "required command missing: capabilities" >&2
   exit 1
 fi
+if ! "$BIN_PATH" --help | rg -q '^- actuation-audit$'; then
+  echo "required command missing: actuation-audit" >&2
+  exit 1
+fi
 if ! "$BIN_PATH" --help | rg -q '^- tool-audit$'; then
   echo "required command missing: tool-audit" >&2
   exit 1
@@ -178,6 +182,14 @@ if ! "$BIN_PATH" capabilities --format json | rg -q -- '"decision_capsule_v1": t
 fi
 if ! "$BIN_PATH" capabilities --format json | rg -q -- '"historical_decisions_dataset_v1": true'; then
   echo "capabilities missing historical_decisions_dataset_v1=true" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" capabilities --format json | rg -q -- '"actuation_audit_v1": true'; then
+  echo "capabilities missing actuation_audit_v1=true" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" capabilities --format json | rg -q -- '"actuation_compaction_resume_v1": true'; then
+  echo "capabilities missing actuation_compaction_resume_v1=true" >&2
   exit 1
 fi
 if ! "$BIN_PATH" workflow-overlap --help | rg -q -- '--mode summary|sessions'; then

@@ -13,3 +13,4 @@ pub const memory_extensions = @import("memory_extensions.zig");
 pub const opencode_prompts = @import("opencode_prompts.zig");
 pub const opencode_events = @import("opencode_events.zig");
 pub const opencode_sqlite = @import("opencode_sqlite.zig");
+pub const actuation = @import("../actuation_audit.zig");
