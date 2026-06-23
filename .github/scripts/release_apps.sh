@@ -67,7 +67,8 @@ case "$mode" in
     mark_build_zig() {
       local changed=0
       local ambiguous=0
-      local line app token matched
+      local current_app=""
+      local line app token matched raw
 
       is_build_boilerplate() {
         local raw="$1"
@@ -88,29 +89,49 @@ case "$mode" in
         return 1
       }
 
+      infer_context_app() {
+        local raw="$1"
+        local app token
+        for app in "${apps[@]}"; do
+          token="${app//-/_}"
+          case "$raw" in
+            *"const ${token}_"*"= b.createModule"*|*"const ${token}_root = b.createModule"*|*"const ${token}_tests_root = b.createModule"*|*"apps/$app/src/"*)
+              current_app="$app"
+              return
+              ;;
+          esac
+        done
+      }
+
       while IFS= read -r line; do
         case "$line" in
           "+++"*|"---"*|"@@"*) continue ;;
           "+"*|"-"*) ;;
+          " "*)
+            raw="${line:1}"
+            infer_context_app "$raw"
+            continue
+            ;;
           *) continue ;;
         esac
 
-        line="${line:1}"
-        [[ -z "$line" ]] && continue
+        raw="${line:1}"
+        [[ -z "$raw" ]] && continue
+        infer_context_app "$raw"
         changed=1
         matched=0
 
         for app in "${apps[@]}"; do
           token="${app//-/_}"
           if [[ "$app" == "st" ]]; then
-            case "$line" in
+            case "$raw" in
               *"apps/st/"*|*"st_root"*|*"st_install"*|*"\"st\""*|*"build-st"*|*"test-st"*|*"run-st"*)
                 mark_app "$app"
                 matched=1
                 ;;
             esac
           else
-            case "$line" in
+            case "$raw" in
               *"apps/$app/"*|*"apps/$app\""*|*"${token}_"*|*"\"$app\""*|*"build-$app"*|*"test-$app"*|*"run-$app"*)
                 mark_app "$app"
                 matched=1
@@ -120,24 +141,32 @@ case "$mode" in
         done
 
         if [[ "$matched" -eq 0 ]]; then
-          case "$line" in
+          case "$raw" in
             *"durable_store"*|*"durable-store"*|*"libs/durable_store/"*)
-              mark_durable_store_consumers
+              if [[ -n "$current_app" ]]; then
+                mark_app "$current_app"
+              else
+                mark_durable_store_consumers
+              fi
               matched=1
               ;;
             *"retrace_core"*|*"libs/retrace_core/"*)
-              mark_retrace_core_consumers
+              if [[ -n "$current_app" ]]; then
+                mark_app "$current_app"
+              else
+                mark_retrace_core_consumers
+              fi
               matched=1
               ;;
           esac
         fi
 
         if [[ "$matched" -eq 0 ]]; then
-          if ! is_build_boilerplate "$line"; then
+          if ! is_build_boilerplate "$raw"; then
             ambiguous=1
           fi
         fi
-      done < <(git diff -U0 --no-ext-diff "$base" "$head" -- build.zig)
+      done < <(git diff -U12 --no-ext-diff "$base" "$head" -- build.zig)
 
       if [[ "$changed" -eq 1 && "$ambiguous" -eq 1 ]]; then
         mark_all
