@@ -3,6 +3,7 @@ const retrace_core = @import("retrace_core");
 comptime {
     _ = @import("lib.zig");
     _ = @import("tests/correctness_golden.zig");
+    _ = @import("tests/actuation_audit.zig");
     _ = @import("tests/fuzz_regression.zig");
     _ = @import("tests/allocation_failure.zig");
     _ = @import("types/spec.zig");
@@ -33,6 +34,7 @@ comptime {
     _ = retrace_core.decision_anchor;
     _ = @import("historical_decisions.zig");
     _ = @import("decision_capsule.zig");
+    _ = @import("actuation_audit.zig");
     _ = @import("datasets/tool_calls.zig");
     _ = @import("datasets/memory_files.zig");
     _ = @import("datasets/memory_blocks.zig");
@@ -100,6 +102,7 @@ test "bootstrap parse coverage" {
     try std.testing.expectEqual(lib.Command.opencode_prompts, lib.parseCommand("opencode-prompts"));
     try std.testing.expectEqual(lib.Command.opencode_events, lib.parseCommand("opencode-events"));
     try std.testing.expectEqual(lib.Command.index, lib.parseCommand("index"));
+    try std.testing.expectEqual(lib.Command.actuation_audit, lib.parseCommand("actuation-audit"));
     try std.testing.expectEqual(lib.Command.unknown, lib.parseCommand("invalid"));
 }
 

@@ -17,6 +17,14 @@ const token_cost = @import("../token_cost.zig");
 const skill_contract = @import("../skill_contract.zig");
 const skill_decision_receipt = @import("../skill_decision_receipt.zig");
 const skill_decision_signals = @import("../skill_decision_signals.zig");
+const actuation_audit = @import("../actuation_audit.zig");
+const actuation_gcr = @import("../actuation/gcr.zig");
+const actuation_afr = @import("../actuation/afr.zig");
+const actuation_realization = @import("../actuation/realization.zig");
+const actuation_proof = @import("../actuation/proof.zig");
+const actuation_compaction = @import("../actuation/compaction.zig");
+const actuation_workers = @import("../actuation/workers.zig");
+const actuation_surface = @import("../actuation/surface.zig");
 const app_meta = @import("app_meta");
 
 var test_codex_thread_id: ?[]const u8 = null;
@@ -185,6 +193,36 @@ pub const dataset_meta = [_]DatasetMeta{
         .name = "review_compiler_evidence",
         .description = "Flattened review-compiler evidence refs",
         .fields = &.{ "session_id", "path", "evidence_id", "present", "source", "provenance_role", "reason", "excerpt" },
+    },
+    .{
+        .name = "actuation_runs",
+        .description = "SEQ-ACTRUN-v1 actuation run ledger projections",
+        .fields = &.{ "run_id", "session_id", "path", "repo", "branch", "true_actuating", "verdict", "graph.compile_attempts", "graph.compile_failures", "graph.mutations_without_gcr", "projection.update_plan_calls", "surface.churn.apply_patch_calls", "diagnostic_query_json" },
+    },
+    .{
+        .name = "actuation_slices",
+        .description = "Actuation slice/frontier lineage rows",
+        .fields = &.{ "run_id", "session_id", "slice_id", "afr_valid", "afr_missing", "afr_stale", "valid_realizations", "return_to_frontier" },
+    },
+    .{
+        .name = "actuation_graph_events",
+        .description = "Actuation GCR attempts, receipts, and graph-control violations",
+        .fields = &.{ "run_id", "session_id", "event_kind", "gcr_id", "result", "gcr_state", "mutation_event_ref", "last_gcr_ref", "source_ref" },
+    },
+    .{
+        .name = "actuation_proofs",
+        .description = "Actuation proof cadence rows",
+        .fields = &.{ "run_id", "session_id", "proof_id", "command", "scope", "classification_source", "current" },
+    },
+    .{
+        .name = "actuation_compactions",
+        .description = "Actuation compaction and resume coverage rows",
+        .fields = &.{ "run_id", "session_id", "compactions", "compactions_with_resume_artifact", "resume_coverage_ratio", "skill_reads_after_compaction", "rediscovery_tool_calls" },
+    },
+    .{
+        .name = "actuation_workers",
+        .description = "Actuation linked worker and packet-yield rows",
+        .fields = &.{ "run_id", "session_id", "spawned", "linked", "valid_artifacts", "artifact_yield" },
     },
     .{
         .name = "token_events",
@@ -615,6 +653,7 @@ const Options = struct {
     trace_text: ?[]const u8 = null,
     include_root_equivalent_text: ?[]const u8 = null,
     bundle_dir_text: ?[]const u8 = null,
+    artifact_root_text: ?[]const u8 = null,
     state_db_path: ?[]const u8 = null,
     memory_root_text: ?[]const u8 = null,
     extensions_root_text: ?[]const u8 = null,
@@ -646,7 +685,9 @@ const Options = struct {
     include_workers: bool = false,
     include_excerpts: bool = false,
     index_mode: []const u8 = "auto",
+    actuation_strict: bool = false,
     strict: bool = true,
+    strict_set: bool = false,
 };
 
 pub fn run(
@@ -711,6 +752,7 @@ pub fn run(
         .workflow_overlap => try cmdWorkflowOverlap(allocator, sessions_root, opts),
         .session_tooling => try cmdSessionTooling(allocator, sessions_root, opts),
         .query_diagnose => try cmdQueryDiagnose(allocator, sessions_root, opts),
+        .actuation_audit => try cmdActuationAudit(allocator, sessions_root, opts),
         .capabilities => try cmdCapabilities(allocator, opts),
         .memory_provenance => try cmdMemoryProvenance(allocator, opts),
         .memory_map => try cmdMemoryMap(allocator, opts),
@@ -926,6 +968,13 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\  --exclude-current         Exclude the current CODEX_THREAD_ID session
         \\  path mentions are candidates only; true C3 governance requires controller evidence or explicit workflow declaration
         ,
+        .actuation_audit =>
+        \\usage: seq actuation-audit --root <path> [--session-id <id>|--path <rollout.jsonl>|(--repo <path>|--workdir <path>) (--since <iso>|--until <iso>|--last <duration>)] [--include-workers] [--artifact-root <path>] [--mode summary|runs|slices|proof|compactions|decisions|report] [--strict] [--include-excerpts] [--format table|json|jsonl|csv|markdown]
+        \\extra options:
+        \\  --exclude-current          Exclude the current CODEX_THREAD_ID session from corpus selectors
+        \\  --strict                   Exit 2 when a true run has a defined actuation control failure
+        \\  --include-excerpts         Include bounded sanitized excerpts; full prompts and private reasoning stay excluded
+        ,
         .goal_audit =>
         \\usage: seq goal-audit [--mode summary|rows] [--workflow review|resolve|review,resolve] [--duration-gte <seconds|minutes|hours>] [--status <name>] [--contains <text>] [--since <iso>] [--until <iso>] [--path <jsonl>|--session-id <id>] [--exclude-current] [--show-query] [--limit N] [--format table|json|csv|jsonl]
         ,
@@ -1020,6 +1069,7 @@ fn commandSupportsSummary(cmd: lib.Command) bool {
 fn commandSupportsExcludeCurrent(cmd: lib.Command) bool {
     const name = @tagName(cmd);
     return std.mem.eql(u8, name, "message_audit") or
+        std.mem.eql(u8, name, "actuation_audit") or
         std.mem.eql(u8, name, "skill_audit") or
         std.mem.eql(u8, name, "skill_cohort") or
         std.mem.eql(u8, name, "skill_success_rank") or
@@ -1064,6 +1114,12 @@ fn validateFormatForCommand(cmd: lib.Command, opts: Options) !void {
             if (fmt == .dot) return error.InvalidFormatForCommand;
             const mode = decision_capsule.Mode.parse(opts.mode) catch return error.InvalidModeArg;
             if (fmt == .markdown and mode != .capsule) return error.InvalidFormatForCommand;
+        },
+        .actuation_audit => {
+            if (fmt == .dot) return error.InvalidFormatForCommand;
+            const mode = opts.mode orelse "summary";
+            if (!isValidActuationAuditMode(mode)) return error.InvalidModeArg;
+            if (fmt == .markdown and !std.mem.eql(u8, mode, "report")) return error.InvalidFormatForCommand;
         },
         .skill_contract, .skill_decision_receipt, .capabilities => {
             if (fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
@@ -1150,16 +1206,16 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_tool = cmd == .opencode_events or cmd == .artifact_search or cmd == .tool_audit or cmd == .tool_search;
     const supports_executable = cmd == .tool_audit or cmd == .tool_search;
     const supports_workdir = switch (cmd) {
-        .artifact_search, .tool_audit, .tool_search, .workdir_report, .workflow_audit, .workflow_overlap, .skill_decision_audit => true,
+        .artifact_search, .tool_audit, .tool_search, .workdir_report, .workflow_audit, .workflow_overlap, .skill_decision_audit, .actuation_audit => true,
         else => false,
     };
     const supports_repo = switch (cmd) {
-        .plan_search, .sessions, .resolve_churn_audit, .review_compiler_audit, .skill_decision_audit, .decision_capsule => true,
+        .plan_search, .sessions, .resolve_churn_audit, .review_compiler_audit, .skill_decision_audit, .decision_capsule, .actuation_audit => true,
         else => false,
     };
     const supports_status = cmd == .opencode_events or cmd == .turns or cmd == .goal_audit;
     const supports_mode = switch (cmd) {
-        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .skill_decision_audit, .skill_success_rank, .skill_blocks, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit, .workflow_overlap, .adjudication_audit, .review_compiler_audit, .goal_audit, .decision_capsule => true,
+        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .skill_decision_audit, .skill_success_rank, .skill_blocks, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit, .workflow_overlap, .adjudication_audit, .review_compiler_audit, .goal_audit, .decision_capsule, .actuation_audit => true,
         else => false,
     };
     const supports_kind = cmd == .artifact_search or cmd == .skill_contract;
@@ -1186,6 +1242,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .skill_audit,
         .skill_evidence,
         .skill_decision_audit,
+        .actuation_audit,
         .role_breakdown,
         .occurrence_export,
         .find_session,
@@ -1230,6 +1287,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .skill_audit,
         .skill_evidence,
         .skill_decision_audit,
+        .actuation_audit,
         .role_breakdown,
         .occurrence_export,
         .find_session,
@@ -1336,9 +1394,10 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_window_hours = cmd == .token_window;
     const supports_duration_gte = cmd == .goal_audit;
     const supports_since_cursor = cmd == .skill_evidence or cmd == .skill_decision_audit;
-    const supports_last = cmd == .token_usage or cmd == .token_cost or cmd == .skill_audit or cmd == .skill_evidence or cmd == .skill_decision_audit or cmd == .skill_success_rank or cmd == .skill_cohort or cmd == .workflow_audit or cmd == .adjudication_audit or cmd == .message_audit or cmd == .message_search or cmd == .tool_audit or cmd == .tool_search or cmd == .skill_blocks;
+    const supports_last = cmd == .token_usage or cmd == .token_cost or cmd == .skill_audit or cmd == .skill_evidence or cmd == .skill_decision_audit or cmd == .actuation_audit or cmd == .skill_success_rank or cmd == .skill_cohort or cmd == .workflow_audit or cmd == .adjudication_audit or cmd == .message_audit or cmd == .message_search or cmd == .tool_audit or cmd == .tool_search or cmd == .skill_blocks;
     const supports_include_root_equivalent = cmd == .adjudication_audit;
     const supports_bundle_dir = cmd == .adjudication_audit;
+    const supports_artifact_root = cmd == .actuation_audit;
     const supports_token_cost_options = cmd == .token_cost;
     const supports_protocol = cmd == .review_compiler_audit;
     const supports_skill_decision_inputs = cmd == .skill_decision_audit or cmd == .skill_contract or cmd == .skill_decision_receipt;
@@ -1378,6 +1437,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.discovery_skills != null, supports_discovery_skills, "--discovery-skills", cmd);
     try ensureOptionAllowed(opts.include_root_equivalent_text != null, supports_include_root_equivalent, "--include-root-equivalent", cmd);
     try ensureOptionAllowed(opts.bundle_dir_text != null, supports_bundle_dir, "--bundle-dir", cmd);
+    try ensureOptionAllowed(opts.artifact_root_text != null, supports_artifact_root, "--artifact-root", cmd);
     try ensureOptionAllowed(opts.dataset != null, supports_dataset, "--dataset", cmd);
     try ensureOptionAllowed(opts.spec_text != null, supports_spec_text, "--spec", cmd);
     try ensureOptionAllowed(opts.contains != null, supports_contains, "--contains", cmd);
@@ -1424,8 +1484,9 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.opencode_source_text != null, supports_opencode_source, "--source", cmd);
     try ensureOptionAllowed(!std.mem.eql(u8, opts.index_mode, "auto"), supports_index_mode, "--index", cmd);
     try ensureOptionAllowed(opts.include_raw, supports_include_raw, "--include-raw", cmd);
-    try ensureOptionAllowed(opts.include_workers, cmd == .skill_decision_audit or cmd == .decision_capsule, "--include-workers", cmd);
-    try ensureOptionAllowed(opts.include_excerpts, cmd == .skill_decision_audit or cmd == .decision_capsule, "--include-excerpts", cmd);
+    try ensureOptionAllowed(opts.include_workers, cmd == .skill_decision_audit or cmd == .decision_capsule or cmd == .actuation_audit, "--include-workers", cmd);
+    try ensureOptionAllowed(opts.include_excerpts, cmd == .skill_decision_audit or cmd == .decision_capsule or cmd == .actuation_audit, "--include-excerpts", cmd);
+    try ensureOptionAllowed(opts.actuation_strict, cmd == .actuation_audit, "--strict", cmd);
     try ensureOptionAllowed(opts.ongoing, cmd == .sessions, "--ongoing", cmd);
     try ensureOptionAllowed(opts.completed, cmd == .sessions, "--completed", cmd);
     try ensureOptionAllowed(opts.include_tools, cmd == .turns or cmd == .session_detail, "--include-tools", cmd);
@@ -1606,6 +1667,15 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
             if (!isValidReviewCompilerAuditMode(text)) return error.InvalidModeArg;
         }
     }
+    if (cmd == .actuation_audit) {
+        if (opts.mode) |text| {
+            if (!isValidActuationAuditMode(text)) return error.InvalidModeArg;
+        }
+        if (!hasActuationAuditScope(opts)) {
+            printCliError("error: actuation-audit requires --session-id, --path, or (--repo/--workdir with --since/--until/--last)\n", .{});
+            return error.MissingArgValue;
+        }
+    }
     if (opts.unique_by_text) |text| {
         if (!std.mem.eql(u8, text, "snippet") and !std.mem.eql(u8, text, "path-snippet")) return error.InvalidModeArg;
     }
@@ -1632,6 +1702,7 @@ fn commandSupportsPath(cmd: lib.Command) bool {
         .query_diagnose,
         .skill_evidence,
         .skill_decision_audit,
+        .actuation_audit,
         .decision_capsule,
         .skill_blocks,
         .token_usage,
@@ -1659,6 +1730,7 @@ fn commandSupportsSessionId(cmd: lib.Command) bool {
         .session_tooling,
         .skill_evidence,
         .skill_decision_audit,
+        .actuation_audit,
         .decision_capsule,
         .skill_blocks,
         .token_usage,
@@ -1820,6 +1892,16 @@ fn isValidSkillDecisionAuditMode(text: []const u8) bool {
         std.mem.eql(u8, text, "delta");
 }
 
+fn isValidActuationAuditMode(text: []const u8) bool {
+    return std.mem.eql(u8, text, "summary") or
+        std.mem.eql(u8, text, "runs") or
+        std.mem.eql(u8, text, "slices") or
+        std.mem.eql(u8, text, "proof") or
+        std.mem.eql(u8, text, "compactions") or
+        std.mem.eql(u8, text, "decisions") or
+        std.mem.eql(u8, text, "report");
+}
+
 fn isValidSkillDecisionCausality(text: []const u8) bool {
     return std.mem.eql(u8, text, "explicit") or
         std.mem.eql(u8, text, "strong") or
@@ -1839,6 +1921,13 @@ fn hasSkillDecisionAuditScope(opts: Options) bool {
         opts.since != null or
         opts.until != null or
         opts.last_text != null;
+}
+
+fn hasActuationAuditScope(opts: Options) bool {
+    if (opts.session_id != null or opts.path != null) return true;
+    const has_repo_scope = opts.repo_text != null or opts.workdir_text != null;
+    const has_window = opts.since != null or opts.until != null or opts.last_text != null;
+    return has_repo_scope and has_window;
 }
 
 fn validateSkillContractArgs(opts: Options) !void {
@@ -2851,6 +2940,15 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
             \\      "review_compiler_run_ledger_v1": true,
             \\      "source_governance_projection_v1": true,
             \\      "c3_structured_closure_v1": true,
+            \\      "actuation_audit_v1": true,
+            \\      "actuation_run_ledger_v1": true,
+            \\      "afr_v1": true,
+            \\      "arh_v1": true,
+            \\      "fpsr_v1": true,
+            \\      "asr_v2": true,
+            \\      "gcr_projection_inversion_v1": true,
+            \\      "actuation_proof_cadence_v1": true,
+            \\      "actuation_compaction_resume_v1": true,
             \\      "matched_cohort_v1": false
             \\    }
             \\  }
@@ -2879,6 +2977,15 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
         .{ .name = "review_compiler_run_ledger_v1", .enabled = true },
         .{ .name = "source_governance_projection_v1", .enabled = true },
         .{ .name = "c3_structured_closure_v1", .enabled = true },
+        .{ .name = "actuation_audit_v1", .enabled = true },
+        .{ .name = "actuation_run_ledger_v1", .enabled = true },
+        .{ .name = "afr_v1", .enabled = true },
+        .{ .name = "arh_v1", .enabled = true },
+        .{ .name = "fpsr_v1", .enabled = true },
+        .{ .name = "asr_v2", .enabled = true },
+        .{ .name = "gcr_projection_inversion_v1", .enabled = true },
+        .{ .name = "actuation_proof_cadence_v1", .enabled = true },
+        .{ .name = "actuation_compaction_resume_v1", .enabled = true },
         .{ .name = "matched_cohort_v1", .enabled = false },
     };
     for (features) |feature| {
@@ -2890,6 +2997,92 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
     }
     const cols = [_][]const u8{ "version", "feature", "enabled" };
     try output.writeOutput(allocator, opts.format, rows.items, cols[0..], opts.out_path);
+}
+
+fn cmdActuationAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    const mode = opts.mode orelse "summary";
+    if (opts.format == .markdown and std.mem.eql(u8, mode, "report")) {
+        try cmdActuationAuditReport(allocator, sessions_root, opts);
+        return;
+    }
+
+    var params = std.ArrayList(spec.ParamSpec).empty;
+    defer params.deinit(allocator);
+    if (opts.path) |path| try params.append(allocator, .{ .key = "path", .value = .{ .string = path } });
+    if (opts.session_id) |session_id| try params.append(allocator, .{ .key = "session_id", .value = .{ .string = session_id } });
+
+    const dataset_name = actuationDatasetForMode(mode);
+    var rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &rows);
+    try collectActuationDatasetRows(allocator, dataset_name, sessions_root, params.items, &rows);
+
+    if (opts.actuation_strict and hasStrictActuationFailure(rows.items)) {
+        std.process.exit(2);
+    }
+
+    const cols = actuationColumnsForMode(mode);
+    try output.writeOutput(allocator, opts.format, rows.items, cols, opts.out_path);
+}
+
+fn cmdActuationAuditReport(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    var params = std.ArrayList(spec.ParamSpec).empty;
+    defer params.deinit(allocator);
+    if (opts.path) |path| try params.append(allocator, .{ .key = "path", .value = .{ .string = path } });
+    if (opts.session_id) |session_id| try params.append(allocator, .{ .key = "session_id", .value = .{ .string = session_id } });
+    var rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &rows);
+    try collectActuationDatasetRows(allocator, "actuation_runs", sessions_root, params.items, &rows);
+    if (opts.actuation_strict and hasStrictActuationFailure(rows.items)) std.process.exit(2);
+
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+    try writer.writeAll("# Actuation Audit\n\n");
+    try writer.print("- included_runs: {d}\n", .{rows.items.len});
+    var violations: usize = 0;
+    for (rows.items) |row| {
+        const verdict = scalarString(row.valueOrNull("verdict")) orelse "unknown";
+        if (std.mem.eql(u8, verdict, "projection_inversion") or std.mem.eql(u8, verdict, "graph_bypass")) violations += 1;
+    }
+    try writer.print("- control_failures: {d}\n\n", .{violations});
+    try writer.writeAll("| session_id | verdict | compile_failures | mutations_without_gcr |\n");
+    try writer.writeAll("| --- | --- | ---: | ---: |\n");
+    for (rows.items) |row| {
+        try writer.print("| {s} | {s} | {d} | {d} |\n", .{
+            scalarString(row.valueOrNull("session_id")) orelse "",
+            scalarString(row.valueOrNull("verdict")) orelse "",
+            scalarIntOrZero(row.valueOrNull("graph.compile_failures")),
+            scalarIntOrZero(row.valueOrNull("graph.mutations_without_gcr")),
+        });
+    }
+    const rendered = try writer_alloc.toOwnedSlice();
+    defer allocator.free(rendered);
+    try writeTextOutput(rendered, opts.out_path);
+}
+
+fn actuationDatasetForMode(mode: []const u8) []const u8 {
+    if (std.mem.eql(u8, mode, "runs") or std.mem.eql(u8, mode, "summary") or std.mem.eql(u8, mode, "report")) return "actuation_runs";
+    if (std.mem.eql(u8, mode, "slices") or std.mem.eql(u8, mode, "decisions")) return "actuation_slices";
+    if (std.mem.eql(u8, mode, "proof")) return "actuation_proofs";
+    if (std.mem.eql(u8, mode, "compactions")) return "actuation_compactions";
+    return "actuation_runs";
+}
+
+fn actuationColumnsForMode(mode: []const u8) []const []const u8 {
+    if (std.mem.eql(u8, mode, "summary")) return &.{ "session_id", "true_actuating", "verdict", "graph.compile_attempts", "graph.compile_failures", "graph.mutations_without_gcr", "projection.update_plan_calls", "surface.churn.apply_patch_calls" };
+    if (std.mem.eql(u8, mode, "runs")) return findDatasetMeta("actuation_runs").?.fields;
+    if (std.mem.eql(u8, mode, "slices") or std.mem.eql(u8, mode, "decisions")) return findDatasetMeta("actuation_slices").?.fields;
+    if (std.mem.eql(u8, mode, "proof")) return findDatasetMeta("actuation_proofs").?.fields;
+    if (std.mem.eql(u8, mode, "compactions")) return findDatasetMeta("actuation_compactions").?.fields;
+    return findDatasetMeta("actuation_runs").?.fields;
+}
+
+fn hasStrictActuationFailure(rows: []const query.Row) bool {
+    for (rows) |row| {
+        const verdict = scalarString(row.valueOrNull("verdict")) orelse continue;
+        if (std.mem.eql(u8, verdict, "projection_inversion") or std.mem.eql(u8, verdict, "graph_bypass")) return true;
+    }
+    return false;
 }
 
 fn cmdDecisionCapsule(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
@@ -18706,6 +18899,8 @@ fn collectDatasetRowsTracked(
         std.mem.eql(u8, dataset_name, "review_compiler_evidence"))
     {
         try collectReviewCompilerDatasetRows(allocator, dataset_name, sessions_root, day_filter, query_params, &rows);
+    } else if (std.mem.startsWith(u8, dataset_name, "actuation_")) {
+        try collectActuationDatasetRows(allocator, dataset_name, sessions_root, query_params, &rows);
     } else if (std.mem.eql(u8, dataset_name, "token_events")) {
         try collectTokenEventsRows(allocator, sessions_root, day_filter, &rows);
     } else if (std.mem.eql(u8, dataset_name, "token_deltas")) {
@@ -18847,6 +19042,204 @@ fn collectReviewCompilerDatasetRows(
             try appendReviewCompilerDatasetEvidenceRows(allocator, out_rows, parsed.session.session_id, path, signals);
         }
     }
+}
+
+fn collectActuationDatasetRows(
+    allocator: std.mem.Allocator,
+    dataset_name: []const u8,
+    sessions_root: []const u8,
+    query_params: []const spec.ParamSpec,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    const path = paramString(query_params, "path");
+    const session_id = paramString(query_params, "session_id");
+    const opts = Options{ .path = path, .session_id = session_id };
+    var paths = if (path != null or session_id != null)
+        try resolveTraceTargetPaths(allocator, sessions_root, opts, false)
+    else
+        try collectJsonlPaths(allocator, sessions_root, null);
+    defer freePathList(allocator, &paths);
+
+    for (paths.items) |trace_path| {
+        var trace = canonical_trace.parseSessionTrace(allocator, trace_path, traceParseOptions(opts)) catch continue;
+        defer trace.deinit(allocator);
+        var ledger = try actuation_audit.compileRunLedger(allocator, trace, .{ .root = sessions_root });
+        defer ledger.deinit(allocator);
+        var graph = try actuation_gcr.analyzeTrace(allocator, trace);
+        defer graph.deinit(allocator);
+        if (std.mem.eql(u8, dataset_name, "actuation_runs")) {
+            try appendActuationRunRow(allocator, out_rows, ledger, graph, trace);
+        } else if (std.mem.eql(u8, dataset_name, "actuation_slices")) {
+            try appendActuationSliceRows(allocator, out_rows, ledger, trace);
+        } else if (std.mem.eql(u8, dataset_name, "actuation_graph_events")) {
+            try appendActuationGraphRows(allocator, out_rows, ledger, graph);
+        } else if (std.mem.eql(u8, dataset_name, "actuation_proofs")) {
+            try appendActuationProofRows(allocator, out_rows, ledger, trace);
+        } else if (std.mem.eql(u8, dataset_name, "actuation_compactions")) {
+            try appendActuationCompactionRow(allocator, out_rows, ledger, trace);
+        } else if (std.mem.eql(u8, dataset_name, "actuation_workers")) {
+            try appendActuationWorkerRow(allocator, out_rows, ledger, trace);
+        } else {
+            return error.UnknownDataset;
+        }
+    }
+}
+
+fn appendActuationRunRow(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayList(query.Row),
+    ledger: actuation_audit.RunLedger,
+    graph: actuation_gcr.Analysis,
+    trace: canonical_trace.CanonicalSessionTrace,
+) !void {
+    const churn = actuation_surface.churnFromTrace(trace);
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    try row.putStaticKey("run_id", .{ .string = ledger.identity.run_id });
+    try row.putStaticKey("session_id", .{ .string = ledger.identity.session_id });
+    try row.putStaticKey("path", .{ .string = ledger.identity.path });
+    try putOptionalString(&row, "repo", ledger.identity.repo);
+    try putOptionalString(&row, "branch", ledger.identity.branch);
+    try row.putStaticKey("true_actuating", .{ .bool = ledger.classification.true_run });
+    try row.putStaticKey("verdict", .{ .string = actuationVerdict(graph, ledger.classification.true_run) });
+    try row.putStaticKey("graph.compile_attempts", .{ .int = @intCast(graph.compile_attempts.len) });
+    try row.putStaticKey("graph.compile_failures", .{ .int = @intCast(countCompileFailures(graph)) });
+    try row.putStaticKey("graph.mutations_without_gcr", .{ .int = @intCast(graph.material_mutations_without_current_executable_gcr) });
+    try row.putStaticKey("projection.update_plan_calls", .{ .int = @intCast(graph.projection.update_plan_calls) });
+    try row.putStaticKey("surface.churn.apply_patch_calls", .{ .int = @intCast(churn.apply_patch_calls) });
+    try row.putStaticKey("diagnostic_query_json", .{ .string = ledger.diagnostic_query_json });
+    try rows.append(allocator, row);
+}
+
+fn appendActuationSliceRows(allocator: std.mem.Allocator, rows: *std.ArrayList(query.Row), ledger: actuation_audit.RunLedger, trace: canonical_trace.CanonicalSessionTrace) !void {
+    var saw_artifact = false;
+    for (trace.turns.items) |turn| {
+        const text = turn.final_answer orelse turn.assistant_preview orelse continue;
+        if (std.mem.indexOf(u8, text, "actuation_frontier") == null and std.mem.indexOf(u8, text, "fixed_point_slice_result") == null) continue;
+        saw_artifact = true;
+        var artifact = actuation_afr.parseArtifact(allocator, text) catch continue;
+        defer artifact.deinit(allocator);
+        var row = query.Row.init(allocator);
+        errdefer row.deinit();
+        try row.putStaticKey("run_id", .{ .string = ledger.identity.run_id });
+        try row.putStaticKey("session_id", .{ .string = ledger.identity.session_id });
+        try putOptionalString(&row, "slice_id", artifact.slice_id);
+        try row.putStaticKey("afr_valid", .{ .bool = artifact.kind == .afr and artifact.valid });
+        try row.putStaticKey("afr_missing", .{ .bool = false });
+        try row.putStaticKey("afr_stale", .{ .bool = false });
+        try row.putStaticKey("valid_realizations", .{ .int = if (artifact.kind == .fpsr and artifact.valid) 1 else 0 });
+        try row.putStaticKey("return_to_frontier", .{ .bool = std.mem.indexOf(u8, text, "return_to_frontier") != null });
+        try rows.append(allocator, row);
+    }
+    if (!saw_artifact) {
+        var row = query.Row.init(allocator);
+        errdefer row.deinit();
+        try row.putStaticKey("run_id", .{ .string = ledger.identity.run_id });
+        try row.putStaticKey("session_id", .{ .string = ledger.identity.session_id });
+        try row.putStaticKey("slice_id", .{ .string = "" });
+        try row.putStaticKey("afr_valid", .{ .bool = false });
+        try row.putStaticKey("afr_missing", .{ .bool = true });
+        try row.putStaticKey("afr_stale", .{ .bool = false });
+        try row.putStaticKey("valid_realizations", .{ .int = 0 });
+        try row.putStaticKey("return_to_frontier", .{ .bool = false });
+        try rows.append(allocator, row);
+    }
+}
+
+fn appendActuationGraphRows(allocator: std.mem.Allocator, rows: *std.ArrayList(query.Row), ledger: actuation_audit.RunLedger, graph: actuation_gcr.Analysis) !void {
+    for (graph.compile_attempts) |attempt| {
+        var row = query.Row.init(allocator);
+        errdefer row.deinit();
+        try row.putStaticKey("run_id", .{ .string = ledger.identity.run_id });
+        try row.putStaticKey("session_id", .{ .string = ledger.identity.session_id });
+        try row.putStaticKey("event_kind", .{ .string = "st_compile_aperture" });
+        try putOptionalString(&row, "gcr_id", attempt.gcr_id);
+        try row.putStaticKey("result", .{ .string = @tagName(attempt.result) });
+        try row.putStaticKey("gcr_state", .{ .string = "" });
+        try row.putStaticKey("mutation_event_ref", .{ .string = "" });
+        try row.putStaticKey("last_gcr_ref", .{ .string = "" });
+        try row.putStaticKey("source_ref", .{ .string = attempt.call_id orelse "" });
+        try rows.append(allocator, row);
+    }
+    for (graph.control_violations) |violation| {
+        var row = query.Row.init(allocator);
+        errdefer row.deinit();
+        try row.putStaticKey("run_id", .{ .string = ledger.identity.run_id });
+        try row.putStaticKey("session_id", .{ .string = ledger.identity.session_id });
+        try row.putStaticKey("event_kind", .{ .string = "graph_control_violation" });
+        try row.putStaticKey("gcr_id", .{ .string = "" });
+        try row.putStaticKey("result", .{ .string = "" });
+        try row.putStaticKey("gcr_state", .{ .string = @tagName(violation.gcr_state) });
+        try row.putStaticKey("mutation_event_ref", .{ .string = violation.mutation_event_ref });
+        try row.putStaticKey("last_gcr_ref", .{ .string = violation.last_gcr_ref orelse "" });
+        try row.putStaticKey("source_ref", .{ .string = violation.violation_id });
+        try rows.append(allocator, row);
+    }
+}
+
+fn appendActuationProofRows(allocator: std.mem.Allocator, rows: *std.ArrayList(query.Row), ledger: actuation_audit.RunLedger, trace: canonical_trace.CanonicalSessionTrace) !void {
+    const proofs = try actuation_proof.collectProofs(allocator, trace);
+    defer {
+        for (proofs) |*row| row.deinit(allocator);
+        allocator.free(proofs);
+    }
+    for (proofs, 0..) |proof_row, idx| {
+        var row = query.Row.init(allocator);
+        errdefer row.deinit();
+        try row.putStaticKey("run_id", .{ .string = ledger.identity.run_id });
+        try row.putStaticKey("session_id", .{ .string = ledger.identity.session_id });
+        const proof_id = try std.fmt.allocPrint(allocator, "proof-{d}", .{idx + 1});
+        defer allocator.free(proof_id);
+        try row.putStaticKey("proof_id", .{ .string = proof_id });
+        try row.putStaticKey("command", .{ .string = proof_row.command });
+        try row.putStaticKey("scope", .{ .string = @tagName(proof_row.scope) });
+        try row.putStaticKey("classification_source", .{ .string = @tagName(proof_row.classification_source) });
+        try row.putStaticKey("current", .{ .bool = proof_row.current });
+        try rows.append(allocator, row);
+    }
+}
+
+fn appendActuationCompactionRow(allocator: std.mem.Allocator, rows: *std.ArrayList(query.Row), ledger: actuation_audit.RunLedger, trace: canonical_trace.CanonicalSessionTrace) !void {
+    const summary = actuation_compaction.analyzeTrace(trace);
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    try row.putStaticKey("run_id", .{ .string = ledger.identity.run_id });
+    try row.putStaticKey("session_id", .{ .string = ledger.identity.session_id });
+    try row.putStaticKey("compactions", .{ .int = @intCast(summary.compactions) });
+    try row.putStaticKey("compactions_with_resume_artifact", .{ .int = @intCast(summary.compactions_with_resume_artifact) });
+    try row.putStaticKey("resume_coverage_ratio", .{ .float = summary.resumeCoverageRatio() });
+    try row.putStaticKey("skill_reads_after_compaction", .{ .int = @intCast(summary.skill_reads_after_compaction) });
+    try row.putStaticKey("rediscovery_tool_calls", .{ .int = @intCast(summary.rediscovery_tool_calls) });
+    try rows.append(allocator, row);
+}
+
+fn appendActuationWorkerRow(allocator: std.mem.Allocator, rows: *std.ArrayList(query.Row), ledger: actuation_audit.RunLedger, trace: canonical_trace.CanonicalSessionTrace) !void {
+    const summary = actuation_workers.analyzeTrace(trace);
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    try row.putStaticKey("run_id", .{ .string = ledger.identity.run_id });
+    try row.putStaticKey("session_id", .{ .string = ledger.identity.session_id });
+    try row.putStaticKey("spawned", .{ .int = @intCast(summary.spawned) });
+    try row.putStaticKey("linked", .{ .int = @intCast(summary.linked) });
+    try row.putStaticKey("valid_artifacts", .{ .int = @intCast(summary.valid_artifacts) });
+    try row.putStaticKey("artifact_yield", .{ .float = summary.artifactYield() });
+    try rows.append(allocator, row);
+}
+
+fn countCompileFailures(graph: actuation_gcr.Analysis) usize {
+    var failures: usize = 0;
+    for (graph.compile_attempts) |attempt| {
+        if (attempt.result != .pass) failures += 1;
+    }
+    return failures;
+}
+
+fn actuationVerdict(graph: actuation_gcr.Analysis, true_run: bool) []const u8 {
+    if (!true_run) return "insufficient_evidence";
+    if (graph.projection.projection_inversion.present) return "projection_inversion";
+    if (graph.material_mutations_without_current_executable_gcr > 0) return "graph_bypass";
+    if (graph.gcrs.len == 0) return "frontier_missing";
+    return "controlled_with_gaps";
 }
 
 fn appendReviewCompilerDatasetRunRow(
@@ -21469,7 +21862,11 @@ fn parseOptionsForCommand(cmd: lib.Command, args: []const []const u8) !Options {
         opts.command_action = args[0];
         return opts;
     }
-    return parseOptions(args);
+    var opts = try parseOptions(args);
+    if (cmd == .actuation_audit and opts.strict_set and opts.strict) {
+        opts.actuation_strict = true;
+    }
+    return opts;
 }
 
 fn parseOptions(args: []const []const u8) !Options {
@@ -21751,6 +22148,10 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.bundle_dir_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--artifact-root")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.artifact_root_text = args[i];
         } else if (std.mem.eql(u8, arg, "--state-db-path")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -21832,8 +22233,10 @@ fn parseOptions(args: []const []const u8) !Options {
             opts.strict_hang = false;
         } else if (std.mem.eql(u8, arg, "--strict")) {
             opts.strict = true;
+            opts.strict_set = true;
         } else if (std.mem.eql(u8, arg, "--no-strict")) {
             opts.strict = false;
+            opts.strict_set = true;
         } else if (std.mem.eql(u8, arg, "--sections")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -21922,6 +22325,82 @@ fn parseDurationSeconds(raw: []const u8) !i64 {
         'm' => std.math.mul(i64, value, 60) catch return error.InvalidLimit,
         else => value,
     };
+}
+
+test "actuation-audit validates bounded selector modes and formats" {
+    const path_opts = try parseOptionsForCommand(.actuation_audit, &.{
+        "--root",
+        "/tmp/sessions",
+        "--path",
+        "/tmp/session.jsonl",
+        "--mode",
+        "summary",
+        "--format",
+        "json",
+        "--include-workers",
+        "--include-excerpts",
+        "--artifact-root",
+        "/tmp/artifacts",
+        "--strict",
+    });
+    try std.testing.expect(path_opts.actuation_strict);
+    try validateFormatForCommand(.actuation_audit, path_opts);
+    try validateCommandOptions(.actuation_audit, path_opts);
+
+    const session_opts = try parseOptionsForCommand(.actuation_audit, &.{ "--session-id", "abc", "--mode", "runs" });
+    try validateCommandOptions(.actuation_audit, session_opts);
+
+    const repo_window_opts = try parseOptionsForCommand(.actuation_audit, &.{ "--repo", "/tmp/repo", "--last", "2h" });
+    try validateCommandOptions(.actuation_audit, repo_window_opts);
+
+    const unbounded_opts = try parseOptionsForCommand(.actuation_audit, &.{ "--root", "/tmp/sessions" });
+    try std.testing.expectError(error.MissingArgValue, validateCommandOptions(.actuation_audit, unbounded_opts));
+
+    const repo_without_window_opts = try parseOptionsForCommand(.actuation_audit, &.{ "--repo", "/tmp/repo" });
+    try std.testing.expectError(error.MissingArgValue, validateCommandOptions(.actuation_audit, repo_without_window_opts));
+
+    const invalid_mode_opts = try parseOptionsForCommand(.actuation_audit, &.{ "--path", "/tmp/session.jsonl", "--mode", "mentions" });
+    try std.testing.expectError(error.InvalidModeArg, validateCommandOptions(.actuation_audit, invalid_mode_opts));
+
+    const report_markdown_opts = try parseOptionsForCommand(.actuation_audit, &.{ "--path", "/tmp/session.jsonl", "--mode", "report", "--format", "markdown" });
+    try validateFormatForCommand(.actuation_audit, report_markdown_opts);
+    try validateCommandOptions(.actuation_audit, report_markdown_opts);
+
+    const summary_markdown_opts = try parseOptionsForCommand(.actuation_audit, &.{ "--path", "/tmp/session.jsonl", "--format", "markdown" });
+    try std.testing.expectError(error.InvalidFormatForCommand, validateFormatForCommand(.actuation_audit, summary_markdown_opts));
+
+    const dot_opts = Options{ .format = .dot, .format_set = true, .path = "/tmp/session.jsonl" };
+    try std.testing.expectError(error.InvalidFormatForCommand, validateFormatForCommand(.actuation_audit, dot_opts));
+}
+
+test "actuation analyzer modules compile through command owner" {
+    const afr_text =
+        \\{"actuation_frontier":{"run_id":"run","slice_id":"slice","afr_id":"afr","graph_binding":{"gcr_id":"gcr"},"decision":{"selected_route":"bounded_new_surface"}}}
+    ;
+    var artifact = try actuation_afr.parseArtifact(std.testing.allocator, afr_text);
+    defer artifact.deinit(std.testing.allocator);
+    try std.testing.expect(artifact.valid);
+
+    var realization = try actuation_realization.analyzeHandoffResult(
+        std.testing.allocator,
+        "{\"actuation_realization_handoff\":{\"run_id\":\"run\",\"selected_route\":\"bounded_new_surface\"}}",
+        "{\"fixed_point_slice_result\":{\"run_id\":\"run\",\"selected_route\":\"bounded_new_surface\"}}",
+    );
+    defer realization.deinit(std.testing.allocator);
+    try std.testing.expect(realization.route_match);
+
+    const classified = actuation_proof.classifyCommand("zig build test --summary all", null);
+    try std.testing.expectEqual(actuation_proof.ProofScope.full_closure, classified[0]);
+
+    var trace = canonical_trace.CanonicalSessionTrace{ .session = try canonical_trace.SessionRecord.init(std.testing.allocator, "/tmp/run.jsonl") };
+    defer trace.deinit(std.testing.allocator);
+    try trace.turns.append(std.testing.allocator, .{ .path = try std.testing.allocator.dupe(u8, "/tmp/run.jsonl"), .turn_id = try std.testing.allocator.dupe(u8, "t1"), .turn_index = 1, .has_compaction = true });
+    try trace.tools.append(std.testing.allocator, .{ .path = try std.testing.allocator.dupe(u8, "/tmp/run.jsonl"), .turn_index = 2, .kind = .exec_command, .command_text = try std.testing.allocator.dupe(u8, "sed -n '1,20p' actuating/SKILL.md"), .output_text = try std.testing.allocator.dupe(u8, "ASR-v2") });
+    try trace.graph_edges.append(std.testing.allocator, .{ .parent_session_id = try std.testing.allocator.dupe(u8, "p"), .worker_session_id = try std.testing.allocator.dupe(u8, "w"), .parent_path = try std.testing.allocator.dupe(u8, "/tmp/p.jsonl"), .prompt_preview = try std.testing.allocator.dupe(u8, "AFM-v1 packet") });
+    try trace.tools.append(std.testing.allocator, .{ .path = try std.testing.allocator.dupe(u8, "/tmp/run.jsonl"), .kind = .patch_apply, .patch_changes_json = try std.testing.allocator.dupe(u8, "{\"added\":2,\"removed\":1}") });
+    try std.testing.expectEqual(@as(usize, 1), actuation_compaction.analyzeTrace(trace).compactions);
+    try std.testing.expectEqual(@as(usize, 1), actuation_workers.analyzeTrace(trace).valid_artifacts);
+    try std.testing.expectEqual(@as(usize, 1), actuation_surface.churnFromTrace(trace).apply_patch_calls);
 }
 
 fn findDatasetMeta(name: []const u8) ?DatasetMeta {

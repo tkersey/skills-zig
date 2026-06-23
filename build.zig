@@ -66,6 +66,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "core_path", .module = core_path },
             .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "retrace_core", .module = retrace_core },
             .{ .name = "app_meta", .module = seq_meta },
         },
     });

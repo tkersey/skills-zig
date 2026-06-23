@@ -231,6 +231,28 @@ seq query --root ~/.codex/sessions --spec '{"dataset":"skill_decision_outcomes",
 seq query --root ~/.codex/sessions --spec '{"dataset":"historical_decisions","params":{"path":"rollout.jsonl"},"select":["decision_id","turn_index","selected_route","confidence"],"format":"table"}'
 ```
 
+`actuation-audit` compiles SEQ-ACTRUN-v1 ledgers for `$actuating` plan-to-PR runs:
+- requires a bounded selector: `--session-id`, `--path`, or `--repo`/`--workdir` with `--since`, `--until`, or `--last`
+- classifies true runs separately from pasted skill blocks, examples, reports, and incidental mentions
+- recovers GCR attempts, material mutations without current executable GCR, projection inversion, proof cadence, compaction resume signals, worker linkage, churn, and ship flags from canonical trace evidence
+- keeps raw prompts/excerpts out by default; `--include-excerpts` is explicit
+- `--strict` exits 2 for graph bypass or projection inversion rows
+
+Examples:
+```bash
+seq actuation-audit --root ~/.codex/sessions --path rollout.jsonl --mode summary --format json
+seq actuation-audit --root ~/.codex/sessions --repo /path/to/repo --last 7d --mode report --format markdown
+seq query --root ~/.codex/sessions --spec '{"dataset":"actuation_runs","params":{"path":"rollout.jsonl"},"select":["session_id","verdict","graph.compile_failures","projection.update_plan_calls","surface.churn.apply_patch_calls"],"format":"table"}'
+```
+
+Actuation query datasets:
+- `actuation_runs`
+- `actuation_slices`
+- `actuation_graph_events`
+- `actuation_proofs`
+- `actuation_compactions`
+- `actuation_workers`
+
 ## Trace-native session surfaces
 
 `seq` can parse Codex rollout JSONL into canonical sessions, turns, tool lifecycle rows, and worker graph edges. These commands preserve the existing local-first flow: they read local `rollout-*.jsonl` files under `~/.codex/sessions` or an explicit `--path`.
