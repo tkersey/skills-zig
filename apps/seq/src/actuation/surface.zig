@@ -20,6 +20,7 @@ pub const ShipSummary = struct {
 pub fn churnFromTrace(trace: canonical_trace.CanonicalSessionTrace) Churn {
     var churn = Churn{};
     for (trace.tools.items) |tool| {
+        if (tool.patch_success == false) continue;
         if (tool.kind == .patch_apply or tool.patch_changes_json != null or toolContains(tool, "apply_patch")) churn.apply_patch_calls += 1;
         if (tool.patch_changes_json) |json| {
             churn.gross_insertions += countNumberAfter(json, "\"added\":");

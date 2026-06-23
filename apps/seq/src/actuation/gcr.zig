@@ -164,7 +164,7 @@ pub fn analyzeTrace(allocator: std.mem.Allocator, trace: canonical_trace.Canonic
         if (isCompileAttempt(tool)) {
             scan.material_graph_context = true;
             const parsed_gcr = try parseGcrEvidence(allocator, tool, event_ref);
-            const result = classifyAttempt(tool, parsed_gcr != null);
+            const result = classifyAttempt(tool, parsed_gcr);
             const gcr_id = if (parsed_gcr) |evidence| try allocator.dupe(u8, evidence.gcr_id) else null;
             try attempts.append(allocator, .{
                 .call_id = try dupOpt(allocator, tool.call_id),
@@ -260,7 +260,7 @@ fn parseGcrEvidence(allocator: std.mem.Allocator, tool: canonical_trace.ToolLife
     errdefer freeStringList(allocator, blocking_debt);
     const selected = try extractStringList(allocator, text, "selected_task_ids");
     errdefer freeStringList(allocator, selected);
-    const execution_allowed = !contains(text, "\"execution_allowed\":false") and
+    const execution_allowed = !containsJsonBoolFalse(text, "execution_allowed") and
         !contains(text, "execution_allowed: false") and
         !contains(text, "execution_allowed=no");
 
@@ -281,10 +281,11 @@ fn parseGcrEvidence(allocator: std.mem.Allocator, tool: canonical_trace.ToolLife
     };
 }
 
-fn classifyAttempt(tool: canonical_trace.ToolLifecycleRecord, has_gcr: bool) AttemptResult {
+fn classifyAttempt(tool: canonical_trace.ToolLifecycleRecord, gcr: ?GcrEvidence) AttemptResult {
     const text = joinedToolText(tool);
-    if (has_gcr and (tool.exit_code == null or tool.exit_code.? == 0)) {
-        if (contains(text, "\"execution_allowed\":false") or contains(text, "execution_allowed: false") or contains(text, "blocking_debt")) return .gate_fail;
+    if (gcr) |evidence| {
+        if (tool.exit_code != null and tool.exit_code.? != 0) return .system_error;
+        if (!evidence.execution_allowed or evidence.blocking_debt.len > 0) return .gate_fail;
         return .pass;
     }
     if (contains(text, "usage") or contains(text, "unknown option") or contains(text, "invalid argument")) return .usage_error;
@@ -303,10 +304,34 @@ fn isUpdatePlan(tool: canonical_trace.ToolLifecycleRecord) bool {
 }
 
 fn isMaterialMutation(tool: canonical_trace.ToolLifecycleRecord) bool {
+    if (tool.patch_success == false) return false;
     if (tool.kind == .patch_apply) return true;
     if (tool.patch_changes_json != null) return true;
     if (tool.tool_name) |name| if (contains(name, "apply_patch")) return true;
     return toolContains(tool, "*** Begin Patch");
+}
+
+fn containsJsonBoolFalse(text: []const u8, key: []const u8) bool {
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, text, start, key)) |idx| {
+        var pos = idx + key.len;
+        while (pos < text.len and std.ascii.isWhitespace(text[pos])) pos += 1;
+        if (pos >= text.len or text[pos] != '"') {
+            start = idx + key.len;
+            continue;
+        }
+        pos += 1;
+        while (pos < text.len and std.ascii.isWhitespace(text[pos])) pos += 1;
+        if (pos >= text.len or text[pos] != ':') {
+            start = idx + key.len;
+            continue;
+        }
+        pos += 1;
+        while (pos < text.len and std.ascii.isWhitespace(text[pos])) pos += 1;
+        if (std.mem.startsWith(u8, text[pos..], "false")) return true;
+        start = idx + key.len;
+    }
+    return false;
 }
 
 fn isGraphInvalidator(tool: canonical_trace.ToolLifecycleRecord) bool {

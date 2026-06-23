@@ -1,6 +1,10 @@
 const std = @import("std");
 const commands = @import("../commands/mod.zig");
 const lib = @import("../lib.zig");
+const retrace_core = @import("retrace_core");
+const canonical_trace = retrace_core.canonical_trace;
+const actuation_afr = @import("../actuation/afr.zig");
+const actuation_gcr = @import("../actuation/gcr.zig");
 
 fn runAndReadOutput(
     allocator: std.mem.Allocator,
@@ -37,7 +41,7 @@ fn writePastedSkillFixture(path: []const u8) !void {
     try out.writeAll(
         \\{"type":"session_meta","timestamp":"2026-06-01T11:00:00Z","payload":{"id":"actuation-pasted-skill","cwd":"/repo/seq-audit","model":"gpt-5"}}
         \\{"type":"event_msg","timestamp":"2026-06-01T11:00:01Z","payload":{"type":"task_started","turn_id":"t1"}}
-        \\{"type":"event_msg","timestamp":"2026-06-01T11:00:02Z","payload":{"type":"agent_message","turn_id":"t1","message":"<skill><name>actuating</name><body>$actuating example block</body></skill>"}}
+        \\{"type":"event_msg","timestamp":"2026-06-01T11:00:02Z","payload":{"type":"agent_message","turn_id":"t1","message":"<skill><name>actuating</name><body>$actuating example block with AFR-v1 and actuation_frontier</body></skill>"}}
         \\{"type":"event_msg","timestamp":"2026-06-01T11:00:03Z","payload":{"type":"task_complete","turn_id":"t1","duration_ms":1000}}
         \\
     );
@@ -48,8 +52,8 @@ test "actuation audit regression fixture exposes projection inversion signals" {
     const fixture = "testdata/actuation/long-run-regression.jsonl";
 
     const args = [_][]const u8{
-        "--path", fixture,
-        "--mode", "summary",
+        "--path",   fixture,
+        "--mode",   "summary",
         "--format", "json",
     };
     const got = try runAndReadOutput(std.testing.allocator, .actuation_audit, args[0..], ".zig-cache/actuation-summary.json");
@@ -97,6 +101,14 @@ test "actuation audit datasets expose lineage proof compaction and query rows" {
     try expectContains(query_out, "\"session_id\": \"actuation-long-run\"");
     try expectContains(query_out, "\"graph.compile_failures\": 20");
     try expectContains(query_out, "\"projection.update_plan_calls\": 192");
+
+    const filtered_query_spec =
+        \\{"dataset":"actuation_runs","params":{"path":"testdata/actuation/long-run-regression.jsonl","repo":"/different/repo"},"select":["session_id"],"format":"json"}
+    ;
+    const filtered_query_args = [_][]const u8{ "--root", ".zig-cache", "--spec", filtered_query_spec };
+    const filtered = try runAndReadOutput(std.testing.allocator, .query, filtered_query_args[0..], ".zig-cache/actuation-query-filtered.json");
+    defer std.testing.allocator.free(filtered);
+    try std.testing.expectEqualStrings("[\n]\n", filtered);
 }
 
 test "actuation audit excludes pasted skill blocks as true runs" {
@@ -110,4 +122,50 @@ test "actuation audit excludes pasted skill blocks as true runs" {
     try expectContains(got, "\"session_id\": \"actuation-pasted-skill\"");
     try expectContains(got, "\"true_actuating\": false");
     try expectContains(got, "\"verdict\": \"insufficient_evidence\"");
+}
+
+test "actuation audit parses embedded artifacts and GCR edge cases" {
+    const embedded =
+        \\frontier:
+        \\```json
+        \\{"actuation_frontier":{"run_id":"run","slice_id":"slice","afr_id":"afr","graph_binding":{"gcr_id":"GCR-1"},"decision":{"selected_route":"route"}}}
+        \\```
+    ;
+    var artifact = try actuation_afr.parseArtifact(std.testing.allocator, embedded);
+    defer artifact.deinit(std.testing.allocator);
+    try std.testing.expect(artifact.valid);
+    try std.testing.expectEqual(actuation_afr.ArtifactKind.afr, artifact.kind);
+
+    var trace = canonical_trace.CanonicalSessionTrace{ .session = try canonical_trace.SessionRecord.init(std.testing.allocator, "/tmp/run.jsonl") };
+    defer trace.deinit(std.testing.allocator);
+    try trace.tools.append(std.testing.allocator, .{
+        .path = try std.testing.allocator.dupe(u8, "/tmp/run.jsonl"),
+        .kind = .exec_command,
+        .command_text = try std.testing.allocator.dupe(u8, "st compile aperture"),
+        .output_text = try std.testing.allocator.dupe(u8, "{\"graph_control_receipt\":{\"gcr_id\":\"GCR-1\",\"execution_allowed\": true,\"blocking_debt\":[]}}"),
+        .exit_code = 0,
+    });
+    try trace.tools.append(std.testing.allocator, .{
+        .path = try std.testing.allocator.dupe(u8, "/tmp/run.jsonl"),
+        .kind = .patch_apply,
+        .patch_success = false,
+    });
+    var graph = try actuation_gcr.analyzeTrace(std.testing.allocator, trace);
+    defer graph.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), graph.material_mutations);
+    try std.testing.expectEqual(actuation_gcr.AttemptResult.pass, graph.compile_attempts[0].result);
+
+    var denied_trace = canonical_trace.CanonicalSessionTrace{ .session = try canonical_trace.SessionRecord.init(std.testing.allocator, "/tmp/denied.jsonl") };
+    defer denied_trace.deinit(std.testing.allocator);
+    try denied_trace.tools.append(std.testing.allocator, .{
+        .path = try std.testing.allocator.dupe(u8, "/tmp/denied.jsonl"),
+        .kind = .exec_command,
+        .command_text = try std.testing.allocator.dupe(u8, "st compile aperture"),
+        .output_text = try std.testing.allocator.dupe(u8, "{ \"graph_control_receipt\": { \"gcr_id\": \"GCR-2\", \"execution_allowed\": false, \"blocking_debt\": [] } }"),
+        .exit_code = 0,
+    });
+    var denied_graph = try actuation_gcr.analyzeTrace(std.testing.allocator, denied_trace);
+    defer denied_graph.deinit(std.testing.allocator);
+    try std.testing.expectEqual(actuation_gcr.AttemptResult.gate_fail, denied_graph.compile_attempts[0].result);
+    try std.testing.expectEqual(actuation_gcr.GcrState.execution_denied, denied_graph.gcr_state_at_end);
 }

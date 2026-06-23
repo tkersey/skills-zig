@@ -23,7 +23,19 @@ pub const ArtifactRow = struct {
 };
 
 pub fn parseArtifact(allocator: std.mem.Allocator, text: []const u8) !ArtifactRow {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch {
+    var owned_embedded: ?[]u8 = null;
+    defer if (owned_embedded) |json| allocator.free(json);
+    const json_text = blk: {
+        if (std.json.parseFromSlice(std.json.Value, allocator, text, .{})) |parsed_probe| {
+            var probe = parsed_probe;
+            probe.deinit();
+            break :blk text;
+        } else |_| {
+            owned_embedded = try extractEmbeddedArtifactJson(allocator, text);
+            break :blk owned_embedded orelse return invalidRow(allocator, .unknown, "json_parse_error");
+        }
+    };
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_text, .{}) catch {
         return invalidRow(allocator, .unknown, "json_parse_error");
     };
     defer parsed.deinit();
@@ -34,6 +46,60 @@ pub fn parseArtifact(allocator: std.mem.Allocator, text: []const u8) !ArtifactRo
     if (root.get("actuation_summary")) |value| return parseWrapped(allocator, .asr, value);
     if (root.get("skill_decision_receipt")) |value| return parseWrapped(allocator, .sdr, value);
     return invalidRow(allocator, .unknown, "unsupported_wrapper");
+}
+
+fn extractEmbeddedArtifactJson(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
+    const key_idx = firstWrapperIndex(text) orelse return null;
+    var start = key_idx;
+    while (start > 0) {
+        start -= 1;
+        if (text[start] == '{') break;
+    } else return null;
+    var depth: usize = 0;
+    var in_string = false;
+    var escaped = false;
+    var idx = start;
+    while (idx < text.len) : (idx += 1) {
+        const c = text[idx];
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+            continue;
+        }
+        if (c == '{') {
+            depth += 1;
+        } else if (c == '}') {
+            if (depth == 0) return null;
+            depth -= 1;
+            if (depth == 0) return try allocator.dupe(u8, text[start .. idx + 1]);
+        }
+    }
+    return null;
+}
+
+fn firstWrapperIndex(text: []const u8) ?usize {
+    var best: ?usize = null;
+    for ([_][]const u8{
+        "\"actuation_frontier\"",
+        "\"actuation_realization_handoff\"",
+        "\"fixed_point_slice_result\"",
+        "\"actuation_summary\"",
+        "\"skill_decision_receipt\"",
+    }) |needle| {
+        if (std.mem.indexOf(u8, text, needle)) |idx| {
+            if (best == null or idx < best.?) best = idx;
+        }
+    }
+    return best;
 }
 
 fn parseAfr(allocator: std.mem.Allocator, value: std.json.Value) !ArtifactRow {

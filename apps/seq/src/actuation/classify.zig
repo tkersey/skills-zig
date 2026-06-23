@@ -85,6 +85,10 @@ fn inspectText(
     has_skill_read: bool,
 ) !void {
     const contaminated = try classifyContamination(allocator, contamination, text);
+    if (contaminated) {
+        counts.weak += 1;
+        return;
+    }
     if (contains(text, "actuation_frontier") or contains(text, "AFR-v1")) {
         try addEvidence(allocator, evidence, "turn", turn_index, role, "afr_v1");
         counts.strong += 1;
@@ -105,20 +109,18 @@ fn inspectText(
         try addEvidence(allocator, evidence, "turn", turn_index, role, "sdr_v1_actuating");
         counts.strong += 1;
     }
-    if (std.mem.eql(u8, role, "user") and contains(text, "$actuating") and !contaminated) {
+    if (std.mem.eql(u8, role, "user") and contains(text, "$actuating")) {
         try addEvidence(allocator, evidence, "turn", turn_index, role, "explicit_user_actuating");
         counts.strong += 1;
         return;
     }
-    if (std.mem.eql(u8, role, "assistant") and has_skill_read and assistantDeclaresActuating(text) and !contaminated) {
+    if (std.mem.eql(u8, role, "assistant") and has_skill_read and assistantDeclaresActuating(text)) {
         try addEvidence(allocator, evidence, "turn", turn_index, role, "assistant_declared_actuating_with_skill_read");
         counts.strong += 1;
         return;
     }
-    if ((contains(text, "$actuating") or contains(text, "actuating")) and !contaminated) {
+    if (contains(text, "$actuating") or contains(text, "actuating")) {
         try addEvidence(allocator, evidence, "turn", turn_index, role, "generic_actuating_mention");
-        counts.weak += 1;
-    } else if (contaminated) {
         counts.weak += 1;
     }
 }

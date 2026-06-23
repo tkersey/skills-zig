@@ -3008,17 +3008,14 @@ fn cmdActuationAudit(allocator: std.mem.Allocator, sessions_root: []const u8, op
 
     var params = std.ArrayList(spec.ParamSpec).empty;
     defer params.deinit(allocator);
-    if (opts.path) |path| try params.append(allocator, .{ .key = "path", .value = .{ .string = path } });
-    if (opts.session_id) |session_id| try params.append(allocator, .{ .key = "session_id", .value = .{ .string = session_id } });
+    try appendActuationScopeParams(allocator, &params, opts);
 
     const dataset_name = actuationDatasetForMode(mode);
     var rows: std.ArrayList(query.Row) = .empty;
     defer deinitQueryRows(allocator, &rows);
     try collectActuationDatasetRows(allocator, dataset_name, sessions_root, params.items, &rows);
 
-    if (opts.actuation_strict and hasStrictActuationFailure(rows.items)) {
-        std.process.exit(2);
-    }
+    if (opts.actuation_strict and try hasStrictActuationFailureForParams(allocator, sessions_root, params.items, dataset_name, rows.items)) std.process.exit(2);
 
     const cols = actuationColumnsForMode(mode);
     try output.writeOutput(allocator, opts.format, rows.items, cols, opts.out_path);
@@ -3027,8 +3024,7 @@ fn cmdActuationAudit(allocator: std.mem.Allocator, sessions_root: []const u8, op
 fn cmdActuationAuditReport(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
     var params = std.ArrayList(spec.ParamSpec).empty;
     defer params.deinit(allocator);
-    if (opts.path) |path| try params.append(allocator, .{ .key = "path", .value = .{ .string = path } });
-    if (opts.session_id) |session_id| try params.append(allocator, .{ .key = "session_id", .value = .{ .string = session_id } });
+    try appendActuationScopeParams(allocator, &params, opts);
     var rows: std.ArrayList(query.Row) = .empty;
     defer deinitQueryRows(allocator, &rows);
     try collectActuationDatasetRows(allocator, "actuation_runs", sessions_root, params.items, &rows);
@@ -3083,6 +3079,31 @@ fn hasStrictActuationFailure(rows: []const query.Row) bool {
         if (std.mem.eql(u8, verdict, "projection_inversion") or std.mem.eql(u8, verdict, "graph_bypass")) return true;
     }
     return false;
+}
+
+fn hasStrictActuationFailureForParams(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    params: []const spec.ParamSpec,
+    dataset_name: []const u8,
+    rows: []const query.Row,
+) !bool {
+    if (std.mem.eql(u8, dataset_name, "actuation_runs")) return hasStrictActuationFailure(rows);
+    var run_rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &run_rows);
+    try collectActuationDatasetRows(allocator, "actuation_runs", sessions_root, params, &run_rows);
+    return hasStrictActuationFailure(run_rows.items);
+}
+
+fn appendActuationScopeParams(allocator: std.mem.Allocator, params: *std.ArrayList(spec.ParamSpec), opts: Options) !void {
+    if (opts.path) |path| try params.append(allocator, .{ .key = "path", .value = .{ .string = path } });
+    if (opts.session_id) |session_id| try params.append(allocator, .{ .key = "session_id", .value = .{ .string = session_id } });
+    if (opts.repo_text) |repo| try params.append(allocator, .{ .key = "repo", .value = .{ .string = repo } });
+    if (opts.workdir_text) |workdir| try params.append(allocator, .{ .key = "workdir", .value = .{ .string = workdir } });
+    if (opts.since) |since| try params.append(allocator, .{ .key = "since", .value = .{ .string = since } });
+    if (opts.until) |until| try params.append(allocator, .{ .key = "until", .value = .{ .string = until } });
+    if (opts.last_text) |last| try params.append(allocator, .{ .key = "last", .value = .{ .string = last } });
+    if (opts.exclude_current) try params.append(allocator, .{ .key = "exclude_current", .value = .{ .bool = true } });
 }
 
 fn cmdDecisionCapsule(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
@@ -19053,16 +19074,28 @@ fn collectActuationDatasetRows(
 ) !void {
     const path = paramString(query_params, "path");
     const session_id = paramString(query_params, "session_id");
-    const opts = Options{ .path = path, .session_id = session_id };
-    var paths = if (path != null or session_id != null)
-        try resolveTraceTargetPaths(allocator, sessions_root, opts, false)
-    else
-        try collectJsonlPaths(allocator, sessions_root, null);
+    const opts = Options{
+        .path = path,
+        .session_id = session_id,
+        .repo_text = paramString(query_params, "repo"),
+        .workdir_text = paramString(query_params, "workdir"),
+        .since = paramString(query_params, "since"),
+        .until = paramString(query_params, "until"),
+        .last_text = paramString(query_params, "last"),
+        .exclude_current = paramBool(query_params, "exclude_current") orelse false,
+    };
+    var paths = try resolveTraceTargetPaths(allocator, sessions_root, opts, false);
     defer freePathList(allocator, &paths);
+    const current_thread_id = if (opts.exclude_current)
+        getEnvVarOwned(allocator, "CODEX_THREAD_ID") catch null
+    else
+        null;
+    defer if (current_thread_id) |id| allocator.free(id);
 
     for (paths.items) |trace_path| {
         var trace = canonical_trace.parseSessionTrace(allocator, trace_path, traceParseOptions(opts)) catch continue;
         defer trace.deinit(allocator);
+        if (!actuationTracePassesScope(trace.session, opts, current_thread_id)) continue;
         var ledger = try actuation_audit.compileRunLedger(allocator, trace, .{ .root = sessions_root });
         defer ledger.deinit(allocator);
         var graph = try actuation_gcr.analyzeTrace(allocator, trace);
@@ -19083,6 +19116,25 @@ fn collectActuationDatasetRows(
             return error.UnknownDataset;
         }
     }
+}
+
+fn actuationTracePassesScope(session: canonical_trace.SessionRecord, opts: Options, current_thread_id: ?[]const u8) bool {
+    if (current_thread_id) |id| {
+        if (session.session_id) |session_id| {
+            if (std.mem.eql(u8, session_id, id)) return false;
+        }
+    }
+    const ts = session.start_time orelse session.end_time;
+    if ((opts.since != null or opts.until != null or opts.last_text != null) and !timestampSatisfiesBounds(ts, opts)) return false;
+    if (opts.repo_text) |repo| {
+        const cwd = session.cwd orelse return false;
+        if (!std.mem.eql(u8, cwd, repo) and !std.mem.startsWith(u8, cwd, repo)) return false;
+    }
+    if (opts.workdir_text) |workdir| {
+        const cwd = session.cwd orelse return false;
+        if (!std.mem.eql(u8, cwd, workdir) and !std.mem.startsWith(u8, cwd, workdir)) return false;
+    }
+    return true;
 }
 
 fn appendActuationRunRow(

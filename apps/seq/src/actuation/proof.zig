@@ -68,6 +68,7 @@ fn isProofCommand(command: []const u8) bool {
 }
 
 fn isMaterialMutation(tool: canonical_trace.ToolLifecycleRecord) bool {
+    if (tool.patch_success == false) return false;
     return tool.kind == .patch_apply or tool.patch_changes_json != null or toolContains(tool, "apply_patch");
 }
 
