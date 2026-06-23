@@ -7,6 +7,8 @@ pub const ArtifactRow = struct {
     valid: bool,
     run_id: ?[]u8 = null,
     slice_id: ?[]u8 = null,
+    decision_id: ?[]u8 = null,
+    question: ?[]u8 = null,
     gcr_id: ?[]u8 = null,
     afr_id: ?[]u8 = null,
     selected_route: ?[]u8 = null,
@@ -15,6 +17,8 @@ pub const ArtifactRow = struct {
     pub fn deinit(self: *ArtifactRow, allocator: std.mem.Allocator) void {
         freeOpt(allocator, self.run_id);
         freeOpt(allocator, self.slice_id);
+        freeOpt(allocator, self.decision_id);
+        freeOpt(allocator, self.question);
         freeOpt(allocator, self.gcr_id);
         freeOpt(allocator, self.afr_id);
         freeOpt(allocator, self.selected_route);
@@ -144,6 +148,10 @@ fn parseWrapped(allocator: std.mem.Allocator, kind: ArtifactKind, value: std.jso
     errdefer freeOpt(allocator, run_id);
     const slice_id = try optionalString(allocator, obj, "slice_id");
     errdefer freeOpt(allocator, slice_id);
+    const decision_id = try optionalString(allocator, obj, "decision_id");
+    errdefer freeOpt(allocator, decision_id);
+    const question = try optionalString(allocator, obj, "question");
+    errdefer freeOpt(allocator, question);
     const gcr_id = try optionalString(allocator, obj, "gcr_id");
     errdefer freeOpt(allocator, gcr_id);
     const afr_id = try optionalString(allocator, obj, "afr_id");
@@ -155,6 +163,8 @@ fn parseWrapped(allocator: std.mem.Allocator, kind: ArtifactKind, value: std.jso
         .valid = errors.items.len == 0,
         .run_id = run_id,
         .slice_id = slice_id,
+        .decision_id = decision_id,
+        .question = question,
         .gcr_id = gcr_id,
         .afr_id = afr_id,
         .selected_route = selected_route,

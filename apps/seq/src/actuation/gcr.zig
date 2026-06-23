@@ -296,11 +296,13 @@ fn classifyAttempt(tool: canonical_trace.ToolLifecycleRecord, gcr: ?GcrEvidence)
 }
 
 fn isCompileAttempt(tool: canonical_trace.ToolLifecycleRecord) bool {
-    return toolContains(tool, "st compile aperture");
+    return toolInvokesSt(tool, "compile aperture");
 }
 
 fn isUpdatePlan(tool: canonical_trace.ToolLifecycleRecord) bool {
-    return toolContains(tool, "update_plan");
+    if (tool.tool_name) |name| if (contains(name, "update_plan")) return true;
+    if (tool.mcp_tool) |name| if (contains(name, "update_plan")) return true;
+    return false;
 }
 
 fn isMaterialMutation(tool: canonical_trace.ToolLifecycleRecord) bool {
@@ -308,7 +310,7 @@ fn isMaterialMutation(tool: canonical_trace.ToolLifecycleRecord) bool {
     if (tool.kind == .patch_apply) return true;
     if (tool.patch_changes_json != null) return true;
     if (tool.tool_name) |name| if (contains(name, "apply_patch")) return true;
-    return toolContains(tool, "*** Begin Patch");
+    return commandFieldsContain(tool, "*** Begin Patch");
 }
 
 fn containsJsonBoolFalse(text: []const u8, key: []const u8) bool {
@@ -335,15 +337,13 @@ fn containsJsonBoolFalse(text: []const u8, key: []const u8) bool {
 }
 
 fn isGraphInvalidator(tool: canonical_trace.ToolLifecycleRecord) bool {
-    const command = tool.command_text orelse tool.input_text orelse "";
-    if (!contains(command, "st ")) return false;
-    return contains(command, "st complete") or
-        contains(command, "st intake apply") or
-        contains(command, "st set") or
-        contains(command, "st proof record") or
-        contains(command, "st waive") or
-        contains(command, "st graph debt") or
-        contains(command, "st compile aperture");
+    return toolInvokesSt(tool, "complete") or
+        toolInvokesSt(tool, "intake apply") or
+        toolInvokesSt(tool, "set") or
+        toolInvokesSt(tool, "proof record") or
+        toolInvokesSt(tool, "waive") or
+        toolInvokesSt(tool, "graph debt") or
+        toolInvokesSt(tool, "compile aperture");
 }
 
 fn buildViolation(
@@ -452,6 +452,67 @@ fn toolContains(tool: canonical_trace.ToolLifecycleRecord, needle: []const u8) b
     return false;
 }
 
+fn commandFieldsContain(tool: canonical_trace.ToolLifecycleRecord, needle: []const u8) bool {
+    if (tool.command_text) |text| if (contains(text, needle)) return true;
+    if (tool.input_text) |text| if (contains(text, needle)) return true;
+    if (tool.arguments_json) |text| if (contains(text, needle)) return true;
+    return false;
+}
+
+fn toolInvokesSt(tool: canonical_trace.ToolLifecycleRecord, subcommand: []const u8) bool {
+    if (tool.command_text) |text| if (commandInvokesSt(text, subcommand)) return true;
+    if (tool.input_text) |text| if (commandInvokesSt(text, subcommand)) return true;
+    return false;
+}
+
+fn commandInvokesSt(command: []const u8, subcommand: []const u8) bool {
+    var start: usize = 0;
+    while (start < command.len) {
+        while (start < command.len and isCommandBoundary(command[start])) start += 1;
+        if (start >= command.len) return false;
+        const segment_end = findSegmentEnd(command, start);
+        const segment = std.mem.trim(u8, command[start..segment_end], " \t\r\n");
+        if (segmentStartsWithWords(segment, "st", subcommand)) return true;
+        start = if (segment_end < command.len) segment_end + 1 else segment_end;
+    }
+    return false;
+}
+
+fn segmentStartsWithWords(segment: []const u8, first: []const u8, rest: []const u8) bool {
+    if (!startsWithWord(segment, first)) return false;
+    var cursor = first.len;
+    if (cursor >= segment.len or !std.ascii.isWhitespace(segment[cursor])) return false;
+    while (cursor < segment.len and std.ascii.isWhitespace(segment[cursor])) cursor += 1;
+    if (!startsWithPhraseWords(segment[cursor..], rest)) return false;
+    return true;
+}
+
+fn startsWithPhraseWords(text: []const u8, phrase: []const u8) bool {
+    if (!contains(text, phrase)) return false;
+    if (!std.ascii.eqlIgnoreCase(text[0..@min(text.len, phrase.len)], phrase)) return false;
+    if (text.len == phrase.len) return true;
+    return std.ascii.isWhitespace(text[phrase.len]) or text[phrase.len] == '-';
+}
+
+fn startsWithWord(text: []const u8, word: []const u8) bool {
+    if (text.len < word.len) return false;
+    if (!std.ascii.eqlIgnoreCase(text[0..word.len], word)) return false;
+    if (text.len == word.len) return true;
+    return std.ascii.isWhitespace(text[word.len]);
+}
+
+fn findSegmentEnd(command: []const u8, start: usize) usize {
+    var idx = start;
+    while (idx < command.len) : (idx += 1) {
+        if (isCommandBoundary(command[idx])) return idx;
+    }
+    return idx;
+}
+
+fn isCommandBoundary(byte: u8) bool {
+    return byte == ';' or byte == '\n' or byte == '&' or byte == '|';
+}
+
 fn joinedToolText(tool: canonical_trace.ToolLifecycleRecord) []const u8 {
     if (tool.output_text) |text| return text;
     if (tool.command_text) |text| return text;
@@ -519,6 +580,27 @@ test "gcr analyzer detects failed compile projection inversion before patch" {
     try std.testing.expectEqual(@as(usize, 1), analysis.control_violations.len);
     try std.testing.expect(analysis.projection.projection_inversion.present);
     try std.testing.expectEqual(@as(usize, 2), analysis.projection.projection_inversion.update_plan_count);
+}
+
+test "gcr analyzer does not infer compile attempts from command output" {
+    var trace = try fixtureTrace(std.testing.allocator);
+    defer trace.deinit(std.testing.allocator);
+    try appendTool(std.testing.allocator, &trace, .exec_command, "search", "rg GCR apps/seq", "st compile aperture --file .step/st-plan.jsonl", 0);
+
+    var analysis = try analyzeTrace(std.testing.allocator, trace);
+    defer analysis.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), analysis.compile_attempts.len);
+    try std.testing.expectEqual(GcrState.absent, analysis.gcr_state_at_end);
+}
+
+test "gcr analyzer does not count searches for compile syntax as compile attempts" {
+    var trace = try fixtureTrace(std.testing.allocator);
+    defer trace.deinit(std.testing.allocator);
+    try appendTool(std.testing.allocator, &trace, .exec_command, "search", "rg \"st compile aperture\" apps/seq", "apps/seq/src/actuation/gcr.zig:st compile aperture", 0);
+
+    var analysis = try analyzeTrace(std.testing.allocator, trace);
+    defer analysis.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), analysis.compile_attempts.len);
 }
 
 fn fixtureTrace(allocator: std.mem.Allocator) !canonical_trace.CanonicalSessionTrace {
