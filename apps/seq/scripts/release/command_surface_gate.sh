@@ -192,6 +192,21 @@ if ! "$BIN_PATH" capabilities --format json | rg -q -- '"actuation_compaction_re
   echo "capabilities missing actuation_compaction_resume_v1=true" >&2
   exit 1
 fi
+for feature in \
+  resolve_acceptance_contract_v2 \
+  resolve_review_batch_v1 \
+  resolve_review_aperture_v1 \
+  resolve_counterexample_v1 \
+  resolve_counterexample_basis_v2 \
+  resolve_review_potential_v1 \
+  resolve_intent_closed_audit_v1 \
+  internal_context_not_success_v1
+do
+  if ! "$BIN_PATH" capabilities --format json | rg -q -- "\"${feature}\": true"; then
+    echo "capabilities missing ${feature}=true" >&2
+    exit 1
+  fi
+done
 if ! "$BIN_PATH" workflow-overlap --help | rg -q -- '--mode summary|sessions'; then
   echo "workflow-overlap help missing summary/sessions modes" >&2
   exit 1

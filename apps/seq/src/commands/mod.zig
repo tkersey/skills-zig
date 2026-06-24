@@ -25,6 +25,7 @@ const actuation_proof = @import("../actuation/proof.zig");
 const actuation_compaction = @import("../actuation/compaction.zig");
 const actuation_workers = @import("../actuation/workers.zig");
 const actuation_surface = @import("../actuation/surface.zig");
+const resolve_intent_closed = @import("../resolve_intent_closed/mod.zig");
 const app_meta = @import("app_meta");
 
 var test_codex_thread_id: ?[]const u8 = null;
@@ -193,6 +194,46 @@ pub const dataset_meta = [_]DatasetMeta{
         .name = "review_compiler_evidence",
         .description = "Flattened review-compiler evidence refs",
         .fields = &.{ "session_id", "path", "evidence_id", "present", "source", "provenance_role", "reason", "excerpt" },
+    },
+    .{
+        .name = "resolve_acceptance_contracts",
+        .description = "Resolve intent-closed AC-v2/RCA acceptance contract artifacts",
+        .fields = &.{ "artifact_id", "campaign_id", "contract_id", "protocol", "fingerprint", "sealed", "valid", "issues", "source_refs", "evidence_refs" },
+    },
+    .{
+        .name = "resolve_review_batches",
+        .description = "Resolve RB-v1 review batch artifacts and open/mutation diagnostics",
+        .fields = &.{ "artifact_id", "campaign_id", "batch_id", "mode", "state", "horizon_fingerprint", "valid", "issues", "source_refs", "evidence_refs" },
+    },
+    .{
+        .name = "resolve_review_apertures",
+        .description = "Resolve RAP-v1 review aperture artifacts",
+        .fields = &.{ "artifact_id", "campaign_id", "batch_id", "aperture_id", "mode", "horizon_fingerprint", "valid", "issues", "source_refs", "evidence_refs" },
+    },
+    .{
+        .name = "resolve_counterexamples",
+        .description = "Resolve CEX-v1 counterexample rows with intent, novelty, and disposition fields",
+        .fields = &.{ "counterexample_id", "campaign_id", "batch_id", "aperture_id", "review_mode", "validity", "intent_relation", "novelty", "disposition", "mutation_authority", "source_refs", "evidence_refs", "issues" },
+    },
+    .{
+        .name = "resolve_counterexample_classes",
+        .description = "Resolve CEB-v2 counterexample basis/class fingerprint rows",
+        .fields = &.{ "basis_id", "campaign_id", "fingerprint", "sealed", "valid", "issues", "source_refs", "evidence_refs" },
+    },
+    .{
+        .name = "resolve_potential_cycles",
+        .description = "Resolve PHI-v1 potential cycle rows",
+        .fields = &.{ "cycle_id", "campaign_id", "acceptance_fingerprint", "strict_progress", "valid", "issues", "source_refs", "evidence_refs" },
+    },
+    .{
+        .name = "resolve_realization_cycles",
+        .description = "Resolve realization and reduction-certificate lineage rows",
+        .fields = &.{ "cycle_id", "campaign_id", "kind", "fingerprint", "valid", "issues", "source_refs", "evidence_refs" },
+    },
+    .{
+        .name = "resolve_intent_closed_runs",
+        .description = "Resolve intent-closed run rows projected from controller artifact evidence",
+        .fields = &.{ "run_version", "campaign_id", "artifact_id", "artifact_kind", "protocol", "verdict", "valid", "issues", "source_refs", "evidence_refs" },
     },
     .{
         .name = "actuation_runs",
@@ -691,6 +732,7 @@ const Options = struct {
     include_excerpts: bool = false,
     index_mode: []const u8 = "auto",
     actuation_strict: bool = false,
+    review_compiler_strict: bool = false,
     strict: bool = true,
     strict_set: bool = false,
 };
@@ -965,10 +1007,12 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\  raw $resolve mentions are denominator candidates only; true sessions require assistant workflow or tool evidence
         ,
         .review_compiler_audit =>
-        \\usage: seq review-compiler-audit [--protocol auto|legacy-cleanroom|c3|c3-mrpc|mbk] [--mode summary|runs|evidence] --since <iso> --until <iso> --repo <path> [--exclude-current] [--format table|json|jsonl|markdown]
+        \\usage: seq review-compiler-audit [--protocol auto|legacy-cleanroom|c3|c3-mrpc|mbk|mbk-v1-legacy-open-horizon|intent-closed-cegis-v1|mixed|none] [--mode summary|runs|batches|counterexamples|potential|closure|report|evidence] --since <iso> --until <iso> --repo <path> [--artifact-root <path>] [--strict] [--exclude-current] [--format table|json|jsonl|markdown]
         \\extra options:
-        \\  --protocol <name>        auto (default) | legacy-cleanroom | c3 | c3-mrpc | mbk
-        \\  --mode <name>            summary (default) | runs | evidence
+        \\  --protocol <name>         auto (default) | legacy-cleanroom | c3 | c3-mrpc | mbk | mbk-v1-legacy-open-horizon | intent-closed-cegis-v1 | mixed | none
+        \\  --mode <name>             summary (default) | runs | batches | counterexamples | potential | closure | report | evidence
+        \\  --artifact-root <path>    Include controller artifact root in corpus/report metadata
+        \\  --strict                  Exit 2 for hard current intent-closed/C3 closure failures
         \\  --repo <path>             Match session cwd/tool cwd against this repo root or descendants
         \\  --exclude-current         Exclude the current CODEX_THREAD_ID session
         \\  path mentions are candidates only; true C3 governance requires controller evidence or explicit workflow declaration
@@ -1402,7 +1446,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_last = cmd == .token_usage or cmd == .token_cost or cmd == .skill_audit or cmd == .skill_evidence or cmd == .skill_decision_audit or cmd == .actuation_audit or cmd == .skill_success_rank or cmd == .skill_cohort or cmd == .workflow_audit or cmd == .adjudication_audit or cmd == .message_audit or cmd == .message_search or cmd == .tool_audit or cmd == .tool_search or cmd == .skill_blocks;
     const supports_include_root_equivalent = cmd == .adjudication_audit;
     const supports_bundle_dir = cmd == .adjudication_audit;
-    const supports_artifact_root = false;
+    const supports_artifact_root = cmd == .review_compiler_audit;
     const supports_token_cost_options = cmd == .token_cost;
     const supports_protocol = cmd == .review_compiler_audit;
     const supports_skill_decision_inputs = cmd == .skill_decision_audit or cmd == .skill_contract or cmd == .skill_decision_receipt;
@@ -1492,6 +1536,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.include_workers, cmd == .skill_decision_audit or cmd == .decision_capsule or cmd == .actuation_audit, "--include-workers", cmd);
     try ensureOptionAllowed(opts.include_excerpts, cmd == .skill_decision_audit or cmd == .decision_capsule or cmd == .actuation_audit, "--include-excerpts", cmd);
     try ensureOptionAllowed(opts.actuation_strict, cmd == .actuation_audit, "--strict", cmd);
+    try ensureOptionAllowed(opts.review_compiler_strict, cmd == .review_compiler_audit, "--strict", cmd);
     try ensureOptionAllowed(opts.ongoing, cmd == .sessions, "--ongoing", cmd);
     try ensureOptionAllowed(opts.completed, cmd == .sessions, "--completed", cmd);
     try ensureOptionAllowed(opts.include_tools, cmd == .turns or cmd == .session_detail, "--include-tools", cmd);
@@ -1991,6 +2036,11 @@ fn isValidAdjudicationAuditMode(text: []const u8) bool {
 fn isValidReviewCompilerAuditMode(text: []const u8) bool {
     return std.mem.eql(u8, text, "summary") or
         std.mem.eql(u8, text, "runs") or
+        std.mem.eql(u8, text, "batches") or
+        std.mem.eql(u8, text, "counterexamples") or
+        std.mem.eql(u8, text, "potential") or
+        std.mem.eql(u8, text, "closure") or
+        std.mem.eql(u8, text, "report") or
         std.mem.eql(u8, text, "evidence");
 }
 
@@ -2943,6 +2993,14 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
             \\      "dcp_validation_v1": true,
             \\      "review_compiler_provenance_v1": true,
             \\      "review_compiler_run_ledger_v1": true,
+            \\      "resolve_acceptance_contract_v2": true,
+            \\      "resolve_review_batch_v1": true,
+            \\      "resolve_review_aperture_v1": true,
+            \\      "resolve_counterexample_v1": true,
+            \\      "resolve_counterexample_basis_v2": true,
+            \\      "resolve_review_potential_v1": true,
+            \\      "resolve_intent_closed_audit_v1": true,
+            \\      "internal_context_not_success_v1": true,
             \\      "source_governance_projection_v1": true,
             \\      "c3_structured_closure_v1": true,
             \\      "actuation_audit_v1": true,
@@ -2980,6 +3038,14 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
         .{ .name = "dcp_validation_v1", .enabled = true },
         .{ .name = "review_compiler_provenance_v1", .enabled = true },
         .{ .name = "review_compiler_run_ledger_v1", .enabled = true },
+        .{ .name = "resolve_acceptance_contract_v2", .enabled = true },
+        .{ .name = "resolve_review_batch_v1", .enabled = true },
+        .{ .name = "resolve_review_aperture_v1", .enabled = true },
+        .{ .name = "resolve_counterexample_v1", .enabled = true },
+        .{ .name = "resolve_counterexample_basis_v2", .enabled = true },
+        .{ .name = "resolve_review_potential_v1", .enabled = true },
+        .{ .name = "resolve_intent_closed_audit_v1", .enabled = true },
+        .{ .name = "internal_context_not_success_v1", .enabled = true },
         .{ .name = "source_governance_projection_v1", .enabled = true },
         .{ .name = "c3_structured_closure_v1", .enabled = true },
         .{ .name = "actuation_audit_v1", .enabled = true },
@@ -6027,6 +6093,10 @@ const adjudication_audit_columns = [_][]const u8{
     "investigate_count",
     "route_count",
     "blocked_count",
+    "cex_total",
+    "cex_accepted",
+    "cex_unanchored",
+    "cex_disposition_mismatch",
     "skew_flags",
     "invariant_flags",
     "evidence_excerpt",
@@ -6066,6 +6136,10 @@ const AdjudicationRouteCounts = struct {
     investigate: usize = 0,
     route: usize = 0,
     blocked: usize = 0,
+    cex_total: usize = 0,
+    cex_accepted: usize = 0,
+    cex_unanchored: usize = 0,
+    cex_disposition_mismatch: usize = 0,
 
     fn selected(self: AdjudicationRouteCounts) usize {
         return self.address + self.validate_only + self.investigate;
@@ -6157,6 +6231,10 @@ fn cmdAdjudicationAudit(allocator: std.mem.Allocator, sessions_root: []const u8,
         try row.putStaticKey("investigate_count", .{ .int = @intCast(summary.counts.investigate) });
         try row.putStaticKey("route_count", .{ .int = @intCast(summary.counts.route) });
         try row.putStaticKey("blocked_count", .{ .int = @intCast(summary.counts.blocked) });
+        try row.putStaticKey("cex_total", .{ .int = @intCast(summary.counts.cex_total) });
+        try row.putStaticKey("cex_accepted", .{ .int = @intCast(summary.counts.cex_accepted) });
+        try row.putStaticKey("cex_unanchored", .{ .int = @intCast(summary.counts.cex_unanchored) });
+        try row.putStaticKey("cex_disposition_mismatch", .{ .int = @intCast(summary.counts.cex_disposition_mismatch) });
         try row.putStaticKey("skew_flags", .{ .string = skew_flags });
         try row.putStaticKey("invariant_flags", .{ .string = invariant_flags });
         try row.putStaticKey("evidence_excerpt", .{ .string = summary.evidence_excerpt });
@@ -6195,6 +6273,7 @@ fn cmdAdjudicationAudit(allocator: std.mem.Allocator, sessions_root: []const u8,
 
 fn contentContainsAdjudicationCandidate(content: []const u8, skill: []const u8, root_equivalents: ?[]const u8) bool {
     if (containsDollarWorkflowMention(content, skill)) return true;
+    if (std.mem.indexOf(u8, content, "\"cex_version\"") != null or std.mem.indexOf(u8, content, "CEX-v1") != null) return true;
     const csv = root_equivalents orelse return false;
     var split = std.mem.splitScalar(u8, csv, ',');
     while (split.next()) |part_raw| {
@@ -6310,7 +6389,6 @@ fn summarizeAdjudicationSession(
     skill: []const u8,
     include_root_equivalent_text: ?[]const u8,
 ) !AdjudicationSessionSummary {
-    _ = allocator;
     var summary = AdjudicationSessionSummary{};
     for (messages) |message| {
         if (!skillSuccessTimestampInWindow(message.timestamp, window)) continue;
@@ -6323,6 +6401,7 @@ fn summarizeAdjudicationSession(
         if (containsAnyIgnoreCaseAscii(text, &.{ "tuning", "spec out", "spec-pipeline", "quick_validate" })) {
             summary.tuning_or_spec = true;
         }
+        countAdjudicationCounterexampleArtifact(allocator, text, &summary.counts);
 
         if (!is_assistant) continue;
         if (containsIgnoreCaseAscii(text, "Resolve Selection")) summary.resolve_selection_present = true;
@@ -6385,6 +6464,22 @@ fn countAdjudicationRoutes(text: []const u8, counts: *AdjudicationRouteCounts) v
         if (lineMatchesRoute(line, "investigate") or lineMatchesRoute(line, "need-evidence")) counts.investigate += 1;
         if (lineMatchesRoute(line, "route")) counts.route += 1;
         if (lineMatchesRoute(line, "blocked")) counts.blocked += 1;
+    }
+}
+
+fn countAdjudicationCounterexampleArtifact(allocator: std.mem.Allocator, text: []const u8, counts: *AdjudicationRouteCounts) void {
+    if (std.mem.indexOf(u8, text, "\"cex_version\"") == null and std.mem.indexOf(u8, text, "CEX-v1") == null) return;
+    var artifact = resolve_intent_closed.parseArtifact(allocator, text, "adjudication-audit-message", .structured_skill_artifact) catch return;
+    defer artifact.deinit(allocator);
+    if (artifact.kind != .counterexample) return;
+    counts.cex_total += 1;
+    const disposition = artifact.disposition orelse "";
+    if (containsIgnoreCaseAscii(disposition, "accepted")) {
+        counts.cex_accepted += 1;
+        if (!artifact.valid) counts.cex_disposition_mismatch += 1;
+    }
+    for (artifact.issues) |issue| {
+        if (std.mem.eql(u8, issue, "unanchored_accepted_cex")) counts.cex_unanchored += 1;
     }
 }
 
@@ -6642,6 +6737,10 @@ const ReviewCompilerProtocol = enum {
     c3,
     c3_mrpc,
     mbk,
+    mbk_v1_legacy_open_horizon,
+    intent_closed_cegis_v1,
+    mixed,
+    none,
 
     fn label(self: ReviewCompilerProtocol) []const u8 {
         return switch (self) {
@@ -6650,6 +6749,10 @@ const ReviewCompilerProtocol = enum {
             .c3 => "c3",
             .c3_mrpc => "c3-mrpc",
             .mbk => "mbk",
+            .mbk_v1_legacy_open_horizon => "mbk-v1-legacy-open-horizon",
+            .intent_closed_cegis_v1 => "intent-closed-cegis-v1",
+            .mixed => "mixed",
+            .none => "none",
         };
     }
 };
@@ -6660,8 +6763,20 @@ fn parseReviewCompilerProtocol(text: []const u8) !ReviewCompilerProtocol {
     if (std.mem.eql(u8, text, "c3")) return .c3;
     if (std.mem.eql(u8, text, "c3-mrpc")) return .c3_mrpc;
     if (std.mem.eql(u8, text, "mbk")) return .mbk;
-    printCliError("error: invalid --protocol value {s}; expected auto, legacy-cleanroom, c3, c3-mrpc, or mbk\n", .{text});
+    if (std.mem.eql(u8, text, "mbk-v1-legacy-open-horizon")) return .mbk_v1_legacy_open_horizon;
+    if (std.mem.eql(u8, text, "intent-closed-cegis-v1")) return .intent_closed_cegis_v1;
+    if (std.mem.eql(u8, text, "mixed")) return .mixed;
+    if (std.mem.eql(u8, text, "none")) return .none;
+    printCliError("error: invalid --protocol value {s}; expected auto, legacy-cleanroom, c3, c3-mrpc, mbk, mbk-v1-legacy-open-horizon, intent-closed-cegis-v1, mixed, or none\n", .{text});
     return error.InvalidModeArg;
+}
+
+fn reviewCompilerProtocolIsMBK(protocol: ReviewCompilerProtocol) bool {
+    return protocol == .mbk or protocol == .mbk_v1_legacy_open_horizon;
+}
+
+fn reviewCompilerProtocolIncludesC3(protocol: ReviewCompilerProtocol) bool {
+    return protocol == .c3 or protocol == .c3_mrpc or protocol == .intent_closed_cegis_v1 or protocol == .mixed;
 }
 
 const ReviewCompilerAudit = struct {
@@ -7430,7 +7545,7 @@ fn cmdReviewCompilerAudit(allocator: std.mem.Allocator, sessions_root: []const u
         }
         audit.mbk.denominator.candidate_sessions += 1;
         var mbk_exclusion_recorded = false;
-        if ((audit.requested_protocol == .auto or audit.requested_protocol == .mbk) and !signals.true_mbk) {
+        if ((audit.requested_protocol == .auto or audit.requested_protocol == .mbk or audit.requested_protocol == .mbk_v1_legacy_open_horizon) and !signals.true_mbk) {
             try addReviewCompilerMBKExclusion(allocator, &audit, parsed.session.session_id, path, "candidate_without_mbk_evidence");
             mbk_exclusion_recorded = true;
         }
@@ -7438,17 +7553,23 @@ fn cmdReviewCompilerAudit(allocator: std.mem.Allocator, sessions_root: []const u
             .auto => signals.true_resolve,
             .legacy_cleanroom => signals.true_legacy,
             .c3, .c3_mrpc => signals.true_c3,
-            .mbk => signals.true_mbk,
+            .mbk, .mbk_v1_legacy_open_horizon => signals.true_mbk,
+            .intent_closed_cegis_v1 => signals.true_mbk and signals.true_c3,
+            .mixed => signals.true_mbk and signals.true_c3,
+            .none => false,
         };
         if (!protocol_match) {
             const reason: []const u8 = switch (audit.requested_protocol) {
                 .auto => "candidate_without_protocol_evidence",
                 .legacy_cleanroom => "candidate_without_assistant_cleanroom_evidence",
                 .c3, .c3_mrpc => if (signals.governance_state == .incidental) signals.incidental_reason else "candidate_without_c3_evidence",
-                .mbk => "candidate_without_mbk_evidence",
+                .mbk, .mbk_v1_legacy_open_horizon => "candidate_without_mbk_evidence",
+                .intent_closed_cegis_v1 => "candidate_without_intent_closed_artifact_evidence",
+                .mixed => "candidate_without_mixed_protocol_evidence",
+                .none => "protocol_none_never_included",
             };
             try addReviewCompilerExclusionWithGovernance(allocator, &audit, parsed.session.session_id, path, reason, signals.governance_state.label(), signals.delivery_closed_seen);
-            if (audit.requested_protocol == .mbk and !mbk_exclusion_recorded) try addReviewCompilerMBKExclusion(allocator, &audit, parsed.session.session_id, path, reason);
+            if ((audit.requested_protocol == .mbk or audit.requested_protocol == .mbk_v1_legacy_open_horizon) and !mbk_exclusion_recorded) try addReviewCompilerMBKExclusion(allocator, &audit, parsed.session.session_id, path, reason);
             continue;
         }
 
@@ -7460,9 +7581,12 @@ fn cmdReviewCompilerAudit(allocator: std.mem.Allocator, sessions_root: []const u
     }
 
     const mode = opts.mode orelse "summary";
-    const fmt = if (opts.format_set) opts.format else if (std.mem.eql(u8, mode, "summary")) output.Format.markdown else output.Format.table;
+    const fmt = if (opts.format_set) opts.format else if (std.mem.eql(u8, mode, "summary") or std.mem.eql(u8, mode, "report")) output.Format.markdown else output.Format.table;
+    if (opts.review_compiler_strict and hasStrictReviewCompilerFailure(audit)) std.process.exit(2);
     if (std.mem.eql(u8, mode, "runs")) return writeReviewCompilerRunsMode(allocator, audit, fmt, opts.out_path);
     if (std.mem.eql(u8, mode, "evidence")) return writeReviewCompilerEvidenceMode(allocator, audit, fmt, opts.out_path);
+    if (std.mem.eql(u8, mode, "batches") or std.mem.eql(u8, mode, "counterexamples") or std.mem.eql(u8, mode, "potential") or std.mem.eql(u8, mode, "closure")) return writeReviewCompilerIntentRowsMode(allocator, audit, mode, fmt, opts.out_path);
+    if (std.mem.eql(u8, mode, "report")) return writeReviewCompilerIntentReportMarkdown(allocator, audit, opts.artifact_root_text, opts.out_path);
     return switch (fmt) {
         .json => writeReviewCompilerAuditJson(allocator, audit, opts.out_path),
         .markdown => writeReviewCompilerAuditMarkdown(allocator, audit, opts.out_path),
@@ -7513,8 +7637,36 @@ fn writeReviewCompilerRunsMode(allocator: std.mem.Allocator, audit: ReviewCompil
     var rows: std.ArrayList(query.Row) = .empty;
     defer deinitQueryRows(allocator, &rows);
     try appendReviewCompilerRunRows(allocator, &rows, audit);
-    const cols = [_][]const u8{ "session_id", "governance", "lifecycle", "delivery_closed", "c3_closed", "compression", "c3_required", "c3_entered", "protocol", "classification", "path" };
+    const cols = [_][]const u8{ "run_version", "session_id", "governance", "lifecycle", "delivery_closed", "c3_closed", "compression", "c3_required", "c3_entered", "protocol", "classification", "path" };
     try output.writeOutput(allocator, fmt, rows.items, cols[0..], out_path);
+}
+
+fn writeReviewCompilerIntentRowsMode(allocator: std.mem.Allocator, audit: ReviewCompilerAudit, mode: []const u8, fmt: output.Format, out_path: ?[]const u8) !void {
+    if (fmt == .markdown) return writeReviewCompilerIntentReportMarkdown(allocator, audit, null, out_path);
+    if (fmt == .jsonl) return writeReviewCompilerIntentRowsJsonl(allocator, audit, mode, out_path);
+    var rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &rows);
+    try appendReviewCompilerIntentRows(allocator, &rows, audit, mode);
+    const cols = [_][]const u8{ "run_version", "mode", "session_id", "path", "protocol", "verdict", "evidence_refs", "limitations" };
+    try output.writeOutput(allocator, fmt, rows.items, cols[0..], out_path);
+}
+
+fn writeReviewCompilerIntentRowsJsonl(allocator: std.mem.Allocator, audit: ReviewCompilerAudit, mode: []const u8, out_path: ?[]const u8) !void {
+    var rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &rows);
+    try appendReviewCompilerIntentRows(allocator, &rows, audit, mode);
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+    const cols = [_][]const u8{ "run_version", "mode", "session_id", "path", "protocol", "verdict", "evidence_refs", "limitations" };
+    for (rows.items) |row| {
+        try output.writeJsonObject(writer, row, cols[0..], false, "");
+        try writer.writeByte('\n');
+    }
+    const rendered = try writer_alloc.toOwnedSlice();
+    defer allocator.free(rendered);
+    if (out_path) |path| try ensureParentDir(path);
+    try writeTextOutput(rendered, out_path);
 }
 
 fn writeReviewCompilerEvidenceMode(allocator: std.mem.Allocator, audit: ReviewCompilerAudit, fmt: output.Format, out_path: ?[]const u8) !void {
@@ -7545,10 +7697,30 @@ fn writeReviewCompilerRunsJsonl(allocator: std.mem.Allocator, audit: ReviewCompi
     try writeTextOutput(rendered, out_path);
 }
 
+fn reviewCompilerVerdictForSession(row: ReviewCompilerAudit.IncludedSession) []const u8 {
+    if (row.c3_closed and row.delivery_closed) return "clean_review_closed";
+    if (row.c3_closed) return "intent_closed_terminal";
+    if (row.delivery_closed) return "tuple_closed_holdout_pending";
+    return "insufficient_evidence";
+}
+
+fn hasStrictReviewCompilerFailure(audit: ReviewCompilerAudit) bool {
+    const protocol = audit.outputProtocol();
+    if (protocol != .intent_closed_cegis_v1 and protocol != .mixed and protocol != .c3_mrpc and protocol != .c3) return false;
+    return audit.c3.lab_vs_delivery.raw_delivery_mutations_while_frozen > 0 or
+        audit.c3.delivery.raw_commits_while_active > 0 or
+        audit.c3.delivery.raw_pushes_while_active > 0 or
+        audit.c3.compliance.direct_review_to_delivery_mutation > 0 or
+        audit.c3.compliance.commit_or_push_bypass > 0 or
+        audit.c3.compliance.stale_mrpc > 0 or
+        audit.c3.compliance.holdout_missing > 0;
+}
+
 fn appendReviewCompilerRunRows(allocator: std.mem.Allocator, rows: *std.ArrayList(query.Row), audit: ReviewCompilerAudit) !void {
     for (audit.denominator.included_sessions.items) |item| {
         var row = query.Row.init(allocator);
         errdefer row.deinit();
+        try row.putStaticKey("run_version", .{ .string = resolve_intent_closed.run_version });
         try putOptionalString(&row, "session_id", item.session_id);
         try row.putStaticKey("path", .{ .string = item.path });
         try row.putStaticKey("protocol", .{ .string = item.protocol });
@@ -7560,6 +7732,22 @@ fn appendReviewCompilerRunRows(allocator: std.mem.Allocator, rows: *std.ArrayLis
         try row.putStaticKey("c3_entered", .{ .bool = item.c3_entered });
         try row.putStaticKey("c3_closed", .{ .bool = item.c3_closed });
         try row.putStaticKey("compression", .{ .string = item.compression });
+        try rows.append(allocator, row);
+    }
+}
+
+fn appendReviewCompilerIntentRows(allocator: std.mem.Allocator, rows: *std.ArrayList(query.Row), audit: ReviewCompilerAudit, mode: []const u8) !void {
+    for (audit.denominator.included_sessions.items) |item| {
+        var row = query.Row.init(allocator);
+        errdefer row.deinit();
+        try row.putStaticKey("run_version", .{ .string = resolve_intent_closed.run_version });
+        try row.putStaticKey("mode", .{ .string = mode });
+        try putOptionalString(&row, "session_id", item.session_id);
+        try row.putStaticKey("path", .{ .string = item.path });
+        try row.putStaticKey("protocol", .{ .string = audit.outputProtocol().label() });
+        try row.putStaticKey("verdict", .{ .string = reviewCompilerVerdictForSession(item) });
+        try row.putStaticKey("evidence_refs", .{ .string = "[]" });
+        try row.putStaticKey("limitations", .{ .string = "[\"controller_artifact_projection_pending\"]" });
         try rows.append(allocator, row);
     }
 }
@@ -9130,6 +9318,59 @@ fn reviewCompilerC3MissingCompressionEvidence(signals: ReviewCompilerSessionSign
     return missing;
 }
 
+fn writeReviewCompilerIntentReportMarkdown(allocator: std.mem.Allocator, audit: ReviewCompilerAudit, artifact_root: ?[]const u8, out_path: ?[]const u8) !void {
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+    const protocol = audit.outputProtocol();
+
+    try writer.writeAll("# seq review-compiler-audit intent-closed report\n\n");
+    try writer.writeAll("## Corpus and capability proof\n\n");
+    try writer.print("- seq_version: {s}\n- scanner_version: {s}\n- run_version: {s}\n- protocol: {s}\n- candidate_sessions: {d}\n- included_sessions: {d}\n- artifact_root: ", .{ app_meta.version, resolve_intent_closed.scanner_version, resolve_intent_closed.run_version, protocol.label(), audit.denominator.candidate_sessions, audit.denominator.included_sessions.items.len });
+    if (artifact_root) |root| try output.writeJsonString(writer, root) else try writer.writeAll("null");
+    try writer.writeAll("\n\n");
+
+    try writer.writeAll("## Protocol-separated denominator\n\n");
+    try writer.print("- true_resolve_sessions: {d}\n- excluded_sessions: {d}\n- authoritative_sessions: {d}\n- declared_uncontrolled_sessions: {d}\n- incidental_sessions: {d}\n- ambiguous_sessions: {d}\n\n", .{ audit.denominator.true_resolve_sessions, audit.denominator.excluded_sessions, audit.denominator.authoritative_sessions, audit.denominator.declared_uncontrolled_sessions, audit.denominator.incidental_sessions, audit.denominator.ambiguous_sessions });
+
+    try writer.writeAll("## AC/horizon integrity\n\n");
+    try writer.writeAll("- AC-v2 controller artifact projection: pending in resolve-intent-closed dataset slice.\n- Absence reason: no accepted AC rows are emitted from transcript prose.\n\n");
+
+    try writer.writeAll("## Review batch/mode discipline\n\n");
+    try writer.print("- c3_required_sessions: {d}\n- c3_entered_sessions: {d}\n- c3_closed_sessions: {d}\n- direct_review_to_delivery_mutation: {d}\n\n", .{ audit.denominator.c3_required_sessions, audit.denominator.c3_entered_sessions, audit.denominator.c3_closed_sessions, audit.c3.compliance.direct_review_to_delivery_mutation });
+
+    try writer.writeAll("## Counterexample novelty/compression\n\n");
+    try writer.print("- raw_findings: {d}\n- branch_liabilities: {d}\n- independent_families: {d}\n- subsumed_findings: {d}\n\n", .{ audit.c3.counterexamples.raw_findings + audit.mbk.observations.raw_findings, audit.c3.counterexamples.branch_liabilities + audit.mbk.observations.branch_liabilities, audit.c3.counterexamples.independent_families, audit.c3.counterexamples.subsumed_findings });
+
+    try writer.writeAll("## Kernel/realization lineage\n\n");
+    try writer.print("- kernel_laws: {d}\n- selected_designs: {d}\n- realization_recompilations: {d}\n- duplicate_realizations: {d}\n\n", .{ audit.mbk.kernel.laws, audit.mbk.realization.selected_designs, audit.mbk.realization.realization_recompilations, audit.mbk.realization.duplicate_realizations });
+
+    try writer.writeAll("## PHI progress\n\n");
+    try writer.writeAll("- PHI-v1 strict progress recomputation: available in shared parser; cohort projection pending in dataset slice.\n\n");
+
+    try writer.writeAll("## Mapping/proof compression\n\n");
+    try writer.print("- proof_runs: {d}\n- proof_families: {d}\n- wound_specific_tests: {d}\n- unmapped_proof_actions: {d}\n\n", .{ audit.mbk.proof.proof_runs, audit.mbk.proof.proof_families, audit.mbk.proof.wound_specific_tests, audit.mbk.proof.unmapped_proof_actions });
+
+    try writer.writeAll("## Holdout/delivery/closure\n\n");
+    try writer.print("- delivery_holdouts: {d}\n- new_counterexamples: {d}\n- closed_runs: {d}\n- terminal_closed_sessions: {d}\n- raw_commits_while_active: {d}\n- raw_pushes_while_active: {d}\n\n", .{ audit.c3.holdout.delivery_holdouts, audit.c3.holdout.new_counterexamples, audit.c3.delivery.closed_runs, audit.mbk.denominator.terminal_closed_sessions, audit.c3.delivery.raw_commits_while_active, audit.c3.delivery.raw_pushes_while_active });
+
+    try writer.writeAll("## Decision effects\n\n");
+    try writer.writeAll("- Controller-derived historical decision projection: pending in decision normalization slice.\n\n");
+
+    try writer.writeAll("## Violations and exact evidence\n\n");
+    const strict_failure = hasStrictReviewCompilerFailure(audit);
+    try writer.print("- strict_failure: {any}\n- stale_mrpc: {d}\n- holdout_missing: {d}\n- commit_or_push_bypass: {d}\n\n", .{ strict_failure, audit.c3.compliance.stale_mrpc, audit.c3.compliance.holdout_missing, audit.c3.compliance.commit_or_push_bypass });
+
+    try writer.writeAll("## Remaining source gaps\n\n");
+    try writer.writeAll("- Structured AC/RB/RAP/CEX/CEB/PHI rows are parsed by the shared scanner but not yet registered as query datasets in this slice.\n\n");
+    try writer.writeAll("SINGLE MOST IMPORTANT REMAINING BLIND SPOT:\ncontroller artifact roots are accepted in the command surface, but full AC/RB/RAP/CEX/CEB/PHI lineage projection is completed in the dataset/decision slices, not this review-compiler slice.\n");
+
+    const rendered = try writer_alloc.toOwnedSlice();
+    defer allocator.free(rendered);
+    if (out_path) |path| try ensureParentDir(path);
+    try writeTextOutput(rendered, out_path);
+}
+
 fn writeReviewCompilerAuditMarkdown(allocator: std.mem.Allocator, audit: ReviewCompilerAudit, out_path: ?[]const u8) !void {
     var writer_alloc = std.Io.Writer.Allocating.init(allocator);
     defer writer_alloc.deinit();
@@ -9148,7 +9389,7 @@ fn writeReviewCompilerAuditMarkdown(allocator: std.mem.Allocator, audit: ReviewC
 fn writeReviewCompilerAuditYamlBody(writer: anytype, audit: ReviewCompilerAudit, indent: []const u8) !void {
     const protocol = audit.outputProtocol();
     try writer.print("{s}protocol: {s}\n", .{ indent, protocol.label() });
-    if (protocol == .mbk) {
+    if (reviewCompilerProtocolIsMBK(protocol)) {
         try writeReviewCompilerMBKYamlBody(writer, audit.mbk, indent);
         return;
     }
@@ -9171,8 +9412,8 @@ fn writeReviewCompilerAuditYamlBody(writer: anytype, audit: ReviewCompilerAudit,
             try writer.writeByte('\n');
         }
     }
-    if (protocol == .c3 or protocol == .c3_mrpc) try writeReviewCompilerIncludedSessionsYaml(writer, audit.denominator.included_sessions.items, indent);
-    if (protocol == .c3 or protocol == .c3_mrpc) try writeReviewCompilerC3YamlBody(writer, audit, indent);
+    if (reviewCompilerProtocolIncludesC3(protocol)) try writeReviewCompilerIncludedSessionsYaml(writer, audit.denominator.included_sessions.items, indent);
+    if (reviewCompilerProtocolIncludesC3(protocol)) try writeReviewCompilerC3YamlBody(writer, audit, indent);
     try writeReviewCompilerLegacyYamlBody(writer, audit.legacy_cleanroom, indent);
 }
 
@@ -9368,7 +9609,7 @@ fn writeReviewCompilerAuditJson(allocator: std.mem.Allocator, audit: ReviewCompi
 
     try writer.writeAll("{\n  \"review_compiler_audit\": {\n");
     try writer.print("    \"protocol\": \"{s}\",\n", .{audit.outputProtocol().label()});
-    if (audit.outputProtocol() == .mbk) {
+    if (reviewCompilerProtocolIsMBK(audit.outputProtocol())) {
         try writeReviewCompilerMBKJsonFields(writer, audit.mbk);
         try writer.writeAll("  }\n}\n");
 
@@ -9399,7 +9640,7 @@ fn writeReviewCompilerAuditJson(allocator: std.mem.Allocator, audit: ReviewCompi
     }
     try writer.writeAll("] },\n");
     const protocol = audit.outputProtocol();
-    if (protocol == .c3 or protocol == .c3_mrpc) {
+    if (reviewCompilerProtocolIncludesC3(protocol)) {
         try writer.print("    \"controller\": {{ \"begin_events\": {d}, \"state_files\": {d}, \"mrpc_apply_certified\": {d}, \"mrpc_final_certified\": {d}, \"mrpc_committed\": {d}, \"mrpc_pushed\": {d}, \"mrpc_closed\": {d} }},\n", .{ audit.c3.controller.begin_events, audit.c3.controller.state_files, audit.c3.controller.mrpc_apply_certified, audit.c3.controller.mrpc_final_certified, audit.c3.controller.mrpc_committed, audit.c3.controller.mrpc_pushed, audit.c3.controller.mrpc_closed });
         try writer.print("    \"counterexamples\": {{ \"raw_findings\": {d}, \"branch_liabilities\": {d}, \"non_branch_liabilities\": {d}, \"independent_families\": {d}, \"subsumed_findings\": {d}, ", .{ audit.c3.counterexamples.raw_findings, audit.c3.counterexamples.branch_liabilities, audit.c3.counterexamples.non_branch_liabilities, audit.c3.counterexamples.independent_families, audit.c3.counterexamples.subsumed_findings });
         try writeJsonRatioFields(writer, "compression_ratio", audit.c3.counterexamples.branch_liabilities, audit.c3.counterexamples.independent_families, "independent_families_zero");
@@ -9446,7 +9687,9 @@ fn writeReviewCompilerClosureCompressionJson(writer: anytype, closure: ReviewCom
 }
 
 fn writeReviewCompilerIncludedSessionJson(writer: anytype, row: ReviewCompilerAudit.IncludedSession) !void {
-    try writer.writeAll("{ \"run_version\": \"RCRUN-v1\", \"identity\": { \"session_id\": ");
+    try writer.writeAll("{ \"run_version\": ");
+    try output.writeJsonString(writer, resolve_intent_closed.run_version);
+    try writer.writeAll(", \"identity\": { \"session_id\": ");
     if (row.session_id) |id| try output.writeJsonString(writer, id) else try writer.writeAll("null");
     try writer.writeAll(", \"path\": ");
     try output.writeJsonString(writer, row.path);
@@ -9477,7 +9720,19 @@ fn writeReviewCompilerIncludedSessionJson(writer: anytype, row: ReviewCompilerAu
     try output.writeJsonString(writer, row.compression);
     try writer.writeAll(", \"reason\": ");
     try output.writeJsonString(writer, if (std.mem.eql(u8, row.compression, "NONE")) "workflow_not_governing_or_not_closed" else "classified_from_c3_closure");
-    try writer.writeAll(" }, \"artifact_tuple\": { \"campaign_base_sha\": null, \"review_ready_baseline_sha\": null, \"delivery_head\": null, \"pr_number\": null }, \"limitations\": []");
+    try writer.writeAll(" }, \"artifact_tuple\": { \"campaign_base_sha\": null, \"review_ready_baseline_sha\": null, \"delivery_head\": null, \"pr_number\": null }");
+    try writer.writeAll(", \"acceptance\": { \"contract_id\": null, \"sequence\": null, \"fingerprint\": null, \"horizon_state\": null, \"sealed\": false, \"rebases\": 0, \"source_refs\": [], \"evidence_refs\": [] }");
+    try writer.print(", \"review\": {{ \"batches_total\": 0, \"discovery\": 0, \"kernel_review\": 0, \"conformance\": 0, \"terminal_holdout\": 0, \"open_batches\": [], \"mutation_while_open\": false, \"whole_diff_conformance\": false, \"aperture_coverage\": null, \"evidence_refs\": [] }}", .{});
+    try writer.writeAll(", \"counterexamples\": { \"raw_claims\": 0, \"confirmed\": 0, \"in_horizon\": 0, \"outside_horizon\": 0, \"contract_invalidating\": 0, \"unknown\": 0, \"new_classes\": 0, \"existing_class_witnesses\": 0, \"duplicates\": 0, \"rejected_or_stale\": 0, \"compression_ratio\": null, \"rows\": [] }");
+    try writer.writeAll(", \"basis\": { \"id\": null, \"fingerprint\": null, \"sealed\": false, \"classes\": 0, \"unresolved\": 0, \"evidence_refs\": [] }");
+    try writer.writeAll(", \"kernel\": { \"fingerprint\": null, \"laws\": 0, \"distinctions\": 0, \"congruence\": null, \"accepted\": false, \"evidence_refs\": [] }");
+    try writer.writeAll(", \"realization\": { \"cycle_count\": 0, \"selected_designs\": 0, \"invalidations\": 0, \"same_class_recurrences\": 0, \"novel_class_returns\": 0, \"contract_returns\": 0, \"evidence_refs\": [] }");
+    try writer.writeAll(", \"potential\": { \"cycles\": 0, \"strict_progress\": 0, \"failed_cycles\": 0, \"hard_surface_regressions\": 0, \"proof_debt_regressions\": 0, \"rows\": [] }");
+    try writer.writeAll(", \"mapping\": { \"constructs\": 0, \"mapped_constructs\": 0, \"orphan_constructs\": 0, \"proof_actions\": 0, \"mapped_proof_actions\": 0, \"wound_specific_tests\": 0 }");
+    try writer.print(", \"delivery\": {{ \"applied\": false, \"committed\": false, \"pushed\": false, \"tuple_closed\": {any}, \"terminal_closed\": {any}, \"holdout_clean\": {any}, \"pr_threads_swept\": false, \"evidence_refs\": [] }}", .{ row.delivery_closed, row.c3_closed, row.c3_closed });
+    try writer.writeAll(", \"verdict\": ");
+    try output.writeJsonString(writer, reviewCompilerVerdictForSession(row));
+    try writer.writeAll(", \"limitations\": [\"controller_artifact_projection_pending\"]");
     try writer.writeAll(", \"session_id\": ");
     if (row.session_id) |id2| try output.writeJsonString(writer, id2) else try writer.writeAll("null");
     try writer.writeAll(", \"path\": ");
@@ -18928,6 +19183,8 @@ fn collectDatasetRowsTracked(
         std.mem.eql(u8, dataset_name, "review_compiler_evidence"))
     {
         try collectReviewCompilerDatasetRows(allocator, dataset_name, sessions_root, day_filter, query_params, &rows);
+    } else if (std.mem.startsWith(u8, dataset_name, "resolve_")) {
+        try collectResolveIntentClosedDatasetRows(allocator, dataset_name, sessions_root, query_params, &rows);
     } else if (std.mem.startsWith(u8, dataset_name, "actuation_")) {
         try collectActuationDatasetRows(allocator, dataset_name, sessions_root, query_params, &rows);
     } else if (std.mem.eql(u8, dataset_name, "token_events")) {
@@ -19060,7 +19317,10 @@ fn collectReviewCompilerDatasetRows(
             .auto => signals.true_resolve or signals.governance_state == .incidental,
             .legacy_cleanroom => signals.true_legacy,
             .c3, .c3_mrpc => signals.true_c3 or signals.governance_state == .incidental,
-            .mbk => signals.true_mbk,
+            .mbk, .mbk_v1_legacy_open_horizon => signals.true_mbk,
+            .intent_closed_cegis_v1 => signals.true_mbk and signals.true_c3,
+            .mixed => signals.true_mbk and signals.true_c3,
+            .none => false,
         };
         if (!protocol_match) continue;
         if (std.mem.eql(u8, dataset_name, "review_compiler_runs")) {
@@ -19071,6 +19331,211 @@ fn collectReviewCompilerDatasetRows(
             try appendReviewCompilerDatasetEvidenceRows(allocator, out_rows, parsed.session.session_id, path, signals);
         }
     }
+}
+
+fn collectResolveIntentClosedDatasetRows(
+    allocator: std.mem.Allocator,
+    dataset_name: []const u8,
+    sessions_root: []const u8,
+    query_params: []const spec.ParamSpec,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    const artifact_root = paramString(query_params, "artifact_root") orelse sessions_root;
+    var paths = try collectResolveArtifactJsonPaths(allocator, artifact_root);
+    defer freePathList(allocator, &paths);
+    for (paths.items) |path| {
+        const content = (try readFileAllocOrSkip(allocator, path)) orelse continue;
+        defer allocator.free(content);
+        var artifact = resolve_intent_closed.parseArtifact(allocator, content, path, .controller_artifact) catch continue;
+        defer artifact.deinit(allocator);
+        if (!resolveDatasetAcceptsArtifact(dataset_name, artifact.kind)) continue;
+        try appendResolveIntentClosedDatasetRow(allocator, out_rows, dataset_name, artifact, path);
+    }
+}
+
+fn collectResolveArtifactJsonPaths(allocator: std.mem.Allocator, root_abs: []const u8) !std.ArrayList([]u8) {
+    var out = std.ArrayList([]u8).empty;
+    errdefer freePathList(allocator, &out);
+    if (std.mem.endsWith(u8, root_abs, ".json")) {
+        try out.append(allocator, try allocator.dupe(u8, root_abs));
+        return out;
+    }
+
+    var root_dir = std.Io.Dir.openDirAbsolute(defaultIo(), root_abs, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return out,
+        else => return err,
+    };
+    defer root_dir.close(defaultIo());
+
+    var walker = try root_dir.walk(allocator);
+    defer walker.deinit();
+    while (try walker.next(defaultIo())) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.path, ".json")) continue;
+        try out.append(allocator, try std.fs.path.join(allocator, &.{ root_abs, entry.path }));
+    }
+    std.mem.sort([]u8, out.items, {}, lessThanString);
+    return out;
+}
+
+fn resolveDatasetAcceptsArtifact(dataset_name: []const u8, kind: resolve_intent_closed.ArtifactKind) bool {
+    if (std.mem.eql(u8, dataset_name, "resolve_acceptance_contracts")) return kind == .acceptance_contract;
+    if (std.mem.eql(u8, dataset_name, "resolve_review_batches")) return kind == .review_batch;
+    if (std.mem.eql(u8, dataset_name, "resolve_review_apertures")) return kind == .review_aperture;
+    if (std.mem.eql(u8, dataset_name, "resolve_counterexamples")) return kind == .counterexample;
+    if (std.mem.eql(u8, dataset_name, "resolve_counterexample_classes")) return kind == .counterexample_basis;
+    if (std.mem.eql(u8, dataset_name, "resolve_potential_cycles")) return kind == .potential_cycle;
+    if (std.mem.eql(u8, dataset_name, "resolve_realization_cycles")) return kind == .mbkc or kind == .reduction_certificate or kind == .delivery or kind == .holdout;
+    if (std.mem.eql(u8, dataset_name, "resolve_intent_closed_runs")) return kind != .unknown;
+    return false;
+}
+
+fn appendResolveIntentClosedDatasetRow(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayList(query.Row),
+    dataset_name: []const u8,
+    artifact: resolve_intent_closed.ArtifactRow,
+    path: []const u8,
+) !void {
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    const issues = try resolveIssuesJson(allocator, artifact.issues);
+    defer allocator.free(issues);
+    const source_refs = try resolveStringListJson(allocator, artifact.source_refs);
+    defer allocator.free(source_refs);
+    const evidence_refs = try resolveEvidenceRefsJson(allocator, artifact.evidence_refs);
+    defer allocator.free(evidence_refs);
+
+    if (std.mem.eql(u8, dataset_name, "resolve_acceptance_contracts")) {
+        try putResolveArtifactIdentity(&row, artifact, path, "artifact_id");
+        try putOptionalString(&row, "campaign_id", artifact.campaign_id);
+        try putOptionalString(&row, "contract_id", artifact.id);
+        try row.putStaticKey("protocol", .{ .string = artifact.protocol.label() });
+        try putOptionalString(&row, "fingerprint", artifact.fingerprint);
+        try row.putStaticKey("sealed", .{ .bool = artifact.sealed orelse false });
+        try putResolveDiagnostics(&row, artifact, issues, source_refs, evidence_refs);
+    } else if (std.mem.eql(u8, dataset_name, "resolve_review_batches")) {
+        try putResolveArtifactIdentity(&row, artifact, path, "artifact_id");
+        try putOptionalString(&row, "campaign_id", artifact.campaign_id);
+        try putOptionalString(&row, "batch_id", artifact.batch_id orelse artifact.id);
+        try putOptionalString(&row, "mode", artifact.mode);
+        try putOptionalString(&row, "state", artifact.state);
+        try putOptionalString(&row, "horizon_fingerprint", artifact.acceptance_fingerprint);
+        try putResolveDiagnostics(&row, artifact, issues, source_refs, evidence_refs);
+    } else if (std.mem.eql(u8, dataset_name, "resolve_review_apertures")) {
+        try putResolveArtifactIdentity(&row, artifact, path, "artifact_id");
+        try putOptionalString(&row, "campaign_id", artifact.campaign_id);
+        try putOptionalString(&row, "batch_id", artifact.batch_id);
+        try putOptionalString(&row, "aperture_id", artifact.aperture_id orelse artifact.id);
+        try putOptionalString(&row, "mode", artifact.mode);
+        try putOptionalString(&row, "horizon_fingerprint", artifact.acceptance_fingerprint);
+        try putResolveDiagnostics(&row, artifact, issues, source_refs, evidence_refs);
+    } else if (std.mem.eql(u8, dataset_name, "resolve_counterexamples")) {
+        try putResolveArtifactIdentity(&row, artifact, path, "counterexample_id");
+        try putOptionalString(&row, "campaign_id", artifact.campaign_id);
+        try putOptionalString(&row, "batch_id", artifact.batch_id);
+        try putOptionalString(&row, "aperture_id", artifact.aperture_id);
+        try putOptionalString(&row, "review_mode", artifact.mode);
+        try row.putStaticKey("validity", .{ .string = if (artifact.valid) "valid" else "invalid" });
+        try putOptionalString(&row, "intent_relation", artifact.intent_relation);
+        try putOptionalString(&row, "novelty", artifact.novelty);
+        try putOptionalString(&row, "disposition", artifact.disposition);
+        try row.putStaticKey("mutation_authority", .{ .bool = artifact.mutation_authority orelse false });
+        try putResolveDiagnostics(&row, artifact, issues, source_refs, evidence_refs);
+    } else if (std.mem.eql(u8, dataset_name, "resolve_counterexample_classes")) {
+        try putResolveArtifactIdentity(&row, artifact, path, "basis_id");
+        try putOptionalString(&row, "campaign_id", artifact.campaign_id);
+        try putOptionalString(&row, "fingerprint", artifact.fingerprint);
+        try row.putStaticKey("sealed", .{ .bool = artifact.sealed orelse false });
+        try putResolveDiagnostics(&row, artifact, issues, source_refs, evidence_refs);
+    } else if (std.mem.eql(u8, dataset_name, "resolve_potential_cycles")) {
+        try putResolveArtifactIdentity(&row, artifact, path, "cycle_id");
+        try putOptionalString(&row, "campaign_id", artifact.campaign_id);
+        try putOptionalString(&row, "acceptance_fingerprint", artifact.acceptance_fingerprint);
+        try row.putStaticKey("strict_progress", .null);
+        try putResolveDiagnostics(&row, artifact, issues, source_refs, evidence_refs);
+    } else if (std.mem.eql(u8, dataset_name, "resolve_realization_cycles")) {
+        try putResolveArtifactIdentity(&row, artifact, path, "cycle_id");
+        try putOptionalString(&row, "campaign_id", artifact.campaign_id);
+        try row.putStaticKey("kind", .{ .string = resolveArtifactKindLabel(artifact.kind) });
+        try putOptionalString(&row, "fingerprint", artifact.fingerprint);
+        try putResolveDiagnostics(&row, artifact, issues, source_refs, evidence_refs);
+    } else if (std.mem.eql(u8, dataset_name, "resolve_intent_closed_runs")) {
+        try row.putStaticKey("run_version", .{ .string = resolve_intent_closed.run_version });
+        try putOptionalString(&row, "campaign_id", artifact.campaign_id);
+        try putResolveArtifactIdentity(&row, artifact, path, "artifact_id");
+        try row.putStaticKey("artifact_kind", .{ .string = resolveArtifactKindLabel(artifact.kind) });
+        try row.putStaticKey("protocol", .{ .string = artifact.protocol.label() });
+        try row.putStaticKey("verdict", .{ .string = if (artifact.valid) "insufficient_evidence" else "blocked" });
+        try putResolveDiagnostics(&row, artifact, issues, source_refs, evidence_refs);
+    } else {
+        return error.UnknownDataset;
+    }
+    try rows.append(allocator, row);
+}
+
+fn putResolveArtifactIdentity(row: *query.Row, artifact: resolve_intent_closed.ArtifactRow, path: []const u8, field: []const u8) !void {
+    if (artifact.id) |id| {
+        try row.putStaticKey(field, .{ .string = id });
+    } else if (artifact.fingerprint) |fingerprint| {
+        try row.putStaticKey(field, .{ .string = fingerprint });
+    } else {
+        try row.putStaticKey(field, .{ .string = path });
+    }
+}
+
+fn putResolveDiagnostics(row: *query.Row, artifact: resolve_intent_closed.ArtifactRow, issues: []const u8, source_refs: []const u8, evidence_refs: []const u8) !void {
+    try row.putStaticKey("valid", .{ .bool = artifact.valid });
+    try row.putStaticKey("issues", .{ .string = issues });
+    try row.putStaticKey("source_refs", .{ .string = source_refs });
+    try row.putStaticKey("evidence_refs", .{ .string = evidence_refs });
+}
+
+fn resolveArtifactKindLabel(kind: resolve_intent_closed.ArtifactKind) []const u8 {
+    return switch (kind) {
+        .acceptance_contract => "acceptance_contract",
+        .review_batch => "review_batch",
+        .review_aperture => "review_aperture",
+        .counterexample => "counterexample",
+        .counterexample_basis => "counterexample_basis",
+        .potential_cycle => "potential_cycle",
+        .mbkc => "mbkc",
+        .reduction_certificate => "reduction_certificate",
+        .delivery => "delivery",
+        .holdout => "holdout",
+        .controller_event => "controller_event",
+        .unknown => "unknown",
+    };
+}
+
+fn resolveIssuesJson(allocator: std.mem.Allocator, items: [][]u8) ![]u8 {
+    return resolveStringListJson(allocator, items);
+}
+
+fn resolveStringListJson(allocator: std.mem.Allocator, items: [][]u8) ![]u8 {
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+    try writer.writeByte('[');
+    for (items, 0..) |item, idx| {
+        if (idx > 0) try writer.writeAll(", ");
+        try output.writeJsonString(writer, item);
+    }
+    try writer.writeByte(']');
+    return writer_alloc.toOwnedSlice();
+}
+
+fn resolveEvidenceRefsJson(allocator: std.mem.Allocator, refs: []resolve_intent_closed.EvidenceRef) ![]u8 {
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+    try writer.writeByte('[');
+    for (refs, 0..) |ref, idx| {
+        if (idx > 0) try writer.writeAll(", ");
+        try output.writeJsonString(writer, ref.ref);
+    }
+    try writer.writeByte(']');
+    return writer_alloc.toOwnedSlice();
 }
 
 fn collectActuationDatasetRows(
@@ -21966,6 +22431,9 @@ fn parseOptionsForCommand(cmd: lib.Command, args: []const []const u8) !Options {
     if (cmd == .actuation_audit and opts.strict_set and opts.strict) {
         opts.actuation_strict = true;
     }
+    if (cmd == .review_compiler_audit and opts.strict_set and opts.strict) {
+        opts.review_compiler_strict = true;
+    }
     return opts;
 }
 
@@ -23876,6 +24344,18 @@ test "validateCommandOptions gates review-compiler-audit protocol" {
         .repo_text = "/repo",
         .protocol_text = "mbk",
     });
+    try validateCommandOptions(.review_compiler_audit, .{
+        .since = "2026-05-10T00:00:00Z",
+        .until = "2026-05-11T00:00:00Z",
+        .repo_text = "/repo",
+        .protocol_text = "mbk-v1-legacy-open-horizon",
+    });
+    try validateCommandOptions(.review_compiler_audit, .{
+        .since = "2026-05-10T00:00:00Z",
+        .until = "2026-05-11T00:00:00Z",
+        .repo_text = "/repo",
+        .protocol_text = "intent-closed-cegis-v1",
+    });
     try std.testing.expectError(error.UnsupportedOption, validateCommandOptions(.skill_report, .{ .protocol_text = "c3" }));
     try std.testing.expectError(error.InvalidModeArg, validateCommandOptions(.review_compiler_audit, .{
         .since = "2026-05-10T00:00:00Z",
@@ -23883,6 +24363,133 @@ test "validateCommandOptions gates review-compiler-audit protocol" {
         .repo_text = "/repo",
         .protocol_text = "bad",
     }));
+}
+
+test "review-compiler-audit accepts intent closed modes and strict flag" {
+    const opts = try parseOptionsForCommand(.review_compiler_audit, &.{
+        "--since",
+        "2026-05-10T00:00:00Z",
+        "--until",
+        "2026-05-11T00:00:00Z",
+        "--repo",
+        "/repo",
+        "--protocol",
+        "intent-closed-cegis-v1",
+        "--mode",
+        "report",
+        "--artifact-root",
+        "/tmp/resolve-c3",
+        "--strict",
+    });
+    try std.testing.expect(opts.review_compiler_strict);
+    try validateFormatForCommand(.review_compiler_audit, opts);
+    try validateCommandOptions(.review_compiler_audit, opts);
+    try std.testing.expectEqual(ReviewCompilerProtocol.intent_closed_cegis_v1, try parseReviewCompilerProtocol("intent-closed-cegis-v1"));
+    try std.testing.expectEqualStrings("intent-closed-cegis-v1", ReviewCompilerProtocol.intent_closed_cegis_v1.label());
+
+    const mode_opts = try parseOptionsForCommand(.review_compiler_audit, &.{
+        "--since",
+        "2026-05-10T00:00:00Z",
+        "--until",
+        "2026-05-11T00:00:00Z",
+        "--repo",
+        "/repo",
+        "--mode",
+        "counterexamples",
+    });
+    try validateCommandOptions(.review_compiler_audit, mode_opts);
+}
+
+test "resolve intent closed datasets register schemas and query artifact rows" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "artifacts");
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "artifacts/cex-outside.json",
+        .data =
+        \\{"cex_version":"CEX-v1","cex_id":"cex.outside","batch_id":"batch.1","aperture_id":"rap.1","review_mode":"conformance","intent_relation":"outside_horizon","novelty":"new_equivalence_class","disposition":"accepted","acceptance_refs":["AC-1"],"minimal_trace":["step"],"mutation_authority":false}
+        ,
+    });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "artifacts/phi.json",
+        .data =
+        \\{"potential_version":"PHI-v1","cycle_id":"phi.1","acceptance_fingerprint":"acfp.1","evidence_refs":["receipt.1"],"primary":{"U":2,"L":1,"C":0,"O":0},"hard_surface":{},"proof_debt":{}}
+        ,
+    });
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const artifact_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "artifacts", std.testing.allocator);
+    defer std.testing.allocator.free(artifact_abs);
+
+    try std.testing.expect(findDatasetMeta("resolve_counterexamples") != null);
+    const potential_meta = findDatasetMeta("resolve_potential_cycles") orelse return error.TestExpectedEqual;
+    var saw_strict_progress = false;
+    for (potential_meta.fields) |field| {
+        if (std.mem.eql(u8, field, "strict_progress")) saw_strict_progress = true;
+    }
+    try std.testing.expect(saw_strict_progress);
+
+    const params = [_]spec.ParamSpec{.{ .key = "artifact_root", .value = .{ .string = artifact_abs } }};
+    const where = [_]spec.WhereClause{.{
+        .field = "intent_relation",
+        .op = .eq,
+        .value = .{ .scalar = .{ .string = "outside_horizon" } },
+    }};
+    const query_spec = spec.QuerySpec{
+        .where = where[0..],
+        .params = params[0..],
+    };
+    var cex_rows = try collectDatasetRowsForSpec(std.testing.allocator, "resolve_counterexamples", root_abs, query_spec);
+    defer deinitQueryRows(std.testing.allocator, &cex_rows);
+    try std.testing.expectEqual(@as(usize, 1), cex_rows.items.len);
+    try std.testing.expectEqualStrings("cex.outside", cex_rows.items[0].valueOrNull("counterexample_id").string);
+    try std.testing.expectEqualStrings("outside_horizon", cex_rows.items[0].valueOrNull("intent_relation").string);
+
+    var phi_rows = try collectDatasetRows(std.testing.allocator, "resolve_potential_cycles", root_abs, params[0..], &.{});
+    defer deinitQueryRows(std.testing.allocator, &phi_rows);
+    try std.testing.expectEqual(@as(usize, 1), phi_rows.items.len);
+    try std.testing.expectEqualStrings("phi.1", phi_rows.items[0].valueOrNull("cycle_id").string);
+}
+
+test "resolve controller artifacts project to decisions and adjudication CEX counters" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/16");
+    const session_rel = "sessions/2026/05/16/rollout-resolve-controller-cex.jsonl";
+    const session_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-16T10:00:00Z\",\"payload\":{\"id\":\"resolve-controller-cex\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-16T10:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Use $review-adjudication.\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-16T10:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"{\\\"cex_version\\\":\\\"CEX-v1\\\",\\\"campaign_id\\\":\\\"camp.1\\\",\\\"cex_id\\\":\\\"cex.1\\\",\\\"batch_id\\\":\\\"batch.1\\\",\\\"aperture_id\\\":\\\"rap.1\\\",\\\"intent_relation\\\":\\\"in_horizon\\\",\\\"novelty\\\":\\\"new_equivalence_class\\\",\\\"disposition\\\":\\\"accepted\\\",\\\"acceptance_refs\\\":[\\\"AC-1\\\"],\\\"minimal_trace\\\":[\\\"step\\\"],\\\"mutation_authority\\\":false}\"}]}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = session_rel, .data = session_content });
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const session_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), session_rel, std.testing.allocator);
+    defer std.testing.allocator.free(session_abs);
+    const candidates_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "decision-candidates.json" });
+    defer std.testing.allocator.free(candidates_out);
+    const adjudication_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "adjudication-audit.json" });
+    defer std.testing.allocator.free(adjudication_out);
+
+    const candidates = try runCommandWithOutput(std.testing.allocator, .decision_capsule, &.{
+        "--root",   root_abs,
+        "--path",   session_abs,
+        "--mode",   "candidates",
+        "--format", "json",
+    }, candidates_out);
+    defer std.testing.allocator.free(candidates);
+    try std.testing.expect(std.mem.indexOf(u8, candidates, "camp.1:cex_disposition:cex.1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, candidates, "controller-derived") != null);
+
+    const adjudication = try runCommandWithOutput(std.testing.allocator, .adjudication_audit, &.{
+        "--root",   root_abs,
+        "--since",  "2026-05-16T00:00:00Z",
+        "--until",  "2026-05-17T00:00:00Z",
+        "--mode",   "rows",
+        "--format", "json",
+    }, adjudication_out);
+    defer std.testing.allocator.free(adjudication);
+    try std.testing.expect(std.mem.indexOf(u8, adjudication, "\"cex_total\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, adjudication, "\"cex_accepted\": 1") != null);
 }
 
 test "validateFormatForCommand gates skill-blocks formats by mode" {
@@ -23950,6 +24557,30 @@ test "skill companion command actions parse and validate" {
 test "capabilities supports json output" {
     try validateFormatForCommand(.capabilities, .{ .format = .json });
     try std.testing.expectError(error.InvalidFormatForCommand, validateFormatForCommand(.capabilities, .{ .format = .markdown }));
+}
+
+test "capabilities advertises resolve intent closed audit flags" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "capabilities.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const got = try runCommandWithOutput(std.testing.allocator, .capabilities, &.{
+        "--format", "json",
+    }, output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"version\": \"0.3.11\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_acceptance_contract_v2\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_review_batch_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_review_aperture_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_counterexample_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_counterexample_basis_v2\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_review_potential_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_intent_closed_audit_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"internal_context_not_success_v1\": true") != null);
 }
 
 test "skill-audit supports exclude-current option" {

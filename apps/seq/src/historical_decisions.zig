@@ -4,6 +4,7 @@ const canonical_trace = retrace_core.canonical_trace;
 const query_engine = @import("query/engine.zig");
 const skill_decision_receipt = @import("skill_decision_receipt.zig");
 const skill_decision_signals = @import("skill_decision_signals.zig");
+const resolve_intent_closed = @import("resolve_intent_closed/mod.zig");
 
 pub const Confidence = enum {
     strong,
@@ -79,6 +80,8 @@ pub fn compileCandidates(allocator: std.mem.Allocator, trace: canonical_trace.Ca
         const text = turn.final_answer orelse turn.assistant_preview orelse "";
         if (text.len == 0) continue;
         if (!passesTextFilters(text, filters, regex_atoms)) continue;
+
+        if (try appendResolveArtifactCandidate(allocator, &out, trace, turn, text)) continue;
 
         if (std.mem.indexOf(u8, text, "skill_decision_receipt") != null) {
             if (skill_decision_receipt.parseText(allocator, text)) |parsed_value| {
@@ -226,6 +229,75 @@ fn appendTurnSelectorCandidate(
         .evidence_refs = evidence,
         .source_text = turn.final_answer orelse turn.user_message orelse turn.turn_id,
     }));
+}
+
+fn appendResolveArtifactCandidate(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(Candidate),
+    trace: canonical_trace.CanonicalSessionTrace,
+    turn: canonical_trace.TurnRecord,
+    text: []const u8,
+) !bool {
+    if (std.mem.indexOf(u8, text, "_version") == null and std.mem.indexOf(u8, text, "minimum_behavioral_kernel_certificate") == null) return false;
+    var artifact = resolve_intent_closed.parseArtifact(allocator, text, turn.turn_id, .structured_skill_artifact) catch return false;
+    defer artifact.deinit(allocator);
+    if (artifact.kind == .unknown) return false;
+
+    const event_kind = resolveDecisionEventKind(artifact);
+    const artifact_id = artifact.id orelse artifact.fingerprint orelse turn.turn_id;
+    const campaign_id = artifact.campaign_id orelse trace.session.session_id orelse inferSessionIdFromPath(trace.session.path);
+    const decision_id = try std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ campaign_id, event_kind, artifact_id });
+    defer allocator.free(decision_id);
+    const question = try std.fmt.allocPrint(allocator, "resolve controller {s}", .{event_kind});
+    defer allocator.free(question);
+    const selected_route = artifact.disposition orelse resolveArtifactKindLabel(artifact.kind);
+    const evidence = try singletonList(allocator, "controller-derived");
+    defer freeStringSlice(allocator, evidence);
+
+    try out.append(allocator, try initCandidate(allocator, trace, turn, .{
+        .decision_id = decision_id,
+        .question = question,
+        .selected_route = selected_route,
+        .source_kind = "controller-derived",
+        .confidence = .strong,
+        .evidence_refs = evidence,
+        .source_text = text,
+    }));
+    return true;
+}
+
+fn resolveDecisionEventKind(artifact: resolve_intent_closed.ArtifactRow) []const u8 {
+    return switch (artifact.kind) {
+        .acceptance_contract => if (artifact.sealed == true) "acceptance_seal" else "acceptance_rebase",
+        .counterexample => "cex_disposition",
+        .counterexample_basis => if (artifact.sealed == true) "basis_seal" else "class_merge_split",
+        .potential_cycle => if (artifact.valid) "phi_pass" else "phi_fail",
+        .mbkc => "kernel_accept",
+        .reduction_certificate => "realization_invalid",
+        .review_batch => "review_batch",
+        .review_aperture => "review_aperture",
+        .delivery => "tuple_close",
+        .holdout => "terminal_close",
+        .controller_event => "controller_event",
+        .unknown => "unknown",
+    };
+}
+
+fn resolveArtifactKindLabel(kind: resolve_intent_closed.ArtifactKind) []const u8 {
+    return switch (kind) {
+        .acceptance_contract => "acceptance_contract",
+        .review_batch => "review_batch",
+        .review_aperture => "review_aperture",
+        .counterexample => "counterexample",
+        .counterexample_basis => "counterexample_basis",
+        .potential_cycle => "potential_cycle",
+        .mbkc => "mbkc",
+        .reduction_certificate => "reduction_certificate",
+        .delivery => "delivery",
+        .holdout => "holdout",
+        .controller_event => "controller_event",
+        .unknown => "unknown",
+    };
 }
 
 fn passesTextFilters(text: []const u8, filters: Filters, regex_atoms: ?[]const query_engine.RegexAtom) bool {
