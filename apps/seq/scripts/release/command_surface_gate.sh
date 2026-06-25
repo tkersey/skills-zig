@@ -80,6 +80,10 @@ if ! "$BIN_PATH" --help | rg -q '^- execution-policy-audit$'; then
   echo "required command missing: execution-policy-audit" >&2
   exit 1
 fi
+if ! "$BIN_PATH" --help | rg -q '^- st-workspace-audit$'; then
+  echo "required command missing: st-workspace-audit" >&2
+  exit 1
+fi
 if ! "$BIN_PATH" --help | rg -q '^- tool-audit$'; then
   echo "required command missing: tool-audit" >&2
   exit 1
@@ -184,6 +188,14 @@ if ! "$BIN_PATH" execution-policy-audit --help | rg -q -- '--policy-root <path>'
   echo "execution-policy-audit help missing policy root support" >&2
   exit 1
 fi
+if ! "$BIN_PATH" st-workspace-audit --help | rg -q -- '--mode summary|workspaces|plans|claims|sessions|apertures|gcr|changesets|proof|integration|evidence|report'; then
+  echo "st-workspace-audit help missing mode surface" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" st-workspace-audit --help | rg -q -- '--workspace-root <path>'; then
+  echo "st-workspace-audit help missing workspace root support" >&2
+  exit 1
+fi
 if ! "$BIN_PATH" capabilities --format json | rg -q -- '"skill_decision_audit": true'; then
   echo "capabilities missing skill_decision_audit=true" >&2
   exit 1
@@ -212,12 +224,40 @@ if ! "$BIN_PATH" capabilities --format json | rg -q -- '"policy_transition_datas
   echo "capabilities missing policy_transition_dataset_v1=true" >&2
   exit 1
 fi
+for feature in \
+  st_workspace_audit_v1 \
+  st_workspace_dataset_v1 \
+  st_plan_namespace_v1 \
+  st_claim_fencing_v1 \
+  st_session_view_v1 \
+  st_gcr_v2 \
+  st_changeset_integration_v1 \
+  st_proof_epoch_v1 \
+  ledger_artifact_root_v1
+do
+  if ! "$BIN_PATH" capabilities --format json | rg -q -- "\"${feature}\": true"; then
+    echo "capabilities missing ${feature}=true" >&2
+    exit 1
+  fi
+done
 if ! "$BIN_PATH" dataset-schema --dataset execution_policy_transitions --format json | rg -q -- '"field": "transition_audits"'; then
   echo "execution_policy_transitions schema missing transition_audits" >&2
   exit 1
 fi
+if ! "$BIN_PATH" dataset-schema --dataset st_workspaces --format json | rg -q -- '"field": "workspace_id"'; then
+  echo "st_workspaces schema missing workspace_id" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" dataset-schema --dataset st_gcr_v2 --format json | rg -q -- '"field": "execution_allowed"'; then
+  echo "st_gcr_v2 schema missing execution_allowed" >&2
+  exit 1
+fi
 if ! "$BIN_PATH" query --root /tmp --spec '{"dataset":"execution_policy_runs","params":{"path":"/dev/null"},"select":["runtime_state","verdict"],"format":"json"}' | rg -q -- '"runtime_state"'; then
   echo "execution_policy_runs query projection failed" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" query --root /tmp --spec '{"dataset":"st_workspaces","params":{"workspace_root":"/dev/null"},"select":["workspace_id","protocol_version"],"format":"json"}' | rg -q -- '\['; then
+  echo "st_workspaces query projection failed" >&2
   exit 1
 fi
 for feature in \
