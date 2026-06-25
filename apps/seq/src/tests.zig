@@ -1,4 +1,5 @@
 const retrace_core = @import("retrace_core");
+const execution_policy_core = @import("execution_policy_core");
 
 comptime {
     _ = @import("lib.zig");
@@ -111,4 +112,18 @@ test "retrace core exposes DCP capsule primitives" {
     try std.testing.expectEqualStrings("DCP-v2", retrace_core.dcp_schema.version);
     _ = retrace_core.canonical_trace.CanonicalSessionTrace;
     _ = retrace_core.decision_anchor.Anchors;
+}
+
+test "seq uses execution policy core canonical digest" {
+    var policy = try execution_policy_core.parsePolicy(std.testing.allocator, "{\"b\":2,\"a\":1}");
+    defer policy.deinit(std.testing.allocator);
+    var digest_a = try execution_policy_core.canonicalPolicyDigest(std.testing.allocator, &policy);
+    defer digest_a.deinit(std.testing.allocator);
+
+    var equivalent = try execution_policy_core.parsePolicy(std.testing.allocator, "{\"a\":1,\"b\":2}");
+    defer equivalent.deinit(std.testing.allocator);
+    var digest_b = try execution_policy_core.canonicalPolicyDigest(std.testing.allocator, &equivalent);
+    defer digest_b.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(digest_a.text, digest_b.text);
 }

@@ -2,6 +2,7 @@ const app_meta = @import("app_meta");
 const builtin = @import("builtin");
 const core_cli = @import("core_cli");
 const durable_store = @import("durable_store");
+const execution_policy_core = @import("execution_policy_core");
 const std = @import("std");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
@@ -74,6 +75,20 @@ const UsageText =
     \\  -h, --help                      Show help
     \\  -V, --version | version         Show version
 ;
+
+test "st uses execution policy core canonical digest" {
+    var policy = try execution_policy_core.parsePolicy(std.testing.allocator, "{\"b\":2,\"a\":1}");
+    defer policy.deinit(std.testing.allocator);
+    var digest_a = try execution_policy_core.canonicalPolicyDigest(std.testing.allocator, &policy);
+    defer digest_a.deinit(std.testing.allocator);
+
+    var equivalent = try execution_policy_core.parsePolicy(std.testing.allocator, "{\"a\":1,\"b\":2}");
+    defer equivalent.deinit(std.testing.allocator);
+    var digest_b = try execution_policy_core.canonicalPolicyDigest(std.testing.allocator, &equivalent);
+    defer digest_b.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(digest_a.text, digest_b.text);
+}
 
 const InitHelpText =
     \\st init
