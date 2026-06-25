@@ -23,6 +23,34 @@ pub const CreateNewOptions = struct {
     sync: bool = true,
 };
 
+pub const JsonlTransactionMode = enum {
+    append,
+    replace,
+};
+
+pub const JsonlTransactionOptions = struct {
+    expected_sequence: ?i64 = null,
+    sequence_field: []const u8 = "seq",
+    operation: []const u8 = "append-checkpoint",
+    max_existing_bytes: usize = 1024 * 1024,
+    mode: JsonlTransactionMode = .append,
+    allow_sequence_reset: bool = false,
+};
+
+pub const JsonlTransactionReceipt = struct {
+    transaction_id: []u8,
+    prepared_path: []u8,
+    commit_path: []u8,
+    sequence_before: i64,
+    sequence_after: i64,
+
+    pub fn deinit(self: JsonlTransactionReceipt, allocator: std.mem.Allocator) void {
+        allocator.free(self.transaction_id);
+        allocator.free(self.prepared_path);
+        allocator.free(self.commit_path);
+    }
+};
+
 pub fn lockPathAlloc(allocator: std.mem.Allocator, store_path: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}.lock", .{store_path});
 }
@@ -229,10 +257,9 @@ pub fn writeTextCreateNew(
 }
 
 pub fn writeTextAtomic(allocator: std.mem.Allocator, path: []const u8, text: []const u8) !void {
-    try ensureParentPath(path);
-
     const base = std.fs.path.basename(path);
     const parent = std.fs.path.dirname(path) orelse ".";
+    try ensureDirectoryPathNoSymlinks(parent);
     const tmp_name = try std.fmt.allocPrint(
         allocator,
         ".{s}.{d}.tmp",
@@ -286,6 +313,192 @@ pub fn appendLineAtomic(
     const payload = try out.toOwnedSlice();
     defer allocator.free(payload);
     try writeTextAtomic(allocator, path, payload);
+}
+
+pub fn ensureNoPendingTransactions(
+    allocator: std.mem.Allocator,
+    transactions_dir: []const u8,
+) !void {
+    const dir_exists = fileExists(transactions_dir);
+    if (!dir_exists) return;
+
+    const names = try listSortedRegularFilesNoSymlink(allocator, transactions_dir, 4096, 1024 * 1024);
+    defer freeStringList(allocator, names);
+
+    const prepared_suffix = ".prepared.json";
+    for (names) |name| {
+        if (!std.mem.endsWith(u8, name, prepared_suffix)) continue;
+        const prefix = name[0 .. name.len - prepared_suffix.len];
+        const commit_name = try std.fmt.allocPrint(allocator, "{s}.commit.json", .{prefix});
+        defer allocator.free(commit_name);
+        const commit_path = try std.fs.path.join(allocator, &.{ transactions_dir, commit_name });
+        defer allocator.free(commit_path);
+        if (!fileExists(commit_path)) return error.TransactionRecoveryRequired;
+    }
+}
+
+pub fn appendJsonlCheckpointTransaction(
+    allocator: std.mem.Allocator,
+    store_path: []const u8,
+    locks_dir: []const u8,
+    transactions_dir: []const u8,
+    checkpoint_line: []const u8,
+    options: JsonlTransactionOptions,
+) !JsonlTransactionReceipt {
+    try ensureDirectoryPathNoSymlinks(locks_dir);
+    try ensureDirectoryPathNoSymlinks(transactions_dir);
+
+    const lock_name = try transactionLockNameAlloc(allocator, store_path);
+    defer allocator.free(lock_name);
+    const lock_path = try std.fs.path.join(allocator, &.{ locks_dir, lock_name });
+    defer allocator.free(lock_path);
+    var lock = try acquireExclusiveLockPath(allocator, lock_path);
+    defer lock.release(allocator);
+
+    try ensureNoPendingTransactions(allocator, transactions_dir);
+
+    const existing = readRegularFileNoSymlink(allocator, store_path, options.max_existing_bytes) catch |err| switch (err) {
+        error.FileNotFound => try allocator.dupe(u8, ""),
+        else => return err,
+    };
+    defer allocator.free(existing);
+
+    const sequence_before = try lastJsonlSequence(allocator, existing, options.sequence_field);
+    if (options.expected_sequence) |expected| {
+        if (expected != sequence_before) return error.SequenceStale;
+    }
+
+    const trimmed_checkpoint = std.mem.trim(u8, checkpoint_line, " \t\r\n");
+    if (trimmed_checkpoint.len == 0) return error.InvalidCheckpoint;
+    const sequence_after = try jsonObjectSequence(allocator, trimmed_checkpoint, options.sequence_field);
+    switch (options.mode) {
+        .append => {
+            if (sequence_after != sequence_before + 1) return error.TransactionSequenceMismatch;
+        },
+        .replace => {
+            if (!options.allow_sequence_reset and sequence_after != sequence_before + 1) {
+                return error.TransactionSequenceMismatch;
+            }
+        },
+    }
+
+    const transaction_id = try std.fmt.allocPrint(
+        allocator,
+        "txn-{d:0>12}-{d}",
+        .{ sequence_after, std.Io.Clock.awake.now(Io.io()).nanoseconds },
+    );
+    errdefer allocator.free(transaction_id);
+    const prepared_name = try std.fmt.allocPrint(allocator, "{s}.prepared.json", .{transaction_id});
+    defer allocator.free(prepared_name);
+    const prepared_path = try std.fs.path.join(allocator, &.{ transactions_dir, prepared_name });
+    errdefer allocator.free(prepared_path);
+    const commit_name = try std.fmt.allocPrint(allocator, "{s}.commit.json", .{transaction_id});
+    defer allocator.free(commit_name);
+    const commit_path = try std.fs.path.join(allocator, &.{ transactions_dir, commit_name });
+    errdefer allocator.free(commit_path);
+
+    const prepared = try renderTransactionRecord(
+        allocator,
+        "prepared",
+        transaction_id,
+        store_path,
+        options.operation,
+        sequence_before,
+        sequence_after,
+    );
+    defer allocator.free(prepared);
+    try writeTextCreateNew(allocator, prepared_path, prepared, .{});
+
+    const combined = switch (options.mode) {
+        .append => try combineJsonlAppend(allocator, existing, trimmed_checkpoint),
+        .replace => try combineJsonlAppend(allocator, "", trimmed_checkpoint),
+    };
+    defer allocator.free(combined);
+    try writeTextAtomic(allocator, store_path, combined);
+
+    const committed = try renderTransactionRecord(
+        allocator,
+        "committed",
+        transaction_id,
+        store_path,
+        options.operation,
+        sequence_before,
+        sequence_after,
+    );
+    defer allocator.free(committed);
+    try writeTextCreateNew(allocator, commit_path, committed, .{});
+
+    return .{
+        .transaction_id = transaction_id,
+        .prepared_path = prepared_path,
+        .commit_path = commit_path,
+        .sequence_before = sequence_before,
+        .sequence_after = sequence_after,
+    };
+}
+
+fn transactionLockNameAlloc(allocator: std.mem.Allocator, store_path: []const u8) ![]u8 {
+    const base = std.fs.path.basename(store_path);
+    if (base.len == 0 or std.mem.eql(u8, base, ".") or std.mem.eql(u8, base, "..")) return error.InvalidPath;
+    return std.fmt.allocPrint(allocator, "{s}.lock", .{base});
+}
+
+fn combineJsonlAppend(allocator: std.mem.Allocator, existing: []const u8, line: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll(existing);
+    if (existing.len > 0 and existing[existing.len - 1] != '\n') try out.writer.writeByte('\n');
+    try out.writer.writeAll(line);
+    try out.writer.writeByte('\n');
+    return out.toOwnedSlice();
+}
+
+fn lastJsonlSequence(allocator: std.mem.Allocator, data: []const u8, sequence_field: []const u8) !i64 {
+    var last: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r\n");
+        if (line.len != 0) last = line;
+    }
+    if (last.len == 0) return 0;
+    return jsonObjectSequence(allocator, last, sequence_field);
+}
+
+fn jsonObjectSequence(allocator: std.mem.Allocator, line: []const u8, sequence_field: []const u8) !i64 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidCheckpoint;
+    const value = parsed.value.object.get(sequence_field) orelse return error.InvalidCheckpoint;
+    if (value != .integer) return error.InvalidCheckpoint;
+    return value.integer;
+}
+
+fn renderTransactionRecord(
+    allocator: std.mem.Allocator,
+    state: []const u8,
+    transaction_id: []const u8,
+    store_path: []const u8,
+    operation: []const u8,
+    sequence_before: i64,
+    sequence_after: i64,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"transaction_schema\":\"DSTXN-v1\",\"state\":");
+    try std.json.Stringify.value(state, .{}, writer);
+    try writer.writeAll(",\"transaction_id\":");
+    try std.json.Stringify.value(transaction_id, .{}, writer);
+    try writer.writeAll(",\"operation\":");
+    try std.json.Stringify.value(operation, .{}, writer);
+    try writer.writeAll(",\"store_path\":");
+    try std.json.Stringify.value(store_path, .{}, writer);
+    try writer.writeAll(",\"sequence_before\":");
+    try writer.print("{d}", .{sequence_before});
+    try writer.writeAll(",\"sequence_after\":");
+    try writer.print("{d}", .{sequence_after});
+    try writer.writeAll("}\n");
+    return out.toOwnedSlice();
 }
 
 pub fn validateJsonl(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) !JsonlValidation {
@@ -374,6 +587,24 @@ pub fn acquireAbsoluteExclusiveLock(allocator: std.mem.Allocator, absolute_path:
         if (stat.kind == .sym_link) return error.SymlinkComponent;
     }
     var file = try std.Io.Dir.createFileAbsolute(Io.io(), path, .{ .exclusive = true, .read = true, .truncate = false });
+    file.close(Io.io());
+    return .{ .path = path };
+}
+
+pub fn acquireExclusiveLockPath(allocator: std.mem.Allocator, path_raw: []const u8) !LockFile {
+    if (std.fs.path.isAbsolute(path_raw)) return acquireAbsoluteExclusiveLock(allocator, path_raw);
+    const path = try allocator.dupe(u8, path_raw);
+    errdefer allocator.free(path);
+    const parent = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    try ensureDirectoryPathNoSymlinks(parent);
+    const existing_stat = std.Io.Dir.cwd().statFile(Io.io(), path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (existing_stat) |stat| {
+        if (stat.kind == .sym_link) return error.SymlinkComponent;
+    }
+    var file = try std.Io.Dir.cwd().createFile(Io.io(), path, .{ .exclusive = true, .read = true, .truncate = false });
     file.close(Io.io());
     return .{ .path = path };
 }
@@ -527,6 +758,106 @@ test "appendLineAtomic appends newline-delimited records" {
     const data = try tryReadForTest(path);
     defer std.testing.allocator.free(data);
     try std.testing.expectEqualStrings("{\"n\":1}\n{\"n\":2}\n", data);
+}
+
+test "appendJsonlCheckpointTransaction publishes checkpoint and receipts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root, "workspace.jsonl" });
+    defer std.testing.allocator.free(store_path);
+    const locks_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "locks" });
+    defer std.testing.allocator.free(locks_dir);
+    const transactions_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "transactions" });
+    defer std.testing.allocator.free(transactions_dir);
+
+    var first = try appendJsonlCheckpointTransaction(
+        std.testing.allocator,
+        store_path,
+        locks_dir,
+        transactions_dir,
+        "{\"workspace_sequence\":1,\"ok\":true}",
+        .{ .expected_sequence = 0, .sequence_field = "workspace_sequence", .operation = "test-init" },
+    );
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(i64, 0), first.sequence_before);
+    try std.testing.expectEqual(@as(i64, 1), first.sequence_after);
+    try std.testing.expect(fileExists(first.prepared_path));
+    try std.testing.expect(fileExists(first.commit_path));
+
+    var second = try appendJsonlCheckpointTransaction(
+        std.testing.allocator,
+        store_path,
+        locks_dir,
+        transactions_dir,
+        "{\"workspace_sequence\":2,\"ok\":false}",
+        .{ .expected_sequence = 1, .sequence_field = "workspace_sequence", .operation = "test-append" },
+    );
+    defer second.deinit(std.testing.allocator);
+    const data = try tryReadForTest(store_path);
+    defer std.testing.allocator.free(data);
+    try std.testing.expectEqualStrings("{\"workspace_sequence\":1,\"ok\":true}\n{\"workspace_sequence\":2,\"ok\":false}\n", data);
+}
+
+test "appendJsonlCheckpointTransaction rejects stale sequence without publishing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root, "workspace.jsonl" });
+    defer std.testing.allocator.free(store_path);
+    const locks_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "locks" });
+    defer std.testing.allocator.free(locks_dir);
+    const transactions_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "transactions" });
+    defer std.testing.allocator.free(transactions_dir);
+
+    var first = try appendJsonlCheckpointTransaction(
+        std.testing.allocator,
+        store_path,
+        locks_dir,
+        transactions_dir,
+        "{\"workspace_sequence\":1,\"ok\":true}",
+        .{ .expected_sequence = 0, .sequence_field = "workspace_sequence" },
+    );
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectError(error.SequenceStale, appendJsonlCheckpointTransaction(
+        std.testing.allocator,
+        store_path,
+        locks_dir,
+        transactions_dir,
+        "{\"workspace_sequence\":2,\"ok\":false}",
+        .{ .expected_sequence = 0, .sequence_field = "workspace_sequence" },
+    ));
+    const data = try tryReadForTest(store_path);
+    defer std.testing.allocator.free(data);
+    try std.testing.expectEqualStrings("{\"workspace_sequence\":1,\"ok\":true}\n", data);
+}
+
+test "appendJsonlCheckpointTransaction reports pending prepared recovery" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root, "workspace.jsonl" });
+    defer std.testing.allocator.free(store_path);
+    const locks_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "locks" });
+    defer std.testing.allocator.free(locks_dir);
+    const transactions_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "transactions" });
+    defer std.testing.allocator.free(transactions_dir);
+    try ensureDirectoryPathNoSymlinks(transactions_dir);
+    const prepared_path = try std.fs.path.join(std.testing.allocator, &.{ transactions_dir, "txn-orphan.prepared.json" });
+    defer std.testing.allocator.free(prepared_path);
+    try writeTextCreateNew(std.testing.allocator, prepared_path, "{\"state\":\"prepared\"}\n", .{});
+
+    try std.testing.expectError(error.TransactionRecoveryRequired, appendJsonlCheckpointTransaction(
+        std.testing.allocator,
+        store_path,
+        locks_dir,
+        transactions_dir,
+        "{\"workspace_sequence\":1,\"ok\":true}",
+        .{ .expected_sequence = 0, .sequence_field = "workspace_sequence" },
+    ));
 }
 
 test "validateJsonlBytes reports first invalid row" {
