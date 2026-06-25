@@ -64,6 +64,11 @@ case "$mode" in
       mark_app cas
     }
 
+    mark_execution_policy_core_consumers() {
+      mark_app seq
+      mark_app st
+    }
+
     mark_build_zig() {
       local changed=0
       local ambiguous=0
@@ -82,7 +87,7 @@ case "$mode" in
           *".target = target,"*|*".optimize = optimize,"*|*".imports = &.{"*|*".{ .name = \"core_"*|*".link_libc = true"*)
             return 0
             ;;
-          *\"Build\ *|*\"Run\ *|*\"Test\ *)
+          *\"Build\ *|*\"Run\ *|*\"Test\ *|*"execution_policy_core/src/root.zig"*|*"test-execution-policy-core"*)
             return 0
             ;;
         esac
@@ -162,6 +167,14 @@ case "$mode" in
               fi
               matched=1
               ;;
+            *"execution_policy_core"*|*"libs/execution_policy_core/"*)
+              if [[ -n "$current_app" ]]; then
+                mark_app "$current_app"
+              else
+                mark_execution_policy_core_consumers
+              fi
+              matched=1
+              ;;
           esac
         fi
 
@@ -190,6 +203,9 @@ case "$mode" in
           ;;
         libs/retrace_core/*)
           mark_retrace_core_consumers
+          ;;
+        libs/execution_policy_core/*)
+          mark_execution_policy_core_consumers
           ;;
         .github/workflows/release-seq.yml)
           mark_app seq
