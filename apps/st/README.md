@@ -36,6 +36,104 @@ The graph is durable state in `.step/st-plan.jsonl`. Codex `update_plan` and Ope
 
 Material intake and graph patches must use the canonical `.step/st-plan.jsonl`. A second durable plan file is not a compatibility workaround for legacy graph debt; the CLI should repair or reject the canonical graph instead.
 
+## Workspace Bootstrap
+
+`st workspace` initializes, migrates, and inspects the `.ledger/st` workspace root used by the multi-plan storage model. This workspace surface creates the canonical directory skeleton and an STW-v1 `workspace.jsonl` checkpoint. `st plan` adds the workspace-owned plan registry. `st claim` adds workspace-global claims, leases, resource conflict detection, and fencing tokens. `st session`, `st worktree`, and `st changeset` bind worker execution and output to that workspace authority; `st integrate` serializes target-branch updates.
+
+```bash
+st workspace init --workspace .ledger/st
+st workspace migrate --from .step/st-plan.jsonl --to .ledger/st --plan-id default --format json
+st workspace status --workspace .ledger/st --format json
+st workspace audit --workspace .ledger/st --format json
+st workspace doctor --workspace .ledger/st --format json
+st workspace recover --workspace .ledger/st --format json
+st workspace export --workspace .ledger/st --output .ledger/st-export.json
+st workspace import --workspace .ledger/st --input .ledger/st-export.json --replace
+st plan create --workspace .ledger/st --plan default
+st plan list --workspace .ledger/st --format json
+st plan show --workspace .ledger/st --plan default --format json
+st plan pause --workspace .ledger/st --plan default
+st plan resume --workspace .ledger/st --plan default
+st plan complete --workspace .ledger/st --plan default
+st plan archive --workspace .ledger/st --plan default
+st plan link --workspace .ledger/st --from plan://default/st-001 --to plan://other/st-001 --type hard
+st plan unlink --workspace .ledger/st --from plan://default/st-001 --to plan://other/st-001 --type hard
+st workspace aperture --workspace .ledger/st --format json
+ST_WORKSPACE=.ledger/st ST_PLAN=default st show --format json
+```
+
+`workspace init` fails closed when `workspace.jsonl` already exists unless `--replace` is explicit. `workspace status` is read-only and returns exit code `2` when the workspace is missing. Workspace metadata mutations publish through `.ledger/st/transactions` prepare/commit receipts, a short `.ledger/st/locks` lock, and workspace-sequence compare-and-swap; an unfinished prepared transaction fails closed with recovery required. `plan create` rejects duplicate or malformed plan IDs and creates `.ledger/st/plans/PLAN_ID/plan.jsonl` through the workspace registry. Plan lifecycle commands append new workspace checkpoints: active plans may be paused or completed, paused plans may be resumed, and only non-active plans may be archived. `plan link` and `plan unlink` mutate workspace-owned `cross_plan_edges` using qualified refs shaped like `plan://PLAN_ID/ITEM_ID`; they validate registered plans and existing local items. Plan-local commands can use `ST_WORKSPACE` and `ST_PLAN` defaults, or infer the plan when workspace mode has exactly one active registered plan; two or more active plans require explicit scope.
+
+`workspace migrate` imports a legacy `.step/st-plan.jsonl` into `.ledger/st/plans/PLAN_ID/plan.jsonl` only after loading the legacy and migrated files through the same graph-state materializer and passing a parity comparison. Migrated checkpoint rows receive immutable `plan_id` and `plan_sequence` fields, the workspace registry records the plan sequence and graph fingerprints, a receipt is written under `.ledger/st/migration/receipt.json`, and source bytes are archived under `.ledger/st/migration/source/`. Re-running the same migration is idempotent when the registered plan still matches the legacy graph.
+
+`workspace audit`, `doctor`, and `recover` emit JSON receipts for registry integrity and prepared transaction recovery state. `workspace export` writes an STW-EXPORT-v1 bundle containing the latest workspace checkpoint plus registered plan JSONL bytes; `workspace import` restores that bundle and refuses to replace an existing workspace unless `--replace` is explicit.
+
+`workspace aperture` emits a WAP-v1 receipt without mutating plan state. It scans active registered plans, gates candidates on plan-local readiness plus hard cross-plan dependencies, ignores nonblocking links for execution readiness, infers write resources from `lock_roots` or `location`, rejects candidates that conflict with held workspace claims or already selected candidates, and selects a deterministic conflict-free set by score, fairness debt, then qualified ID.
+
+The workspace resource grammar accepts `path:PATH`, `symbol:PATH#SYMBOL`, `generated:NAME`, `schema:NAME`, `service:NAME`, `git:index`, `git:branch:BRANCH`, and `repo:all`. Paths are repository-relative with POSIX normalization; absolute paths, traversal, NUL bytes, malformed names, and symlink escapes are rejected. Read/read resources are compatible, read/write and write/write conflict, exclusive conflicts with every mode, path ancestors conflict with descendants, and unknown mutation scope falls back to `repo:all` exclusive authority.
+
+Workspace claims are stored in `workspace.jsonl` checkpoints and published with the same workspace-sequence compare-and-swap as plan registry changes:
+
+```bash
+st claim grant --workspace .ledger/st --session s1 --executor teams --resources write:path:src/a.zig
+st claim grant --workspace .ledger/st --session s2 --executor teams --resources read:path:docs,write:schema:events
+st claim conflicts --workspace .ledger/st --resources write:path:src/a.zig --format json
+st claim heartbeat --workspace .ledger/st --claim claim-1 --session s1 --fencing-token 1
+st claim amend --workspace .ledger/st --claim claim-1 --session s1 --fencing-token 1 --resources write:path:src/a.zig,write:path:src/b.zig
+st claim release --workspace .ledger/st --claim claim-2 --session s2 --fencing-token 2
+st claim reclaim-stale --workspace .ledger/st --now 2026-03-12T00:00:00Z
+st claim list --workspace .ledger/st --format json
+st claim show --workspace .ledger/st --claim claim-1 --format json
+```
+
+`--resources` is a comma-separated list of `mode:resource` entries where `mode` is `read`, `write`, or `exclusive`. An omitted resource list is treated as unknown mutation scope and grants `exclusive:repo:all` only after conflict checks. A grant allocates a monotonic fencing token and writes a WCL-v1-style receipt. Heartbeat, release, and amend require the current claim ID, matching session when supplied, and current fencing token. Reclaim marks expired held claims stale without granting new authority; old tokens remain invalid. Amend is release-and-regrant semantics and always allocates a new token.
+
+Workspace sessions write isolated runtime records and SVW-v1 views under `.ledger/st/runtime/sessions` and `.ledger/st/runtime/views`:
+
+```bash
+st session bind --workspace .ledger/st --session s1 --executor teams --plan default --ids st-001
+st session bind --workspace .ledger/st --session s2 --executor teams --plan other --claim claim-2 --fencing-token 2
+st session show --workspace .ledger/st --session s1 --format json
+st session switch-plan --workspace .ledger/st --session s1 --plan other
+st session release --workspace .ledger/st --session s2
+st session list --workspace .ledger/st --format json
+```
+
+Session views include executor, plan ID, optional claim and fencing token, workspace sequence, plan sequence, branch epoch, selected item IDs, target, and a projection digest. A claim-bound session cannot switch plans until released. Session files are runtime-local state; they do not rewrite plan-local selected flags.
+
+Workspace-scoped aperture compilation emits legacy GCR-v1 plus a GCR-v2 authority receipt when claim and session scope are supplied:
+
+```bash
+st compile aperture --workspace .ledger/st --plan default --session s1 --claim claim-1 --fencing-token 1 --expect-workspace-seq 3 --expect-plan-seq 2 --expect-branch-epoch 0
+```
+
+The GCR-v2 receipt binds workspace sequence, plan sequence, graph fingerprints, branch epoch, claim ID, fencing token, claim resources, session view digest, selected item IDs, and `execution_allowed`. Stale workspace or plan sequences, stale graph fingerprints, stale branch epoch, missing or expired claims, stale fencing tokens, and stale or mismatched session views deny execution through machine-readable `gate.denials`; callers cannot override `execution_allowed`.
+
+Claim-bound worker output is sealed through external worktrees and CS-v1 change sets:
+
+```bash
+st worktree create --workspace .ledger/st --claim claim-1 --session s1 --fencing-token 1 --output /tmp/st-worker
+st changeset seal --workspace .ledger/st --claim claim-1 --session s1 --fencing-token 1 --worktree /tmp/st-worker --id cs-1
+st changeset show --workspace .ledger/st --id cs-1
+st changeset reject --workspace .ledger/st --id cs-1
+st changeset supersede --workspace .ledger/st --id cs-1 --to cs-2
+```
+
+`worktree create` uses Git to create a detached worktree at the workspace target head, or current repository `HEAD` when no target head is recorded, and stores WT-v1 metadata under `.ledger/st/worktrees/CLAIM.json`. Nested worktrees inside the primary checkout are rejected, and later sealing verifies the worktree still belongs to the recorded Git common directory. `changeset seal` validates the current claim, session, and fencing token; derives changed paths from Git instead of trusting caller input; rejects changed paths outside write or exclusive claim resources; computes patch and tree digests; and writes CS-v1 receipts under `.ledger/st/changesets/`. Rejected and integrated change sets are immutable terminal states.
+
+Sealed change sets are integrated through a serialized controller lane:
+
+```bash
+st integrate enqueue --workspace .ledger/st --id cs-1
+st integrate status --workspace .ledger/st
+st integrate preview --workspace .ledger/st --id cs-1
+st integrate apply --workspace .ledger/st --id cs-1 --source . --expect-branch-epoch 0
+st integrate reject --workspace .ledger/st --id cs-1
+st integrate recover --workspace .ledger/st
+```
+
+`integrate apply` verifies the target branch head and expected branch epoch, checks the CS-v1 patch digest, applies and commits the patch in a detached scratch worktree, and advances the target branch with `git update-ref <new> <old>` compare-and-swap. Text conflicts leave the target branch unchanged and write conflict artifacts under `.ledger/st/integration/scratch/`; successful applies write IGR-v1 receipts under `.ledger/st/integration/receipts/`, mark the change set integrated, publish a workspace checkpoint with the incremented branch epoch, and append PINV-v1 proof invalidation events under `.ledger/st/proof/PLAN_ID/invalidations.jsonl`.
+
 ## JSONL v4 Graph Envelope
 
 Legacy v3 files remain readable. Non-graph commands may keep writing v3 until graph mode is activated. The first graph mutation writes v4 canonical records with a graph envelope:
@@ -146,6 +244,19 @@ st graph audit --file .step/st-plan.jsonl --gate proof-complete --format json
 ```
 
 `set-status --status completed` also respects proof requirements in graph mode. Use `--allow-unproven --reason "..."` only when an explicit waiver is the intended durable record.
+
+Workspace-scoped proof recording emits PRF-v3 lineage fields:
+
+```bash
+st proof record --workspace .ledger/st --plan default \
+  --id st-001 \
+  --obligation proof-001 \
+  --action proof-action-test \
+  --command "zig build test-st" \
+  --evidence-ref .ledger/st/proof/default/proof-001.log
+```
+
+PRF-v3 receipts include workspace sequence, plan ID and sequence, branch epoch, current tree digest when Git is available, and the item dependency resource cut derived from `lock_roots`, `location`, or `scope`. Historical proof receipts are retained; integration writes invalidation events instead of deleting or rewriting old proof.
 
 ## Projection Commands
 

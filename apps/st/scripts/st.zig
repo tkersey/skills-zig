@@ -20,7 +20,7 @@ const UsageText =
     \\
     \\Manage dependency-aware JSONL v3/v4 plan state.
     \\
-    \\usage: st {init,add,select,deselect,set-status,set-priority,set-deps,set-notes,add-comment,remove,show,ready,blocked,doctor,prime,assert-projection,reconcile-codex,import-proposed-plan,guard-session-start,guard-pre-tool-use,export,import-plan,import-orchplan,claim,heartbeat,set-runtime,set-proof,complete,proof,release,reclaim-stale,import-mesh-results,intake,graph,aperture,compile,capabilities} [options]
+    \\usage: st {init,add,select,deselect,set-status,set-priority,set-deps,set-notes,add-comment,remove,show,ready,blocked,doctor,prime,assert-projection,reconcile-codex,import-proposed-plan,guard-session-start,guard-pre-tool-use,export,import-plan,import-orchplan,claim,heartbeat,set-runtime,set-proof,complete,proof,release,reclaim-stale,import-mesh-results,intake,graph,aperture,compile,workspace,plan,session,worktree,changeset,integrate,capabilities} [options]
     \\
     \\commands:
     \\  init              Initialize plan storage
@@ -59,10 +59,18 @@ const UsageText =
     \\  graph            Graph compiler commands: schema, apply, audit, insights, polish, debt
     \\  aperture         Aperture commands: next, plan, select, explain
     \\  compile          Compile shortcuts: intent, graph, ready, aperture
+    \\  workspace        Workspace commands: init, status, aperture
+    \\  plan             Workspace plan commands: create, list, show
+    \\  session          Workspace session commands: bind, show, switch-plan, release, list
+    \\  worktree         Claim-bound external Git worktrees
+    \\  changeset        Claim-bound worker output receipts
+    \\  integrate        Serialized target-branch integration
     \\  capabilities     Emit machine-readable st feature capabilities
     \\
     \\common options:
     \\  --file PATH                     Path to plan JSONL file (default: .step/st-plan.jsonl)
+    \\  --workspace PATH                Path to workspace root (default: .ledger/st)
+    \\  --plan PLAN_ID                  Workspace plan id for plan-scoped commands
     \\  --allow-multiple-in-progress    Allow multiple in_progress items
     \\  --format markdown|table|json|plan-sync|text  Output format for commands that support formats
     \\  --surface plan|all|backlog      Surface for show/ready/blocked (default: plan)
@@ -434,17 +442,108 @@ const ImportOrchplanHelpText =
 const ClaimHelpText =
     \\st claim
     \\
-    \\Claim a safe wave or task set with a lease.
+    \\Claim a safe wave or task set, or manage workspace-global claims.
     \\
     \\usage: st claim --file PATH (--ids IDS | --wave WAVE) --executor NAME [--lease-seconds N]
+    \\       st claim grant --workspace PATH --session SESSION --executor NAME [--resources SPEC] [--lease-seconds N]
+    \\       st claim {heartbeat,release,amend} --workspace PATH --claim CLAIM --session SESSION --fencing-token N [--resources SPEC]
+    \\       st claim {show,list,conflicts,reclaim-stale} --workspace PATH [options]
     \\
     \\options:
     \\  --ids IDS            Comma-separated item ids
     \\  --wave WAVE          Wave id to claim
     \\  --executor NAME      Claim owner
     \\  --lease-seconds N    Lease duration (default: 900)
+    \\  --resources SPEC     Comma-separated mode:resource entries for workspace claims
+    \\  --claim CLAIM        Workspace claim id
+    \\  --session SESSION    Workspace session id
+    \\  --fencing-token N    Workspace fencing token
+    \\  --workspace PATH     Workspace root
     \\  --file PATH          Path to plan JSONL file
     \\  -h, --help           Show help for claim
+;
+
+const WorktreeHelpText =
+    \\st worktree
+    \\
+    \\Create claim-bound external Git worktrees.
+    \\
+    \\usage: st worktree create --workspace PATH --claim CLAIM --session SESSION --fencing-token N --output PATH [--source REPO]
+    \\
+    \\options:
+    \\  --workspace PATH     Workspace root
+    \\  --claim CLAIM        Workspace claim id
+    \\  --session SESSION    Workspace session id
+    \\  --fencing-token N    Workspace fencing token
+    \\  --output PATH        External worktree path
+    \\  --source REPO        Source repository root (default: current directory)
+    \\  -h, --help           Show help for worktree
+;
+
+const ChangesetHelpText =
+    \\st changeset
+    \\
+    \\Seal and manage claim-bound worker outputs.
+    \\
+    \\usage: st changeset seal --workspace PATH --claim CLAIM --session SESSION --fencing-token N --worktree PATH [--id ID] [--from OLD]
+    \\       st changeset show --workspace PATH --id ID
+    \\       st changeset reject --workspace PATH --id ID
+    \\       st changeset supersede --workspace PATH --id OLD --to NEW
+    \\
+    \\options:
+    \\  --workspace PATH     Workspace root
+    \\  --claim CLAIM        Workspace claim id
+    \\  --session SESSION    Workspace session id
+    \\  --fencing-token N    Workspace fencing token
+    \\  --worktree PATH      External worker worktree
+    \\  --id ID              Change-set id
+    \\  --from ID            Superseded change-set id for seal
+    \\  --to ID              Superseding change-set id
+    \\  -h, --help           Show help for changeset
+;
+
+const IntegrateHelpText =
+    \\st integrate
+    \\
+    \\Serialize target-branch integration for sealed change sets.
+    \\
+    \\usage: st integrate enqueue --workspace PATH --id CHANGESET
+    \\       st integrate status --workspace PATH
+    \\       st integrate preview --workspace PATH [--id CHANGESET]
+    \\       st integrate apply --workspace PATH --id CHANGESET [--source REPO] [--expect-branch-epoch N]
+    \\       st integrate reject --workspace PATH --id CHANGESET
+    \\       st integrate recover --workspace PATH
+    \\
+    \\options:
+    \\  --workspace PATH          Workspace root
+    \\  --id CHANGESET            Change-set id
+    \\  --source REPO             Target repository root (default: current directory)
+    \\  --expect-branch-epoch N   Expected branch epoch
+    \\  --format FORMAT           json|markdown
+    \\  -h, --help                Show help for integrate
+;
+
+const SessionHelpText =
+    \\st session
+    \\
+    \\Manage session-scoped workspace views.
+    \\
+    \\usage: st session bind --workspace PATH --session SESSION --executor NAME [--plan PLAN] [--claim CLAIM --fencing-token N] [--ids IDS]
+    \\       st session show --workspace PATH --session SESSION
+    \\       st session switch-plan --workspace PATH --session SESSION --plan PLAN
+    \\       st session release --workspace PATH --session SESSION
+    \\       st session list --workspace PATH
+    \\
+    \\options:
+    \\  --workspace PATH     Workspace root
+    \\  --session SESSION    Session id
+    \\  --executor NAME      Executor id
+    \\  --plan PLAN          Plan id
+    \\  --claim CLAIM        Workspace claim id
+    \\  --fencing-token N    Workspace fencing token
+    \\  --ids IDS            Comma-separated selected item ids
+    \\  --format FORMAT      json|markdown
+    \\  -h, --help           Show help for session
 ;
 
 const HeartbeatHelpText =
@@ -574,6 +673,217 @@ const ProofAuditHelpText =
     \\  --format FORMAT json|markdown
     \\  --file PATH     Path to plan JSONL file
     \\  -h, --help      Show help for proof audit
+;
+
+const WorkspaceHelpText =
+    \\st workspace
+    \\
+    \\Manage `.ledger/st` workspace storage.
+    \\
+    \\usage: st workspace {init,status,audit,doctor,recover,export,import,aperture,migrate} [--workspace PATH] [--format json]
+    \\
+    \\commands:
+    \\  aperture  Compute a workspace-global WAP-v1 aperture
+    \\  audit     Validate workspace registry and plan files
+    \\  doctor    Emit workspace health and recovery status
+    \\  export    Export a workspace bundle
+    \\  init      Initialize workspace storage
+    \\  import    Import a workspace bundle
+    \\  migrate   Atomically migrate a legacy `.step` plan into the workspace
+    \\  recover   Inspect prepared transaction recovery state
+    \\  status    Show workspace status
+    \\
+    \\options:
+    \\  --workspace PATH  Workspace root (default: .ledger/st)
+    \\  --format FORMAT   json|markdown
+    \\  -h, --help        Show help for workspace
+;
+
+const WorkspaceApertureHelpText =
+    \\st workspace aperture
+    \\
+    \\Compute a workspace-global aperture without mutating plan state.
+    \\
+    \\usage: st workspace aperture [--workspace PATH] [--limit N] [--format json|markdown]
+    \\
+    \\options:
+    \\  --workspace PATH  Workspace root (default: .ledger/st)
+    \\  --limit N         Maximum selected allocations (default: 7)
+    \\  --format FORMAT   json|markdown
+    \\  -h, --help        Show help for workspace aperture
+;
+
+const WorkspaceAdminHelpText =
+    \\st workspace admin
+    \\
+    \\Audit, doctor, recover, export, or import workspace state.
+    \\
+    \\usage: st workspace {audit,doctor,recover} --workspace PATH [--format json|markdown]
+    \\       st workspace export --workspace PATH --output PATH [--format json|markdown]
+    \\       st workspace import --workspace PATH --input PATH [--replace] [--format json|markdown]
+    \\
+    \\options:
+    \\  --workspace PATH  Workspace root (default: .ledger/st)
+    \\  --input PATH      Import bundle path
+    \\  --output PATH     Export bundle path
+    \\  --replace         Replace existing workspace files during import
+    \\  --format FORMAT   json|markdown
+    \\  -h, --help        Show help for workspace admin commands
+;
+
+const WorkspaceInitHelpText =
+    \\st workspace init
+    \\
+    \\Initialize workspace storage.
+    \\
+    \\usage: st workspace init [--workspace PATH] [--replace]
+    \\
+    \\options:
+    \\  --workspace PATH  Workspace root (default: .ledger/st)
+    \\  --replace         Replace the workspace metadata file
+    \\  -h, --help        Show help for workspace init
+;
+
+const WorkspaceStatusHelpText =
+    \\st workspace status
+    \\
+    \\Show workspace status.
+    \\
+    \\usage: st workspace status [--workspace PATH] [--format json|markdown]
+    \\
+    \\options:
+    \\  --workspace PATH  Workspace root (default: .ledger/st)
+    \\  --format FORMAT   json|markdown
+    \\  -h, --help        Show help for workspace status
+;
+
+const WorkspaceMigrateHelpText =
+    \\st workspace migrate
+    \\
+    \\Atomically migrate a legacy single-plan JSONL ledger into `.ledger/st`.
+    \\
+    \\usage: st workspace migrate --from PATH --to PATH --plan-id PLAN_ID [--format json|markdown]
+    \\
+    \\options:
+    \\  --from PATH     Legacy plan JSONL path, for example .step/st-plan.jsonl
+    \\  --to PATH       Workspace root to publish, for example .ledger/st
+    \\  --plan-id ID    Plan id to register in the workspace
+    \\  --format FORMAT json|markdown
+    \\  -h, --help      Show help for workspace migrate
+;
+
+const PlanHelpText =
+    \\st plan
+    \\
+    \\Manage plans registered in a `.ledger/st` workspace.
+    \\
+    \\usage: st plan {create,list,show,pause,resume,complete,archive,link,unlink} [--workspace PATH] [--plan PLAN_ID] [--format json|markdown]
+    \\
+    \\commands:
+    \\  create    Create and register a plan
+    \\  list      List registered plans
+    \\  show      Show one registered plan
+    \\  pause     Pause an active plan
+    \\  resume    Resume a paused plan
+    \\  complete  Mark an active or paused plan completed
+    \\  archive   Archive a non-active plan
+    \\  link      Add a workspace-owned cross-plan edge
+    \\  unlink    Remove a workspace-owned cross-plan edge
+    \\
+    \\options:
+    \\  --workspace PATH  Workspace root (default: .ledger/st)
+    \\  --plan PLAN_ID    Plan id for create/show
+    \\  --alias TEXT      Human-readable alias for create
+    \\  --format FORMAT   json|markdown
+    \\  -h, --help        Show help for plan
+;
+
+const PlanCreateHelpText =
+    \\st plan create
+    \\
+    \\Create and register a plan in a workspace.
+    \\
+    \\usage: st plan create --workspace PATH --plan PLAN_ID [--alias TEXT] [--format json|markdown]
+    \\
+    \\options:
+    \\  --workspace PATH  Workspace root (default: .ledger/st)
+    \\  --plan PLAN_ID    Plan id to create
+    \\  --alias TEXT      Human-readable alias (default: PLAN_ID)
+    \\  --format FORMAT   json|markdown
+    \\  -h, --help        Show help for plan create
+;
+
+const PlanListHelpText =
+    \\st plan list
+    \\
+    \\List plans registered in a workspace.
+    \\
+    \\usage: st plan list [--workspace PATH] [--format json|markdown]
+    \\
+    \\options:
+    \\  --workspace PATH  Workspace root (default: .ledger/st)
+    \\  --format FORMAT   json|markdown
+    \\  -h, --help        Show help for plan list
+;
+
+const PlanShowHelpText =
+    \\st plan show
+    \\
+    \\Show one plan registered in a workspace.
+    \\
+    \\usage: st plan show --workspace PATH --plan PLAN_ID [--format json|markdown]
+    \\
+    \\options:
+    \\  --workspace PATH  Workspace root (default: .ledger/st)
+    \\  --plan PLAN_ID    Plan id to show
+    \\  --format FORMAT   json|markdown
+    \\  -h, --help        Show help for plan show
+;
+
+const PlanLifecycleHelpText =
+    \\st plan <pause|resume|complete|archive>
+    \\
+    \\Update one plan registry lifecycle state.
+    \\
+    \\usage: st plan {pause,resume,complete,archive} --workspace PATH --plan PLAN_ID [--format json|markdown]
+    \\
+    \\options:
+    \\  --workspace PATH  Workspace root (default: .ledger/st)
+    \\  --plan PLAN_ID    Plan id to update
+    \\  --format FORMAT   json|markdown
+    \\  -h, --help        Show help for plan lifecycle commands
+;
+
+const PlanLinkHelpText =
+    \\st plan link
+    \\
+    \\Add a workspace-owned cross-plan edge.
+    \\
+    \\usage: st plan link --workspace PATH --from plan://PLAN/ITEM --to plan://PLAN/ITEM [--type hard|nonblocking] [--format json|markdown]
+    \\
+    \\options:
+    \\  --workspace PATH  Workspace root (default: .ledger/st)
+    \\  --from REF        Dependent qualified item ref
+    \\  --to REF          Referenced qualified item ref
+    \\  --type TYPE       hard|nonblocking (default: hard)
+    \\  --format FORMAT   json|markdown
+    \\  -h, --help        Show help for plan link
+;
+
+const PlanUnlinkHelpText =
+    \\st plan unlink
+    \\
+    \\Remove a workspace-owned cross-plan edge.
+    \\
+    \\usage: st plan unlink --workspace PATH --from plan://PLAN/ITEM --to plan://PLAN/ITEM [--type hard|nonblocking] [--format json|markdown]
+    \\
+    \\options:
+    \\  --workspace PATH  Workspace root (default: .ledger/st)
+    \\  --from REF        Dependent qualified item ref
+    \\  --to REF          Referenced qualified item ref
+    \\  --type TYPE       hard|nonblocking (default: hard)
+    \\  --format FORMAT   json|markdown
+    \\  -h, --help        Show help for plan unlink
 ;
 
 const ReleaseHelpText =
@@ -1007,12 +1317,21 @@ const CompileApertureHelpText =
     \\Select and project the execution aperture.
     \\
     \\usage: st compile aperture --file PATH [--limit N] [--parallelism auto]
+    \\       st compile aperture --workspace PATH --plan PLAN --session SESSION --claim CLAIM --fencing-token N [--expect-workspace-seq N] [--expect-plan-seq N] [--expect-branch-epoch N]
     \\
     \\options:
-    \\  --limit N             Projection limit (default: 7)
-    \\  --parallelism auto    Legacy no-op compatibility alias
-    \\  --file PATH           Path to plan JSONL file
-    \\  -h, --help            Show help for compile aperture
+    \\  --limit N                 Projection limit (default: 7)
+    \\  --parallelism auto        Legacy no-op compatibility alias
+    \\  --file PATH               Path to plan JSONL file
+    \\  --workspace PATH          Workspace root for GCR-v2
+    \\  --plan PLAN               Workspace plan id for GCR-v2
+    \\  --session SESSION         Session id for GCR-v2 view validation
+    \\  --claim CLAIM             Claim id for GCR-v2 authority validation
+    \\  --fencing-token N         Fencing token for GCR-v2 authority validation
+    \\  --expect-workspace-seq N  Expected workspace sequence
+    \\  --expect-plan-seq N       Expected plan sequence
+    \\  --expect-branch-epoch N   Expected branch epoch
+    \\  -h, --help                Show help for compile aperture
 ;
 
 const CapabilitiesHelpText =
@@ -1178,6 +1497,13 @@ const ProofReceipt = struct {
     artifact_ref: []const u8 = "",
     recorded_at: []const u8 = "",
     waiver_id: []const u8 = "",
+    workspace_id: []const u8 = "",
+    workspace_sequence: i64 = -1,
+    plan_id: []const u8 = "",
+    plan_sequence: i64 = -1,
+    branch_epoch: i64 = -1,
+    tree_digest: []const u8 = "",
+    dependency_resources: []const []const u8 = &.{},
 };
 
 const ProofCover = struct {
@@ -1517,6 +1843,75 @@ const ProofCommand = enum {
     record,
 };
 
+const ClaimCommand = enum {
+    grant,
+    heartbeat,
+    show,
+    list,
+    release,
+    reclaim_stale,
+    conflicts,
+    amend,
+};
+
+const WorkspaceCommand = enum {
+    none,
+    aperture,
+    audit,
+    doctor,
+    @"export",
+    init,
+    import,
+    migrate,
+    recover,
+    status,
+};
+
+const PlanCommand = enum {
+    none,
+    create,
+    list,
+    show,
+    pause,
+    @"resume",
+    complete,
+    archive,
+    link,
+    unlink,
+};
+
+const SessionCommand = enum {
+    none,
+    bind,
+    show,
+    switch_plan,
+    release,
+    list,
+};
+
+const WorktreeCommand = enum {
+    none,
+    create,
+};
+
+const ChangesetCommand = enum {
+    none,
+    seal,
+    show,
+    reject,
+    supersede,
+};
+
+const IntegrateCommand = enum {
+    none,
+    enqueue,
+    status,
+    preview,
+    apply,
+    reject,
+    recover,
+};
+
 const AuditGate = enum {
     draft,
     implementation_ready,
@@ -1784,7 +2179,9 @@ pub const Command = enum {
     import_plan,
     import_proposed_plan,
     intake,
+    integrate,
     init,
+    plan,
     prime,
     proof,
     ready,
@@ -1799,7 +2196,11 @@ pub const Command = enum {
     set_priority,
     set_runtime,
     set_status,
+    session,
     show,
+    worktree,
+    workspace,
+    changeset,
 };
 
 pub const CommandDef = struct {
@@ -1819,6 +2220,8 @@ const command_defs = [_]CommandDef{
     .{ .name = "add-comment", .command = .add_comment },
     .{ .name = "remove", .command = .remove },
     .{ .name = "show", .command = .show },
+    .{ .name = "worktree", .command = .worktree },
+    .{ .name = "changeset", .command = .changeset },
     .{ .name = "ready", .command = .ready },
     .{ .name = "blocked", .command = .blocked },
     .{ .name = "capabilities", .command = .capabilities },
@@ -1845,6 +2248,10 @@ const command_defs = [_]CommandDef{
     .{ .name = "reclaim-stale", .command = .reclaim_stale },
     .{ .name = "import-mesh-results", .command = .import_mesh_results },
     .{ .name = "intake", .command = .intake },
+    .{ .name = "integrate", .command = .integrate },
+    .{ .name = "workspace", .command = .workspace },
+    .{ .name = "plan", .command = .plan },
+    .{ .name = "session", .command = .session },
 };
 
 pub fn commandDefs() []const CommandDef {
@@ -1907,8 +2314,22 @@ pub const Args = struct {
     aperture_command: ApertureCommand = .none,
     compile_command: CompileCommand = .none,
     proof_command: ProofCommand = .none,
+    claim_command: ClaimCommand = .grant,
+    workspace_command: WorkspaceCommand = .none,
+    plan_command: PlanCommand = .none,
+    session_command: SessionCommand = .none,
+    worktree_command: WorktreeCommand = .none,
+    changeset_command: ChangesetCommand = .none,
+    integrate_command: IntegrateCommand = .none,
     gate: AuditGate = .draft,
     file: []const u8 = ".step/st-plan.jsonl",
+    file_explicit: bool = false,
+    workspace: []const u8 = ".ledger/st",
+    workspace_explicit: bool = false,
+    workspace_from_env: bool = false,
+    plan_id: ?[]const u8 = null,
+    plan_from_env: bool = false,
+    workspace_plan_resolved: bool = false,
     allow_multiple_in_progress: bool = false,
     format: OutputFormat = .markdown,
     surface: Surface = .plan,
@@ -1946,10 +2367,20 @@ pub const Args = struct {
     now: ?[]const u8 = null,
     transcript_path: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
+    claim_id: ?[]const u8 = null,
+    fencing_token: ?[]const u8 = null,
+    worktree_path: ?[]const u8 = null,
+    expect_workspace_seq: ?[]const u8 = null,
+    expect_plan_seq: ?[]const u8 = null,
+    expect_branch_epoch: ?[]const u8 = null,
+    resources: []const u8 = "",
     guard_root: ?[]const u8 = null,
     id_prefix: []const u8 = "st",
     start_at: ?[]const u8 = null,
     name: ?[]const u8 = null,
+    from_ref: ?[]const u8 = null,
+    to_ref: ?[]const u8 = null,
+    link_type: []const u8 = "hard",
     pass_number: ?[]const u8 = null,
     min_stable_passes: usize = 2,
     strategy: []const u8 = "aperture-score",
@@ -2155,15 +2586,20 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const args = parseArgs(argv) catch |err| {
+    var args = parseArgs(argv) catch |err| {
         return exitWithError(err);
     };
+    var resolved_workspace_plan_file: ?[]u8 = null;
+    defer if (resolved_workspace_plan_file) |path| allocator.free(path);
+    try resolveWorkspacePlanArgsInPlace(allocator, &args, &resolved_workspace_plan_file);
 
     const mutating = isMutatingCommand(args.command) or
         (args.command == .graph and args.graph_command == .apply and !args.dry_run) or
         (args.command == .graph and args.graph_command == .debt and (args.debt_command == .waive or args.debt_command == .resolve)) or
         (args.command == .intake and args.intake_command == .apply) or
         (args.command == .aperture and args.aperture_command == .select) or
+        (args.command == .workspace and (args.workspace_command == .init or args.workspace_command == .migrate or args.workspace_command == .import)) or
+        (args.command == .plan and args.plan_command != .list and args.plan_command != .show) or
         (args.command == .complete) or
         (args.command == .compile and (args.compile_command == .intent or args.compile_command == .graph or args.compile_command == .aperture));
     if (args.command == .doctor and args.repair_seq) {
@@ -2192,6 +2628,9 @@ fn commandHelpTextForArgv(argv: []const []const u8) ?[]const u8 {
         .aperture => apertureHelpTextForArgv(argv),
         .compile => compileHelpTextForArgv(argv),
         .proof => proofHelpTextForArgv(argv),
+        .workspace => workspaceHelpTextForArgv(argv),
+        .plan => planHelpTextForArgv(argv),
+        .session => SessionHelpText,
         else => commandHelpText(command),
     };
 }
@@ -2230,6 +2669,9 @@ fn commandHelpText(command: Command) []const u8 {
         .import_plan => ImportPlanHelpText,
         .import_orchplan => ImportOrchplanHelpText,
         .claim => ClaimHelpText,
+        .worktree => WorktreeHelpText,
+        .changeset => ChangesetHelpText,
+        .integrate => IntegrateHelpText,
         .heartbeat => HeartbeatHelpText,
         .set_runtime => SetRuntimeHelpText,
         .set_proof => SetProofHelpText,
@@ -2243,6 +2685,9 @@ fn commandHelpText(command: Command) []const u8 {
         .aperture => ApertureHelpText,
         .compile => CompileHelpText,
         .capabilities => CapabilitiesHelpText,
+        .workspace => WorkspaceHelpText,
+        .plan => PlanHelpText,
+        .session => SessionHelpText,
     };
 }
 
@@ -2321,6 +2766,33 @@ fn proofHelpTextForArgv(argv: []const []const u8) []const u8 {
     };
 }
 
+fn workspaceHelpTextForArgv(argv: []const []const u8) []const u8 {
+    if (argv.len < 4 or core_cli.isHelpArg(argv[2])) return WorkspaceHelpText;
+    const workspace_command = parseWorkspaceCommand(argv[2]) orelse return WorkspaceHelpText;
+    return switch (workspace_command) {
+        .none => WorkspaceHelpText,
+        .aperture => WorkspaceApertureHelpText,
+        .audit, .doctor, .recover, .@"export", .import => WorkspaceAdminHelpText,
+        .init => WorkspaceInitHelpText,
+        .migrate => WorkspaceMigrateHelpText,
+        .status => WorkspaceStatusHelpText,
+    };
+}
+
+fn planHelpTextForArgv(argv: []const []const u8) []const u8 {
+    if (argv.len < 4 or core_cli.isHelpArg(argv[2])) return PlanHelpText;
+    const plan_command = parsePlanCommand(argv[2]) orelse return PlanHelpText;
+    return switch (plan_command) {
+        .none => PlanHelpText,
+        .create => PlanCreateHelpText,
+        .list => PlanListHelpText,
+        .show => PlanShowHelpText,
+        .pause, .@"resume", .complete, .archive => PlanLifecycleHelpText,
+        .link => PlanLinkHelpText,
+        .unlink => PlanUnlinkHelpText,
+    };
+}
+
 fn parseArgs(argv: []const []const u8) !Args {
     if (argv.len < 2) return error.MissingCommand;
 
@@ -2364,6 +2836,44 @@ fn parseArgs(argv: []const []const u8) !Args {
         args.proof_command = parseProofCommand(argv[2]) orelse return error.UnknownCommand;
         i = 3;
     }
+    if (args.command == .claim) {
+        if (argv.len >= 3) {
+            if (parseClaimCommand(argv[2])) |claim_command| {
+                args.claim_command = claim_command;
+                i = 3;
+            }
+        }
+    }
+    if (args.command == .workspace) {
+        if (argv.len < 3) return error.MissingCommand;
+        args.workspace_command = parseWorkspaceCommand(argv[2]) orelse return error.UnknownCommand;
+        i = 3;
+    }
+    if (args.command == .plan) {
+        if (argv.len < 3) return error.MissingCommand;
+        args.plan_command = parsePlanCommand(argv[2]) orelse return error.UnknownCommand;
+        i = 3;
+    }
+    if (args.command == .session) {
+        if (argv.len < 3) return error.MissingCommand;
+        args.session_command = parseSessionCommand(argv[2]) orelse return error.UnknownCommand;
+        i = 3;
+    }
+    if (args.command == .worktree) {
+        if (argv.len < 3) return error.MissingCommand;
+        args.worktree_command = parseWorktreeCommand(argv[2]) orelse return error.UnknownCommand;
+        i = 3;
+    }
+    if (args.command == .changeset) {
+        if (argv.len < 3) return error.MissingCommand;
+        args.changeset_command = parseChangesetCommand(argv[2]) orelse return error.UnknownCommand;
+        i = 3;
+    }
+    if (args.command == .integrate) {
+        if (argv.len < 3) return error.MissingCommand;
+        args.integrate_command = parseIntegrateCommand(argv[2]) orelse return error.UnknownCommand;
+        i = 3;
+    }
     while (i < argv.len) : (i += 1) {
         const token = argv[i];
 
@@ -2371,6 +2881,57 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i >= argv.len) return error.MissingFileValue;
             args.file = argv[i];
+            args.file_explicit = true;
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--workspace")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.workspace = argv[i];
+            args.workspace_explicit = true;
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--plan") or std.mem.eql(u8, token, "--plan-id")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.plan_id = argv[i];
+            args.plan_from_env = false;
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--session")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.session_id = argv[i];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--claim") or std.mem.eql(u8, token, "--claim-id")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.claim_id = argv[i];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--fencing-token")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.fencing_token = argv[i];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--expect-workspace-seq")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.expect_workspace_seq = argv[i];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--expect-plan-seq")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.expect_plan_seq = argv[i];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--expect-branch-epoch")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.expect_branch_epoch = argv[i];
             continue;
         }
         if (std.mem.eql(u8, token, "--allow-multiple-in-progress")) {
@@ -2595,6 +3156,66 @@ fn parseArgs(argv: []const []const u8) !Args {
             .ready, .blocked, .capabilities => {
                 return error.InvalidListArg;
             },
+            .workspace => {
+                if (std.mem.eql(u8, token, "--replace")) {
+                    args.replace = true;
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--input")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingInputValue;
+                    args.input = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--output")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingOutputValue;
+                    args.output = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--from")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.from_ref = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--to")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.to_ref = argv[i];
+                    args.workspace = argv[i];
+                    args.workspace_explicit = true;
+                    continue;
+                }
+                return error.InvalidWorkspaceArg;
+            },
+            .plan => {
+                if (std.mem.eql(u8, token, "--alias")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.name = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--from")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.from_ref = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--to")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.to_ref = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--type")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.link_type = argv[i];
+                    continue;
+                }
+                return error.InvalidPlanArg;
+            },
             .graph => {
                 if (std.mem.eql(u8, token, "--input")) {
                     i += 1;
@@ -2735,7 +3356,85 @@ fn parseArgs(argv: []const []const u8) !Args {
                     args.lease_seconds = argv[i];
                     continue;
                 }
+                if (std.mem.eql(u8, token, "--resources")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.resources = argv[i];
+                    continue;
+                }
                 return error.InvalidClaimArg;
+            },
+            .session => {
+                if (std.mem.eql(u8, token, "--ids")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingIdsValue;
+                    args.ids = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--executor")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.executor = argv[i];
+                    continue;
+                }
+                return error.InvalidSessionArg;
+            },
+            .worktree => {
+                if (std.mem.eql(u8, token, "--output")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingOutputValue;
+                    args.output = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--source")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.source = argv[i];
+                    continue;
+                }
+                return error.InvalidWorktreeArg;
+            },
+            .changeset => {
+                if (std.mem.eql(u8, token, "--worktree")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.worktree_path = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--id")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingIdValue;
+                    args.id = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--from")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.from_ref = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--to")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.to_ref = argv[i];
+                    continue;
+                }
+                return error.InvalidChangesetArg;
+            },
+            .integrate => {
+                if (std.mem.eql(u8, token, "--id")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingIdValue;
+                    args.id = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--source")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.source = argv[i];
+                    continue;
+                }
+                return error.InvalidIntegrationArg;
             },
             .heartbeat => {
                 if (std.mem.eql(u8, token, "--id")) {
@@ -3121,6 +3820,8 @@ fn parseArgs(argv: []const []const u8) !Args {
         }
     }
 
+    applyWorkspaceEnvDefaults(&args);
+
     switch (args.command) {
         .add => if (args.step == null) return error.MissingStepValue,
         .select, .deselect => {
@@ -3156,9 +3857,11 @@ fn parseArgs(argv: []const []const u8) !Args {
         .import_orchplan => if (args.input == null) return error.MissingInputValue,
         .import_proposed_plan => if (args.input == null) return error.MissingInputValue,
         .claim => {
-            if (args.executor == null) return error.MissingValue;
-            if (args.wave == null and std.mem.trim(u8, args.ids, " \t\r\n").len == 0) {
-                return error.MissingIdsValue;
+            if (args.claim_command == .grant and !workspaceModeRequested(args)) {
+                if (args.executor == null) return error.MissingValue;
+                if (args.wave == null and std.mem.trim(u8, args.ids, " \t\r\n").len == 0) {
+                    return error.MissingIdsValue;
+                }
             }
         },
         .heartbeat => if (args.id == null) return error.MissingIdValue,
@@ -3189,6 +3892,42 @@ fn parseArgs(argv: []const []const u8) !Args {
             if (args.graph_command == .polish and args.polish_command == .snapshot and args.pass_number == null) return error.MissingValue;
             if (args.graph_command == .debt and (args.debt_command == .waive or args.debt_command == .resolve) and args.id == null) return error.MissingIdValue;
             if (args.graph_command == .debt and args.debt_command == .waive and args.reason == null) return error.MissingReason;
+        },
+        .workspace => {},
+        .plan => {
+            if ((args.plan_command == .create or args.plan_command == .show) and args.plan_id == null) return error.MissingPlanScope;
+        },
+        .session => {
+            if (args.session_command != .list and args.session_id == null) return error.SessionUnbound;
+            if ((args.session_command == .bind or args.session_command == .switch_plan) and args.session_command == .bind and args.executor == null) return error.MissingValue;
+        },
+        .worktree => {
+            if (args.worktree_command == .create) {
+                if (args.claim_id == null) return error.ClaimMissing;
+                if (args.session_id == null) return error.SessionUnbound;
+                if (args.fencing_token == null) return error.FencingTokenStale;
+                if (args.output == null) return error.MissingOutputValue;
+            }
+        },
+        .changeset => switch (args.changeset_command) {
+            .seal => {
+                if (args.claim_id == null) return error.ClaimMissing;
+                if (args.session_id == null) return error.SessionUnbound;
+                if (args.fencing_token == null) return error.FencingTokenStale;
+                if (args.worktree_path == null) return error.MissingValue;
+            },
+            .show, .reject => if (args.id == null) return error.MissingIdValue,
+            .supersede => {
+                if (args.id == null) return error.MissingIdValue;
+                if (args.to_ref == null) return error.MissingValue;
+            },
+            .none => return error.MissingCommand,
+        },
+        .integrate => switch (args.integrate_command) {
+            .enqueue, .apply, .reject => if (args.id == null) return error.MissingIdValue,
+            .preview => {},
+            .status, .recover => {},
+            .none => return error.MissingCommand,
         },
         .intake => {
             if ((args.intake_command == .plan or args.intake_command == .scaffold) and args.source == null) return error.MissingValue;
@@ -3266,6 +4005,76 @@ fn parseProofCommand(raw: []const u8) ?ProofCommand {
     if (std.mem.eql(u8, raw, "audit")) return .audit;
     if (std.mem.eql(u8, raw, "plan")) return .plan;
     if (std.mem.eql(u8, raw, "record")) return .record;
+    return null;
+}
+
+fn parseClaimCommand(raw: []const u8) ?ClaimCommand {
+    if (std.mem.eql(u8, raw, "grant")) return .grant;
+    if (std.mem.eql(u8, raw, "heartbeat")) return .heartbeat;
+    if (std.mem.eql(u8, raw, "show")) return .show;
+    if (std.mem.eql(u8, raw, "list")) return .list;
+    if (std.mem.eql(u8, raw, "release")) return .release;
+    if (std.mem.eql(u8, raw, "reclaim-stale")) return .reclaim_stale;
+    if (std.mem.eql(u8, raw, "conflicts")) return .conflicts;
+    if (std.mem.eql(u8, raw, "amend")) return .amend;
+    return null;
+}
+
+fn parseWorkspaceCommand(raw: []const u8) ?WorkspaceCommand {
+    if (std.mem.eql(u8, raw, "aperture")) return .aperture;
+    if (std.mem.eql(u8, raw, "audit")) return .audit;
+    if (std.mem.eql(u8, raw, "doctor")) return .doctor;
+    if (std.mem.eql(u8, raw, "export")) return .@"export";
+    if (std.mem.eql(u8, raw, "init")) return .init;
+    if (std.mem.eql(u8, raw, "import")) return .import;
+    if (std.mem.eql(u8, raw, "migrate")) return .migrate;
+    if (std.mem.eql(u8, raw, "recover")) return .recover;
+    if (std.mem.eql(u8, raw, "status")) return .status;
+    return null;
+}
+
+fn parsePlanCommand(raw: []const u8) ?PlanCommand {
+    if (std.mem.eql(u8, raw, "create")) return .create;
+    if (std.mem.eql(u8, raw, "list")) return .list;
+    if (std.mem.eql(u8, raw, "show")) return .show;
+    if (std.mem.eql(u8, raw, "pause")) return .pause;
+    if (std.mem.eql(u8, raw, "resume")) return .@"resume";
+    if (std.mem.eql(u8, raw, "complete")) return .complete;
+    if (std.mem.eql(u8, raw, "archive")) return .archive;
+    if (std.mem.eql(u8, raw, "link")) return .link;
+    if (std.mem.eql(u8, raw, "unlink")) return .unlink;
+    return null;
+}
+
+fn parseSessionCommand(raw: []const u8) ?SessionCommand {
+    if (std.mem.eql(u8, raw, "bind")) return .bind;
+    if (std.mem.eql(u8, raw, "show")) return .show;
+    if (std.mem.eql(u8, raw, "switch-plan")) return .switch_plan;
+    if (std.mem.eql(u8, raw, "release")) return .release;
+    if (std.mem.eql(u8, raw, "list")) return .list;
+    return null;
+}
+
+fn parseWorktreeCommand(raw: []const u8) ?WorktreeCommand {
+    if (std.mem.eql(u8, raw, "create")) return .create;
+    return null;
+}
+
+fn parseChangesetCommand(raw: []const u8) ?ChangesetCommand {
+    if (std.mem.eql(u8, raw, "seal")) return .seal;
+    if (std.mem.eql(u8, raw, "show")) return .show;
+    if (std.mem.eql(u8, raw, "reject")) return .reject;
+    if (std.mem.eql(u8, raw, "supersede")) return .supersede;
+    return null;
+}
+
+fn parseIntegrateCommand(raw: []const u8) ?IntegrateCommand {
+    if (std.mem.eql(u8, raw, "enqueue")) return .enqueue;
+    if (std.mem.eql(u8, raw, "status")) return .status;
+    if (std.mem.eql(u8, raw, "preview")) return .preview;
+    if (std.mem.eql(u8, raw, "apply")) return .apply;
+    if (std.mem.eql(u8, raw, "reject")) return .reject;
+    if (std.mem.eql(u8, raw, "recover")) return .recover;
     return null;
 }
 
@@ -3350,6 +4159,7 @@ fn isMutatingCommand(command: Command) bool {
         .release,
         .reclaim_stale,
         .import_mesh_results,
+        .session,
         => true,
         else => false,
     };
@@ -3616,49 +4426,4352 @@ fn collectSelectionClosure(
 }
 
 fn runCommand(allocator: std.mem.Allocator, args: Args) !u8 {
-    return switch (args.command) {
-        .init => try cmdInit(allocator, args),
-        .add => try cmdAdd(allocator, args),
-        .select => try cmdSelect(allocator, args),
-        .deselect => try cmdDeselect(allocator, args),
-        .set_status => try cmdSetStatus(allocator, args),
-        .set_priority => try cmdSetPriority(allocator, args),
-        .set_deps => try cmdSetDeps(allocator, args),
-        .set_notes => try cmdSetNotes(allocator, args),
-        .add_comment => try cmdAddComment(allocator, args),
-        .remove => try cmdRemove(allocator, args),
-        .show => try cmdShow(allocator, args),
-        .ready => try cmdReady(allocator, args),
-        .blocked => try cmdBlocked(allocator, args),
-        .capabilities => try cmdCapabilities(allocator, args),
-        .claim => try cmdClaim(allocator, args),
-        .complete => try cmdComplete(allocator, args),
-        .doctor => try cmdDoctor(allocator, args),
-        .prime => try cmdPrime(allocator, args),
-        .proof => try cmdProof(allocator, args),
-        .assert_projection => try cmdAssertProjection(allocator, args),
-        .guard_session_start => try cmdGuardSessionStart(allocator, args),
-        .guard_pre_tool_use => try cmdGuardPreToolUse(allocator, args),
-        .heartbeat => try cmdHeartbeat(allocator, args),
-        .reconcile_codex => try cmdReconcileCodex(allocator, args),
-        .@"export" => try cmdExport(allocator, args),
-        .import_plan => try cmdImportPlan(allocator, args),
-        .import_orchplan => try cmdImportOrchplan(allocator, args),
-        .import_proposed_plan => try cmdImportProposedPlan(allocator, args),
-        .set_runtime => try cmdSetRuntime(allocator, args),
-        .set_proof => try cmdSetProof(allocator, args),
-        .release => try cmdRelease(allocator, args),
-        .reclaim_stale => try cmdReclaimStale(allocator, args),
-        .import_mesh_results => try cmdImportMeshResults(allocator, args),
-        .intake => try cmdIntake(allocator, args),
-        .graph => try cmdGraph(allocator, args),
-        .aperture => try cmdAperture(allocator, args),
-        .compile => try cmdCompile(allocator, args),
+    var resolved_args = args;
+    var resolved_workspace_plan_file: ?[]u8 = null;
+    defer if (resolved_workspace_plan_file) |path| allocator.free(path);
+    try resolveWorkspacePlanArgsInPlace(allocator, &resolved_args, &resolved_workspace_plan_file);
+
+    return switch (resolved_args.command) {
+        .init => try cmdInit(allocator, resolved_args),
+        .add => try cmdAdd(allocator, resolved_args),
+        .select => try cmdSelect(allocator, resolved_args),
+        .deselect => try cmdDeselect(allocator, resolved_args),
+        .set_status => try cmdSetStatus(allocator, resolved_args),
+        .set_priority => try cmdSetPriority(allocator, resolved_args),
+        .set_deps => try cmdSetDeps(allocator, resolved_args),
+        .set_notes => try cmdSetNotes(allocator, resolved_args),
+        .add_comment => try cmdAddComment(allocator, resolved_args),
+        .remove => try cmdRemove(allocator, resolved_args),
+        .show => try cmdShow(allocator, resolved_args),
+        .ready => try cmdReady(allocator, resolved_args),
+        .blocked => try cmdBlocked(allocator, resolved_args),
+        .capabilities => try cmdCapabilities(allocator, resolved_args),
+        .claim => try cmdClaim(allocator, resolved_args),
+        .complete => try cmdComplete(allocator, resolved_args),
+        .doctor => try cmdDoctor(allocator, resolved_args),
+        .prime => try cmdPrime(allocator, resolved_args),
+        .proof => try cmdProof(allocator, resolved_args),
+        .assert_projection => try cmdAssertProjection(allocator, resolved_args),
+        .guard_session_start => try cmdGuardSessionStart(allocator, resolved_args),
+        .guard_pre_tool_use => try cmdGuardPreToolUse(allocator, resolved_args),
+        .heartbeat => try cmdHeartbeat(allocator, resolved_args),
+        .reconcile_codex => try cmdReconcileCodex(allocator, resolved_args),
+        .@"export" => try cmdExport(allocator, resolved_args),
+        .import_plan => try cmdImportPlan(allocator, resolved_args),
+        .import_orchplan => try cmdImportOrchplan(allocator, resolved_args),
+        .import_proposed_plan => try cmdImportProposedPlan(allocator, resolved_args),
+        .set_runtime => try cmdSetRuntime(allocator, resolved_args),
+        .set_proof => try cmdSetProof(allocator, resolved_args),
+        .release => try cmdRelease(allocator, resolved_args),
+        .reclaim_stale => try cmdReclaimStale(allocator, resolved_args),
+        .import_mesh_results => try cmdImportMeshResults(allocator, resolved_args),
+        .intake => try cmdIntake(allocator, resolved_args),
+        .graph => try cmdGraph(allocator, resolved_args),
+        .aperture => try cmdAperture(allocator, resolved_args),
+        .compile => try cmdCompile(allocator, resolved_args),
+        .workspace => try cmdWorkspace(allocator, resolved_args),
+        .plan => try cmdPlan(allocator, resolved_args),
+        .session => try cmdSession(allocator, resolved_args),
+        .worktree => try cmdWorktree(allocator, resolved_args),
+        .changeset => try cmdChangeset(allocator, resolved_args),
+        .integrate => try cmdIntegrate(allocator, resolved_args),
     };
 }
 
 pub fn runPerfArgs(allocator: std.mem.Allocator, args: Args) !u8 {
     return runCommand(allocator, args);
+}
+
+fn commandUsesWorkspacePlanFile(command: Command) bool {
+    return switch (command) {
+        .init,
+        .workspace,
+        .plan,
+        .session,
+        .worktree,
+        .changeset,
+        .integrate,
+        .capabilities,
+        => false,
+        else => true,
+    };
+}
+
+fn applyWorkspaceEnvDefaults(args: *Args) void {
+    if (args.file_explicit) return;
+    if (!args.workspace_explicit) {
+        if (envTrimmed("ST_WORKSPACE")) |workspace| {
+            args.workspace = workspace;
+            args.workspace_from_env = true;
+        }
+    }
+    if (args.plan_id == null) {
+        if (envTrimmed("ST_PLAN")) |plan_id| {
+            args.plan_id = plan_id;
+            args.plan_from_env = true;
+        }
+    }
+}
+
+fn workspaceModeRequested(args: Args) bool {
+    return args.workspace_explicit or args.workspace_from_env or args.plan_id != null;
+}
+
+fn resolveWorkspacePlanArgsInPlace(allocator: std.mem.Allocator, args: *Args, owned_file_out: *?[]u8) !void {
+    if (args.workspace_plan_resolved) return;
+    if (args.command == .claim and (args.claim_command != .grant or workspaceModeRequested(args.*))) return;
+    if (!commandUsesWorkspacePlanFile(args.command)) return;
+    if (args.file_explicit) {
+        if (workspaceModeRequested(args.*)) return error.InvalidPlanScope;
+        return;
+    }
+
+    const raw_plan_id = args.plan_id orelse blk: {
+        if (!workspaceModeRequested(args.*)) return;
+        break :blk try inferSingleActiveWorkspacePlanId(allocator, args.workspace);
+    };
+    defer if (args.plan_id == null) allocator.free(raw_plan_id);
+    const plan_file = try resolveWorkspacePlanFile(allocator, args.workspace, raw_plan_id);
+    errdefer allocator.free(plan_file);
+    args.file = plan_file;
+    args.workspace_plan_resolved = true;
+    owned_file_out.* = plan_file;
+}
+
+fn inferSingleActiveWorkspacePlanId(allocator: std.mem.Allocator, raw_workspace: []const u8) ![]u8 {
+    const workspace_root = try normalizeWorkspacePath(allocator, raw_workspace);
+    defer allocator.free(workspace_root);
+    const workspace_file = try std.fs.path.join(allocator, &.{ workspace_root, "workspace.jsonl" });
+    defer allocator.free(workspace_file);
+    if (!fileExists(workspace_file)) return error.WorkspaceMissing;
+
+    const checkpoint_line = try readLastJsonlLine(allocator, workspace_file);
+    defer allocator.free(checkpoint_line);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, checkpoint_line, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.WorkspaceInvalid;
+    const plans_value = parsed.value.object.get("plans") orelse return error.WorkspaceInvalid;
+    if (plans_value != .array) return error.WorkspaceInvalid;
+
+    var active_plan_id: ?[]const u8 = null;
+    var active_count: usize = 0;
+    for (plans_value.array.items) |entry| {
+        if (entry != .object) return error.WorkspaceInvalid;
+        const state = stringField(entry, "state") orelse return error.WorkspaceInvalid;
+        if (!std.mem.eql(u8, state, "active")) continue;
+        active_count += 1;
+        if (active_count > 1) return error.PlanAmbiguous;
+        active_plan_id = stringField(entry, "plan_id") orelse return error.WorkspaceInvalid;
+    }
+    const plan_id = active_plan_id orelse return error.PlanMissing;
+    return allocator.dupe(u8, plan_id);
+}
+
+fn resolveWorkspacePlanFile(allocator: std.mem.Allocator, raw_workspace: []const u8, raw_plan_id: []const u8) ![]u8 {
+    const workspace_root = try normalizeWorkspacePath(allocator, raw_workspace);
+    defer allocator.free(workspace_root);
+    const plan_id = try normalizePlanId(allocator, raw_plan_id);
+    defer allocator.free(plan_id);
+    const workspace_file = try std.fs.path.join(allocator, &.{ workspace_root, "workspace.jsonl" });
+    defer allocator.free(workspace_file);
+    if (!fileExists(workspace_file)) return error.WorkspaceMissing;
+
+    const checkpoint_line = try readLastJsonlLine(allocator, workspace_file);
+    defer allocator.free(checkpoint_line);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, checkpoint_line, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.WorkspaceInvalid;
+    const plans_value = parsed.value.object.get("plans") orelse return error.WorkspaceInvalid;
+    if (plans_value != .array) return error.WorkspaceInvalid;
+
+    const expected_graph_ref = try workspacePlanGraphRefAlloc(allocator, plan_id);
+    defer allocator.free(expected_graph_ref);
+    for (plans_value.array.items) |entry| {
+        if (entry != .object) return error.WorkspaceInvalid;
+        const entry_plan_id = stringField(entry, "plan_id") orelse return error.WorkspaceInvalid;
+        if (!std.mem.eql(u8, entry_plan_id, plan_id)) continue;
+        const state = stringField(entry, "state") orelse return error.WorkspaceInvalid;
+        if (!std.mem.eql(u8, state, "active")) return error.PlanInactive;
+        const graph_ref = stringField(entry, "graph_ref") orelse return error.WorkspaceInvalid;
+        if (!std.mem.eql(u8, graph_ref, expected_graph_ref)) return error.WorkspaceInvalid;
+        const plan_file = try std.fs.path.join(allocator, &.{ workspace_root, graph_ref });
+        errdefer allocator.free(plan_file);
+        if (!fileExists(plan_file)) return error.PlanMissing;
+        return plan_file;
+    }
+    return error.PlanMissing;
+}
+
+const WorkspaceLayoutDirs = [_][]const u8{
+    "plans",
+    "proof",
+    "runtime/sessions",
+    "runtime/views",
+    "worktrees",
+    "changesets",
+    "integration/receipts",
+    "integration/scratch",
+    "transactions",
+    "locks",
+    "migration",
+};
+
+fn cmdWorkspace(allocator: std.mem.Allocator, args: Args) !u8 {
+    return switch (args.workspace_command) {
+        .aperture => try cmdWorkspaceAperture(allocator, args),
+        .audit => try cmdWorkspaceAudit(allocator, args),
+        .doctor => try cmdWorkspaceDoctor(allocator, args),
+        .@"export" => try cmdWorkspaceExport(allocator, args),
+        .init => try cmdWorkspaceInit(allocator, args),
+        .import => try cmdWorkspaceImport(allocator, args),
+        .migrate => try cmdWorkspaceMigrate(allocator, args),
+        .recover => try cmdWorkspaceRecover(allocator, args),
+        .status => try cmdWorkspaceStatus(allocator, args),
+        .none => error.MissingCommand,
+    };
+}
+
+fn cmdWorkspaceInit(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace_root = try normalizeWorkspacePath(allocator, args.workspace);
+    defer allocator.free(workspace_root);
+    const workspace_file = try std.fs.path.join(allocator, &.{ workspace_root, "workspace.jsonl" });
+    defer allocator.free(workspace_file);
+
+    try durable_store.ensureDirectoryPathNoSymlinks(workspace_root);
+    for (WorkspaceLayoutDirs) |dir| {
+        const path = try std.fs.path.join(allocator, &.{ workspace_root, dir });
+        defer allocator.free(path);
+        try durable_store.ensureDirectoryPathNoSymlinks(path);
+    }
+
+    const now = try nowUtcAlloc(allocator);
+    const workspace_json = try jsonStringAlloc(allocator, workspace_root);
+    defer allocator.free(workspace_json);
+    const now_json = try jsonStringAlloc(allocator, now);
+    defer allocator.free(now_json);
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"lane\":\"checkpoint\",\"schema\":\"STW-v1\",\"workspace_sequence\":1,\"artifact_root\":\".ledger\",\"st_root\":{s},\"created_at\":{s},\"updated_at\":{s},\"target_branch\":null,\"target_head\":null,\"branch_epoch\":0,\"plans\":[],\"cross_plan_edges\":[],\"claims\":[],\"fencing_counter\":0,\"policy\":{{\"fail_closed\":true,\"workspace_v1\":true}}}}\n",
+        .{ workspace_json, now_json, now_json },
+    );
+    defer allocator.free(payload);
+
+    const workspace_exists = fileExists(workspace_file);
+    if (!args.replace and workspace_exists) return error.PathAlreadyExists;
+    const expected_sequence: i64 = if (workspace_exists) blk: {
+        const checkpoint_line = try readLastJsonlLine(allocator, workspace_file);
+        defer allocator.free(checkpoint_line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, checkpoint_line, .{});
+        defer parsed.deinit();
+        break :blk intField(parsed.value, "workspace_sequence") orelse return error.WorkspaceInvalid;
+    } else 0;
+    var receipt = try publishWorkspaceCheckpointTransaction(
+        allocator,
+        workspace_root,
+        workspace_file,
+        payload,
+        expected_sequence,
+        if (args.replace) "workspace-init-replace" else "workspace-init",
+        if (args.replace) .replace else .append,
+        args.replace,
+    );
+    defer receipt.deinit(allocator);
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    if (args.format == .json) {
+        try stdout.writeAll("{\"workspace_init\":{\"ok\":true,\"schema\":\"STW-v1\",\"workspace\":");
+        try std.json.Stringify.value(workspace_root, .{}, stdout);
+        try stdout.writeAll(",\"workspace_sequence\":1}}\n");
+    } else {
+        try stdout.print("initialized workspace {s}\n", .{workspace_root});
+    }
+    return 0;
+}
+
+fn cmdWorkspaceStatus(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace_root = try normalizeWorkspacePath(allocator, args.workspace);
+    defer allocator.free(workspace_root);
+    const workspace_file = try std.fs.path.join(allocator, &.{ workspace_root, "workspace.jsonl" });
+    defer allocator.free(workspace_file);
+
+    const exists = fileExists(workspace_file);
+    var schema: []const u8 = "";
+    var schema_owned: ?[]u8 = null;
+    defer if (schema_owned) |owned| allocator.free(owned);
+    var sequence: i64 = 0;
+    if (exists) {
+        const data = try durable_store.readRegularFileNoSymlink(allocator, workspace_file, 1024 * 1024);
+        defer allocator.free(data);
+        var lines = std.mem.splitScalar(u8, data, '\n');
+        while (lines.next()) |line_raw| {
+            const line = std.mem.trim(u8, line_raw, " \t\r\n");
+            if (line.len == 0) continue;
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.WorkspaceInvalid;
+            const object = parsed.value.object;
+            if (object.get("schema")) |value| {
+                if (value == .string) {
+                    if (schema_owned) |owned| allocator.free(owned);
+                    schema_owned = try allocator.dupe(u8, value.string);
+                    schema = schema_owned.?;
+                }
+            }
+            if (object.get("workspace_sequence")) |value| {
+                if (value == .integer) sequence = value.integer;
+            }
+        }
+    }
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    if (args.format == .json) {
+        try stdout.writeAll("{\"workspace_status\":{\"exists\":");
+        try stdout.writeAll(if (exists) "true" else "false");
+        try stdout.writeAll(",\"workspace\":");
+        try std.json.Stringify.value(workspace_root, .{}, stdout);
+        try stdout.writeAll(",\"workspace_file\":");
+        try std.json.Stringify.value(workspace_file, .{}, stdout);
+        try stdout.writeAll(",\"schema\":");
+        try std.json.Stringify.value(schema, .{}, stdout);
+        try stdout.writeAll(",\"workspace_sequence\":");
+        try stdout.print("{d}", .{sequence});
+        try stdout.writeAll("}}\n");
+    } else if (exists) {
+        try stdout.print("workspace {s}: {s} seq {d}\n", .{ workspace_root, schema, sequence });
+    } else {
+        try stdout.print("workspace missing: {s}\n", .{workspace_root});
+    }
+    return if (exists) 0 else 2;
+}
+
+fn cmdWorkspaceAudit(allocator: std.mem.Allocator, args: Args) !u8 {
+    const audit = try workspaceAuditSummary(allocator, args.workspace);
+    const workspace = try loadWorkspaceCheckpoint(allocator, args.workspace);
+    defer workspace.deinit();
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"workspace_audit\":{\"ok\":");
+    try stdout.writeAll(if (audit.missing_plan_files == 0) "true" else "false");
+    try stdout.writeAll(",\"workspace_sequence\":");
+    try stdout.print("{d}", .{workspaceSequence(workspace.parsed.value)});
+    try stdout.writeAll(",\"plans\":");
+    try stdout.print("{d}", .{audit.plan_count});
+    try stdout.writeAll(",\"missing_plan_files\":");
+    try stdout.print("{d}", .{audit.missing_plan_files});
+    try stdout.writeAll("}}\n");
+    return if (audit.missing_plan_files == 0) 0 else 2;
+}
+
+fn cmdWorkspaceDoctor(allocator: std.mem.Allocator, args: Args) !u8 {
+    const audit = try workspaceAuditSummary(allocator, args.workspace);
+    const prepared = try countWorkspacePreparedTransactions(allocator, args.workspace);
+    const ok = audit.missing_plan_files == 0 and prepared == 0;
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"workspace_doctor\":{\"ok\":");
+    try stdout.writeAll(if (ok) "true" else "false");
+    try stdout.writeAll(",\"plans\":");
+    try stdout.print("{d}", .{audit.plan_count});
+    try stdout.writeAll(",\"missing_plan_files\":");
+    try stdout.print("{d}", .{audit.missing_plan_files});
+    try stdout.writeAll(",\"prepared_transactions\":");
+    try stdout.print("{d}", .{prepared});
+    try stdout.writeAll(",\"recovery_required\":");
+    try stdout.writeAll(if (prepared == 0) "false" else "true");
+    try stdout.writeAll("}}\n");
+    return if (ok) 0 else 2;
+}
+
+const WorkspaceAuditSummary = struct {
+    plan_count: usize,
+    missing_plan_files: usize,
+};
+
+fn workspaceAuditSummary(allocator: std.mem.Allocator, raw_workspace: []const u8) !WorkspaceAuditSummary {
+    const workspace = try loadWorkspaceCheckpoint(allocator, raw_workspace);
+    defer workspace.deinit();
+    const workspace_obj = switch (workspace.parsed.value) {
+        .object => |obj| obj,
+        else => return error.WorkspaceInvalid,
+    };
+    const plans_value = workspace_obj.get("plans") orelse return error.WorkspaceInvalid;
+    if (plans_value != .array) return error.WorkspaceInvalid;
+    var missing: usize = 0;
+    for (plans_value.array.items) |entry| {
+        if (entry != .object) return error.WorkspaceInvalid;
+        const graph_ref = stringField(entry, "graph_ref") orelse return error.WorkspaceInvalid;
+        const plan_path = try std.fs.path.join(allocator, &.{ workspace.root, graph_ref });
+        defer allocator.free(plan_path);
+        if (!fileExists(plan_path)) missing += 1;
+    }
+    return .{
+        .plan_count = plans_value.array.items.len,
+        .missing_plan_files = missing,
+    };
+}
+
+fn cmdWorkspaceRecover(allocator: std.mem.Allocator, args: Args) !u8 {
+    const prepared = try countWorkspacePreparedTransactions(allocator, args.workspace);
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"workspace_recover\":{\"ok\":");
+    try stdout.writeAll(if (prepared == 0) "true" else "false");
+    try stdout.writeAll(",\"prepared_transactions\":");
+    try stdout.print("{d}", .{prepared});
+    try stdout.writeAll(",\"action\":\"inspect-only\"}}\n");
+    return if (prepared == 0) 0 else 2;
+}
+
+fn countWorkspacePreparedTransactions(allocator: std.mem.Allocator, raw_workspace: []const u8) !usize {
+    const workspace_root = try normalizeWorkspacePath(allocator, raw_workspace);
+    defer allocator.free(workspace_root);
+    const transactions_dir = try workspaceTransactionsDirAlloc(allocator, workspace_root);
+    defer allocator.free(transactions_dir);
+    var dir = std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), transactions_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        else => return err,
+    };
+    defer dir.close(std.Io.Threaded.global_single_threaded.io());
+    var count: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".prepared.json")) continue;
+        const prefix = entry.name[0 .. entry.name.len - ".prepared.json".len];
+        const commit_name = try std.fmt.allocPrint(allocator, "{s}.commit.json", .{prefix});
+        defer allocator.free(commit_name);
+        const commit_path = try std.fs.path.join(allocator, &.{ transactions_dir, commit_name });
+        defer allocator.free(commit_path);
+        if (!fileExists(commit_path)) count += 1;
+    }
+    return count;
+}
+
+fn cmdWorkspaceExport(allocator: std.mem.Allocator, args: Args) !u8 {
+    const output_path = args.output orelse return error.MissingOutputValue;
+    const workspace = try loadWorkspaceCheckpoint(allocator, args.workspace);
+    defer workspace.deinit();
+    const workspace_obj = switch (workspace.parsed.value) {
+        .object => |obj| obj,
+        else => return error.WorkspaceInvalid,
+    };
+    const plans_value = workspace_obj.get("plans") orelse return error.WorkspaceInvalid;
+    if (plans_value != .array) return error.WorkspaceInvalid;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"receipt_version\":\"STW-EXPORT-v1\",\"workspace\":");
+    try std.json.Stringify.value(workspace.parsed.value, .{}, writer);
+    try writer.writeAll(",\"plans\":[");
+    for (plans_value.array.items, 0..) |entry, idx| {
+        if (entry != .object) return error.WorkspaceInvalid;
+        if (idx != 0) try writer.writeByte(',');
+        const plan_id = stringField(entry, "plan_id") orelse return error.WorkspaceInvalid;
+        const graph_ref = stringField(entry, "graph_ref") orelse return error.WorkspaceInvalid;
+        const plan_path = try std.fs.path.join(allocator, &.{ workspace.root, graph_ref });
+        defer allocator.free(plan_path);
+        const content = try durable_store.readRegularFileNoSymlink(allocator, plan_path, 64 * 1024 * 1024);
+        defer allocator.free(content);
+        try writer.writeAll("{\"plan_id\":");
+        try std.json.Stringify.value(plan_id, .{}, writer);
+        try writer.writeAll(",\"graph_ref\":");
+        try std.json.Stringify.value(graph_ref, .{}, writer);
+        try writer.writeAll(",\"content\":");
+        try std.json.Stringify.value(content, .{}, writer);
+        try writer.writeByte('}');
+    }
+    try writer.writeAll("]}\n");
+    const payload = try out.toOwnedSlice();
+    try writeTextAtomic(allocator, output_path, payload);
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"workspace_export\":{\"ok\":true,\"output\":");
+    try std.json.Stringify.value(output_path, .{}, stdout);
+    try stdout.writeAll("}}\n");
+    return 0;
+}
+
+fn cmdWorkspaceImport(allocator: std.mem.Allocator, args: Args) !u8 {
+    const input_path = args.input orelse return error.MissingInputValue;
+    const workspace_root = try normalizeWorkspacePath(allocator, args.workspace);
+    defer allocator.free(workspace_root);
+    const workspace_file = try std.fs.path.join(allocator, &.{ workspace_root, "workspace.jsonl" });
+    defer allocator.free(workspace_file);
+    if (fileExists(workspace_file) and !args.replace) return error.PathAlreadyExists;
+    const bytes = try durable_store.readRegularFileNoSymlink(allocator, input_path, 64 * 1024 * 1024);
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    if (!std.mem.eql(u8, stringField(parsed.value, "receipt_version") orelse "", "STW-EXPORT-v1")) return error.WorkspaceInvalid;
+    const workspace_value = parsed.value.object.get("workspace") orelse return error.WorkspaceInvalid;
+    const plans_value = parsed.value.object.get("plans") orelse return error.WorkspaceInvalid;
+    if (workspace_value != .object or plans_value != .array) return error.WorkspaceInvalid;
+    try durable_store.ensureDirectoryPathNoSymlinks(workspace_root);
+    for (WorkspaceLayoutDirs) |dir| {
+        const path = try std.fs.path.join(allocator, &.{ workspace_root, dir });
+        defer allocator.free(path);
+        try durable_store.ensureDirectoryPathNoSymlinks(path);
+    }
+    for (plans_value.array.items) |entry| {
+        if (entry != .object) return error.WorkspaceInvalid;
+        const graph_ref = stringField(entry, "graph_ref") orelse return error.WorkspaceInvalid;
+        const content = stringField(entry, "content") orelse return error.WorkspaceInvalid;
+        const plan_path = try std.fs.path.join(allocator, &.{ workspace_root, graph_ref });
+        defer allocator.free(plan_path);
+        const plan_dir = std.fs.path.dirname(plan_path) orelse return error.WorkspaceInvalid;
+        try durable_store.ensureDirectoryPathNoSymlinks(plan_dir);
+        try writeTextAtomic(allocator, plan_path, content);
+    }
+    var workspace_out: std.Io.Writer.Allocating = .init(allocator);
+    defer workspace_out.deinit();
+    try std.json.Stringify.value(workspace_value, .{}, &workspace_out.writer);
+    try workspace_out.writer.writeByte('\n');
+    const workspace_payload = try workspace_out.toOwnedSlice();
+    try writeTextAtomic(allocator, workspace_file, workspace_payload);
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"workspace_import\":{\"ok\":true,\"workspace\":");
+    try std.json.Stringify.value(workspace_root, .{}, stdout);
+    try stdout.writeAll(",\"plans\":");
+    try stdout.print("{d}", .{plans_value.array.items.len});
+    try stdout.writeAll("}}\n");
+    return 0;
+}
+
+fn cmdWorkspaceMigrate(allocator: std.mem.Allocator, args: Args) !u8 {
+    if (args.file_explicit) return error.InvalidWorkspaceArg;
+
+    const from_path = args.from_ref orelse return error.MissingValue;
+    const to_path = args.to_ref orelse args.workspace;
+    const plan_id_raw = args.plan_id orelse return error.MissingValue;
+    const plan_id = try normalizePlanId(allocator, plan_id_raw);
+    defer allocator.free(plan_id);
+
+    const workspace_root = try normalizeWorkspacePath(allocator, to_path);
+    defer allocator.free(workspace_root);
+    const workspace_file = try std.fs.path.join(allocator, &.{ workspace_root, "workspace.jsonl" });
+    defer allocator.free(workspace_file);
+    const graph_ref = try workspacePlanGraphRefAlloc(allocator, plan_id);
+    defer allocator.free(graph_ref);
+    const plan_dir = try std.fs.path.join(allocator, &.{ workspace_root, "plans", plan_id });
+    defer allocator.free(plan_dir);
+    const plan_file = try std.fs.path.join(allocator, &.{ plan_dir, "plan.jsonl" });
+    defer allocator.free(plan_file);
+
+    if (!fileExists(from_path)) return error.FileNotFound;
+
+    const legacy_loaded = try loadValidatedState(allocator, from_path, true);
+    var legacy_state = legacy_loaded.state;
+    defer legacy_state.deinit();
+
+    const legacy_bytes = try durable_store.readRegularFileNoSymlink(allocator, from_path, 64 * 1024 * 1024);
+    defer allocator.free(legacy_bytes);
+    const migrated_plan = try renderMigratedPlanJsonl(allocator, legacy_bytes, plan_id);
+    defer allocator.free(migrated_plan);
+
+    const migrated_records = try parseRecordsFromBytes(allocator, migrated_plan);
+    var migrated_state = try materializeStateFromRecords(allocator, migrated_records.records);
+    defer migrated_state.deinit();
+    try validateState(&migrated_state, true);
+    try assertMigrationParity(allocator, &legacy_state, &migrated_state, legacy_loaded.latest_seq, migrated_records.latest_seq);
+
+    const now = try nowUtcAlloc(allocator);
+    defer allocator.free(now);
+    const source_digest = try hashTextSha256Alloc(allocator, legacy_bytes);
+    defer allocator.free(source_digest);
+    const migrated_digest = try hashTextSha256Alloc(allocator, migrated_plan);
+    defer allocator.free(migrated_digest);
+
+    const workspace_exists = fileExists(workspace_file);
+    if (workspace_exists) {
+        const checkpoint_line = try readLastJsonlLine(allocator, workspace_file);
+        defer allocator.free(checkpoint_line);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, checkpoint_line, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.WorkspaceInvalid;
+        if (!workspaceHasPlanRecord(parsed.value.object, plan_id, graph_ref)) return error.PathAlreadyExists;
+        if (!fileExists(plan_file)) return error.WorkspaceInvalid;
+        const existing_plan = try durable_store.readRegularFileNoSymlink(allocator, plan_file, 64 * 1024 * 1024);
+        defer allocator.free(existing_plan);
+        const existing_records = try parseRecordsFromBytes(allocator, existing_plan);
+        var existing_state = try materializeStateFromRecords(allocator, existing_records.records);
+        defer existing_state.deinit();
+        try validateState(&existing_state, true);
+        try assertMigrationParity(allocator, &legacy_state, &existing_state, legacy_loaded.latest_seq, existing_records.latest_seq);
+        try writeMigrationReceipt(allocator, workspace_root, plan_id, from_path, plan_file, source_digest, migrated_digest, legacy_loaded.latest_seq, workspaceSequence(parsed.value), "idempotent", now);
+        try writeWorkspaceMigrateOutput(allocator, args, workspace_root, plan_id, plan_file, workspaceSequence(parsed.value), legacy_loaded.latest_seq, "idempotent");
+        return 0;
+    }
+
+    try durable_store.ensureDirectoryPathNoSymlinks(workspace_root);
+    for (WorkspaceLayoutDirs) |dir| {
+        const path = try std.fs.path.join(allocator, &.{ workspace_root, dir });
+        defer allocator.free(path);
+        try durable_store.ensureDirectoryPathNoSymlinks(path);
+    }
+    try durable_store.ensureDirectoryPathNoSymlinks(plan_dir);
+    try durable_store.writeTextCreateNew(allocator, plan_file, migrated_plan, .{});
+    try archiveMigrationSource(allocator, workspace_root, from_path, legacy_bytes);
+
+    const workspace_payload = try renderMigratedWorkspaceCheckpoint(allocator, workspace_root, plan_id, graph_ref, legacy_loaded.latest_seq, legacy_state.graph.fingerprints, now);
+    defer allocator.free(workspace_payload);
+    var receipt = try publishWorkspaceCheckpointTransaction(
+        allocator,
+        workspace_root,
+        workspace_file,
+        workspace_payload,
+        0,
+        "workspace-migrate",
+        .append,
+        false,
+    );
+    defer receipt.deinit(allocator);
+
+    try writeMigrationReceipt(allocator, workspace_root, plan_id, from_path, plan_file, source_digest, migrated_digest, legacy_loaded.latest_seq, 1, "migrated", now);
+    try writeWorkspaceMigrateOutput(allocator, args, workspace_root, plan_id, plan_file, 1, legacy_loaded.latest_seq, "migrated");
+    return 0;
+}
+
+fn workspaceHasPlanRecord(workspace_obj: std.json.ObjectMap, plan_id: []const u8, graph_ref: []const u8) bool {
+    const plans_value = workspace_obj.get("plans") orelse return false;
+    if (plans_value != .array) return false;
+    for (plans_value.array.items) |entry| {
+        if (entry != .object) return false;
+        const entry_plan_id = stringField(entry, "plan_id") orelse return false;
+        if (!std.mem.eql(u8, entry_plan_id, plan_id)) continue;
+        const entry_graph_ref = stringField(entry, "graph_ref") orelse return false;
+        return std.mem.eql(u8, entry_graph_ref, graph_ref);
+    }
+    return false;
+}
+
+fn writeWorkspaceMigrateOutput(
+    allocator: std.mem.Allocator,
+    args: Args,
+    workspace_root: []const u8,
+    plan_id: []const u8,
+    plan_file: []const u8,
+    workspace_sequence: i64,
+    plan_sequence: i64,
+    state: []const u8,
+) !void {
+    _ = allocator;
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    if (args.format == .json) {
+        try stdout.writeAll("{\"workspace_migrate\":{\"ok\":true,\"state\":");
+        try std.json.Stringify.value(state, .{}, stdout);
+        try stdout.writeAll(",\"workspace\":");
+        try std.json.Stringify.value(workspace_root, .{}, stdout);
+        try stdout.writeAll(",\"plan_id\":");
+        try std.json.Stringify.value(plan_id, .{}, stdout);
+        try stdout.writeAll(",\"plan_file\":");
+        try std.json.Stringify.value(plan_file, .{}, stdout);
+        try stdout.writeAll(",\"workspace_sequence\":");
+        try stdout.print("{d}", .{workspace_sequence});
+        try stdout.writeAll(",\"plan_sequence\":");
+        try stdout.print("{d}", .{plan_sequence});
+        try stdout.writeAll("}}\n");
+    } else {
+        try stdout.print("workspace migration {s}: {s} -> {s} ({s})\n", .{ state, plan_id, plan_file, workspace_root });
+    }
+}
+
+fn writeMigrationReceipt(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    plan_id: []const u8,
+    source_path: []const u8,
+    plan_file: []const u8,
+    source_digest: []const u8,
+    migrated_digest: []const u8,
+    plan_sequence: i64,
+    workspace_sequence: i64,
+    state: []const u8,
+    now: []const u8,
+) !void {
+    const migration_dir = try std.fs.path.join(allocator, &.{ workspace_root, "migration" });
+    defer allocator.free(migration_dir);
+    try durable_store.ensureDirectoryPathNoSymlinks(migration_dir);
+    const receipt_path = try std.fs.path.join(allocator, &.{ migration_dir, "receipt.json" });
+    defer allocator.free(receipt_path);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"receipt_version\":\"STM-v1\",\"state\":");
+    try std.json.Stringify.value(state, .{}, writer);
+    try writer.writeAll(",\"plan_id\":");
+    try std.json.Stringify.value(plan_id, .{}, writer);
+    try writer.writeAll(",\"source_path\":");
+    try std.json.Stringify.value(source_path, .{}, writer);
+    try writer.writeAll(",\"plan_file\":");
+    try std.json.Stringify.value(plan_file, .{}, writer);
+    try writer.writeAll(",\"source_digest\":");
+    try std.json.Stringify.value(source_digest, .{}, writer);
+    try writer.writeAll(",\"migrated_digest\":");
+    try std.json.Stringify.value(migrated_digest, .{}, writer);
+    try writer.writeAll(",\"plan_sequence\":");
+    try writer.print("{d}", .{plan_sequence});
+    try writer.writeAll(",\"workspace_sequence\":");
+    try writer.print("{d}", .{workspace_sequence});
+    try writer.writeAll(",\"parity\":\"pass\",\"created_at\":");
+    try std.json.Stringify.value(now, .{}, writer);
+    try writer.writeAll("}\n");
+    const payload = try out.toOwnedSlice();
+    try writeTextAtomic(allocator, receipt_path, payload);
+}
+
+fn archiveMigrationSource(allocator: std.mem.Allocator, workspace_root: []const u8, source_path: []const u8, legacy_bytes: []const u8) !void {
+    const source_dir = try std.fs.path.join(allocator, &.{ workspace_root, "migration", "source" });
+    defer allocator.free(source_dir);
+    try durable_store.ensureDirectoryPathNoSymlinks(source_dir);
+    const base = std.fs.path.basename(source_path);
+    const safe_base = if (base.len == 0) "st-plan.jsonl" else base;
+    const archive_path = try std.fs.path.join(allocator, &.{ source_dir, safe_base });
+    defer allocator.free(archive_path);
+    if (!fileExists(archive_path)) {
+        try durable_store.writeTextCreateNew(allocator, archive_path, legacy_bytes, .{});
+    }
+}
+
+const CommandRunResult = struct {
+    exit_code: u8,
+    stdout: []u8,
+    stderr: []u8,
+
+    fn deinit(self: CommandRunResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.stdout);
+        allocator.free(self.stderr);
+    }
+};
+
+fn runCommandCapture(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    cwd: ?[]const u8,
+) !CommandRunResult {
+    const process_allocator = std.heap.page_allocator;
+    var process_io: std.Io.Threaded = .init(process_allocator, .{});
+    defer process_io.deinit();
+    const result = try std.process.run(process_allocator, process_io.io(), .{
+        .argv = argv,
+        .cwd = if (cwd) |path| .{ .path = path } else .inherit,
+        .stdout_limit = .limited(32 * 1024 * 1024),
+        .stderr_limit = .limited(32 * 1024 * 1024),
+    });
+    defer process_allocator.free(result.stdout);
+    defer process_allocator.free(result.stderr);
+    const code: u8 = switch (result.term) {
+        .exited => |c| @intCast(c),
+        else => 1,
+    };
+    return .{
+        .exit_code = code,
+        .stdout = try allocator.dupe(u8, result.stdout),
+        .stderr = try allocator.dupe(u8, result.stderr),
+    };
+}
+
+fn gitCapture(allocator: std.mem.Allocator, cwd: []const u8, args: []const []const u8) ![]u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, "git");
+    try argv.appendSlice(allocator, args);
+    const result = try runCommandCapture(allocator, argv.items, cwd);
+    defer allocator.free(result.stderr);
+    if (result.exit_code != 0) {
+        allocator.free(result.stdout);
+        return error.GitCommandFailed;
+    }
+    return result.stdout;
+}
+
+fn gitTrimmedAlloc(allocator: std.mem.Allocator, cwd: []const u8, args: []const []const u8) ![]u8 {
+    const stdout = try gitCapture(allocator, cwd, args);
+    defer allocator.free(stdout);
+    const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
+    if (trimmed.len == 0) return error.GitCommandFailed;
+    return allocator.dupe(u8, trimmed);
+}
+
+fn absolutePathForPossiblyMissingAlloc(allocator: std.mem.Allocator, raw_path: []const u8) ![]u8 {
+    const trimmed = try requireNonEmptyString(allocator, raw_path, "path");
+    defer allocator.free(trimmed);
+    if (std.mem.indexOfScalar(u8, trimmed, 0) != null) return error.InvalidPath;
+    if (std.fs.path.isAbsolute(trimmed)) return allocator.dupe(u8, trimmed);
+    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
+    defer allocator.free(cwd);
+    return std.fs.path.join(allocator, &.{ cwd, trimmed });
+}
+
+fn pathInsideOrSame(parent: []const u8, child: []const u8) bool {
+    if (std.mem.eql(u8, parent, child)) return true;
+    return child.len > parent.len and std.mem.startsWith(u8, child, parent) and child[parent.len] == '/';
+}
+
+fn changesetFilePathAlloc(allocator: std.mem.Allocator, workspace_root: []const u8, changeset_id: []const u8) ![]u8 {
+    const safe_id = try normalizeArtifactId(allocator, changeset_id, "--id");
+    defer allocator.free(safe_id);
+    const file_name = try std.fmt.allocPrint(allocator, "{s}.json", .{safe_id});
+    defer allocator.free(file_name);
+    return std.fs.path.join(allocator, &.{ workspace_root, "changesets", file_name });
+}
+
+fn changesetPatchPathAlloc(allocator: std.mem.Allocator, workspace_root: []const u8, changeset_id: []const u8) ![]u8 {
+    const safe_id = try normalizeArtifactId(allocator, changeset_id, "--id");
+    defer allocator.free(safe_id);
+    const file_name = try std.fmt.allocPrint(allocator, "{s}.patch", .{safe_id});
+    defer allocator.free(file_name);
+    return std.fs.path.join(allocator, &.{ workspace_root, "changesets", file_name });
+}
+
+fn worktreeFilePathAlloc(allocator: std.mem.Allocator, workspace_root: []const u8, claim_id: []const u8) ![]u8 {
+    const safe_id = try normalizeArtifactId(allocator, claim_id, "--claim");
+    defer allocator.free(safe_id);
+    const file_name = try std.fmt.allocPrint(allocator, "{s}.json", .{safe_id});
+    defer allocator.free(file_name);
+    return std.fs.path.join(allocator, &.{ workspace_root, "worktrees", file_name });
+}
+
+fn normalizeArtifactId(allocator: std.mem.Allocator, raw: []const u8, field: []const u8) ![]const u8 {
+    const trimmed = try requireNonEmptyString(allocator, raw, field);
+    errdefer allocator.free(trimmed);
+    if (trimmed.len > 160) return error.InvalidArtifactId;
+    for (trimmed) |c| {
+        const ok = std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.';
+        if (!ok) return error.InvalidArtifactId;
+    }
+    if (std.mem.eql(u8, trimmed, ".") or std.mem.eql(u8, trimmed, "..") or std.mem.indexOf(u8, trimmed, "..") != null) return error.InvalidArtifactId;
+    return trimmed;
+}
+
+fn cmdWorktree(allocator: std.mem.Allocator, args: Args) !u8 {
+    return switch (args.worktree_command) {
+        .create => try cmdWorktreeCreate(allocator, args),
+        .none => error.MissingCommand,
+    };
+}
+
+fn cmdWorktreeCreate(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace = try loadWorkspaceCheckpoint(allocator, args.workspace);
+    defer workspace.deinit();
+    const workspace_obj = switch (workspace.parsed.value) {
+        .object => |obj| obj,
+        else => return error.WorkspaceInvalid,
+    };
+    const claim_id = try requireNonEmptyString(allocator, args.claim_id orelse return error.ClaimMissing, "--claim");
+    defer allocator.free(claim_id);
+    const session_id = try requireNonEmptyString(allocator, args.session_id orelse return error.SessionUnbound, "--session");
+    defer allocator.free(session_id);
+    const token = try parseFencingTokenArg(args.fencing_token orelse return error.FencingTokenStale);
+    const now = try nowUtcAlloc(allocator);
+    _ = try validateWorkspaceClaimAuthority(workspace_obj, claim_id, session_id, token, now);
+
+    const source_repo_raw = args.source orelse ".";
+    const repo_root = try gitTrimmedAlloc(allocator, source_repo_raw, &.{ "rev-parse", "--show-toplevel" });
+    defer allocator.free(repo_root);
+    const repo_common_dir = try gitTrimmedAlloc(allocator, repo_root, &.{ "rev-parse", "--path-format=absolute", "--git-common-dir" });
+    defer allocator.free(repo_common_dir);
+    const target_head = if (stringField(workspace.parsed.value, "target_head")) |head|
+        try allocator.dupe(u8, head)
+    else
+        try gitTrimmedAlloc(allocator, repo_root, &.{ "rev-parse", "HEAD" });
+    defer allocator.free(target_head);
+
+    const worktree_path = try absolutePathForPossiblyMissingAlloc(allocator, args.output orelse return error.MissingOutputValue);
+    defer allocator.free(worktree_path);
+    if (pathInsideOrSame(repo_root, worktree_path)) return error.NestedPrimaryCheckoutWorktree;
+
+    var add_result = try runCommandCapture(allocator, &.{ "git", "-C", repo_root, "worktree", "add", "--detach", worktree_path, target_head }, null);
+    defer add_result.deinit(allocator);
+    if (add_result.exit_code != 0) return error.GitCommandFailed;
+
+    const worktree_common_dir = try gitTrimmedAlloc(allocator, worktree_path, &.{ "rev-parse", "--path-format=absolute", "--git-common-dir" });
+    defer allocator.free(worktree_common_dir);
+    if (!std.mem.eql(u8, repo_common_dir, worktree_common_dir)) return error.GitCommonDirMismatch;
+
+    const metadata_path = try worktreeFilePathAlloc(allocator, workspace.root, claim_id);
+    defer allocator.free(metadata_path);
+    const now_json = try jsonStringAlloc(allocator, now);
+    defer allocator.free(now_json);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"receipt_version\":\"WT-v1\",\"state\":\"active\",\"claim_id\":");
+    try std.json.Stringify.value(claim_id, .{}, writer);
+    try writer.writeAll(",\"session_id\":");
+    try std.json.Stringify.value(session_id, .{}, writer);
+    try writer.writeAll(",\"fencing_token\":");
+    try writer.print("{d}", .{token});
+    try writer.writeAll(",\"workspace_sequence\":");
+    try writer.print("{d}", .{workspaceSequence(workspace.parsed.value)});
+    try writer.writeAll(",\"branch_epoch\":");
+    try writer.print("{d}", .{intField(workspace.parsed.value, "branch_epoch") orelse 0});
+    try writer.writeAll(",\"repo_root\":");
+    try std.json.Stringify.value(repo_root, .{}, writer);
+    try writer.writeAll(",\"worktree_path\":");
+    try std.json.Stringify.value(worktree_path, .{}, writer);
+    try writer.writeAll(",\"git_common_dir\":");
+    try std.json.Stringify.value(repo_common_dir, .{}, writer);
+    try writer.writeAll(",\"target_head\":");
+    try std.json.Stringify.value(target_head, .{}, writer);
+    try writer.writeAll(",\"created_at\":");
+    try writer.writeAll(now_json);
+    try writer.writeAll("}\n");
+    const payload = try out.toOwnedSlice();
+    try writeTextAtomic(allocator, metadata_path, payload);
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"worktree_create\":{\"receipt_version\":\"WT-v1\",\"claim_id\":");
+    try std.json.Stringify.value(claim_id, .{}, stdout);
+    try stdout.writeAll(",\"worktree_path\":");
+    try std.json.Stringify.value(worktree_path, .{}, stdout);
+    try stdout.writeAll(",\"target_head\":");
+    try std.json.Stringify.value(target_head, .{}, stdout);
+    try stdout.writeAll("}}\n");
+    return 0;
+}
+
+fn cmdChangeset(allocator: std.mem.Allocator, args: Args) !u8 {
+    return switch (args.changeset_command) {
+        .seal => try cmdChangesetSeal(allocator, args),
+        .show => try cmdChangesetShow(allocator, args),
+        .reject => try cmdChangesetReject(allocator, args),
+        .supersede => try cmdChangesetSupersede(allocator, args),
+        .none => error.MissingCommand,
+    };
+}
+
+fn cmdIntegrate(allocator: std.mem.Allocator, args: Args) !u8 {
+    return switch (args.integrate_command) {
+        .enqueue => try cmdIntegrateEnqueue(allocator, args),
+        .status => try cmdIntegrateStatus(allocator, args),
+        .preview => try cmdIntegratePreview(allocator, args),
+        .apply => try cmdIntegrateApply(allocator, args),
+        .reject => try cmdIntegrateReject(allocator, args),
+        .recover => try cmdIntegrateRecover(allocator, args),
+        .none => error.MissingCommand,
+    };
+}
+
+fn cmdChangesetSeal(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace = try loadWorkspaceCheckpoint(allocator, args.workspace);
+    defer workspace.deinit();
+    const workspace_obj = switch (workspace.parsed.value) {
+        .object => |obj| obj,
+        else => return error.WorkspaceInvalid,
+    };
+    const claim_id = try requireNonEmptyString(allocator, args.claim_id orelse return error.ClaimMissing, "--claim");
+    defer allocator.free(claim_id);
+    const session_id = try requireNonEmptyString(allocator, args.session_id orelse return error.SessionUnbound, "--session");
+    defer allocator.free(session_id);
+    const token = try parseFencingTokenArg(args.fencing_token orelse return error.FencingTokenStale);
+    const now = try nowUtcAlloc(allocator);
+    const claim = try validateWorkspaceClaimAuthority(workspace_obj, claim_id, session_id, token, now);
+    const worktree_path = try absolutePathForPossiblyMissingAlloc(allocator, args.worktree_path orelse return error.MissingValue);
+    defer allocator.free(worktree_path);
+    try validateWorktreeMetadataForClaim(allocator, workspace.root, claim_id, worktree_path);
+
+    const changed_paths = try deriveGitChangedPaths(allocator, worktree_path);
+    defer freeStringList(allocator, changed_paths);
+    if (changed_paths.len == 0) return error.ChangeSetStale;
+    try ensureChangedPathsWithinClaim(claim, changed_paths);
+
+    const patch = try gitCapture(allocator, worktree_path, &.{ "diff", "--binary", "HEAD", "--" });
+    defer allocator.free(patch);
+    const patch_digest = try hashTextSha256Alloc(allocator, patch);
+    defer allocator.free(patch_digest);
+    const head = try gitTrimmedAlloc(allocator, worktree_path, &.{ "rev-parse", "HEAD" });
+    defer allocator.free(head);
+    const tree_digest = try hashChangesetTreeDigest(allocator, head, patch, changed_paths);
+    defer allocator.free(tree_digest);
+    const changeset_id = if (args.id) |raw|
+        try normalizeArtifactId(allocator, raw, "--id")
+    else
+        try std.fmt.allocPrint(allocator, "cs-{s}-{s}", .{ claim_id, patch_digest["sha256:".len .. "sha256:".len + 12] });
+    defer allocator.free(changeset_id);
+    if (args.from_ref) |old_id| try ensureChangesetMutable(allocator, workspace.root, old_id);
+
+    const changeset_path = try changesetFilePathAlloc(allocator, workspace.root, changeset_id);
+    defer allocator.free(changeset_path);
+    if (fileExists(changeset_path)) return error.PathAlreadyExists;
+    const patch_path = try changesetPatchPathAlloc(allocator, workspace.root, changeset_id);
+    defer allocator.free(patch_path);
+    try writeTextAtomic(allocator, patch_path, patch);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeChangesetReceiptJson(&out.writer, .{
+        .changeset_id = changeset_id,
+        .state = "sealed",
+        .claim_id = claim_id,
+        .session_id = session_id,
+        .fencing_token = token,
+        .workspace_sequence = workspaceSequence(workspace.parsed.value),
+        .branch_epoch = intField(workspace.parsed.value, "branch_epoch") orelse 0,
+        .worktree_path = worktree_path,
+        .base_head = head,
+        .changed_paths = changed_paths,
+        .patch_path = patch_path,
+        .patch_digest = patch_digest,
+        .tree_digest = tree_digest,
+        .created_at = now,
+        .supersedes = args.from_ref orelse "",
+    });
+    const payload = try out.toOwnedSlice();
+    try writeTextAtomic(allocator, changeset_path, payload);
+    if (args.from_ref) |old_id| try writeChangesetState(allocator, workspace.root, old_id, "superseded", changeset_id, now);
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"changeset_seal\":{\"receipt_version\":\"CS-v1\",\"changeset_id\":");
+    try std.json.Stringify.value(changeset_id, .{}, stdout);
+    try stdout.writeAll(",\"claim_id\":");
+    try std.json.Stringify.value(claim_id, .{}, stdout);
+    try stdout.writeAll(",\"changed_paths\":");
+    try writeJsonStringArray(stdout, changed_paths);
+    try stdout.writeAll(",\"patch_digest\":");
+    try std.json.Stringify.value(patch_digest, .{}, stdout);
+    try stdout.writeAll(",\"tree_digest\":");
+    try std.json.Stringify.value(tree_digest, .{}, stdout);
+    try stdout.writeAll("}}\n");
+    return 0;
+}
+
+fn cmdChangesetShow(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace_root = try normalizeWorkspacePath(allocator, args.workspace);
+    defer allocator.free(workspace_root);
+    const changeset_id = try requireNonEmptyString(allocator, args.id orelse return error.MissingIdValue, "--id");
+    defer allocator.free(changeset_id);
+    const path = try changesetFilePathAlloc(allocator, workspace_root, changeset_id);
+    defer allocator.free(path);
+    if (!fileExists(path)) return error.ChangeSetStale;
+    const data = try durable_store.readRegularFileNoSymlink(allocator, path, 16 * 1024 * 1024);
+    defer allocator.free(data);
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    try stdout_writer.interface.writeAll(data);
+    return 0;
+}
+
+fn cmdChangesetReject(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace_root = try normalizeWorkspacePath(allocator, args.workspace);
+    defer allocator.free(workspace_root);
+    const id = try requireNonEmptyString(allocator, args.id orelse return error.MissingIdValue, "--id");
+    defer allocator.free(id);
+    const path = try changesetFilePathAlloc(allocator, workspace_root, id);
+    defer allocator.free(path);
+    const data = try durable_store.readRegularFileNoSymlink(allocator, path, 16 * 1024 * 1024);
+    defer allocator.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const claim_id = stringField(parsed.value, "claim_id") orelse return error.WorkspaceInvalid;
+    const worktree_path = stringField(parsed.value, "worktree_path") orelse "";
+    const now = try nowUtcAlloc(allocator);
+    try writeChangesetState(allocator, workspace_root, id, "rejected", "", now);
+    if (worktree_path.len > 0) try markWorktreeRecoveryIfDirty(allocator, workspace_root, claim_id, worktree_path, now);
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"changeset_reject\":{\"ok\":true,\"changeset_id\":");
+    try std.json.Stringify.value(id, .{}, stdout);
+    try stdout.writeAll("}}\n");
+    return 0;
+}
+
+fn cmdChangesetSupersede(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace_root = try normalizeWorkspacePath(allocator, args.workspace);
+    defer allocator.free(workspace_root);
+    const old_id = try requireNonEmptyString(allocator, args.id orelse return error.MissingIdValue, "--id");
+    defer allocator.free(old_id);
+    const new_id = try requireNonEmptyString(allocator, args.to_ref orelse return error.MissingValue, "--to");
+    defer allocator.free(new_id);
+    const new_path = try changesetFilePathAlloc(allocator, workspace_root, new_id);
+    defer allocator.free(new_path);
+    if (!fileExists(new_path)) return error.ChangeSetStale;
+    const now = try nowUtcAlloc(allocator);
+    try writeChangesetState(allocator, workspace_root, old_id, "superseded", new_id, now);
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"changeset_supersede\":{\"ok\":true,\"old_changeset_id\":");
+    try std.json.Stringify.value(old_id, .{}, stdout);
+    try stdout.writeAll(",\"new_changeset_id\":");
+    try std.json.Stringify.value(new_id, .{}, stdout);
+    try stdout.writeAll("}}\n");
+    return 0;
+}
+
+fn integrationQueuePathAlloc(allocator: std.mem.Allocator, workspace_root: []const u8) ![]u8 {
+    return std.fs.path.join(allocator, &.{ workspace_root, "integration", "queue.jsonl" });
+}
+
+fn integrationReceiptPathAlloc(allocator: std.mem.Allocator, workspace_root: []const u8, changeset_id: []const u8) ![]u8 {
+    const safe_id = try normalizeArtifactId(allocator, changeset_id, "--id");
+    defer allocator.free(safe_id);
+    const file_name = try std.fmt.allocPrint(allocator, "{s}.json", .{safe_id});
+    defer allocator.free(file_name);
+    return std.fs.path.join(allocator, &.{ workspace_root, "integration", "receipts", file_name });
+}
+
+fn integrationConflictPathAlloc(allocator: std.mem.Allocator, workspace_root: []const u8, changeset_id: []const u8) ![]u8 {
+    const safe_id = try normalizeArtifactId(allocator, changeset_id, "--id");
+    defer allocator.free(safe_id);
+    const file_name = try std.fmt.allocPrint(allocator, "{s}-conflict.txt", .{safe_id});
+    defer allocator.free(file_name);
+    return std.fs.path.join(allocator, &.{ workspace_root, "integration", "scratch", file_name });
+}
+
+fn integrationScratchWorktreePathAlloc(allocator: std.mem.Allocator, repo_root: []const u8, changeset_id: []const u8) ![]u8 {
+    const safe_id = try normalizeArtifactId(allocator, changeset_id, "--id");
+    defer allocator.free(safe_id);
+    const parent = std.fs.path.dirname(repo_root) orelse return error.InvalidPath;
+    const dir_name = try std.fmt.allocPrint(allocator, ".st-integration-{s}", .{safe_id});
+    defer allocator.free(dir_name);
+    return std.fs.path.join(allocator, &.{ parent, dir_name });
+}
+
+fn nextIntegrationQueueSequence(allocator: std.mem.Allocator, queue_path: []const u8) !i64 {
+    if (!fileExists(queue_path)) return 1;
+    const data = try durable_store.readRegularFileNoSymlink(allocator, queue_path, 16 * 1024 * 1024);
+    defer allocator.free(data);
+    var max_sequence: i64 = 0;
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len == 0) continue;
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        max_sequence = @max(max_sequence, intField(parsed.value, "enqueue_sequence") orelse 0);
+    }
+    return max_sequence + 1;
+}
+
+fn appendIntegrationQueueEvent(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    changeset_id: []const u8,
+    state: []const u8,
+    now: []const u8,
+    conflict_artifact: []const u8,
+) !i64 {
+    const queue_path = try integrationQueuePathAlloc(allocator, workspace_root);
+    defer allocator.free(queue_path);
+    const sequence = try nextIntegrationQueueSequence(allocator, queue_path);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"receipt_version\":\"IQE-v1\",\"enqueue_sequence\":");
+    try writer.print("{d}", .{sequence});
+    try writer.writeAll(",\"changeset_id\":");
+    try std.json.Stringify.value(changeset_id, .{}, writer);
+    try writer.writeAll(",\"state\":");
+    try std.json.Stringify.value(state, .{}, writer);
+    try writer.writeAll(",\"created_at\":");
+    try std.json.Stringify.value(now, .{}, writer);
+    try writer.writeAll(",\"updated_at\":");
+    try std.json.Stringify.value(now, .{}, writer);
+    if (conflict_artifact.len > 0) {
+        try writer.writeAll(",\"conflict_artifact\":");
+        try std.json.Stringify.value(conflict_artifact, .{}, writer);
+    }
+    try writer.writeAll("}\n");
+    const payload = try out.toOwnedSlice();
+    defer allocator.free(payload);
+    if (fileExists(queue_path)) {
+        try appendTextFile(allocator, queue_path, payload);
+    } else {
+        try writeTextAtomic(allocator, queue_path, payload);
+    }
+    return sequence;
+}
+
+fn appendTextFile(allocator: std.mem.Allocator, path: []const u8, text: []const u8) !void {
+    const previous = if (fileExists(path)) try durable_store.readRegularFileNoSymlink(allocator, path, 16 * 1024 * 1024) else try allocator.dupe(u8, "");
+    defer allocator.free(previous);
+    const payload = try std.fmt.allocPrint(allocator, "{s}{s}", .{ previous, text });
+    defer allocator.free(payload);
+    try writeTextAtomic(allocator, path, payload);
+}
+
+fn loadChangesetJson(allocator: std.mem.Allocator, workspace_root: []const u8, changeset_id: []const u8) !std.json.Parsed(std.json.Value) {
+    const path = try changesetFilePathAlloc(allocator, workspace_root, changeset_id);
+    defer allocator.free(path);
+    if (!fileExists(path)) return error.ChangeSetStale;
+    const data = try durable_store.readRegularFileNoSymlink(allocator, path, 16 * 1024 * 1024);
+    defer allocator.free(data);
+    return std.json.parseFromSlice(std.json.Value, allocator, data, .{});
+}
+
+fn changesetChangedPathList(allocator: std.mem.Allocator, changeset: std.json.Value) ![]const []const u8 {
+    const changed_paths = switch (changeset) {
+        .object => |obj| obj.get("changed_paths") orelse return error.WorkspaceInvalid,
+        else => return error.WorkspaceInvalid,
+    };
+    if (changed_paths != .array) return error.WorkspaceInvalid;
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer freeStringList(allocator, out.items);
+    for (changed_paths.array.items) |entry| {
+        const path = asString(entry) orelse return error.WorkspaceInvalid;
+        try out.append(allocator, try allocator.dupe(u8, path));
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn cmdIntegrateEnqueue(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace_root = try normalizeWorkspacePath(allocator, args.workspace);
+    defer allocator.free(workspace_root);
+    const changeset_id = try requireNonEmptyString(allocator, args.id orelse return error.MissingIdValue, "--id");
+    defer allocator.free(changeset_id);
+    var parsed = try loadChangesetJson(allocator, workspace_root, changeset_id);
+    defer parsed.deinit();
+    const state = stringField(parsed.value, "state") orelse return error.WorkspaceInvalid;
+    if (!std.mem.eql(u8, state, "sealed")) return error.ChangeSetStale;
+    const now = try nowUtcAlloc(allocator);
+    defer allocator.free(now);
+    const sequence = try appendIntegrationQueueEvent(allocator, workspace_root, changeset_id, "queued", now, "");
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"integrate_enqueue\":{\"receipt_version\":\"IQE-v1\",\"changeset_id\":");
+    try std.json.Stringify.value(changeset_id, .{}, stdout);
+    try stdout.writeAll(",\"enqueue_sequence\":");
+    try stdout.print("{d}", .{sequence});
+    try stdout.writeAll(",\"state\":\"queued\"}}\n");
+    return 0;
+}
+
+fn cmdIntegrateStatus(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace_root = try normalizeWorkspacePath(allocator, args.workspace);
+    defer allocator.free(workspace_root);
+    const queue_path = try integrationQueuePathAlloc(allocator, workspace_root);
+    defer allocator.free(queue_path);
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"integration_status\":{\"entries\":[");
+    if (fileExists(queue_path)) {
+        const data = try durable_store.readRegularFileNoSymlink(allocator, queue_path, 16 * 1024 * 1024);
+        defer allocator.free(data);
+        var first = true;
+        var lines = std.mem.splitScalar(u8, data, '\n');
+        while (lines.next()) |line_raw| {
+            const line = std.mem.trim(u8, line_raw, " \t\r\n");
+            if (line.len == 0) continue;
+            var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+            defer parsed.deinit();
+            if (!first) try stdout.writeByte(',');
+            try std.json.Stringify.value(parsed.value, .{}, stdout);
+            first = false;
+        }
+    }
+    try stdout.writeAll("]}}\n");
+    return 0;
+}
+
+fn cmdIntegratePreview(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace_root = try normalizeWorkspacePath(allocator, args.workspace);
+    defer allocator.free(workspace_root);
+    const changeset_id = if (args.id) |id| try requireNonEmptyString(allocator, id, "--id") else try nextQueuedChangesetIdAlloc(allocator, workspace_root);
+    defer allocator.free(changeset_id);
+    var parsed = try loadChangesetJson(allocator, workspace_root, changeset_id);
+    defer parsed.deinit();
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"integration_preview\":{\"changeset\":");
+    try std.json.Stringify.value(parsed.value, .{}, stdout);
+    try stdout.writeAll("}}\n");
+    return 0;
+}
+
+fn nextQueuedChangesetIdAlloc(allocator: std.mem.Allocator, workspace_root: []const u8) ![]u8 {
+    const queue_path = try integrationQueuePathAlloc(allocator, workspace_root);
+    defer allocator.free(queue_path);
+    if (!fileExists(queue_path)) return error.ChangeSetStale;
+    const data = try durable_store.readRegularFileNoSymlink(allocator, queue_path, 16 * 1024 * 1024);
+    defer allocator.free(data);
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len == 0) continue;
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        if (!std.mem.eql(u8, stringField(parsed.value, "state") orelse "", "queued")) continue;
+        const id = stringField(parsed.value, "changeset_id") orelse return error.WorkspaceInvalid;
+        return allocator.dupe(u8, id);
+    }
+    return error.ChangeSetStale;
+}
+
+fn cmdIntegrateReject(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace_root = try normalizeWorkspacePath(allocator, args.workspace);
+    defer allocator.free(workspace_root);
+    const changeset_id = try requireNonEmptyString(allocator, args.id orelse return error.MissingIdValue, "--id");
+    defer allocator.free(changeset_id);
+    const now = try nowUtcAlloc(allocator);
+    defer allocator.free(now);
+    _ = try appendIntegrationQueueEvent(allocator, workspace_root, changeset_id, "rejected", now, "");
+    try writeIntegrationReceipt(allocator, workspace_root, .{
+        .changeset_id = changeset_id,
+        .state = "rejected",
+        .target_branch = "",
+        .expected_head = "",
+        .new_head = "",
+        .branch_epoch_before = 0,
+        .branch_epoch_after = 0,
+        .changed_paths = &.{},
+        .proof_status = "not_run",
+        .conflict_artifact = "",
+        .created_at = now,
+    });
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"integrate_reject\":{\"ok\":true,\"changeset_id\":");
+    try std.json.Stringify.value(changeset_id, .{}, stdout);
+    try stdout.writeAll("}}\n");
+    return 0;
+}
+
+fn cmdIntegrateRecover(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace_root = try normalizeWorkspacePath(allocator, args.workspace);
+    defer allocator.free(workspace_root);
+    const scratch_dir = try std.fs.path.join(allocator, &.{ workspace_root, "integration", "scratch" });
+    defer allocator.free(scratch_dir);
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"integration_recover\":{\"artifacts\":[");
+    var emitted = false;
+    var dir = std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), scratch_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => {
+            try stdout.writeAll("]}}\n");
+            return 0;
+        },
+        else => return err,
+    };
+    defer dir.close(std.Io.Threaded.global_single_threaded.io());
+    var it = dir.iterate();
+    while (try it.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
+        if (emitted) try stdout.writeByte(',');
+        try std.json.Stringify.value(entry.name, .{}, stdout);
+        emitted = true;
+    }
+    try stdout.writeAll("]}}\n");
+    return 0;
+}
+
+const IntegrationReceipt = struct {
+    changeset_id: []const u8,
+    state: []const u8,
+    target_branch: []const u8,
+    expected_head: []const u8,
+    new_head: []const u8,
+    branch_epoch_before: i64,
+    branch_epoch_after: i64,
+    changed_paths: []const []const u8,
+    proof_status: []const u8,
+    conflict_artifact: []const u8,
+    created_at: []const u8,
+};
+
+fn writeIntegrationReceipt(allocator: std.mem.Allocator, workspace_root: []const u8, receipt: IntegrationReceipt) !void {
+    const receipt_path = try integrationReceiptPathAlloc(allocator, workspace_root, receipt.changeset_id);
+    defer allocator.free(receipt_path);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"receipt_version\":\"IGR-v1\",\"changeset_id\":");
+    try std.json.Stringify.value(receipt.changeset_id, .{}, writer);
+    try writer.writeAll(",\"state\":");
+    try std.json.Stringify.value(receipt.state, .{}, writer);
+    try writer.writeAll(",\"target_branch\":");
+    try std.json.Stringify.value(receipt.target_branch, .{}, writer);
+    try writer.writeAll(",\"expected_head\":");
+    try std.json.Stringify.value(receipt.expected_head, .{}, writer);
+    try writer.writeAll(",\"new_head\":");
+    try std.json.Stringify.value(receipt.new_head, .{}, writer);
+    try writer.writeAll(",\"branch_epoch_before\":");
+    try writer.print("{d}", .{receipt.branch_epoch_before});
+    try writer.writeAll(",\"branch_epoch_after\":");
+    try writer.print("{d}", .{receipt.branch_epoch_after});
+    try writer.writeAll(",\"changed_paths\":");
+    try writeJsonStringArray(writer, receipt.changed_paths);
+    try writer.writeAll(",\"proof_status\":");
+    try std.json.Stringify.value(receipt.proof_status, .{}, writer);
+    if (receipt.conflict_artifact.len > 0) {
+        try writer.writeAll(",\"conflict_artifact\":");
+        try std.json.Stringify.value(receipt.conflict_artifact, .{}, writer);
+    }
+    try writer.writeAll(",\"created_at\":");
+    try std.json.Stringify.value(receipt.created_at, .{}, writer);
+    try writer.writeAll("}\n");
+    const payload = try out.toOwnedSlice();
+    try writeTextAtomic(allocator, receipt_path, payload);
+}
+
+fn appendProofInvalidationEvents(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    workspace_value: std.json.Value,
+    changeset_id: []const u8,
+    changed_paths: []const []const u8,
+    branch_epoch_before: i64,
+    branch_epoch_after: i64,
+    tree_digest: []const u8,
+    now: []const u8,
+) !void {
+    const workspace_obj = switch (workspace_value) {
+        .object => |obj| obj,
+        else => return error.WorkspaceInvalid,
+    };
+    const plans_value = workspace_obj.get("plans") orelse return error.WorkspaceInvalid;
+    if (plans_value != .array) return error.WorkspaceInvalid;
+    for (plans_value.array.items) |plan_record| {
+        if (plan_record != .object) return error.WorkspaceInvalid;
+        const plan_id = stringField(plan_record, "plan_id") orelse return error.WorkspaceInvalid;
+        const plan_proof_dir = try std.fs.path.join(allocator, &.{ workspace_root, "proof", plan_id });
+        defer allocator.free(plan_proof_dir);
+        try durable_store.ensureDirectoryPathNoSymlinks(plan_proof_dir);
+        const invalidation_path = try std.fs.path.join(allocator, &.{ plan_proof_dir, "invalidations.jsonl" });
+        defer allocator.free(invalidation_path);
+
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        const writer = &out.writer;
+        try writer.writeAll("{\"receipt_version\":\"PINV-v1\",\"changeset_id\":");
+        try std.json.Stringify.value(changeset_id, .{}, writer);
+        try writer.writeAll(",\"plan_id\":");
+        try std.json.Stringify.value(plan_id, .{}, writer);
+        try writer.writeAll(",\"branch_epoch_before\":");
+        try writer.print("{d}", .{branch_epoch_before});
+        try writer.writeAll(",\"branch_epoch_after\":");
+        try writer.print("{d}", .{branch_epoch_after});
+        try writer.writeAll(",\"tree_digest\":");
+        try std.json.Stringify.value(tree_digest, .{}, writer);
+        try writer.writeAll(",\"changed_paths\":");
+        try writeJsonStringArray(writer, changed_paths);
+        try writer.writeAll(",\"changed_resources\":[");
+        for (changed_paths, 0..) |path, idx| {
+            if (idx != 0) try writer.writeByte(',');
+            const resource = try std.fmt.allocPrint(allocator, "path:{s}", .{path});
+            defer allocator.free(resource);
+            try std.json.Stringify.value(resource, .{}, writer);
+        }
+        try writer.writeAll("],\"final_proof_stale\":true,\"dependency_cut\":\"changed_resources\",\"created_at\":");
+        try std.json.Stringify.value(now, .{}, writer);
+        try writer.writeAll("}\n");
+        const payload = try out.toOwnedSlice();
+        defer allocator.free(payload);
+        if (fileExists(invalidation_path)) {
+            try appendTextFile(allocator, invalidation_path, payload);
+        } else {
+            try writeTextAtomic(allocator, invalidation_path, payload);
+        }
+    }
+}
+
+fn cmdIntegrateApply(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace = try loadWorkspaceCheckpoint(allocator, args.workspace);
+    defer workspace.deinit();
+    if (workspace.parsed.value != .object) return error.WorkspaceInvalid;
+    const branch_epoch = intField(workspace.parsed.value, "branch_epoch") orelse 0;
+    if (args.expect_branch_epoch) |raw| {
+        if (try parseNonNegativeI64(raw) != branch_epoch) return error.BranchEpochStale;
+    }
+
+    const changeset_id = try requireNonEmptyString(allocator, args.id orelse return error.MissingIdValue, "--id");
+    defer allocator.free(changeset_id);
+    var changeset = try loadChangesetJson(allocator, workspace.root, changeset_id);
+    defer changeset.deinit();
+    const state = stringField(changeset.value, "state") orelse return error.WorkspaceInvalid;
+    if (!std.mem.eql(u8, state, "sealed")) return error.ChangeSetStale;
+    const changed_paths = try changesetChangedPathList(allocator, changeset.value);
+    defer freeStringList(allocator, changed_paths);
+
+    const repo_source = args.source orelse ".";
+    const repo_root = try gitTrimmedAlloc(allocator, repo_source, &.{ "rev-parse", "--show-toplevel" });
+    defer allocator.free(repo_root);
+    const primary_status = try gitCapture(allocator, repo_root, &.{ "status", "--porcelain=v1", "--untracked-files=no" });
+    defer allocator.free(primary_status);
+    if (std.mem.trim(u8, primary_status, " \t\r\n").len != 0) return error.IntegrationConflict;
+
+    const target_branch = if (stringField(workspace.parsed.value, "target_branch")) |branch|
+        try allocator.dupe(u8, branch)
+    else
+        try gitTrimmedAlloc(allocator, repo_root, &.{ "branch", "--show-current" });
+    defer allocator.free(target_branch);
+    const actual_head = try gitTrimmedAlloc(allocator, repo_root, &.{ "rev-parse", target_branch });
+    defer allocator.free(actual_head);
+    const expected_head = if (stringField(workspace.parsed.value, "target_head")) |head|
+        try allocator.dupe(u8, head)
+    else
+        try allocator.dupe(u8, actual_head);
+    defer allocator.free(expected_head);
+    if (!std.mem.eql(u8, actual_head, expected_head)) return error.TargetHeadStale;
+    if (!std.mem.eql(u8, stringField(changeset.value, "base_head") orelse "", expected_head)) return error.ChangeSetStale;
+
+    const patch_path = if (stringField(changeset.value, "patch_path")) |path|
+        try allocator.dupe(u8, path)
+    else
+        try changesetPatchPathAlloc(allocator, workspace.root, changeset_id);
+    defer allocator.free(patch_path);
+    const patch = try durable_store.readRegularFileNoSymlink(allocator, patch_path, 32 * 1024 * 1024);
+    defer allocator.free(patch);
+    const patch_digest = try hashTextSha256Alloc(allocator, patch);
+    defer allocator.free(patch_digest);
+    if (!std.mem.eql(u8, patch_digest, stringField(changeset.value, "patch_digest") orelse "")) return error.ChangeSetStale;
+
+    const scratch = try integrationScratchWorktreePathAlloc(allocator, repo_root, changeset_id);
+    defer allocator.free(scratch);
+    var added = try runCommandCapture(allocator, &.{ "git", "-C", repo_root, "worktree", "add", "--detach", scratch, expected_head }, null);
+    defer added.deinit(allocator);
+    if (added.exit_code != 0) return error.GitCommandFailed;
+    const cleanup_scratch = true;
+    defer if (cleanup_scratch) {
+        var cleanup = runCommandCapture(allocator, &.{ "git", "-C", repo_root, "worktree", "remove", "--force", scratch }, null) catch null;
+        if (cleanup) |*result| result.deinit(allocator);
+    };
+
+    var check = try runCommandCapture(allocator, &.{ "git", "-C", scratch, "apply", "--check", patch_path }, null);
+    defer check.deinit(allocator);
+    const now = try nowUtcAlloc(allocator);
+    defer allocator.free(now);
+    if (check.exit_code != 0) {
+        const conflict_path = try integrationConflictPathAlloc(allocator, workspace.root, changeset_id);
+        defer allocator.free(conflict_path);
+        try writeTextAtomic(allocator, conflict_path, check.stderr);
+        _ = try appendIntegrationQueueEvent(allocator, workspace.root, changeset_id, "blocked", now, conflict_path);
+        try writeIntegrationReceipt(allocator, workspace.root, .{
+            .changeset_id = changeset_id,
+            .state = "blocked",
+            .target_branch = target_branch,
+            .expected_head = expected_head,
+            .new_head = "",
+            .branch_epoch_before = branch_epoch,
+            .branch_epoch_after = branch_epoch,
+            .changed_paths = changed_paths,
+            .proof_status = "not_run",
+            .conflict_artifact = conflict_path,
+            .created_at = now,
+        });
+        return error.IntegrationConflict;
+    }
+
+    var apply = try runCommandCapture(allocator, &.{ "git", "-C", scratch, "apply", patch_path }, null);
+    defer apply.deinit(allocator);
+    if (apply.exit_code != 0) return error.IntegrationConflict;
+    var add_args: std.ArrayList([]const u8) = .empty;
+    defer add_args.deinit(allocator);
+    try add_args.appendSlice(allocator, &.{ "git", "-C", scratch, "add", "--" });
+    try add_args.appendSlice(allocator, changed_paths);
+    var add_result = try runCommandCapture(allocator, add_args.items, null);
+    defer add_result.deinit(allocator);
+    if (add_result.exit_code != 0) return error.GitCommandFailed;
+    var commit = try runCommandCapture(allocator, &.{ "git", "-C", scratch, "-c", "user.name=st", "-c", "user.email=st@example.com", "commit", "-m", "st integrate changeset" }, null);
+    defer commit.deinit(allocator);
+    if (commit.exit_code != 0) return error.GitCommandFailed;
+    const new_head = try gitTrimmedAlloc(allocator, scratch, &.{ "rev-parse", "HEAD" });
+    defer allocator.free(new_head);
+    const ref_name = try std.fmt.allocPrint(allocator, "refs/heads/{s}", .{target_branch});
+    defer allocator.free(ref_name);
+    var cas = try runCommandCapture(allocator, &.{ "git", "-C", repo_root, "update-ref", ref_name, new_head, expected_head }, null);
+    defer cas.deinit(allocator);
+    if (cas.exit_code != 0) return error.TargetHeadStale;
+    var reset = try runCommandCapture(allocator, &.{ "git", "-C", repo_root, "reset", "--hard", new_head }, null);
+    defer reset.deinit(allocator);
+    if (reset.exit_code != 0) return error.GitCommandFailed;
+
+    const workspace_payload = try renderWorkspaceCheckpointWithBranchState(allocator, workspace.root, workspace.parsed.value, target_branch, new_head, branch_epoch + 1, now);
+    defer allocator.free(workspace_payload);
+    var receipt = try appendWorkspaceCheckpointTransaction(allocator, workspace.root, workspace.file, workspace_payload, workspaceSequence(workspace.parsed.value), "integrate-apply");
+    defer receipt.deinit(allocator);
+    try writeChangesetState(allocator, workspace.root, changeset_id, "integrated", "", now);
+    _ = try appendIntegrationQueueEvent(allocator, workspace.root, changeset_id, "integrated", now, "");
+    try writeIntegrationReceipt(allocator, workspace.root, .{
+        .changeset_id = changeset_id,
+        .state = "integrated",
+        .target_branch = target_branch,
+        .expected_head = expected_head,
+        .new_head = new_head,
+        .branch_epoch_before = branch_epoch,
+        .branch_epoch_after = branch_epoch + 1,
+        .changed_paths = changed_paths,
+        .proof_status = "not_declared",
+        .conflict_artifact = "",
+        .created_at = now,
+    });
+    try appendProofInvalidationEvents(allocator, workspace.root, workspace.parsed.value, changeset_id, changed_paths, branch_epoch, branch_epoch + 1, new_head, now);
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"integrate_apply\":{\"receipt_version\":\"IGR-v1\",\"changeset_id\":");
+    try std.json.Stringify.value(changeset_id, .{}, stdout);
+    try stdout.writeAll(",\"target_branch\":");
+    try std.json.Stringify.value(target_branch, .{}, stdout);
+    try stdout.writeAll(",\"expected_head\":");
+    try std.json.Stringify.value(expected_head, .{}, stdout);
+    try stdout.writeAll(",\"new_head\":");
+    try std.json.Stringify.value(new_head, .{}, stdout);
+    try stdout.writeAll(",\"branch_epoch\":");
+    try stdout.print("{d}", .{branch_epoch + 1});
+    try stdout.writeAll("}}\n");
+    return 0;
+}
+
+fn validateWorktreeMetadataForClaim(allocator: std.mem.Allocator, workspace_root: []const u8, claim_id: []const u8, worktree_path: []const u8) !void {
+    const metadata_path = try worktreeFilePathAlloc(allocator, workspace_root, claim_id);
+    defer allocator.free(metadata_path);
+    if (!fileExists(metadata_path)) return error.WorktreeMissing;
+    const bytes = try durable_store.readRegularFileNoSymlink(allocator, metadata_path, 1024 * 1024);
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.WorkspaceInvalid;
+    const recorded_path = stringField(parsed.value, "worktree_path") orelse return error.WorkspaceInvalid;
+    if (!std.mem.eql(u8, recorded_path, worktree_path)) return error.WorktreeMismatch;
+    const recorded_common = stringField(parsed.value, "git_common_dir") orelse return error.WorkspaceInvalid;
+    const current_common = try gitTrimmedAlloc(allocator, worktree_path, &.{ "rev-parse", "--path-format=absolute", "--git-common-dir" });
+    defer allocator.free(current_common);
+    if (!std.mem.eql(u8, recorded_common, current_common)) return error.GitCommonDirMismatch;
+}
+
+fn markWorktreeRecoveryIfDirty(allocator: std.mem.Allocator, workspace_root: []const u8, claim_id: []const u8, worktree_path: []const u8, now: []const u8) !void {
+    const status_or_null: ?[]u8 = gitCapture(allocator, worktree_path, &.{ "status", "--porcelain=v1" }) catch null;
+    const status = status_or_null orelse return;
+    defer allocator.free(status);
+    if (std.mem.trim(u8, status, " \t\r\n").len == 0) return;
+
+    const metadata_path = try worktreeFilePathAlloc(allocator, workspace_root, claim_id);
+    defer allocator.free(metadata_path);
+    if (!fileExists(metadata_path)) return error.WorktreeMissing;
+    const bytes = try durable_store.readRegularFileNoSymlink(allocator, metadata_path, 1024 * 1024);
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.WorkspaceInvalid;
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"receipt_version\":\"WT-v1\",\"state\":\"recovery\",\"claim_id\":");
+    try std.json.Stringify.value(stringField(parsed.value, "claim_id") orelse claim_id, .{}, writer);
+    try writer.writeAll(",\"session_id\":");
+    try std.json.Stringify.value(stringField(parsed.value, "session_id") orelse "", .{}, writer);
+    try writer.writeAll(",\"fencing_token\":");
+    try writer.print("{d}", .{intField(parsed.value, "fencing_token") orelse 0});
+    try writer.writeAll(",\"workspace_sequence\":");
+    try writer.print("{d}", .{intField(parsed.value, "workspace_sequence") orelse 0});
+    try writer.writeAll(",\"branch_epoch\":");
+    try writer.print("{d}", .{intField(parsed.value, "branch_epoch") orelse 0});
+    try writer.writeAll(",\"repo_root\":");
+    try std.json.Stringify.value(stringField(parsed.value, "repo_root") orelse "", .{}, writer);
+    try writer.writeAll(",\"worktree_path\":");
+    try std.json.Stringify.value(stringField(parsed.value, "worktree_path") orelse worktree_path, .{}, writer);
+    try writer.writeAll(",\"git_common_dir\":");
+    try std.json.Stringify.value(stringField(parsed.value, "git_common_dir") orelse "", .{}, writer);
+    try writer.writeAll(",\"target_head\":");
+    try std.json.Stringify.value(stringField(parsed.value, "target_head") orelse "", .{}, writer);
+    try writer.writeAll(",\"created_at\":");
+    try std.json.Stringify.value(stringField(parsed.value, "created_at") orelse now, .{}, writer);
+    try writer.writeAll(",\"recovery_reason\":\"dirty_abandoned_worktree\",\"recovery_at\":");
+    try std.json.Stringify.value(now, .{}, writer);
+    try writer.writeAll("}\n");
+    const payload = try out.toOwnedSlice();
+    try writeTextAtomic(allocator, metadata_path, payload);
+}
+
+fn deriveGitChangedPaths(allocator: std.mem.Allocator, worktree_path: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer freeStringList(allocator, out.items);
+    const diff = try gitCapture(allocator, worktree_path, &.{ "diff", "--name-only", "HEAD", "--" });
+    defer allocator.free(diff);
+    try appendGitPathLines(allocator, &out, diff);
+    const untracked = try gitCapture(allocator, worktree_path, &.{ "ls-files", "--others", "--exclude-standard" });
+    defer allocator.free(untracked);
+    try appendGitPathLines(allocator, &out, untracked);
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendGitPathLines(allocator: std.mem.Allocator, out: *std.ArrayList([]const u8), data: []const u8) !void {
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len == 0) continue;
+        const normalized = try normalizeResourcePath(allocator, line);
+        errdefer allocator.free(normalized);
+        for (out.items) |existing| {
+            if (std.mem.eql(u8, existing, normalized)) {
+                allocator.free(normalized);
+                break;
+            }
+        } else {
+            try out.append(allocator, normalized);
+        }
+    }
+}
+
+fn freeStringList(allocator: std.mem.Allocator, items: []const []const u8) void {
+    for (items) |item| allocator.free(item);
+    allocator.free(items);
+}
+
+fn ensureChangedPathsWithinClaim(claim: std.json.Value, changed_paths: []const []const u8) !void {
+    if (claim != .object) return error.WorkspaceInvalid;
+    const resources = claim.object.get("resources") orelse return error.ChangeSetOutsideClaim;
+    if (resources != .array) return error.WorkspaceInvalid;
+    for (changed_paths) |path| {
+        var authorized = false;
+        for (resources.array.items) |entry| {
+            const resource = try workspaceResourceFromJson(entry);
+            if (resourceAuthorizesChangedPath(resource, path)) {
+                authorized = true;
+                break;
+            }
+        }
+        if (!authorized) return error.ChangeSetOutsideClaim;
+    }
+}
+
+fn resourceAuthorizesChangedPath(resource: WorkspaceResource, changed_path: []const u8) bool {
+    if (resource.mode == .read) return false;
+    return switch (resource.kind) {
+        .repo_all => true,
+        .path, .symbol => std.mem.eql(u8, resource.primary, changed_path) or pathIsAncestor(resource.primary, changed_path),
+        else => false,
+    };
+}
+
+fn hashChangesetTreeDigest(allocator: std.mem.Allocator, head: []const u8, patch: []const u8, paths: []const []const u8) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll(head);
+    try out.writer.writeByte('\n');
+    for (paths) |path| {
+        try out.writer.writeAll(path);
+        try out.writer.writeByte('\n');
+    }
+    try out.writer.writeAll(patch);
+    const payload = try out.toOwnedSlice();
+    defer allocator.free(payload);
+    return hashTextSha256Alloc(allocator, payload);
+}
+
+const ChangesetReceipt = struct {
+    changeset_id: []const u8,
+    state: []const u8,
+    claim_id: []const u8,
+    session_id: []const u8,
+    fencing_token: u64,
+    workspace_sequence: i64,
+    branch_epoch: i64,
+    worktree_path: []const u8,
+    base_head: []const u8,
+    changed_paths: []const []const u8,
+    patch_path: []const u8 = "",
+    patch_digest: []const u8,
+    tree_digest: []const u8,
+    created_at: []const u8,
+    supersedes: []const u8 = "",
+    superseded_by: []const u8 = "",
+    rejected_at: []const u8 = "",
+};
+
+fn writeChangesetReceiptJson(writer: anytype, receipt: ChangesetReceipt) !void {
+    try writer.writeAll("{\"receipt_version\":\"CS-v1\",\"changeset_id\":");
+    try std.json.Stringify.value(receipt.changeset_id, .{}, writer);
+    try writer.writeAll(",\"state\":");
+    try std.json.Stringify.value(receipt.state, .{}, writer);
+    try writer.writeAll(",\"claim_id\":");
+    try std.json.Stringify.value(receipt.claim_id, .{}, writer);
+    try writer.writeAll(",\"session_id\":");
+    try std.json.Stringify.value(receipt.session_id, .{}, writer);
+    try writer.writeAll(",\"fencing_token\":");
+    try writer.print("{d}", .{receipt.fencing_token});
+    try writer.writeAll(",\"workspace_sequence\":");
+    try writer.print("{d}", .{receipt.workspace_sequence});
+    try writer.writeAll(",\"branch_epoch\":");
+    try writer.print("{d}", .{receipt.branch_epoch});
+    try writer.writeAll(",\"worktree_path\":");
+    try std.json.Stringify.value(receipt.worktree_path, .{}, writer);
+    try writer.writeAll(",\"base_head\":");
+    try std.json.Stringify.value(receipt.base_head, .{}, writer);
+    try writer.writeAll(",\"changed_paths\":");
+    try writeJsonStringArray(writer, receipt.changed_paths);
+    if (receipt.patch_path.len > 0) {
+        try writer.writeAll(",\"patch_path\":");
+        try std.json.Stringify.value(receipt.patch_path, .{}, writer);
+    }
+    try writer.writeAll(",\"patch_digest\":");
+    try std.json.Stringify.value(receipt.patch_digest, .{}, writer);
+    try writer.writeAll(",\"tree_digest\":");
+    try std.json.Stringify.value(receipt.tree_digest, .{}, writer);
+    try writer.writeAll(",\"created_at\":");
+    try std.json.Stringify.value(receipt.created_at, .{}, writer);
+    if (receipt.supersedes.len > 0) {
+        try writer.writeAll(",\"supersedes\":");
+        try std.json.Stringify.value(receipt.supersedes, .{}, writer);
+    }
+    if (receipt.superseded_by.len > 0) {
+        try writer.writeAll(",\"superseded_by\":");
+        try std.json.Stringify.value(receipt.superseded_by, .{}, writer);
+    }
+    if (receipt.rejected_at.len > 0) {
+        try writer.writeAll(",\"rejected_at\":");
+        try std.json.Stringify.value(receipt.rejected_at, .{}, writer);
+    }
+    try writer.writeAll("}\n");
+}
+
+fn writeJsonStringArray(writer: anytype, values: []const []const u8) !void {
+    try writer.writeByte('[');
+    for (values, 0..) |value, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try std.json.Stringify.value(value, .{}, writer);
+    }
+    try writer.writeByte(']');
+}
+
+fn ensureChangesetMutable(allocator: std.mem.Allocator, workspace_root: []const u8, id: []const u8) !void {
+    const path = try changesetFilePathAlloc(allocator, workspace_root, id);
+    defer allocator.free(path);
+    if (!fileExists(path)) return error.ChangeSetStale;
+    const data = try durable_store.readRegularFileNoSymlink(allocator, path, 16 * 1024 * 1024);
+    defer allocator.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    const state = stringField(parsed.value, "state") orelse return error.WorkspaceInvalid;
+    if (std.mem.eql(u8, state, "integrated") or std.mem.eql(u8, state, "rejected")) return error.ChangeSetStale;
+}
+
+fn writeChangesetState(allocator: std.mem.Allocator, workspace_root: []const u8, id: []const u8, state: []const u8, superseded_by: []const u8, now: []const u8) !void {
+    const path = try changesetFilePathAlloc(allocator, workspace_root, id);
+    defer allocator.free(path);
+    if (!fileExists(path)) return error.ChangeSetStale;
+    const data = try durable_store.readRegularFileNoSymlink(allocator, path, 16 * 1024 * 1024);
+    defer allocator.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.WorkspaceInvalid;
+    const old_state = stringField(parsed.value, "state") orelse return error.WorkspaceInvalid;
+    if (std.mem.eql(u8, old_state, "integrated") or std.mem.eql(u8, old_state, "rejected")) return error.ChangeSetStale;
+    const changed_paths = parsed.value.object.get("changed_paths") orelse return error.WorkspaceInvalid;
+    if (changed_paths != .array) return error.WorkspaceInvalid;
+    var path_list: std.ArrayList([]const u8) = .empty;
+    defer path_list.deinit(allocator);
+    for (changed_paths.array.items) |entry| {
+        const path_text = asString(entry) orelse return error.WorkspaceInvalid;
+        try path_list.append(allocator, path_text);
+    }
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeChangesetReceiptJson(&out.writer, .{
+        .changeset_id = stringField(parsed.value, "changeset_id") orelse return error.WorkspaceInvalid,
+        .state = state,
+        .claim_id = stringField(parsed.value, "claim_id") orelse return error.WorkspaceInvalid,
+        .session_id = stringField(parsed.value, "session_id") orelse return error.WorkspaceInvalid,
+        .fencing_token = @intCast(intField(parsed.value, "fencing_token") orelse return error.WorkspaceInvalid),
+        .workspace_sequence = intField(parsed.value, "workspace_sequence") orelse 0,
+        .branch_epoch = intField(parsed.value, "branch_epoch") orelse 0,
+        .worktree_path = stringField(parsed.value, "worktree_path") orelse "",
+        .base_head = stringField(parsed.value, "base_head") orelse "",
+        .changed_paths = path_list.items,
+        .patch_path = stringField(parsed.value, "patch_path") orelse "",
+        .patch_digest = stringField(parsed.value, "patch_digest") orelse return error.WorkspaceInvalid,
+        .tree_digest = stringField(parsed.value, "tree_digest") orelse return error.WorkspaceInvalid,
+        .created_at = stringField(parsed.value, "created_at") orelse now,
+        .supersedes = stringField(parsed.value, "supersedes") orelse "",
+        .superseded_by = superseded_by,
+        .rejected_at = if (std.mem.eql(u8, state, "rejected")) now else "",
+    });
+    const payload = try out.toOwnedSlice();
+    try writeTextAtomic(allocator, path, payload);
+}
+
+const WorkspaceApertureCandidate = struct {
+    plan_id: []const u8,
+    item_id: []const u8,
+    qualified_id: []const u8,
+    step: []const u8,
+    score: i64,
+    fairness_debt: i64 = 0,
+    resources: []const WorkspaceResource,
+};
+
+const WorkspaceApertureRejected = struct {
+    qualified_id: []const u8,
+    reason: []const u8,
+    conflicting: []const u8 = "",
+};
+
+fn cmdWorkspaceAperture(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace = try loadWorkspaceCheckpoint(allocator, args.workspace);
+    defer workspace.deinit();
+    const workspace_obj = switch (workspace.parsed.value) {
+        .object => |obj| obj,
+        else => return error.WorkspaceInvalid,
+    };
+    const plans_value = workspace_obj.get("plans") orelse return error.WorkspaceInvalid;
+    if (plans_value != .array) return error.WorkspaceInvalid;
+    const edges_value = workspace_obj.get("cross_plan_edges") orelse return error.WorkspaceInvalid;
+    if (edges_value != .array) return error.WorkspaceInvalid;
+
+    const now = try nowUtcAlloc(allocator);
+    var candidates: std.ArrayList(WorkspaceApertureCandidate) = .empty;
+    var rejected: std.ArrayList(WorkspaceApertureRejected) = .empty;
+
+    for (plans_value.array.items) |plan_record| {
+        if (plan_record != .object) return error.WorkspaceInvalid;
+        const state = stringField(plan_record, "state") orelse return error.WorkspaceInvalid;
+        if (!std.mem.eql(u8, state, "active")) continue;
+        const plan_id = stringField(plan_record, "plan_id") orelse return error.WorkspaceInvalid;
+        const graph_ref = stringField(plan_record, "graph_ref") orelse return error.WorkspaceInvalid;
+        const plan_file = try std.fs.path.join(allocator, &.{ workspace.root, graph_ref });
+        var loaded = try loadValidatedState(allocator, plan_file, false);
+        defer loaded.state.deinit();
+        const index = try buildGraphIndex(allocator, &loaded.state);
+        const critical_depths = try criticalDepthsAlloc(allocator, &loaded.state, index);
+
+        for (loaded.state.items.items) |item| {
+            if (!try isReadyPendingItem(allocator, &loaded.state, item)) continue;
+            const qualified = try std.fmt.allocPrint(allocator, "plan://{s}/{s}", .{ plan_id, item.id });
+            if (try workspaceHardDependencyBlocker(allocator, workspace.root, plans_value, edges_value, qualified)) |blocker| {
+                try rejected.append(allocator, .{
+                    .qualified_id = qualified,
+                    .reason = "cross_plan_dependency_blocked",
+                    .conflicting = blocker,
+                });
+                continue;
+            }
+            const resources = try workspaceResourcesForItem(allocator, item);
+            if (try workspaceHeldClaimConflict(workspace_obj, resources, now)) |claim_id| {
+                try rejected.append(allocator, .{
+                    .qualified_id = qualified,
+                    .reason = "resource_conflict",
+                    .conflicting = claim_id,
+                });
+                continue;
+            }
+            try candidates.append(allocator, .{
+                .plan_id = plan_id,
+                .item_id = item.id,
+                .qualified_id = qualified,
+                .step = item.step,
+                .score = apertureScore(&loaded.state, item, index, critical_depths),
+                .resources = resources,
+            });
+        }
+    }
+
+    std.mem.sort(WorkspaceApertureCandidate, candidates.items, {}, workspaceApertureCandidateLessThan);
+
+    var selected: std.ArrayList(WorkspaceApertureCandidate) = .empty;
+    for (candidates.items) |candidate| {
+        if (selected.items.len >= args.limit) {
+            try rejected.append(allocator, .{ .qualified_id = candidate.qualified_id, .reason = "aperture_limit" });
+            continue;
+        }
+        if (workspaceCandidateConflict(candidate, selected.items)) |conflict| {
+            try rejected.append(allocator, .{
+                .qualified_id = candidate.qualified_id,
+                .reason = "resource_conflict",
+                .conflicting = conflict,
+            });
+            continue;
+        }
+        try selected.append(allocator, candidate);
+    }
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    if (args.format == .json) {
+        try writeWorkspaceApertureJson(stdout, workspace.parsed.value, selected.items, rejected.items, args);
+    } else {
+        try stdout.print("workspace aperture seq {d} epoch {d}\n", .{ workspaceSequence(workspace.parsed.value), intField(workspace.parsed.value, "branch_epoch") orelse 0 });
+        for (selected.items) |candidate| try stdout.print("- {s} ({d}): {s}\n", .{ candidate.qualified_id, candidate.score, candidate.step });
+        for (rejected.items) |entry| {
+            try stdout.print("rejected {s}: {s}", .{ entry.qualified_id, entry.reason });
+            if (entry.conflicting.len > 0) try stdout.print(" ({s})", .{entry.conflicting});
+            try stdout.writeByte('\n');
+        }
+    }
+    return 0;
+}
+
+fn workspaceApertureCandidateLessThan(_: void, lhs: WorkspaceApertureCandidate, rhs: WorkspaceApertureCandidate) bool {
+    if (lhs.score != rhs.score) return lhs.score > rhs.score;
+    if (lhs.fairness_debt != rhs.fairness_debt) return lhs.fairness_debt > rhs.fairness_debt;
+    return std.mem.lessThan(u8, lhs.qualified_id, rhs.qualified_id);
+}
+
+fn workspaceResourcesForItem(allocator: std.mem.Allocator, item: Item) ![]WorkspaceResource {
+    const roots = apertureLockRootsForItem(item);
+    if (roots.len == 0) {
+        const inferred = try inferUnknownMutationResource(allocator);
+        const out = try allocator.alloc(WorkspaceResource, 1);
+        out[0] = inferred.resource;
+        return out;
+    }
+    var out: std.ArrayList(WorkspaceResource) = .empty;
+    for (roots) |root| {
+        const resource = try std.fmt.allocPrint(allocator, "path:{s}", .{root});
+        try out.append(allocator, try parseWorkspaceResource(allocator, resource, .write));
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn workspaceHardDependencyBlocker(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    plans_value: std.json.Value,
+    edges_value: std.json.Value,
+    qualified_id: []const u8,
+) !?[]const u8 {
+    if (edges_value != .array) return error.WorkspaceInvalid;
+    for (edges_value.array.items) |entry| {
+        if (entry != .object) return error.WorkspaceInvalid;
+        if (!std.mem.eql(u8, stringField(entry, "type") orelse "", "hard")) continue;
+        if (!std.mem.eql(u8, stringField(entry, "from") orelse "", qualified_id)) continue;
+        const target_raw = stringField(entry, "to") orelse return error.WorkspaceInvalid;
+        const target = try parseQualifiedRef(allocator, target_raw);
+        defer target.deinit(allocator);
+        const graph_ref = try workspacePlanGraphRefForId(allocator, plans_value, target.plan_id);
+        const plan_file = try std.fs.path.join(allocator, &.{ workspace_root, graph_ref });
+        var loaded = try loadValidatedState(allocator, plan_file, false);
+        defer loaded.state.deinit();
+        const target_item = loaded.state.getConst(target.item_id) orelse return error.UnknownItemId;
+        if (target_item.status != .completed) return target_raw;
+    }
+    return null;
+}
+
+fn workspaceHeldClaimConflict(workspace_obj: std.json.ObjectMap, resources: []const WorkspaceResource, now: []const u8) !?[]const u8 {
+    const claims = workspace_obj.get("claims") orelse return null;
+    if (claims != .array) return error.WorkspaceInvalid;
+    for (claims.array.items) |claim| {
+        if (!workspaceClaimIsHeldCurrent(claim, now)) continue;
+        if (try workspaceClaimConflictsWithResources(claim, resources)) {
+            return stringField(claim, "claim_id") orelse return error.WorkspaceInvalid;
+        }
+    }
+    return null;
+}
+
+fn workspaceCandidateConflict(candidate: WorkspaceApertureCandidate, selected: []const WorkspaceApertureCandidate) ?[]const u8 {
+    for (selected) |held| {
+        for (held.resources) |held_resource| {
+            for (candidate.resources) |candidate_resource| {
+                if (workspaceResourcesConflict(held_resource, candidate_resource)) return held.qualified_id;
+            }
+        }
+    }
+    return null;
+}
+
+fn writeWorkspaceApertureJson(
+    writer: anytype,
+    workspace_value: std.json.Value,
+    selected: []const WorkspaceApertureCandidate,
+    rejected: []const WorkspaceApertureRejected,
+    args: Args,
+) !void {
+    try writer.writeAll("{\"workspace_aperture\":{\"receipt_version\":\"WAP-v1\",\"workspace_sequence\":");
+    try writer.print("{d}", .{workspaceSequence(workspace_value)});
+    try writer.writeAll(",\"branch_epoch\":");
+    try writer.print("{d}", .{intField(workspace_value, "branch_epoch") orelse 0});
+    try writer.writeAll(",\"allocations\":[");
+    for (selected, 0..) |candidate, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try writer.writeByte('{');
+        try writer.writeAll("\"executor\":");
+        try std.json.Stringify.value(args.executor orelse "", .{}, writer);
+        try writer.writeAll(",\"session_id\":");
+        try std.json.Stringify.value(args.session_id orelse "", .{}, writer);
+        try writer.writeAll(",\"plan_id\":");
+        try std.json.Stringify.value(candidate.plan_id, .{}, writer);
+        try writer.writeAll(",\"item_ids\":[");
+        try std.json.Stringify.value(candidate.item_id, .{}, writer);
+        try writer.writeAll("],\"qualified_item\":");
+        try std.json.Stringify.value(candidate.qualified_id, .{}, writer);
+        try writer.writeAll(",\"score\":");
+        try writer.print("{d}", .{candidate.score});
+        try writer.writeAll(",\"fairness_debt\":");
+        try writer.print("{d}", .{candidate.fairness_debt});
+        try writer.writeAll(",\"resources\":");
+        try writeWorkspaceResourcesArray(writer, candidate.resources);
+        try writer.writeByte('}');
+    }
+    try writer.writeAll("],\"rejected\":[");
+    for (rejected, 0..) |entry, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try writer.writeAll("{\"qualified_item\":");
+        try std.json.Stringify.value(entry.qualified_id, .{}, writer);
+        try writer.writeAll(",\"reason\":");
+        try std.json.Stringify.value(entry.reason, .{}, writer);
+        try writer.writeAll(",\"conflicting_claim_or_candidate\":");
+        try std.json.Stringify.value(entry.conflicting, .{}, writer);
+        try writer.writeByte('}');
+    }
+    try writer.writeAll("]}}\n");
+}
+
+fn cmdPlan(allocator: std.mem.Allocator, args: Args) !u8 {
+    return switch (args.plan_command) {
+        .create => try cmdPlanCreate(allocator, args),
+        .list => try cmdPlanList(allocator, args),
+        .show => try cmdPlanShow(allocator, args),
+        .pause => try cmdPlanLifecycle(allocator, args, "paused"),
+        .@"resume" => try cmdPlanLifecycle(allocator, args, "active"),
+        .complete => try cmdPlanLifecycle(allocator, args, "completed"),
+        .archive => try cmdPlanLifecycle(allocator, args, "archived"),
+        .link => try cmdPlanCrossLink(allocator, args, .link),
+        .unlink => try cmdPlanCrossLink(allocator, args, .unlink),
+        .none => error.MissingCommand,
+    };
+}
+
+fn cmdSession(allocator: std.mem.Allocator, args: Args) !u8 {
+    return switch (args.session_command) {
+        .bind => try cmdSessionBind(allocator, args),
+        .show => try cmdSessionShow(allocator, args),
+        .switch_plan => try cmdSessionSwitchPlan(allocator, args),
+        .release => try cmdSessionRelease(allocator, args),
+        .list => try cmdSessionList(allocator, args),
+        .none => error.MissingCommand,
+    };
+}
+
+fn cmdSessionBind(allocator: std.mem.Allocator, args: Args) !u8 {
+    const executor = try normalizeExecutor(allocator, args.executor.?);
+    const session_id = try normalizeSessionId(allocator, args.session_id.?);
+    defer allocator.free(session_id);
+    return writeSessionBinding(allocator, args, session_id, executor, "bound");
+}
+
+fn cmdSessionSwitchPlan(allocator: std.mem.Allocator, args: Args) !u8 {
+    const session_id = try normalizeSessionId(allocator, args.session_id.?);
+    defer allocator.free(session_id);
+    const session_path = try workspaceSessionFilePathAlloc(allocator, args.workspace, session_id);
+    defer allocator.free(session_path);
+    const bytes = try durable_store.readRegularFileNoSymlink(allocator, session_path, 1024 * 1024);
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const state = stringField(parsed.value, "state") orelse return error.SessionUnbound;
+    const claim_id = stringField(parsed.value, "claim_id") orelse "";
+    if (std.mem.eql(u8, state, "bound") and claim_id.len > 0) return error.SessionPlanMismatch;
+    const executor = stringField(parsed.value, "executor") orelse return error.WorkspaceInvalid;
+    return writeSessionBinding(allocator, args, session_id, executor, "bound");
+}
+
+fn cmdSessionRelease(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace = try loadWorkspaceCheckpoint(allocator, args.workspace);
+    defer workspace.deinit();
+    const session_id = try normalizeSessionId(allocator, args.session_id.?);
+    defer allocator.free(session_id);
+    const session_path = try workspaceSessionFilePathAlloc(allocator, args.workspace, session_id);
+    defer allocator.free(session_path);
+    const bytes = try durable_store.readRegularFileNoSymlink(allocator, session_path, 1024 * 1024);
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const now = try nowUtcAlloc(allocator);
+    const payload = try renderSessionRecord(allocator, .{
+        .session_id = session_id,
+        .executor = stringField(parsed.value, "executor") orelse "",
+        .plan_id = stringField(parsed.value, "plan_id") orelse "",
+        .claim_id = stringField(parsed.value, "claim_id") orelse "",
+        .fencing_token = intField(parsed.value, "fencing_token") orelse 0,
+        .workspace_sequence = workspaceSequence(workspace.parsed.value),
+        .plan_sequence = intField(parsed.value, "plan_sequence") orelse 0,
+        .branch_epoch = intField(workspace.parsed.value, "branch_epoch") orelse 0,
+        .state = "released",
+        .updated_at = now,
+    });
+    defer allocator.free(payload);
+    try writeTextAtomic(allocator, session_path, payload);
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"session_release\":{\"ok\":true,\"session_id\":");
+    try std.json.Stringify.value(session_id, .{}, stdout);
+    try stdout.writeAll("}}\n");
+    return 0;
+}
+
+fn cmdSessionShow(allocator: std.mem.Allocator, args: Args) !u8 {
+    const session_id = try normalizeSessionId(allocator, args.session_id.?);
+    defer allocator.free(session_id);
+    const session_path = try workspaceSessionFilePathAlloc(allocator, args.workspace, session_id);
+    defer allocator.free(session_path);
+    const view_path = try workspaceViewFilePathAlloc(allocator, args.workspace, session_id);
+    defer allocator.free(view_path);
+    const session_bytes = try durable_store.readRegularFileNoSymlink(allocator, session_path, 1024 * 1024);
+    defer allocator.free(session_bytes);
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"session_show\":{\"session\":");
+    try stdout.writeAll(session_bytes);
+    try stdout.writeAll(",\"view\":");
+    if (fileExists(view_path)) {
+        const view_bytes = try durable_store.readRegularFileNoSymlink(allocator, view_path, 1024 * 1024);
+        defer allocator.free(view_bytes);
+        try stdout.writeAll(view_bytes);
+    } else {
+        try stdout.writeAll("null");
+    }
+    try stdout.writeAll("}}\n");
+    return 0;
+}
+
+fn cmdSessionList(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace_root = try normalizeWorkspacePath(allocator, args.workspace);
+    defer allocator.free(workspace_root);
+    const sessions_dir = try std.fs.path.join(allocator, &.{ workspace_root, "runtime", "sessions" });
+    defer allocator.free(sessions_dir);
+    try durable_store.ensureDirectoryPathNoSymlinks(sessions_dir);
+
+    var dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), sessions_dir, .{ .iterate = true, .follow_symlinks = false });
+    defer dir.close(std.Io.Threaded.global_single_threaded.io());
+    var iter = dir.iterate();
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"session_list\":{\"sessions\":[");
+    var emitted = false;
+    while (try iter.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) continue;
+        const path = try std.fs.path.join(allocator, &.{ sessions_dir, entry.name });
+        defer allocator.free(path);
+        const bytes = try durable_store.readRegularFileNoSymlink(allocator, path, 1024 * 1024);
+        defer allocator.free(bytes);
+        if (emitted) try stdout.writeByte(',');
+        try stdout.writeAll(bytes);
+        emitted = true;
+    }
+    try stdout.writeAll("]}}\n");
+    return 0;
+}
+
+const SessionRecord = struct {
+    session_id: []const u8,
+    executor: []const u8,
+    plan_id: []const u8,
+    claim_id: []const u8,
+    fencing_token: i64,
+    workspace_sequence: i64,
+    plan_sequence: i64,
+    branch_epoch: i64,
+    state: []const u8,
+    updated_at: []const u8,
+};
+
+fn writeSessionBinding(allocator: std.mem.Allocator, args: Args, session_id: []const u8, executor: []const u8, state: []const u8) !u8 {
+    const workspace = try loadWorkspaceCheckpoint(allocator, args.workspace);
+    defer workspace.deinit();
+    const workspace_obj = switch (workspace.parsed.value) {
+        .object => |obj| obj,
+        else => return error.WorkspaceInvalid,
+    };
+    const plan_id_owned = if (args.plan_id) |raw|
+        try normalizePlanId(allocator, raw)
+    else
+        try inferSingleActiveWorkspacePlanId(allocator, args.workspace);
+    defer allocator.free(plan_id_owned);
+    const plan_file = try resolveWorkspacePlanFile(allocator, args.workspace, plan_id_owned);
+    defer allocator.free(plan_file);
+    var plan_state = try loadValidatedState(allocator, plan_file, false);
+    defer plan_state.state.deinit();
+
+    const selected_ids = try parseCliIds(allocator, args.ids);
+    for (selected_ids) |item_id| {
+        if (plan_state.state.getConst(item_id) == null) return error.UnknownItemId;
+    }
+
+    const claim_id = args.claim_id orelse "";
+    const fencing_token: i64 = if (claim_id.len > 0) blk: {
+        const token = try parseFencingTokenArg(args.fencing_token orelse return error.MissingValue);
+        const now_for_claim = try nowUtcAlloc(allocator);
+        _ = try validateWorkspaceClaimAuthority(workspace_obj, claim_id, session_id, token, now_for_claim);
+        break :blk @intCast(token);
+    } else 0;
+
+    const plan_sequence = try planSequenceForFile(allocator, plan_file);
+    const workspace_sequence = workspaceSequence(workspace.parsed.value);
+    const branch_epoch = intField(workspace.parsed.value, "branch_epoch") orelse 0;
+    const now = try nowUtcAlloc(allocator);
+    const digest_input = try sessionDigestInputAlloc(allocator, session_id, executor, plan_id_owned, claim_id, fencing_token, workspace_sequence, plan_sequence, branch_epoch, selected_ids, args.target);
+    defer allocator.free(digest_input);
+    const projection_digest = try hashTextSha256Alloc(allocator, digest_input);
+    defer allocator.free(projection_digest);
+
+    const session_payload = try renderSessionRecord(allocator, .{
+        .session_id = session_id,
+        .executor = executor,
+        .plan_id = plan_id_owned,
+        .claim_id = claim_id,
+        .fencing_token = fencing_token,
+        .workspace_sequence = workspace_sequence,
+        .plan_sequence = plan_sequence,
+        .branch_epoch = branch_epoch,
+        .state = state,
+        .updated_at = now,
+    });
+    defer allocator.free(session_payload);
+    const view_payload = try renderSessionView(allocator, session_id, executor, plan_id_owned, claim_id, fencing_token, workspace_sequence, plan_sequence, branch_epoch, selected_ids, args.target, projection_digest, now);
+    defer allocator.free(view_payload);
+
+    const sessions_dir = try std.fs.path.join(allocator, &.{ workspace.root, "runtime", "sessions" });
+    defer allocator.free(sessions_dir);
+    const views_dir = try std.fs.path.join(allocator, &.{ workspace.root, "runtime", "views" });
+    defer allocator.free(views_dir);
+    try durable_store.ensureDirectoryPathNoSymlinks(sessions_dir);
+    try durable_store.ensureDirectoryPathNoSymlinks(views_dir);
+    const session_path = try workspaceSessionFilePathAlloc(allocator, args.workspace, session_id);
+    defer allocator.free(session_path);
+    const view_path = try workspaceViewFilePathAlloc(allocator, args.workspace, session_id);
+    defer allocator.free(view_path);
+    try writeTextAtomic(allocator, session_path, session_payload);
+    try writeTextAtomic(allocator, view_path, view_payload);
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"session_bind\":{\"ok\":true,\"session_id\":");
+    try std.json.Stringify.value(session_id, .{}, stdout);
+    try stdout.writeAll(",\"plan_id\":");
+    try std.json.Stringify.value(plan_id_owned, .{}, stdout);
+    try stdout.writeAll(",\"projection_digest\":");
+    try std.json.Stringify.value(projection_digest, .{}, stdout);
+    try stdout.writeAll("}}\n");
+    return 0;
+}
+
+fn normalizeSessionId(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const trimmed = try requireNonEmptyString(allocator, raw, "--session");
+    if (trimmed.len > 128 or std.mem.indexOfScalar(u8, trimmed, 0) != null) return error.InvalidSessionId;
+    if (std.mem.indexOfAny(u8, trimmed, "/\\") != null) return error.InvalidSessionId;
+    if (std.mem.indexOf(u8, trimmed, "..") != null) return error.InvalidSessionId;
+    return allocator.dupe(u8, trimmed);
+}
+
+fn workspaceSessionFilePathAlloc(allocator: std.mem.Allocator, raw_workspace: []const u8, session_id: []const u8) ![]u8 {
+    const workspace_root = try normalizeWorkspacePath(allocator, raw_workspace);
+    defer allocator.free(workspace_root);
+    const file_name = try std.fmt.allocPrint(allocator, "{s}.json", .{session_id});
+    defer allocator.free(file_name);
+    return std.fs.path.join(allocator, &.{ workspace_root, "runtime", "sessions", file_name });
+}
+
+fn workspaceViewFilePathAlloc(allocator: std.mem.Allocator, raw_workspace: []const u8, session_id: []const u8) ![]u8 {
+    const workspace_root = try normalizeWorkspacePath(allocator, raw_workspace);
+    defer allocator.free(workspace_root);
+    const file_name = try std.fmt.allocPrint(allocator, "{s}.json", .{session_id});
+    defer allocator.free(file_name);
+    return std.fs.path.join(allocator, &.{ workspace_root, "runtime", "views", file_name });
+}
+
+fn planSequenceForFile(allocator: std.mem.Allocator, plan_file: []const u8) !i64 {
+    const line = try readLastJsonlLine(allocator, plan_file);
+    defer allocator.free(line);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    defer parsed.deinit();
+    return intField(parsed.value, "plan_sequence") orelse intField(parsed.value, "seq") orelse 0;
+}
+
+fn sessionDigestInputAlloc(
+    allocator: std.mem.Allocator,
+    session_id: []const u8,
+    executor: []const u8,
+    plan_id: []const u8,
+    claim_id: []const u8,
+    fencing_token: i64,
+    workspace_sequence: i64,
+    plan_sequence: i64,
+    branch_epoch: i64,
+    selected_ids: []const []const u8,
+    target: ProjectionTarget,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.print("{s}|{s}|{s}|{s}|{d}|{d}|{d}|{d}|{s}|", .{ session_id, executor, plan_id, claim_id, fencing_token, workspace_sequence, plan_sequence, branch_epoch, target.asString() });
+    for (selected_ids) |item_id| try writer.print("{s},", .{item_id});
+    return out.toOwnedSlice();
+}
+
+fn renderSessionRecord(allocator: std.mem.Allocator, record: SessionRecord) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"receipt_version\":\"SES-v1\",\"session_id\":");
+    try std.json.Stringify.value(record.session_id, .{}, writer);
+    try writer.writeAll(",\"executor\":");
+    try std.json.Stringify.value(record.executor, .{}, writer);
+    try writer.writeAll(",\"plan_id\":");
+    try std.json.Stringify.value(record.plan_id, .{}, writer);
+    try writer.writeAll(",\"claim_id\":");
+    try std.json.Stringify.value(record.claim_id, .{}, writer);
+    try writer.writeAll(",\"fencing_token\":");
+    try writer.print("{d}", .{record.fencing_token});
+    try writer.writeAll(",\"workspace_sequence\":");
+    try writer.print("{d}", .{record.workspace_sequence});
+    try writer.writeAll(",\"plan_sequence\":");
+    try writer.print("{d}", .{record.plan_sequence});
+    try writer.writeAll(",\"branch_epoch\":");
+    try writer.print("{d}", .{record.branch_epoch});
+    try writer.writeAll(",\"state\":");
+    try std.json.Stringify.value(record.state, .{}, writer);
+    try writer.writeAll(",\"updated_at\":");
+    try std.json.Stringify.value(record.updated_at, .{}, writer);
+    try writer.writeAll("}\n");
+    return out.toOwnedSlice();
+}
+
+fn renderSessionView(
+    allocator: std.mem.Allocator,
+    session_id: []const u8,
+    executor: []const u8,
+    plan_id: []const u8,
+    claim_id: []const u8,
+    fencing_token: i64,
+    workspace_sequence: i64,
+    plan_sequence: i64,
+    branch_epoch: i64,
+    selected_ids: []const []const u8,
+    target: ProjectionTarget,
+    projection_digest: []const u8,
+    now: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"receipt_version\":\"SVW-v1\",\"session_id\":");
+    try std.json.Stringify.value(session_id, .{}, writer);
+    try writer.writeAll(",\"executor\":");
+    try std.json.Stringify.value(executor, .{}, writer);
+    try writer.writeAll(",\"plan_id\":");
+    try std.json.Stringify.value(plan_id, .{}, writer);
+    try writer.writeAll(",\"claim_id\":");
+    try std.json.Stringify.value(claim_id, .{}, writer);
+    try writer.writeAll(",\"fencing_token\":");
+    try writer.print("{d}", .{fencing_token});
+    try writer.writeAll(",\"workspace_sequence\":");
+    try writer.print("{d}", .{workspace_sequence});
+    try writer.writeAll(",\"plan_sequence\":");
+    try writer.print("{d}", .{plan_sequence});
+    try writer.writeAll(",\"branch_epoch\":");
+    try writer.print("{d}", .{branch_epoch});
+    try writer.writeAll(",\"selected_item_ids\":[");
+    for (selected_ids, 0..) |item_id, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try std.json.Stringify.value(item_id, .{}, writer);
+    }
+    try writer.writeAll("],\"target\":");
+    try std.json.Stringify.value(target.asString(), .{}, writer);
+    try writer.writeAll(",\"projection_digest\":");
+    try std.json.Stringify.value(projection_digest, .{}, writer);
+    try writer.writeAll(",\"updated_at\":");
+    try std.json.Stringify.value(now, .{}, writer);
+    try writer.writeAll("}\n");
+    return out.toOwnedSlice();
+}
+
+fn cmdPlanCreate(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace_root = try normalizeWorkspacePath(allocator, args.workspace);
+    defer allocator.free(workspace_root);
+    const workspace_file = try std.fs.path.join(allocator, &.{ workspace_root, "workspace.jsonl" });
+    defer allocator.free(workspace_file);
+    if (!fileExists(workspace_file)) return error.WorkspaceMissing;
+
+    const plan_id = try normalizePlanId(allocator, args.plan_id.?);
+    defer allocator.free(plan_id);
+    const alias = try requireNonEmptyString(allocator, args.name orelse plan_id, "--alias");
+    defer allocator.free(alias);
+
+    const checkpoint_line = try readLastJsonlLine(allocator, workspace_file);
+    defer allocator.free(checkpoint_line);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, checkpoint_line, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.WorkspaceInvalid;
+    const workspace_obj = parsed.value.object;
+    const plans_value = workspace_obj.get("plans") orelse return error.WorkspaceInvalid;
+    if (plans_value != .array) return error.WorkspaceInvalid;
+    for (plans_value.array.items) |entry| {
+        if (entry != .object) return error.WorkspaceInvalid;
+        const existing_id = stringField(entry, "plan_id") orelse return error.WorkspaceInvalid;
+        if (std.mem.eql(u8, existing_id, plan_id)) return error.PlanAlreadyExists;
+    }
+
+    const plan_dir = try std.fs.path.join(allocator, &.{ workspace_root, "plans", plan_id });
+    defer allocator.free(plan_dir);
+    const plan_file = try std.fs.path.join(allocator, &.{ plan_dir, "plan.jsonl" });
+    defer allocator.free(plan_file);
+    const transactions_dir = try workspaceTransactionsDirAlloc(allocator, workspace_root);
+    defer allocator.free(transactions_dir);
+    try durable_store.ensureNoPendingTransactions(allocator, transactions_dir);
+    try durable_store.ensureDirectoryPathNoSymlinks(plan_dir);
+
+    const now = try nowUtcAlloc(allocator);
+    defer allocator.free(now);
+    const plan_checkpoint = try renderInitialWorkspacePlanCheckpoint(allocator, plan_id, now);
+    defer allocator.free(plan_checkpoint);
+    try durable_store.writeTextCreateNew(allocator, plan_file, plan_checkpoint, .{});
+    errdefer {
+        std.Io.Dir.cwd().deleteFile(std.Io.Threaded.global_single_threaded.io(), plan_file) catch {};
+        std.Io.Dir.cwd().deleteDir(std.Io.Threaded.global_single_threaded.io(), plan_dir) catch {};
+    }
+
+    const workspace_payload = try renderWorkspaceCheckpointWithPlan(allocator, workspace_root, parsed.value, plan_id, alias, now);
+    defer allocator.free(workspace_payload);
+    var receipt = try appendWorkspaceCheckpointTransaction(
+        allocator,
+        workspace_root,
+        workspace_file,
+        workspace_payload,
+        intField(parsed.value, "workspace_sequence") orelse 0,
+        "plan-create",
+    );
+    defer receipt.deinit(allocator);
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    if (args.format == .json) {
+        const graph_ref = try workspacePlanGraphRefAlloc(allocator, plan_id);
+        defer allocator.free(graph_ref);
+        try stdout.writeAll("{\"plan_create\":{\"ok\":true,\"plan_id\":");
+        try std.json.Stringify.value(plan_id, .{}, stdout);
+        try stdout.writeAll(",\"graph_ref\":");
+        try std.json.Stringify.value(graph_ref, .{}, stdout);
+        try stdout.writeAll("}}\n");
+    } else {
+        try stdout.print("created plan {s}\n", .{plan_id});
+    }
+    return 0;
+}
+
+fn cmdPlanList(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace_root = try normalizeWorkspacePath(allocator, args.workspace);
+    defer allocator.free(workspace_root);
+    const workspace_file = try std.fs.path.join(allocator, &.{ workspace_root, "workspace.jsonl" });
+    defer allocator.free(workspace_file);
+    if (!fileExists(workspace_file)) return error.WorkspaceMissing;
+
+    const checkpoint_line = try readLastJsonlLine(allocator, workspace_file);
+    defer allocator.free(checkpoint_line);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, checkpoint_line, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.WorkspaceInvalid;
+    const plans_value = parsed.value.object.get("plans") orelse return error.WorkspaceInvalid;
+    if (plans_value != .array) return error.WorkspaceInvalid;
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    if (args.format == .json) {
+        try stdout.writeAll("{\"plan_list\":{\"workspace_sequence\":");
+        try stdout.print("{d}", .{intField(parsed.value, "workspace_sequence") orelse 0});
+        try stdout.writeAll(",\"plans\":");
+        try std.json.Stringify.value(plans_value, .{}, stdout);
+        try stdout.writeAll("}}\n");
+    } else {
+        for (plans_value.array.items) |entry| {
+            if (entry != .object) return error.WorkspaceInvalid;
+            try stdout.print("{s}\t{s}\n", .{ stringField(entry, "plan_id") orelse "", stringField(entry, "state") orelse "" });
+        }
+    }
+    return 0;
+}
+
+fn cmdPlanShow(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace_root = try normalizeWorkspacePath(allocator, args.workspace);
+    defer allocator.free(workspace_root);
+    const workspace_file = try std.fs.path.join(allocator, &.{ workspace_root, "workspace.jsonl" });
+    defer allocator.free(workspace_file);
+    if (!fileExists(workspace_file)) return error.WorkspaceMissing;
+    const wanted_plan_id = try normalizePlanId(allocator, args.plan_id.?);
+    defer allocator.free(wanted_plan_id);
+
+    const checkpoint_line = try readLastJsonlLine(allocator, workspace_file);
+    defer allocator.free(checkpoint_line);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, checkpoint_line, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.WorkspaceInvalid;
+    const plans_value = parsed.value.object.get("plans") orelse return error.WorkspaceInvalid;
+    if (plans_value != .array) return error.WorkspaceInvalid;
+
+    var match: ?std.json.Value = null;
+    for (plans_value.array.items) |entry| {
+        if (entry != .object) return error.WorkspaceInvalid;
+        const plan_id = stringField(entry, "plan_id") orelse return error.WorkspaceInvalid;
+        if (std.mem.eql(u8, plan_id, wanted_plan_id)) {
+            match = entry;
+            break;
+        }
+    }
+    const plan_record = match orelse return error.PlanMissing;
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    if (args.format == .json) {
+        try stdout.writeAll("{\"plan_show\":{\"workspace_sequence\":");
+        try stdout.print("{d}", .{intField(parsed.value, "workspace_sequence") orelse 0});
+        try stdout.writeAll(",\"plan\":");
+        try std.json.Stringify.value(plan_record, .{}, stdout);
+        try stdout.writeAll("}}\n");
+    } else {
+        try stdout.print("{s}\t{s}\t{s}\n", .{
+            stringField(plan_record, "plan_id") orelse "",
+            stringField(plan_record, "state") orelse "",
+            stringField(plan_record, "graph_ref") orelse "",
+        });
+    }
+    return 0;
+}
+
+fn cmdPlanLifecycle(allocator: std.mem.Allocator, args: Args, target_state: []const u8) !u8 {
+    const workspace_root = try normalizeWorkspacePath(allocator, args.workspace);
+    defer allocator.free(workspace_root);
+    const workspace_file = try std.fs.path.join(allocator, &.{ workspace_root, "workspace.jsonl" });
+    defer allocator.free(workspace_file);
+    if (!fileExists(workspace_file)) return error.WorkspaceMissing;
+    const wanted_plan_id = try normalizePlanId(allocator, args.plan_id.?);
+    defer allocator.free(wanted_plan_id);
+
+    const checkpoint_line = try readLastJsonlLine(allocator, workspace_file);
+    defer allocator.free(checkpoint_line);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, checkpoint_line, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.WorkspaceInvalid;
+    const plans_value = parsed.value.object.get("plans") orelse return error.WorkspaceInvalid;
+    if (plans_value != .array) return error.WorkspaceInvalid;
+
+    var current_state: ?[]const u8 = null;
+    for (plans_value.array.items) |entry| {
+        if (entry != .object) return error.WorkspaceInvalid;
+        const plan_id = stringField(entry, "plan_id") orelse return error.WorkspaceInvalid;
+        if (std.mem.eql(u8, plan_id, wanted_plan_id)) {
+            current_state = stringField(entry, "state") orelse return error.WorkspaceInvalid;
+            break;
+        }
+    }
+    const from_state = current_state orelse return error.PlanMissing;
+    if (!planLifecycleTransitionAllowed(from_state, target_state)) return error.InvalidPlanStateTransition;
+
+    const now = try nowUtcAlloc(allocator);
+    defer allocator.free(now);
+    const workspace_payload = try renderWorkspaceCheckpointWithPlanState(allocator, workspace_root, parsed.value, wanted_plan_id, target_state, now);
+    defer allocator.free(workspace_payload);
+    var receipt = try appendWorkspaceCheckpointTransaction(
+        allocator,
+        workspace_root,
+        workspace_file,
+        workspace_payload,
+        intField(parsed.value, "workspace_sequence") orelse 0,
+        "plan-lifecycle",
+    );
+    defer receipt.deinit(allocator);
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    if (args.format == .json) {
+        try stdout.writeAll("{\"plan_lifecycle\":{\"ok\":true,\"plan_id\":");
+        try std.json.Stringify.value(wanted_plan_id, .{}, stdout);
+        try stdout.writeAll(",\"from\":");
+        try std.json.Stringify.value(from_state, .{}, stdout);
+        try stdout.writeAll(",\"to\":");
+        try std.json.Stringify.value(target_state, .{}, stdout);
+        try stdout.writeAll(",\"workspace_sequence\":");
+        try stdout.print("{d}", .{(intField(parsed.value, "workspace_sequence") orelse 0) + 1});
+        try stdout.writeAll("}}\n");
+    } else {
+        try stdout.print("updated plan {s}: {s} -> {s}\n", .{ wanted_plan_id, from_state, target_state });
+    }
+    return 0;
+}
+
+const CrossPlanEdgeOp = enum {
+    link,
+    unlink,
+};
+
+const QualifiedRef = struct {
+    plan_id: []const u8,
+    item_id: []const u8,
+    canonical: []const u8,
+
+    fn deinit(self: QualifiedRef, allocator: std.mem.Allocator) void {
+        allocator.free(self.plan_id);
+        allocator.free(self.item_id);
+        allocator.free(self.canonical);
+    }
+};
+
+const CrossPlanEdge = struct {
+    from: []const u8,
+    to: []const u8,
+    edge_type: []const u8,
+};
+
+const WorkspaceResourceKind = enum {
+    path,
+    symbol,
+    generated,
+    schema,
+    service,
+    git_index,
+    git_branch,
+    repo_all,
+};
+
+const WorkspaceResourceMode = enum {
+    read,
+    write,
+    exclusive,
+};
+
+const WorkspaceResource = struct {
+    kind: WorkspaceResourceKind,
+    mode: WorkspaceResourceMode,
+    primary: []const u8,
+    secondary: []const u8 = "",
+
+    fn deinit(self: WorkspaceResource, allocator: std.mem.Allocator) void {
+        allocator.free(self.primary);
+        if (self.secondary.len != 0) allocator.free(self.secondary);
+    }
+};
+
+const InferredWorkspaceResource = struct {
+    resource: WorkspaceResource,
+    confidence: []const u8,
+};
+
+const WorkspaceClaimDraft = struct {
+    claim_id: []const u8,
+    state: []const u8,
+    owner: []const u8,
+    executor: []const u8,
+    session_id: []const u8,
+    plan_id: []const u8 = "",
+    item_ids: []const []const u8 = &.{},
+    resources: []const WorkspaceResource = &.{},
+    fencing_token: u64,
+    claimed_at: []const u8,
+    lease_seconds: i64,
+    lease_expires_at: []const u8,
+    heartbeat_at: []const u8,
+    released_at: []const u8 = "",
+    stale_at: []const u8 = "",
+    supersedes: []const u8 = "",
+};
+
+fn cmdWorkspaceClaim(allocator: std.mem.Allocator, args: Args) !u8 {
+    return switch (args.claim_command) {
+        .grant => try cmdWorkspaceClaimGrant(allocator, args),
+        .heartbeat => try cmdWorkspaceClaimHeartbeat(allocator, args),
+        .show => try cmdWorkspaceClaimShow(allocator, args),
+        .list => try cmdWorkspaceClaimList(allocator, args),
+        .release => try cmdWorkspaceClaimRelease(allocator, args),
+        .reclaim_stale => try cmdWorkspaceClaimReclaimStale(allocator, args),
+        .conflicts => try cmdWorkspaceClaimConflicts(allocator, args),
+        .amend => try cmdWorkspaceClaimAmend(allocator, args),
+    };
+}
+
+fn cmdWorkspaceClaimGrant(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace = try loadWorkspaceCheckpoint(allocator, args.workspace);
+    defer workspace.deinit();
+    const workspace_root = workspace.root;
+    const workspace_file = workspace.file;
+    const previous = workspace.parsed.value;
+    const previous_obj = switch (previous) {
+        .object => |obj| obj,
+        else => return error.WorkspaceInvalid,
+    };
+
+    const now = try nowUtcAlloc(allocator);
+    const resources = try parseWorkspaceClaimResources(allocator, args.resources);
+    try ensureWorkspaceClaimNoConflicts(previous_obj, resources, null, now);
+
+    const current_counter = workspaceFencingCounter(previous);
+    const token: u64 = current_counter + 1;
+    const claim_id = try std.fmt.allocPrint(allocator, "claim-{d}", .{token});
+    const lease_seconds = try parseLeaseSeconds(args.lease_seconds orelse "900");
+    const lease_expires_at = try addSecondsUtcAlloc(allocator, @as(i64, @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000))) + lease_seconds);
+    const actor = buildMutationMeta(allocator, args.allow_multiple_in_progress).actor;
+    const executor = if (args.executor) |raw| try normalizeExecutor(allocator, raw) else envTrimmed("ST_EXECUTOR") orelse "manual";
+    const session_id = args.session_id orelse envTrimmed("ST_SESSION") orelse "default";
+    const item_ids = try parseCliIds(allocator, args.ids);
+    const draft = WorkspaceClaimDraft{
+        .claim_id = claim_id,
+        .state = "held",
+        .owner = actor,
+        .executor = executor,
+        .session_id = session_id,
+        .plan_id = args.plan_id orelse "",
+        .item_ids = item_ids,
+        .resources = resources,
+        .fencing_token = token,
+        .claimed_at = now,
+        .lease_seconds = lease_seconds,
+        .lease_expires_at = lease_expires_at,
+        .heartbeat_at = now,
+    };
+
+    var claims_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer claims_writer.deinit();
+    try writeWorkspaceClaimsWithAppend(&claims_writer.writer, previous_obj, draft);
+    const claims_json = try claims_writer.toOwnedSlice();
+    const payload = try renderWorkspaceCheckpointReplacingClaims(allocator, workspace_root, previous, claims_json, token, now);
+    defer allocator.free(payload);
+    try publishWorkspaceClaimCheckpoint(allocator, workspace_root, workspace_file, payload, previous, args, "claim-grant");
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"workspace_claim\":{\"receipt_version\":\"WCL-v1\",\"state\":\"held\",\"claim_id\":");
+    try std.json.Stringify.value(claim_id, .{}, stdout);
+    try stdout.writeAll(",\"session_id\":");
+    try std.json.Stringify.value(session_id, .{}, stdout);
+    try stdout.writeAll(",\"fencing_token\":");
+    try stdout.print("{d}", .{token});
+    try stdout.writeAll(",\"workspace_sequence\":");
+    try stdout.print("{d}", .{workspaceSequence(previous) + 1});
+    try stdout.writeAll(",\"resources\":");
+    try writeWorkspaceResourcesArray(stdout, resources);
+    try stdout.writeAll("}}\n");
+    return 0;
+}
+
+fn cmdWorkspaceClaimHeartbeat(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace = try loadWorkspaceCheckpoint(allocator, args.workspace);
+    defer workspace.deinit();
+    const previous = workspace.parsed.value;
+    const previous_obj = switch (previous) {
+        .object => |obj| obj,
+        else => return error.WorkspaceInvalid,
+    };
+    const claim_id = try requireNonEmptyString(allocator, args.claim_id orelse args.id orelse return error.MissingValue, "--claim");
+    const token = try parseFencingTokenArg(args.fencing_token orelse return error.MissingValue);
+    const now = try nowUtcAlloc(allocator);
+    _ = try validateWorkspaceClaimAuthority(previous_obj, claim_id, args.session_id, token, now);
+
+    const lease_seconds = try workspaceClaimLeaseSeconds(previous_obj, claim_id);
+    const lease_expires_at = try addSecondsUtcAlloc(allocator, @as(i64, @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000))) + lease_seconds);
+    var claims_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer claims_writer.deinit();
+    try writeWorkspaceClaimsWithHeartbeat(&claims_writer.writer, previous_obj, claim_id, lease_expires_at, now);
+    const claims_json = try claims_writer.toOwnedSlice();
+    const payload = try renderWorkspaceCheckpointReplacingClaims(allocator, workspace.root, previous, claims_json, workspaceFencingCounter(previous), now);
+    defer allocator.free(payload);
+    try publishWorkspaceClaimCheckpoint(allocator, workspace.root, workspace.file, payload, previous, args, "claim-heartbeat");
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"workspace_claim_heartbeat\":{\"ok\":true,\"claim_id\":");
+    try std.json.Stringify.value(claim_id, .{}, stdout);
+    try stdout.writeAll(",\"workspace_sequence\":");
+    try stdout.print("{d}", .{workspaceSequence(previous) + 1});
+    try stdout.writeAll("}}\n");
+    return 0;
+}
+
+fn cmdWorkspaceClaimRelease(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace = try loadWorkspaceCheckpoint(allocator, args.workspace);
+    defer workspace.deinit();
+    const previous = workspace.parsed.value;
+    const previous_obj = switch (previous) {
+        .object => |obj| obj,
+        else => return error.WorkspaceInvalid,
+    };
+    const claim_id = try requireNonEmptyString(allocator, args.claim_id orelse args.id orelse return error.MissingValue, "--claim");
+    const token = try parseFencingTokenArg(args.fencing_token orelse return error.MissingValue);
+    const now = try nowUtcAlloc(allocator);
+    _ = try validateWorkspaceClaimAuthority(previous_obj, claim_id, args.session_id, token, now);
+
+    var claims_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer claims_writer.deinit();
+    try writeWorkspaceClaimsWithStateChange(&claims_writer.writer, previous_obj, claim_id, "released", now);
+    const claims_json = try claims_writer.toOwnedSlice();
+    const payload = try renderWorkspaceCheckpointReplacingClaims(allocator, workspace.root, previous, claims_json, workspaceFencingCounter(previous), now);
+    defer allocator.free(payload);
+    try publishWorkspaceClaimCheckpoint(allocator, workspace.root, workspace.file, payload, previous, args, "claim-release");
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"workspace_claim_release\":{\"ok\":true,\"claim_id\":");
+    try std.json.Stringify.value(claim_id, .{}, stdout);
+    try stdout.writeAll(",\"workspace_sequence\":");
+    try stdout.print("{d}", .{workspaceSequence(previous) + 1});
+    try stdout.writeAll("}}\n");
+    return 0;
+}
+
+fn cmdWorkspaceClaimReclaimStale(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace = try loadWorkspaceCheckpoint(allocator, args.workspace);
+    defer workspace.deinit();
+    const previous = workspace.parsed.value;
+    const previous_obj = switch (previous) {
+        .object => |obj| obj,
+        else => return error.WorkspaceInvalid,
+    };
+    const now = if (args.now) |raw| try requireNonEmptyString(allocator, raw, "--now") else try nowUtcAlloc(allocator);
+
+    var reclaimed: usize = 0;
+    var claims_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer claims_writer.deinit();
+    try writeWorkspaceClaimsWithReclaim(&claims_writer.writer, previous_obj, now, &reclaimed);
+    const claims_json = try claims_writer.toOwnedSlice();
+    const payload = try renderWorkspaceCheckpointReplacingClaims(allocator, workspace.root, previous, claims_json, workspaceFencingCounter(previous), now);
+    defer allocator.free(payload);
+    try publishWorkspaceClaimCheckpoint(allocator, workspace.root, workspace.file, payload, previous, args, "claim-reclaim-stale");
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"workspace_claim_reclaim_stale\":{\"reclaimed\":");
+    try stdout.print("{d}", .{reclaimed});
+    try stdout.writeAll(",\"workspace_sequence\":");
+    try stdout.print("{d}", .{workspaceSequence(previous) + 1});
+    try stdout.writeAll("}}\n");
+    return 0;
+}
+
+fn cmdWorkspaceClaimAmend(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace = try loadWorkspaceCheckpoint(allocator, args.workspace);
+    defer workspace.deinit();
+    const previous = workspace.parsed.value;
+    const previous_obj = switch (previous) {
+        .object => |obj| obj,
+        else => return error.WorkspaceInvalid,
+    };
+    const old_claim_id = try requireNonEmptyString(allocator, args.claim_id orelse args.id orelse return error.MissingValue, "--claim");
+    const old_token = try parseFencingTokenArg(args.fencing_token orelse return error.MissingValue);
+    const now = try nowUtcAlloc(allocator);
+    const old_claim = try validateWorkspaceClaimAuthority(previous_obj, old_claim_id, args.session_id, old_token, now);
+    const resources = try parseWorkspaceClaimResources(allocator, args.resources);
+    try ensureWorkspaceClaimNoConflicts(previous_obj, resources, old_claim_id, now);
+
+    const token = workspaceFencingCounter(previous) + 1;
+    const claim_id = try std.fmt.allocPrint(allocator, "claim-{d}", .{token});
+    const lease_seconds = try parseLeaseSeconds(args.lease_seconds orelse "900");
+    const lease_expires_at = try addSecondsUtcAlloc(allocator, @as(i64, @intCast(@divFloor(std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds, 1_000_000_000))) + lease_seconds);
+    const draft = WorkspaceClaimDraft{
+        .claim_id = claim_id,
+        .state = "held",
+        .owner = stringField(old_claim, "owner") orelse "",
+        .executor = stringField(old_claim, "executor") orelse "",
+        .session_id = stringField(old_claim, "session_id") orelse args.session_id orelse "default",
+        .plan_id = stringField(old_claim, "plan_id") orelse "",
+        .item_ids = try workspaceClaimItemIds(allocator, old_claim),
+        .resources = resources,
+        .fencing_token = token,
+        .claimed_at = now,
+        .lease_seconds = lease_seconds,
+        .lease_expires_at = lease_expires_at,
+        .heartbeat_at = now,
+        .supersedes = old_claim_id,
+    };
+
+    var claims_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer claims_writer.deinit();
+    try writeWorkspaceClaimsWithAmend(&claims_writer.writer, previous_obj, old_claim_id, now, draft);
+    const claims_json = try claims_writer.toOwnedSlice();
+    const payload = try renderWorkspaceCheckpointReplacingClaims(allocator, workspace.root, previous, claims_json, token, now);
+    defer allocator.free(payload);
+    try publishWorkspaceClaimCheckpoint(allocator, workspace.root, workspace.file, payload, previous, args, "claim-amend");
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"workspace_claim_amend\":{\"ok\":true,\"old_claim_id\":");
+    try std.json.Stringify.value(old_claim_id, .{}, stdout);
+    try stdout.writeAll(",\"claim_id\":");
+    try std.json.Stringify.value(claim_id, .{}, stdout);
+    try stdout.writeAll(",\"fencing_token\":");
+    try stdout.print("{d}", .{token});
+    try stdout.writeAll(",\"workspace_sequence\":");
+    try stdout.print("{d}", .{workspaceSequence(previous) + 1});
+    try stdout.writeAll("}}\n");
+    return 0;
+}
+
+fn cmdWorkspaceClaimShow(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace = try loadWorkspaceCheckpoint(allocator, args.workspace);
+    defer workspace.deinit();
+    const previous_obj = switch (workspace.parsed.value) {
+        .object => |obj| obj,
+        else => return error.WorkspaceInvalid,
+    };
+    const claim_id = try requireNonEmptyString(allocator, args.claim_id orelse args.id orelse return error.MissingValue, "--claim");
+    const claim = findWorkspaceClaim(previous_obj, claim_id) orelse return error.ClaimMissing;
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"workspace_claim_show\":{\"workspace_sequence\":");
+    try stdout.print("{d}", .{workspaceSequence(workspace.parsed.value)});
+    try stdout.writeAll(",\"claim\":");
+    try std.json.Stringify.value(claim, .{}, stdout);
+    try stdout.writeAll("}}\n");
+    return 0;
+}
+
+fn cmdWorkspaceClaimList(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace = try loadWorkspaceCheckpoint(allocator, args.workspace);
+    defer workspace.deinit();
+    const previous_obj = switch (workspace.parsed.value) {
+        .object => |obj| obj,
+        else => return error.WorkspaceInvalid,
+    };
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"workspace_claim_list\":{\"workspace_sequence\":");
+    try stdout.print("{d}", .{workspaceSequence(workspace.parsed.value)});
+    try stdout.writeAll(",\"claims\":");
+    if (previous_obj.get("claims")) |claims| {
+        try std.json.Stringify.value(claims, .{}, stdout);
+    } else {
+        try stdout.writeAll("[]");
+    }
+    try stdout.writeAll("}}\n");
+    return 0;
+}
+
+fn cmdWorkspaceClaimConflicts(allocator: std.mem.Allocator, args: Args) !u8 {
+    const workspace = try loadWorkspaceCheckpoint(allocator, args.workspace);
+    defer workspace.deinit();
+    const previous_obj = switch (workspace.parsed.value) {
+        .object => |obj| obj,
+        else => return error.WorkspaceInvalid,
+    };
+    const now = try nowUtcAlloc(allocator);
+    const resources = try parseWorkspaceClaimResources(allocator, args.resources);
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"workspace_claim_conflicts\":{\"workspace_sequence\":");
+    try stdout.print("{d}", .{workspaceSequence(workspace.parsed.value)});
+    try stdout.writeAll(",\"conflicts\":[");
+    var emitted = false;
+    if (previous_obj.get("claims")) |claims| {
+        if (claims != .array) return error.WorkspaceInvalid;
+        for (claims.array.items) |claim| {
+            if (!workspaceClaimIsHeldCurrent(claim, now)) continue;
+            if (!try workspaceClaimConflictsWithResources(claim, resources)) continue;
+            if (emitted) try stdout.writeByte(',');
+            try stdout.writeAll("{\"claim_id\":");
+            try std.json.Stringify.value(stringField(claim, "claim_id") orelse "", .{}, stdout);
+            try stdout.writeAll(",\"reason\":\"resource_conflict\"}");
+            emitted = true;
+        }
+    }
+    try stdout.writeAll("]}}\n");
+    return if (emitted) 2 else 0;
+}
+
+const LoadedWorkspaceCheckpoint = struct {
+    allocator: std.mem.Allocator,
+    root: []u8,
+    file: []u8,
+    line: []u8,
+    parsed: std.json.Parsed(std.json.Value),
+
+    fn deinit(self: LoadedWorkspaceCheckpoint) void {
+        self.parsed.deinit();
+        self.allocator.free(self.line);
+        self.allocator.free(self.file);
+        self.allocator.free(self.root);
+    }
+};
+
+fn loadWorkspaceCheckpoint(allocator: std.mem.Allocator, raw_workspace: []const u8) !LoadedWorkspaceCheckpoint {
+    const workspace_root = try normalizeWorkspacePath(allocator, raw_workspace);
+    errdefer allocator.free(workspace_root);
+    const workspace_file = try std.fs.path.join(allocator, &.{ workspace_root, "workspace.jsonl" });
+    errdefer allocator.free(workspace_file);
+    if (!fileExists(workspace_file)) return error.WorkspaceMissing;
+    const line = try readLastJsonlLine(allocator, workspace_file);
+    errdefer allocator.free(line);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+    errdefer parsed.deinit();
+    if (parsed.value != .object) return error.WorkspaceInvalid;
+    return .{ .allocator = allocator, .root = workspace_root, .file = workspace_file, .line = line, .parsed = parsed };
+}
+
+fn publishWorkspaceClaimCheckpoint(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    workspace_file: []const u8,
+    payload: []const u8,
+    previous: std.json.Value,
+    args: Args,
+    operation: []const u8,
+) !void {
+    const current_sequence = workspaceSequence(previous);
+    if (args.expect_workspace_seq) |raw| {
+        const expected_arg = try parseNonNegativeI64(raw);
+        if (expected_arg != current_sequence) return error.WorkspaceSequenceStale;
+    }
+    var receipt = try appendWorkspaceCheckpointTransaction(
+        allocator,
+        workspace_root,
+        workspace_file,
+        payload,
+        current_sequence,
+        operation,
+    );
+    defer receipt.deinit(allocator);
+}
+
+fn workspaceSequence(value: std.json.Value) i64 {
+    return intField(value, "workspace_sequence") orelse 0;
+}
+
+fn workspaceFencingCounter(value: std.json.Value) u64 {
+    const raw = intField(value, "fencing_counter") orelse 0;
+    if (raw <= 0) return 0;
+    return @intCast(raw);
+}
+
+fn parseNonNegativeI64(raw: []const u8) !i64 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const value = try std.fmt.parseInt(i64, trimmed, 10);
+    if (value < 0) return error.InvalidSequence;
+    return value;
+}
+
+fn parseFencingTokenArg(raw: []const u8) !u64 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const value = try std.fmt.parseInt(u64, trimmed, 10);
+    if (value == 0) return error.FencingTokenStale;
+    return value;
+}
+
+fn parseWorkspaceClaimResources(allocator: std.mem.Allocator, raw: []const u8) ![]WorkspaceResource {
+    if (std.mem.trim(u8, raw, " \t\r\n").len == 0) {
+        const inferred = try inferUnknownMutationResource(allocator);
+        const out = try allocator.alloc(WorkspaceResource, 1);
+        out[0] = inferred.resource;
+        return out;
+    }
+
+    var out: std.ArrayList(WorkspaceResource) = .empty;
+    var parts = std.mem.splitScalar(u8, raw, ',');
+    while (parts.next()) |part_raw| {
+        const part = std.mem.trim(u8, part_raw, " \t\r\n");
+        if (part.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, part, ':') orelse return error.InvalidResource;
+        const mode_raw = part[0..colon];
+        const resource_raw = part[colon + 1 ..];
+        const mode = parseWorkspaceResourceModeString(mode_raw) orelse return error.InvalidResource;
+        try out.append(allocator, try parseWorkspaceResource(allocator, resource_raw, mode));
+    }
+    if (out.items.len == 0) return error.InvalidResource;
+    return out.toOwnedSlice(allocator);
+}
+
+fn parseWorkspaceResourceModeString(raw: []const u8) ?WorkspaceResourceMode {
+    if (std.mem.eql(u8, raw, "read")) return .read;
+    if (std.mem.eql(u8, raw, "write")) return .write;
+    if (std.mem.eql(u8, raw, "exclusive")) return .exclusive;
+    return null;
+}
+
+fn workspaceResourceModeString(mode: WorkspaceResourceMode) []const u8 {
+    return switch (mode) {
+        .read => "read",
+        .write => "write",
+        .exclusive => "exclusive",
+    };
+}
+
+fn workspaceResourceKindString(kind: WorkspaceResourceKind) []const u8 {
+    return switch (kind) {
+        .path => "path",
+        .symbol => "symbol",
+        .generated => "generated",
+        .schema => "schema",
+        .service => "service",
+        .git_index => "git:index",
+        .git_branch => "git:branch",
+        .repo_all => "repo:all",
+    };
+}
+
+fn parseWorkspaceResourceKindString(raw: []const u8) ?WorkspaceResourceKind {
+    if (std.mem.eql(u8, raw, "path")) return .path;
+    if (std.mem.eql(u8, raw, "symbol")) return .symbol;
+    if (std.mem.eql(u8, raw, "generated")) return .generated;
+    if (std.mem.eql(u8, raw, "schema")) return .schema;
+    if (std.mem.eql(u8, raw, "service")) return .service;
+    if (std.mem.eql(u8, raw, "git:index")) return .git_index;
+    if (std.mem.eql(u8, raw, "git:branch")) return .git_branch;
+    if (std.mem.eql(u8, raw, "repo:all")) return .repo_all;
+    return null;
+}
+
+fn writeWorkspaceResourceObject(writer: anytype, resource: WorkspaceResource) !void {
+    try writer.writeByte('{');
+    try writer.writeAll("\"kind\":");
+    try std.json.Stringify.value(workspaceResourceKindString(resource.kind), .{}, writer);
+    try writer.writeAll(",\"mode\":");
+    try std.json.Stringify.value(workspaceResourceModeString(resource.mode), .{}, writer);
+    try writer.writeAll(",\"primary\":");
+    try std.json.Stringify.value(resource.primary, .{}, writer);
+    if (resource.secondary.len > 0) {
+        try writer.writeAll(",\"secondary\":");
+        try std.json.Stringify.value(resource.secondary, .{}, writer);
+    }
+    try writer.writeByte('}');
+}
+
+fn writeWorkspaceResourcesArray(writer: anytype, resources: []const WorkspaceResource) !void {
+    try writer.writeByte('[');
+    for (resources, 0..) |resource, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try writeWorkspaceResourceObject(writer, resource);
+    }
+    try writer.writeByte(']');
+}
+
+fn workspaceResourceFromJson(value: std.json.Value) !WorkspaceResource {
+    if (value != .object) return error.WorkspaceInvalid;
+    const kind = parseWorkspaceResourceKindString(stringField(value, "kind") orelse return error.WorkspaceInvalid) orelse return error.WorkspaceInvalid;
+    const mode = parseWorkspaceResourceModeString(stringField(value, "mode") orelse return error.WorkspaceInvalid) orelse return error.WorkspaceInvalid;
+    return .{
+        .kind = kind,
+        .mode = mode,
+        .primary = stringField(value, "primary") orelse "",
+        .secondary = stringField(value, "secondary") orelse "",
+    };
+}
+
+fn ensureWorkspaceClaimNoConflicts(
+    workspace_obj: std.json.ObjectMap,
+    resources: []const WorkspaceResource,
+    except_claim_id: ?[]const u8,
+    now: []const u8,
+) !void {
+    const claims = workspace_obj.get("claims") orelse return;
+    if (claims != .array) return error.WorkspaceInvalid;
+    for (claims.array.items) |claim| {
+        if (except_claim_id) |except| {
+            if (std.mem.eql(u8, stringField(claim, "claim_id") orelse "", except)) continue;
+        }
+        if (!workspaceClaimIsHeldCurrent(claim, now)) continue;
+        if (try workspaceClaimConflictsWithResources(claim, resources)) return error.ResourceConflict;
+    }
+}
+
+fn workspaceClaimConflictsWithResources(claim: std.json.Value, resources: []const WorkspaceResource) !bool {
+    if (claim != .object) return error.WorkspaceInvalid;
+    const claim_resources = claim.object.get("resources") orelse return false;
+    if (claim_resources != .array) return error.WorkspaceInvalid;
+    for (claim_resources.array.items) |entry| {
+        const held = try workspaceResourceFromJson(entry);
+        for (resources) |candidate| {
+            if (workspaceResourcesConflict(held, candidate)) return true;
+        }
+    }
+    return false;
+}
+
+fn workspaceClaimIsHeldCurrent(claim: std.json.Value, now: []const u8) bool {
+    const state = stringField(claim, "state") orelse return false;
+    if (!std.mem.eql(u8, state, "held")) return false;
+    const expires = stringField(claim, "lease_expires_at") orelse "";
+    if (expires.len == 0) return true;
+    return std.mem.order(u8, expires, now) == .gt;
+}
+
+fn validateWorkspaceClaimAuthority(
+    workspace_obj: std.json.ObjectMap,
+    claim_id: []const u8,
+    session_id: ?[]const u8,
+    token: u64,
+    now: []const u8,
+) !std.json.Value {
+    const claim = findWorkspaceClaim(workspace_obj, claim_id) orelse return error.ClaimMissing;
+    const state = stringField(claim, "state") orelse return error.WorkspaceInvalid;
+    if (!std.mem.eql(u8, state, "held")) return error.FencingTokenStale;
+    if (!workspaceClaimIsHeldCurrent(claim, now)) return error.ClaimExpired;
+    const held_token_raw = intField(claim, "fencing_token") orelse return error.WorkspaceInvalid;
+    if (held_token_raw <= 0 or @as(u64, @intCast(held_token_raw)) != token) return error.FencingTokenStale;
+    if (session_id) |wanted| {
+        const held_session = stringField(claim, "session_id") orelse "";
+        if (!std.mem.eql(u8, held_session, wanted)) return error.ClaimOwnerMismatch;
+    }
+    return claim;
+}
+
+fn findWorkspaceClaim(workspace_obj: std.json.ObjectMap, claim_id: []const u8) ?std.json.Value {
+    const claims = workspace_obj.get("claims") orelse return null;
+    if (claims != .array) return null;
+    for (claims.array.items) |claim| {
+        if (std.mem.eql(u8, stringField(claim, "claim_id") orelse "", claim_id)) return claim;
+    }
+    return null;
+}
+
+fn findWorkspacePlanRecord(workspace_obj: std.json.ObjectMap, plan_id: []const u8) ?std.json.Value {
+    const plans = workspace_obj.get("plans") orelse return null;
+    if (plans != .array) return null;
+    for (plans.array.items) |plan_record| {
+        if (std.mem.eql(u8, stringField(plan_record, "plan_id") orelse "", plan_id)) return plan_record;
+    }
+    return null;
+}
+
+fn workspacePlanRecordFingerprintsCurrent(plan_record: std.json.Value, fps: GraphFingerprints) !bool {
+    if (plan_record != .object) return error.WorkspaceInvalid;
+    const registry_fps = plan_record.object.get("graph_fingerprints") orelse return true;
+    if (registry_fps != .object) return error.WorkspaceInvalid;
+    if (registry_fps.object.count() == 0) return true;
+    return graphFingerprintFieldMatches(registry_fps, "structure", fps.structure) and
+        graphFingerprintFieldMatches(registry_fps, "contract", fps.contract) and
+        graphFingerprintFieldMatches(registry_fps, "coverage", fps.coverage) and
+        graphFingerprintFieldMatches(registry_fps, "execution", fps.execution);
+}
+
+fn graphFingerprintFieldMatches(registry_fps: std.json.Value, field: []const u8, current: []const u8) bool {
+    const value = registry_fps.object.get(field) orelse return false;
+    const stored = asString(value) orelse return false;
+    return stored.len > 0 and std.mem.eql(u8, stored, current);
+}
+
+fn workspaceClaimLeaseSeconds(workspace_obj: std.json.ObjectMap, claim_id: []const u8) !i64 {
+    const claim = findWorkspaceClaim(workspace_obj, claim_id) orelse return error.ClaimMissing;
+    const raw = intField(claim, "lease_seconds") orelse 900;
+    if (raw <= 0) return 900;
+    return raw;
+}
+
+fn workspaceClaimItemIds(allocator: std.mem.Allocator, claim: std.json.Value) ![]const []const u8 {
+    if (claim != .object) return error.WorkspaceInvalid;
+    const value = claim.object.get("item_ids") orelse return &.{};
+    if (value != .array) return error.WorkspaceInvalid;
+    var out: std.ArrayList([]const u8) = .empty;
+    for (value.array.items) |entry| {
+        if (entry != .string) return error.WorkspaceInvalid;
+        try out.append(allocator, entry.string);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn writeWorkspaceClaimObject(writer: anytype, claim: WorkspaceClaimDraft) !void {
+    try writer.writeByte('{');
+    try writer.writeAll("\"claim_id\":");
+    try std.json.Stringify.value(claim.claim_id, .{}, writer);
+    try writer.writeAll(",\"state\":");
+    try std.json.Stringify.value(claim.state, .{}, writer);
+    try writer.writeAll(",\"owner\":");
+    try std.json.Stringify.value(claim.owner, .{}, writer);
+    try writer.writeAll(",\"executor\":");
+    try std.json.Stringify.value(claim.executor, .{}, writer);
+    try writer.writeAll(",\"session_id\":");
+    try std.json.Stringify.value(claim.session_id, .{}, writer);
+    try writer.writeAll(",\"plan_id\":");
+    try std.json.Stringify.value(claim.plan_id, .{}, writer);
+    try writer.writeAll(",\"item_ids\":[");
+    for (claim.item_ids, 0..) |item_id, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try std.json.Stringify.value(item_id, .{}, writer);
+    }
+    try writer.writeAll("],\"resources\":");
+    try writeWorkspaceResourcesArray(writer, claim.resources);
+    try writer.writeAll(",\"fencing_token\":");
+    try writer.print("{d}", .{claim.fencing_token});
+    try writer.writeAll(",\"claimed_at\":");
+    try std.json.Stringify.value(claim.claimed_at, .{}, writer);
+    try writer.writeAll(",\"lease_seconds\":");
+    try writer.print("{d}", .{claim.lease_seconds});
+    try writer.writeAll(",\"lease_expires_at\":");
+    try std.json.Stringify.value(claim.lease_expires_at, .{}, writer);
+    try writer.writeAll(",\"heartbeat_at\":");
+    try std.json.Stringify.value(claim.heartbeat_at, .{}, writer);
+    if (claim.released_at.len > 0) {
+        try writer.writeAll(",\"released_at\":");
+        try std.json.Stringify.value(claim.released_at, .{}, writer);
+    }
+    if (claim.stale_at.len > 0) {
+        try writer.writeAll(",\"stale_at\":");
+        try std.json.Stringify.value(claim.stale_at, .{}, writer);
+    }
+    if (claim.supersedes.len > 0) {
+        try writer.writeAll(",\"supersedes\":");
+        try std.json.Stringify.value(claim.supersedes, .{}, writer);
+    }
+    try writer.writeByte('}');
+}
+
+fn writeExistingWorkspaceClaimObject(
+    writer: anytype,
+    entry: std.json.Value,
+    state: ?[]const u8,
+    lease_expires_at: ?[]const u8,
+    heartbeat_at: ?[]const u8,
+    released_at: ?[]const u8,
+    stale_at: ?[]const u8,
+) !void {
+    if (entry != .object) return error.WorkspaceInvalid;
+    const obj = entry.object;
+    try writer.writeByte('{');
+    try writer.writeAll("\"claim_id\":");
+    try std.json.Stringify.value(stringField(entry, "claim_id") orelse return error.WorkspaceInvalid, .{}, writer);
+    try writer.writeAll(",\"state\":");
+    try std.json.Stringify.value(state orelse stringField(entry, "state") orelse return error.WorkspaceInvalid, .{}, writer);
+    try writer.writeAll(",\"owner\":");
+    try std.json.Stringify.value(stringField(entry, "owner") orelse "", .{}, writer);
+    try writer.writeAll(",\"executor\":");
+    try std.json.Stringify.value(stringField(entry, "executor") orelse "", .{}, writer);
+    try writer.writeAll(",\"session_id\":");
+    try std.json.Stringify.value(stringField(entry, "session_id") orelse "", .{}, writer);
+    try writer.writeAll(",\"plan_id\":");
+    try std.json.Stringify.value(stringField(entry, "plan_id") orelse "", .{}, writer);
+    try writer.writeAll(",\"item_ids\":");
+    if (obj.get("item_ids")) |item_ids| {
+        try std.json.Stringify.value(item_ids, .{}, writer);
+    } else {
+        try writer.writeAll("[]");
+    }
+    try writer.writeAll(",\"resources\":");
+    if (obj.get("resources")) |resources| {
+        try std.json.Stringify.value(resources, .{}, writer);
+    } else {
+        try writer.writeAll("[]");
+    }
+    try writer.writeAll(",\"fencing_token\":");
+    try writer.print("{d}", .{intField(entry, "fencing_token") orelse 0});
+    try writer.writeAll(",\"claimed_at\":");
+    try std.json.Stringify.value(stringField(entry, "claimed_at") orelse "", .{}, writer);
+    try writer.writeAll(",\"lease_seconds\":");
+    try writer.print("{d}", .{intField(entry, "lease_seconds") orelse 900});
+    try writer.writeAll(",\"lease_expires_at\":");
+    try std.json.Stringify.value(lease_expires_at orelse stringField(entry, "lease_expires_at") orelse "", .{}, writer);
+    try writer.writeAll(",\"heartbeat_at\":");
+    try std.json.Stringify.value(heartbeat_at orelse stringField(entry, "heartbeat_at") orelse "", .{}, writer);
+    if (released_at orelse stringField(entry, "released_at")) |value| {
+        if (value.len > 0) {
+            try writer.writeAll(",\"released_at\":");
+            try std.json.Stringify.value(value, .{}, writer);
+        }
+    }
+    if (stale_at orelse stringField(entry, "stale_at")) |value| {
+        if (value.len > 0) {
+            try writer.writeAll(",\"stale_at\":");
+            try std.json.Stringify.value(value, .{}, writer);
+        }
+    }
+    if (stringField(entry, "supersedes")) |value| {
+        try writer.writeAll(",\"supersedes\":");
+        try std.json.Stringify.value(value, .{}, writer);
+    }
+    try writer.writeByte('}');
+}
+
+fn writeWorkspaceClaimsWithAppend(writer: anytype, workspace_obj: std.json.ObjectMap, draft: WorkspaceClaimDraft) !void {
+    try writer.writeByte('[');
+    var emitted = false;
+    if (workspace_obj.get("claims")) |claims| {
+        if (claims != .array) return error.WorkspaceInvalid;
+        for (claims.array.items) |entry| {
+            if (emitted) try writer.writeByte(',');
+            try std.json.Stringify.value(entry, .{}, writer);
+            emitted = true;
+        }
+    }
+    if (emitted) try writer.writeByte(',');
+    try writeWorkspaceClaimObject(writer, draft);
+    try writer.writeByte(']');
+}
+
+fn writeWorkspaceClaimsWithHeartbeat(writer: anytype, workspace_obj: std.json.ObjectMap, claim_id: []const u8, lease_expires_at: []const u8, now: []const u8) !void {
+    try writer.writeByte('[');
+    var emitted = false;
+    const claims = workspace_obj.get("claims") orelse return error.ClaimMissing;
+    if (claims != .array) return error.WorkspaceInvalid;
+    for (claims.array.items) |entry| {
+        if (emitted) try writer.writeByte(',');
+        if (std.mem.eql(u8, stringField(entry, "claim_id") orelse "", claim_id)) {
+            try writeExistingWorkspaceClaimObject(writer, entry, null, lease_expires_at, now, null, null);
+        } else {
+            try std.json.Stringify.value(entry, .{}, writer);
+        }
+        emitted = true;
+    }
+    try writer.writeByte(']');
+}
+
+fn writeWorkspaceClaimsWithStateChange(writer: anytype, workspace_obj: std.json.ObjectMap, claim_id: []const u8, state: []const u8, now: []const u8) !void {
+    try writer.writeByte('[');
+    var emitted = false;
+    const claims = workspace_obj.get("claims") orelse return error.ClaimMissing;
+    if (claims != .array) return error.WorkspaceInvalid;
+    for (claims.array.items) |entry| {
+        if (emitted) try writer.writeByte(',');
+        if (std.mem.eql(u8, stringField(entry, "claim_id") orelse "", claim_id)) {
+            const released_at = if (std.mem.eql(u8, state, "released")) now else null;
+            const stale_at = if (std.mem.eql(u8, state, "stale")) now else null;
+            try writeExistingWorkspaceClaimObject(writer, entry, state, "", now, released_at, stale_at);
+        } else {
+            try std.json.Stringify.value(entry, .{}, writer);
+        }
+        emitted = true;
+    }
+    try writer.writeByte(']');
+}
+
+fn writeWorkspaceClaimsWithReclaim(writer: anytype, workspace_obj: std.json.ObjectMap, now: []const u8, reclaimed: *usize) !void {
+    try writer.writeByte('[');
+    var emitted = false;
+    if (workspace_obj.get("claims")) |claims| {
+        if (claims != .array) return error.WorkspaceInvalid;
+        for (claims.array.items) |entry| {
+            if (emitted) try writer.writeByte(',');
+            const state = stringField(entry, "state") orelse @as([]const u8, "");
+            if (state.len > 0 and !workspaceClaimIsHeldCurrent(entry, now) and std.mem.eql(u8, state, "held")) {
+                try writeExistingWorkspaceClaimObject(writer, entry, "stale", "", now, null, now);
+                reclaimed.* += 1;
+            } else {
+                try std.json.Stringify.value(entry, .{}, writer);
+            }
+            emitted = true;
+        }
+    }
+    try writer.writeByte(']');
+}
+
+fn writeWorkspaceClaimsWithAmend(writer: anytype, workspace_obj: std.json.ObjectMap, old_claim_id: []const u8, now: []const u8, draft: WorkspaceClaimDraft) !void {
+    try writer.writeByte('[');
+    var emitted = false;
+    const claims = workspace_obj.get("claims") orelse return error.ClaimMissing;
+    if (claims != .array) return error.WorkspaceInvalid;
+    for (claims.array.items) |entry| {
+        if (emitted) try writer.writeByte(',');
+        if (std.mem.eql(u8, stringField(entry, "claim_id") orelse "", old_claim_id)) {
+            try writeExistingWorkspaceClaimObject(writer, entry, "released", "", now, now, null);
+        } else {
+            try std.json.Stringify.value(entry, .{}, writer);
+        }
+        emitted = true;
+    }
+    if (emitted) try writer.writeByte(',');
+    try writeWorkspaceClaimObject(writer, draft);
+    try writer.writeByte(']');
+}
+
+fn renderWorkspaceCheckpointReplacingClaims(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    previous: std.json.Value,
+    claims_json: []const u8,
+    fencing_counter: u64,
+    now: []const u8,
+) ![]u8 {
+    const previous_obj = switch (previous) {
+        .object => |obj| obj,
+        else => return error.WorkspaceInvalid,
+    };
+    const plans_value = previous_obj.get("plans") orelse return error.WorkspaceInvalid;
+    if (plans_value != .array) return error.WorkspaceInvalid;
+    const workspace_sequence = workspaceSequence(previous) + 1;
+    const artifact_root = stringField(previous, "artifact_root") orelse ".ledger";
+    const st_root = stringField(previous, "st_root") orelse workspace_root;
+    const created_at = stringField(previous, "created_at") orelse now;
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"lane\":\"checkpoint\",\"schema\":\"STW-v1\",\"workspace_sequence\":");
+    try writer.print("{d}", .{workspace_sequence});
+    try writer.writeAll(",\"artifact_root\":");
+    try std.json.Stringify.value(artifact_root, .{}, writer);
+    try writer.writeAll(",\"st_root\":");
+    try std.json.Stringify.value(st_root, .{}, writer);
+    try writer.writeAll(",\"created_at\":");
+    try std.json.Stringify.value(created_at, .{}, writer);
+    try writer.writeAll(",\"updated_at\":");
+    try std.json.Stringify.value(now, .{}, writer);
+    try writer.writeAll(",\"target_branch\":");
+    try std.json.Stringify.value(previous_obj.get("target_branch") orelse std.json.Value{ .null = {} }, .{}, writer);
+    try writer.writeAll(",\"target_head\":");
+    try std.json.Stringify.value(previous_obj.get("target_head") orelse std.json.Value{ .null = {} }, .{}, writer);
+    try writer.writeAll(",\"branch_epoch\":");
+    try writer.print("{d}", .{intField(previous, "branch_epoch") orelse 0});
+    try writer.writeAll(",\"plans\":");
+    try std.json.Stringify.value(plans_value, .{}, writer);
+    try writer.writeAll(",\"cross_plan_edges\":");
+    if (previous_obj.get("cross_plan_edges")) |cross_plan_edges| {
+        try std.json.Stringify.value(cross_plan_edges, .{}, writer);
+    } else {
+        try writer.writeAll("[]");
+    }
+    try writer.writeAll(",\"claims\":");
+    try writer.writeAll(claims_json);
+    try writer.writeAll(",\"fencing_counter\":");
+    try writer.print("{d}", .{fencing_counter});
+    try writer.writeAll(",\"policy\":");
+    if (previous_obj.get("policy")) |policy| {
+        try std.json.Stringify.value(policy, .{}, writer);
+    } else {
+        try writer.writeAll("{\"fail_closed\":true,\"workspace_v1\":true}");
+    }
+    try writer.writeAll("}\n");
+    return out.toOwnedSlice();
+}
+
+fn renderWorkspaceCheckpointWithBranchState(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    previous: std.json.Value,
+    target_branch: []const u8,
+    target_head: []const u8,
+    branch_epoch: i64,
+    now: []const u8,
+) ![]u8 {
+    const previous_obj = switch (previous) {
+        .object => |obj| obj,
+        else => return error.WorkspaceInvalid,
+    };
+    const plans_value = previous_obj.get("plans") orelse return error.WorkspaceInvalid;
+    if (plans_value != .array) return error.WorkspaceInvalid;
+    const workspace_sequence = workspaceSequence(previous) + 1;
+    const artifact_root = stringField(previous, "artifact_root") orelse ".ledger";
+    const st_root = stringField(previous, "st_root") orelse workspace_root;
+    const created_at = stringField(previous, "created_at") orelse now;
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"lane\":\"checkpoint\",\"schema\":\"STW-v1\",\"workspace_sequence\":");
+    try writer.print("{d}", .{workspace_sequence});
+    try writer.writeAll(",\"artifact_root\":");
+    try std.json.Stringify.value(artifact_root, .{}, writer);
+    try writer.writeAll(",\"st_root\":");
+    try std.json.Stringify.value(st_root, .{}, writer);
+    try writer.writeAll(",\"created_at\":");
+    try std.json.Stringify.value(created_at, .{}, writer);
+    try writer.writeAll(",\"updated_at\":");
+    try std.json.Stringify.value(now, .{}, writer);
+    try writer.writeAll(",\"target_branch\":");
+    try std.json.Stringify.value(target_branch, .{}, writer);
+    try writer.writeAll(",\"target_head\":");
+    try std.json.Stringify.value(target_head, .{}, writer);
+    try writer.writeAll(",\"branch_epoch\":");
+    try writer.print("{d}", .{branch_epoch});
+    try writer.writeAll(",\"plans\":");
+    try std.json.Stringify.value(plans_value, .{}, writer);
+    try writer.writeAll(",\"cross_plan_edges\":");
+    if (previous_obj.get("cross_plan_edges")) |cross_plan_edges| {
+        try std.json.Stringify.value(cross_plan_edges, .{}, writer);
+    } else {
+        try writer.writeAll("[]");
+    }
+    try writeWorkspaceAuthorityFields(writer, previous_obj);
+    try writer.writeAll(",\"policy\":");
+    if (previous_obj.get("policy")) |policy| {
+        try std.json.Stringify.value(policy, .{}, writer);
+    } else {
+        try writer.writeAll("{\"fail_closed\":true,\"workspace_v1\":true}");
+    }
+    try writer.writeAll("}\n");
+    return out.toOwnedSlice();
+}
+
+fn cmdPlanCrossLink(allocator: std.mem.Allocator, args: Args, op: CrossPlanEdgeOp) !u8 {
+    const workspace_root = try normalizeWorkspacePath(allocator, args.workspace);
+    defer allocator.free(workspace_root);
+    const workspace_file = try std.fs.path.join(allocator, &.{ workspace_root, "workspace.jsonl" });
+    defer allocator.free(workspace_file);
+    if (!fileExists(workspace_file)) return error.WorkspaceMissing;
+
+    const from_ref = try parseQualifiedRef(allocator, args.from_ref orelse return error.MissingValue);
+    defer from_ref.deinit(allocator);
+    const to_ref = try parseQualifiedRef(allocator, args.to_ref orelse return error.MissingValue);
+    defer to_ref.deinit(allocator);
+    const edge_type = try normalizeCrossPlanEdgeType(args.link_type);
+    const edge = CrossPlanEdge{ .from = from_ref.canonical, .to = to_ref.canonical, .edge_type = edge_type };
+
+    const checkpoint_line = try readLastJsonlLine(allocator, workspace_file);
+    defer allocator.free(checkpoint_line);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, checkpoint_line, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.WorkspaceInvalid;
+    const plans_value = parsed.value.object.get("plans") orelse return error.WorkspaceInvalid;
+    if (plans_value != .array) return error.WorkspaceInvalid;
+    const edges_value = parsed.value.object.get("cross_plan_edges");
+    if (edges_value) |value| {
+        if (value != .array) return error.WorkspaceInvalid;
+    }
+
+    try validateQualifiedRefTarget(allocator, workspace_root, plans_value, from_ref);
+    try validateQualifiedRefTarget(allocator, workspace_root, plans_value, to_ref);
+
+    const exists = if (edges_value) |value| try crossPlanEdgeExists(value, edge) else false;
+    switch (op) {
+        .link => if (exists) return error.CrossPlanEdgeExists,
+        .unlink => if (!exists) return error.CrossPlanEdgeMissing,
+    }
+
+    const now = try nowUtcAlloc(allocator);
+    defer allocator.free(now);
+    const workspace_payload = try renderWorkspaceCheckpointWithCrossPlanEdge(allocator, workspace_root, parsed.value, edge, op, now);
+    defer allocator.free(workspace_payload);
+    var receipt = try appendWorkspaceCheckpointTransaction(
+        allocator,
+        workspace_root,
+        workspace_file,
+        workspace_payload,
+        intField(parsed.value, "workspace_sequence") orelse 0,
+        if (op == .link) "plan-link" else "plan-unlink",
+    );
+    defer receipt.deinit(allocator);
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    if (args.format == .json) {
+        try stdout.writeAll("{\"plan_");
+        try stdout.writeAll(if (op == .link) "link" else "unlink");
+        try stdout.writeAll("\":{\"ok\":true,\"from\":");
+        try std.json.Stringify.value(edge.from, .{}, stdout);
+        try stdout.writeAll(",\"to\":");
+        try std.json.Stringify.value(edge.to, .{}, stdout);
+        try stdout.writeAll(",\"type\":");
+        try std.json.Stringify.value(edge.edge_type, .{}, stdout);
+        try stdout.writeAll(",\"workspace_sequence\":");
+        try stdout.print("{d}", .{(intField(parsed.value, "workspace_sequence") orelse 0) + 1});
+        try stdout.writeAll("}}\n");
+    } else {
+        try stdout.print("{s} cross-plan edge {s} -> {s} ({s})\n", .{ if (op == .link) "linked" else "unlinked", edge.from, edge.to, edge.edge_type });
+    }
+    return 0;
+}
+
+fn parseQualifiedRef(allocator: std.mem.Allocator, raw: []const u8) !QualifiedRef {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const prefix = "plan://";
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return error.InvalidQualifiedRef;
+    const rest = trimmed[prefix.len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.InvalidQualifiedRef;
+    const plan_part = rest[0..slash];
+    const item_part = rest[slash + 1 ..];
+    if (item_part.len == 0 or std.mem.indexOfScalar(u8, item_part, '/') != null or std.mem.indexOfScalar(u8, item_part, 0) != null) {
+        return error.InvalidQualifiedRef;
+    }
+    const plan_id = try normalizePlanId(allocator, plan_part);
+    errdefer allocator.free(plan_id);
+    const item_id = try requireNonEmptyString(allocator, item_part, "qualified item id");
+    errdefer allocator.free(item_id);
+    const canonical = try std.fmt.allocPrint(allocator, "plan://{s}/{s}", .{ plan_id, item_id });
+    return .{ .plan_id = plan_id, .item_id = item_id, .canonical = canonical };
+}
+
+fn normalizeCrossPlanEdgeType(raw: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.mem.eql(u8, trimmed, "hard")) return "hard";
+    if (std.mem.eql(u8, trimmed, "nonblocking")) return "nonblocking";
+    return error.InvalidCrossPlanEdgeType;
+}
+
+fn validateQualifiedRefTarget(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    plans_value: std.json.Value,
+    ref: QualifiedRef,
+) !void {
+    const graph_ref = try workspacePlanGraphRefForId(allocator, plans_value, ref.plan_id);
+    defer allocator.free(graph_ref);
+    const plan_file = try std.fs.path.join(allocator, &.{ workspace_root, graph_ref });
+    defer allocator.free(plan_file);
+    var loaded = try loadValidatedState(allocator, plan_file, false);
+    defer loaded.state.deinit();
+    if (loaded.state.getConst(ref.item_id) == null) return error.UnknownItemId;
+}
+
+fn workspacePlanGraphRefForId(allocator: std.mem.Allocator, plans_value: std.json.Value, plan_id: []const u8) ![]u8 {
+    if (plans_value != .array) return error.WorkspaceInvalid;
+    for (plans_value.array.items) |entry| {
+        if (entry != .object) return error.WorkspaceInvalid;
+        const entry_plan_id = stringField(entry, "plan_id") orelse return error.WorkspaceInvalid;
+        if (std.mem.eql(u8, entry_plan_id, plan_id)) {
+            return allocator.dupe(u8, stringField(entry, "graph_ref") orelse return error.WorkspaceInvalid);
+        }
+    }
+    return error.PlanMissing;
+}
+
+fn crossPlanEdgeExists(edges_value: std.json.Value, edge: CrossPlanEdge) !bool {
+    if (edges_value != .array) return error.WorkspaceInvalid;
+    for (edges_value.array.items) |entry| {
+        if (entry != .object) return error.WorkspaceInvalid;
+        if (crossPlanEdgeMatches(entry, edge)) return true;
+    }
+    return false;
+}
+
+fn crossPlanEdgeMatches(entry: std.json.Value, edge: CrossPlanEdge) bool {
+    return std.mem.eql(u8, stringField(entry, "from") orelse "", edge.from) and
+        std.mem.eql(u8, stringField(entry, "to") orelse "", edge.to) and
+        std.mem.eql(u8, stringField(entry, "type") orelse "", edge.edge_type);
+}
+
+fn parseWorkspaceResource(allocator: std.mem.Allocator, raw: []const u8, mode: WorkspaceResourceMode) !WorkspaceResource {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.mem.startsWith(u8, trimmed, "path:")) {
+        const path = try normalizeResourcePath(allocator, trimmed["path:".len..]);
+        return .{ .kind = .path, .mode = mode, .primary = path };
+    }
+    if (std.mem.startsWith(u8, trimmed, "symbol:")) {
+        const body = trimmed["symbol:".len..];
+        const marker = std.mem.indexOfScalar(u8, body, '#') orelse return error.InvalidResource;
+        if (std.mem.indexOfScalar(u8, body[marker + 1 ..], '#') != null) return error.InvalidResource;
+        const path = try normalizeResourcePath(allocator, body[0..marker]);
+        errdefer allocator.free(path);
+        const symbol = try normalizeResourceIdentifier(allocator, body[marker + 1 ..], false);
+        return .{ .kind = .symbol, .mode = mode, .primary = path, .secondary = symbol };
+    }
+    if (std.mem.startsWith(u8, trimmed, "generated:")) {
+        const name = try normalizeResourceIdentifier(allocator, trimmed["generated:".len..], true);
+        return .{ .kind = .generated, .mode = mode, .primary = name };
+    }
+    if (std.mem.startsWith(u8, trimmed, "schema:")) {
+        const name = try normalizeResourceIdentifier(allocator, trimmed["schema:".len..], true);
+        return .{ .kind = .schema, .mode = mode, .primary = name };
+    }
+    if (std.mem.startsWith(u8, trimmed, "service:")) {
+        const name = try normalizeResourceIdentifier(allocator, trimmed["service:".len..], true);
+        return .{ .kind = .service, .mode = mode, .primary = name };
+    }
+    if (std.mem.eql(u8, trimmed, "git:index")) {
+        return .{ .kind = .git_index, .mode = mode, .primary = try allocator.dupe(u8, "index") };
+    }
+    if (std.mem.startsWith(u8, trimmed, "git:branch:")) {
+        const branch = try normalizeGitBranchResource(allocator, trimmed["git:branch:".len..]);
+        return .{ .kind = .git_branch, .mode = mode, .primary = branch };
+    }
+    if (std.mem.eql(u8, trimmed, "repo:all")) {
+        return .{ .kind = .repo_all, .mode = mode, .primary = try allocator.dupe(u8, "all") };
+    }
+    return error.InvalidResource;
+}
+
+fn inferUnknownMutationResource(allocator: std.mem.Allocator) !InferredWorkspaceResource {
+    return .{
+        .resource = .{ .kind = .repo_all, .mode = .exclusive, .primary = try allocator.dupe(u8, "all") },
+        .confidence = "low",
+    };
+}
+
+fn workspaceResourcesConflict(a: WorkspaceResource, b: WorkspaceResource) bool {
+    if (a.kind == .repo_all or b.kind == .repo_all) return true;
+    if (workspaceResourcePathLike(a) and workspaceResourcePathLike(b)) {
+        return resourcePathsOverlap(a.primary, b.primary) and resourceModesConflict(a.mode, b.mode);
+    }
+    if (a.kind != b.kind) return false;
+    if (!std.mem.eql(u8, a.primary, b.primary)) return false;
+    return resourceModesConflict(a.mode, b.mode);
+}
+
+fn workspaceResourcePathLike(resource: WorkspaceResource) bool {
+    return resource.kind == .path or resource.kind == .symbol;
+}
+
+fn resourceModesConflict(a: WorkspaceResourceMode, b: WorkspaceResourceMode) bool {
+    if (a == .exclusive or b == .exclusive) return true;
+    return !(a == .read and b == .read);
+}
+
+fn resourcePathsOverlap(a: []const u8, b: []const u8) bool {
+    if (std.mem.eql(u8, a, b)) return true;
+    return pathIsAncestor(a, b) or pathIsAncestor(b, a);
+}
+
+fn pathIsAncestor(parent: []const u8, child: []const u8) bool {
+    return child.len > parent.len and
+        std.mem.startsWith(u8, child, parent) and
+        child[parent.len] == '/';
+}
+
+fn normalizeResourcePath(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0 or std.mem.indexOfScalar(u8, trimmed, 0) != null) return error.InvalidResource;
+    if (std.fs.path.isAbsolute(trimmed)) return error.InvalidResource;
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var wrote = false;
+    var components = std.mem.splitAny(u8, trimmed, "/\\");
+    while (components.next()) |component| {
+        if (component.len == 0 or std.mem.eql(u8, component, ".")) continue;
+        if (std.mem.eql(u8, component, "..")) return error.InvalidResource;
+        if (wrote) try out.writer.writeByte('/');
+        try out.writer.writeAll(component);
+        wrote = true;
+    }
+    if (!wrote) return error.InvalidResource;
+    const normalized = try out.toOwnedSlice();
+    errdefer allocator.free(normalized);
+    try durable_store.rejectSymlinkComponents(normalized);
+    return normalized;
+}
+
+fn normalizeResourceIdentifier(allocator: std.mem.Allocator, raw: []const u8, lowercase: bool) ![]u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0 or std.mem.indexOfScalar(u8, trimmed, 0) != null) return error.InvalidResource;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    for (trimmed) |c| {
+        const ok = std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.';
+        if (!ok) return error.InvalidResource;
+        try out.writer.writeByte(if (lowercase) std.ascii.toLower(c) else c);
+    }
+    return out.toOwnedSlice();
+}
+
+fn normalizeGitBranchResource(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0 or std.mem.indexOfScalar(u8, trimmed, 0) != null) return error.InvalidResource;
+    if (trimmed[0] == '/' or trimmed[trimmed.len - 1] == '/' or std.mem.indexOf(u8, trimmed, "..") != null) return error.InvalidResource;
+    for (trimmed) |c| {
+        const ok = std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '.' or c == '/';
+        if (!ok) return error.InvalidResource;
+    }
+    return allocator.dupe(u8, trimmed);
+}
+
+fn planLifecycleTransitionAllowed(from_state: []const u8, target_state: []const u8) bool {
+    if (std.mem.eql(u8, target_state, "paused")) {
+        return std.mem.eql(u8, from_state, "active");
+    }
+    if (std.mem.eql(u8, target_state, "active")) {
+        return std.mem.eql(u8, from_state, "paused");
+    }
+    if (std.mem.eql(u8, target_state, "completed")) {
+        return std.mem.eql(u8, from_state, "active") or std.mem.eql(u8, from_state, "paused");
+    }
+    if (std.mem.eql(u8, target_state, "archived")) {
+        return std.mem.eql(u8, from_state, "paused") or std.mem.eql(u8, from_state, "completed");
+    }
+    return false;
+}
+
+fn appendWorkspaceCheckpointTransaction(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    workspace_file: []const u8,
+    checkpoint_line: []const u8,
+    expected_sequence: i64,
+    operation: []const u8,
+) !durable_store.JsonlTransactionReceipt {
+    return publishWorkspaceCheckpointTransaction(
+        allocator,
+        workspace_root,
+        workspace_file,
+        checkpoint_line,
+        expected_sequence,
+        operation,
+        .append,
+        false,
+    );
+}
+
+fn publishWorkspaceCheckpointTransaction(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    workspace_file: []const u8,
+    checkpoint_line: []const u8,
+    expected_sequence: i64,
+    operation: []const u8,
+    mode: durable_store.JsonlTransactionMode,
+    allow_sequence_reset: bool,
+) !durable_store.JsonlTransactionReceipt {
+    const locks_dir = try workspaceLocksDirAlloc(allocator, workspace_root);
+    defer allocator.free(locks_dir);
+    const transactions_dir = try workspaceTransactionsDirAlloc(allocator, workspace_root);
+    defer allocator.free(transactions_dir);
+    return durable_store.appendJsonlCheckpointTransaction(
+        allocator,
+        workspace_file,
+        locks_dir,
+        transactions_dir,
+        checkpoint_line,
+        .{
+            .expected_sequence = expected_sequence,
+            .sequence_field = "workspace_sequence",
+            .operation = operation,
+            .max_existing_bytes = 1024 * 1024,
+            .mode = mode,
+            .allow_sequence_reset = allow_sequence_reset,
+        },
+    );
+}
+
+fn workspaceLocksDirAlloc(allocator: std.mem.Allocator, workspace_root: []const u8) ![]u8 {
+    return std.fs.path.join(allocator, &.{ workspace_root, "locks" });
+}
+
+fn workspaceTransactionsDirAlloc(allocator: std.mem.Allocator, workspace_root: []const u8) ![]u8 {
+    return std.fs.path.join(allocator, &.{ workspace_root, "transactions" });
+}
+
+fn normalizeWorkspacePath(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const trimmed = try requireNonEmptyString(allocator, raw, "--workspace");
+    if (std.mem.indexOfScalar(u8, trimmed, 0) != null) return error.InvalidWorkspacePath;
+
+    var components = std.mem.splitAny(u8, trimmed, "/\\");
+    while (components.next()) |component| {
+        if (std.mem.eql(u8, component, "..")) return error.InvalidWorkspacePath;
+    }
+    return allocator.dupe(u8, trimmed);
+}
+
+fn normalizePlanId(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const trimmed = try requireNonEmptyString(allocator, raw, "--plan");
+    if (trimmed.len > 128) return error.InvalidPlanId;
+    for (trimmed) |c| {
+        const ok = std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.';
+        if (!ok) return error.InvalidPlanId;
+    }
+    if (std.mem.eql(u8, trimmed, ".") or std.mem.eql(u8, trimmed, "..")) return error.InvalidPlanId;
+    if (std.mem.indexOf(u8, trimmed, "..") != null) return error.InvalidPlanId;
+    return allocator.dupe(u8, trimmed);
+}
+
+fn readLastJsonlLine(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const data = try durable_store.readRegularFileNoSymlink(allocator, path, 1024 * 1024);
+    defer allocator.free(data);
+    var last: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len != 0) last = line;
+    }
+    if (last.len == 0) return error.WorkspaceInvalid;
+    return allocator.dupe(u8, last);
+}
+
+fn workspacePlanGraphRefAlloc(allocator: std.mem.Allocator, plan_id: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "plans/{s}/plan.jsonl", .{plan_id});
+}
+
+fn renderInitialWorkspacePlanCheckpoint(allocator: std.mem.Allocator, plan_id: []const u8, now: []const u8) ![]u8 {
+    const plan_id_json = try jsonStringAlloc(allocator, plan_id);
+    defer allocator.free(plan_id_json);
+    const now_json = try jsonStringAlloc(allocator, now);
+    defer allocator.free(now_json);
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"v\":4,\"ts\":{s},\"lane\":\"event\",\"seq\":1,\"op\":\"replace\",\"items\":[],\"graph\":{{\"version\":2,\"policy\":{{\"completion_requires_proof\":true}},\"intent\":[],\"waivers\":[],\"debt\":[],\"proof_actions\":[],\"polish\":{{\"session_id\":\"\",\"passes\":[]}},\"fingerprints\":{{}}}},\"mutation\":{{\"actor\":\"st\",\"session\":\"workspace-plan-create\"}}}}\n" ++
+            "{{\"v\":4,\"ts\":{s},\"lane\":\"checkpoint\",\"seq\":1,\"plan_id\":{s},\"plan_sequence\":1,\"items\":[],\"graph\":{{\"version\":2,\"policy\":{{\"completion_requires_proof\":true}},\"intent\":[],\"waivers\":[],\"debt\":[],\"proof_actions\":[],\"polish\":{{\"session_id\":\"\",\"passes\":[]}},\"fingerprints\":{{}}}},\"mutation\":{{\"actor\":\"st\",\"session\":\"workspace-plan-create\"}}}}\n",
+        .{ now_json, now_json, plan_id_json },
+    );
+}
+
+fn renderMigratedWorkspaceCheckpoint(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    plan_id: []const u8,
+    graph_ref: []const u8,
+    plan_sequence: i64,
+    fingerprints: GraphFingerprints,
+    now: []const u8,
+) ![]u8 {
+    const workspace_json = try jsonStringAlloc(allocator, workspace_root);
+    defer allocator.free(workspace_json);
+    const now_json = try jsonStringAlloc(allocator, now);
+    defer allocator.free(now_json);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"lane\":\"checkpoint\",\"schema\":\"STW-v1\",\"workspace_sequence\":1,\"artifact_root\":\".ledger\",\"st_root\":");
+    try writer.writeAll(workspace_json);
+    try writer.writeAll(",\"created_at\":");
+    try writer.writeAll(now_json);
+    try writer.writeAll(",\"updated_at\":");
+    try writer.writeAll(now_json);
+    try writer.writeAll(",\"target_branch\":null,\"target_head\":null,\"branch_epoch\":0,\"plans\":[{\"plan_id\":");
+    try std.json.Stringify.value(plan_id, .{}, writer);
+    try writer.writeAll(",\"alias\":");
+    try std.json.Stringify.value(plan_id, .{}, writer);
+    try writer.writeAll(",\"state\":\"active\",\"graph_ref\":");
+    try std.json.Stringify.value(graph_ref, .{}, writer);
+    try writer.writeAll(",\"target_branch\":null,\"source\":\"st workspace migrate\",\"plan_sequence\":");
+    try writer.print("{d}", .{plan_sequence});
+    try writer.writeAll(",\"graph_fingerprints\":");
+    try writeGraphFingerprintsObject(writer, fingerprints);
+    try writer.writeAll(",\"created_at\":");
+    try writer.writeAll(now_json);
+    try writer.writeAll(",\"updated_at\":");
+    try writer.writeAll(now_json);
+    try writer.writeAll("}],\"cross_plan_edges\":[],\"claims\":[],\"fencing_counter\":0,\"policy\":{\"fail_closed\":true,\"workspace_v1\":true,\"legacy_writes\":\"read_only_after_migration\"}}\n");
+    return out.toOwnedSlice();
+}
+
+fn renderWorkspaceCheckpointWithPlan(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    previous: std.json.Value,
+    plan_id: []const u8,
+    alias: []const u8,
+    now: []const u8,
+) ![]u8 {
+    const previous_obj = switch (previous) {
+        .object => |obj| obj,
+        else => return error.WorkspaceInvalid,
+    };
+    const plans_value = previous_obj.get("plans") orelse return error.WorkspaceInvalid;
+    if (plans_value != .array) return error.WorkspaceInvalid;
+    const workspace_sequence = (intField(previous, "workspace_sequence") orelse 0) + 1;
+    const artifact_root = stringField(previous, "artifact_root") orelse ".ledger";
+    const st_root = stringField(previous, "st_root") orelse workspace_root;
+    const created_at = stringField(previous, "created_at") orelse now;
+    const graph_ref = try workspacePlanGraphRefAlloc(allocator, plan_id);
+    defer allocator.free(graph_ref);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"lane\":\"checkpoint\",\"schema\":\"STW-v1\",\"workspace_sequence\":");
+    try writer.print("{d}", .{workspace_sequence});
+    try writer.writeAll(",\"artifact_root\":");
+    try std.json.Stringify.value(artifact_root, .{}, writer);
+    try writer.writeAll(",\"st_root\":");
+    try std.json.Stringify.value(st_root, .{}, writer);
+    try writer.writeAll(",\"created_at\":");
+    try std.json.Stringify.value(created_at, .{}, writer);
+    try writer.writeAll(",\"updated_at\":");
+    try std.json.Stringify.value(now, .{}, writer);
+    try writer.writeAll(",\"target_branch\":");
+    try std.json.Stringify.value(previous_obj.get("target_branch") orelse std.json.Value{ .null = {} }, .{}, writer);
+    try writer.writeAll(",\"target_head\":");
+    try std.json.Stringify.value(previous_obj.get("target_head") orelse std.json.Value{ .null = {} }, .{}, writer);
+    try writer.writeAll(",\"branch_epoch\":");
+    try writer.print("{d}", .{intField(previous, "branch_epoch") orelse 0});
+    try writer.writeAll(",\"plans\":[");
+    for (plans_value.array.items, 0..) |entry, idx| {
+        if (idx != 0) try writer.writeByte(',');
+        try std.json.Stringify.value(entry, .{}, writer);
+    }
+    if (plans_value.array.items.len != 0) try writer.writeByte(',');
+    try writer.writeAll("{\"plan_id\":");
+    try std.json.Stringify.value(plan_id, .{}, writer);
+    try writer.writeAll(",\"alias\":");
+    try std.json.Stringify.value(alias, .{}, writer);
+    try writer.writeAll(",\"state\":\"active\",\"graph_ref\":");
+    try std.json.Stringify.value(graph_ref, .{}, writer);
+    try writer.writeAll(",\"target_branch\":");
+    try std.json.Stringify.value(previous_obj.get("target_branch") orelse std.json.Value{ .null = {} }, .{}, writer);
+    try writer.writeAll(",\"source\":\"st plan create\",\"plan_sequence\":1,\"graph_fingerprints\":{},\"created_at\":");
+    try std.json.Stringify.value(now, .{}, writer);
+    try writer.writeAll(",\"updated_at\":");
+    try std.json.Stringify.value(now, .{}, writer);
+    try writer.writeAll("}],\"cross_plan_edges\":");
+    if (previous_obj.get("cross_plan_edges")) |cross_plan_edges| {
+        try std.json.Stringify.value(cross_plan_edges, .{}, writer);
+    } else {
+        try writer.writeAll("[]");
+    }
+    try writeWorkspaceAuthorityFields(writer, previous_obj);
+    try writer.writeAll(",\"policy\":");
+    if (previous_obj.get("policy")) |policy| {
+        try std.json.Stringify.value(policy, .{}, writer);
+    } else {
+        try writer.writeAll("{\"fail_closed\":true,\"workspace_v1\":true}");
+    }
+    try writer.writeAll("}\n");
+    return out.toOwnedSlice();
+}
+
+fn renderWorkspaceCheckpointWithPlanState(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    previous: std.json.Value,
+    plan_id: []const u8,
+    target_state: []const u8,
+    now: []const u8,
+) ![]u8 {
+    const previous_obj = switch (previous) {
+        .object => |obj| obj,
+        else => return error.WorkspaceInvalid,
+    };
+    const plans_value = previous_obj.get("plans") orelse return error.WorkspaceInvalid;
+    if (plans_value != .array) return error.WorkspaceInvalid;
+    const workspace_sequence = (intField(previous, "workspace_sequence") orelse 0) + 1;
+    const artifact_root = stringField(previous, "artifact_root") orelse ".ledger";
+    const st_root = stringField(previous, "st_root") orelse workspace_root;
+    const created_at = stringField(previous, "created_at") orelse now;
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"lane\":\"checkpoint\",\"schema\":\"STW-v1\",\"workspace_sequence\":");
+    try writer.print("{d}", .{workspace_sequence});
+    try writer.writeAll(",\"artifact_root\":");
+    try std.json.Stringify.value(artifact_root, .{}, writer);
+    try writer.writeAll(",\"st_root\":");
+    try std.json.Stringify.value(st_root, .{}, writer);
+    try writer.writeAll(",\"created_at\":");
+    try std.json.Stringify.value(created_at, .{}, writer);
+    try writer.writeAll(",\"updated_at\":");
+    try std.json.Stringify.value(now, .{}, writer);
+    try writer.writeAll(",\"target_branch\":");
+    try std.json.Stringify.value(previous_obj.get("target_branch") orelse std.json.Value{ .null = {} }, .{}, writer);
+    try writer.writeAll(",\"target_head\":");
+    try std.json.Stringify.value(previous_obj.get("target_head") orelse std.json.Value{ .null = {} }, .{}, writer);
+    try writer.writeAll(",\"branch_epoch\":");
+    try writer.print("{d}", .{intField(previous, "branch_epoch") orelse 0});
+    try writer.writeAll(",\"plans\":[");
+    for (plans_value.array.items, 0..) |entry, idx| {
+        if (entry != .object) return error.WorkspaceInvalid;
+        if (idx != 0) try writer.writeByte(',');
+        const entry_plan_id = stringField(entry, "plan_id") orelse return error.WorkspaceInvalid;
+        if (std.mem.eql(u8, entry_plan_id, plan_id)) {
+            try writeWorkspacePlanRecordWithState(writer, entry, target_state, now);
+        } else {
+            try std.json.Stringify.value(entry, .{}, writer);
+        }
+    }
+    try writer.writeAll("],\"cross_plan_edges\":");
+    if (previous_obj.get("cross_plan_edges")) |cross_plan_edges| {
+        try std.json.Stringify.value(cross_plan_edges, .{}, writer);
+    } else {
+        try writer.writeAll("[]");
+    }
+    try writeWorkspaceAuthorityFields(writer, previous_obj);
+    try writer.writeAll(",\"policy\":");
+    if (previous_obj.get("policy")) |policy| {
+        try std.json.Stringify.value(policy, .{}, writer);
+    } else {
+        try writer.writeAll("{\"fail_closed\":true,\"workspace_v1\":true}");
+    }
+    try writer.writeAll("}\n");
+    return out.toOwnedSlice();
+}
+
+fn writeWorkspacePlanRecordWithState(writer: anytype, entry: std.json.Value, target_state: []const u8, now: []const u8) !void {
+    const obj = switch (entry) {
+        .object => |o| o,
+        else => return error.WorkspaceInvalid,
+    };
+    try writer.writeByte('{');
+    try writer.writeAll("\"plan_id\":");
+    try std.json.Stringify.value(stringField(entry, "plan_id") orelse return error.WorkspaceInvalid, .{}, writer);
+    try writer.writeAll(",\"alias\":");
+    try std.json.Stringify.value(stringField(entry, "alias") orelse "", .{}, writer);
+    try writer.writeAll(",\"state\":");
+    try std.json.Stringify.value(target_state, .{}, writer);
+    try writer.writeAll(",\"graph_ref\":");
+    try std.json.Stringify.value(stringField(entry, "graph_ref") orelse return error.WorkspaceInvalid, .{}, writer);
+    try writer.writeAll(",\"target_branch\":");
+    try std.json.Stringify.value(obj.get("target_branch") orelse std.json.Value{ .null = {} }, .{}, writer);
+    try writer.writeAll(",\"source\":");
+    try std.json.Stringify.value(stringField(entry, "source") orelse "", .{}, writer);
+    try writer.writeAll(",\"plan_sequence\":");
+    try writer.print("{d}", .{intField(entry, "plan_sequence") orelse 0});
+    try writer.writeAll(",\"graph_fingerprints\":");
+    try std.json.Stringify.value(obj.get("graph_fingerprints") orelse std.json.Value{ .object = .empty }, .{}, writer);
+    try writer.writeAll(",\"created_at\":");
+    try std.json.Stringify.value(stringField(entry, "created_at") orelse now, .{}, writer);
+    try writer.writeAll(",\"updated_at\":");
+    try std.json.Stringify.value(now, .{}, writer);
+    try writer.writeByte('}');
+}
+
+fn renderWorkspaceCheckpointWithCrossPlanEdge(
+    allocator: std.mem.Allocator,
+    workspace_root: []const u8,
+    previous: std.json.Value,
+    edge: CrossPlanEdge,
+    op: CrossPlanEdgeOp,
+    now: []const u8,
+) ![]u8 {
+    const previous_obj = switch (previous) {
+        .object => |obj| obj,
+        else => return error.WorkspaceInvalid,
+    };
+    const plans_value = previous_obj.get("plans") orelse return error.WorkspaceInvalid;
+    if (plans_value != .array) return error.WorkspaceInvalid;
+    const edges_value = previous_obj.get("cross_plan_edges");
+    if (edges_value) |value| {
+        if (value != .array) return error.WorkspaceInvalid;
+    }
+    const workspace_sequence = (intField(previous, "workspace_sequence") orelse 0) + 1;
+    const artifact_root = stringField(previous, "artifact_root") orelse ".ledger";
+    const st_root = stringField(previous, "st_root") orelse workspace_root;
+    const created_at = stringField(previous, "created_at") orelse now;
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"lane\":\"checkpoint\",\"schema\":\"STW-v1\",\"workspace_sequence\":");
+    try writer.print("{d}", .{workspace_sequence});
+    try writer.writeAll(",\"artifact_root\":");
+    try std.json.Stringify.value(artifact_root, .{}, writer);
+    try writer.writeAll(",\"st_root\":");
+    try std.json.Stringify.value(st_root, .{}, writer);
+    try writer.writeAll(",\"created_at\":");
+    try std.json.Stringify.value(created_at, .{}, writer);
+    try writer.writeAll(",\"updated_at\":");
+    try std.json.Stringify.value(now, .{}, writer);
+    try writer.writeAll(",\"target_branch\":");
+    try std.json.Stringify.value(previous_obj.get("target_branch") orelse std.json.Value{ .null = {} }, .{}, writer);
+    try writer.writeAll(",\"target_head\":");
+    try std.json.Stringify.value(previous_obj.get("target_head") orelse std.json.Value{ .null = {} }, .{}, writer);
+    try writer.writeAll(",\"branch_epoch\":");
+    try writer.print("{d}", .{intField(previous, "branch_epoch") orelse 0});
+    try writer.writeAll(",\"plans\":");
+    try std.json.Stringify.value(plans_value, .{}, writer);
+    try writer.writeAll(",\"cross_plan_edges\":[");
+    var wrote_edge = false;
+    if (edges_value) |value| {
+        for (value.array.items) |entry| {
+            if (entry != .object) return error.WorkspaceInvalid;
+            if (op == .unlink and crossPlanEdgeMatches(entry, edge)) continue;
+            if (wrote_edge) try writer.writeByte(',');
+            try std.json.Stringify.value(entry, .{}, writer);
+            wrote_edge = true;
+        }
+    }
+    if (op == .link) {
+        if (wrote_edge) try writer.writeByte(',');
+        try writeCrossPlanEdgeObject(writer, edge, now);
+    }
+    try writer.writeByte(']');
+    try writeWorkspaceAuthorityFields(writer, previous_obj);
+    try writer.writeAll(",\"policy\":");
+    if (previous_obj.get("policy")) |policy| {
+        try std.json.Stringify.value(policy, .{}, writer);
+    } else {
+        try writer.writeAll("{\"fail_closed\":true,\"workspace_v1\":true}");
+    }
+    try writer.writeAll("}\n");
+    return out.toOwnedSlice();
+}
+
+fn writeWorkspaceAuthorityFields(writer: anytype, previous_obj: std.json.ObjectMap) !void {
+    try writer.writeAll(",\"claims\":");
+    if (previous_obj.get("claims")) |claims| {
+        try std.json.Stringify.value(claims, .{}, writer);
+    } else {
+        try writer.writeAll("[]");
+    }
+    try writer.writeAll(",\"fencing_counter\":");
+    if (previous_obj.get("fencing_counter")) |counter| {
+        try std.json.Stringify.value(counter, .{}, writer);
+    } else {
+        try writer.writeAll("0");
+    }
+}
+
+fn writeCrossPlanEdgeObject(writer: anytype, edge: CrossPlanEdge, now: []const u8) !void {
+    try writer.writeByte('{');
+    try writer.writeAll("\"from\":");
+    try std.json.Stringify.value(edge.from, .{}, writer);
+    try writer.writeAll(",\"to\":");
+    try std.json.Stringify.value(edge.to, .{}, writer);
+    try writer.writeAll(",\"type\":");
+    try std.json.Stringify.value(edge.edge_type, .{}, writer);
+    try writer.writeAll(",\"created_at\":");
+    try std.json.Stringify.value(now, .{}, writer);
+    try writer.writeByte('}');
+}
+
+fn jsonStringAlloc(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try std.json.Stringify.value(value, .{}, &out.writer);
+    return out.toOwnedSlice();
 }
 
 fn cmdInit(allocator: std.mem.Allocator, args: Args) !u8 {
@@ -4308,7 +9421,7 @@ fn cmdCapabilities(allocator: std.mem.Allocator, args: Args) !u8 {
     const stdout = &stdout_writer.interface;
     try stdout.writeAll("{\"st_capabilities\":{\"version\":");
     try std.json.Stringify.value(Version, .{}, stdout);
-    try stdout.writeAll(",\"schema_versions\":{\"readable\":[3,4],\"writable\":[3,4],\"graph_envelope\":[1,2]},\"features\":{\"intake_check\":true,\"intake_normalize\":true,\"graph_control_receipt\":true,\"safe_parallel_wave\":true,\"proof_basis\":true,\"multi_proof_receipts\":true}}}\n");
+    try stdout.writeAll(",\"storage\":{\"ledger_artifact_root_v1\":true,\"workspace_v1\":true,\"workspace_schema\":\"STW-v1\",\"plan_graph_schema\":4,\"transaction_journal_v1\":true,\"compare_and_swap_v1\":true},\"plans\":{\"plan_namespace_v1\":true,\"qualified_refs_v1\":true,\"cross_plan_dependencies_v1\":true,\"plan_bundle_import_export_v1\":true},\"concurrency\":{\"workspace_claim_v1\":true,\"resource_grammar_v1\":true,\"fencing_token_v1\":true,\"session_view_v1\":true,\"workspace_aperture_v1\":true},\"git\":{\"external_worktree_v1\":true,\"changeset_v1\":true,\"serialized_integration_v1\":true,\"branch_epoch_v1\":true},\"proof\":{\"proof_receipt_v3\":true,\"dependency_cut_invalidation_v1\":true},\"control\":{\"gcr_v2\":true},\"schema_versions\":{\"readable\":[3,4],\"writable\":[3,4],\"graph_envelope\":[1,2]},\"features\":{\"intake_check\":true,\"intake_normalize\":true,\"graph_control_receipt\":true,\"gcr_v2\":true,\"safe_parallel_wave\":true,\"proof_basis\":true,\"multi_proof_receipts\":true,\"proof_receipt_v3\":true,\"proof_invalidation\":true,\"workspace_init\":true,\"workspace_status\":true,\"workspace_audit\":true,\"workspace_doctor\":true,\"workspace_recover\":true,\"workspace_export\":true,\"workspace_import\":true,\"workspace_migrate\":true,\"workspace_transactions\":true,\"resource_grammar\":true,\"workspace_claims\":true,\"fencing_tokens\":true,\"session_views\":true,\"workspace_aperture\":true,\"external_worktrees\":true,\"changesets\":true,\"serialized_integration\":true,\"plan_create\":true,\"plan_list\":true,\"plan_show\":true,\"plan_pause\":true,\"plan_resume\":true,\"plan_complete\":true,\"plan_archive\":true,\"qualified_refs\":true,\"plan_link\":true,\"plan_unlink\":true}}}\n");
     return 0;
 }
 
@@ -5417,6 +10530,7 @@ fn cmdCompileAperture(allocator: std.mem.Allocator, args: Args) !u8 {
         try stdout.writeAll("graph_control_receipt: ");
         try writeGraphControlReceiptJson(allocator, stdout, &state, args.file, parsed.latest_seq, fps, validity_audit, &.{}, args.limit, receipt_id);
         try stdout.writeByte('\n');
+        try maybeWriteWorkspaceGraphControlReceiptJson(allocator, stdout, args, &state, parsed.latest_seq, fps, validity_audit, &.{}, receipt_id, true);
         try stdout.writeAll("st_receipt: ");
         try writeStReceiptJson(stdout, "st compile aperture", "gate_blocked", 2, args.file, parsed.latest_seq, parsed.latest_seq, state.graph_active, receipt_id, &.{"invalid-graph"});
         try stdout.writeByte('\n');
@@ -5441,6 +10555,7 @@ fn cmdCompileAperture(allocator: std.mem.Allocator, args: Args) !u8 {
         try stdout.writeAll("graph_control_receipt: ");
         try writeGraphControlReceiptJson(allocator, stdout, &state, args.file, parsed.latest_seq, fps, audit, selected_ids, args.limit, blocked_receipt_id);
         try stdout.writeByte('\n');
+        try maybeWriteWorkspaceGraphControlReceiptJson(allocator, stdout, args, &state, parsed.latest_seq, fps, audit, selected_ids, blocked_receipt_id, true);
         try stdout.writeAll("st_receipt: ");
         try writeStReceiptJson(stdout, "st compile aperture", "gate_blocked", 2, args.file, parsed.latest_seq, parsed.latest_seq, state.graph_active, blocked_receipt_id, &.{"execution-gate-blocked"});
         try stdout.writeByte('\n');
@@ -5456,6 +10571,7 @@ fn cmdCompileAperture(allocator: std.mem.Allocator, args: Args) !u8 {
     try stdout.writeAll("graph_control_receipt: ");
     try writeGraphControlReceiptJson(allocator, stdout, &state, args.file, seq_after, fps, audit, selected_ids, args.limit, receipt_id);
     try stdout.writeByte('\n');
+    try maybeWriteWorkspaceGraphControlReceiptJson(allocator, stdout, args, &state, seq_after, fps, audit, selected_ids, receipt_id, false);
     try emitPlanSyncWithPolicy(allocator, stdout, &state, .{ .source_file = args.file, .source_seq = seq_after, .mode = .aperture, .limit = args.limit }, true);
     try stdout.writeAll("st_receipt: ");
     try writeStReceiptJson(stdout, "st compile aperture", "success", 0, args.file, parsed.latest_seq, seq_after, state.graph_active, receipt_id, &.{});
@@ -7493,6 +12609,197 @@ fn writeGraphControlReceiptJson(
     try writer.writeAll("}}}");
 }
 
+fn maybeWriteWorkspaceGraphControlReceiptJson(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    args: Args,
+    state: *const ItemState,
+    seq: i64,
+    fps: GraphFingerprints,
+    audit: AuditResult,
+    selected_ids: []const []const u8,
+    gcr_v1_id: []const u8,
+    graph_gate_blocked: bool,
+) !void {
+    if (!workspaceModeRequested(args)) return;
+    try writer.writeAll("workspace_graph_control_receipt: ");
+    try writeWorkspaceGraphControlReceiptJson(allocator, writer, args, state, seq, fps, audit, selected_ids, gcr_v1_id, graph_gate_blocked);
+    try writer.writeByte('\n');
+}
+
+fn writeWorkspaceGraphControlReceiptJson(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    args: Args,
+    state: *const ItemState,
+    seq: i64,
+    fps: GraphFingerprints,
+    audit: AuditResult,
+    selected_ids: []const []const u8,
+    gcr_v1_id: []const u8,
+    graph_gate_blocked: bool,
+) !void {
+    const workspace = try loadWorkspaceCheckpoint(allocator, args.workspace);
+    defer workspace.deinit();
+    const workspace_obj = switch (workspace.parsed.value) {
+        .object => |obj| obj,
+        else => return error.WorkspaceInvalid,
+    };
+    const workspace_sequence = workspaceSequence(workspace.parsed.value);
+    const branch_epoch = intField(workspace.parsed.value, "branch_epoch") orelse 0;
+    const plan_sequence = try planSequenceForFile(allocator, args.file);
+    const plan_id_owned = if (args.plan_id) |plan_id|
+        try normalizePlanId(allocator, plan_id)
+    else
+        try inferSingleActiveWorkspacePlanId(allocator, args.workspace);
+    defer allocator.free(plan_id_owned);
+    const plan_record = findWorkspacePlanRecord(workspace_obj, plan_id_owned) orelse return error.PlanMissing;
+
+    var denials: std.ArrayList([]const u8) = .empty;
+    if (!try workspacePlanRecordFingerprintsCurrent(plan_record, fps)) {
+        try denials.append(allocator, "gcr_stale");
+    }
+
+    if (args.expect_workspace_seq) |raw| {
+        if (try parseNonNegativeI64(raw) != workspace_sequence) try denials.append(allocator, "workspace_sequence_stale");
+    }
+    if (args.expect_plan_seq) |raw| {
+        if (try parseNonNegativeI64(raw) != plan_sequence) try denials.append(allocator, "plan_sequence_stale");
+    }
+    if (args.expect_branch_epoch) |raw| {
+        if (try parseNonNegativeI64(raw) != branch_epoch) try denials.append(allocator, "branch_epoch_stale");
+    }
+    if (graph_gate_blocked or audit.errors != 0 or countActiveGraphDebt(state.graph.debt, "blocking") != 0) {
+        try denials.append(allocator, "graph_gate_blocked");
+    }
+
+    var claim_value: ?std.json.Value = null;
+    const claim_id = args.claim_id orelse "";
+    const session_id = args.session_id orelse "";
+    const token: i64 = if (args.fencing_token) |raw| try parseNonNegativeI64(raw) else 0;
+    if (claim_id.len == 0) {
+        try denials.append(allocator, "claim_missing");
+    } else if (token <= 0) {
+        try denials.append(allocator, "fencing_token_stale");
+    } else {
+        const now_for_claim = try nowUtcAlloc(allocator);
+        defer allocator.free(now_for_claim);
+        claim_value = validateWorkspaceClaimAuthority(workspace_obj, claim_id, if (session_id.len > 0) session_id else null, @intCast(token), now_for_claim) catch |err| blk: {
+            try denials.append(allocator, workspaceGcrDenialForError(err));
+            break :blk null;
+        };
+    }
+
+    var projection_digest: []const u8 = "";
+    var projection_digest_owned: ?[]u8 = null;
+    defer if (projection_digest_owned) |owned| allocator.free(owned);
+    if (session_id.len == 0) {
+        try denials.append(allocator, "session_unbound");
+    } else {
+        const view_path = try workspaceViewFilePathAlloc(allocator, args.workspace, session_id);
+        defer allocator.free(view_path);
+        const view_bytes = durable_store.readRegularFileNoSymlink(allocator, view_path, 1024 * 1024) catch |err| switch (err) {
+            error.FileNotFound => blk: {
+                try denials.append(allocator, "session_unbound");
+                break :blk "";
+            },
+            else => return err,
+        };
+        defer if (view_bytes.len > 0) allocator.free(view_bytes);
+        if (view_bytes.len > 0) {
+            var parsed_view = try std.json.parseFromSlice(std.json.Value, allocator, view_bytes, .{});
+            defer parsed_view.deinit();
+            if (stringField(parsed_view.value, "projection_digest")) |digest| {
+                projection_digest_owned = try allocator.dupe(u8, digest);
+                projection_digest = projection_digest_owned.?;
+            }
+            if (!std.mem.eql(u8, stringField(parsed_view.value, "plan_id") orelse "", plan_id_owned)) try denials.append(allocator, "session_plan_mismatch");
+            if (!std.mem.eql(u8, stringField(parsed_view.value, "claim_id") orelse "", claim_id)) try denials.append(allocator, "view_stale");
+            if ((intField(parsed_view.value, "fencing_token") orelse -1) != token) try denials.append(allocator, "view_stale");
+            if ((intField(parsed_view.value, "workspace_sequence") orelse -1) != workspace_sequence) try denials.append(allocator, "view_stale");
+            if ((intField(parsed_view.value, "plan_sequence") orelse -1) != plan_sequence) try denials.append(allocator, "view_stale");
+            if ((intField(parsed_view.value, "branch_epoch") orelse -1) != branch_epoch) try denials.append(allocator, "branch_epoch_stale");
+        }
+    }
+
+    const execution_allowed = denials.items.len == 0;
+    const receipt_id = try std.fmt.allocPrint(allocator, "GCR2-{d}-{s}", .{ seq, fps.structure["sha256:".len..@min(fps.structure.len, "sha256:".len + 8)] });
+    defer allocator.free(receipt_id);
+    try writer.writeAll("{\"graph_control_receipt\":{\"receipt_version\":\"GCR-v2\",\"receipt_id\":");
+    try std.json.Stringify.value(receipt_id, .{}, writer);
+    try writer.writeAll(",\"extends\":");
+    try std.json.Stringify.value(gcr_v1_id, .{}, writer);
+    try writer.writeAll(",\"workspace\":{\"workspace_sequence\":");
+    try writer.print("{d}", .{workspace_sequence});
+    try writer.writeAll(",\"st_root\":");
+    try std.json.Stringify.value(stringField(workspace.parsed.value, "st_root") orelse args.workspace, .{}, writer);
+    try writer.writeAll("},\"plan\":{\"plan_id\":");
+    try std.json.Stringify.value(plan_id_owned, .{}, writer);
+    try writer.writeAll(",\"plan_sequence\":");
+    try writer.print("{d}", .{plan_sequence});
+    try writer.writeAll(",\"graph_fingerprints\":");
+    try writeGraphFingerprintsObject(writer, fps);
+    try writer.writeAll(",\"registry_graph_fingerprints\":");
+    if (plan_record.object.get("graph_fingerprints")) |registry_fps| {
+        try std.json.Stringify.value(registry_fps, .{}, writer);
+    } else {
+        try writer.writeAll("{}");
+    }
+    try writer.writeAll(",\"selected_item_ids\":");
+    try writeStringListArray(writer, selected_ids);
+    try writer.writeAll("},\"branch\":{\"epoch\":");
+    try writer.print("{d}", .{branch_epoch});
+    try writer.writeAll(",\"target_branch\":");
+    try std.json.Stringify.value(workspace_obj.get("target_branch") orelse std.json.Value{ .null = {} }, .{}, writer);
+    try writer.writeAll(",\"target_head\":");
+    try std.json.Stringify.value(workspace_obj.get("target_head") orelse std.json.Value{ .null = {} }, .{}, writer);
+    try writer.writeAll("},\"claim\":{\"claim_id\":");
+    try std.json.Stringify.value(claim_id, .{}, writer);
+    try writer.writeAll(",\"fencing_token\":");
+    try writer.print("{d}", .{token});
+    try writer.writeAll(",\"resources\":");
+    if (claim_value) |claim| {
+        if (claim.object.get("resources")) |resources| {
+            try std.json.Stringify.value(resources, .{}, writer);
+        } else {
+            try writer.writeAll("[]");
+        }
+    } else {
+        try writer.writeAll("[]");
+    }
+    try writer.writeAll("},\"session_view\":{\"session_id\":");
+    try std.json.Stringify.value(session_id, .{}, writer);
+    try writer.writeAll(",\"projection_digest\":");
+    try std.json.Stringify.value(projection_digest, .{}, writer);
+    try writer.writeAll("},\"currentness\":{\"workspace_sequence\":");
+    try writer.writeAll(if (!containsString(denials.items, "workspace_sequence_stale")) "true" else "false");
+    try writer.writeAll(",\"plan_sequence\":");
+    try writer.writeAll(if (!containsString(denials.items, "plan_sequence_stale")) "true" else "false");
+    try writer.writeAll(",\"branch_epoch\":");
+    try writer.writeAll(if (!containsString(denials.items, "branch_epoch_stale")) "true" else "false");
+    try writer.writeAll(",\"graph_fingerprints\":");
+    try writer.writeAll(if (!containsString(denials.items, "gcr_stale")) "true" else "false");
+    try writer.writeAll(",\"claim_and_fencing\":");
+    try writer.writeAll(if (claim_value != null and !containsString(denials.items, "fencing_token_stale")) "true" else "false");
+    try writer.writeAll(",\"session_view\":");
+    try writer.writeAll(if (!containsString(denials.items, "view_stale") and !containsString(denials.items, "session_unbound") and !containsString(denials.items, "session_plan_mismatch")) "true" else "false");
+    try writer.writeAll("},\"gate\":{\"execution_allowed\":");
+    try std.json.Stringify.value(if (execution_allowed) "yes" else "no", .{}, writer);
+    try writer.writeAll(",\"denials\":");
+    try writeStringListArray(writer, denials.items);
+    try writer.writeAll("}}}");
+}
+
+fn workspaceGcrDenialForError(err: anyerror) []const u8 {
+    return switch (err) {
+        error.ClaimMissing => "claim_missing",
+        error.ClaimExpired => "claim_expired",
+        error.ClaimOwnerMismatch => "claim_owner_mismatch",
+        error.FencingTokenStale => "fencing_token_stale",
+        else => "workspace_invalid",
+    };
+}
+
 fn countActiveGraphDebt(debts: []const GraphDebt, severity: []const u8) usize {
     var count: usize = 0;
     for (debts) |debt| {
@@ -7609,6 +12916,10 @@ fn cmdImportProposedPlan(allocator: std.mem.Allocator, args: Args) !u8 {
 }
 
 fn cmdClaim(allocator: std.mem.Allocator, args: Args) !u8 {
+    if (args.claim_command != .grant or workspaceModeRequested(args)) {
+        return cmdWorkspaceClaim(allocator, args);
+    }
+
     const loaded = try loadValidatedState(allocator, args.file, args.allow_multiple_in_progress);
     var state = loaded.state;
     defer state.deinit();
@@ -7901,7 +13212,7 @@ fn cmdProofRecord(allocator: std.mem.Allocator, args: Args) !u8 {
         return 2;
     }
     const now = try nowUtcAlloc(allocator);
-    try upsertProofReceipt(allocator, item, .{
+    var receipt = ProofReceipt{
         .obligation_id = obligation_id,
         .action_id = try requireNonEmptyString(allocator, args.action_id.?, "--action"),
         .state = "pass",
@@ -7909,7 +13220,29 @@ fn cmdProofRecord(allocator: std.mem.Allocator, args: Args) !u8 {
         .evidence_ref = try requireNonEmptyString(allocator, args.evidence_ref.?, "--evidence-ref"),
         .artifact_ref = if (args.artifact_ref) |raw| try requireNonEmptyString(allocator, raw, "--artifact-ref") else "",
         .recorded_at = now,
-    });
+    };
+    var workspace_plan_id: ?[]u8 = null;
+    defer if (workspace_plan_id) |owned| allocator.free(owned);
+    var tree_digest_owned: ?[]u8 = null;
+    defer if (tree_digest_owned) |owned| allocator.free(owned);
+    if (workspaceModeRequested(args)) {
+        const workspace = try loadWorkspaceCheckpoint(allocator, args.workspace);
+        defer workspace.deinit();
+        workspace_plan_id = if (args.plan_id) |plan_id|
+            try normalizePlanId(allocator, plan_id)
+        else
+            try inferSingleActiveWorkspacePlanId(allocator, args.workspace);
+        tree_digest_owned = currentGitTreeDigestAlloc(allocator) catch try allocator.dupe(u8, "");
+        receipt.receipt_version = "PRF-v3";
+        receipt.workspace_id = stringField(workspace.parsed.value, "st_root") orelse workspace.root;
+        receipt.workspace_sequence = workspaceSequence(workspace.parsed.value);
+        receipt.plan_id = workspace_plan_id.?;
+        receipt.plan_sequence = loaded.latest_seq + 1;
+        receipt.branch_epoch = intField(workspace.parsed.value, "branch_epoch") orelse 0;
+        receipt.tree_digest = tree_digest_owned.?;
+        receipt.dependency_resources = try proofDependencyResourcesForItem(allocator, item.*);
+    }
+    try upsertProofReceipt(allocator, item, receipt);
 
     try validateState(&state, args.allow_multiple_in_progress);
     const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
@@ -7918,6 +13251,32 @@ fn cmdProofRecord(allocator: std.mem.Allocator, args: Args) !u8 {
     try stdout.print("recorded proof receipt for {s}/{s}\n", .{ item_id, obligation_id });
     try emitSyncOutputs(allocator, stdout, &state, args.allow_multiple_in_progress, args.file, loaded.latest_seq + 1);
     return 0;
+}
+
+fn currentGitTreeDigestAlloc(allocator: std.mem.Allocator) ![]u8 {
+    const tree = try gitTrimmedAlloc(allocator, ".", &.{ "rev-parse", "HEAD^{tree}" });
+    defer allocator.free(tree);
+    return std.fmt.allocPrint(allocator, "git-tree:{s}", .{tree});
+}
+
+fn proofDependencyResourcesForItem(allocator: std.mem.Allocator, item: Item) ![]const []const u8 {
+    const roots = if (item.lock_roots.len > 0)
+        item.lock_roots
+    else if (item.location.len > 0)
+        item.location
+    else if (item.scope.len > 0)
+        item.scope
+    else
+        &[_][]const u8{"repo:all"};
+    var out: std.ArrayList([]const u8) = .empty;
+    for (roots) |root| {
+        if (std.mem.indexOfScalar(u8, root, ':') != null) {
+            try out.append(allocator, root);
+        } else {
+            try out.append(allocator, try std.fmt.allocPrint(allocator, "path:{s}", .{root}));
+        }
+    }
+    return try out.toOwnedSlice(allocator);
 }
 
 const ProofBasis = struct {
@@ -9083,6 +14442,10 @@ fn readRecordsNoSeqValidation(allocator: std.mem.Allocator, path: []const u8) !P
     }
 
     const bytes = try readFileAlloc(allocator, path, 64 * 1024 * 1024);
+    return parseRecordsFromBytes(allocator, bytes);
+}
+
+fn parseRecordsFromBytes(allocator: std.mem.Allocator, bytes: []const u8) !ParsedRecords {
     var lines = std.mem.splitScalar(u8, bytes, '\n');
 
     var records = std.ArrayList(std.json.Value).empty;
@@ -9103,6 +14466,85 @@ fn readRecordsNoSeqValidation(allocator: std.mem.Allocator, path: []const u8) !P
     }
 
     return .{ .records = try records.toOwnedSlice(allocator), .latest_seq = latest };
+}
+
+fn renderMigratedPlanJsonl(allocator: std.mem.Allocator, legacy_bytes: []const u8, plan_id: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var lines = std.mem.splitScalar(u8, legacy_bytes, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len == 0) continue;
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        if (parsed.value != .object) return error.InvalidRecord;
+        const lane = normalizedLane(parsed.value) orelse "";
+        if (std.mem.eql(u8, lane, "checkpoint")) {
+            try writeMigratedCheckpointRecord(&out.writer, parsed.value, plan_id);
+        } else {
+            try std.json.Stringify.value(parsed.value, .{}, &out.writer);
+        }
+        try out.writer.writeByte('\n');
+    }
+    return out.toOwnedSlice();
+}
+
+fn writeMigratedCheckpointRecord(writer: anytype, record: std.json.Value, plan_id: []const u8) !void {
+    if (record != .object) return error.InvalidRecord;
+    const has_plan_id = record.object.get("plan_id") != null;
+    const has_plan_sequence = record.object.get("plan_sequence") != null;
+    var emitted: usize = 0;
+    try writer.writeByte('{');
+    var it = record.object.iterator();
+    while (it.next()) |entry| {
+        if (emitted != 0) try writer.writeByte(',');
+        try std.json.Stringify.value(entry.key_ptr.*, .{}, writer);
+        try writer.writeByte(':');
+        try std.json.Stringify.value(entry.value_ptr.*, .{}, writer);
+        emitted += 1;
+    }
+    if (!has_plan_id) {
+        if (emitted != 0) try writer.writeByte(',');
+        try writer.writeAll("\"plan_id\":");
+        try std.json.Stringify.value(plan_id, .{}, writer);
+        emitted += 1;
+    }
+    if (!has_plan_sequence) {
+        if (emitted != 0) try writer.writeByte(',');
+        try writer.writeAll("\"plan_sequence\":");
+        try writer.print("{d}", .{intField(record, "seq") orelse 0});
+    }
+    try writer.writeByte('}');
+}
+
+fn assertMigrationParity(
+    allocator: std.mem.Allocator,
+    legacy_state: *const ItemState,
+    migrated_state: *const ItemState,
+    legacy_seq: i64,
+    migrated_seq: i64,
+) !void {
+    if (legacy_seq != migrated_seq) return error.MigrationParityFailed;
+    const legacy_snapshot = try renderMigrationParitySnapshot(allocator, legacy_state);
+    defer allocator.free(legacy_snapshot);
+    const migrated_snapshot = try renderMigrationParitySnapshot(allocator, migrated_state);
+    defer allocator.free(migrated_snapshot);
+    if (!std.mem.eql(u8, legacy_snapshot, migrated_snapshot)) return error.MigrationParityFailed;
+}
+
+fn renderMigrationParitySnapshot(allocator: std.mem.Allocator, state: *const ItemState) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeByte('{');
+    try out.writer.writeAll("\"graph_active\":");
+    try out.writer.writeAll(if (state.graph_active) "true" else "false");
+    if (state.graph_active) {
+        try out.writer.writeAll(",\"graph\":");
+        try writeGraphEnvelopeObject(&out.writer, state.graph);
+    }
+    try out.writer.writeAll(",\"items\":");
+    try writeItemsArray(&out.writer, state.items.items);
+    try out.writer.writeByte('}');
+    return out.toOwnedSlice();
 }
 
 fn materializeStateFromRecords(allocator: std.mem.Allocator, records: []const std.json.Value) !ItemState {
@@ -9709,6 +15151,34 @@ fn writeProofReceiptsArray(writer: anytype, receipts: []const ProofReceipt) !voi
         if (receipt.waiver_id.len > 0) {
             try writer.writeAll(",\"waiver_id\":");
             try std.json.Stringify.value(receipt.waiver_id, .{}, writer);
+        }
+        if (receipt.workspace_id.len > 0) {
+            try writer.writeAll(",\"workspace_id\":");
+            try std.json.Stringify.value(receipt.workspace_id, .{}, writer);
+        }
+        if (receipt.workspace_sequence >= 0) {
+            try writer.writeAll(",\"workspace_sequence\":");
+            try writer.print("{d}", .{receipt.workspace_sequence});
+        }
+        if (receipt.plan_id.len > 0) {
+            try writer.writeAll(",\"plan_id\":");
+            try std.json.Stringify.value(receipt.plan_id, .{}, writer);
+        }
+        if (receipt.plan_sequence >= 0) {
+            try writer.writeAll(",\"plan_sequence\":");
+            try writer.print("{d}", .{receipt.plan_sequence});
+        }
+        if (receipt.branch_epoch >= 0) {
+            try writer.writeAll(",\"branch_epoch\":");
+            try writer.print("{d}", .{receipt.branch_epoch});
+        }
+        if (receipt.tree_digest.len > 0) {
+            try writer.writeAll(",\"tree_digest\":");
+            try std.json.Stringify.value(receipt.tree_digest, .{}, writer);
+        }
+        if (receipt.dependency_resources.len > 0) {
+            try writer.writeAll(",\"dependency_resources\":");
+            try writeJsonStringArray(writer, receipt.dependency_resources);
         }
         try writer.writeByte('}');
     }
@@ -11270,7 +16740,22 @@ fn proofReceiptsEqual(lhs: []const ProofReceipt, rhs: []const ProofReceipt) bool
             !std.mem.eql(u8, left.evidence_ref, right.evidence_ref) or
             !std.mem.eql(u8, left.artifact_ref, right.artifact_ref) or
             !std.mem.eql(u8, left.recorded_at, right.recorded_at) or
-            !std.mem.eql(u8, left.waiver_id, right.waiver_id)) return false;
+            !std.mem.eql(u8, left.waiver_id, right.waiver_id) or
+            !std.mem.eql(u8, left.workspace_id, right.workspace_id) or
+            left.workspace_sequence != right.workspace_sequence or
+            !std.mem.eql(u8, left.plan_id, right.plan_id) or
+            left.plan_sequence != right.plan_sequence or
+            left.branch_epoch != right.branch_epoch or
+            !std.mem.eql(u8, left.tree_digest, right.tree_digest) or
+            !stringSlicesEqual(left.dependency_resources, right.dependency_resources)) return false;
+    }
+    return true;
+}
+
+fn stringSlicesEqual(lhs: []const []const u8, rhs: []const []const u8) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        if (!std.mem.eql(u8, left, right)) return false;
     }
     return true;
 }
@@ -11937,6 +17422,25 @@ fn canonicalProofReceipt(allocator: std.mem.Allocator, value: std.json.Value) !P
         .artifact_ref = try optionalObjectString(allocator, obj, "artifact_ref"),
         .recorded_at = try optionalObjectString(allocator, obj, "recorded_at"),
         .waiver_id = try optionalObjectString(allocator, obj, "waiver_id"),
+        .workspace_id = try optionalObjectString(allocator, obj, "workspace_id"),
+        .workspace_sequence = if (obj.get("workspace_sequence")) |v| switch (v) {
+            .integer => |n| n,
+            .null => -1,
+            else => return error.InvalidItem,
+        } else -1,
+        .plan_id = try optionalObjectString(allocator, obj, "plan_id"),
+        .plan_sequence = if (obj.get("plan_sequence")) |v| switch (v) {
+            .integer => |n| n,
+            .null => -1,
+            else => return error.InvalidItem,
+        } else -1,
+        .branch_epoch = if (obj.get("branch_epoch")) |v| switch (v) {
+            .integer => |n| n,
+            .null => -1,
+            else => return error.InvalidItem,
+        } else -1,
+        .tree_digest = try optionalObjectString(allocator, obj, "tree_digest"),
+        .dependency_resources = try jsonStringListValue(allocator, obj.get("dependency_resources")),
     };
 }
 
@@ -12802,6 +18306,8 @@ test "parseCommand and parseOutputFormat recognize known values" {
     try std.testing.expectEqual(Command.guard_pre_tool_use, parseCommand("guard-pre-tool-use").?);
     try std.testing.expectEqual(Command.graph, parseCommand("graph").?);
     try std.testing.expectEqual(Command.intake, parseCommand("intake").?);
+    try std.testing.expectEqual(Command.workspace, parseCommand("workspace").?);
+    try std.testing.expectEqual(Command.plan, parseCommand("plan").?);
     try std.testing.expectEqual(Command.capabilities, parseCommand("capabilities").?);
     try std.testing.expectEqual(Command.complete, parseCommand("complete").?);
     try std.testing.expectEqual(Command.proof, parseCommand("proof").?);
@@ -12816,6 +18322,18 @@ test "parseCommand and parseOutputFormat recognize known values" {
     try std.testing.expectEqual(ProofCommand.audit, parseProofCommand("audit").?);
     try std.testing.expectEqual(ProofCommand.plan, parseProofCommand("plan").?);
     try std.testing.expectEqual(ProofCommand.record, parseProofCommand("record").?);
+    try std.testing.expectEqual(WorkspaceCommand.aperture, parseWorkspaceCommand("aperture").?);
+    try std.testing.expectEqual(WorkspaceCommand.init, parseWorkspaceCommand("init").?);
+    try std.testing.expectEqual(WorkspaceCommand.status, parseWorkspaceCommand("status").?);
+    try std.testing.expectEqual(PlanCommand.create, parsePlanCommand("create").?);
+    try std.testing.expectEqual(PlanCommand.list, parsePlanCommand("list").?);
+    try std.testing.expectEqual(PlanCommand.show, parsePlanCommand("show").?);
+    try std.testing.expectEqual(PlanCommand.pause, parsePlanCommand("pause").?);
+    try std.testing.expectEqual(PlanCommand.@"resume", parsePlanCommand("resume").?);
+    try std.testing.expectEqual(PlanCommand.complete, parsePlanCommand("complete").?);
+    try std.testing.expectEqual(PlanCommand.archive, parsePlanCommand("archive").?);
+    try std.testing.expectEqual(PlanCommand.link, parsePlanCommand("link").?);
+    try std.testing.expectEqual(PlanCommand.unlink, parsePlanCommand("unlink").?);
     try std.testing.expectEqual(AuditGate.implementation_ready, parseAuditGate("implementation-ready").?);
     try std.testing.expect(parseCommand("unknown-cmd") == null);
 
@@ -12873,6 +18391,18 @@ test "commandHelpTextForArgv resolves nested command help" {
     const compile_aperture_help = commandHelpTextForArgv(&.{ "st", "compile", "aperture", "--help" }).?;
     try std.testing.expect(std.mem.indexOf(u8, compile_aperture_help, "usage: st compile aperture --file PATH [--limit N] [--parallelism auto]") != null);
     try std.testing.expect(std.mem.indexOf(u8, compile_aperture_help, "Legacy no-op compatibility alias") != null);
+
+    const plan_create_help = commandHelpTextForArgv(&.{ "st", "plan", "create", "--help" }).?;
+    try std.testing.expect(std.mem.indexOf(u8, plan_create_help, "usage: st plan create --workspace PATH --plan PLAN_ID") != null);
+
+    const plan_pause_help = commandHelpTextForArgv(&.{ "st", "plan", "pause", "--help" }).?;
+    try std.testing.expect(std.mem.indexOf(u8, plan_pause_help, "usage: st plan {pause,resume,complete,archive}") != null);
+
+    const plan_link_help = commandHelpTextForArgv(&.{ "st", "plan", "link", "--help" }).?;
+    try std.testing.expect(std.mem.indexOf(u8, plan_link_help, "usage: st plan link --workspace PATH --from plan://PLAN/ITEM") != null);
+
+    const workspace_migrate_help = commandHelpTextForArgv(&.{ "st", "workspace", "migrate", "--help" }).?;
+    try std.testing.expect(std.mem.indexOf(u8, workspace_migrate_help, "usage: st workspace migrate --from PATH --to PATH --plan-id PLAN_ID") != null);
 }
 
 test "compile aperture accepts legacy parallelism auto flag" {
@@ -13184,6 +18714,1123 @@ test "capabilities command emits successfully" {
     const stdout_guard = try silenceStdout();
     defer restoreStdout(stdout_guard);
     try std.testing.expectEqual(@as(u8, 0), try cmdCapabilities(allocator, .{ .command = .capabilities, .format = .json }));
+}
+
+test "workspace init creates STW-v1 skeleton and refuses overwrite" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const workspace_path = try std.fs.path.join(allocator, &.{ root, ".ledger", "st" });
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .init, .workspace = workspace_path }));
+    try std.testing.expectError(error.PathAlreadyExists, cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .init, .workspace = workspace_path }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .status, .workspace = workspace_path, .format = .json }));
+
+    const workspace_file = try std.fs.path.join(allocator, &.{ workspace_path, "workspace.jsonl" });
+    const payload = try durable_store.readRegularFileNoSymlink(allocator, workspace_file, 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"schema\":\"STW-v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload, "\"workspace_sequence\":1") != null);
+    try std.testing.expect(fileExists(try std.fs.path.join(allocator, &.{ workspace_path, "runtime", "sessions" })));
+    try std.testing.expect(fileExists(try std.fs.path.join(allocator, &.{ workspace_path, "integration", "receipts" })));
+}
+
+test "workspace migrate preserves graph plan parity and is idempotent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const legacy_dir = try std.fs.path.join(allocator, &.{ root, ".step" });
+    try durable_store.ensureDirectoryPathNoSymlinks(legacy_dir);
+    const legacy_path = try std.fs.path.join(allocator, &.{ legacy_dir, "st-plan.jsonl" });
+    const patch_path = try std.fs.path.join(allocator, &.{ root, "patch.json" });
+    const workspace_path = try std.fs.path.join(allocator, &.{ root, ".ledger", "st" });
+    try writeTextAtomic(allocator, patch_path,
+        \\{"version":1,"author":"test","reason":"migration fixture","ops":[
+        \\{"op":"upsert-intent","intent":{"id":"intent-001","text":"Migration preserves graph state.","category":"requirement","disposition":"covered"}},
+        \\{"op":"upsert-item","item":{"id":"st-001","step":"Migrate graph fixture","status":"pending","priority":"high","in_plan":true,"item_type":"feature","intent_refs":["intent-001"],"acceptance":["State survives migration"],"validation":["zig build test-st"],"lock_roots":["apps/st"],"contract":{"objective":"Exercise workspace migration.","proof_obligations":[{"id":"proof-001","kind":"unit","command":"zig build test-st","required":true}]}}}
+        \\]}
+    );
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 0), try cmdGraph(allocator, .{ .command = .graph, .graph_command = .apply, .file = legacy_path, .input = patch_path, .gate = .implementation_ready }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .migrate, .from_ref = legacy_path, .to_ref = workspace_path, .workspace = workspace_path, .plan_id = "default", .format = .json }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .migrate, .from_ref = legacy_path, .to_ref = workspace_path, .workspace = workspace_path, .plan_id = "default", .format = .json }));
+
+    const workspace_file = try std.fs.path.join(allocator, &.{ workspace_path, "workspace.jsonl" });
+    const plan_file = try std.fs.path.join(allocator, &.{ workspace_path, "plans", "default", "plan.jsonl" });
+    const receipt_file = try std.fs.path.join(allocator, &.{ workspace_path, "migration", "receipt.json" });
+    const source_archive = try std.fs.path.join(allocator, &.{ workspace_path, "migration", "source", "st-plan.jsonl" });
+    try std.testing.expect(fileExists(workspace_file));
+    try std.testing.expect(fileExists(plan_file));
+    try std.testing.expect(fileExists(receipt_file));
+    try std.testing.expect(fileExists(source_archive));
+
+    var legacy_loaded = try loadValidatedState(allocator, legacy_path, true);
+    defer legacy_loaded.state.deinit();
+    var migrated_loaded = try loadValidatedState(allocator, plan_file, true);
+    defer migrated_loaded.state.deinit();
+    try assertMigrationParity(allocator, &legacy_loaded.state, &migrated_loaded.state, legacy_loaded.latest_seq, migrated_loaded.latest_seq);
+
+    const plan_bytes = try durable_store.readRegularFileNoSymlink(allocator, plan_file, 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, plan_bytes, "\"plan_id\":\"default\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan_bytes, "\"plan_sequence\":") != null);
+
+    const workspace_line = try readLastJsonlLine(allocator, workspace_file);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, workspace_line, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), intField(parsed.value, "workspace_sequence").?);
+    const plans = parsed.value.object.get("plans") orelse return error.WorkspaceInvalid;
+    try std.testing.expectEqual(@as(usize, 1), plans.array.items.len);
+    try std.testing.expectEqualStrings("default", stringField(plans.array.items[0], "plan_id").?);
+    try std.testing.expectEqual(legacy_loaded.latest_seq, intField(plans.array.items[0], "plan_sequence").?);
+
+    const receipt_bytes = try durable_store.readRegularFileNoSymlink(allocator, receipt_file, 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, receipt_bytes, "\"state\":\"idempotent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, receipt_bytes, "\"parity\":\"pass\"") != null);
+}
+
+test "plan create registers plan and rejects duplicate ids" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const workspace_path = try std.fs.path.join(allocator, &.{ root, ".ledger", "st" });
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .init, .workspace = workspace_path }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .create, .workspace = workspace_path, .plan_id = "default", .name = "Default Plan", .format = .json }));
+    try std.testing.expectError(error.PlanAlreadyExists, cmdPlan(allocator, .{ .command = .plan, .plan_command = .create, .workspace = workspace_path, .plan_id = "default" }));
+    try std.testing.expectError(error.InvalidPlanId, cmdPlan(allocator, .{ .command = .plan, .plan_command = .create, .workspace = workspace_path, .plan_id = "../escape" }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .list, .workspace = workspace_path, .format = .json }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .show, .workspace = workspace_path, .plan_id = "default", .format = .json }));
+    try std.testing.expectError(error.PlanMissing, cmdPlan(allocator, .{ .command = .plan, .plan_command = .show, .workspace = workspace_path, .plan_id = "missing" }));
+
+    const workspace_file = try std.fs.path.join(allocator, &.{ workspace_path, "workspace.jsonl" });
+    const workspace_payload = try durable_store.readRegularFileNoSymlink(allocator, workspace_file, 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, workspace_payload, "\"workspace_sequence\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, workspace_payload, "\"plan_id\":\"default\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, workspace_payload, "\"graph_ref\":\"plans/default/plan.jsonl\"") != null);
+
+    const plan_file = try std.fs.path.join(allocator, &.{ workspace_path, "plans", "default", "plan.jsonl" });
+    const plan_payload = try durable_store.readRegularFileNoSymlink(allocator, plan_file, 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, plan_payload, "\"plan_id\":\"default\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan_payload, "\"plan_sequence\":1") != null);
+}
+
+test "workspace audit and doctor fail on missing registered plan file" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const workspace_path = try std.fs.path.join(allocator, &.{ root, ".ledger", "st" });
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .init, .workspace = workspace_path }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .create, .workspace = workspace_path, .plan_id = "default" }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .audit, .workspace = workspace_path, .format = .json }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .doctor, .workspace = workspace_path, .format = .json }));
+
+    const plan_file = try std.fs.path.join(allocator, &.{ workspace_path, "plans", "default", "plan.jsonl" });
+    try std.Io.Dir.cwd().deleteFile(std.Io.Threaded.global_single_threaded.io(), plan_file);
+
+    try std.testing.expectEqual(@as(u8, 2), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .audit, .workspace = workspace_path, .format = .json }));
+    try std.testing.expectEqual(@as(u8, 2), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .doctor, .workspace = workspace_path, .format = .json }));
+}
+
+test "plan lifecycle transitions update registry and active inference" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const workspace_path = try std.fs.path.join(allocator, &.{ root, ".ledger", "st" });
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .init, .workspace = workspace_path }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .create, .workspace = workspace_path, .plan_id = "alpha" }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .create, .workspace = workspace_path, .plan_id = "beta" }));
+
+    try std.testing.expectError(error.InvalidPlanStateTransition, cmdPlan(allocator, .{ .command = .plan, .plan_command = .archive, .workspace = workspace_path, .plan_id = "beta" }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .pause, .workspace = workspace_path, .plan_id = "beta", .format = .json }));
+    try std.testing.expectError(error.InvalidPlanStateTransition, cmdPlan(allocator, .{ .command = .plan, .plan_command = .pause, .workspace = workspace_path, .plan_id = "beta" }));
+    try std.testing.expectEqual(@as(u8, 0), try runCommand(allocator, .{ .command = .add, .workspace = workspace_path, .workspace_explicit = true, .id = "st-001", .step = "Inferred alpha after beta pause" }));
+
+    const alpha_file = try std.fs.path.join(allocator, &.{ workspace_path, "plans", "alpha", "plan.jsonl" });
+    var alpha = try loadValidatedState(allocator, alpha_file, false);
+    defer alpha.state.deinit();
+    try std.testing.expectEqualStrings("Inferred alpha after beta pause", alpha.state.get("st-001").?.step);
+
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .@"resume", .workspace = workspace_path, .plan_id = "beta" }));
+    try std.testing.expectError(error.PlanAmbiguous, runCommand(allocator, .{ .command = .add, .workspace = workspace_path, .workspace_explicit = true, .id = "st-002", .step = "Ambiguous after resume" }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .complete, .workspace = workspace_path, .plan_id = "beta" }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .archive, .workspace = workspace_path, .plan_id = "beta" }));
+    try std.testing.expectError(error.InvalidPlanStateTransition, cmdPlan(allocator, .{ .command = .plan, .plan_command = .@"resume", .workspace = workspace_path, .plan_id = "beta" }));
+    try std.testing.expectError(error.PlanMissing, cmdPlan(allocator, .{ .command = .plan, .plan_command = .pause, .workspace = workspace_path, .plan_id = "missing" }));
+
+    const workspace_file = try std.fs.path.join(allocator, &.{ workspace_path, "workspace.jsonl" });
+    const workspace_payload = try durable_store.readRegularFileNoSymlink(allocator, workspace_file, 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, workspace_payload, "\"workspace_sequence\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, workspace_payload, "\"plan_id\":\"beta\",\"alias\":\"beta\",\"state\":\"archived\"") != null);
+}
+
+test "plan link and unlink mutate workspace cross-plan edges only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const workspace_path = try std.fs.path.join(allocator, &.{ root, ".ledger", "st" });
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .init, .workspace = workspace_path }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .create, .workspace = workspace_path, .plan_id = "alpha" }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .create, .workspace = workspace_path, .plan_id = "beta" }));
+    try std.testing.expectEqual(@as(u8, 0), try runCommand(allocator, .{ .command = .add, .workspace = workspace_path, .plan_id = "alpha", .id = "st-001", .step = "Alpha task" }));
+    try std.testing.expectEqual(@as(u8, 0), try runCommand(allocator, .{ .command = .add, .workspace = workspace_path, .plan_id = "beta", .id = "st-001", .step = "Beta task" }));
+
+    const alpha_file = try std.fs.path.join(allocator, &.{ workspace_path, "plans", "alpha", "plan.jsonl" });
+    const beta_file = try std.fs.path.join(allocator, &.{ workspace_path, "plans", "beta", "plan.jsonl" });
+    const alpha_before = try durable_store.readRegularFileNoSymlink(allocator, alpha_file, 1024 * 1024);
+    const beta_before = try durable_store.readRegularFileNoSymlink(allocator, beta_file, 1024 * 1024);
+
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{
+        .command = .plan,
+        .plan_command = .link,
+        .workspace = workspace_path,
+        .from_ref = "plan://alpha/st-001",
+        .to_ref = "plan://beta/st-001",
+        .link_type = "hard",
+        .format = .json,
+    }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{
+        .command = .plan,
+        .plan_command = .link,
+        .workspace = workspace_path,
+        .from_ref = "plan://beta/st-001",
+        .to_ref = "plan://alpha/st-001",
+        .link_type = "nonblocking",
+    }));
+
+    const alpha_after = try durable_store.readRegularFileNoSymlink(allocator, alpha_file, 1024 * 1024);
+    const beta_after = try durable_store.readRegularFileNoSymlink(allocator, beta_file, 1024 * 1024);
+    try std.testing.expectEqualStrings(alpha_before, alpha_after);
+    try std.testing.expectEqualStrings(beta_before, beta_after);
+
+    const workspace_file = try std.fs.path.join(allocator, &.{ workspace_path, "workspace.jsonl" });
+    const linked_workspace = try durable_store.readRegularFileNoSymlink(allocator, workspace_file, 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, linked_workspace, "\"from\":\"plan://alpha/st-001\",\"to\":\"plan://beta/st-001\",\"type\":\"hard\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, linked_workspace, "\"from\":\"plan://beta/st-001\",\"to\":\"plan://alpha/st-001\",\"type\":\"nonblocking\"") != null);
+
+    try std.testing.expectError(error.CrossPlanEdgeExists, cmdPlan(allocator, .{
+        .command = .plan,
+        .plan_command = .link,
+        .workspace = workspace_path,
+        .from_ref = "plan://alpha/st-001",
+        .to_ref = "plan://beta/st-001",
+        .link_type = "hard",
+    }));
+    try std.testing.expectError(error.PlanMissing, cmdPlan(allocator, .{
+        .command = .plan,
+        .plan_command = .link,
+        .workspace = workspace_path,
+        .from_ref = "plan://missing/st-001",
+        .to_ref = "plan://beta/st-001",
+    }));
+    try std.testing.expectError(error.UnknownItemId, cmdPlan(allocator, .{
+        .command = .plan,
+        .plan_command = .link,
+        .workspace = workspace_path,
+        .from_ref = "plan://alpha/st-404",
+        .to_ref = "plan://beta/st-001",
+    }));
+    try std.testing.expectError(error.InvalidQualifiedRef, cmdPlan(allocator, .{
+        .command = .plan,
+        .plan_command = .link,
+        .workspace = workspace_path,
+        .from_ref = "alpha/st-001",
+        .to_ref = "plan://beta/st-001",
+    }));
+
+    const before_invalid = try durable_store.readRegularFileNoSymlink(allocator, workspace_file, 1024 * 1024);
+    try std.testing.expectError(error.CrossPlanEdgeMissing, cmdPlan(allocator, .{
+        .command = .plan,
+        .plan_command = .unlink,
+        .workspace = workspace_path,
+        .from_ref = "plan://alpha/st-001",
+        .to_ref = "plan://beta/st-001",
+        .link_type = "nonblocking",
+    }));
+    const after_invalid = try durable_store.readRegularFileNoSymlink(allocator, workspace_file, 1024 * 1024);
+    try std.testing.expectEqualStrings(before_invalid, after_invalid);
+
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{
+        .command = .plan,
+        .plan_command = .unlink,
+        .workspace = workspace_path,
+        .from_ref = "plan://alpha/st-001",
+        .to_ref = "plan://beta/st-001",
+        .link_type = "hard",
+    }));
+    const unlinked_checkpoint = try readLastJsonlLine(allocator, workspace_file);
+    try std.testing.expect(std.mem.indexOf(u8, unlinked_checkpoint, "\"from\":\"plan://alpha/st-001\",\"to\":\"plan://beta/st-001\",\"type\":\"hard\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, unlinked_checkpoint, "\"from\":\"plan://beta/st-001\",\"to\":\"plan://alpha/st-001\",\"type\":\"nonblocking\"") != null);
+}
+
+test "workspace aperture blocks hard cross-plan deps and ignores nonblocking links" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const workspace_path = try std.fs.path.join(allocator, &.{ root, ".ledger", "st" });
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .init, .workspace = workspace_path }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .create, .workspace = workspace_path, .plan_id = "alpha" }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .create, .workspace = workspace_path, .plan_id = "beta" }));
+    try std.testing.expectEqual(@as(u8, 0), try runCommand(allocator, .{ .command = .add, .workspace = workspace_path, .plan_id = "alpha", .id = "st-blocked", .step = "Blocked alpha", .selection_priority = "high" }));
+    try std.testing.expectEqual(@as(u8, 0), try runCommand(allocator, .{ .command = .add, .workspace = workspace_path, .plan_id = "alpha", .id = "st-free", .step = "Free alpha", .selection_priority = "high" }));
+    try std.testing.expectEqual(@as(u8, 0), try runCommand(allocator, .{ .command = .add, .workspace = workspace_path, .plan_id = "beta", .id = "st-blocker", .step = "Beta blocker" }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{
+        .command = .plan,
+        .plan_command = .link,
+        .workspace = workspace_path,
+        .from_ref = "plan://alpha/st-blocked",
+        .to_ref = "plan://beta/st-blocker",
+        .link_type = "hard",
+    }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{
+        .command = .plan,
+        .plan_command = .link,
+        .workspace = workspace_path,
+        .from_ref = "plan://alpha/st-free",
+        .to_ref = "plan://beta/st-blocker",
+        .link_type = "nonblocking",
+    }));
+
+    const workspace = try loadWorkspaceCheckpoint(allocator, workspace_path);
+    defer workspace.deinit();
+    const plans = workspace.parsed.value.object.get("plans") orelse return error.WorkspaceInvalid;
+    const edges = workspace.parsed.value.object.get("cross_plan_edges") orelse return error.WorkspaceInvalid;
+    try std.testing.expect((try workspaceHardDependencyBlocker(allocator, workspace.root, plans, edges, "plan://alpha/st-blocked")) != null);
+    try std.testing.expect((try workspaceHardDependencyBlocker(allocator, workspace.root, plans, edges, "plan://alpha/st-free")) == null);
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .aperture, .workspace = workspace_path, .format = .json }));
+}
+
+test "workspace aperture selects deterministic conflict-free candidates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const workspace_path = try std.fs.path.join(allocator, &.{ root, ".ledger", "st" });
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .init, .workspace = workspace_path }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .create, .workspace = workspace_path, .plan_id = "alpha" }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .create, .workspace = workspace_path, .plan_id = "beta" }));
+    try std.testing.expectEqual(@as(u8, 0), try runCommand(allocator, .{ .command = .add, .workspace = workspace_path, .plan_id = "alpha", .id = "st-a", .step = "Alpha A", .selection_priority = "high" }));
+    try std.testing.expectEqual(@as(u8, 0), try runCommand(allocator, .{ .command = .add, .workspace = workspace_path, .plan_id = "beta", .id = "st-b", .step = "Beta B", .selection_priority = "high" }));
+    try std.testing.expectEqual(@as(u8, 0), try runCommand(allocator, .{ .command = .add, .workspace = workspace_path, .plan_id = "beta", .id = "st-c", .step = "Beta C", .selection_priority = "medium" }));
+
+    const alpha_file = try resolveWorkspacePlanFile(allocator, workspace_path, "alpha");
+    const beta_file = try resolveWorkspacePlanFile(allocator, workspace_path, "beta");
+    const alpha_patch = try std.fs.path.join(allocator, &.{ root, "alpha-locks.json" });
+    const beta_patch = try std.fs.path.join(allocator, &.{ root, "beta-locks.json" });
+    try writeTextAtomic(allocator, alpha_patch,
+        \\{"version":1,"author":"test","reason":"alpha locks","ops":[
+        \\{"op":"set-lock-roots","id":"st-a","lock_roots":["src/shared"]}
+        \\]}
+    );
+    try writeTextAtomic(allocator, beta_patch,
+        \\{"version":1,"author":"test","reason":"beta locks","ops":[
+        \\{"op":"set-lock-roots","id":"st-b","lock_roots":["src/shared/api.zig"]},
+        \\{"op":"set-lock-roots","id":"st-c","lock_roots":["docs"]}
+        \\]}
+    );
+    try std.testing.expectEqual(@as(u8, 0), try cmdGraph(allocator, .{ .command = .graph, .graph_command = .apply, .file = alpha_file, .input = alpha_patch, .gate = .draft }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdGraph(allocator, .{ .command = .graph, .graph_command = .apply, .file = beta_file, .input = beta_patch, .gate = .draft }));
+
+    const workspace = try loadWorkspaceCheckpoint(allocator, workspace_path);
+    defer workspace.deinit();
+    const now = try nowUtcAlloc(allocator);
+    var alpha_state = try loadValidatedState(allocator, alpha_file, false);
+    defer alpha_state.state.deinit();
+    var beta_state = try loadValidatedState(allocator, beta_file, false);
+    defer beta_state.state.deinit();
+    const alpha = alpha_state.state.getConst("st-a").?;
+    const beta = beta_state.state.getConst("st-b").?;
+    const docs = beta_state.state.getConst("st-c").?;
+    const alpha_resources = try workspaceResourcesForItem(allocator, alpha.*);
+    const beta_resources = try workspaceResourcesForItem(allocator, beta.*);
+    const docs_resources = try workspaceResourcesForItem(allocator, docs.*);
+    try std.testing.expect(workspaceResourcesConflict(alpha_resources[0], beta_resources[0]));
+    try std.testing.expect(!workspaceResourcesConflict(alpha_resources[0], docs_resources[0]));
+    try std.testing.expect((try workspaceHeldClaimConflict(workspace.parsed.value.object, alpha_resources, now)) == null);
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .aperture, .workspace = workspace_path, .format = .json }));
+}
+
+test "workspace resource grammar normalizes and rejects unsafe resources" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const path = try parseWorkspaceResource(allocator, "path:src//st\\workspace.zig", .write);
+    try std.testing.expectEqual(WorkspaceResourceKind.path, path.kind);
+    try std.testing.expectEqual(WorkspaceResourceMode.write, path.mode);
+    try std.testing.expectEqualStrings("src/st/workspace.zig", path.primary);
+
+    const symbol = try parseWorkspaceResource(allocator, "symbol:src/st/workspace.zig#WorkspaceClaim", .read);
+    try std.testing.expectEqual(WorkspaceResourceKind.symbol, symbol.kind);
+    try std.testing.expectEqualStrings("src/st/workspace.zig", symbol.primary);
+    try std.testing.expectEqualStrings("WorkspaceClaim", symbol.secondary);
+
+    const generated = try parseWorkspaceResource(allocator, "generated:OpenAPI.Client", .write);
+    try std.testing.expectEqual(WorkspaceResourceKind.generated, generated.kind);
+    try std.testing.expectEqualStrings("openapi.client", generated.primary);
+
+    const branch = try parseWorkspaceResource(allocator, "git:branch:feature/st-workspace", .exclusive);
+    try std.testing.expectEqual(WorkspaceResourceKind.git_branch, branch.kind);
+    try std.testing.expectEqualStrings("feature/st-workspace", branch.primary);
+
+    try std.testing.expectError(error.InvalidResource, parseWorkspaceResource(allocator, "path:/absolute", .write));
+    try std.testing.expectError(error.InvalidResource, parseWorkspaceResource(allocator, "path:../escape", .write));
+    try std.testing.expectError(error.InvalidResource, parseWorkspaceResource(allocator, "path:src/\x00bad", .write));
+    try std.testing.expectError(error.InvalidResource, parseWorkspaceResource(allocator, "symbol:src/a.zig", .write));
+    try std.testing.expectError(error.InvalidResource, parseWorkspaceResource(allocator, "generated:name/with/slash", .write));
+    try std.testing.expectError(error.InvalidResource, parseWorkspaceResource(allocator, "git:branch:../main", .write));
+}
+
+test "workspace resource conflicts follow mode matrix and overlap rules" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const path_read_a = try parseWorkspaceResource(allocator, "path:src/app.zig", .read);
+    const path_read_b = try parseWorkspaceResource(allocator, "path:src/app.zig", .read);
+    const path_write = try parseWorkspaceResource(allocator, "path:src/app.zig", .write);
+    const dir_write = try parseWorkspaceResource(allocator, "path:src", .write);
+    const other_write = try parseWorkspaceResource(allocator, "path:test/app.zig", .write);
+    try std.testing.expect(!workspaceResourcesConflict(path_read_a, path_read_b));
+    try std.testing.expect(workspaceResourcesConflict(path_read_a, path_write));
+    try std.testing.expect(workspaceResourcesConflict(dir_write, path_write));
+    try std.testing.expect(!workspaceResourcesConflict(path_write, other_write));
+
+    const symbol_a = try parseWorkspaceResource(allocator, "symbol:src/app.zig#A", .write);
+    const symbol_b = try parseWorkspaceResource(allocator, "symbol:src/app.zig#B", .write);
+    const symbol_read = try parseWorkspaceResource(allocator, "symbol:src/app.zig#A", .read);
+    try std.testing.expect(workspaceResourcesConflict(path_write, symbol_read));
+    try std.testing.expect(workspaceResourcesConflict(symbol_a, symbol_b));
+
+    const generated_a = try parseWorkspaceResource(allocator, "generated:client", .write);
+    const generated_b = try parseWorkspaceResource(allocator, "generated:client", .read);
+    const generated_c = try parseWorkspaceResource(allocator, "generated:server", .write);
+    try std.testing.expect(workspaceResourcesConflict(generated_a, generated_b));
+    try std.testing.expect(!workspaceResourcesConflict(generated_a, generated_c));
+
+    const schema_a = try parseWorkspaceResource(allocator, "schema:events", .write);
+    const schema_b = try parseWorkspaceResource(allocator, "schema:events", .write);
+    const service_a = try parseWorkspaceResource(allocator, "service:api", .exclusive);
+    const service_b = try parseWorkspaceResource(allocator, "service:api", .read);
+    try std.testing.expect(workspaceResourcesConflict(schema_a, schema_b));
+    try std.testing.expect(workspaceResourcesConflict(service_a, service_b));
+
+    const git_index = try parseWorkspaceResource(allocator, "git:index", .write);
+    const git_index_read = try parseWorkspaceResource(allocator, "git:index", .read);
+    const git_branch = try parseWorkspaceResource(allocator, "git:branch:main", .write);
+    try std.testing.expect(workspaceResourcesConflict(git_index, git_index_read));
+    try std.testing.expect(!workspaceResourcesConflict(git_index, git_branch));
+
+    const repo = try parseWorkspaceResource(allocator, "repo:all", .read);
+    try std.testing.expect(workspaceResourcesConflict(repo, path_read_a));
+
+    const unknown = try inferUnknownMutationResource(allocator);
+    try std.testing.expectEqual(WorkspaceResourceKind.repo_all, unknown.resource.kind);
+    try std.testing.expectEqual(WorkspaceResourceMode.exclusive, unknown.resource.mode);
+    try std.testing.expectEqualStrings("low", unknown.confidence);
+    try std.testing.expect(workspaceResourcesConflict(unknown.resource, other_write));
+}
+
+test "workspace claims grant disjoint resources and reject conflicts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const workspace_path = try std.fs.path.join(allocator, &.{ root, ".ledger", "st" });
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .init, .workspace = workspace_path }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .create, .workspace = workspace_path, .plan_id = "default" }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdClaim(allocator, .{
+        .command = .claim,
+        .workspace = workspace_path,
+        .workspace_explicit = true,
+        .session_id = "s1",
+        .executor = "teams",
+        .resources = "write:path:src/a.zig",
+    }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdClaim(allocator, .{
+        .command = .claim,
+        .workspace = workspace_path,
+        .workspace_explicit = true,
+        .session_id = "s2",
+        .executor = "teams",
+        .resources = "write:path:src/b.zig",
+    }));
+    try std.testing.expectError(error.ResourceConflict, cmdClaim(allocator, .{
+        .command = .claim,
+        .workspace = workspace_path,
+        .workspace_explicit = true,
+        .session_id = "s3",
+        .executor = "teams",
+        .resources = "write:path:src/a.zig",
+    }));
+
+    const workspace_file = try std.fs.path.join(allocator, &.{ workspace_path, "workspace.jsonl" });
+    const checkpoint = try readLastJsonlLine(allocator, workspace_file);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint, "\"claim_id\":\"claim-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint, "\"claim_id\":\"claim-2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint, "\"fencing_counter\":2") != null);
+}
+
+test "workspace claim fencing validates heartbeat, reclaim, and amend" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const workspace_path = try std.fs.path.join(allocator, &.{ root, ".ledger", "st" });
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .init, .workspace = workspace_path }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .create, .workspace = workspace_path, .plan_id = "default" }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdClaim(allocator, .{
+        .command = .claim,
+        .workspace = workspace_path,
+        .workspace_explicit = true,
+        .session_id = "s1",
+        .executor = "teams",
+        .resources = "write:path:src/a.zig",
+    }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdClaim(allocator, .{
+        .command = .claim,
+        .claim_command = .heartbeat,
+        .workspace = workspace_path,
+        .claim_id = "claim-1",
+        .session_id = "s1",
+        .fencing_token = "1",
+    }));
+    try std.testing.expectError(error.ClaimOwnerMismatch, cmdClaim(allocator, .{
+        .command = .claim,
+        .claim_command = .heartbeat,
+        .workspace = workspace_path,
+        .claim_id = "claim-1",
+        .session_id = "wrong",
+        .fencing_token = "1",
+    }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdClaim(allocator, .{
+        .command = .claim,
+        .claim_command = .amend,
+        .workspace = workspace_path,
+        .claim_id = "claim-1",
+        .session_id = "s1",
+        .fencing_token = "1",
+        .resources = "write:path:src/a.zig,write:path:src/c.zig",
+    }));
+    try std.testing.expectError(error.FencingTokenStale, cmdClaim(allocator, .{
+        .command = .claim,
+        .claim_command = .heartbeat,
+        .workspace = workspace_path,
+        .claim_id = "claim-1",
+        .session_id = "s1",
+        .fencing_token = "1",
+    }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdClaim(allocator, .{
+        .command = .claim,
+        .claim_command = .heartbeat,
+        .workspace = workspace_path,
+        .claim_id = "claim-2",
+        .session_id = "s1",
+        .fencing_token = "2",
+    }));
+
+    try std.testing.expectEqual(@as(u8, 0), try cmdClaim(allocator, .{
+        .command = .claim,
+        .workspace = workspace_path,
+        .workspace_explicit = true,
+        .session_id = "s2",
+        .executor = "teams",
+        .lease_seconds = "1",
+        .resources = "write:path:src/expired.zig",
+    }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdClaim(allocator, .{
+        .command = .claim,
+        .claim_command = .reclaim_stale,
+        .workspace = workspace_path,
+        .now = "2999-01-01T00:00:00Z",
+    }));
+    try std.testing.expectError(error.FencingTokenStale, cmdClaim(allocator, .{
+        .command = .claim,
+        .claim_command = .heartbeat,
+        .workspace = workspace_path,
+        .claim_id = "claim-3",
+        .session_id = "s2",
+        .fencing_token = "3",
+    }));
+
+    const workspace_file = try std.fs.path.join(allocator, &.{ workspace_path, "workspace.jsonl" });
+    const checkpoint = try readLastJsonlLine(allocator, workspace_file);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint, "\"claim_id\":\"claim-1\",\"state\":\"released\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint, "\"claim_id\":\"claim-2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint, "\"claim_id\":\"claim-3\",\"state\":\"stale\"") != null);
+}
+
+fn runTestGit(allocator: std.mem.Allocator, cwd: []const u8, args: []const []const u8) !void {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, "git");
+    try argv.appendSlice(allocator, args);
+    var result = try runCommandCapture(allocator, argv.items, cwd);
+    defer result.deinit(allocator);
+    if (result.exit_code != 0) return error.TestGitCommandFailed;
+}
+
+test "external worktree and changeset sealing enforce claim path authority" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const repo_path = try std.fs.path.join(allocator, &.{ root, "repo" });
+    const worktree_path = try std.fs.path.join(allocator, &.{ root, "worker" });
+    const workspace_path = try std.fs.path.join(allocator, &.{ repo_path, ".ledger", "st" });
+    try durable_store.ensureDirectoryPathNoSymlinks(repo_path);
+
+    try runTestGit(allocator, repo_path, &.{ "init", "-b", "main" });
+    const a_path = try std.fs.path.join(allocator, &.{ repo_path, "src", "a.txt" });
+    const b_path = try std.fs.path.join(allocator, &.{ repo_path, "src", "b.txt" });
+    try writeTextAtomic(allocator, a_path, "alpha\n");
+    try writeTextAtomic(allocator, b_path, "beta\n");
+    try runTestGit(allocator, repo_path, &.{ "add", "src/a.txt", "src/b.txt" });
+    try runTestGit(allocator, repo_path, &.{ "-c", "user.name=st-test", "-c", "user.email=st-test@example.com", "commit", "-m", "initial" });
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .init, .workspace = workspace_path }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdClaim(allocator, .{
+        .command = .claim,
+        .workspace = workspace_path,
+        .workspace_explicit = true,
+        .session_id = "s1",
+        .executor = "teams",
+        .resources = "write:path:src/a.txt",
+    }));
+
+    const nested_path = try std.fs.path.join(allocator, &.{ repo_path, "nested-worker" });
+    try std.testing.expectError(error.NestedPrimaryCheckoutWorktree, cmdWorktree(allocator, .{
+        .command = .worktree,
+        .worktree_command = .create,
+        .workspace = workspace_path,
+        .claim_id = "claim-1",
+        .session_id = "s1",
+        .fencing_token = "1",
+        .source = repo_path,
+        .output = nested_path,
+    }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorktree(allocator, .{
+        .command = .worktree,
+        .worktree_command = .create,
+        .workspace = workspace_path,
+        .claim_id = "claim-1",
+        .session_id = "s1",
+        .fencing_token = "1",
+        .source = repo_path,
+        .output = worktree_path,
+    }));
+
+    const worker_a = try std.fs.path.join(allocator, &.{ worktree_path, "src", "a.txt" });
+    try writeTextAtomic(allocator, worker_a, "alpha changed\n");
+    try std.testing.expectEqual(@as(u8, 0), try cmdChangeset(allocator, .{
+        .command = .changeset,
+        .changeset_command = .seal,
+        .workspace = workspace_path,
+        .claim_id = "claim-1",
+        .session_id = "s1",
+        .fencing_token = "1",
+        .worktree_path = worktree_path,
+        .id = "cs-1",
+    }));
+    const cs1_path = try changesetFilePathAlloc(allocator, workspace_path, "cs-1");
+    const cs1 = try durable_store.readRegularFileNoSymlink(allocator, cs1_path, 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, cs1, "\"receipt_version\":\"CS-v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cs1, "\"changed_paths\":[\"src/a.txt\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cs1, "\"patch_digest\":\"sha256:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cs1, "\"tree_digest\":\"sha256:") != null);
+
+    const worker_b = try std.fs.path.join(allocator, &.{ worktree_path, "src", "b.txt" });
+    try writeTextAtomic(allocator, worker_b, "outside claim\n");
+    try std.testing.expectError(error.ChangeSetOutsideClaim, cmdChangeset(allocator, .{
+        .command = .changeset,
+        .changeset_command = .seal,
+        .workspace = workspace_path,
+        .claim_id = "claim-1",
+        .session_id = "s1",
+        .fencing_token = "1",
+        .worktree_path = worktree_path,
+        .id = "cs-outside",
+    }));
+
+    try runTestGit(allocator, worktree_path, &.{ "checkout", "--", "src/b.txt" });
+    try writeTextAtomic(allocator, worker_a, "alpha changed twice\n");
+    try std.testing.expectEqual(@as(u8, 0), try cmdChangeset(allocator, .{
+        .command = .changeset,
+        .changeset_command = .seal,
+        .workspace = workspace_path,
+        .claim_id = "claim-1",
+        .session_id = "s1",
+        .fencing_token = "1",
+        .worktree_path = worktree_path,
+        .id = "cs-2",
+        .from_ref = "cs-1",
+    }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdChangeset(allocator, .{
+        .command = .changeset,
+        .changeset_command = .show,
+        .workspace = workspace_path,
+        .id = "cs-2",
+    }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdChangeset(allocator, .{
+        .command = .changeset,
+        .changeset_command = .reject,
+        .workspace = workspace_path,
+        .id = "cs-2",
+    }));
+    const wt_metadata_path = try worktreeFilePathAlloc(allocator, workspace_path, "claim-1");
+    const wt_metadata = try durable_store.readRegularFileNoSymlink(allocator, wt_metadata_path, 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, wt_metadata, "\"state\":\"recovery\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wt_metadata, "\"recovery_reason\":\"dirty_abandoned_worktree\"") != null);
+    try std.testing.expectError(error.ChangeSetStale, cmdChangeset(allocator, .{
+        .command = .changeset,
+        .changeset_command = .supersede,
+        .workspace = workspace_path,
+        .id = "cs-2",
+        .to_ref = "cs-1",
+    }));
+}
+
+test "serialized integration applies sealed changeset with branch CAS and epoch receipt" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const repo_path = try std.fs.path.join(allocator, &.{ root, "repo" });
+    const worktree_path = try std.fs.path.join(allocator, &.{ root, "worker" });
+    const workspace_path = try std.fs.path.join(allocator, &.{ repo_path, ".ledger", "st" });
+    try durable_store.ensureDirectoryPathNoSymlinks(repo_path);
+
+    try runTestGit(allocator, repo_path, &.{ "init", "-b", "main" });
+    const a_path = try std.fs.path.join(allocator, &.{ repo_path, "src", "a.txt" });
+    try writeTextAtomic(allocator, a_path, "alpha\n");
+    try runTestGit(allocator, repo_path, &.{ "add", "src/a.txt" });
+    try runTestGit(allocator, repo_path, &.{ "-c", "user.name=st-test", "-c", "user.email=st-test@example.com", "commit", "-m", "initial" });
+    const initial_head = try gitTrimmedAlloc(allocator, repo_path, &.{ "rev-parse", "HEAD" });
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .init, .workspace = workspace_path }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .create, .workspace = workspace_path, .plan_id = "default" }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdClaim(allocator, .{
+        .command = .claim,
+        .workspace = workspace_path,
+        .workspace_explicit = true,
+        .session_id = "s1",
+        .executor = "teams",
+        .resources = "write:path:src/a.txt",
+    }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorktree(allocator, .{
+        .command = .worktree,
+        .worktree_command = .create,
+        .workspace = workspace_path,
+        .claim_id = "claim-1",
+        .session_id = "s1",
+        .fencing_token = "1",
+        .source = repo_path,
+        .output = worktree_path,
+    }));
+
+    const worker_a = try std.fs.path.join(allocator, &.{ worktree_path, "src", "a.txt" });
+    try writeTextAtomic(allocator, worker_a, "alpha integrated\n");
+    try std.testing.expectEqual(@as(u8, 0), try cmdChangeset(allocator, .{
+        .command = .changeset,
+        .changeset_command = .seal,
+        .workspace = workspace_path,
+        .claim_id = "claim-1",
+        .session_id = "s1",
+        .fencing_token = "1",
+        .worktree_path = worktree_path,
+        .id = "cs-int",
+    }));
+
+    try std.testing.expectEqual(@as(u8, 0), try cmdIntegrate(allocator, .{ .command = .integrate, .integrate_command = .enqueue, .workspace = workspace_path, .id = "cs-int" }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdIntegrate(allocator, .{ .command = .integrate, .integrate_command = .status, .workspace = workspace_path }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdIntegrate(allocator, .{ .command = .integrate, .integrate_command = .preview, .workspace = workspace_path, .id = "cs-int" }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdIntegrate(allocator, .{
+        .command = .integrate,
+        .integrate_command = .apply,
+        .workspace = workspace_path,
+        .id = "cs-int",
+        .source = repo_path,
+        .expect_branch_epoch = "0",
+    }));
+
+    const integrated_text = try readFileAlloc(allocator, a_path, 1024 * 1024);
+    try std.testing.expectEqualStrings("alpha integrated\n", integrated_text);
+    const new_head = try gitTrimmedAlloc(allocator, repo_path, &.{ "rev-parse", "HEAD" });
+    try std.testing.expect(!std.mem.eql(u8, initial_head, new_head));
+
+    const workspace_file = try std.fs.path.join(allocator, &.{ workspace_path, "workspace.jsonl" });
+    const workspace_checkpoint = try readLastJsonlLine(allocator, workspace_file);
+    try std.testing.expect(std.mem.indexOf(u8, workspace_checkpoint, "\"target_branch\":\"main\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, workspace_checkpoint, "\"branch_epoch\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, workspace_checkpoint, new_head) != null);
+
+    const cs_path = try changesetFilePathAlloc(allocator, workspace_path, "cs-int");
+    const cs = try durable_store.readRegularFileNoSymlink(allocator, cs_path, 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, cs, "\"state\":\"integrated\"") != null);
+    const receipt_path = try integrationReceiptPathAlloc(allocator, workspace_path, "cs-int");
+    const receipt = try durable_store.readRegularFileNoSymlink(allocator, receipt_path, 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, receipt, "\"receipt_version\":\"IGR-v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, receipt, "\"branch_epoch_after\":1") != null);
+    const queue_path = try integrationQueuePathAlloc(allocator, workspace_path);
+    const queue = try durable_store.readRegularFileNoSymlink(allocator, queue_path, 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, queue, "\"state\":\"queued\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, queue, "\"state\":\"integrated\"") != null);
+    const invalidation_path = try std.fs.path.join(allocator, &.{ workspace_path, "proof", "default", "invalidations.jsonl" });
+    const invalidation = try durable_store.readRegularFileNoSymlink(allocator, invalidation_path, 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, invalidation, "\"receipt_version\":\"PINV-v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalidation, "\"changed_resources\":[\"path:src/a.txt\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalidation, "\"final_proof_stale\":true") != null);
+}
+
+test "workspace sessions bind independent views and gate claimed switch-plan" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const workspace_path = try std.fs.path.join(allocator, &.{ root, ".ledger", "st" });
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .init, .workspace = workspace_path }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .create, .workspace = workspace_path, .plan_id = "alpha" }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .create, .workspace = workspace_path, .plan_id = "beta" }));
+    try std.testing.expectEqual(@as(u8, 0), try runCommand(allocator, .{ .command = .add, .workspace = workspace_path, .plan_id = "alpha", .id = "st-001", .step = "Alpha task" }));
+    try std.testing.expectEqual(@as(u8, 0), try runCommand(allocator, .{ .command = .add, .workspace = workspace_path, .plan_id = "beta", .id = "st-001", .step = "Beta task" }));
+
+    try std.testing.expectEqual(@as(u8, 0), try cmdSession(allocator, .{
+        .command = .session,
+        .session_command = .bind,
+        .workspace = workspace_path,
+        .session_id = "s1",
+        .executor = "teams",
+        .plan_id = "alpha",
+        .ids = "st-001",
+        .format = .json,
+    }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdSession(allocator, .{
+        .command = .session,
+        .session_command = .bind,
+        .workspace = workspace_path,
+        .session_id = "s2",
+        .executor = "teams",
+        .plan_id = "beta",
+        .ids = "st-001",
+        .format = .json,
+    }));
+
+    const s1_view_path = try workspaceViewFilePathAlloc(allocator, workspace_path, "s1");
+    const s2_view_path = try workspaceViewFilePathAlloc(allocator, workspace_path, "s2");
+    const s1_view = try durable_store.readRegularFileNoSymlink(allocator, s1_view_path, 1024 * 1024);
+    const s2_view = try durable_store.readRegularFileNoSymlink(allocator, s2_view_path, 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, s1_view, "\"receipt_version\":\"SVW-v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s1_view, "\"plan_id\":\"alpha\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s2_view, "\"plan_id\":\"beta\"") != null);
+    try std.testing.expect(!std.mem.eql(u8, s1_view, s2_view));
+
+    try std.testing.expectEqual(@as(u8, 0), try cmdClaim(allocator, .{
+        .command = .claim,
+        .workspace = workspace_path,
+        .workspace_explicit = true,
+        .session_id = "s3",
+        .executor = "teams",
+        .resources = "write:path:src/session.zig",
+    }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdSession(allocator, .{
+        .command = .session,
+        .session_command = .bind,
+        .workspace = workspace_path,
+        .session_id = "s3",
+        .executor = "teams",
+        .plan_id = "alpha",
+        .claim_id = "claim-1",
+        .fencing_token = "1",
+    }));
+    try std.testing.expectError(error.SessionPlanMismatch, cmdSession(allocator, .{
+        .command = .session,
+        .session_command = .switch_plan,
+        .workspace = workspace_path,
+        .session_id = "s3",
+        .plan_id = "beta",
+    }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdSession(allocator, .{
+        .command = .session,
+        .session_command = .release,
+        .workspace = workspace_path,
+        .session_id = "s3",
+    }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdSession(allocator, .{
+        .command = .session,
+        .session_command = .switch_plan,
+        .workspace = workspace_path,
+        .session_id = "s3",
+        .plan_id = "beta",
+    }));
+
+    const s3_view_path = try workspaceViewFilePathAlloc(allocator, workspace_path, "s3");
+    const s3_view = try durable_store.readRegularFileNoSymlink(allocator, s3_view_path, 1024 * 1024);
+    try std.testing.expect(std.mem.indexOf(u8, s3_view, "\"plan_id\":\"beta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s3_view, "\"claim_id\":\"\"") != null);
+}
+
+test "GCR-v2 binds workspace claim, session view, and registry graph fingerprints" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const workspace_path = try std.fs.path.join(allocator, &.{ root, ".ledger", "st" });
+    const plan_path = try std.fs.path.join(allocator, &.{ workspace_path, "plans", "default", "plan.jsonl" });
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .init, .workspace = workspace_path }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .create, .workspace = workspace_path, .plan_id = "default" }));
+
+    var state = ItemState.init(allocator);
+    defer state.deinit();
+    state.graph_active = true;
+    state.graph.version = GraphEnvelopeVersion;
+    state.graph.lineage.materiality = "material";
+    state.graph.policy.completion_requires_proof = true;
+    state.graph.intent = &.{.{ .id = "intent-001", .text = "Authorize workspace execution.", .category = "requirement", .disposition = "covered" }};
+    try state.upsert(.{
+        .id = "st-001",
+        .step = "Authorized work",
+        .status = .pending,
+        .priority = .high,
+        .in_plan = true,
+        .deps = &.{},
+        .notes = "",
+        .comments = &.{},
+        .item_type = .feature,
+        .intent_refs = &.{"intent-001"},
+        .acceptance = &.{"GCR-v2 authorizes current state"},
+        .validation = &.{"zig build test-st"},
+        .contract = .{
+            .objective = "Emit current workspace execution authority.",
+            .proof_obligations = &.{.{ .id = "proof-001", .kind = "unit", .command = "zig build test-st" }},
+        },
+        .lock_roots = &.{"apps/st/scripts/st.zig"},
+    });
+    const now = try nowUtcAlloc(allocator);
+    try writeCanonicalRecords(plan_path, &state, 2, now, buildMutationMeta(allocator, false), null);
+    const fps = try computeGraphFingerprints(allocator, &state);
+    state.graph.fingerprints = fps;
+    const audit = AuditResult{ .gate = .execution_ready, .findings = &.{}, .errors = 0, .warnings = 0 };
+
+    try std.testing.expectEqual(@as(u8, 0), try cmdClaim(allocator, .{
+        .command = .claim,
+        .workspace = workspace_path,
+        .workspace_explicit = true,
+        .session_id = "s1",
+        .executor = "teams",
+        .plan_id = "default",
+        .resources = "write:path:apps/st/scripts/st.zig",
+    }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdSession(allocator, .{
+        .command = .session,
+        .session_command = .bind,
+        .workspace = workspace_path,
+        .session_id = "s1",
+        .executor = "teams",
+        .plan_id = "default",
+        .claim_id = "claim-1",
+        .fencing_token = "1",
+        .ids = "st-001",
+    }));
+
+    var allowed_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer allowed_writer.deinit();
+    try writeWorkspaceGraphControlReceiptJson(allocator, &allowed_writer.writer, .{
+        .command = .compile,
+        .workspace = workspace_path,
+        .file = plan_path,
+        .plan_id = "default",
+        .session_id = "s1",
+        .claim_id = "claim-1",
+        .fencing_token = "1",
+    }, &state, 2, fps, audit, &.{"st-001"}, "GCR-test", false);
+    const allowed_json = try allowed_writer.toOwnedSlice();
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"receipt_version\":\"GCR-v2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"execution_allowed\":\"yes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"graph_fingerprints\":{\"structure\":\"sha256:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"registry_graph_fingerprints\":{}") != null);
+
+    const workspace_file = try std.fs.path.join(allocator, &.{ workspace_path, "workspace.jsonl" });
+    const workspace_line = try readLastJsonlLine(allocator, workspace_file);
+    const marker = "\"graph_fingerprints\":{}";
+    const marker_index = std.mem.indexOf(u8, workspace_line, marker) orelse return error.TestUnexpectedResult;
+    var stale_workspace: std.Io.Writer.Allocating = .init(allocator);
+    defer stale_workspace.deinit();
+    try stale_workspace.writer.writeAll(workspace_line[0..marker_index]);
+    try stale_workspace.writer.writeAll("\"graph_fingerprints\":{\"structure\":\"sha256:stale\",\"contract\":\"sha256:stale\",\"coverage\":\"sha256:stale\",\"execution\":\"sha256:stale\"}");
+    try stale_workspace.writer.writeAll(workspace_line[marker_index + marker.len ..]);
+    try stale_workspace.writer.writeByte('\n');
+    const stale_payload = try stale_workspace.toOwnedSlice();
+    try writeTextAtomic(allocator, workspace_file, stale_payload);
+
+    var stale_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer stale_writer.deinit();
+    try writeWorkspaceGraphControlReceiptJson(allocator, &stale_writer.writer, .{
+        .command = .compile,
+        .workspace = workspace_path,
+        .file = plan_path,
+        .plan_id = "default",
+        .session_id = "s1",
+        .claim_id = "claim-1",
+        .fencing_token = "1",
+    }, &state, 2, fps, audit, &.{"st-001"}, "GCR-test", false);
+    const stale_json = try stale_writer.toOwnedSlice();
+    try std.testing.expect(std.mem.indexOf(u8, stale_json, "\"execution_allowed\":\"no\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stale_json, "\"gcr_stale\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stale_json, "\"graph_fingerprints\":false") != null);
+}
+
+test "workspace plan scope routes legacy add commands to registered graph files" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const workspace_path = try std.fs.path.join(allocator, &.{ root, ".ledger", "st" });
+    const legacy_path = try std.fs.path.join(allocator, &.{ root, "legacy.jsonl" });
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .init, .workspace = workspace_path }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .create, .workspace = workspace_path, .plan_id = "alpha" }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .create, .workspace = workspace_path, .plan_id = "beta" }));
+
+    try std.testing.expectEqual(@as(u8, 0), try runCommand(allocator, .{ .command = .add, .workspace = workspace_path, .plan_id = "alpha", .id = "st-001", .step = "Alpha local task" }));
+    try std.testing.expectEqual(@as(u8, 0), try runCommand(allocator, .{ .command = .add, .workspace = workspace_path, .plan_id = "beta", .id = "st-001", .step = "Beta local task" }));
+    try std.testing.expectEqual(@as(u8, 0), try runCommand(allocator, .{ .command = .add, .file = legacy_path, .id = "st-001", .step = "Legacy local task" }));
+
+    const alpha_file = try std.fs.path.join(allocator, &.{ workspace_path, "plans", "alpha", "plan.jsonl" });
+    const beta_file = try std.fs.path.join(allocator, &.{ workspace_path, "plans", "beta", "plan.jsonl" });
+    var alpha = try loadValidatedState(allocator, alpha_file, false);
+    defer alpha.state.deinit();
+    var beta = try loadValidatedState(allocator, beta_file, false);
+    defer beta.state.deinit();
+    var legacy = try loadValidatedState(allocator, legacy_path, false);
+    defer legacy.state.deinit();
+
+    try std.testing.expectEqualStrings("Alpha local task", alpha.state.get("st-001").?.step);
+    try std.testing.expectEqualStrings("Beta local task", beta.state.get("st-001").?.step);
+    try std.testing.expectEqualStrings("Legacy local task", legacy.state.get("st-001").?.step);
+    try std.testing.expectError(error.PlanMissing, runCommand(allocator, .{ .command = .add, .workspace = workspace_path, .plan_id = "missing", .id = "st-002", .step = "Should not write" }));
+    try std.testing.expectError(error.InvalidPlanScope, runCommand(allocator, .{ .command = .add, .workspace = workspace_path, .plan_id = "alpha", .file = legacy_path, .file_explicit = true, .id = "st-002", .step = "Ambiguous write" }));
+}
+
+test "workspace plan scope infers exactly one active plan and rejects ambiguity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const workspace_path = try std.fs.path.join(allocator, &.{ root, ".ledger", "st" });
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .init, .workspace = workspace_path }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .create, .workspace = workspace_path, .plan_id = "solo" }));
+    try std.testing.expectEqual(@as(u8, 0), try runCommand(allocator, .{ .command = .add, .workspace = workspace_path, .workspace_explicit = true, .id = "st-001", .step = "Inferred solo task" }));
+
+    const solo_file = try std.fs.path.join(allocator, &.{ workspace_path, "plans", "solo", "plan.jsonl" });
+    var solo = try loadValidatedState(allocator, solo_file, false);
+    defer solo.state.deinit();
+    try std.testing.expectEqualStrings("Inferred solo task", solo.state.get("st-001").?.step);
+
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .create, .workspace = workspace_path, .plan_id = "other" }));
+    try std.testing.expectError(error.PlanAmbiguous, runCommand(allocator, .{ .command = .add, .workspace = workspace_path, .workspace_explicit = true, .id = "st-002", .step = "Ambiguous task" }));
+
+    var solo_after = try loadValidatedState(allocator, solo_file, false);
+    defer solo_after.state.deinit();
+    try std.testing.expect(solo_after.state.get("st-002") == null);
+    const other_file = try std.fs.path.join(allocator, &.{ workspace_path, "plans", "other", "plan.jsonl" });
+    var other = try loadValidatedState(allocator, other_file, false);
+    defer other.state.deinit();
+    try std.testing.expect(other.state.get("st-002") == null);
 }
 
 test "intake apply compiles markdown into graph state" {
@@ -14202,6 +20849,58 @@ test "multiple required proof obligations can be satisfied by multiple receipts"
     try std.testing.expectEqual(Status.completed, completed_item.status);
     try std.testing.expectEqual(@as(usize, 2), completed_item.proof_receipts.len);
     try std.testing.expect(completed_item.proof == null);
+}
+
+test "workspace proof record emits PRF-v3 branch and dependency lineage" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const workspace_path = try std.fs.path.join(allocator, &.{ root, ".ledger", "st" });
+    const patch_path = try std.fs.path.join(allocator, &.{ root, "patch.json" });
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .init, .workspace = workspace_path }));
+    try std.testing.expectEqual(@as(u8, 0), try cmdPlan(allocator, .{ .command = .plan, .plan_command = .create, .workspace = workspace_path, .plan_id = "default" }));
+    const plan_path = try resolveWorkspacePlanFile(allocator, workspace_path, "default");
+    try writeTextAtomic(allocator, patch_path,
+        \\{"version":1,"author":"test","reason":"prf-v3 fixture","ops":[
+        \\{"op":"upsert-intent","intent":{"id":"intent-001","text":"Workspace proof records carry lineage.","category":"requirement","disposition":"covered"}},
+        \\{"op":"upsert-item","item":{"id":"st-001","step":"Record PRF-v3 proof","status":"pending","priority":"high","in_plan":true,"item_type":"feature","intent_refs":["intent-001"],"acceptance":["PRF-v3 emitted"],"validation":["zig build test-st"],"lock_roots":["apps/st"],"contract":{"objective":"Exercise PRF-v3 receipt.","proof_obligations":[{"id":"proof-001","kind":"unit","command":"zig build test-st","required":true}]}}}
+        \\]}
+    );
+    try std.testing.expectEqual(@as(u8, 0), try cmdGraph(allocator, .{ .command = .graph, .graph_command = .apply, .file = plan_path, .input = patch_path, .gate = .implementation_ready }));
+    var before = try loadValidatedState(allocator, plan_path, false);
+    defer before.state.deinit();
+    const expected_plan_sequence = before.latest_seq + 1;
+    try std.testing.expectEqual(@as(u8, 0), try cmdProofRecord(allocator, .{
+        .command = .proof,
+        .proof_command = .record,
+        .file = plan_path,
+        .workspace = workspace_path,
+        .workspace_explicit = true,
+        .plan_id = "default",
+        .id = "st-001",
+        .obligation_id = "proof-001",
+        .action_id = "proof-action-test",
+        .step = "zig build test-st",
+        .evidence_ref = "test.log",
+        .artifact_ref = "git:test",
+    }));
+
+    var loaded = try loadValidatedState(allocator, plan_path, false);
+    defer loaded.state.deinit();
+    const receipt = loaded.state.getConst("st-001").?.proof_receipts[0];
+    try std.testing.expectEqualStrings("PRF-v3", receipt.receipt_version);
+    try std.testing.expectEqualStrings("default", receipt.plan_id);
+    try std.testing.expectEqual(expected_plan_sequence, receipt.plan_sequence);
+    try std.testing.expectEqual(@as(i64, 2), receipt.workspace_sequence);
+    try std.testing.expectEqual(@as(i64, 0), receipt.branch_epoch);
+    try std.testing.expectEqualStrings("path:apps/st", receipt.dependency_resources[0]);
 }
 
 test "proof record command mismatch is a blocked result" {
