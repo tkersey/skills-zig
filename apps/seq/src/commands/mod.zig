@@ -25,6 +25,7 @@ const actuation_proof = @import("../actuation/proof.zig");
 const actuation_compaction = @import("../actuation/compaction.zig");
 const actuation_workers = @import("../actuation/workers.zig");
 const actuation_surface = @import("../actuation/surface.zig");
+const execution_policy_audit = @import("../execution_policy/mod.zig");
 const resolve_intent_closed = @import("../resolve_intent_closed/mod.zig");
 const app_meta = @import("app_meta");
 
@@ -269,6 +270,46 @@ pub const dataset_meta = [_]DatasetMeta{
         .name = "actuation_workers",
         .description = "Actuation linked worker and packet-yield rows",
         .fields = &.{ "run_id", "session_id", "spawned", "linked", "valid_artifacts", "artifact_yield" },
+    },
+    .{
+        .name = "execution_policy_runs",
+        .description = "EPRUN-v1 execution-policy run ledger projections",
+        .fields = &.{ "run_version", "run_id", "session_id", "path", "repo", "policy_id", "runtime_state", "candidate", "true_run", "verdict", "source_current", "regime", "active_or_stale", "gcr_coverage", "materializations", "horizon_violations", "lineage_violations", "shield_findings", "potential_gate", "potential_findings", "proof_required", "proof_passed", "proof_stale", "proof_missing", "outcome_levels", "strict_findings", "evidence_ref_count", "evidence_refs", "contamination_flags", "limitations", "diagnostic_query_json" },
+    },
+    .{
+        .name = "execution_policies",
+        .description = "Execution-policy source/currentness projections",
+        .fields = &.{ "run_id", "session_id", "policy_id", "policy_revision", "policy_digest", "current", "semantic_drift", "invalidations", "verdict", "evidence_refs" },
+    },
+    .{
+        .name = "execution_policy_states",
+        .description = "Execution-policy runtime state and recurrence projections",
+        .fields = &.{ "run_id", "session_id", "runtime_state", "regime", "active_or_stale", "repeated_state_action", "outcome_levels", "evidence_refs" },
+    },
+    .{
+        .name = "execution_policy_decisions",
+        .description = "Historical execution-policy decisions normalized for retrace",
+        .fields = &.{ "run_id", "session_id", "decision_id", "stable_decision_ids", "policy_id", "state_id", "selected_route", "class", "causal_claim_allowed", "evidence_refs" },
+    },
+    .{
+        .name = "execution_policy_transitions",
+        .description = "ETR transition calibration projections",
+        .fields = &.{ "run_id", "session_id", "transition_id", "state_before", "decision_id", "action_id", "predicted", "observed", "matches", "misses", "unexpected", "proof", "surprise", "potential", "state_after", "valid", "transition_audits", "evidence_refs" },
+    },
+    .{
+        .name = "execution_policy_unknowns",
+        .description = "Critical unknown resolution latency projections",
+        .fields = &.{ "run_id", "session_id", "unknowns", "critical_unknowns", "resolved_unknowns", "premature_mutations", "evidence_refs" },
+    },
+    .{
+        .name = "execution_policy_actions",
+        .description = "Execution-policy action, shield, horizon, and materialization projections",
+        .fields = &.{ "run_id", "session_id", "action_id", "materializations", "gcr_coverage", "horizon_violations", "shield_findings", "potential_gate", "strict_findings", "evidence_refs" },
+    },
+    .{
+        .name = "execution_policy_regret_candidates",
+        .description = "Observational hindsight-separated execution-policy regret candidates",
+        .fields = &.{ "run_id", "session_id", "decision_id", "class", "selected_action", "candidate_action", "regret_candidates", "causal_claim_allowed", "evidence_refs" },
     },
     .{
         .name = "token_events",
@@ -700,6 +741,7 @@ const Options = struct {
     include_root_equivalent_text: ?[]const u8 = null,
     bundle_dir_text: ?[]const u8 = null,
     artifact_root_text: ?[]const u8 = null,
+    policy_root_text: ?[]const u8 = null,
     state_db_path: ?[]const u8 = null,
     memory_root_text: ?[]const u8 = null,
     extensions_root_text: ?[]const u8 = null,
@@ -732,6 +774,7 @@ const Options = struct {
     include_excerpts: bool = false,
     index_mode: []const u8 = "auto",
     actuation_strict: bool = false,
+    execution_policy_strict: bool = false,
     review_compiler_strict: bool = false,
     strict: bool = true,
     strict_set: bool = false,
@@ -800,6 +843,7 @@ pub fn run(
         .session_tooling => try cmdSessionTooling(allocator, sessions_root, opts),
         .query_diagnose => try cmdQueryDiagnose(allocator, sessions_root, opts),
         .actuation_audit => try cmdActuationAudit(allocator, sessions_root, opts),
+        .execution_policy_audit => try cmdExecutionPolicyAudit(allocator, sessions_root, opts),
         .capabilities => try cmdCapabilities(allocator, opts),
         .memory_provenance => try cmdMemoryProvenance(allocator, opts),
         .memory_map => try cmdMemoryMap(allocator, opts),
@@ -1024,6 +1068,13 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\  --strict                   Exit 2 when a true run has a defined actuation control failure
         \\  --include-excerpts         Include bounded sanitized excerpts; full prompts and private reasoning stay excluded
         ,
+        .execution_policy_audit =>
+        \\usage: seq execution-policy-audit --root <path> [--session-id <id>|--path <rollout.jsonl>|--repo <path>|--since <iso>|--until <iso>|--last <duration>] [--exclude-current] [--include-workers] [--policy-root <path>] [--mode summary|runs|policies|transitions|calibration|regret|proof|report] [--strict] [--format table|json|jsonl|csv|markdown]
+        \\extra options:
+        \\  --policy-root <path>        Include policy artifact root in corpus metadata
+        \\  --strict                   Exit 2 for hard current-protocol execution policy failures
+        \\  --format markdown          Only valid with --mode report
+        ,
         .goal_audit =>
         \\usage: seq goal-audit [--mode summary|rows] [--workflow review|resolve|review,resolve] [--duration-gte <seconds|minutes|hours>] [--status <name>] [--contains <text>] [--since <iso>] [--until <iso>] [--path <jsonl>|--session-id <id>] [--exclude-current] [--show-query] [--limit N] [--format table|json|csv|jsonl]
         ,
@@ -1119,6 +1170,7 @@ fn commandSupportsExcludeCurrent(cmd: lib.Command) bool {
     const name = @tagName(cmd);
     return std.mem.eql(u8, name, "message_audit") or
         std.mem.eql(u8, name, "actuation_audit") or
+        std.mem.eql(u8, name, "execution_policy_audit") or
         std.mem.eql(u8, name, "skill_audit") or
         std.mem.eql(u8, name, "skill_cohort") or
         std.mem.eql(u8, name, "skill_success_rank") or
@@ -1168,6 +1220,12 @@ fn validateFormatForCommand(cmd: lib.Command, opts: Options) !void {
             if (fmt == .dot) return error.InvalidFormatForCommand;
             const mode = opts.mode orelse "summary";
             if (!isValidActuationAuditMode(mode)) return error.InvalidModeArg;
+            if (fmt == .markdown and !std.mem.eql(u8, mode, "report")) return error.InvalidFormatForCommand;
+        },
+        .execution_policy_audit => {
+            if (fmt == .dot) return error.InvalidFormatForCommand;
+            const mode = opts.mode orelse "summary";
+            if (!isValidExecutionPolicyAuditMode(mode)) return error.InvalidModeArg;
             if (fmt == .markdown and !std.mem.eql(u8, mode, "report")) return error.InvalidFormatForCommand;
         },
         .skill_contract, .skill_decision_receipt, .capabilities => {
@@ -1259,12 +1317,12 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         else => false,
     };
     const supports_repo = switch (cmd) {
-        .plan_search, .sessions, .resolve_churn_audit, .review_compiler_audit, .skill_decision_audit, .decision_capsule, .actuation_audit => true,
+        .plan_search, .sessions, .resolve_churn_audit, .review_compiler_audit, .skill_decision_audit, .decision_capsule, .actuation_audit, .execution_policy_audit => true,
         else => false,
     };
     const supports_status = cmd == .opencode_events or cmd == .turns or cmd == .goal_audit;
     const supports_mode = switch (cmd) {
-        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .skill_decision_audit, .skill_success_rank, .skill_blocks, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit, .workflow_overlap, .adjudication_audit, .review_compiler_audit, .goal_audit, .decision_capsule, .actuation_audit => true,
+        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .skill_decision_audit, .skill_success_rank, .skill_blocks, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit, .workflow_overlap, .adjudication_audit, .review_compiler_audit, .goal_audit, .decision_capsule, .actuation_audit, .execution_policy_audit => true,
         else => false,
     };
     const supports_kind = cmd == .artifact_search or cmd == .skill_contract;
@@ -1292,6 +1350,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .skill_evidence,
         .skill_decision_audit,
         .actuation_audit,
+        .execution_policy_audit,
         .role_breakdown,
         .occurrence_export,
         .find_session,
@@ -1337,6 +1396,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .skill_evidence,
         .skill_decision_audit,
         .actuation_audit,
+        .execution_policy_audit,
         .role_breakdown,
         .occurrence_export,
         .find_session,
@@ -1443,10 +1503,11 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_window_hours = cmd == .token_window;
     const supports_duration_gte = cmd == .goal_audit;
     const supports_since_cursor = cmd == .skill_evidence or cmd == .skill_decision_audit;
-    const supports_last = cmd == .token_usage or cmd == .token_cost or cmd == .skill_audit or cmd == .skill_evidence or cmd == .skill_decision_audit or cmd == .actuation_audit or cmd == .skill_success_rank or cmd == .skill_cohort or cmd == .workflow_audit or cmd == .adjudication_audit or cmd == .message_audit or cmd == .message_search or cmd == .tool_audit or cmd == .tool_search or cmd == .skill_blocks;
+    const supports_last = cmd == .token_usage or cmd == .token_cost or cmd == .skill_audit or cmd == .skill_evidence or cmd == .skill_decision_audit or cmd == .actuation_audit or cmd == .execution_policy_audit or cmd == .skill_success_rank or cmd == .skill_cohort or cmd == .workflow_audit or cmd == .adjudication_audit or cmd == .message_audit or cmd == .message_search or cmd == .tool_audit or cmd == .tool_search or cmd == .skill_blocks;
     const supports_include_root_equivalent = cmd == .adjudication_audit;
     const supports_bundle_dir = cmd == .adjudication_audit;
     const supports_artifact_root = cmd == .review_compiler_audit;
+    const supports_policy_root = cmd == .execution_policy_audit;
     const supports_token_cost_options = cmd == .token_cost;
     const supports_protocol = cmd == .review_compiler_audit;
     const supports_skill_decision_inputs = cmd == .skill_decision_audit or cmd == .skill_contract or cmd == .skill_decision_receipt;
@@ -1487,6 +1548,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.include_root_equivalent_text != null, supports_include_root_equivalent, "--include-root-equivalent", cmd);
     try ensureOptionAllowed(opts.bundle_dir_text != null, supports_bundle_dir, "--bundle-dir", cmd);
     try ensureOptionAllowed(opts.artifact_root_text != null, supports_artifact_root, "--artifact-root", cmd);
+    try ensureOptionAllowed(opts.policy_root_text != null, supports_policy_root, "--policy-root", cmd);
     try ensureOptionAllowed(opts.dataset != null, supports_dataset, "--dataset", cmd);
     try ensureOptionAllowed(opts.spec_text != null, supports_spec_text, "--spec", cmd);
     try ensureOptionAllowed(opts.contains != null, supports_contains, "--contains", cmd);
@@ -1533,9 +1595,10 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.opencode_source_text != null, supports_opencode_source, "--source", cmd);
     try ensureOptionAllowed(!std.mem.eql(u8, opts.index_mode, "auto"), supports_index_mode, "--index", cmd);
     try ensureOptionAllowed(opts.include_raw, supports_include_raw, "--include-raw", cmd);
-    try ensureOptionAllowed(opts.include_workers, cmd == .skill_decision_audit or cmd == .decision_capsule or cmd == .actuation_audit, "--include-workers", cmd);
+    try ensureOptionAllowed(opts.include_workers, cmd == .skill_decision_audit or cmd == .decision_capsule or cmd == .actuation_audit or cmd == .execution_policy_audit, "--include-workers", cmd);
     try ensureOptionAllowed(opts.include_excerpts, cmd == .skill_decision_audit or cmd == .decision_capsule or cmd == .actuation_audit, "--include-excerpts", cmd);
     try ensureOptionAllowed(opts.actuation_strict, cmd == .actuation_audit, "--strict", cmd);
+    try ensureOptionAllowed(opts.execution_policy_strict, cmd == .execution_policy_audit, "--strict", cmd);
     try ensureOptionAllowed(opts.review_compiler_strict, cmd == .review_compiler_audit, "--strict", cmd);
     try ensureOptionAllowed(opts.ongoing, cmd == .sessions, "--ongoing", cmd);
     try ensureOptionAllowed(opts.completed, cmd == .sessions, "--completed", cmd);
@@ -1726,6 +1789,15 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
             return error.MissingArgValue;
         }
     }
+    if (cmd == .execution_policy_audit) {
+        if (opts.mode) |text| {
+            if (!isValidExecutionPolicyAuditMode(text)) return error.InvalidModeArg;
+        }
+        if (!hasExecutionPolicyAuditScope(opts)) {
+            printCliError("error: execution-policy-audit requires --session-id, --path, --repo, --since, --until, or --last\n", .{});
+            return error.MissingArgValue;
+        }
+    }
     if (opts.unique_by_text) |text| {
         if (!std.mem.eql(u8, text, "snippet") and !std.mem.eql(u8, text, "path-snippet")) return error.InvalidModeArg;
     }
@@ -1753,6 +1825,7 @@ fn commandSupportsPath(cmd: lib.Command) bool {
         .skill_evidence,
         .skill_decision_audit,
         .actuation_audit,
+        .execution_policy_audit,
         .decision_capsule,
         .skill_blocks,
         .token_usage,
@@ -1781,6 +1854,7 @@ fn commandSupportsSessionId(cmd: lib.Command) bool {
         .skill_evidence,
         .skill_decision_audit,
         .actuation_audit,
+        .execution_policy_audit,
         .decision_capsule,
         .skill_blocks,
         .token_usage,
@@ -1952,6 +2026,17 @@ fn isValidActuationAuditMode(text: []const u8) bool {
         std.mem.eql(u8, text, "report");
 }
 
+fn isValidExecutionPolicyAuditMode(text: []const u8) bool {
+    return std.mem.eql(u8, text, "summary") or
+        std.mem.eql(u8, text, "runs") or
+        std.mem.eql(u8, text, "policies") or
+        std.mem.eql(u8, text, "transitions") or
+        std.mem.eql(u8, text, "calibration") or
+        std.mem.eql(u8, text, "regret") or
+        std.mem.eql(u8, text, "proof") or
+        std.mem.eql(u8, text, "report");
+}
+
 fn isValidSkillDecisionCausality(text: []const u8) bool {
     return std.mem.eql(u8, text, "explicit") or
         std.mem.eql(u8, text, "strong") or
@@ -1978,6 +2063,15 @@ fn hasActuationAuditScope(opts: Options) bool {
     const has_repo_scope = opts.repo_text != null or opts.workdir_text != null;
     const has_window = opts.since != null or opts.until != null or opts.last_text != null;
     return has_repo_scope and has_window;
+}
+
+fn hasExecutionPolicyAuditScope(opts: Options) bool {
+    return opts.session_id != null or
+        opts.path != null or
+        opts.repo_text != null or
+        opts.since != null or
+        opts.until != null or
+        opts.last_text != null;
 }
 
 fn validateSkillContractArgs(opts: Options) !void {
@@ -3004,6 +3098,14 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
             \\      "source_governance_projection_v1": true,
             \\      "c3_structured_closure_v1": true,
             \\      "actuation_audit_v1": true,
+            \\      "execution_policy_audit_v1": true,
+            \\      "epg_v1": true,
+            \\      "eps_v1": true,
+            \\      "epd_v1": true,
+            \\      "etr_v1": true,
+            \\      "policy_calibration_v1": true,
+            \\      "policy_regret_candidates_v1": true,
+            \\      "policy_transition_dataset_v1": true,
             \\      "actuation_run_ledger_v1": true,
             \\      "afr_v1": true,
             \\      "arh_v1": true,
@@ -3049,6 +3151,14 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
         .{ .name = "source_governance_projection_v1", .enabled = true },
         .{ .name = "c3_structured_closure_v1", .enabled = true },
         .{ .name = "actuation_audit_v1", .enabled = true },
+        .{ .name = "execution_policy_audit_v1", .enabled = true },
+        .{ .name = "epg_v1", .enabled = true },
+        .{ .name = "eps_v1", .enabled = true },
+        .{ .name = "epd_v1", .enabled = true },
+        .{ .name = "etr_v1", .enabled = true },
+        .{ .name = "policy_calibration_v1", .enabled = true },
+        .{ .name = "policy_regret_candidates_v1", .enabled = true },
+        .{ .name = "policy_transition_dataset_v1", .enabled = true },
         .{ .name = "actuation_run_ledger_v1", .enabled = true },
         .{ .name = "afr_v1", .enabled = true },
         .{ .name = "arh_v1", .enabled = true },
@@ -3090,6 +3200,316 @@ fn cmdActuationAudit(allocator: std.mem.Allocator, sessions_root: []const u8, op
 
     const cols = actuationColumnsForMode(mode);
     try output.writeOutput(allocator, opts.format, rows.items, cols, opts.out_path);
+}
+
+fn cmdExecutionPolicyAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    const mode = opts.mode orelse "summary";
+    var rows: std.ArrayList(query.Row) = .empty;
+    defer deinitQueryRows(allocator, &rows);
+    try collectExecutionPolicyRowsForMode(allocator, sessions_root, opts, mode, &rows);
+
+    if (opts.execution_policy_strict and hasStrictExecutionPolicyFailure(rows.items)) std.process.exit(2);
+
+    if (opts.format == .markdown and std.mem.eql(u8, mode, "report")) {
+        var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+        defer writer_alloc.deinit();
+        const writer = &writer_alloc.writer;
+        try writer.writeAll("# Execution Policy Audit\n\n");
+        try writer.writeAll("## Corpus/capabilities/denominator\n\n");
+        try writer.print("- included_runs: {d}\n", .{rows.items.len});
+        try writer.writeAll("- capabilities: execution_policy_audit_v1, epg_v1, eps_v1, epd_v1, etr_v1, policy_calibration_v1, policy_regret_candidates_v1, policy_transition_dataset_v1\n\n");
+        try writeExecutionPolicyReportSection(writer, "Source and regime", rows.items, &.{ "session_id", "policy_id", "source_current", "regime", "active_or_stale" });
+        try writeExecutionPolicyReportSection(writer, "Policy validation and closure", rows.items, &.{ "session_id", "runtime_state", "true_run", "verdict", "strict_findings" });
+        try writeExecutionPolicyReportSection(writer, "Unknowns/observations", rows.items, &.{ "session_id", "critical_unknowns", "resolved_unknowns", "premature_mutations", "unexpected" });
+        try writeExecutionPolicyReportSection(writer, "Action selection and shield", rows.items, &.{ "session_id", "decision_id", "action_id", "shield_findings", "strict_findings" });
+        try writeExecutionPolicyReportSection(writer, "Horizon/GCR materialization", rows.items, &.{ "session_id", "gcr_coverage", "materializations", "horizon_violations", "lineage_violations" });
+        try writeExecutionPolicyReportSection(writer, "Transition calibration", rows.items, &.{ "session_id", "transition_count", "predicted", "observed", "matches", "misses", "unexpected" });
+        try writeExecutionPolicyReportSection(writer, "Potential/surface/proof", rows.items, &.{ "session_id", "potential_gate", "potential_findings", "required", "passed", "stale", "missing" });
+        try writeExecutionPolicyReportSection(writer, "Surprise/rework/rollback", rows.items, &.{ "session_id", "unexpected", "repeated_state_action", "limitations" });
+        try writeExecutionPolicyReportSection(writer, "Regret candidates and retrace routes", rows.items, &.{ "session_id", "class", "decision_id", "stable_decision_ids", "causal_claim_allowed" });
+        try writeExecutionPolicyReportSection(writer, "Terminal/delivery outcome", rows.items, &.{ "session_id", "outcome_levels", "verdict", "final_proof" });
+        try writer.writeAll("## Limitations\n\n");
+        try writer.writeAll("- Regret candidates are observational and do not claim causal certainty.\n");
+        try writer.writeAll("- Text evidence does not imply semantic equivalence of policy states.\n\n");
+        try writer.writeAll("| session_id | runtime_state | verdict | evidence_refs |\n");
+        try writer.writeAll("| --- | --- | --- | ---: |\n");
+        for (rows.items) |row| {
+            try writer.print("| {s} | {s} | {s} | {d} |\n", .{
+                scalarString(row.valueOrNull("session_id")) orelse "",
+                scalarString(row.valueOrNull("runtime_state")) orelse "",
+                scalarString(row.valueOrNull("verdict")) orelse "",
+                scalarIntOrZero(row.valueOrNull("evidence_ref_count")),
+            });
+        }
+        const rendered = try writer_alloc.toOwnedSlice();
+        defer allocator.free(rendered);
+        try writeTextOutput(rendered, opts.out_path);
+        return;
+    }
+
+    try output.writeOutput(allocator, opts.format, rows.items, executionPolicyColumnsForMode(mode), opts.out_path);
+}
+
+fn executionPolicyColumnsForMode(mode: []const u8) []const []const u8 {
+    if (std.mem.eql(u8, mode, "policies")) return &.{ "run_id", "policy_id", "policy_revision", "policy_digest", "current", "semantic_drift", "verdict" };
+    if (std.mem.eql(u8, mode, "transitions")) return &.{ "transition_id", "state_before", "decision_id", "action_id", "valid", "matches", "misses", "unexpected" };
+    if (std.mem.eql(u8, mode, "calibration")) return &.{ "run_id", "transition_id", "predicted", "observed", "matches", "misses", "unexpected" };
+    if (std.mem.eql(u8, mode, "regret")) return &.{ "run_id", "decision_id", "class", "selected_action", "candidate_action", "causal_claim_allowed" };
+    if (std.mem.eql(u8, mode, "proof")) return &.{ "run_id", "required", "passed", "stale", "missing", "final_proof" };
+    return &.{ "run_version", "run_id", "session_id", "path", "repo", "policy_id", "runtime_state", "candidate", "true_run", "verdict", "source_current", "regime", "active_or_stale", "gcr_coverage", "materializations", "horizon_violations", "lineage_violations", "shield_findings", "potential_gate", "potential_findings", "transition_count", "predicted", "observed", "matches", "misses", "unexpected", "unknowns", "critical_unknowns", "resolved_unknowns", "premature_mutations", "regret_candidates", "stable_decision_ids", "repeated_state_action", "proof_required", "proof_passed", "proof_stale", "proof_missing", "outcome_levels", "strict_findings", "evidence_ref_count", "evidence_refs", "contamination_flags", "limitations", "diagnostic_query_json" };
+}
+
+fn writeExecutionPolicyReportSection(writer: anytype, title: []const u8, rows: []const query.Row, cols: []const []const u8) !void {
+    try writer.print("## {s}\n\n", .{title});
+    if (rows.len == 0) {
+        try writer.writeAll("_No runs matched the bounded selector._\n\n");
+        return;
+    }
+    try writer.writeByte('|');
+    for (cols) |col| try writer.print(" {s} |", .{col});
+    try writer.writeAll("\n|");
+    for (cols) |_| try writer.writeAll(" --- |");
+    try writer.writeByte('\n');
+    for (rows) |row| {
+        try writer.writeByte('|');
+        for (cols) |col| {
+            try writer.writeByte(' ');
+            try writeMarkdownCell(writer, row.valueOrNull(col));
+            try writer.writeAll(" |");
+        }
+        try writer.writeByte('\n');
+    }
+    try writer.writeByte('\n');
+}
+
+fn writeMarkdownCell(writer: anytype, value: spec.Scalar) !void {
+    switch (value) {
+        .null => {},
+        .bool => |flag| try writer.writeAll(if (flag) "true" else "false"),
+        .int => |number| try writer.print("{d}", .{number}),
+        .float => |number| try writer.print("{d}", .{number}),
+        .string => |text| {
+            for (text) |c| {
+                switch (c) {
+                    '|' => try writer.writeAll("\\|"),
+                    '\n', '\r' => try writer.writeByte(' '),
+                    else => try writer.writeByte(c),
+                }
+            }
+        },
+    }
+}
+
+fn collectExecutionPolicyRowsForMode(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options, mode: []const u8, out_rows: *std.ArrayList(query.Row)) !void {
+    const dataset_name = executionPolicyDatasetForMode(mode);
+    var params = std.ArrayList(spec.ParamSpec).empty;
+    defer params.deinit(allocator);
+    try appendExecutionPolicyScopeParams(allocator, &params, opts);
+    try collectExecutionPolicyDatasetRows(allocator, dataset_name, sessions_root, params.items, out_rows);
+}
+
+fn executionPolicyDatasetForMode(mode: []const u8) []const u8 {
+    if (std.mem.eql(u8, mode, "policies")) return "execution_policies";
+    if (std.mem.eql(u8, mode, "transitions") or std.mem.eql(u8, mode, "calibration")) return "execution_policy_transitions";
+    if (std.mem.eql(u8, mode, "regret")) return "execution_policy_regret_candidates";
+    if (std.mem.eql(u8, mode, "proof")) return "execution_policy_runs";
+    return "execution_policy_runs";
+}
+
+fn appendExecutionPolicyScopeParams(allocator: std.mem.Allocator, params: *std.ArrayList(spec.ParamSpec), opts: Options) !void {
+    if (opts.path) |path| try params.append(allocator, .{ .key = "path", .value = .{ .string = path } });
+    if (opts.session_id) |session_id| try params.append(allocator, .{ .key = "session_id", .value = .{ .string = session_id } });
+    if (opts.repo_text) |repo| try params.append(allocator, .{ .key = "repo", .value = .{ .string = repo } });
+    if (opts.policy_root_text) |policy_root| try params.append(allocator, .{ .key = "policy_root", .value = .{ .string = policy_root } });
+    if (opts.since) |since| try params.append(allocator, .{ .key = "since", .value = .{ .string = since } });
+    if (opts.until) |until| try params.append(allocator, .{ .key = "until", .value = .{ .string = until } });
+    if (opts.last_text) |last| try params.append(allocator, .{ .key = "last", .value = .{ .string = last } });
+    if (opts.exclude_current) try params.append(allocator, .{ .key = "exclude_current", .value = .{ .bool = true } });
+    if (opts.include_workers) try params.append(allocator, .{ .key = "include_workers", .value = .{ .bool = true } });
+}
+
+fn collectExecutionPolicyDatasetRows(
+    allocator: std.mem.Allocator,
+    dataset_name: []const u8,
+    sessions_root: []const u8,
+    query_params: []const spec.ParamSpec,
+    out_rows: *std.ArrayList(query.Row),
+) !void {
+    if (!execution_policy_audit.datasets.isExecutionPolicyDataset(dataset_name)) return error.UnknownDataset;
+    const opts = Options{
+        .path = paramString(query_params, "path"),
+        .session_id = paramString(query_params, "session_id"),
+        .repo_text = paramString(query_params, "repo"),
+        .policy_root_text = paramString(query_params, "policy_root"),
+        .since = paramString(query_params, "since"),
+        .until = paramString(query_params, "until"),
+        .last_text = paramString(query_params, "last"),
+        .exclude_current = paramBool(query_params, "exclude_current") orelse false,
+        .include_workers = paramBool(query_params, "include_workers") orelse false,
+    };
+    const require_single = opts.path != null or opts.session_id != null;
+    var paths = try resolveTraceTargetPaths(allocator, sessions_root, opts, require_single);
+    defer freePathList(allocator, &paths);
+
+    const current_thread_id = if (opts.exclude_current)
+        getEnvVarOwned(allocator, "CODEX_THREAD_ID") catch null
+    else
+        null;
+    defer if (current_thread_id) |id| allocator.free(id);
+
+    for (paths.items) |trace_path| {
+        var trace = canonical_trace.parseSessionTrace(allocator, trace_path, traceParseOptions(opts)) catch continue;
+        defer trace.deinit(allocator);
+        if (!executionPolicyTracePassesScope(trace.session, opts, current_thread_id)) continue;
+        var ledger = try execution_policy_audit.compileRunLedger(allocator, trace, .{
+            .root = sessions_root,
+            .repo = opts.repo_text,
+            .policy_root = opts.policy_root_text,
+            .since = opts.since,
+            .until = opts.until,
+            .last = opts.last_text,
+            .exclude_current = opts.exclude_current,
+            .include_workers = opts.include_workers,
+        });
+        defer ledger.deinit(allocator);
+        try appendExecutionPolicyRunRow(allocator, out_rows, ledger);
+    }
+}
+
+fn collectExecutionPolicyRows(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options, out_rows: *std.ArrayList(query.Row)) !void {
+    const require_single = opts.path != null or opts.session_id != null;
+    var paths = try resolveTraceTargetPaths(allocator, sessions_root, opts, require_single);
+    defer freePathList(allocator, &paths);
+
+    const current_thread_id = if (opts.exclude_current)
+        getEnvVarOwned(allocator, "CODEX_THREAD_ID") catch null
+    else
+        null;
+    defer if (current_thread_id) |id| allocator.free(id);
+
+    for (paths.items) |trace_path| {
+        var trace = canonical_trace.parseSessionTrace(allocator, trace_path, traceParseOptions(opts)) catch continue;
+        defer trace.deinit(allocator);
+        if (!executionPolicyTracePassesScope(trace.session, opts, current_thread_id)) continue;
+        var ledger = try execution_policy_audit.compileRunLedger(allocator, trace, .{
+            .root = sessions_root,
+            .repo = opts.repo_text,
+            .policy_root = opts.policy_root_text,
+            .since = opts.since,
+            .until = opts.until,
+            .last = opts.last_text,
+            .exclude_current = opts.exclude_current,
+            .include_workers = opts.include_workers,
+        });
+        defer ledger.deinit(allocator);
+        try appendExecutionPolicyRunRow(allocator, out_rows, ledger);
+    }
+}
+
+fn appendExecutionPolicyRunRow(allocator: std.mem.Allocator, rows: *std.ArrayList(query.Row), ledger: execution_policy_audit.RunLedger) !void {
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    try row.putOwnedKey("run_version", .{ .string = execution_policy_audit.run_version });
+    try row.putOwnedKey("run_id", .{ .string = ledger.identity.run_id });
+    try row.putOwnedKey("session_id", .{ .string = ledger.identity.session_id });
+    try row.putOwnedKey("path", .{ .string = ledger.identity.path });
+    if (ledger.identity.repo) |repo| try row.putOwnedKey("repo", .{ .string = repo }) else try row.putOwnedKey("repo", .null);
+    if (ledger.classification.policy_id) |policy_id| try row.putOwnedKey("policy_id", .{ .string = policy_id }) else try row.putOwnedKey("policy_id", .null);
+    try row.putOwnedKey("policy_revision", .null);
+    try row.putOwnedKey("policy_digest", .null);
+    try row.putOwnedKey("current", .{ .string = ledger.governance.lineage_summary.source_current });
+    try row.putOwnedKey("semantic_drift", .null);
+    try row.putOwnedKey("invalidations", .{ .string = ledger.governance.strict_findings_json });
+    try row.putOwnedKey("runtime_state", .{ .string = ledger.classification.runtime_state.text() });
+    try row.putOwnedKey("candidate", .{ .bool = ledger.classification.candidate });
+    try row.putOwnedKey("true_run", .{ .bool = ledger.classification.true_run });
+    try row.putOwnedKey("verdict", .{ .string = ledger.classification.verdict });
+    try row.putOwnedKey("source_current", .{ .string = ledger.governance.lineage_summary.source_current });
+    try row.putOwnedKey("regime", .{ .string = ledger.governance.lineage_summary.regime });
+    try row.putOwnedKey("active_or_stale", .{ .string = ledger.governance.lineage_summary.active_or_stale });
+    try row.putOwnedKey("gcr_coverage", .{ .string = ledger.governance.lineage_summary.gcr_coverage });
+    try row.putOwnedKey("materializations", .{ .int = ledger.governance.lineage_summary.materializations });
+    try row.putOwnedKey("horizon_violations", .{ .string = ledger.governance.horizon_summary.horizon_violations_json });
+    try row.putOwnedKey("lineage_violations", .{ .string = ledger.governance.lineage_summary.lineage_violations_json });
+    try row.putOwnedKey("shield_findings", .{ .string = ledger.governance.shield_summary.shield_findings_json });
+    try row.putOwnedKey("potential_gate", .{ .string = ledger.governance.potential_summary.potential_gate });
+    try row.putOwnedKey("potential_findings", .{ .string = ledger.governance.potential_summary.potential_findings_json });
+    try row.putOwnedKey("transition_id", .{ .string = if (ledger.learning.calibration_summary.transition_count > 0) "summary" else "" });
+    try row.putOwnedKey("state_before", .null);
+    try row.putOwnedKey("decision_id", .{ .string = ledger.learning.decisions_summary.decision_ids_json });
+    try row.putOwnedKey("action_id", .{ .string = if (ledger.governance.lineage_summary.materializations > 0) "materialized" else "" });
+    try row.putOwnedKey("valid", .{ .bool = std.mem.eql(u8, ledger.governance.strict_findings_json, "[]") });
+    try row.putOwnedKey("transition_count", .{ .int = ledger.learning.calibration_summary.transition_count });
+    try row.putOwnedKey("transition_audits", .{ .string = ledger.learning.calibration_summary.transition_audits_json });
+    try row.putOwnedKey("predicted", .{ .int = ledger.learning.calibration_summary.predicted_facts });
+    try row.putOwnedKey("observed", .{ .int = ledger.learning.calibration_summary.observed_facts });
+    try row.putOwnedKey("matches", .{ .int = ledger.learning.calibration_summary.matched_facts });
+    try row.putOwnedKey("misses", .{ .int = ledger.learning.calibration_summary.missed_facts });
+    try row.putOwnedKey("unexpected", .{ .int = ledger.learning.calibration_summary.unexpected_facts });
+    try row.putOwnedKey("proof", .{ .string = ledger.governance.potential_summary.potential_findings_json });
+    try row.putOwnedKey("surprise", .{ .int = ledger.learning.calibration_summary.unexpected_facts });
+    try row.putOwnedKey("potential", .{ .string = ledger.governance.potential_summary.potential_gate });
+    try row.putOwnedKey("state_after", .null);
+    try row.putOwnedKey("unknowns", .{ .string = ledger.learning.unknowns_summary.unknowns_json });
+    try row.putOwnedKey("critical_unknowns", .{ .int = ledger.learning.unknowns_summary.critical_unknowns });
+    try row.putOwnedKey("resolved_unknowns", .{ .int = ledger.learning.unknowns_summary.resolved_unknowns });
+    try row.putOwnedKey("premature_mutations", .{ .int = ledger.learning.unknowns_summary.premature_mutations });
+    try row.putOwnedKey("regret_candidates", .{ .string = ledger.learning.regret_summary.regret_candidates_json });
+    try row.putOwnedKey("class", .{ .string = ledger.learning.regret_summary.regret_candidates_json });
+    try row.putOwnedKey("selected_action", .null);
+    try row.putOwnedKey("candidate_action", .null);
+    try row.putOwnedKey("causal_claim_allowed", .{ .bool = false });
+    try row.putOwnedKey("stable_decision_ids", .{ .string = ledger.learning.decisions_summary.decision_ids_json });
+    try row.putOwnedKey("state_id", .null);
+    try row.putOwnedKey("selected_route", .null);
+    try row.putOwnedKey("repeated_state_action", .{ .string = ledger.learning.repeated_state_action_json });
+    try row.putOwnedKey("proof_required", .{ .int = ledger.governance.potential_summary.proof_required });
+    try row.putOwnedKey("proof_passed", .{ .int = ledger.governance.potential_summary.proof_passed });
+    try row.putOwnedKey("proof_stale", .{ .int = ledger.governance.potential_summary.proof_stale });
+    try row.putOwnedKey("proof_missing", .{ .int = ledger.governance.potential_summary.proof_missing });
+    try row.putOwnedKey("required", .{ .int = ledger.governance.potential_summary.proof_required });
+    try row.putOwnedKey("passed", .{ .int = ledger.governance.potential_summary.proof_passed });
+    try row.putOwnedKey("stale", .{ .int = ledger.governance.potential_summary.proof_stale });
+    try row.putOwnedKey("missing", .{ .int = ledger.governance.potential_summary.proof_missing });
+    try row.putOwnedKey("final_proof", .{ .string = ledger.governance.potential_summary.potential_findings_json });
+    try row.putOwnedKey("outcome_levels", .{ .string = ledger.governance.lineage_summary.outcome_levels_json });
+    try row.putOwnedKey("strict_findings", .{ .string = ledger.governance.strict_findings_json });
+    try row.putOwnedKey("evidence_ref_count", .{ .int = @intCast(ledger.classification.evidence_refs.len) });
+    try row.putOwnedKey("evidence_refs", .{ .string = ledger.classification.evidence_ref_json });
+    const contamination = try execution_policy_audit.render.stringArrayJson(allocator, ledger.classification.contamination_flags);
+    defer allocator.free(contamination);
+    try row.putOwnedKey("contamination_flags", .{ .string = contamination });
+    const limitations = try execution_policy_audit.render.stringArrayJson(allocator, ledger.classification.limitations);
+    defer allocator.free(limitations);
+    try row.putOwnedKey("limitations", .{ .string = limitations });
+    try row.putOwnedKey("diagnostic_query_json", .{ .string = ledger.diagnostic_query_json });
+    try rows.append(allocator, row);
+}
+
+fn hasStrictExecutionPolicyFailure(rows: []const query.Row) bool {
+    for (rows) |row| {
+        const findings = scalarString(row.valueOrNull("strict_findings")) orelse continue;
+        if (!std.mem.eql(u8, findings, "[]")) return true;
+    }
+    return false;
+}
+
+fn executionPolicyTracePassesScope(session: canonical_trace.SessionRecord, opts: Options, current_thread_id: ?[]const u8) bool {
+    if (current_thread_id) |id| {
+        if (session.session_id) |session_id| {
+            if (std.mem.eql(u8, session_id, id)) return false;
+        }
+    }
+    const ts = session.start_time orelse session.end_time;
+    if ((opts.since != null or opts.until != null or opts.last_text != null) and !timestampSatisfiesBounds(ts, opts)) return false;
+    if (opts.repo_text) |repo| {
+        const cwd = session.cwd orelse return false;
+        const repo_root = normalizeRepoMatchPath(std.heap.page_allocator, repo) catch return false;
+        defer std.heap.page_allocator.free(repo_root);
+        const matches = pathMatchesRepoScope(std.heap.page_allocator, repo_root, cwd) catch return false;
+        if (!matches) return false;
+    }
+    return true;
 }
 
 fn cmdActuationAuditReport(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
@@ -19187,6 +19607,8 @@ fn collectDatasetRowsTracked(
         try collectResolveIntentClosedDatasetRows(allocator, dataset_name, sessions_root, query_params, &rows);
     } else if (std.mem.startsWith(u8, dataset_name, "actuation_")) {
         try collectActuationDatasetRows(allocator, dataset_name, sessions_root, query_params, &rows);
+    } else if (execution_policy_audit.datasets.isExecutionPolicyDataset(dataset_name)) {
+        try collectExecutionPolicyDatasetRows(allocator, dataset_name, sessions_root, query_params, &rows);
     } else if (std.mem.eql(u8, dataset_name, "token_events")) {
         try collectTokenEventsRows(allocator, sessions_root, day_filter, &rows);
     } else if (std.mem.eql(u8, dataset_name, "token_deltas")) {
@@ -22431,6 +22853,9 @@ fn parseOptionsForCommand(cmd: lib.Command, args: []const []const u8) !Options {
     if (cmd == .actuation_audit and opts.strict_set and opts.strict) {
         opts.actuation_strict = true;
     }
+    if (cmd == .execution_policy_audit and opts.strict_set and opts.strict) {
+        opts.execution_policy_strict = true;
+    }
     if (cmd == .review_compiler_audit and opts.strict_set and opts.strict) {
         opts.review_compiler_strict = true;
     }
@@ -22720,6 +23145,10 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.artifact_root_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--policy-root")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.policy_root_text = args[i];
         } else if (std.mem.eql(u8, arg, "--state-db-path")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -22940,6 +23369,117 @@ test "actuation-audit validates bounded selector modes and formats" {
 
     const dot_opts = Options{ .format = .dot, .format_set = true, .path = "/tmp/session.jsonl" };
     try std.testing.expectError(error.InvalidFormatForCommand, validateFormatForCommand(.actuation_audit, dot_opts));
+}
+
+test "execution-policy-audit validates bounded selector modes and formats" {
+    const path_opts = try parseOptionsForCommand(.execution_policy_audit, &.{
+        "--root",
+        "/tmp/sessions",
+        "--path",
+        "/tmp/session.jsonl",
+        "--mode",
+        "summary",
+        "--format",
+        "json",
+        "--include-workers",
+        "--policy-root",
+        "/tmp/policies",
+        "--strict",
+    });
+    try std.testing.expect(path_opts.execution_policy_strict);
+    try std.testing.expect(std.mem.eql(u8, path_opts.policy_root_text.?, "/tmp/policies"));
+    try validateFormatForCommand(.execution_policy_audit, path_opts);
+    try validateCommandOptions(.execution_policy_audit, path_opts);
+
+    const session_opts = try parseOptionsForCommand(.execution_policy_audit, &.{ "--session-id", "abc", "--mode", "runs" });
+    try validateCommandOptions(.execution_policy_audit, session_opts);
+
+    const repo_opts = try parseOptionsForCommand(.execution_policy_audit, &.{ "--repo", "/tmp/repo", "--mode", "policies" });
+    try validateCommandOptions(.execution_policy_audit, repo_opts);
+
+    const window_opts = try parseOptionsForCommand(.execution_policy_audit, &.{ "--last", "2h", "--mode", "transitions" });
+    try validateCommandOptions(.execution_policy_audit, window_opts);
+
+    const unbounded_opts = try parseOptionsForCommand(.execution_policy_audit, &.{ "--root", "/tmp/sessions" });
+    try std.testing.expectError(error.MissingArgValue, validateCommandOptions(.execution_policy_audit, unbounded_opts));
+
+    const invalid_mode_opts = try parseOptionsForCommand(.execution_policy_audit, &.{ "--path", "/tmp/session.jsonl", "--mode", "mentions" });
+    try std.testing.expectError(error.InvalidModeArg, validateCommandOptions(.execution_policy_audit, invalid_mode_opts));
+
+    const report_markdown_opts = try parseOptionsForCommand(.execution_policy_audit, &.{ "--path", "/tmp/session.jsonl", "--mode", "report", "--format", "markdown" });
+    try validateFormatForCommand(.execution_policy_audit, report_markdown_opts);
+    try validateCommandOptions(.execution_policy_audit, report_markdown_opts);
+
+    const summary_markdown_opts = try parseOptionsForCommand(.execution_policy_audit, &.{ "--path", "/tmp/session.jsonl", "--format", "markdown" });
+    try std.testing.expectError(error.InvalidFormatForCommand, validateFormatForCommand(.execution_policy_audit, summary_markdown_opts));
+
+    const dot_opts = Options{ .format = .dot, .format_set = true, .path = "/tmp/session.jsonl" };
+    try std.testing.expectError(error.InvalidFormatForCommand, validateFormatForCommand(.execution_policy_audit, dot_opts));
+
+    const artifact_root_opts = try parseOptionsForCommand(.execution_policy_audit, &.{ "--path", "/tmp/session.jsonl", "--artifact-root", "/tmp/artifacts" });
+    try std.testing.expectError(error.UnsupportedOption, validateCommandOptions(.execution_policy_audit, artifact_root_opts));
+}
+
+test "execution-policy-audit exposes report modes and query datasets" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/06/24");
+    const trace_content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-06-24T10:00:00Z\",\"payload\":{\"id\":\"policy-run-1\",\"cwd\":\"/tmp/seq-policy-repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-06-24T10:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"$actuating policy runtime critical unknown: API shape resolver action probe evidence produced resolved_unknowns: api shape\"}]}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-06-24T10:00:02Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"explicit $actuating policy runtime declaration\\nEPG-v1 {\\\"policy_id\\\":\\\"p\\\",\\\"revision\\\":2}\\nEPS-v1 {\\\"state_id\\\":\\\"s\\\"}\\nEPD-v1 {\\\"decision_id\\\":\\\"d\\\",\\\"action_id\\\":\\\"a\\\"}\\nASR-v4 policy-bound ASL/FPS/FPSR\\nGCR lineage current policy source\\ncritical unknown: API shape\\nresolver action probe evidence produced\\nresolved_unknowns: api shape\\nhigher_information_candidate\\nETR-v1 {\\\"receipt_id\\\":\\\"tr-1\\\",\\\"decision_id\\\":\\\"d\\\",\\\"action_id\\\":\\\"a\\\",\\\"predicted_effects\\\":[\\\"fact:a\\\",\\\"fact:b\\\"],\\\"observed\\\":{\\\"facts\\\":[\\\"fact:a\\\",\\\"fact:c\\\"]},\\\"state_after\\\":{}}\"}]}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+        .sub_path = "2026/06/24/rollout-policy-run-1.jsonl",
+        .data = trace_content,
+    });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "2026/06/24/rollout-policy-run-1.jsonl" });
+    defer std.testing.allocator.free(path);
+
+    const mode_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "execution-policy-transitions.json" });
+    defer std.testing.allocator.free(mode_out);
+    const mode_got = try runCommandWithOutput(std.testing.allocator, .execution_policy_audit, &.{
+        "--root",   root_abs,
+        "--path",   path,
+        "--mode",   "calibration",
+        "--format", "json",
+    }, mode_out);
+    defer std.testing.allocator.free(mode_got);
+    try std.testing.expect(std.mem.indexOf(u8, mode_got, "\"transition_id\": \"summary\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mode_got, "\"matches\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mode_got, "\"misses\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mode_got, "\"unexpected\": 1") != null);
+
+    const query_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "execution-policy-query.json" });
+    defer std.testing.allocator.free(query_out);
+    const query_spec =
+        \\{"dataset":"execution_policy_unknowns","params":{"path":"PATH_PLACEHOLDER"},"select":["session_id","critical_unknowns","resolved_unknowns","premature_mutations"],"format":"json"}
+    ;
+    const patched_spec = try std.mem.replaceOwned(u8, std.testing.allocator, query_spec, "PATH_PLACEHOLDER", path);
+    defer std.testing.allocator.free(patched_spec);
+    const query_got = try runCommandWithOutput(std.testing.allocator, .query, &.{
+        "--root", root_abs,
+        "--spec", patched_spec,
+    }, query_out);
+    defer std.testing.allocator.free(query_got);
+    try std.testing.expect(std.mem.indexOf(u8, query_got, "\"critical_unknowns\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, query_got, "\"resolved_unknowns\": 1") != null);
+
+    const report_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "execution-policy-report.md" });
+    defer std.testing.allocator.free(report_out);
+    const report_got = try runCommandWithOutput(std.testing.allocator, .execution_policy_audit, &.{
+        "--root",   root_abs,
+        "--path",   path,
+        "--mode",   "report",
+        "--format", "markdown",
+    }, report_out);
+    defer std.testing.allocator.free(report_got);
+    try std.testing.expect(std.mem.indexOf(u8, report_got, "## Transition calibration") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report_got, "## Regret candidates and retrace routes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report_got, "higher_information_candidate") != null);
 }
 
 test "actuation-audit selectors are exact bounded and worker-visible" {
@@ -24572,7 +25112,7 @@ test "capabilities advertises resolve intent closed audit flags" {
     }, output_path);
     defer std.testing.allocator.free(got);
 
-    try std.testing.expect(std.mem.indexOf(u8, got, "\"version\": \"0.3.12\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"version\": \"0.3.13\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_acceptance_contract_v2\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_review_batch_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_review_aperture_v1\": true") != null);
@@ -24581,6 +25121,9 @@ test "capabilities advertises resolve intent closed audit flags" {
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_review_potential_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_intent_closed_audit_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"internal_context_not_success_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"execution_policy_audit_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"epg_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"policy_transition_dataset_v1\": true") != null);
 }
 
 test "skill-audit supports exclude-current option" {

@@ -59,6 +59,7 @@ pub const Command = enum {
     goal_audit,
     index,
     actuation_audit,
+    execution_policy_audit,
     unknown,
 };
 
@@ -126,6 +127,7 @@ pub const command_defs = [_]CommandDef{
     .{ .name = "opencode-events", .cmd = .opencode_events },
     .{ .name = "index", .cmd = .index },
     .{ .name = "actuation-audit", .cmd = .actuation_audit },
+    .{ .name = "execution-policy-audit", .cmd = .execution_policy_audit },
 };
 
 pub fn parseCommand(arg: []const u8) Command {

@@ -76,6 +76,10 @@ if ! "$BIN_PATH" --help | rg -q '^- actuation-audit$'; then
   echo "required command missing: actuation-audit" >&2
   exit 1
 fi
+if ! "$BIN_PATH" --help | rg -q '^- execution-policy-audit$'; then
+  echo "required command missing: execution-policy-audit" >&2
+  exit 1
+fi
 if ! "$BIN_PATH" --help | rg -q '^- tool-audit$'; then
   echo "required command missing: tool-audit" >&2
   exit 1
@@ -172,6 +176,14 @@ if ! "$BIN_PATH" decision-capsule --help | rg -q -- 'capsule|candidates|anchors|
   echo "decision-capsule help missing mode surface" >&2
   exit 1
 fi
+if ! "$BIN_PATH" execution-policy-audit --help | rg -q -- '--mode summary|runs|policies|transitions|calibration|regret|proof|report'; then
+  echo "execution-policy-audit help missing mode surface" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" execution-policy-audit --help | rg -q -- '--policy-root <path>'; then
+  echo "execution-policy-audit help missing policy root support" >&2
+  exit 1
+fi
 if ! "$BIN_PATH" capabilities --format json | rg -q -- '"skill_decision_audit": true'; then
   echo "capabilities missing skill_decision_audit=true" >&2
   exit 1
@@ -190,6 +202,22 @@ if ! "$BIN_PATH" capabilities --format json | rg -q -- '"actuation_audit_v1": tr
 fi
 if ! "$BIN_PATH" capabilities --format json | rg -q -- '"actuation_compaction_resume_v1": true'; then
   echo "capabilities missing actuation_compaction_resume_v1=true" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" capabilities --format json | rg -q -- '"execution_policy_audit_v1": true'; then
+  echo "capabilities missing execution_policy_audit_v1=true" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" capabilities --format json | rg -q -- '"policy_transition_dataset_v1": true'; then
+  echo "capabilities missing policy_transition_dataset_v1=true" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" dataset-schema --dataset execution_policy_transitions --format json | rg -q -- '"field": "transition_audits"'; then
+  echo "execution_policy_transitions schema missing transition_audits" >&2
+  exit 1
+fi
+if ! "$BIN_PATH" query --root /tmp --spec '{"dataset":"execution_policy_runs","params":{"path":"/dev/null"},"select":["runtime_state","verdict"],"format":"json"}' | rg -q -- '"runtime_state"'; then
+  echo "execution_policy_runs query projection failed" >&2
   exit 1
 fi
 for feature in \

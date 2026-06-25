@@ -41,6 +41,8 @@ Binary output:
 ./zig-out/bin/seq dataset-schema --dataset skill_decision_episodes
 ./zig-out/bin/seq dataset-schema --dataset historical_decisions
 ./zig-out/bin/seq dataset-schema --dataset decision_capsules
+./zig-out/bin/seq dataset-schema --dataset execution_policy_runs
+./zig-out/bin/seq dataset-schema --dataset execution_policy_transitions
 ./zig-out/bin/seq role-breakdown --root ~/.codex/sessions --since 2026-03-01T00:00:00Z --format table
 ./zig-out/bin/seq query --spec '{"dataset":"tool_calls","group_by":["tool"],"metrics":[{"op":"count","as":"count"}],"sort":["-count"],"limit":10,"format":"json"}'
 ./zig-out/bin/seq query --root ~/.codex/sessions --spec '{"dataset":"tool_invocations","where":[{"field":"command_text","op":"contains","value":"learnings recall"}],"select":["path","tool_name","command_text","workdir"],"sort":["timestamp"],"limit":5,"format":"table"}'
@@ -252,6 +254,30 @@ Actuation query datasets:
 - `actuation_proofs`
 - `actuation_compactions`
 - `actuation_workers`
+
+`execution-policy-audit` compiles EPRUN-v1 ledgers for closed-loop EPG/EPS/EPD/ETR policy runtime evidence:
+- requires a bounded selector: `--session-id`, `--path`, `--repo`, `--since`, `--until`, or `--last`
+- separates authoritative policy runtime, structured manual runtime, declared unstructured, candidate-only, and contamination-only sessions
+- projects source/regime currentness, GCR materialization, horizon, shield, potential, proof, calibration, unknown latency, recurrence, regret candidates, and retrace decision IDs from canonical trace evidence
+- preserves outcome discipline: selection, materialization, action result, transition, policy terminal, and delivery success are exposed separately
+- `--strict` exits 2 for current-protocol hard failures such as mutation without lineage, shield bypass, horizon mismatch, invalid transition, stale source execution, or success terminal without proof
+
+Examples:
+```bash
+seq execution-policy-audit --root ~/.codex/sessions --path rollout.jsonl --mode report --format markdown
+seq execution-policy-audit --root ~/.codex/sessions --repo /path/to/repo --last 7d --mode calibration --format table
+seq query --root ~/.codex/sessions --spec '{"dataset":"execution_policy_transitions","params":{"path":"rollout.jsonl"},"select":["session_id","transition_id","matches","misses","unexpected"],"format":"table"}'
+```
+
+Execution-policy query datasets:
+- `execution_policy_runs`
+- `execution_policies`
+- `execution_policy_states`
+- `execution_policy_decisions`
+- `execution_policy_transitions`
+- `execution_policy_unknowns`
+- `execution_policy_actions`
+- `execution_policy_regret_candidates`
 
 ## Trace-native session surfaces
 
