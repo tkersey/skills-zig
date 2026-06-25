@@ -36,6 +36,10 @@ No unified umbrella CLI is introduced. Binaries remain separate.
 - `.github/workflows`
 - `docs/release`
 
+## Shared Libraries
+
+`libs/durable_store` provides the file-state substrate used by shipped CLIs that persist local ledgers. Legacy helpers such as `writeTextAtomic`, `appendLineAtomic`, `acquireLock`, and `acquireAbsoluteExclusiveLock` remain available for single-file replacement, append, and basic exclusive-lock callers. Coordinated multi-record mutation must use the newer lease, fencing, CAS, JSONL snapshot, and DTX-v1 transaction APIs so stale workers fail through semantic concurrency errors instead of losing updates.
+
 ## Build
 
 ```bash
@@ -108,7 +112,7 @@ Per-app VERSION files are the source of truth:
 - `apps/parse-arch/VERSION`
 
 PRs that touch release-relevant CLI surfaces must bump the corresponding `VERSION` file.
-The check is conservative: app-local changes count for that app, broad shared shipped surfaces such as `build.zig`, `build.zig.zon`, and `libs/core/**` count for every shipped CLI, and `libs/durable_store/**` counts for its shipped consumers.
+The check is conservative: app-local changes count for that app, broad shared shipped surfaces such as `build.zig`, `build.zig.zon`, and `libs/core/**` count for every shipped CLI, and `libs/durable_store/**` counts for its shipped consumers. Durable-store concurrency changes are release-relevant for `st` when they affect workspace mutation, transaction recovery, fencing, CAS, or command exit behavior.
 Do not close release-relevant CLI work with a local `./zig-out/bin` binary alone.
 Release closure means the changed CLI has a tagged GitHub release, the tap formula has been updated, Homebrew audit/test have passed, and the installed Homebrew binary reports the expected version.
 

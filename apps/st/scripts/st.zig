@@ -4431,55 +4431,78 @@ fn runCommand(allocator: std.mem.Allocator, args: Args) !u8 {
     defer if (resolved_workspace_plan_file) |path| allocator.free(path);
     try resolveWorkspacePlanArgsInPlace(allocator, &resolved_args, &resolved_workspace_plan_file);
 
-    return switch (resolved_args.command) {
-        .init => try cmdInit(allocator, resolved_args),
-        .add => try cmdAdd(allocator, resolved_args),
-        .select => try cmdSelect(allocator, resolved_args),
-        .deselect => try cmdDeselect(allocator, resolved_args),
-        .set_status => try cmdSetStatus(allocator, resolved_args),
-        .set_priority => try cmdSetPriority(allocator, resolved_args),
-        .set_deps => try cmdSetDeps(allocator, resolved_args),
-        .set_notes => try cmdSetNotes(allocator, resolved_args),
-        .add_comment => try cmdAddComment(allocator, resolved_args),
-        .remove => try cmdRemove(allocator, resolved_args),
-        .show => try cmdShow(allocator, resolved_args),
-        .ready => try cmdReady(allocator, resolved_args),
-        .blocked => try cmdBlocked(allocator, resolved_args),
-        .capabilities => try cmdCapabilities(allocator, resolved_args),
-        .claim => try cmdClaim(allocator, resolved_args),
-        .complete => try cmdComplete(allocator, resolved_args),
-        .doctor => try cmdDoctor(allocator, resolved_args),
-        .prime => try cmdPrime(allocator, resolved_args),
-        .proof => try cmdProof(allocator, resolved_args),
-        .assert_projection => try cmdAssertProjection(allocator, resolved_args),
-        .guard_session_start => try cmdGuardSessionStart(allocator, resolved_args),
-        .guard_pre_tool_use => try cmdGuardPreToolUse(allocator, resolved_args),
-        .heartbeat => try cmdHeartbeat(allocator, resolved_args),
-        .reconcile_codex => try cmdReconcileCodex(allocator, resolved_args),
-        .@"export" => try cmdExport(allocator, resolved_args),
-        .import_plan => try cmdImportPlan(allocator, resolved_args),
-        .import_orchplan => try cmdImportOrchplan(allocator, resolved_args),
-        .import_proposed_plan => try cmdImportProposedPlan(allocator, resolved_args),
-        .set_runtime => try cmdSetRuntime(allocator, resolved_args),
-        .set_proof => try cmdSetProof(allocator, resolved_args),
-        .release => try cmdRelease(allocator, resolved_args),
-        .reclaim_stale => try cmdReclaimStale(allocator, resolved_args),
-        .import_mesh_results => try cmdImportMeshResults(allocator, resolved_args),
-        .intake => try cmdIntake(allocator, resolved_args),
-        .graph => try cmdGraph(allocator, resolved_args),
-        .aperture => try cmdAperture(allocator, resolved_args),
-        .compile => try cmdCompile(allocator, resolved_args),
-        .workspace => try cmdWorkspace(allocator, resolved_args),
-        .plan => try cmdPlan(allocator, resolved_args),
-        .session => try cmdSession(allocator, resolved_args),
-        .worktree => try cmdWorktree(allocator, resolved_args),
-        .changeset => try cmdChangeset(allocator, resolved_args),
-        .integrate => try cmdIntegrate(allocator, resolved_args),
+    const command_result = switch (resolved_args.command) {
+        .init => cmdInit(allocator, resolved_args),
+        .add => cmdAdd(allocator, resolved_args),
+        .select => cmdSelect(allocator, resolved_args),
+        .deselect => cmdDeselect(allocator, resolved_args),
+        .set_status => cmdSetStatus(allocator, resolved_args),
+        .set_priority => cmdSetPriority(allocator, resolved_args),
+        .set_deps => cmdSetDeps(allocator, resolved_args),
+        .set_notes => cmdSetNotes(allocator, resolved_args),
+        .add_comment => cmdAddComment(allocator, resolved_args),
+        .remove => cmdRemove(allocator, resolved_args),
+        .show => cmdShow(allocator, resolved_args),
+        .ready => cmdReady(allocator, resolved_args),
+        .blocked => cmdBlocked(allocator, resolved_args),
+        .capabilities => cmdCapabilities(allocator, resolved_args),
+        .claim => cmdClaim(allocator, resolved_args),
+        .complete => cmdComplete(allocator, resolved_args),
+        .doctor => cmdDoctor(allocator, resolved_args),
+        .prime => cmdPrime(allocator, resolved_args),
+        .proof => cmdProof(allocator, resolved_args),
+        .assert_projection => cmdAssertProjection(allocator, resolved_args),
+        .guard_session_start => cmdGuardSessionStart(allocator, resolved_args),
+        .guard_pre_tool_use => cmdGuardPreToolUse(allocator, resolved_args),
+        .heartbeat => cmdHeartbeat(allocator, resolved_args),
+        .reconcile_codex => cmdReconcileCodex(allocator, resolved_args),
+        .@"export" => cmdExport(allocator, resolved_args),
+        .import_plan => cmdImportPlan(allocator, resolved_args),
+        .import_orchplan => cmdImportOrchplan(allocator, resolved_args),
+        .import_proposed_plan => cmdImportProposedPlan(allocator, resolved_args),
+        .set_runtime => cmdSetRuntime(allocator, resolved_args),
+        .set_proof => cmdSetProof(allocator, resolved_args),
+        .release => cmdRelease(allocator, resolved_args),
+        .reclaim_stale => cmdReclaimStale(allocator, resolved_args),
+        .import_mesh_results => cmdImportMeshResults(allocator, resolved_args),
+        .intake => cmdIntake(allocator, resolved_args),
+        .graph => cmdGraph(allocator, resolved_args),
+        .aperture => cmdAperture(allocator, resolved_args),
+        .compile => cmdCompile(allocator, resolved_args),
+        .workspace => cmdWorkspace(allocator, resolved_args),
+        .plan => cmdPlan(allocator, resolved_args),
+        .session => cmdSession(allocator, resolved_args),
+        .worktree => cmdWorktree(allocator, resolved_args),
+        .changeset => cmdChangeset(allocator, resolved_args),
+        .integrate => cmdIntegrate(allocator, resolved_args),
+    };
+    return command_result catch |err| {
+        if (concurrencyExitCode(err)) |code| return code;
+        return err;
     };
 }
 
 pub fn runPerfArgs(allocator: std.mem.Allocator, args: Args) !u8 {
     return runCommand(allocator, args);
+}
+
+fn concurrencyExitCode(err: anyerror) ?u8 {
+    return switch (err) {
+        error.LockBusy,
+        error.LockExpired,
+        error.LockOwnerMismatch,
+        error.FencingTokenStale,
+        error.ExpectationMismatch,
+        error.SequenceMismatch,
+        error.DigestMismatch,
+        error.TransactionConflict,
+        error.TransactionRecoveryRequired,
+        error.TransactionCorrupt,
+        error.SequenceStale,
+        error.TransactionSequenceMismatch,
+        => 2,
+        else => null,
+    };
 }
 
 fn commandUsesWorkspacePlanFile(command: Command) bool {
@@ -4829,23 +4852,7 @@ fn countWorkspacePreparedTransactions(allocator: std.mem.Allocator, raw_workspac
     defer allocator.free(workspace_root);
     const transactions_dir = try workspaceTransactionsDirAlloc(allocator, workspace_root);
     defer allocator.free(transactions_dir);
-    var dir = std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), transactions_dir, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return 0,
-        else => return err,
-    };
-    defer dir.close(std.Io.Threaded.global_single_threaded.io());
-    var count: usize = 0;
-    var it = dir.iterate();
-    while (try it.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
-        if (!std.mem.endsWith(u8, entry.name, ".prepared.json")) continue;
-        const prefix = entry.name[0 .. entry.name.len - ".prepared.json".len];
-        const commit_name = try std.fmt.allocPrint(allocator, "{s}.commit.json", .{prefix});
-        defer allocator.free(commit_name);
-        const commit_path = try std.fs.path.join(allocator, &.{ transactions_dir, commit_name });
-        defer allocator.free(commit_path);
-        if (!fileExists(commit_path)) count += 1;
-    }
-    return count;
+    return durable_store.countPendingTransactions(allocator, transactions_dir);
 }
 
 fn cmdWorkspaceExport(allocator: std.mem.Allocator, args: Args) !u8 {
@@ -8376,25 +8383,47 @@ fn publishWorkspaceCheckpointTransaction(
     mode: durable_store.JsonlTransactionMode,
     allow_sequence_reset: bool,
 ) !durable_store.JsonlTransactionReceipt {
-    const locks_dir = try workspaceLocksDirAlloc(allocator, workspace_root);
-    defer allocator.free(locks_dir);
     const transactions_dir = try workspaceTransactionsDirAlloc(allocator, workspace_root);
     defer allocator.free(transactions_dir);
-    return durable_store.appendJsonlCheckpointTransaction(
+    const counter_path = try workspaceFencingCounterPathAlloc(allocator, workspace_root);
+    defer allocator.free(counter_path);
+    if (expected_sequence < 0) return error.InvalidSequence;
+    const sequence_after = try workspaceSequenceFromCheckpointLine(allocator, checkpoint_line);
+    switch (mode) {
+        .append => if (sequence_after != expected_sequence + 1) return error.TransactionSequenceMismatch,
+        .replace => if (!allow_sequence_reset and sequence_after != expected_sequence + 1) return error.TransactionSequenceMismatch,
+    }
+    const workspace_exists = fileExists(workspace_file);
+    const mutation = durable_store.TransactionMutation{
+        .path = workspace_file,
+        .text = checkpoint_line,
+        .expectation = .{
+            .expected_sequence = if (workspace_exists) @intCast(expected_sequence) else null,
+            .expected_exists = workspace_exists,
+        },
+    };
+    var receipt = try durable_store.commitTextTransaction(
         allocator,
-        workspace_file,
-        locks_dir,
         transactions_dir,
-        checkpoint_line,
+        &.{mutation},
         .{
-            .expected_sequence = expected_sequence,
-            .sequence_field = "workspace_sequence",
-            .operation = operation,
-            .max_existing_bytes = 1024 * 1024,
-            .mode = mode,
-            .allow_sequence_reset = allow_sequence_reset,
+            .owner = .{
+                .process_id = currentProcessId(),
+                .session_id = "st-workspace",
+                .executor = operation,
+            },
+            .lease_ms = 5000,
+            .fencing_counter_path = counter_path,
         },
     );
+    defer receipt.deinit(allocator);
+    return .{
+        .transaction_id = try allocator.dupe(u8, receipt.transaction_id),
+        .prepared_path = try allocator.dupe(u8, receipt.record_path),
+        .commit_path = try allocator.dupe(u8, receipt.commit_marker_path),
+        .sequence_before = expected_sequence,
+        .sequence_after = sequence_after,
+    };
 }
 
 fn workspaceLocksDirAlloc(allocator: std.mem.Allocator, workspace_root: []const u8) ![]u8 {
@@ -8403,6 +8432,17 @@ fn workspaceLocksDirAlloc(allocator: std.mem.Allocator, workspace_root: []const 
 
 fn workspaceTransactionsDirAlloc(allocator: std.mem.Allocator, workspace_root: []const u8) ![]u8 {
     return std.fs.path.join(allocator, &.{ workspace_root, "transactions" });
+}
+
+fn workspaceFencingCounterPathAlloc(allocator: std.mem.Allocator, workspace_root: []const u8) ![]u8 {
+    return std.fs.path.join(allocator, &.{ workspace_root, "fencing.counter" });
+}
+
+fn workspaceSequenceFromCheckpointLine(allocator: std.mem.Allocator, checkpoint_line: []const u8) !i64 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, checkpoint_line, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidCheckpoint;
+    return intField(parsed.value, "workspace_sequence") orelse return error.InvalidCheckpoint;
 }
 
 fn normalizeWorkspacePath(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
@@ -18855,6 +18895,31 @@ test "workspace audit and doctor fail on missing registered plan file" {
     try std.testing.expectEqual(@as(u8, 2), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .doctor, .workspace = workspace_path, .format = .json }));
 }
 
+test "workspace recover detects pending DTX transaction directories" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpDirRootAlloc(allocator, tmp.dir);
+    const workspace_path = try std.fs.path.join(allocator, &.{ root, ".ledger", "st" });
+
+    const stdout_guard = try silenceStdout();
+    defer restoreStdout(stdout_guard);
+    try std.testing.expectEqual(@as(u8, 0), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .init, .workspace = workspace_path }));
+
+    const transaction_dir = try std.fs.path.join(allocator, &.{ workspace_path, "transactions", "manual-dtx" });
+    try durable_store.ensureDirectoryPathNoSymlinks(transaction_dir);
+    const record_path = try std.fs.path.join(allocator, &.{ transaction_dir, "transaction.json" });
+    try durable_store.writeTextAtomic(allocator, record_path,
+        \\{"transaction_version":"DTX-v1","transaction_id":"manual-dtx","owner":{"process_id":1,"session_id":"s","executor":"test"},"state":"prepared","expected":[],"writes":[],"locks":[],"created_at":"1","updated_at":"1"}
+        \\
+    );
+
+    try std.testing.expectEqual(@as(u8, 2), try cmdWorkspace(allocator, .{ .command = .workspace, .workspace_command = .recover, .workspace = workspace_path, .format = .json }));
+}
+
 test "plan lifecycle transitions update registry and active inference" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -20221,6 +20286,14 @@ test "graph apply rejects invalid patch atomically" {
     const exit_code = try cmdGraph(allocator, .{ .command = .graph, .graph_command = .apply, .file = plan_path, .input = patch_path, .gate = .draft });
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expect(!fileExists(plan_path));
+}
+
+test "durable concurrency errors map to semantic conflict exit code" {
+    try std.testing.expectEqual(@as(?u8, 2), concurrencyExitCode(error.LockBusy));
+    try std.testing.expectEqual(@as(?u8, 2), concurrencyExitCode(error.FencingTokenStale));
+    try std.testing.expectEqual(@as(?u8, 2), concurrencyExitCode(error.SequenceMismatch));
+    try std.testing.expectEqual(@as(?u8, 2), concurrencyExitCode(error.TransactionRecoveryRequired));
+    try std.testing.expectEqual(@as(?u8, null), concurrencyExitCode(error.InvalidPath));
 }
 
 test "graph delta reports only actual canonical changes" {
