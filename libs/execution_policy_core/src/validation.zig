@@ -186,8 +186,11 @@ const Validator = struct {
         }
         for (terminals.array.items, 0..) |row, index| {
             const obj = try self.objectAt(row, "$.terminals", index) orelse continue;
-            const id = (try self.requiredStringAt(obj, "id", "$.terminals", index)) orelse
-                ((try self.requiredStringAt(obj, "name", "$.terminals", index)) orelse continue);
+            const id = try self.optionalStringAt(obj, "id", "$.terminals", index) orelse
+                (try self.optionalStringAt(obj, "name", "$.terminals", index) orelse {
+                    try self.addIndex(.schema_invalid, "$.terminals", index, ".id");
+                    continue;
+                });
             try self.validateStableId(id, "$.terminals", index, ".id");
             try self.appendUnique(&self.terminal_ids, id, "$.terminals", index);
             try self.validateConditionField(obj, "condition", "$.terminals", index);
@@ -280,6 +283,11 @@ const Validator = struct {
                 if (!contains(self.action_ids.items, action_id)) {
                     try self.addIndex(.reference_unknown, "$.safety_shield", index, ".action_id");
                     self.saw_reference_error = true;
+                }
+                if (stringField(obj, "response")) |response| {
+                    if (!validShieldResponse(response)) {
+                        try self.addIndex(.schema_invalid, "$.safety_shield", index, ".response");
+                    }
                 }
                 try self.validateConditionField(obj, "condition", "$.safety_shield", index);
             }
@@ -390,6 +398,16 @@ const Validator = struct {
                     if (item != .string) continue;
                     if (!contains(self.action_ids.items, item.string)) {
                         try self.addIndex2(.reference_unknown, "$.actions", index, ".requires_actions", dep_index, "");
+                        self.saw_reference_error = true;
+                    }
+                }
+            }
+            if (row.object.get("rollback_actions")) |rollback| {
+                if (rollback != .array) continue;
+                for (rollback.array.items, 0..) |item, rollback_index| {
+                    if (item != .string) continue;
+                    if (!contains(self.action_ids.items, item.string)) {
+                        try self.addIndex2(.reference_unknown, "$.actions", index, ".rollback_actions", rollback_index, "");
                         self.saw_reference_error = true;
                     }
                 }
@@ -617,6 +635,17 @@ const Validator = struct {
         return value.string;
     }
 
+    fn optionalStringAt(self: *Validator, obj: std.json.ObjectMap, key: []const u8, base_path: []const u8, index: usize) !?[]const u8 {
+        const value = obj.get(key) orelse return null;
+        if (value != .string or value.string.len == 0) {
+            const suffix = try std.fmt.allocPrint(self.allocator, ".{s}", .{key});
+            defer self.allocator.free(suffix);
+            try self.addIndex(.schema_invalid, base_path, index, suffix);
+            return null;
+        }
+        return value.string;
+    }
+
     fn requireStringArray(self: *Validator, value: std.json.Value, base_path: []const u8, index: usize, suffix: []const u8) !void {
         if (value != .array) {
             try self.addIndex(.schema_invalid, base_path, index, suffix);
@@ -711,6 +740,12 @@ fn contains(items: []const []const u8, needle: []const u8) bool {
         if (std.mem.eql(u8, item, needle)) return true;
     }
     return false;
+}
+
+fn validShieldResponse(response: []const u8) bool {
+    return std.mem.eql(u8, response, "return_to_spec") or
+        std.mem.eql(u8, response, "rollback") or
+        std.mem.eql(u8, response, "blocked");
 }
 
 fn expectOnlyCode(report: errors.ValidationReport, code: errors.ErrorCode) !void {
@@ -836,6 +871,14 @@ test "validation accepts obligation closer declared later in policy" {
     try std.testing.expect(report.ok());
 }
 
+test "validation accepts terminal name alias without id error" {
+    var report = try validateText(std.testing.allocator,
+        \\{"policy_id":"p","revision":1,"declared_atoms":["fact:start","terminal:success"],"actions":[{"id":"a"}],"policy_rules":[{"id":"r","actions":["a"]},{"id":"done","terminal":"success"}],"terminals":[{"name":"success"}]}
+    );
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expect(report.ok());
+}
+
 test "validation rejects unstable generated atom ids" {
     var report = try validateText(std.testing.allocator,
         \\{"policy_id":"p","revision":1,"declared_atoms":["fact:a"],"actions":[{"id":"bad action"}],"policy_rules":[{"id":"r","actions":["bad action"]}]}
@@ -848,6 +891,20 @@ test "validation rejects unstable generated atom ids" {
     );
     defer outcome_report.deinit(std.testing.allocator);
     try expectOnlyCode(outcome_report, .atom_invalid);
+}
+
+test "validation rejects unknown rollback refs and shield responses" {
+    var rollback_report = try validateText(std.testing.allocator,
+        \\{"policy_id":"p","revision":1,"declared_atoms":["fact:a"],"actions":[{"id":"a","rollback_actions":["missing"]},{"id":"rollback","rollback_only":true}],"policy_rules":[{"id":"r","actions":["a"]}]}
+    );
+    defer rollback_report.deinit(std.testing.allocator);
+    try expectOnlyCode(rollback_report, .reference_unknown);
+
+    var shield_report = try validateText(std.testing.allocator,
+        \\{"policy_id":"p","revision":1,"declared_atoms":["fact:a"],"actions":[{"id":"a","risky":true}],"policy_rules":[{"id":"r","actions":["a"]}],"safety_shield":[{"action_id":"a","response":"retun_to_spec"}]}
+    );
+    defer shield_report.deinit(std.testing.allocator);
+    try expectOnlyCode(shield_report, .schema_invalid);
 }
 
 test "validation reports risky action without shield" {

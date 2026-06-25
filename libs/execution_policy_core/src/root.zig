@@ -109,17 +109,23 @@ test "public API validates and applies transition receipt" {
         \\{"policy_id":"p","revision":1,"actions":[{"id":"a","results":{"success":["fact:done"]}}]}
     );
     defer policy.deinit(std.testing.allocator);
-    var state = try parseState(std.testing.allocator,
-        \\{"policy_id":"p","revision":1,"policy_digest":"sha256:p","satisfied_atoms":[]}
-    );
+    var policy_digest = try canonicalPolicyDigest(std.testing.allocator, &policy);
+    defer policy_digest.deinit(std.testing.allocator);
+    const state_text = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"policy_id":"p","revision":1,"policy_digest":"{s}","satisfied_atoms":[]}}
+    , .{policy_digest.text});
+    defer std.testing.allocator.free(state_text);
+    var state = try parseState(std.testing.allocator, state_text);
     defer state.deinit(std.testing.allocator);
     var decision = try parseDecision(std.testing.allocator,
         \\{"decision_id":"d","winner":{"kind":"action","id":"a"}}
     );
     defer decision.deinit(std.testing.allocator);
-    var receipt = try parseTransitionReceipt(std.testing.allocator,
-        \\{"policy_id":"p","revision":1,"policy_digest":"sha256:p","decision_id":"d","action_id":"a","result":"success","predicted_effects":["fact:done"],"observed":{"facts":["fact:done"],"potential":[0]},"state_after":{"state_id":"s2","potential":[0]}}
-    );
+    const receipt_text = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"policy_id":"p","revision":1,"policy_digest":"{s}","decision_id":"d","action_id":"a","result":"success","predicted_effects":["fact:done"],"observed":{{"facts":["fact:done"],"potential":[0]}},"state_after":{{"state_id":"s2","potential":[0]}}}}
+    , .{policy_digest.text});
+    defer std.testing.allocator.free(receipt_text);
+    var receipt = try parseTransitionReceipt(std.testing.allocator, receipt_text);
     defer receipt.deinit(std.testing.allocator);
 
     var report = try validateReceipt(std.testing.allocator, &policy, &state, &decision, &receipt);
