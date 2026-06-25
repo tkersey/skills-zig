@@ -105,6 +105,7 @@ test "bootstrap parse coverage" {
     try std.testing.expectEqual(lib.Command.opencode_events, lib.parseCommand("opencode-events"));
     try std.testing.expectEqual(lib.Command.index, lib.parseCommand("index"));
     try std.testing.expectEqual(lib.Command.actuation_audit, lib.parseCommand("actuation-audit"));
+    try std.testing.expectEqual(lib.Command.execution_policy_audit, lib.parseCommand("execution-policy-audit"));
     try std.testing.expectEqual(lib.Command.unknown, lib.parseCommand("invalid"));
 }
 
