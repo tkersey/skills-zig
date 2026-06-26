@@ -104,6 +104,7 @@ const HelpText =
     \\  resolve-c3 delivery apply|commit|push
     \\  resolve-c3 certify tuple|terminal
     \\  resolve-c3 migrate mrpc|intent-closed
+    \\  resolve-c3 authority-chain init|check
     \\
     \\legacy aliases remain available for MRPC-v1 state, but MBKC-v1 commands are the material surface.
     \\
@@ -122,6 +123,19 @@ const HelpText =
     \\  --design ID                Realization design id
     \\  --batch-id ID              Review batch id
     \\  --receipt-id ID            Review receipt id
+    \\  --campaign ID              RAC-v1 campaign id
+    \\  --artifact-state PATH       RAC-v1 artifact-state JSON
+    \\  --review-claim PATH         RAC-v1 review-claim JSON
+    \\  --cex PATH                  RAC-v1 CEX-v1 JSON
+    \\  --batch PATH                RAC-v1 RB-v1 JSON
+    \\  --basis PATH                RAC-v1 CEB-v2 JSON
+    \\  --kernel PATH               RAC-v1 MBK-v1 JSON
+    \\  --reduction PATH            RAC-v1 RC-v1 JSON
+    \\  --proof-obligation REF      RAC-v1 proof obligation ref
+    \\  --realization-target PATH   RAC-v1 realization target JSON
+    \\  --output PATH               RAC-v1 init output path
+    \\  --chain PATH                RAC-v1 authority chain path
+    \\  --format text|json          RAC-v1 check output format
     \\  --mode MODE                Review mode or plan mode
     \\  --head SHA                 Artifact head for review batch begin
     \\  --stage candidate|delivery Holdout stage
@@ -189,6 +203,7 @@ const SchemaArtifacts = [_][]const u8{
     "construct-map",
     "proof-plan",
     "holdout",
+    "authority-chain",
     "mbkc",
 };
 const PhaseCollectingSelectedInvalidated = [_][]const u8{ "collecting", "selected", "invalidated" };
@@ -289,6 +304,8 @@ const Command = enum {
     certify_terminal,
     migrate_mrpc,
     migrate_intent_closed,
+    authority_chain_init,
+    authority_chain_check,
     doctor,
     init,
     paths,
@@ -336,6 +353,19 @@ const Args = struct {
     design_id: ?[]const u8 = null,
     batch_id: ?[]const u8 = null,
     receipt_id: ?[]const u8 = null,
+    campaign_id: ?[]const u8 = null,
+    artifact_state: ?[]const u8 = null,
+    review_claim: ?[]const u8 = null,
+    cex: ?[]const u8 = null,
+    batch: ?[]const u8 = null,
+    basis: ?[]const u8 = null,
+    kernel: ?[]const u8 = null,
+    reduction: ?[]const u8 = null,
+    proof_obligation: ?[]const u8 = null,
+    realization_target: ?[]const u8 = null,
+    output: ?[]const u8 = null,
+    chain: ?[]const u8 = null,
+    format: ?[]const u8 = null,
     mode: ?[]const u8 = null,
     head: ?[]const u8 = null,
     path: ?[]const u8 = null,
@@ -535,6 +565,32 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.batch_id = try optionValue(argv, &i);
         } else if (std.mem.eql(u8, token, "--receipt-id")) {
             args.receipt_id = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--campaign")) {
+            args.campaign_id = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--artifact-state")) {
+            args.artifact_state = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--review-claim")) {
+            args.review_claim = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--cex")) {
+            args.cex = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--batch")) {
+            args.batch = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--basis")) {
+            args.basis = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--kernel")) {
+            args.kernel = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--reduction")) {
+            args.reduction = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--proof-obligation")) {
+            args.proof_obligation = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--realization-target")) {
+            args.realization_target = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--output")) {
+            args.output = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--chain")) {
+            args.chain = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--format")) {
+            args.format = try optionValue(argv, &i);
         } else if (std.mem.eql(u8, token, "--mode")) {
             args.mode = try optionValue(argv, &i);
         } else if (std.mem.eql(u8, token, "--head")) {
@@ -593,6 +649,11 @@ fn parseCommandTokens(argv: []const []const u8, first_option_index: *usize) !Com
         if (argv.len < 4) return error.MissingCommand;
         first_option_index.* = 4;
         return parseReviewCommand(argv[2], argv[3]) orelse error.UnknownCommand;
+    }
+    if (std.mem.eql(u8, primary, "authority-chain")) {
+        if (argv.len < 3) return error.MissingCommand;
+        first_option_index.* = 3;
+        return parseAuthorityChainCommand(argv[2]) orelse error.UnknownCommand;
     }
     if (std.mem.eql(u8, primary, "counterexample")) {
         if (argv.len < 3) return error.MissingCommand;
@@ -757,6 +818,12 @@ fn parseMigrateCommand(value: []const u8) ?Command {
     return null;
 }
 
+fn parseAuthorityChainCommand(value: []const u8) ?Command {
+    if (std.mem.eql(u8, value, "init")) return .authority_chain_init;
+    if (std.mem.eql(u8, value, "check")) return .authority_chain_check;
+    return null;
+}
+
 fn parseCommand(value: []const u8) ?Command {
     if (std.mem.eql(u8, value, "capabilities")) return .capabilities;
     if (std.mem.eql(u8, value, "schema")) return .schema;
@@ -862,6 +929,8 @@ fn run(allocator: std.mem.Allocator, args: Args, process_io: std.Io) !u8 {
         .certify_terminal => certifyTerminal(allocator, args),
         .migrate_mrpc => migrateMrpc(allocator, args),
         .migrate_intent_closed => migrateIntentClosed(allocator, args),
+        .authority_chain_init => authorityChainSurface(allocator, args, "init"),
+        .authority_chain_check => authorityChainSurface(allocator, args, "check"),
         .doctor => printDoctor(allocator, args),
         .init => initState(allocator, args),
         .paths => printPaths(allocator, args),
@@ -898,10 +967,296 @@ fn run(allocator: std.mem.Allocator, args: Args, process_io: std.Io) !u8 {
 
 fn printCapabilities(allocator: std.mem.Allocator) !u8 {
     try writeStdoutBytes(allocator,
-        \\{"resolve_c3_capabilities":{"version":"0.3.0","protocol_profiles":{"intent_closed_cegis_v1":true,"mbkc_v1":true,"mrpc_v1_read":true},"state_versions":{"readable":[1,2,3],"writable":[3]},"certificate_versions":{"readable":["MRPC-v1","MBKC-v1"],"writable":["MBKC-v1"]},"features":{"acceptance_contract_v2":true,"sealed_review_horizon_v1":true,"review_batch_v1":true,"review_aperture_v1":true,"counterexample_v1":true,"counterexample_basis_v2":true,"minimum_behavioral_kernel_v1":true,"reduction_certificate_v1":true,"review_potential_v1":true,"intent_closed_conformance_v1":true,"terminal_holdout_v1":true,"semantic_surface_v1":true,"proof_compression_v1":true,"physical_apply":true,"physical_commit":true,"physical_push":true,"closure_horizon_v1":true,"mutation_guard_v2":true,"mbkc_v1":true,"mrpc_v1_read":true}}}
+        \\{"resolve_c3_capabilities":{"version":"0.3.1","protocol_profiles":{"intent_closed_cegis_v1":true,"mbkc_v1":true,"mrpc_v1_read":true,"rac_v1":true},"state_versions":{"readable":[1,2,3],"writable":[3]},"certificate_versions":{"readable":["MRPC-v1","MBKC-v1","RAC-v1"],"writable":["MBKC-v1","RAC-v1"]},"features":{"acceptance_contract_v2":true,"sealed_review_horizon_v1":true,"review_batch_v1":true,"review_aperture_v1":true,"counterexample_v1":true,"counterexample_basis_v2":true,"minimum_behavioral_kernel_v1":true,"reduction_certificate_v1":true,"review_potential_v1":true,"intent_closed_conformance_v1":true,"terminal_holdout_v1":true,"semantic_surface_v1":true,"proof_compression_v1":true,"authority_chain_rac_v1":true,"physical_apply":true,"physical_commit":true,"physical_push":true,"closure_horizon_v1":true,"mutation_guard_v2":true,"mbkc_v1":true,"mrpc_v1_read":true}}}
         \\
     );
     return 0;
+}
+
+fn authorityChainSurface(allocator: std.mem.Allocator, args: Args, subcommand: []const u8) !u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    if (std.mem.eql(u8, subcommand, "init")) {
+        _ = args.campaign_id orelse return error.MissingValue;
+        _ = args.artifact_state orelse return error.MissingValue;
+        _ = args.review_claim orelse return error.MissingValue;
+        _ = args.acceptance orelse return error.MissingValue;
+        _ = args.cex orelse return error.MissingValue;
+        _ = args.batch orelse return error.MissingValue;
+        _ = args.basis orelse return error.MissingValue;
+        _ = args.kernel orelse return error.MissingValue;
+        _ = args.reduction orelse return error.MissingValue;
+        _ = args.proof_obligation orelse return error.MissingValue;
+        _ = args.realization_target orelse return error.MissingValue;
+        _ = args.output orelse return error.MissingValue;
+    } else {
+        _ = args.chain orelse return error.MissingValue;
+        if (args.format) |format| {
+            if (!std.mem.eql(u8, format, "text") and !std.mem.eql(u8, format, "json")) return error.UnknownOption;
+        }
+        return checkAuthorityChain(allocator, args);
+    }
+    try out.writer.writeAll("{\"resolve_c3_authority_chain\":{\"chain_version\":\"RAC-v1\",\"command\":");
+    try writeJsonString(&out.writer, subcommand);
+    try out.writer.writeAll(",\"surface\":\"declared\",\"validation\":\"pending\"}}\n");
+    try writeStdoutAlloc(allocator, &out);
+    return 0;
+}
+
+const RacFacts = struct {
+    chain_id: []const u8 = "",
+    campaign_id: []const u8 = "",
+    chain_version_ok: bool = false,
+    artifact_state_complete: bool = false,
+    review_claim_present: bool = false,
+    acceptance_contract_present: bool = false,
+    horizon_present: bool = false,
+    law_refs_present: bool = false,
+    relation: []const u8 = "",
+    cex_confirmed: bool = false,
+    adjudication_disposition: []const u8 = "",
+    batch_sealed: bool = false,
+    ceb_class_present: bool = false,
+    mbk_present: bool = false,
+    rc_present: bool = false,
+    transition_present: bool = false,
+    proof_obligation_present: bool = false,
+    realization_allowed: bool = false,
+    gate_current_yes: bool = false,
+    gate_complete_yes: bool = false,
+    gate_mutation_yes: bool = false,
+};
+
+fn checkAuthorityChain(allocator: std.mem.Allocator, args: Args) !u8 {
+    const chain_path = args.chain orelse return error.MissingValue;
+    const bytes = readFileOrStdin(allocator, chain_path) catch return 3;
+    defer allocator.free(bytes);
+    const facts = parseRacFacts(allocator, bytes) catch return 3;
+    defer allocator.free(facts.chain_id);
+    defer allocator.free(facts.campaign_id);
+    defer allocator.free(facts.relation);
+    defer allocator.free(facts.adjudication_disposition);
+
+    var missing = std.ArrayList([]const u8).empty;
+    var violations = std.ArrayList([]const u8).empty;
+    try validateRacFacts(allocator, facts, &missing, &violations);
+    defer missing.deinit(allocator);
+    defer violations.deinit(allocator);
+
+    const non_mutation_valid = !facts.realization_allowed and !facts.gate_mutation_yes and hasNonMutationDisposition(facts.adjudication_disposition);
+    const mutation_allowed = missing.items.len == 0 and violations.items.len == 0;
+    const valid = mutation_allowed or (non_mutation_valid and missing.items.len == 0 and nonMutationViolationsOnly(violations.items));
+    const format = args.format orelse "text";
+    if (std.mem.eql(u8, format, "json")) {
+        try writeRacCheckJson(allocator, facts, valid, mutation_allowed, missing.items, if (valid and !mutation_allowed) &.{} else violations.items);
+    } else {
+        try writeRacCheckText(allocator, facts, valid, mutation_allowed, missing.items, if (valid and !mutation_allowed) &.{} else violations.items);
+    }
+    return if (valid) 0 else 2;
+}
+
+fn parseRacFacts(allocator: std.mem.Allocator, bytes: []const u8) !RacFacts {
+    const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
+    if (trimmed.len == 0) return error.UnsupportedFormat;
+    if (trimmed[0] == '{') return parseJsonRacFacts(allocator, bytes);
+    if (std.mem.containsAtLeast(u8, bytes, 1, "resolve_authority_chain:")) return parseYamlRacFacts(allocator, bytes);
+    return error.UnsupportedFormat;
+}
+
+fn parseJsonRacFacts(allocator: std.mem.Allocator, bytes: []const u8) !RacFacts {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const root = objectField(parsed.value, "resolve_authority_chain") orelse parsed.value;
+    const artifact_state = objectField(root, "artifact_state");
+    const review_claim = objectField(root, "review_claim");
+    const acceptance = objectField(root, "acceptance");
+    const adjudication = objectField(root, "adjudication");
+    const batch = objectField(root, "batch");
+    const compression = objectField(root, "compression");
+    const realization = objectField(root, "realization");
+    const gate = objectField(root, "gate");
+    return .{
+        .chain_id = try allocator.dupe(u8, stringField(root, "chain_id") orelse ""),
+        .campaign_id = try allocator.dupe(u8, stringField(root, "campaign_id") orelse ""),
+        .chain_version_ok = std.mem.eql(u8, stringField(root, "chain_version") orelse "", "RAC-v1"),
+        .artifact_state_complete = allStringFieldsPresent(artifact_state, &.{ "base_sha", "head_sha", "dirty_fingerprint", "review_receipt" }),
+        .review_claim_present = stringFieldOpt(review_claim, "claim_id") != null,
+        .acceptance_contract_present = allStringFieldsPresent(acceptance, &.{ "contract_id", "contract_fingerprint" }),
+        .horizon_present = stringFieldOpt(acceptance, "horizon_fingerprint") != null,
+        .law_refs_present = arrayLen(if (acceptance) |a| objectField(a, "law_refs") else null) > 0,
+        .relation = try allocator.dupe(u8, stringFieldOpt(acceptance, "relation") orelse ""),
+        .cex_confirmed = std.mem.eql(u8, stringFieldOpt(adjudication, "validity") orelse "", "confirmed"),
+        .adjudication_disposition = try allocator.dupe(u8, stringFieldOpt(adjudication, "disposition") orelse ""),
+        .batch_sealed = boolFieldOpt(batch, "sealed") == true,
+        .ceb_class_present = allStringFieldsPresent(compression, &.{ "ceb_id", "class_id", "class_status", "quotient_witness_ref" }),
+        .mbk_present = stringFieldOpt(compression, "mbk_id") != null,
+        .rc_present = stringFieldOpt(compression, "rc_id") != null,
+        .transition_present = stringFieldOpt(compression, "transition_ref") != null,
+        .proof_obligation_present = stringFieldOpt(compression, "proof_obligation_ref") != null,
+        .realization_allowed = boolFieldOpt(realization, "allowed") == true,
+        .gate_current_yes = std.mem.eql(u8, stringFieldOpt(gate, "current_artifact_state") orelse "", "yes"),
+        .gate_complete_yes = std.mem.eql(u8, stringFieldOpt(gate, "complete_chain") orelse "", "yes"),
+        .gate_mutation_yes = std.mem.eql(u8, stringFieldOpt(gate, "mutation_allowed") orelse "", "yes"),
+    };
+}
+
+fn parseYamlRacFacts(allocator: std.mem.Allocator, bytes: []const u8) !RacFacts {
+    return .{
+        .chain_id = try yamlScalarDup(allocator, bytes, "chain_id"),
+        .campaign_id = try yamlScalarDup(allocator, bytes, "campaign_id"),
+        .chain_version_ok = std.mem.eql(u8, try yamlScalarTemp(bytes, "chain_version"), "RAC-v1"),
+        .artifact_state_complete = yamlHasValue(bytes, "base_sha") and yamlHasValue(bytes, "head_sha") and yamlHasValue(bytes, "dirty_fingerprint") and yamlHasValue(bytes, "review_receipt"),
+        .review_claim_present = yamlHasValue(bytes, "claim_id"),
+        .acceptance_contract_present = yamlHasValue(bytes, "contract_id") and yamlHasValue(bytes, "contract_fingerprint"),
+        .horizon_present = yamlHasValue(bytes, "horizon_fingerprint"),
+        .law_refs_present = yamlHasNonEmptyArray(bytes, "law_refs"),
+        .relation = try yamlScalarDup(allocator, bytes, "relation"),
+        .cex_confirmed = std.mem.eql(u8, try yamlScalarTemp(bytes, "validity"), "confirmed"),
+        .adjudication_disposition = try yamlScalarDup(allocator, bytes, "disposition"),
+        .batch_sealed = yamlBool(bytes, "sealed") == true,
+        .ceb_class_present = yamlHasValue(bytes, "ceb_id") and yamlHasValue(bytes, "class_id") and yamlHasValue(bytes, "class_status") and yamlHasValue(bytes, "quotient_witness_ref"),
+        .mbk_present = yamlHasValue(bytes, "mbk_id"),
+        .rc_present = yamlHasValue(bytes, "rc_id"),
+        .transition_present = yamlHasValue(bytes, "transition_ref"),
+        .proof_obligation_present = yamlHasValue(bytes, "proof_obligation_ref"),
+        .realization_allowed = yamlBool(bytes, "allowed") == true,
+        .gate_current_yes = std.mem.eql(u8, try yamlScalarTemp(bytes, "current_artifact_state"), "yes"),
+        .gate_complete_yes = std.mem.eql(u8, try yamlScalarTemp(bytes, "complete_chain"), "yes"),
+        .gate_mutation_yes = std.mem.eql(u8, try yamlScalarTemp(bytes, "mutation_allowed"), "yes"),
+    };
+}
+
+fn validateRacFacts(allocator: std.mem.Allocator, facts: RacFacts, missing: *std.ArrayList([]const u8), violations: *std.ArrayList([]const u8)) !void {
+    if (!facts.chain_version_ok) try missing.append(allocator, "missing_chain_version");
+    if (!facts.artifact_state_complete) try missing.append(allocator, "missing_artifact_state");
+    if (!facts.review_claim_present) try missing.append(allocator, "missing_review_claim");
+    if (!facts.acceptance_contract_present) try missing.append(allocator, "missing_acceptance_contract");
+    if (!facts.horizon_present) try missing.append(allocator, "missing_horizon");
+    if (!facts.law_refs_present) try missing.append(allocator, "missing_law_refs");
+    if (std.mem.eql(u8, facts.relation, "outside_horizon")) try violations.append(allocator, "outside_horizon");
+    if (std.mem.eql(u8, facts.relation, "unrelated") or std.mem.eql(u8, facts.relation, "rejected") or std.mem.eql(u8, facts.relation, "unknown")) try violations.append(allocator, "unrelated_or_rejected");
+    if (!facts.cex_confirmed) try violations.append(allocator, "invalid_cex");
+    if (!facts.batch_sealed) try violations.append(allocator, "unsealed_batch");
+    if (!facts.ceb_class_present) try missing.append(allocator, "missing_ceb_class");
+    if (!facts.mbk_present or !facts.rc_present) try missing.append(allocator, "missing_mbk_or_rc");
+    if (!facts.transition_present) try missing.append(allocator, "missing_transition");
+    if (!facts.proof_obligation_present) try missing.append(allocator, "missing_proof_obligation");
+    if (!facts.gate_current_yes) try violations.append(allocator, "artifact_state_stale");
+    if (!facts.realization_allowed) try violations.append(allocator, "realization_not_allowed");
+    if (!facts.gate_complete_yes or (facts.realization_allowed and !facts.gate_mutation_yes) or (!facts.realization_allowed and facts.gate_mutation_yes)) try violations.append(allocator, "mutation_gate_disagrees");
+}
+
+fn writeRacCheckJson(allocator: std.mem.Allocator, facts: RacFacts, valid: bool, mutation_allowed: bool, missing: []const []const u8, violations: []const []const u8) !void {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"status\":");
+    try writeJsonString(&out.writer, if (valid) "valid" else "invalid");
+    try out.writer.writeAll(",\"mutation_allowed\":");
+    try out.writer.writeAll(if (mutation_allowed) "true" else "false");
+    try out.writer.writeAll(",\"missing\":");
+    try writeStringArray(&out.writer, missing);
+    try out.writer.writeAll(",\"violations\":");
+    try writeStringArray(&out.writer, violations);
+    try out.writer.writeAll(",\"chain_id\":");
+    try writeJsonString(&out.writer, facts.chain_id);
+    try out.writer.writeAll(",\"campaign_id\":");
+    try writeJsonString(&out.writer, facts.campaign_id);
+    try out.writer.writeAll("}\n");
+    try writeStdoutAlloc(allocator, &out);
+}
+
+fn writeRacCheckText(allocator: std.mem.Allocator, facts: RacFacts, valid: bool, mutation_allowed: bool, missing: []const []const u8, violations: []const []const u8) !void {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.print("RAC-v1 {s}: chain_id={s} campaign_id={s} mutation_allowed={}\n", .{ if (valid) "valid" else "invalid", facts.chain_id, facts.campaign_id, mutation_allowed });
+    if (missing.len != 0) {
+        try out.writer.writeAll("missing: ");
+        try writeStringArray(&out.writer, missing);
+        try out.writer.writeByte('\n');
+    }
+    if (violations.len != 0) {
+        try out.writer.writeAll("violations: ");
+        try writeStringArray(&out.writer, violations);
+        try out.writer.writeByte('\n');
+    }
+    try writeStdoutAlloc(allocator, &out);
+}
+
+fn allStringFieldsPresent(value: ?std.json.Value, fields: []const []const u8) bool {
+    const actual = value orelse return false;
+    for (fields) |field| {
+        if (stringField(actual, field) == null) return false;
+    }
+    return true;
+}
+
+fn stringFieldOpt(value: ?std.json.Value, key: []const u8) ?[]const u8 {
+    return if (value) |actual| stringField(actual, key) else null;
+}
+
+fn boolFieldOpt(value: ?std.json.Value, key: []const u8) ?bool {
+    return if (value) |actual| boolField(actual, key) else null;
+}
+
+fn hasNonMutationDisposition(value: []const u8) bool {
+    return std.mem.eql(u8, value, "refuted") or std.mem.eql(u8, value, "stale") or std.mem.eql(u8, value, "outside_horizon") or std.mem.eql(u8, value, "contract_invalidating") or std.mem.eql(u8, value, "unknown");
+}
+
+fn nonMutationViolationsOnly(values: []const []const u8) bool {
+    for (values) |value| {
+        if (!std.mem.eql(u8, value, "invalid_cex") and !std.mem.eql(u8, value, "realization_not_allowed") and !std.mem.eql(u8, value, "mutation_gate_disagrees") and !std.mem.eql(u8, value, "outside_horizon") and !std.mem.eql(u8, value, "unrelated_or_rejected")) return false;
+    }
+    return true;
+}
+
+fn yamlScalarDup(allocator: std.mem.Allocator, text: []const u8, key: []const u8) ![]const u8 {
+    return allocator.dupe(u8, try yamlScalarTemp(text, key));
+}
+
+fn yamlScalarTemp(text: []const u8, key: []const u8) ![]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        if (!std.mem.eql(u8, name, key)) continue;
+        var value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (value.len >= 2 and ((value[0] == '"' and value[value.len - 1] == '"') or (value[0] == '\'' and value[value.len - 1] == '\''))) value = value[1 .. value.len - 1];
+        return value;
+    }
+    return "";
+}
+
+fn yamlHasValue(text: []const u8, key: []const u8) bool {
+    return (yamlScalarTemp(text, key) catch "").len != 0;
+}
+
+fn yamlBool(text: []const u8, key: []const u8) ?bool {
+    const value = yamlScalarTemp(text, key) catch return null;
+    if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "yes")) return true;
+    if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "no")) return false;
+    return null;
+}
+
+fn yamlHasNonEmptyArray(text: []const u8, key: []const u8) bool {
+    const value = yamlScalarTemp(text, key) catch "";
+    if (value.len != 0 and !std.mem.eql(u8, value, "[]")) return true;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var saw_key = false;
+    while (lines.next()) |raw| {
+        const line = raw;
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (!saw_key) {
+            const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
+            const name = std.mem.trim(u8, trimmed[0..colon], " \t");
+            saw_key = std.mem.eql(u8, name, key);
+            continue;
+        }
+        if (std.mem.startsWith(u8, trimmed, "- ")) return true;
+        if (trimmed.len != 0 and !std.mem.startsWith(u8, line, " ")) return false;
+    }
+    return false;
 }
 
 fn printSchema(allocator: std.mem.Allocator, args: Args) !u8 {
@@ -2572,6 +2927,7 @@ fn schemaRootName(artifact: []const u8) []const u8 {
     if (std.mem.eql(u8, artifact, "construct-map")) return "kernel_realization_map";
     if (std.mem.eql(u8, artifact, "proof-plan")) return "proof_plan";
     if (std.mem.eql(u8, artifact, "holdout")) return "holdout";
+    if (std.mem.eql(u8, artifact, "authority-chain")) return "resolve_authority_chain";
     return "minimum_behavioral_kernel_certificate";
 }
 
@@ -2590,6 +2946,7 @@ fn writeRequiredFields(writer: anytype, artifact: []const u8) !void {
     if (std.mem.eql(u8, artifact, "construct-map")) return writer.writeAll("[\"map_version\",\"kernel_fingerprint\",\"realization_tree_fingerprint\",\"constructs\",\"proof_actions\"]");
     if (std.mem.eql(u8, artifact, "proof-plan")) return writer.writeAll("[\"plan_version\",\"kernel_fingerprint\",\"realization_tree_fingerprint\",\"actions\"]");
     if (std.mem.eql(u8, artifact, "holdout")) return writer.writeAll("[\"holdout_version\",\"stage\",\"verdict\",\"refs\",\"gate\"]");
+    if (std.mem.eql(u8, artifact, "authority-chain")) return writer.writeAll("[\"resolve_authority_chain\",\"chain_version\",\"chain_id\",\"campaign_id\",\"artifact_state\",\"review_claim\",\"acceptance\",\"adjudication\",\"batch\",\"compression\",\"realization\",\"gate\"]");
     return writer.writeAll("[\"certificate_version\",\"certificate_id\",\"stage\",\"campaign\",\"acceptance\",\"observations\",\"kernel\",\"semantic_surface\",\"proof_basis\",\"delivery\",\"closure_horizon\",\"gate\"]");
 }
 
@@ -2608,6 +2965,7 @@ fn writeExampleValue(writer: anytype, artifact: []const u8) !void {
     if (std.mem.eql(u8, artifact, "construct-map")) return writer.writeAll("{\"map_version\":\"KRM-v1\",\"kernel_fingerprint\":\"sha256:kernel\",\"realization_tree_fingerprint\":\"sha256:tree\",\"constructs\":[],\"proof_actions\":[]}");
     if (std.mem.eql(u8, artifact, "proof-plan")) return writer.writeAll("{\"plan_version\":\"RCP-v1\",\"kernel_fingerprint\":\"sha256:kernel\",\"realization_tree_fingerprint\":\"sha256:tree\",\"actions\":[]}");
     if (std.mem.eql(u8, artifact, "holdout")) return writer.writeAll("{\"holdout_version\":\"RCH-v1\",\"stage\":\"kernel\",\"verdict\":\"clean\",\"refs\":[],\"gate\":{\"blocks\":false}}");
+    if (std.mem.eql(u8, artifact, "authority-chain")) return writer.writeAll("{\"resolve_authority_chain\":{\"chain_version\":\"RAC-v1\",\"chain_id\":\"RAC-example\",\"campaign_id\":\"c3-example\",\"artifact_state\":{\"base_sha\":\"base\",\"head_sha\":\"head\",\"dirty_fingerprint\":\"clean\",\"review_receipt\":\"review.example\"},\"review_claim\":{\"claim_id\":\"claim.example\",\"source\":\"review\",\"statement\":\"accepted finding\",\"suggested_repair\":\"owner-scoped repair\"},\"acceptance\":{\"contract_id\":\"ac.example\",\"contract_fingerprint\":\"sha256:ac\",\"horizon_fingerprint\":\"sha256:horizon\",\"law_refs\":[\"law.example\"],\"relation\":\"directly_entailed\"},\"adjudication\":{\"cex_id\":\"cex.example\",\"validity\":\"confirmed\",\"liability\":\"introduced_by_current_diff\",\"novelty\":\"new_equivalence_class\",\"disposition\":\"accepted\",\"minimal_trace_ref\":\"trace.example\"},\"batch\":{\"batch_id\":\"batch.example\",\"sealed\":true,\"mode\":\"conformance\"},\"compression\":{\"ceb_id\":\"basis.example\",\"class_id\":\"class.example\",\"class_status\":\"accepted\",\"quotient_witness_ref\":\"witness.example\",\"mbk_id\":\"mbk.example\",\"rc_id\":\"rc.example\",\"transition_ref\":\"transition.example\",\"proof_obligation_ref\":\"proof.example\"},\"realization\":{\"allowed\":true,\"target_owner\":\"owner.example\",\"target_boundary\":\"path:src/example.zig\",\"forbidden_expansions\":[]},\"gate\":{\"current_artifact_state\":\"yes\",\"complete_chain\":\"yes\",\"mutation_allowed\":\"yes\"}}}");
     return writer.writeAll("{\"minimum_behavioral_kernel_certificate\":{\"certificate_version\":\"MBKC-v1\",\"certificate_id\":\"sha256:canonical-content\",\"stage\":\"kernel_accepted\",\"campaign\":{},\"acceptance\":{},\"observations\":{},\"kernel\":{},\"kernel_review\":{},\"realization_designs\":{},\"selected_design\":{},\"realization_map\":{},\"semantic_surface\":{},\"proof_basis\":{},\"negative_evidence\":{},\"holdouts\":{},\"delivery\":{},\"closure_horizon\":{},\"gate\":{\"kernel_allowed\":true,\"realization_allowed\":false,\"apply_allowed\":false,\"commit_allowed\":false,\"push_allowed\":false,\"tuple_closure_allowed\":false,\"terminal_closure_allowed\":false}}}");
 }
 
@@ -6503,6 +6861,64 @@ test "parseArgs accepts canonical nested command tokens" {
     const reduction_args = try parseArgs(&reduction);
     try std.testing.expectEqual(Command.reduction_accept, reduction_args.command);
     try std.testing.expectEqualStrings("/tmp/repo", reduction_args.cwd);
+
+    const authority_init = [_][]const u8{
+        "resolve-c3",
+        "authority-chain",
+        "init",
+        "--campaign",
+        "campaign.one",
+        "--artifact-state",
+        "artifact-state.json",
+        "--review-claim",
+        "claim.json",
+        "--acceptance",
+        "ac-v2.json",
+        "--cex",
+        "cex-v1.json",
+        "--batch",
+        "rb-v1.json",
+        "--basis",
+        "ceb-v2.json",
+        "--kernel",
+        "mbk-v1.json",
+        "--reduction",
+        "rc-v1.json",
+        "--proof-obligation",
+        "proof.one",
+        "--realization-target",
+        "target.json",
+        "--output",
+        "rac.yaml",
+    };
+    const authority_init_args = try parseArgs(&authority_init);
+    try std.testing.expectEqual(Command.authority_chain_init, authority_init_args.command);
+    try std.testing.expectEqualStrings("campaign.one", authority_init_args.campaign_id.?);
+    try std.testing.expectEqualStrings("artifact-state.json", authority_init_args.artifact_state.?);
+    try std.testing.expectEqualStrings("claim.json", authority_init_args.review_claim.?);
+    try std.testing.expectEqualStrings("ac-v2.json", authority_init_args.acceptance.?);
+    try std.testing.expectEqualStrings("cex-v1.json", authority_init_args.cex.?);
+    try std.testing.expectEqualStrings("rb-v1.json", authority_init_args.batch.?);
+    try std.testing.expectEqualStrings("ceb-v2.json", authority_init_args.basis.?);
+    try std.testing.expectEqualStrings("mbk-v1.json", authority_init_args.kernel.?);
+    try std.testing.expectEqualStrings("rc-v1.json", authority_init_args.reduction.?);
+    try std.testing.expectEqualStrings("proof.one", authority_init_args.proof_obligation.?);
+    try std.testing.expectEqualStrings("target.json", authority_init_args.realization_target.?);
+    try std.testing.expectEqualStrings("rac.yaml", authority_init_args.output.?);
+
+    const authority_check = [_][]const u8{
+        "resolve-c3",
+        "authority-chain",
+        "check",
+        "--chain",
+        "rac.yaml",
+        "--format",
+        "json",
+    };
+    const authority_check_args = try parseArgs(&authority_check);
+    try std.testing.expectEqual(Command.authority_chain_check, authority_check_args.command);
+    try std.testing.expectEqualStrings("rac.yaml", authority_check_args.chain.?);
+    try std.testing.expectEqualStrings("json", authority_check_args.format.?);
 }
 
 test "schema discovery advertises intent closed artifacts" {
@@ -6523,8 +6939,212 @@ test "schema discovery advertises intent closed artifacts" {
     try std.testing.expect(knownSchemaArtifact("counterexample-basis-v2"));
     try std.testing.expect(knownSchemaArtifact("review-potential"));
     try std.testing.expect(knownSchemaArtifact("kernel"));
+    try std.testing.expect(knownSchemaArtifact("authority-chain"));
     try std.testing.expect(knownSchemaArtifact("mbkc"));
     try std.testing.expect(!knownSchemaArtifact("candidate"));
+    try std.testing.expectEqualStrings("resolve_authority_chain", schemaRootName("authority-chain"));
+
+    var rac_fields_out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer rac_fields_out.deinit();
+    try writeRequiredFields(&rac_fields_out.writer, "authority-chain");
+    const rac_fields = try rac_fields_out.toOwnedSlice();
+    defer std.testing.allocator.free(rac_fields);
+    try std.testing.expect(std.mem.containsAtLeast(u8, rac_fields, 1, "resolve_authority_chain"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, rac_fields, 1, "chain_version"));
+}
+
+fn validRacFactsForTest() RacFacts {
+    return .{
+        .chain_id = "RAC-test",
+        .campaign_id = "campaign-test",
+        .chain_version_ok = true,
+        .artifact_state_complete = true,
+        .review_claim_present = true,
+        .acceptance_contract_present = true,
+        .horizon_present = true,
+        .law_refs_present = true,
+        .relation = "directly_entailed",
+        .cex_confirmed = true,
+        .adjudication_disposition = "accepted",
+        .batch_sealed = true,
+        .ceb_class_present = true,
+        .mbk_present = true,
+        .rc_present = true,
+        .transition_present = true,
+        .proof_obligation_present = true,
+        .realization_allowed = true,
+        .gate_current_yes = true,
+        .gate_complete_yes = true,
+        .gate_mutation_yes = true,
+    };
+}
+
+fn expectRacReason(facts: RacFacts, reason: []const u8) !void {
+    var missing = std.ArrayList([]const u8).empty;
+    defer missing.deinit(std.testing.allocator);
+    var violations = std.ArrayList([]const u8).empty;
+    defer violations.deinit(std.testing.allocator);
+    try validateRacFacts(std.testing.allocator, facts, &missing, &violations);
+    try std.testing.expect(containsString(missing.items, reason) or containsString(violations.items, reason));
+}
+
+test "RAC-v1 validation covers fail-closed reasons" {
+    const valid = validRacFactsForTest();
+    var missing = std.ArrayList([]const u8).empty;
+    defer missing.deinit(std.testing.allocator);
+    var violations = std.ArrayList([]const u8).empty;
+    defer violations.deinit(std.testing.allocator);
+    try validateRacFacts(std.testing.allocator, valid, &missing, &violations);
+    try std.testing.expectEqual(@as(usize, 0), missing.items.len);
+    try std.testing.expectEqual(@as(usize, 0), violations.items.len);
+
+    var missing_chain = valid;
+    missing_chain.chain_version_ok = false;
+    try expectRacReason(missing_chain, "missing_chain_version");
+
+    var missing_artifact = valid;
+    missing_artifact.artifact_state_complete = false;
+    try expectRacReason(missing_artifact, "missing_artifact_state");
+
+    var missing_claim = valid;
+    missing_claim.review_claim_present = false;
+    try expectRacReason(missing_claim, "missing_review_claim");
+
+    var missing_acceptance = valid;
+    missing_acceptance.acceptance_contract_present = false;
+    try expectRacReason(missing_acceptance, "missing_acceptance_contract");
+
+    var missing_horizon = valid;
+    missing_horizon.horizon_present = false;
+    try expectRacReason(missing_horizon, "missing_horizon");
+
+    var missing_laws = valid;
+    missing_laws.law_refs_present = false;
+    try expectRacReason(missing_laws, "missing_law_refs");
+
+    var outside = valid;
+    outside.relation = "outside_horizon";
+    try expectRacReason(outside, "outside_horizon");
+
+    var unrelated = valid;
+    unrelated.relation = "unrelated";
+    try expectRacReason(unrelated, "unrelated_or_rejected");
+
+    var invalid_cex = valid;
+    invalid_cex.cex_confirmed = false;
+    try expectRacReason(invalid_cex, "invalid_cex");
+
+    var unsealed = valid;
+    unsealed.batch_sealed = false;
+    try expectRacReason(unsealed, "unsealed_batch");
+
+    var missing_class = valid;
+    missing_class.ceb_class_present = false;
+    try expectRacReason(missing_class, "missing_ceb_class");
+
+    var missing_mbk = valid;
+    missing_mbk.mbk_present = false;
+    try expectRacReason(missing_mbk, "missing_mbk_or_rc");
+
+    var missing_transition = valid;
+    missing_transition.transition_present = false;
+    try expectRacReason(missing_transition, "missing_transition");
+
+    var missing_proof = valid;
+    missing_proof.proof_obligation_present = false;
+    try expectRacReason(missing_proof, "missing_proof_obligation");
+
+    var stale = valid;
+    stale.gate_current_yes = false;
+    try expectRacReason(stale, "artifact_state_stale");
+
+    var not_allowed = valid;
+    not_allowed.realization_allowed = false;
+    try expectRacReason(not_allowed, "realization_not_allowed");
+
+    var disagrees = valid;
+    disagrees.gate_mutation_yes = false;
+    try expectRacReason(disagrees, "mutation_gate_disagrees");
+}
+
+test "RAC-v1 parser accepts JSON and YAML facts" {
+    const json_text =
+        \\{"resolve_authority_chain":{"chain_version":"RAC-v1","chain_id":"RAC-json","campaign_id":"campaign-json","artifact_state":{"base_sha":"b","head_sha":"h","dirty_fingerprint":"clean","review_receipt":"rr"},"review_claim":{"claim_id":"claim"},"acceptance":{"contract_id":"ac","contract_fingerprint":"sha256:ac","horizon_fingerprint":"sha256:h","law_refs":["law"],"relation":"directly_entailed"},"adjudication":{"cex_id":"cex","validity":"confirmed","disposition":"accepted"},"batch":{"batch_id":"batch","sealed":true},"compression":{"ceb_id":"ceb","class_id":"class","class_status":"accepted","quotient_witness_ref":"w","mbk_id":"mbk","rc_id":"rc","transition_ref":"t","proof_obligation_ref":"p"},"realization":{"allowed":true},"gate":{"current_artifact_state":"yes","complete_chain":"yes","mutation_allowed":"yes"}}}
+    ;
+    const json_facts = try parseRacFacts(std.testing.allocator, json_text);
+    defer std.testing.allocator.free(json_facts.chain_id);
+    defer std.testing.allocator.free(json_facts.campaign_id);
+    defer std.testing.allocator.free(json_facts.relation);
+    defer std.testing.allocator.free(json_facts.adjudication_disposition);
+    try std.testing.expect(json_facts.chain_version_ok);
+    try std.testing.expectEqualStrings("RAC-json", json_facts.chain_id);
+    try std.testing.expect(json_facts.realization_allowed);
+
+    const yaml_text =
+        \\resolve_authority_chain:
+        \\  chain_version: RAC-v1
+        \\  chain_id: RAC-yaml
+        \\  campaign_id: campaign-yaml
+        \\  artifact_state:
+        \\    base_sha: b
+        \\    head_sha: h
+        \\    dirty_fingerprint: clean
+        \\    review_receipt: rr
+        \\  review_claim:
+        \\    claim_id: claim
+        \\  acceptance:
+        \\    contract_id: ac
+        \\    contract_fingerprint: sha256:ac
+        \\    horizon_fingerprint: sha256:h
+        \\    law_refs:
+        \\      - law
+        \\    relation: directly_entailed
+        \\  adjudication:
+        \\    validity: confirmed
+        \\    disposition: accepted
+        \\  batch:
+        \\    sealed: true
+        \\  compression:
+        \\    ceb_id: ceb
+        \\    class_id: class
+        \\    class_status: accepted
+        \\    quotient_witness_ref: w
+        \\    mbk_id: mbk
+        \\    rc_id: rc
+        \\    transition_ref: t
+        \\    proof_obligation_ref: p
+        \\  realization:
+        \\    allowed: true
+        \\  gate:
+        \\    current_artifact_state: yes
+        \\    complete_chain: yes
+        \\    mutation_allowed: yes
+    ;
+    const yaml_facts = try parseRacFacts(std.testing.allocator, yaml_text);
+    defer std.testing.allocator.free(yaml_facts.chain_id);
+    defer std.testing.allocator.free(yaml_facts.campaign_id);
+    defer std.testing.allocator.free(yaml_facts.relation);
+    defer std.testing.allocator.free(yaml_facts.adjudication_disposition);
+    try std.testing.expect(yaml_facts.chain_version_ok);
+    try std.testing.expectEqualStrings("RAC-yaml", yaml_facts.chain_id);
+    try std.testing.expect(yaml_facts.law_refs_present);
+    try std.testing.expect(yaml_facts.gate_mutation_yes);
+}
+
+test "RAC-v1 non-mutation route can be valid without mutation authority" {
+    var facts = validRacFactsForTest();
+    facts.cex_confirmed = false;
+    facts.adjudication_disposition = "refuted";
+    facts.realization_allowed = false;
+    facts.gate_mutation_yes = false;
+    var missing = std.ArrayList([]const u8).empty;
+    defer missing.deinit(std.testing.allocator);
+    var violations = std.ArrayList([]const u8).empty;
+    defer violations.deinit(std.testing.allocator);
+    try validateRacFacts(std.testing.allocator, facts, &missing, &violations);
+    try std.testing.expectEqual(@as(usize, 0), missing.items.len);
+    try std.testing.expect(hasNonMutationDisposition(facts.adjudication_disposition));
+    try std.testing.expect(nonMutationViolationsOnly(violations.items));
 }
 
 test "initial material state writes v3 intent closed protocol projection" {

@@ -11,7 +11,7 @@ This app owns the runtime command surface that will replace the legacy Python co
 - `intent_closed_cegis_v1`, MBKC-v1, and MRPC-v1 read compatibility are advertised.
 - state v3 is writable; state v1 and v2 remain readable for migration and audits.
 - MBKC-v1 is writable; MRPC-v1 remains readable for legacy gates.
-- AC-v2, sealed review horizons, review batches/apertures, CEX-v1, CEB-v2, MBK/RC, PHI-v1, targeted conformance, terminal holdout, semantic surface, proof compression, physical delivery, closure horizon, and mutation-guard-v2 feature flags are advertised for the 0.3.x implementation line.
+- AC-v2, sealed review horizons, review batches/apertures, CEX-v1, CEB-v2, MBK/RC, PHI-v1, targeted conformance, terminal holdout, semantic surface, proof compression, RAC-v1 authority-chain, physical delivery, closure horizon, and mutation-guard-v2 feature flags are advertised for the 0.3.x implementation line.
 
 ## Commands
 
@@ -38,6 +38,7 @@ This app owns the runtime command surface that will replace the legacy Python co
 - `resolve-c3 proof plan|run|compress`: generate intent/class-mapped law coverage, execute proof commands with tree-stability checks, and write a compressed proof basis.
 - `resolve-c3 delivery apply|commit|push`: after sealed clean conformance, PHI strict progress, current proof basis, and current fingerprints, replace the delivery tree from the captured realization tree, create an actual Git commit, and push the branch.
 - `resolve-c3 certify tuple|terminal`: record tuple-bound closure from a clean PR sweep receipt, then terminal closure only after a sealed clean terminal holdout and explicit reopen conditions.
+- `resolve-c3 authority-chain init|check`: native RAC-v1 command surface for review-originated mutation authority chains; validation semantics land in the RAC-v1 validator wave.
 - `resolve-c3 migrate mrpc --from <state-root> --campaign-base <sha> --review-ready-baseline <sha>`: archive MRPC/v1 artifacts and create an initialized campaign without accepting a kernel.
 - `resolve-c3 migrate intent-closed --from <state-root> --acceptance <acceptance-v2.json> --campaign-base <sha> --review-ready-baseline <sha> --confirm`: archive legacy artifacts and start a v3 intent-open campaign with a draft AC-v2, requiring fresh discovery/basis/kernel gates before mutation.
 
@@ -58,6 +59,7 @@ realization-design
 construct-map
 proof-plan
 holdout
+authority-chain
 mbkc
 ```
 
