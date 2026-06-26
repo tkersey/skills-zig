@@ -103,13 +103,34 @@ st session list --workspace .ledger/st --format json
 
 Session views include executor, plan ID, optional claim and fencing token, workspace sequence, plan sequence, branch epoch, selected item IDs, target, and a projection digest. A claim-bound session cannot switch plans until released. Session files are runtime-local state; they do not rewrite plan-local selected flags.
 
-Workspace-scoped aperture compilation emits legacy GCR-v1 plus a GCR-v2 authority receipt when claim and session scope are supplied:
+Workspace-scoped aperture compilation emits legacy GCR-v1 plus a graph-intelligence GCR-v2 authority receipt when claim and session scope are supplied:
 
 ```bash
 st compile aperture --workspace .ledger/st --plan default --session s1 --claim claim-1 --fencing-token 1 --expect-workspace-seq 3 --expect-plan-seq 2 --expect-branch-epoch 0
 ```
 
-The GCR-v2 receipt binds workspace sequence, plan sequence, graph fingerprints, branch epoch, claim ID, fencing token, claim resources, session view digest, selected item IDs, and `execution_allowed`. Stale workspace or plan sequences, stale graph fingerprints, stale branch epoch, missing or expired claims, stale fencing tokens, and stale or mismatched session views deny execution through machine-readable `gate.denials`; callers cannot override `execution_allowed`.
+The GCR-v2 authority receipt binds workspace sequence, plan sequence, graph fingerprints, branch epoch, claim ID, fencing token, claim resources, session view digest, selected frontier, ready frontier, unselected ready frontier, critical path, components, downstream unlock facts, parallel width, proof cut, aperture rationale, and `execution_allowed`. Selected IDs plus claim/fencing are not sufficient for material execution. Stale currentness, graph-intelligence failure, a selected node outside the ready frontier, a missing proof cut, unexplained unselected-ready work, or blocking graph debt deny execution through machine-readable `denial_reasons`; callers cannot override `execution_allowed`.
+
+`st graph receipt` prints the same GCR-v2 graph-intelligence payload without mutating plan state. It persists under the plan receipt directory only when `--write-receipt` is supplied:
+
+```bash
+st graph receipt --workspace .ledger/st --plan default --claim claim-1 --session s1 --fencing-token 1 --format json
+st graph receipt --workspace .ledger/st --plan default --claim claim-1 --session s1 --fencing-token 1 --write-receipt --format json
+```
+
+Ledger-only plan preview is allowed for migration, reporting, manual graph repair, and read-only inspection. Ledger-only receipts declare `ledger_mode.active=true` and `material_execution_allowed=false`; they are not mutation authority.
+
+`st graph repair` emits GRR-v1 graph repair receipts for graph compilation failure follow-up and persists them under `.ledger/st/plans/PLAN_ID/repair/`:
+
+```bash
+st graph repair --workspace .ledger/st --plan default --from-last-failure --format json
+```
+
+`st artifact-maintenance record` emits AMR-v1 receipts for sidecar or ledger artifact maintenance where path names could otherwise look like workflow activation. AMR records classify the artifact as governed by `st`, keep `activation_signal=false`, and persist only with `--write-receipt`:
+
+```bash
+st artifact-maintenance record --workspace .ledger/st --operation delete_sidecar --path .step/resolve-c3-st-plan.jsonl --mentioned-workflow resolve-c3 --reason "duplicate sidecar durable state" --format json
+```
 
 Claim-bound worker output is sealed through external worktrees and CS-v1 change sets:
 

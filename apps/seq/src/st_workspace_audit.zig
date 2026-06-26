@@ -15,6 +15,10 @@ pub const dataset_names = [_][]const u8{
     "st_session_views",
     "st_workspace_apertures",
     "st_gcr_v2",
+    "st_graph_control_receipts",
+    "st_graph_repair_receipts",
+    "st_artifact_maintenance_receipts",
+    "workflow_provenance_evidence",
     "st_changesets",
     "st_integrations",
     "st_proof_invalidations",
@@ -31,6 +35,10 @@ pub const resource_conflicts_fields = [_][]const u8{ "workspace_id", "candidate_
 pub const session_views_fields = [_][]const u8{ "session_id", "workspace_id", "plan_id", "claim_id", "projection_digest", "selected_ids", "workspace_seq", "plan_seq", "branch_epoch", "state", "evidence_refs" };
 pub const workspace_apertures_fields = [_][]const u8{ "workspace_id", "receipt_id", "allocations", "rejections", "parallel_width", "plans_considered", "fairness_state", "evidence_refs" };
 pub const gcr_v2_fields = [_][]const u8{ "gcr_id", "workspace_id", "plan_id", "session_id", "claim_id", "fencing_token", "workspace_seq", "plan_seq", "branch_epoch", "selected_tasks", "execution_allowed", "denial_reasons", "current_at_mutation", "evidence_refs" };
+pub const graph_control_receipts_fields = [_][]const u8{ "gcr_id", "workspace_id", "plan_id", "session_id", "claim_id", "fencing_token", "workspace_seq", "plan_seq", "branch_epoch", "ready_frontier", "selected_frontier", "unselected_ready", "critical_path", "parallel_width", "proof_cut_kind", "minimum_proof_cut", "execution_allowed", "denial_reasons", "evidence_refs" };
+pub const graph_repair_receipts_fields = [_][]const u8{ "repair_id", "workspace_id", "workspace_seq", "plan_id", "plan_seq", "command", "failure_class", "observed_exit_code", "current_status", "execution_allowed", "blocking_debt", "evidence_refs" };
+pub const artifact_maintenance_receipts_fields = [_][]const u8{ "maintenance_id", "workspace_id", "operation", "governing_workflow", "artifact_paths", "mentioned_workflow_names", "activation_signal", "controller_invocation", "reason", "evidence_refs" };
+pub const workflow_provenance_evidence_fields = [_][]const u8{ "evidence_id", "workflow_name", "evidence_class", "artifact_paths", "activation_signal", "controller_invocation", "governing_workflow", "source_receipt_id", "evidence_refs" };
 pub const changesets_fields = [_][]const u8{ "change_set_id", "workspace_id", "plan_id", "claim_id", "base_head", "branch_epoch", "changed_paths", "uncovered_paths", "proof_refs", "status", "evidence_refs" };
 pub const integrations_fields = [_][]const u8{ "change_set_id", "queue_sequence", "target_branch", "head_before", "head_after", "epoch_before", "epoch_after", "proof", "result", "latency", "evidence_refs" };
 pub const proof_invalidations_fields = [_][]const u8{ "proof_ref", "plan_id", "scope", "epoch_before", "epoch_after", "foreign_change_set", "dependency_cut_intersection", "correctly_invalidated", "evidence_refs" };
@@ -78,6 +86,10 @@ pub const RowSet = struct {
     session_views: std.ArrayList(query.Row) = .empty,
     workspace_apertures: std.ArrayList(query.Row) = .empty,
     gcr_v2: std.ArrayList(query.Row) = .empty,
+    graph_control_receipts: std.ArrayList(query.Row) = .empty,
+    graph_repair_receipts: std.ArrayList(query.Row) = .empty,
+    artifact_maintenance_receipts: std.ArrayList(query.Row) = .empty,
+    workflow_provenance_evidence: std.ArrayList(query.Row) = .empty,
     changesets: std.ArrayList(query.Row) = .empty,
     integrations: std.ArrayList(query.Row) = .empty,
     proof_invalidations: std.ArrayList(query.Row) = .empty,
@@ -99,6 +111,10 @@ pub const RowSet = struct {
         deinitRows(self.allocator, &self.session_views);
         deinitRows(self.allocator, &self.workspace_apertures);
         deinitRows(self.allocator, &self.gcr_v2);
+        deinitRows(self.allocator, &self.graph_control_receipts);
+        deinitRows(self.allocator, &self.graph_repair_receipts);
+        deinitRows(self.allocator, &self.artifact_maintenance_receipts);
+        deinitRows(self.allocator, &self.workflow_provenance_evidence);
         deinitRows(self.allocator, &self.changesets);
         deinitRows(self.allocator, &self.integrations);
         deinitRows(self.allocator, &self.proof_invalidations);
@@ -139,6 +155,10 @@ pub fn fieldsForDataset(name: []const u8) ?[]const []const u8 {
     if (std.mem.eql(u8, name, "st_session_views")) return session_views_fields[0..];
     if (std.mem.eql(u8, name, "st_workspace_apertures")) return workspace_apertures_fields[0..];
     if (std.mem.eql(u8, name, "st_gcr_v2")) return gcr_v2_fields[0..];
+    if (std.mem.eql(u8, name, "st_graph_control_receipts")) return graph_control_receipts_fields[0..];
+    if (std.mem.eql(u8, name, "st_graph_repair_receipts")) return graph_repair_receipts_fields[0..];
+    if (std.mem.eql(u8, name, "st_artifact_maintenance_receipts")) return artifact_maintenance_receipts_fields[0..];
+    if (std.mem.eql(u8, name, "workflow_provenance_evidence")) return workflow_provenance_evidence_fields[0..];
     if (std.mem.eql(u8, name, "st_changesets")) return changesets_fields[0..];
     if (std.mem.eql(u8, name, "st_integrations")) return integrations_fields[0..];
     if (std.mem.eql(u8, name, "st_proof_invalidations")) return proof_invalidations_fields[0..];
@@ -251,6 +271,14 @@ pub fn renderReport(allocator: std.mem.Allocator, rowset: RowSet, opts: Options,
     try writeRowsJson(writer, rowset.workspace_apertures.items, workspace_apertures_fields[0..]);
     try writer.writeAll(",\"gcr\":");
     try writeRowsJson(writer, rowset.gcr_v2.items, gcr_v2_fields[0..]);
+    try writer.writeAll(",\"graph_control_receipts\":");
+    try writeRowsJson(writer, rowset.graph_control_receipts.items, graph_control_receipts_fields[0..]);
+    try writer.writeAll(",\"graph_repair_receipts\":");
+    try writeRowsJson(writer, rowset.graph_repair_receipts.items, graph_repair_receipts_fields[0..]);
+    try writer.writeAll(",\"artifact_maintenance_receipts\":");
+    try writeRowsJson(writer, rowset.artifact_maintenance_receipts.items, artifact_maintenance_receipts_fields[0..]);
+    try writer.writeAll(",\"workflow_provenance_evidence\":");
+    try writeRowsJson(writer, rowset.workflow_provenance_evidence.items, workflow_provenance_evidence_fields[0..]);
     try writer.writeAll(",\"changesets\":");
     try writeRowsJson(writer, rowset.changesets.items, changesets_fields[0..]);
     try writer.writeAll(",\"integration\":");
@@ -276,6 +304,10 @@ fn datasetSlice(rowset: *RowSet, name: []const u8) ?*std.ArrayList(query.Row) {
     if (std.mem.eql(u8, name, "st_session_views")) return &rowset.session_views;
     if (std.mem.eql(u8, name, "st_workspace_apertures")) return &rowset.workspace_apertures;
     if (std.mem.eql(u8, name, "st_gcr_v2")) return &rowset.gcr_v2;
+    if (std.mem.eql(u8, name, "st_graph_control_receipts")) return &rowset.graph_control_receipts;
+    if (std.mem.eql(u8, name, "st_graph_repair_receipts")) return &rowset.graph_repair_receipts;
+    if (std.mem.eql(u8, name, "st_artifact_maintenance_receipts")) return &rowset.artifact_maintenance_receipts;
+    if (std.mem.eql(u8, name, "workflow_provenance_evidence")) return &rowset.workflow_provenance_evidence;
     if (std.mem.eql(u8, name, "st_changesets")) return &rowset.changesets;
     if (std.mem.eql(u8, name, "st_integrations")) return &rowset.integrations;
     if (std.mem.eql(u8, name, "st_proof_invalidations")) return &rowset.proof_invalidations;
@@ -286,7 +318,12 @@ fn datasetSlice(rowset: *RowSet, name: []const u8) ?*std.ArrayList(query.Row) {
 }
 
 fn scanWorkspaceRoot(allocator: std.mem.Allocator, root: []const u8, opts: Options, rows: *RowSet) !void {
-    var root_dir = std.Io.Dir.openDirAbsolute(defaultIo(), root, .{ .iterate = true }) catch |err| switch (err) {
+    const abs_root = if (std.fs.path.isAbsolute(root))
+        try allocator.dupe(u8, root)
+    else
+        try toAbsolutePath(allocator, root);
+    defer allocator.free(abs_root);
+    var root_dir = std.Io.Dir.openDirAbsolute(defaultIo(), abs_root, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => {
             try appendFinding(allocator, rows, "INFO", "workspace_root_unavailable", opts.workspace_id orelse "", opts.plan_id orelse "", opts.session_id orelse "", "workspace root could not be opened", "[]");
             return;
@@ -300,7 +337,7 @@ fn scanWorkspaceRoot(allocator: std.mem.Allocator, root: []const u8, opts: Optio
     while (try walker.next(defaultIo())) |entry| {
         if (entry.kind != .file) continue;
         if (!isArtifactFile(entry.path)) continue;
-        const path = try std.fs.path.join(allocator, &.{ root, entry.path });
+        const path = try std.fs.path.join(allocator, &.{ abs_root, entry.path });
         defer allocator.free(path);
         const content = std.Io.Dir.cwd().readFileAlloc(defaultIo(), path, allocator, .limited(64 * 1024 * 1024)) catch continue;
         defer allocator.free(content);
@@ -342,6 +379,9 @@ fn scanJsonValue(allocator: std.mem.Allocator, value: std.json.Value, path: []co
             if (isSessionViewObject(obj)) try appendSessionViewRow(allocator, rows, obj, evidence);
             if (isApertureObject(obj)) try appendApertureRow(allocator, rows, obj, evidence);
             if (isGcrObject(obj)) try appendGcrRow(allocator, rows, obj, evidence);
+            if (isGraphControlReceiptObject(obj)) try appendGraphControlReceiptRow(allocator, rows, obj, evidence);
+            if (isGraphRepairReceiptObject(obj)) try appendGraphRepairReceiptRow(allocator, rows, obj, evidence);
+            if (isArtifactMaintenanceReceiptObject(obj)) try appendArtifactMaintenanceReceiptRow(allocator, rows, obj, evidence);
             if (isChangeSetObject(obj)) try appendChangeSetRow(allocator, rows, obj, evidence);
             if (isIntegrationObject(obj)) try appendIntegrationRow(allocator, rows, obj, evidence);
             if (isProofInvalidationObject(obj)) try appendProofInvalidationRow(allocator, rows, obj, evidence);
@@ -489,6 +529,87 @@ fn appendGcrRow(allocator: std.mem.Allocator, rows: *RowSet, obj: std.json.Objec
     try putJsonBool(&row, obj, "current_at_mutation", "current_at_mutation");
     try row.putOwnedKey("evidence_refs", .{ .string = evidence });
     try rows.gcr_v2.append(allocator, row);
+}
+
+fn appendGraphControlReceiptRow(allocator: std.mem.Allocator, rows: *RowSet, obj: std.json.ObjectMap, evidence: []const u8) !void {
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    const workspace = jsonObject(obj, "workspace");
+    const plan = jsonObject(obj, "plan");
+    const coordination = jsonObject(obj, "coordination");
+    const claim = jsonObject(obj, "claim");
+    const graph = jsonObject(obj, "graph");
+    const proof = jsonObject(obj, "proof");
+    const session_projection = jsonObject(obj, "session_projection");
+    const branch = jsonObject(obj, "branch");
+    try putJsonStringAny(&row, obj, "gcr_id", &.{ "gcr_id", "receipt_id" });
+    try row.putOwnedKey("workspace_id", .{ .string = if (workspace) |o| jsonString(o, "workspace_id") orelse jsonString(o, "st_root") orelse "" else "" });
+    try row.putOwnedKey("plan_id", .{ .string = if (plan) |o| jsonString(o, "plan_id") orelse "" else "" });
+    try row.putOwnedKey("session_id", .{ .string = if (session_projection) |o| jsonString(o, "session_id") orelse "" else "" });
+    try row.putOwnedKey("claim_id", .{ .string = if (coordination) |o| jsonString(o, "claim_id") orelse "" else if (claim) |o| jsonString(o, "claim_id") orelse "" else "" });
+    try putNestedAny(allocator, &row, coordination orelse claim, "fencing_token", "fencing_token");
+    try putNestedInt(&row, workspace, "workspace_seq", "workspace_sequence");
+    try putNestedInt(&row, plan, "plan_seq", "plan_sequence");
+    try putNestedInt(&row, branch, "branch_epoch", "epoch");
+    try putNestedAny(allocator, &row, graph, "ready_frontier", "ready_frontier");
+    try putNestedAny(allocator, &row, graph, "selected_frontier", "selected_frontier");
+    try putNestedAny(allocator, &row, graph, "unselected_ready", "unselected_ready");
+    try putNestedAny(allocator, &row, graph, "critical_path", "critical_path");
+    try putNestedInt(&row, graph, "parallel_width", "parallel_width");
+    try row.putOwnedKey("proof_cut_kind", .{ .string = if (proof) |o| jsonString(o, "proof_cut_kind") orelse "" else "" });
+    try putNestedAny(allocator, &row, proof, "minimum_proof_cut", "minimum_proof_cut");
+    try putJsonAny(allocator, &row, obj, "execution_allowed", "execution_allowed");
+    try putJsonAny(allocator, &row, obj, "denial_reasons", "denial_reasons");
+    try row.putOwnedKey("evidence_refs", .{ .string = evidence });
+    try rows.graph_control_receipts.append(allocator, row);
+}
+
+fn appendGraphRepairReceiptRow(allocator: std.mem.Allocator, rows: *RowSet, obj: std.json.ObjectMap, evidence: []const u8) !void {
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    const workspace = jsonObject(obj, "workspace");
+    try putJsonString(&row, obj, "repair_id", "repair_id");
+    try row.putOwnedKey("workspace_id", .{ .string = if (workspace) |o| jsonString(o, "workspace_id") orelse "" else "" });
+    try putNestedInt(&row, workspace, "workspace_seq", "workspace_sequence");
+    try putJsonString(&row, obj, "plan_id", "plan_id");
+    try putJsonInt(&row, obj, "plan_seq", "plan_sequence");
+    try putJsonString(&row, obj, "command", "command");
+    try putJsonString(&row, obj, "failure_class", "failure_class");
+    try putJsonInt(&row, obj, "observed_exit_code", "observed_exit_code");
+    try putJsonString(&row, obj, "current_status", "current_status");
+    try putJsonBool(&row, obj, "execution_allowed", "execution_allowed");
+    try putJsonAny(allocator, &row, obj, "blocking_debt", "blocking_debt");
+    try row.putOwnedKey("evidence_refs", .{ .string = evidence });
+    try rows.graph_repair_receipts.append(allocator, row);
+}
+
+fn appendArtifactMaintenanceReceiptRow(allocator: std.mem.Allocator, rows: *RowSet, obj: std.json.ObjectMap, evidence: []const u8) !void {
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    try putJsonString(&row, obj, "maintenance_id", "maintenance_id");
+    try putJsonAny(allocator, &row, obj, "workspace_id", "workspace");
+    try putJsonString(&row, obj, "operation", "operation");
+    try putJsonString(&row, obj, "governing_workflow", "governing_workflow");
+    try putJsonAny(allocator, &row, obj, "artifact_paths", "artifact_paths");
+    try putJsonAny(allocator, &row, obj, "mentioned_workflow_names", "mentioned_workflow_names");
+    try putJsonBool(&row, obj, "activation_signal", "activation_signal");
+    try putJsonBool(&row, obj, "controller_invocation", "controller_invocation");
+    try putJsonString(&row, obj, "reason", "reason");
+    try row.putOwnedKey("evidence_refs", .{ .string = evidence });
+    try rows.artifact_maintenance_receipts.append(allocator, row);
+
+    var provenance = query.Row.init(allocator);
+    errdefer provenance.deinit();
+    try provenance.putOwnedKey("evidence_id", .{ .string = jsonString(obj, "maintenance_id") orelse "" });
+    try provenance.putOwnedKey("workflow_name", .{ .string = firstStringInArray(obj.get("mentioned_workflow_names")) orelse "" });
+    try provenance.putOwnedKey("evidence_class", .{ .string = "artifact_under_repair" });
+    try putJsonAny(allocator, &provenance, obj, "artifact_paths", "artifact_paths");
+    try putJsonBool(&provenance, obj, "activation_signal", "activation_signal");
+    try putJsonBool(&provenance, obj, "controller_invocation", "controller_invocation");
+    try putJsonString(&provenance, obj, "governing_workflow", "governing_workflow");
+    try provenance.putOwnedKey("source_receipt_id", .{ .string = jsonString(obj, "maintenance_id") orelse "" });
+    try provenance.putOwnedKey("evidence_refs", .{ .string = evidence });
+    try rows.workflow_provenance_evidence.append(allocator, provenance);
 }
 
 fn appendChangeSetRow(allocator: std.mem.Allocator, rows: *RowSet, obj: std.json.ObjectMap, evidence: []const u8) !void {
@@ -696,6 +817,27 @@ fn isGcrObject(obj: std.json.ObjectMap) bool {
     return obj.get("gcr_id") != null or (obj.get("execution_allowed") != null and obj.get("selected_tasks") != null);
 }
 
+fn isGraphControlReceiptObject(obj: std.json.ObjectMap) bool {
+    if (jsonString(obj, "receipt_version")) |version| {
+        return std.mem.eql(u8, version, "GCR-v2");
+    }
+    return obj.get("gcr_id") != null and obj.get("graph") != null and obj.get("proof") != null;
+}
+
+fn isGraphRepairReceiptObject(obj: std.json.ObjectMap) bool {
+    if (jsonString(obj, "receipt_version")) |version| {
+        return std.mem.eql(u8, version, "GRR-v1");
+    }
+    return obj.get("repair_id") != null and obj.get("failure_class") != null;
+}
+
+fn isArtifactMaintenanceReceiptObject(obj: std.json.ObjectMap) bool {
+    if (jsonString(obj, "receipt_version")) |version| {
+        return std.mem.eql(u8, version, "AMR-v1");
+    }
+    return obj.get("maintenance_id") != null and obj.get("artifact_paths") != null and obj.get("governing_workflow") != null;
+}
+
 fn isChangeSetObject(obj: std.json.ObjectMap) bool {
     return obj.get("change_set_id") != null and (obj.get("changed_paths") != null or obj.get("base_head") != null);
 }
@@ -787,6 +929,38 @@ fn putJsonAny(allocator: std.mem.Allocator, row: *query.Row, obj: std.json.Objec
     const text = try jsonAnyString(allocator, obj.get(json_key));
     defer allocator.free(text);
     if (text.len == 0) try row.putOwnedKey(out_key, .null) else try row.putOwnedKey(out_key, .{ .string = text });
+}
+
+fn putNestedAny(allocator: std.mem.Allocator, row: *query.Row, obj_opt: ?std.json.ObjectMap, out_key: []const u8, json_key: []const u8) !void {
+    if (obj_opt) |obj| {
+        try putJsonAny(allocator, row, obj, out_key, json_key);
+    } else {
+        try row.putOwnedKey(out_key, .null);
+    }
+}
+
+fn putNestedInt(row: *query.Row, obj_opt: ?std.json.ObjectMap, out_key: []const u8, json_key: []const u8) !void {
+    if (obj_opt) |obj| {
+        try putJsonInt(row, obj, out_key, json_key);
+    } else {
+        try row.putOwnedKey(out_key, .null);
+    }
+}
+
+fn jsonObject(obj: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .object => |child| child,
+        else => null,
+    };
+}
+
+fn firstStringInArray(value_opt: ?std.json.Value) ?[]const u8 {
+    const value = value_opt orelse return null;
+    return switch (value) {
+        .array => |arr| if (arr.items.len > 0 and arr.items[0] == .string) arr.items[0].string else null,
+        else => null,
+    };
 }
 
 fn jsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -940,4 +1114,11 @@ fn scalarString(value: spec.Scalar) ?[]const u8 {
 
 fn defaultIo() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn toAbsolutePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
+    const cwd = try std.process.currentPathAlloc(defaultIo(), allocator);
+    defer allocator.free(cwd);
+    return std.fs.path.join(allocator, &.{ cwd, path });
 }

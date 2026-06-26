@@ -353,6 +353,26 @@ pub const dataset_meta = [_]DatasetMeta{
         .fields = st_workspace_audit.gcr_v2_fields[0..],
     },
     .{
+        .name = "st_graph_control_receipts",
+        .description = "STWA-v1 graph-intelligence GCR-v2 receipt rows",
+        .fields = st_workspace_audit.graph_control_receipts_fields[0..],
+    },
+    .{
+        .name = "st_graph_repair_receipts",
+        .description = "STWA-v1 GRR-v1 graph repair receipt rows",
+        .fields = st_workspace_audit.graph_repair_receipts_fields[0..],
+    },
+    .{
+        .name = "st_artifact_maintenance_receipts",
+        .description = "STWA-v1 AMR-v1 artifact maintenance receipt rows",
+        .fields = st_workspace_audit.artifact_maintenance_receipts_fields[0..],
+    },
+    .{
+        .name = "workflow_provenance_evidence",
+        .description = "Workflow provenance evidence rows, including artifact-under-repair AMR classifications",
+        .fields = st_workspace_audit.workflow_provenance_evidence_fields[0..],
+    },
+    .{
         .name = "st_changesets",
         .description = "STWA-v1 change-set claim coverage and proof reference rows",
         .fields = st_workspace_audit.changesets_fields[0..],
@@ -1152,7 +1172,7 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\  --format markdown          Only valid with --mode report
         ,
         .st_workspace_audit =>
-        \\usage: seq st-workspace-audit [--root <path>] [--repo <path>] [--workspace-root <path>] [--workspace-id <id>] [--plan <plan-id>] [--session-id <id>] [--since <iso>] [--until <iso>] [--last <duration>] [--exclude-current] [--mode summary|workspaces|plans|claims|sessions|apertures|gcr|changesets|proof|integration|evidence|report] [--strict] [--format table|json|jsonl|csv|markdown]
+        \\usage: seq st-workspace-audit [--root <path>] [--repo <path>] [--workspace-root <path>] [--workspace-id <id>] [--plan <plan-id>] [--session-id <id>] [--since <iso>] [--until <iso>] [--last <duration>] [--exclude-current] [--mode summary|workspaces|plans|claims|sessions|apertures|gcr|graph-control|graph-repair|artifact-maintenance|workflow-provenance|changesets|proof|integration|evidence|report] [--strict] [--format table|json|jsonl|csv|markdown]
         \\extra options:
         \\  --workspace-root <path>     .ledger/st artifact root; controller artifacts are primary evidence
         \\  --strict                   Exit 2 for P0/P1 findings or artifact inconsistency
@@ -2147,6 +2167,10 @@ fn isValidStWorkspaceAuditMode(text: []const u8) bool {
         std.mem.eql(u8, text, "sessions") or
         std.mem.eql(u8, text, "apertures") or
         std.mem.eql(u8, text, "gcr") or
+        std.mem.eql(u8, text, "graph-control") or
+        std.mem.eql(u8, text, "graph-repair") or
+        std.mem.eql(u8, text, "artifact-maintenance") or
+        std.mem.eql(u8, text, "workflow-provenance") or
         std.mem.eql(u8, text, "changesets") or
         std.mem.eql(u8, text, "proof") or
         std.mem.eql(u8, text, "integration") or
@@ -3439,6 +3463,10 @@ fn stWorkspaceDatasetForMode(mode: []const u8) []const u8 {
     if (std.mem.eql(u8, mode, "sessions")) return "st_session_views";
     if (std.mem.eql(u8, mode, "apertures")) return "st_workspace_apertures";
     if (std.mem.eql(u8, mode, "gcr")) return "st_gcr_v2";
+    if (std.mem.eql(u8, mode, "graph-control")) return "st_graph_control_receipts";
+    if (std.mem.eql(u8, mode, "graph-repair")) return "st_graph_repair_receipts";
+    if (std.mem.eql(u8, mode, "artifact-maintenance")) return "st_artifact_maintenance_receipts";
+    if (std.mem.eql(u8, mode, "workflow-provenance")) return "workflow_provenance_evidence";
     if (std.mem.eql(u8, mode, "changesets")) return "st_changesets";
     if (std.mem.eql(u8, mode, "proof")) return "st_proof_invalidations";
     if (std.mem.eql(u8, mode, "integration")) return "st_integrations";
@@ -3460,6 +3488,10 @@ fn stWorkspaceDatasetRows(rowset: *st_workspace_audit.RowSet, name: []const u8) 
     if (std.mem.eql(u8, name, "st_session_views")) return &rowset.session_views;
     if (std.mem.eql(u8, name, "st_workspace_apertures")) return &rowset.workspace_apertures;
     if (std.mem.eql(u8, name, "st_gcr_v2")) return &rowset.gcr_v2;
+    if (std.mem.eql(u8, name, "st_graph_control_receipts")) return &rowset.graph_control_receipts;
+    if (std.mem.eql(u8, name, "st_graph_repair_receipts")) return &rowset.graph_repair_receipts;
+    if (std.mem.eql(u8, name, "st_artifact_maintenance_receipts")) return &rowset.artifact_maintenance_receipts;
+    if (std.mem.eql(u8, name, "workflow_provenance_evidence")) return &rowset.workflow_provenance_evidence;
     if (std.mem.eql(u8, name, "st_changesets")) return &rowset.changesets;
     if (std.mem.eql(u8, name, "st_integrations")) return &rowset.integrations;
     if (std.mem.eql(u8, name, "st_proof_invalidations")) return &rowset.proof_invalidations;
@@ -23786,6 +23818,9 @@ test "st-workspace-audit reconstructs workspace fixtures and avoids legacy menti
         "{\"workspace_id\":\"ws-1\",\"session_id\":\"agent-a\",\"plan_id\":\"plan-a\",\"claim_id\":\"claim-a\",\"projection_digest\":\"sha256:view-a\",\"selected_ids\":[\"plan-a:a1\"],\"workspace_seq\":2,\"plan_seq\":1,\"branch_epoch\":1,\"state\":\"current\"}\n" ++
         "{\"workspace_id\":\"ws-1\",\"receipt_id\":\"ap-1\",\"allocations\":[\"plan-a\"],\"rejections\":[\"plan-b\"],\"parallel_width\":2,\"plans_considered\":[\"plan-a\",\"plan-b\"],\"fairness_state\":{\"round\":1}}\n" ++
         "{\"receipt_version\":\"GCR-v2\",\"gcr_id\":\"gcr-1\",\"workspace_id\":\"ws-1\",\"plan_id\":\"plan-a\",\"session_id\":\"agent-a\",\"claim_id\":\"claim-a\",\"fencing_token\":\"tok-a\",\"workspace_seq\":2,\"plan_seq\":1,\"branch_epoch\":1,\"selected_tasks\":[\"plan-a:a1\"],\"execution_allowed\":true,\"denial_reasons\":[],\"current_at_mutation\":true}\n" ++
+        "{\"graph_control_receipt\":{\"receipt_version\":\"GCR-v2\",\"gcr_id\":\"gcr-graph-1\",\"workspace\":{\"workspace_id\":\"ws-1\",\"workspace_sequence\":2},\"plan\":{\"plan_id\":\"plan-a\",\"plan_sequence\":1},\"branch\":{\"epoch\":1},\"claim\":{\"claim_id\":\"claim-a\",\"fencing_token\":\"tok-a\"},\"graph\":{\"ready_frontier\":[\"a1\",\"a2\"],\"selected_frontier\":[\"a1\"],\"unselected_ready\":[\"a2\"],\"critical_path\":[\"a1\"],\"parallel_width\":2},\"proof\":{\"proof_cut_kind\":\"approximation\",\"minimum_proof_cut\":[\"proof-a1\"]},\"session_projection\":{\"session_id\":\"agent-a\"},\"execution_allowed\":\"yes\",\"denial_reasons\":[]}}\n" ++
+        "{\"graph_repair_receipt\":{\"receipt_version\":\"GRR-v1\",\"repair_id\":\"grr-1\",\"workspace\":{\"workspace_id\":\"ws-1\",\"workspace_sequence\":2},\"plan_id\":\"plan-a\",\"plan_sequence\":1,\"command\":\"st graph repair\",\"failure_class\":\"graph_audit_failure\",\"observed_exit_code\":2,\"blocking_debt\":[],\"current_status\":\"blocked\",\"execution_allowed\":false}}\n" ++
+        "{\"st_artifact_maintenance_receipt\":{\"receipt_version\":\"AMR-v1\",\"maintenance_id\":\"amr-1\",\"workspace\":\"ws-1\",\"operation\":\"delete_sidecar\",\"governing_workflow\":\"st\",\"artifact_paths\":[\".step/resolve-c3-st-plan.jsonl\"],\"mentioned_workflow_names\":[\"resolve-c3\"],\"activation_signal\":false,\"controller_invocation\":false,\"reason\":\"duplicate sidecar durable state\",\"evidence_refs\":[]}}\n" ++
         "{\"workspace_id\":\"ws-1\",\"change_set_id\":\"cs-1\",\"plan_id\":\"plan-a\",\"claim_id\":\"claim-a\",\"base_head\":\"abc\",\"branch_epoch\":1,\"changed_paths\":[\"apps/seq/src/lib.zig\"],\"uncovered_paths\":[],\"proof_refs\":[\"proof-1\"],\"status\":\"queued\"}\n" ++
         "{\"change_set_id\":\"cs-1\",\"queue_sequence\":1,\"target_branch\":\"main\",\"head_before\":\"abc\",\"head_after\":\"def\",\"epoch_before\":1,\"epoch_after\":2,\"proof\":{\"receipt\":\"proof-1\"},\"result\":\"accepted\",\"latency\":\"2s\"}\n" ++
         "{\"proof_ref\":\"proof-1\",\"plan_id\":\"plan-a\",\"scope\":\"focused\",\"epoch_before\":1,\"epoch_after\":2,\"foreign_change_set\":\"cs-foreign\",\"dependency_cut_intersection\":true,\"correctly_invalidated\":true}\n" ++
@@ -23830,6 +23865,35 @@ test "st-workspace-audit reconstructs workspace fixtures and avoids legacy menti
     defer std.testing.allocator.free(gcr);
     try std.testing.expect(std.mem.indexOf(u8, gcr, "\"gcr_id\": \"gcr-1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, gcr, "\"execution_allowed\": true") != null);
+
+    const graph_control = try runCommandWithOutput(std.testing.allocator, .st_workspace_audit, &.{
+        "--workspace-root", workspace_root,
+        "--mode",           "graph-control",
+        "--format",         "json",
+    }, output_path);
+    defer std.testing.allocator.free(graph_control);
+    try std.testing.expect(std.mem.indexOf(u8, graph_control, "\"gcr_id\": \"gcr-graph-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph_control, "\"unselected_ready\": \"[\\\"a2\\\"]\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph_control, "\"proof_cut_kind\": \"approximation\"") != null);
+
+    const graph_repair = try runCommandWithOutput(std.testing.allocator, .st_workspace_audit, &.{
+        "--workspace-root", workspace_root,
+        "--mode",           "graph-repair",
+        "--format",         "json",
+    }, output_path);
+    defer std.testing.allocator.free(graph_repair);
+    try std.testing.expect(std.mem.indexOf(u8, graph_repair, "\"repair_id\": \"grr-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph_repair, "\"failure_class\": \"graph_audit_failure\"") != null);
+
+    const workflow_provenance = try runCommandWithOutput(std.testing.allocator, .st_workspace_audit, &.{
+        "--workspace-root", workspace_root,
+        "--mode",           "workflow-provenance",
+        "--format",         "json",
+    }, output_path);
+    defer std.testing.allocator.free(workflow_provenance);
+    try std.testing.expect(std.mem.indexOf(u8, workflow_provenance, "\"workflow_name\": \"resolve-c3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, workflow_provenance, "\"evidence_class\": \"artifact_under_repair\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, workflow_provenance, "\"activation_signal\": false") != null);
 
     const query_spec_template =
         \\{"dataset":"st_resource_conflicts","params":{"workspace_root":"WORKSPACE_ROOT"},"select":["workspace_id","candidate_claim","other_claim","decision"],"format":"json"}
@@ -25518,7 +25582,7 @@ test "capabilities advertises resolve intent closed audit flags" {
     }, output_path);
     defer std.testing.allocator.free(got);
 
-    try std.testing.expect(std.mem.indexOf(u8, got, "\"version\": \"0.3.14\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"version\": \"0.3.15\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_acceptance_contract_v2\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_review_batch_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_review_aperture_v1\": true") != null);

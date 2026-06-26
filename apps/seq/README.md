@@ -281,7 +281,7 @@ Execution-policy query datasets:
 
 `st-workspace-audit` compiles STWA-v1 ledgers for `.ledger/st/` multi-plan workspace artifacts:
 - reads controller/workspace/plan artifacts under `--workspace-root` as primary evidence
-- reconstructs workspace and plan lifecycles, held claims, fencing tokens, session projections, aperture allocations, GCR-v2 receipts, change sets, integrations, proof invalidations, and normalized controller decisions
+- reconstructs workspace and plan lifecycles, held claims, fencing tokens, session projections, aperture allocations, GCR-v2 receipts, graph-intelligence GCR-v2 rows, GRR-v1 graph repair receipts, AMR-v1 artifact maintenance receipts, change sets, integrations, proof invalidations, and normalized controller decisions
 - synthesizes resource-conflict findings from overlapping held claims; different `plan_id` values do not make resources nonconflicting
 - scans session JSONL under `--root` only for actual `.step/` or `.retrace/` write attempts; migration reads and filename mentions are not counted as legacy writes
 - `--strict` exits 2 when P0/P1 findings or artifact inconsistency are present
@@ -290,7 +290,10 @@ Examples:
 ```bash
 seq st-workspace-audit --workspace-root /path/to/repo/.ledger/st --mode summary --format table
 seq st-workspace-audit --root ~/.codex/sessions --repo /path/to/repo --workspace-root /path/to/repo/.ledger/st --mode report --format markdown
+seq st-workspace-audit --workspace-root /path/to/repo/.ledger/st --mode graph-control --format json
+seq st-workspace-audit --workspace-root /path/to/repo/.ledger/st --mode workflow-provenance --format json
 seq query --root ~/.codex/sessions --spec '{"dataset":"st_gcr_v2","params":{"workspace_root":"/path/to/repo/.ledger/st"},"select":["gcr_id","workspace_id","plan_id","execution_allowed","current_at_mutation"],"format":"table"}'
+seq query --root ~/.codex/sessions --spec '{"dataset":"st_artifact_maintenance_receipts","params":{"workspace_root":"/path/to/repo/.ledger/st"},"select":["maintenance_id","artifact_paths","activation_signal","controller_invocation"],"format":"table"}'
 seq query --root ~/.codex/sessions --spec '{"dataset":"historical_decisions","params":{"workspace_root":"/path/to/repo/.ledger/st"},"select":["decision_id","source_kind","selected_route"],"format":"table"}'
 ```
 
@@ -303,6 +306,10 @@ ST workspace query datasets:
 - `st_session_views`
 - `st_workspace_apertures`
 - `st_gcr_v2`
+- `st_graph_control_receipts`
+- `st_graph_repair_receipts`
+- `st_artifact_maintenance_receipts`
+- `workflow_provenance_evidence`
 - `st_changesets`
 - `st_integrations`
 - `st_proof_invalidations`
