@@ -5285,6 +5285,52 @@ fn gitTrimmedAlloc(allocator: std.mem.Allocator, cwd: []const u8, args: []const 
     return allocator.dupe(u8, trimmed);
 }
 
+fn workspaceGitRepoRootAlloc(allocator: std.mem.Allocator, workspace_root: []const u8) ![]u8 {
+    return gitTrimmedAlloc(allocator, workspace_root, &.{ "rev-parse", "--show-toplevel" });
+}
+
+fn workspaceHeadAlloc(allocator: std.mem.Allocator, workspace_root: []const u8) ![]u8 {
+    const repo_root = workspaceGitRepoRootAlloc(allocator, workspace_root) catch {
+        return allocator.dupe(u8, "unknown");
+    };
+    defer allocator.free(repo_root);
+    return gitTrimmedAlloc(allocator, repo_root, &.{ "rev-parse", "HEAD" }) catch
+        allocator.dupe(u8, "unknown");
+}
+
+fn workspaceTargetBranchAlloc(allocator: std.mem.Allocator, workspace_root: []const u8, workspace_value: std.json.Value) ![]u8 {
+    if (stringField(workspace_value, "target_branch")) |branch| {
+        if (branch.len > 0) return allocator.dupe(u8, branch);
+    }
+    const repo_root = workspaceGitRepoRootAlloc(allocator, workspace_root) catch {
+        return allocator.dupe(u8, "detached");
+    };
+    defer allocator.free(repo_root);
+    return gitTrimmedAlloc(allocator, repo_root, &.{ "branch", "--show-current" }) catch
+        allocator.dupe(u8, "detached");
+}
+
+fn workspaceWorkingTreeFingerprintAlloc(allocator: std.mem.Allocator, workspace_root: []const u8) ![]const u8 {
+    const repo_root = workspaceGitRepoRootAlloc(allocator, workspace_root) catch {
+        return hashTextSha256Alloc(allocator, workspace_root);
+    };
+    defer allocator.free(repo_root);
+    const head_owned = gitTrimmedAlloc(allocator, repo_root, &.{ "rev-parse", "HEAD" }) catch null;
+    defer if (head_owned) |head| allocator.free(head);
+    const status_owned = gitCapture(allocator, repo_root, &.{ "status", "--porcelain=v1", "--untracked-files=no" }) catch null;
+    defer if (status_owned) |status| allocator.free(status);
+    const head = head_owned orelse "unknown";
+    const status = status_owned orelse "";
+    var payload: std.Io.Writer.Allocating = .init(allocator);
+    defer payload.deinit();
+    try payload.writer.writeAll(head);
+    try payload.writer.writeByte('\n');
+    try payload.writer.writeAll(status);
+    const bytes = try payload.toOwnedSlice();
+    defer allocator.free(bytes);
+    return hashTextSha256Alloc(allocator, bytes);
+}
+
 fn absolutePathForPossiblyMissingAlloc(allocator: std.mem.Allocator, raw_path: []const u8) ![]u8 {
     const trimmed = try requireNonEmptyString(allocator, raw_path, "path");
     defer allocator.free(trimmed);
@@ -7710,6 +7756,68 @@ fn writeWorkspaceResourcesArray(writer: anytype, resources: []const WorkspaceRes
     for (resources, 0..) |resource, idx| {
         if (idx != 0) try writer.writeByte(',');
         try writeWorkspaceResourceObject(writer, resource);
+    }
+    try writer.writeByte(']');
+}
+
+fn writeWorkspaceResourceRootString(writer: anytype, resource: WorkspaceResource) !void {
+    switch (resource.kind) {
+        .path => {
+            try writer.writeAll("\"path:");
+            try writer.writeAll(resource.primary);
+            try writer.writeByte('"');
+        },
+        .symbol => {
+            try writer.writeAll("\"symbol:");
+            try writer.writeAll(resource.primary);
+            try writer.writeByte('#');
+            try writer.writeAll(resource.secondary);
+            try writer.writeByte('"');
+        },
+        .generated => {
+            try writer.writeAll("\"generated:");
+            try writer.writeAll(resource.primary);
+            try writer.writeByte('"');
+        },
+        .schema => {
+            try writer.writeAll("\"schema:");
+            try writer.writeAll(resource.primary);
+            try writer.writeByte('"');
+        },
+        .service => {
+            try writer.writeAll("\"service:");
+            try writer.writeAll(resource.primary);
+            try writer.writeByte('"');
+        },
+        .git_index => try writer.writeAll("\"git:index\""),
+        .git_branch => {
+            try writer.writeAll("\"git:branch:");
+            try writer.writeAll(resource.primary);
+            try writer.writeByte('"');
+        },
+        .repo_all => try writer.writeAll("\"repo:all\""),
+    }
+}
+
+fn writeWorkspaceCoordinationResourceObject(writer: anytype, resource: WorkspaceResource) !void {
+    try writer.writeByte('{');
+    try writer.writeAll("\"root\":");
+    try writeWorkspaceResourceRootString(writer, resource);
+    try writer.writeAll(",\"mode\":");
+    try std.json.Stringify.value(workspaceResourceModeString(resource.mode), .{}, writer);
+    try writer.writeByte('}');
+}
+
+fn writeWorkspaceCoordinationResourcesArray(writer: anytype, resources_value: ?std.json.Value) !void {
+    try writer.writeByte('[');
+    if (resources_value) |resources| {
+        if (resources == .array) {
+            for (resources.array.items, 0..) |entry, idx| {
+                if (idx != 0) try writer.writeByte(',');
+                const resource = try workspaceResourceFromJson(entry);
+                try writeWorkspaceCoordinationResourceObject(writer, resource);
+            }
+        }
     }
     try writer.writeByte(']');
 }
@@ -10785,7 +10893,8 @@ fn cmdCompileAperture(allocator: std.mem.Allocator, args: Args) !u8 {
     const now = try nowUtcAlloc(allocator);
     state.graph.debt = try computeGraphDebtAlloc(allocator, &state, now);
 
-    const seq_after = if (args.preview) parsed.latest_seq else parsed.latest_seq + 1;
+    const workspace_gcr_mode = args.workspace_explicit;
+    const seq_after = if (args.preview or workspace_gcr_mode) parsed.latest_seq else parsed.latest_seq + 1;
     const fps = try computeGraphFingerprints(allocator, &state);
     state.graph.fingerprints = fps;
     const audit = try auditGraph(allocator, &state, .execution_ready);
@@ -10805,7 +10914,7 @@ fn cmdCompileAperture(allocator: std.mem.Allocator, args: Args) !u8 {
         return 2;
     }
 
-    if (!args.preview) {
+    if (!args.preview and !workspace_gcr_mode) {
         const meta = buildMutationMeta(allocator, args.allow_multiple_in_progress);
         const ts = try nowUtcAlloc(allocator);
         try writeCanonicalRecords(args.file, &state, seq_after, ts, meta, null);
@@ -13068,6 +13177,9 @@ fn writeWorkspaceGraphControlReceiptJson(
     var projection_digest: []const u8 = "";
     var projection_digest_owned: ?[]u8 = null;
     defer if (projection_digest_owned) |owned| allocator.free(owned);
+    var coordination_executor: []const u8 = args.executor orelse "";
+    var coordination_executor_owned: ?[]u8 = null;
+    defer if (coordination_executor_owned) |owned| allocator.free(owned);
     if (session_id.len == 0) {
         try denials.append(allocator, "session_unbound");
     } else {
@@ -13087,6 +13199,10 @@ fn writeWorkspaceGraphControlReceiptJson(
             if (stringField(parsed_view.value, "projection_digest")) |digest| {
                 projection_digest_owned = try allocator.dupe(u8, digest);
                 projection_digest = projection_digest_owned.?;
+            }
+            if (stringField(parsed_view.value, "executor")) |executor| {
+                coordination_executor_owned = try allocator.dupe(u8, executor);
+                coordination_executor = coordination_executor_owned.?;
             }
             if (!std.mem.eql(u8, stringField(parsed_view.value, "plan_id") orelse "", plan_id_owned)) try denials.append(allocator, "session_plan_mismatch");
             if (!std.mem.eql(u8, stringField(parsed_view.value, "claim_id") orelse "", claim_id)) try denials.append(allocator, "view_stale");
@@ -13111,6 +13227,11 @@ fn writeWorkspaceGraphControlReceiptJson(
         if (!containsString(ready_ids, id)) try denials.append(allocator, "selected_not_ready");
     }
     if (!roots_ready_partition_ok) try denials.append(allocator, "ready_frontier_partition_invalid");
+    if (coordination_executor.len == 0) {
+        if (claim_value) |claim| {
+            if (stringField(claim, "executor")) |executor| coordination_executor = executor;
+        }
+    }
     const graph_debt = try computeGraphDebtAlloc(allocator, state, try nowUtcAlloc(allocator));
 
     var graph_index = try buildGraphIndex(allocator, state);
@@ -13148,6 +13269,14 @@ fn writeWorkspaceGraphControlReceiptJson(
     const execution_allowed = denials.items.len == 0;
     const receipt_id = try std.fmt.allocPrint(allocator, "GCR2-{d}-{s}", .{ seq, fps.structure["sha256:".len..@min(fps.structure.len, "sha256:".len + 8)] });
     defer allocator.free(receipt_id);
+    const workspace_id = stringField(workspace.parsed.value, "st_root") orelse args.workspace;
+    const workspace_head = try workspaceHeadAlloc(allocator, args.workspace);
+    defer allocator.free(workspace_head);
+    const workspace_target_branch = try workspaceTargetBranchAlloc(allocator, args.workspace, workspace.parsed.value);
+    defer allocator.free(workspace_target_branch);
+    const working_tree_fingerprint = try workspaceWorkingTreeFingerprintAlloc(allocator, args.workspace);
+    defer allocator.free(working_tree_fingerprint);
+
     try writer.writeAll("{\"graph_control_receipt\":{\"receipt_version\":\"GCR-v2\",\"receipt_id\":");
     try std.json.Stringify.value(receipt_id, .{}, writer);
     try writer.writeAll(",\"gcr_id\":");
@@ -13156,8 +13285,18 @@ fn writeWorkspaceGraphControlReceiptJson(
     try std.json.Stringify.value(gcr_v1_id, .{}, writer);
     try writer.writeAll(",\"workspace\":{\"workspace_sequence\":");
     try writer.print("{d}", .{workspace_sequence});
+    try writer.writeAll(",\"workspace_id\":");
+    try std.json.Stringify.value(workspace_id, .{}, writer);
+    try writer.writeAll(",\"target_branch\":");
+    try std.json.Stringify.value(workspace_target_branch, .{}, writer);
+    try writer.writeAll(",\"branch_epoch\":");
+    try writer.print("{d}", .{branch_epoch});
+    try writer.writeAll(",\"head\":");
+    try std.json.Stringify.value(workspace_head, .{}, writer);
+    try writer.writeAll(",\"working_tree_fingerprint\":");
+    try std.json.Stringify.value(working_tree_fingerprint, .{}, writer);
     try writer.writeAll(",\"st_root\":");
-    try std.json.Stringify.value(stringField(workspace.parsed.value, "st_root") orelse args.workspace, .{}, writer);
+    try std.json.Stringify.value(workspace_id, .{}, writer);
     try writer.writeAll("},\"plan\":{\"plan_id\":");
     try std.json.Stringify.value(plan_id_owned, .{}, writer);
     try writer.writeAll(",\"plan_sequence\":");
@@ -13170,8 +13309,35 @@ fn writeWorkspaceGraphControlReceiptJson(
     } else {
         try writer.writeAll("{}");
     }
+    try writer.writeAll(",\"selected_task_ids\":");
+    try writeStringListArray(writer, selected_ids);
     try writer.writeAll(",\"selected_item_ids\":");
     try writeStringListArray(writer, selected_ids);
+    try writer.writeAll("},\"coordination\":{\"claim_id\":");
+    try std.json.Stringify.value(claim_id, .{}, writer);
+    try writer.writeAll(",\"session_id\":");
+    try std.json.Stringify.value(session_id, .{}, writer);
+    try writer.writeAll(",\"executor\":");
+    try std.json.Stringify.value(coordination_executor, .{}, writer);
+    try writer.writeAll(",\"fencing_token\":");
+    try writer.print("{d}", .{token});
+    try writer.writeAll(",\"workspace_sequence\":");
+    try writer.print("{d}", .{workspace_sequence});
+    try writer.writeAll(",\"plan_sequence\":");
+    try writer.print("{d}", .{plan_sequence});
+    try writer.writeAll(",\"branch_epoch\":");
+    try writer.print("{d}", .{branch_epoch});
+    try writer.writeAll(",\"resources\":");
+    if (claim_value) |claim| {
+        try writeWorkspaceCoordinationResourcesArray(writer, claim.object.get("resources"));
+    } else {
+        try writer.writeAll("[]");
+    }
+    try writer.writeAll(",\"conflicting_claims\":[]");
+    try writer.writeAll(",\"lease_current\":");
+    try writer.writeAll(if (claim_value != null and !containsString(denials.items, "claim_expired")) "true" else "false");
+    try writer.writeAll(",\"fencing_current\":");
+    try writer.writeAll(if (claim_value != null and !containsString(denials.items, "fencing_token_stale")) "true" else "false");
     try writer.writeAll("},\"branch\":{\"epoch\":");
     try writer.print("{d}", .{branch_epoch});
     try writer.writeAll(",\"target_branch\":");
@@ -13219,7 +13385,11 @@ fn writeWorkspaceGraphControlReceiptJson(
     try writer.writeAll("},\"proof\":{\"obligations\":");
     try writeStringListArray(writer, proof_summary.missing);
     try writer.writeAll(",\"missing\":");
-    try writeStringListArray(writer, proof_summary.missing);
+    if (proof_basis.actions.len == 0 and proof_summary.total > 0) {
+        try writeStringListArray(writer, proof_summary.missing);
+    } else {
+        try writer.writeAll("[]");
+    }
     try writer.writeAll(",\"minimum_proof_cut\":[");
     for (proof_basis.actions, 0..) |action, idx| {
         if (idx > 0) try writer.writeByte(',');
@@ -13227,9 +13397,13 @@ fn writeWorkspaceGraphControlReceiptJson(
     }
     try writer.writeAll("],\"proof_cut_kind\":");
     try std.json.Stringify.value(proof_cut_kind, .{}, writer);
+    try writer.writeAll(",\"approximation_basis\":");
+    try std.json.Stringify.value(if (std.mem.eql(u8, proof_cut_kind, "approximation")) "direct-command-dedup" else "", .{}, writer);
     try writer.writeAll(",\"approximation_reason\":");
     try std.json.Stringify.value(if (std.mem.eql(u8, proof_cut_kind, "approximation")) "direct-command-dedup basis over selected proof obligations; invalidated by obligation, command, branch epoch, resource, or graph-fingerprint changes" else "", .{}, writer);
-    try writer.writeAll("},\"aperture_decision\":{\"selected_nodes\":[");
+    try writer.writeAll("},\"aperture_decision\":{\"selected_nodes\":");
+    try writeStringListArray(writer, selected_ids);
+    try writer.writeAll(",\"selected_node_details\":[");
     for (selected_ids, 0..) |id, idx| {
         if (idx > 0) try writer.writeByte(',');
         try writer.writeAll("{\"node_id\":");
@@ -13261,6 +13435,14 @@ fn writeWorkspaceGraphControlReceiptJson(
         emitted_unselected += 1;
     }
     try writer.writeAll("],\"fairness_state\":\"deterministic-local\",\"scheduler_version\":\"aperture-score-v1\"},\"session_projection\":{\"view_id\":");
+    try std.json.Stringify.value(projection_digest, .{}, writer);
+    try writer.writeAll(",\"session_id\":");
+    try std.json.Stringify.value(session_id, .{}, writer);
+    try writer.writeAll(",\"selected_task_ids\":");
+    try writeStringListArray(writer, selected_ids);
+    try writer.writeAll(",\"projection_digest\":");
+    try std.json.Stringify.value(projection_digest, .{}, writer);
+    try writer.writeAll("},\"projection\":{\"view_id\":");
     try std.json.Stringify.value(projection_digest, .{}, writer);
     try writer.writeAll(",\"session_id\":");
     try std.json.Stringify.value(session_id, .{}, writer);
@@ -20274,15 +20456,35 @@ test "GCR-v2 binds workspace claim, session view, and registry graph fingerprint
     const allowed_json = try allowed_writer.toOwnedSlice();
     try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"receipt_version\":\"GCR-v2\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"execution_allowed\":\"yes\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"workspace_id\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"target_branch\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"branch_epoch\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"head\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"working_tree_fingerprint\":\"sha256:") != null);
     try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"graph_fingerprints\":{\"structure\":\"sha256:") != null);
     try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"registry_graph_fingerprints\":{}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"selected_task_ids\":[\"st-001\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"coordination\":{\"claim_id\":\"claim-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"session_id\":\"s1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"executor\":\"teams\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"fencing_token\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"workspace_sequence\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"plan_sequence\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"resources\":[{\"root\":\"path:apps/st/scripts/st.zig\",\"mode\":\"write\"}]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"conflicting_claims\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"lease_current\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"fencing_current\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"ready_frontier\":[\"st-001\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"selected_frontier\":[\"st-001\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"unselected_ready\":[]") != null);
     try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"critical_path\":[\"st-001\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"parallel_width\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"proof_cut_kind\":\"approximation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"approximation_basis\":\"direct-command-dedup\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"minimum_proof_cut\":[\"proof-action-direct-st-001-proof-001\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"selected_nodes\":[\"st-001\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"projection\":{\"view_id\":\"sha256:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"session_id\":\"s1\",\"selected_task_ids\":[\"st-001\"],\"projection_digest\":\"sha256:") != null);
     try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"denial_reasons\":[]") != null);
 
     const workspace_file = try std.fs.path.join(allocator, &.{ workspace_path, "workspace.jsonl" });
