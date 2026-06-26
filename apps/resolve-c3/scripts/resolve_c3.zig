@@ -104,6 +104,9 @@ const HelpText =
     \\  resolve-c3 delivery apply|commit|push
     \\  resolve-c3 certify tuple|terminal
     \\  resolve-c3 migrate mrpc|intent-closed
+    \\  resolve-c3 authority-chain init|check
+    \\  resolve-c3 mutation-gate
+    \\  resolve-c3 closure-gate
     \\
     \\legacy aliases remain available for MRPC-v1 state, but MBKC-v1 commands are the material surface.
     \\
@@ -122,6 +125,22 @@ const HelpText =
     \\  --design ID                Realization design id
     \\  --batch-id ID              Review batch id
     \\  --receipt-id ID            Review receipt id
+    \\  --campaign ID              RAC-v1 campaign id
+    \\  --review-claim-id ID        RAC-v1 review claim id for mutation-gate lookup
+    \\  --artifact-state PATH       RAC-v1 artifact-state JSON
+    \\  --review-claim PATH         RAC-v1 review-claim JSON
+    \\  --cex PATH                  RAC-v1 CEX-v1 JSON
+    \\  --batch PATH                RAC-v1 RB-v1 JSON
+    \\  --basis PATH                RAC-v1 CEB-v2 JSON
+    \\  --kernel PATH               RAC-v1 MBK-v1 JSON
+    \\  --reduction PATH            RAC-v1 RC-v1 JSON
+    \\  --proof-obligation REF      RAC-v1 proof obligation ref
+    \\  --realization-target PATH   RAC-v1 realization target JSON
+    \\  --output PATH               RAC-v1 init output path
+    \\  --chain PATH                RAC-v1 authority chain path
+    \\  --summary PATH              seq resolve summary JSON for closure-gate
+    \\  --runs PATH                 seq resolve runs JSONL for closure-gate
+    \\  --format text|json          gate output format
     \\  --mode MODE                Review mode or plan mode
     \\  --head SHA                 Artifact head for review batch begin
     \\  --stage candidate|delivery Holdout stage
@@ -189,6 +208,7 @@ const SchemaArtifacts = [_][]const u8{
     "construct-map",
     "proof-plan",
     "holdout",
+    "authority-chain",
     "mbkc",
 };
 const PhaseCollectingSelectedInvalidated = [_][]const u8{ "collecting", "selected", "invalidated" };
@@ -222,6 +242,25 @@ const MutatingFileCommands = [_][]const u8{ "rm ", "mv ", "cp ", "mkdir ", "touc
 const CounterexampleIntentRelations = [_][]const u8{ "in_horizon", "outside_horizon", "unknown", "contract_invalidating" };
 const CounterexampleNovelty = [_][]const u8{ "new_equivalence_class", "new_witness_existing_class", "duplicate", "refuted", "stale", "unknown" };
 const CounterexampleDispositions = [_][]const u8{ "accepted", "refuted", "stale", "unknown", "outside_horizon", "contract_invalidating" };
+const MutationGateLegalNextActions = [_][]const u8{
+    "adjudicate_claim",
+    "seal_or_repair_batch",
+    "compile_or_repair_ceb_mbk_rc",
+    "rebase_ac",
+    "create_followup",
+    "reject_finding",
+    "block",
+};
+const ClosureGateLegalNextActions = [_][]const u8{
+    "enter_or_repair_c3",
+    "seal_batches",
+    "compile_compression",
+    "accept_kernel",
+    "map_or_delete_orphans",
+    "map_proof_actions",
+    "reduce_semantic_surface_or_rebase_ac",
+    "rerun_terminal_holdout",
+};
 
 const Command = enum {
     capabilities,
@@ -289,6 +328,10 @@ const Command = enum {
     certify_terminal,
     migrate_mrpc,
     migrate_intent_closed,
+    authority_chain_init,
+    authority_chain_check,
+    mutation_gate,
+    closure_gate,
     doctor,
     init,
     paths,
@@ -336,6 +379,22 @@ const Args = struct {
     design_id: ?[]const u8 = null,
     batch_id: ?[]const u8 = null,
     receipt_id: ?[]const u8 = null,
+    campaign_id: ?[]const u8 = null,
+    review_claim_id: ?[]const u8 = null,
+    artifact_state: ?[]const u8 = null,
+    review_claim: ?[]const u8 = null,
+    cex: ?[]const u8 = null,
+    batch: ?[]const u8 = null,
+    basis: ?[]const u8 = null,
+    kernel: ?[]const u8 = null,
+    reduction: ?[]const u8 = null,
+    proof_obligation: ?[]const u8 = null,
+    realization_target: ?[]const u8 = null,
+    output: ?[]const u8 = null,
+    chain: ?[]const u8 = null,
+    summary: ?[]const u8 = null,
+    runs: ?[]const u8 = null,
+    format: ?[]const u8 = null,
     mode: ?[]const u8 = null,
     head: ?[]const u8 = null,
     path: ?[]const u8 = null,
@@ -535,6 +594,38 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.batch_id = try optionValue(argv, &i);
         } else if (std.mem.eql(u8, token, "--receipt-id")) {
             args.receipt_id = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--campaign")) {
+            args.campaign_id = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--review-claim-id")) {
+            args.review_claim_id = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--artifact-state")) {
+            args.artifact_state = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--review-claim")) {
+            args.review_claim = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--cex")) {
+            args.cex = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--batch")) {
+            args.batch = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--basis")) {
+            args.basis = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--kernel")) {
+            args.kernel = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--reduction")) {
+            args.reduction = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--proof-obligation")) {
+            args.proof_obligation = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--realization-target")) {
+            args.realization_target = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--output")) {
+            args.output = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--chain")) {
+            args.chain = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--summary")) {
+            args.summary = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--runs")) {
+            args.runs = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--format")) {
+            args.format = try optionValue(argv, &i);
         } else if (std.mem.eql(u8, token, "--mode")) {
             args.mode = try optionValue(argv, &i);
         } else if (std.mem.eql(u8, token, "--head")) {
@@ -593,6 +684,19 @@ fn parseCommandTokens(argv: []const []const u8, first_option_index: *usize) !Com
         if (argv.len < 4) return error.MissingCommand;
         first_option_index.* = 4;
         return parseReviewCommand(argv[2], argv[3]) orelse error.UnknownCommand;
+    }
+    if (std.mem.eql(u8, primary, "authority-chain")) {
+        if (argv.len < 3) return error.MissingCommand;
+        first_option_index.* = 3;
+        return parseAuthorityChainCommand(argv[2]) orelse error.UnknownCommand;
+    }
+    if (std.mem.eql(u8, primary, "mutation-gate")) {
+        first_option_index.* = 2;
+        return .mutation_gate;
+    }
+    if (std.mem.eql(u8, primary, "closure-gate")) {
+        first_option_index.* = 2;
+        return .closure_gate;
     }
     if (std.mem.eql(u8, primary, "counterexample")) {
         if (argv.len < 3) return error.MissingCommand;
@@ -757,6 +861,12 @@ fn parseMigrateCommand(value: []const u8) ?Command {
     return null;
 }
 
+fn parseAuthorityChainCommand(value: []const u8) ?Command {
+    if (std.mem.eql(u8, value, "init")) return .authority_chain_init;
+    if (std.mem.eql(u8, value, "check")) return .authority_chain_check;
+    return null;
+}
+
 fn parseCommand(value: []const u8) ?Command {
     if (std.mem.eql(u8, value, "capabilities")) return .capabilities;
     if (std.mem.eql(u8, value, "schema")) return .schema;
@@ -862,6 +972,10 @@ fn run(allocator: std.mem.Allocator, args: Args, process_io: std.Io) !u8 {
         .certify_terminal => certifyTerminal(allocator, args),
         .migrate_mrpc => migrateMrpc(allocator, args),
         .migrate_intent_closed => migrateIntentClosed(allocator, args),
+        .authority_chain_init => authorityChainSurface(allocator, args, "init"),
+        .authority_chain_check => authorityChainSurface(allocator, args, "check"),
+        .mutation_gate => mutationGate(allocator, args),
+        .closure_gate => closureGate(allocator, args),
         .doctor => printDoctor(allocator, args),
         .init => initState(allocator, args),
         .paths => printPaths(allocator, args),
@@ -898,10 +1012,935 @@ fn run(allocator: std.mem.Allocator, args: Args, process_io: std.Io) !u8 {
 
 fn printCapabilities(allocator: std.mem.Allocator) !u8 {
     try writeStdoutBytes(allocator,
-        \\{"resolve_c3_capabilities":{"version":"0.3.0","protocol_profiles":{"intent_closed_cegis_v1":true,"mbkc_v1":true,"mrpc_v1_read":true},"state_versions":{"readable":[1,2,3],"writable":[3]},"certificate_versions":{"readable":["MRPC-v1","MBKC-v1"],"writable":["MBKC-v1"]},"features":{"acceptance_contract_v2":true,"sealed_review_horizon_v1":true,"review_batch_v1":true,"review_aperture_v1":true,"counterexample_v1":true,"counterexample_basis_v2":true,"minimum_behavioral_kernel_v1":true,"reduction_certificate_v1":true,"review_potential_v1":true,"intent_closed_conformance_v1":true,"terminal_holdout_v1":true,"semantic_surface_v1":true,"proof_compression_v1":true,"physical_apply":true,"physical_commit":true,"physical_push":true,"closure_horizon_v1":true,"mutation_guard_v2":true,"mbkc_v1":true,"mrpc_v1_read":true}}}
+        \\{"resolve_c3_capabilities":{"version":"0.3.3","protocol_profiles":{"intent_closed_cegis_v1":true,"mbkc_v1":true,"mrpc_v1_read":true,"rac_v1":true},"state_versions":{"readable":[1,2,3],"writable":[3]},"certificate_versions":{"readable":["MRPC-v1","MBKC-v1","RAC-v1"],"writable":["MBKC-v1","RAC-v1"]},"features":{"acceptance_contract_v2":true,"sealed_review_horizon_v1":true,"review_batch_v1":true,"review_aperture_v1":true,"counterexample_v1":true,"counterexample_basis_v2":true,"minimum_behavioral_kernel_v1":true,"reduction_certificate_v1":true,"review_potential_v1":true,"intent_closed_conformance_v1":true,"terminal_holdout_v1":true,"semantic_surface_v1":true,"proof_compression_v1":true,"authority_chain_rac_v1":true,"mutation_gate_rac_v1":true,"closure_gate_v1":true,"physical_apply":true,"physical_commit":true,"physical_push":true,"closure_horizon_v1":true,"mutation_guard_v2":true,"mbkc_v1":true,"mrpc_v1_read":true}}}
         \\
     );
     return 0;
+}
+
+fn authorityChainSurface(allocator: std.mem.Allocator, args: Args, subcommand: []const u8) !u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    if (std.mem.eql(u8, subcommand, "init")) {
+        const campaign_id = args.campaign_id orelse return error.MissingValue;
+        _ = args.artifact_state orelse return error.MissingValue;
+        _ = args.review_claim orelse return error.MissingValue;
+        _ = args.acceptance orelse return error.MissingValue;
+        _ = args.cex orelse return error.MissingValue;
+        _ = args.batch orelse return error.MissingValue;
+        _ = args.basis orelse return error.MissingValue;
+        _ = args.kernel orelse return error.MissingValue;
+        _ = args.reduction orelse return error.MissingValue;
+        _ = args.proof_obligation orelse return error.MissingValue;
+        _ = args.realization_target orelse return error.MissingValue;
+        const output = args.output orelse return error.MissingValue;
+        var artifact: std.Io.Writer.Allocating = .init(allocator);
+        defer artifact.deinit();
+        try artifact.writer.writeAll("{\"resolve_authority_chain\":{\"chain_version\":\"RAC-v1\",\"chain_id\":");
+        try writeJsonString(&artifact.writer, "RAC-pending");
+        try artifact.writer.writeAll(",\"campaign_id\":");
+        try writeJsonString(&artifact.writer, campaign_id);
+        try artifact.writer.writeAll(",\"source_paths\":{\"artifact_state\":");
+        try writeJsonString(&artifact.writer, args.artifact_state.?);
+        try artifact.writer.writeAll(",\"review_claim\":");
+        try writeJsonString(&artifact.writer, args.review_claim.?);
+        try artifact.writer.writeAll(",\"acceptance\":");
+        try writeJsonString(&artifact.writer, args.acceptance.?);
+        try artifact.writer.writeAll(",\"cex\":");
+        try writeJsonString(&artifact.writer, args.cex.?);
+        try artifact.writer.writeAll(",\"batch\":");
+        try writeJsonString(&artifact.writer, args.batch.?);
+        try artifact.writer.writeAll(",\"basis\":");
+        try writeJsonString(&artifact.writer, args.basis.?);
+        try artifact.writer.writeAll(",\"kernel\":");
+        try writeJsonString(&artifact.writer, args.kernel.?);
+        try artifact.writer.writeAll(",\"reduction\":");
+        try writeJsonString(&artifact.writer, args.reduction.?);
+        try artifact.writer.writeAll(",\"proof_obligation\":");
+        try writeJsonString(&artifact.writer, args.proof_obligation.?);
+        try artifact.writer.writeAll(",\"realization_target\":");
+        try writeJsonString(&artifact.writer, args.realization_target.?);
+        try artifact.writer.writeAll("},\"gate\":{\"complete_chain\":\"no\",\"mutation_allowed\":\"no\"}}}\n");
+        const bytes = try artifact.toOwnedSlice();
+        defer allocator.free(bytes);
+        try std.Io.Dir.cwd().writeFile(Io, .{ .sub_path = output, .data = bytes });
+    } else {
+        _ = args.chain orelse return error.MissingValue;
+        if (args.format) |format| {
+            if (!std.mem.eql(u8, format, "text") and !std.mem.eql(u8, format, "json")) return error.UnknownOption;
+        }
+        return checkAuthorityChain(allocator, args);
+    }
+    try out.writer.writeAll("{\"resolve_c3_authority_chain\":{\"chain_version\":\"RAC-v1\",\"command\":");
+    try writeJsonString(&out.writer, subcommand);
+    try out.writer.writeAll(",\"surface\":\"declared\",\"validation\":\"pending\"}}\n");
+    try writeStdoutAlloc(allocator, &out);
+    return 0;
+}
+
+const RacFacts = struct {
+    chain_id: []const u8 = "",
+    campaign_id: []const u8 = "",
+    artifact_base_sha: []const u8 = "",
+    artifact_head_sha: []const u8 = "",
+    artifact_dirty_fingerprint: []const u8 = "",
+    artifact_review_receipt: []const u8 = "",
+    review_claim_id: []const u8 = "",
+    chain_version_ok: bool = false,
+    artifact_state_complete: bool = false,
+    review_claim_present: bool = false,
+    acceptance_contract_present: bool = false,
+    horizon_present: bool = false,
+    law_refs_present: bool = false,
+    relation: []const u8 = "",
+    cex_confirmed: bool = false,
+    adjudication_disposition: []const u8 = "",
+    batch_sealed: bool = false,
+    ceb_class_present: bool = false,
+    ceb_class_accepted: bool = false,
+    mbk_present: bool = false,
+    rc_present: bool = false,
+    transition_present: bool = false,
+    proof_obligation_present: bool = false,
+    realization_allowed: bool = false,
+    gate_current_yes: bool = false,
+    gate_complete_yes: bool = false,
+    gate_mutation_yes: bool = false,
+};
+
+fn deinitParsedRacFacts(allocator: std.mem.Allocator, facts: RacFacts) void {
+    allocator.free(facts.chain_id);
+    allocator.free(facts.campaign_id);
+    allocator.free(facts.artifact_base_sha);
+    allocator.free(facts.artifact_head_sha);
+    allocator.free(facts.artifact_dirty_fingerprint);
+    allocator.free(facts.artifact_review_receipt);
+    allocator.free(facts.review_claim_id);
+    allocator.free(facts.relation);
+    allocator.free(facts.adjudication_disposition);
+}
+
+fn checkAuthorityChain(allocator: std.mem.Allocator, args: Args) !u8 {
+    const chain_path = args.chain orelse return error.MissingValue;
+    const bytes = readFileOrStdin(allocator, chain_path) catch return 3;
+    defer allocator.free(bytes);
+    const facts = parseRacFacts(allocator, bytes) catch return 3;
+    defer deinitParsedRacFacts(allocator, facts);
+
+    var missing = std.ArrayList([]const u8).empty;
+    var violations = std.ArrayList([]const u8).empty;
+    try validateRacFacts(allocator, facts, &missing, &violations);
+    defer missing.deinit(allocator);
+    defer violations.deinit(allocator);
+
+    const non_mutation_valid = !facts.realization_allowed and !facts.gate_mutation_yes and hasNonMutationDisposition(facts.adjudication_disposition);
+    const mutation_allowed = missing.items.len == 0 and violations.items.len == 0;
+    const valid = mutation_allowed or (non_mutation_valid and missing.items.len == 0 and nonMutationViolationsOnly(violations.items));
+    const format = args.format orelse "text";
+    if (std.mem.eql(u8, format, "json")) {
+        try writeRacCheckJson(allocator, facts, valid, mutation_allowed, missing.items, if (valid and !mutation_allowed) &.{} else violations.items);
+    } else {
+        try writeRacCheckText(allocator, facts, valid, mutation_allowed, missing.items, if (valid and !mutation_allowed) &.{} else violations.items);
+    }
+    return if (valid) 0 else 2;
+}
+
+fn mutationGate(allocator: std.mem.Allocator, args: Args) !u8 {
+    const direct = args.chain != null;
+    const integrated = args.campaign_id != null or args.review_claim_id != null or args.artifact_state != null;
+    if (direct == integrated) return mutationGateCouldNotEvaluate(allocator, "expected --chain or integrated campaign/review-claim-id/artifact-state input");
+
+    const bytes = if (direct)
+        readFileOrStdin(allocator, args.chain.?) catch return mutationGateCouldNotEvaluate(allocator, "could not read RAC chain")
+    else
+        readIntegratedMutationChain(allocator, args) catch return mutationGateCouldNotEvaluate(allocator, "could not resolve RAC chain");
+    defer allocator.free(bytes);
+
+    const facts = parseRacFacts(allocator, bytes) catch return mutationGateCouldNotEvaluate(allocator, "unsupported RAC input");
+    defer deinitParsedRacFacts(allocator, facts);
+
+    var missing = std.ArrayList([]const u8).empty;
+    var violations = std.ArrayList([]const u8).empty;
+    try validateRacFacts(allocator, facts, &missing, &violations);
+    defer missing.deinit(allocator);
+    defer violations.deinit(allocator);
+
+    if (!facts.gate_mutation_yes) try violations.append(allocator, "mutation_gate_disagrees");
+
+    if (!direct) {
+        if (!std.mem.eql(u8, facts.campaign_id, args.campaign_id.?)) try violations.append(allocator, "artifact_state_stale");
+        if (!std.mem.eql(u8, facts.review_claim_id, args.review_claim_id.?)) try missing.append(allocator, "missing_review_claim");
+        const artifact_matches = artifactStateMatches(allocator, args.artifact_state.?, facts) catch return mutationGateCouldNotEvaluate(allocator, "could not evaluate artifact state");
+        if (!artifact_matches) try violations.append(allocator, "artifact_state_stale");
+    }
+
+    const mutation_allowed = missing.items.len == 0 and violations.items.len == 0;
+    const format = args.format orelse "text";
+    if (!std.mem.eql(u8, format, "text") and !std.mem.eql(u8, format, "json")) return mutationGateCouldNotEvaluate(allocator, "unsupported output format");
+    if (std.mem.eql(u8, format, "json")) {
+        try writeMutationGateJson(allocator, facts, mutation_allowed, missing.items, violations.items);
+    } else {
+        try writeMutationGateText(allocator, facts, mutation_allowed, missing.items, violations.items);
+    }
+    return if (mutation_allowed) 0 else 2;
+}
+
+fn parseRacFacts(allocator: std.mem.Allocator, bytes: []const u8) !RacFacts {
+    const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
+    if (trimmed.len == 0) return error.UnsupportedFormat;
+    if (trimmed[0] == '{') return parseJsonRacFacts(allocator, bytes);
+    if (std.mem.containsAtLeast(u8, bytes, 1, "resolve_authority_chain:")) return parseYamlRacFacts(allocator, bytes);
+    return error.UnsupportedFormat;
+}
+
+fn readIntegratedMutationChain(allocator: std.mem.Allocator, args: Args) ![]u8 {
+    const campaign_id = args.campaign_id orelse return error.MissingValue;
+    const review_claim_id = args.review_claim_id orelse return error.MissingValue;
+    _ = args.artifact_state orelse return error.MissingValue;
+    try validateSafeId(campaign_id);
+    try validateSafeId(review_claim_id);
+
+    var root = try openRoot(args.cwd);
+    defer root.close(Io);
+    const claim_json = try std.fmt.allocPrint(allocator, "{s}.json", .{review_claim_id});
+    defer allocator.free(claim_json);
+    const claim_yaml = try std.fmt.allocPrint(allocator, "{s}.yaml", .{review_claim_id});
+    defer allocator.free(claim_yaml);
+    const candidates = [_][]const u8{
+        try std.fs.path.join(allocator, &.{ args.state_root, "authority-chains", campaign_id, claim_json }),
+        try std.fs.path.join(allocator, &.{ args.state_root, "authority-chains", campaign_id, claim_yaml }),
+        try std.fs.path.join(allocator, &.{ args.state_root, "authority-chains", claim_json }),
+        try std.fs.path.join(allocator, &.{ args.state_root, "authority-chains", claim_yaml }),
+    };
+    defer {
+        for (candidates) |candidate| allocator.free(candidate);
+    }
+    for (candidates) |candidate| {
+        if (root.readFileAlloc(Io, candidate, allocator, .limited(MaxFileBytes))) |bytes| return bytes else |_| {}
+    }
+    return error.FileNotFound;
+}
+
+fn artifactStateMatches(allocator: std.mem.Allocator, path: []const u8, facts: RacFacts) !bool {
+    const bytes = try readFileOrStdin(allocator, path);
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const root = objectField(parsed.value, "artifact_state") orelse parsed.value;
+    return std.mem.eql(u8, stringField(root, "base_sha") orelse "", facts.artifact_base_sha) and
+        std.mem.eql(u8, stringField(root, "head_sha") orelse "", facts.artifact_head_sha) and
+        std.mem.eql(u8, stringField(root, "dirty_fingerprint") orelse "", facts.artifact_dirty_fingerprint) and
+        std.mem.eql(u8, stringField(root, "review_receipt") orelse "", facts.artifact_review_receipt);
+}
+
+fn parseJsonRacFacts(allocator: std.mem.Allocator, bytes: []const u8) !RacFacts {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const root = objectField(parsed.value, "resolve_authority_chain") orelse return error.UnsupportedFormat;
+    const artifact_state = objectField(root, "artifact_state");
+    const review_claim = objectField(root, "review_claim");
+    const acceptance = objectField(root, "acceptance");
+    const adjudication = objectField(root, "adjudication");
+    const batch = objectField(root, "batch");
+    const compression = objectField(root, "compression");
+    const realization = objectField(root, "realization");
+    const gate = objectField(root, "gate");
+    return .{
+        .chain_id = try allocator.dupe(u8, stringField(root, "chain_id") orelse ""),
+        .campaign_id = try allocator.dupe(u8, stringField(root, "campaign_id") orelse ""),
+        .artifact_base_sha = try allocator.dupe(u8, stringFieldOpt(artifact_state, "base_sha") orelse ""),
+        .artifact_head_sha = try allocator.dupe(u8, stringFieldOpt(artifact_state, "head_sha") orelse ""),
+        .artifact_dirty_fingerprint = try allocator.dupe(u8, stringFieldOpt(artifact_state, "dirty_fingerprint") orelse ""),
+        .artifact_review_receipt = try allocator.dupe(u8, stringFieldOpt(artifact_state, "review_receipt") orelse ""),
+        .review_claim_id = try allocator.dupe(u8, stringFieldOpt(review_claim, "claim_id") orelse ""),
+        .chain_version_ok = std.mem.eql(u8, stringField(root, "chain_version") orelse "", "RAC-v1"),
+        .artifact_state_complete = allStringFieldsPresent(artifact_state, &.{ "base_sha", "head_sha", "dirty_fingerprint", "review_receipt" }),
+        .review_claim_present = allStringFieldsPresent(review_claim, &.{ "claim_id", "source", "statement" }),
+        .acceptance_contract_present = allStringFieldsPresent(acceptance, &.{ "contract_id", "contract_fingerprint" }),
+        .horizon_present = nonEmptyStringFieldOpt(acceptance, "horizon_fingerprint"),
+        .law_refs_present = stringArrayNonEmpty(if (acceptance) |a| objectField(a, "law_refs") else null),
+        .relation = try allocator.dupe(u8, stringFieldOpt(acceptance, "relation") orelse ""),
+        .cex_confirmed = std.mem.eql(u8, stringFieldOpt(adjudication, "validity") orelse "", "confirmed") and
+            std.mem.eql(u8, stringFieldOpt(adjudication, "disposition") orelse "", "accepted") and
+            isMutationLiability(stringFieldOpt(adjudication, "liability") orelse "") and
+            std.mem.eql(u8, stringFieldOpt(adjudication, "novelty") orelse "", "new_equivalence_class") and
+            allStringFieldsPresent(adjudication, &.{ "cex_id", "minimal_trace_ref" }),
+        .adjudication_disposition = try allocator.dupe(u8, stringFieldOpt(adjudication, "disposition") orelse ""),
+        .batch_sealed = boolFieldOpt(batch, "sealed") == true and allStringFieldsPresent(batch, &.{"batch_id"}) and isMutationBatchMode(stringFieldOpt(batch, "mode") orelse ""),
+        .ceb_class_present = allStringFieldsPresent(compression, &.{ "ceb_id", "class_id", "class_status", "quotient_witness_ref" }),
+        .ceb_class_accepted = std.mem.eql(u8, stringFieldOpt(compression, "class_status") orelse "", "accepted"),
+        .mbk_present = nonEmptyStringFieldOpt(compression, "mbk_id"),
+        .rc_present = nonEmptyStringFieldOpt(compression, "rc_id"),
+        .transition_present = nonEmptyStringFieldOpt(compression, "transition_ref"),
+        .proof_obligation_present = nonEmptyStringFieldOpt(compression, "proof_obligation_ref"),
+        .realization_allowed = boolFieldOpt(realization, "allowed") == true and allStringFieldsPresent(realization, &.{ "target_owner", "target_boundary" }),
+        .gate_current_yes = std.mem.eql(u8, stringFieldOpt(gate, "current_artifact_state") orelse "", "yes"),
+        .gate_complete_yes = std.mem.eql(u8, stringFieldOpt(gate, "complete_chain") orelse "", "yes"),
+        .gate_mutation_yes = std.mem.eql(u8, stringFieldOpt(gate, "mutation_allowed") orelse "", "yes"),
+    };
+}
+
+fn parseYamlRacFacts(allocator: std.mem.Allocator, bytes: []const u8) !RacFacts {
+    return .{
+        .chain_id = try yamlScalarDup(allocator, bytes, "chain_id"),
+        .campaign_id = try yamlScalarDup(allocator, bytes, "campaign_id"),
+        .artifact_base_sha = try yamlScalarDup(allocator, bytes, "base_sha"),
+        .artifact_head_sha = try yamlScalarDup(allocator, bytes, "head_sha"),
+        .artifact_dirty_fingerprint = try yamlScalarDup(allocator, bytes, "dirty_fingerprint"),
+        .artifact_review_receipt = try yamlScalarDup(allocator, bytes, "review_receipt"),
+        .review_claim_id = try yamlScalarDup(allocator, bytes, "claim_id"),
+        .chain_version_ok = std.mem.eql(u8, try yamlScalarTemp(bytes, "chain_version"), "RAC-v1"),
+        .artifact_state_complete = yamlHasValue(bytes, "base_sha") and yamlHasValue(bytes, "head_sha") and yamlHasValue(bytes, "dirty_fingerprint") and yamlHasValue(bytes, "review_receipt"),
+        .review_claim_present = yamlHasValue(bytes, "claim_id") and yamlHasValue(bytes, "source") and yamlHasValue(bytes, "statement"),
+        .acceptance_contract_present = yamlHasValue(bytes, "contract_id") and yamlHasValue(bytes, "contract_fingerprint"),
+        .horizon_present = yamlHasValue(bytes, "horizon_fingerprint"),
+        .law_refs_present = yamlHasNonEmptyArray(bytes, "law_refs"),
+        .relation = try yamlScalarDup(allocator, bytes, "relation"),
+        .cex_confirmed = std.mem.eql(u8, try yamlScalarTemp(bytes, "validity"), "confirmed") and
+            std.mem.eql(u8, try yamlScalarTemp(bytes, "disposition"), "accepted") and
+            isMutationLiability(try yamlScalarTemp(bytes, "liability")) and
+            std.mem.eql(u8, try yamlScalarTemp(bytes, "novelty"), "new_equivalence_class") and
+            yamlHasValue(bytes, "cex_id") and yamlHasValue(bytes, "minimal_trace_ref"),
+        .adjudication_disposition = try yamlScalarDup(allocator, bytes, "disposition"),
+        .batch_sealed = yamlBool(bytes, "sealed") == true and yamlHasValue(bytes, "batch_id") and isMutationBatchMode(try yamlScalarTemp(bytes, "mode")),
+        .ceb_class_present = yamlHasValue(bytes, "ceb_id") and yamlHasValue(bytes, "class_id") and yamlHasValue(bytes, "class_status") and yamlHasValue(bytes, "quotient_witness_ref"),
+        .ceb_class_accepted = std.mem.eql(u8, try yamlScalarTemp(bytes, "class_status"), "accepted"),
+        .mbk_present = yamlHasValue(bytes, "mbk_id"),
+        .rc_present = yamlHasValue(bytes, "rc_id"),
+        .transition_present = yamlHasValue(bytes, "transition_ref"),
+        .proof_obligation_present = yamlHasValue(bytes, "proof_obligation_ref"),
+        .realization_allowed = yamlBool(bytes, "allowed") == true and yamlHasValue(bytes, "target_owner") and yamlHasValue(bytes, "target_boundary"),
+        .gate_current_yes = std.mem.eql(u8, try yamlScalarTemp(bytes, "current_artifact_state"), "yes"),
+        .gate_complete_yes = std.mem.eql(u8, try yamlScalarTemp(bytes, "complete_chain"), "yes"),
+        .gate_mutation_yes = std.mem.eql(u8, try yamlScalarTemp(bytes, "mutation_allowed"), "yes"),
+    };
+}
+
+fn validateRacFacts(allocator: std.mem.Allocator, facts: RacFacts, missing: *std.ArrayList([]const u8), violations: *std.ArrayList([]const u8)) !void {
+    if (!facts.chain_version_ok) try missing.append(allocator, "missing_chain_version");
+    if (facts.chain_id.len == 0 or facts.campaign_id.len == 0) try missing.append(allocator, "missing_chain_identity");
+    if (!facts.artifact_state_complete) try missing.append(allocator, "missing_artifact_state");
+    if (!facts.review_claim_present) try missing.append(allocator, "missing_review_claim");
+    if (!facts.acceptance_contract_present) try missing.append(allocator, "missing_acceptance_contract");
+    if (!facts.horizon_present) try missing.append(allocator, "missing_horizon");
+    if (!facts.law_refs_present) try missing.append(allocator, "missing_law_refs");
+    if (!isInHorizonRelation(facts.relation)) {
+        if (std.mem.eql(u8, facts.relation, "unrelated") or std.mem.eql(u8, facts.relation, "rejected") or std.mem.eql(u8, facts.relation, "unknown")) {
+            try violations.append(allocator, "unrelated_or_rejected");
+        } else {
+            try violations.append(allocator, "outside_horizon");
+        }
+    }
+    if (!facts.cex_confirmed) try violations.append(allocator, "invalid_cex");
+    if (!facts.batch_sealed) try violations.append(allocator, "unsealed_batch");
+    if (!facts.ceb_class_present) try missing.append(allocator, "missing_ceb_class");
+    if (facts.ceb_class_present and !facts.ceb_class_accepted) try violations.append(allocator, "ceb_class_not_accepted");
+    if (!facts.mbk_present or !facts.rc_present) try missing.append(allocator, "missing_mbk_or_rc");
+    if (!facts.transition_present) try missing.append(allocator, "missing_transition");
+    if (!facts.proof_obligation_present) try missing.append(allocator, "missing_proof_obligation");
+    if (!facts.gate_current_yes) try violations.append(allocator, "artifact_state_stale");
+    if (!facts.realization_allowed) try violations.append(allocator, "realization_not_allowed");
+    if (!facts.gate_complete_yes) try violations.append(allocator, "incomplete_chain");
+    if ((facts.realization_allowed and !facts.gate_mutation_yes) or (!facts.realization_allowed and facts.gate_mutation_yes)) try violations.append(allocator, "mutation_gate_disagrees");
+}
+
+fn isInHorizonRelation(value: []const u8) bool {
+    return std.mem.eql(u8, value, "directly_entailed") or
+        std.mem.eql(u8, value, "compatibility_required") or
+        std.mem.eql(u8, value, "forbidden_state_witness");
+}
+
+fn writeRacCheckJson(allocator: std.mem.Allocator, facts: RacFacts, valid: bool, mutation_allowed: bool, missing: []const []const u8, violations: []const []const u8) !void {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"status\":");
+    try writeJsonString(&out.writer, if (valid) "valid" else "invalid");
+    try out.writer.writeAll(",\"mutation_allowed\":");
+    try out.writer.writeAll(if (mutation_allowed) "true" else "false");
+    try out.writer.writeAll(",\"missing\":");
+    try writeStringArray(&out.writer, missing);
+    try out.writer.writeAll(",\"violations\":");
+    try writeStringArray(&out.writer, violations);
+    try out.writer.writeAll(",\"chain_id\":");
+    try writeJsonString(&out.writer, facts.chain_id);
+    try out.writer.writeAll(",\"campaign_id\":");
+    try writeJsonString(&out.writer, facts.campaign_id);
+    try out.writer.writeAll("}\n");
+    try writeStdoutAlloc(allocator, &out);
+}
+
+fn writeRacCheckText(allocator: std.mem.Allocator, facts: RacFacts, valid: bool, mutation_allowed: bool, missing: []const []const u8, violations: []const []const u8) !void {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.print("RAC-v1 {s}: chain_id={s} campaign_id={s} mutation_allowed={}\n", .{ if (valid) "valid" else "invalid", facts.chain_id, facts.campaign_id, mutation_allowed });
+    if (missing.len != 0) {
+        try out.writer.writeAll("missing: ");
+        try writeStringArray(&out.writer, missing);
+        try out.writer.writeByte('\n');
+    }
+    if (violations.len != 0) {
+        try out.writer.writeAll("violations: ");
+        try writeStringArray(&out.writer, violations);
+        try out.writer.writeByte('\n');
+    }
+    try writeStdoutAlloc(allocator, &out);
+}
+
+fn writeMutationGateJson(allocator: std.mem.Allocator, facts: RacFacts, mutation_allowed: bool, missing: []const []const u8, violations: []const []const u8) !void {
+    var normalized = std.ArrayList([]const u8).empty;
+    defer normalized.deinit(allocator);
+    try appendMutationGateReasons(allocator, &normalized, missing);
+    try appendMutationGateReasons(allocator, &normalized, violations);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"mutation_allowed\":");
+    try out.writer.writeAll(if (mutation_allowed) "true" else "false");
+    try out.writer.writeAll(",\"reason\":");
+    try writeJsonString(&out.writer, if (mutation_allowed) "compiled_review_authority" else "uncompiled_review_text");
+    try out.writer.writeAll(",\"missing\":");
+    try writeStringArray(&out.writer, if (mutation_allowed) &.{} else normalized.items);
+    try out.writer.writeAll(",\"legal_next_actions\":");
+    try writeStringArray(&out.writer, if (mutation_allowed) &.{} else MutationGateLegalNextActions[0..]);
+    try out.writer.writeAll(",\"chain_id\":");
+    try writeJsonString(&out.writer, facts.chain_id);
+    try out.writer.writeAll(",\"campaign_id\":");
+    try writeJsonString(&out.writer, facts.campaign_id);
+    try out.writer.writeAll("}\n");
+    try writeStdoutAlloc(allocator, &out);
+}
+
+fn writeMutationGateText(allocator: std.mem.Allocator, facts: RacFacts, mutation_allowed: bool, missing: []const []const u8, violations: []const []const u8) !void {
+    var normalized = std.ArrayList([]const u8).empty;
+    defer normalized.deinit(allocator);
+    try appendMutationGateReasons(allocator, &normalized, missing);
+    try appendMutationGateReasons(allocator, &normalized, violations);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.print("mutation-gate {s}: chain_id={s} campaign_id={s} mutation_allowed={}\n", .{
+        if (mutation_allowed) "allowed" else "blocked",
+        facts.chain_id,
+        facts.campaign_id,
+        mutation_allowed,
+    });
+    if (!mutation_allowed) {
+        try out.writer.writeAll("reason: uncompiled_review_text\nmissing: ");
+        try writeStringArray(&out.writer, normalized.items);
+        try out.writer.writeByte('\n');
+    }
+    try writeStdoutAlloc(allocator, &out);
+}
+
+fn mutationGateCouldNotEvaluate(allocator: std.mem.Allocator, reason: []const u8) !u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"mutation_allowed\":false,\"reason\":\"could_not_evaluate_input\",\"missing\":[],\"legal_next_actions\":[\"block\"],\"error\":");
+    try writeJsonString(&out.writer, reason);
+    try out.writer.writeAll("}\n");
+    try writeStdoutAlloc(allocator, &out);
+    return 3;
+}
+
+const ClosureViolation = struct {
+    scope: []const u8,
+    run_id: ?[]const u8 = null,
+    code: []const u8,
+    detail: []const u8,
+};
+
+fn closureGate(allocator: std.mem.Allocator, args: Args) !u8 {
+    const campaign_id = args.campaign_id orelse return closureGateCouldNotEvaluate(allocator, "missing --campaign");
+    const summary_path = args.summary orelse return closureGateCouldNotEvaluate(allocator, "missing --summary");
+    const runs_path = args.runs orelse return closureGateCouldNotEvaluate(allocator, "missing --runs");
+    const format = args.format orelse "json";
+    if (!std.mem.eql(u8, format, "text") and !std.mem.eql(u8, format, "json")) return closureGateCouldNotEvaluate(allocator, "unsupported output format");
+
+    const summary_bytes = readFileOrStdin(allocator, summary_path) catch return closureGateCouldNotEvaluate(allocator, "could not read summary");
+    defer allocator.free(summary_bytes);
+    var parsed_summary = std.json.parseFromSlice(std.json.Value, allocator, summary_bytes, .{}) catch return closureGateCouldNotEvaluate(allocator, "summary must be JSON");
+    defer parsed_summary.deinit();
+    const campaign_summary = closureSummaryCampaign(parsed_summary.value, campaign_id);
+
+    const runs_bytes = readFileOrStdin(allocator, runs_path) catch return closureGateCouldNotEvaluate(allocator, "could not read runs");
+    defer allocator.free(runs_bytes);
+
+    var violations = std.ArrayList(ClosureViolation).empty;
+    defer deinitClosureViolations(allocator, &violations);
+
+    var material_rows: usize = 0;
+    var any_material = closureMaterial(campaign_summary);
+    var max_strict_progress = closureStrictProgress(campaign_summary);
+    var campaign_orphans = closureCount(campaign_summary, &.{"orphan_code_constructs"}) > 0;
+    var campaign_unmapped = closureCount(campaign_summary, &.{"unmapped_proof_actions"}) > 0;
+    var campaign_surface_delta = closureCount(campaign_summary, &.{"semantic_surface_delta"}) > 0 and !closureAcRebased(campaign_summary);
+
+    var lines = std.mem.splitScalar(u8, runs_bytes, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r\n");
+        if (line.len == 0) continue;
+        var parsed_run = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return closureGateCouldNotEvaluate(allocator, "runs row must be JSON");
+        defer parsed_run.deinit();
+        if (!closureCampaignMatches(parsed_run.value, campaign_id)) continue;
+        if (!closureMaterial(parsed_run.value)) continue;
+
+        material_rows += 1;
+        any_material = true;
+        const run_progress = closureStrictProgress(parsed_run.value);
+        if (run_progress > max_strict_progress) max_strict_progress = run_progress;
+        if (closureCount(parsed_run.value, &.{"orphan_code_constructs"}) > 0) campaign_orphans = true;
+        if (closureCount(parsed_run.value, &.{"unmapped_proof_actions"}) > 0) campaign_unmapped = true;
+        if (closureCount(parsed_run.value, &.{"semantic_surface_delta"}) > 0 and !closureAcRebased(parsed_run.value)) campaign_surface_delta = true;
+
+        try collectClosureRunViolations(allocator, parsed_run.value, &violations);
+    }
+
+    if (closureMaterial(campaign_summary) and material_rows == 0) {
+        try appendClosureViolation(allocator, &violations, "campaign", null, "material_campaign_without_runs", "material campaign has no material runs");
+    }
+    if (any_material) {
+        if (max_strict_progress == 0) try appendClosureViolation(allocator, &violations, "campaign", null, "campaign_strict_progress_zero", "potential.strict_progress=0 for a material campaign");
+        if (campaign_orphans) try appendClosureViolation(allocator, &violations, "campaign", null, "campaign_orphan_code_constructs", "orphan_code_constructs > 0");
+        if (campaign_unmapped) try appendClosureViolation(allocator, &violations, "campaign", null, "campaign_unmapped_proof_actions", "unmapped_proof_actions > 0");
+        if (campaign_surface_delta) try appendClosureViolation(allocator, &violations, "campaign", null, "campaign_semantic_surface_delta_without_ac_rebase", "semantic_surface_delta > 0 without explicit AC rebase");
+    }
+
+    const allowed = violations.items.len == 0;
+    if (std.mem.eql(u8, format, "json")) {
+        try writeClosureGateJson(allocator, allowed, violations.items);
+    } else {
+        try writeClosureGateText(allocator, allowed, violations.items.len);
+    }
+    return if (allowed) 0 else 2;
+}
+
+fn deinitClosureViolations(allocator: std.mem.Allocator, violations: *std.ArrayList(ClosureViolation)) void {
+    for (violations.items) |violation| {
+        if (violation.run_id) |run_id| allocator.free(run_id);
+    }
+    violations.deinit(allocator);
+}
+
+fn collectClosureRunViolations(allocator: std.mem.Allocator, row: std.json.Value, violations: *std.ArrayList(ClosureViolation)) !void {
+    const run_id = stringField(row, "run_id");
+    if (closureBoolField(row, "c3_closed") != true) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "c3_required_without_c3_closure", "material run requires c3_closed=true");
+    }
+    if (closureBoolField(row, "c3_entered") != true) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "c3_required_without_c3_entry", "material run requires c3_entered=true");
+    }
+    if (!closureCompressionReady(row)) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "compression_state_none", "compression_state missing or NONE");
+    }
+    if (closureFindingBearing(row) and closureCount(row, &.{"batches_total"}) == 0) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "finding_workflow_without_batches", "batches_total=0 for a finding-bearing workflow");
+    }
+    if (closureOpenBatchCount(row) > 0) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "open_batches", "open batch indicators remain before closure");
+    }
+    if (closureBoolField(row, "delivery_closed") != true) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "delivery_not_closed", "delivery_closed is not true");
+    }
+    if (closureBoolField(row, "terminal_closed") != true) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "delivery_closed_without_terminal_closure", "delivery_closed=true while terminal_closed=false");
+    }
+    if (closureStrictProgress(row) == 0) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "strict_progress_zero", "potential.strict_progress=0 for a material campaign");
+    }
+    const kernel = objectField(row, "kernel");
+    if (closureBoolFieldOpt(kernel, "accepted") != true and closureBoolField(row, "kernel_accepted") != true) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "kernel_not_accepted", "kernel.accepted is not true");
+    }
+    const orphan_count = closureCount(row, &.{"orphan_code_constructs"});
+    const nested_orphans = if (objectField(row, "realization_map")) |m| closureCount(m, &.{"orphan_code_constructs"}) else 0;
+    if (orphan_count > 0 or nested_orphans > 0) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "orphan_code_constructs", "orphan_code_constructs > 0");
+    }
+    const unmapped_count = closureCount(row, &.{"unmapped_proof_actions"});
+    const nested_unmapped = if (objectField(row, "proof_basis")) |p| closureCount(p, &.{"unmapped_proof_actions"}) else 0;
+    if (unmapped_count > 0 or nested_unmapped > 0) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "unmapped_proof_actions", "unmapped_proof_actions > 0");
+    }
+    const wound_count = closureCount(row, &.{"wound_specific_tests"});
+    const nested_wound = if (objectField(row, "proof_basis")) |p| closureCount(p, &.{"wound_specific_tests"}) else 0;
+    const total_wound = @max(wound_count, nested_wound);
+    if (total_wound > 0 and !closureWoundTestsMapped(row, total_wound)) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "unmapped_wound_specific_tests", "wound_specific_tests > 0 without class mapping");
+    }
+    const surface_delta = closureCount(row, &.{"semantic_surface_delta"});
+    if (surface_delta > 0 and !closureAcRebased(row)) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "semantic_surface_delta_without_ac_rebase", "semantic_surface_delta > 0 without explicit AC rebase");
+    }
+    if (closureUnresolvedConformanceCount(row) > 0) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "unresolved_conformance_evidence", "conformance unresolved counterexamples remain");
+    }
+    if (closureUnresolvedHoldoutCount(row) > 0) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "unresolved_terminal_holdout_evidence", "terminal holdout unresolved counterexamples remain");
+    }
+    if (closureProofOrDeliveryStale(row)) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "proof_or_delivery_not_current", "proof or delivery current gate is not true");
+    }
+}
+
+fn appendClosureViolation(allocator: std.mem.Allocator, target: *std.ArrayList(ClosureViolation), scope: []const u8, run_id: ?[]const u8, code: []const u8, detail: []const u8) !void {
+    try target.append(allocator, .{
+        .scope = scope,
+        .run_id = if (run_id) |id| try allocator.dupe(u8, id) else null,
+        .code = code,
+        .detail = detail,
+    });
+}
+
+fn closureGateCouldNotEvaluate(allocator: std.mem.Allocator, reason: []const u8) !u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"closure_allowed\":false,\"status\":\"error\",\"violations\":[{\"scope\":\"input\",\"code\":\"could_not_evaluate_input\",\"detail\":");
+    try writeJsonString(&out.writer, reason);
+    try out.writer.writeAll("}],\"legal_next_actions\":[\"block\"]}\n");
+    try writeStdoutAlloc(allocator, &out);
+    return 3;
+}
+
+fn closureSummaryCampaign(summary: std.json.Value, campaign_id: []const u8) std.json.Value {
+    const direct_id = closureCampaignId(summary);
+    if (std.mem.eql(u8, direct_id, campaign_id)) return summary;
+    const campaigns = objectField(summary, "campaigns") orelse return std.json.Value{ .null = {} };
+    switch (campaigns) {
+        .array => |arr| {
+            for (arr.items) |row| {
+                if (std.mem.eql(u8, closureCampaignId(row), campaign_id)) return row;
+            }
+        },
+        .object => |obj| {
+            if (obj.get(campaign_id)) |value| return value;
+        },
+        else => {},
+    }
+    if (direct_id.len == 0 and objectField(summary, "campaigns") == null) return summary;
+    return std.json.Value{ .null = {} };
+}
+
+fn closureCampaignMatches(row: std.json.Value, campaign_id: []const u8) bool {
+    return std.mem.eql(u8, closureCampaignId(row), campaign_id);
+}
+
+fn closureCampaignId(row: std.json.Value) []const u8 {
+    return stringField(row, "campaign_id") orelse stringField(row, "campaign") orelse "";
+}
+
+fn closureMaterial(row: std.json.Value) bool {
+    return closureBoolField(row, "c3_required") == true or closureFindingBearing(row);
+}
+
+fn closureFindingBearing(row: std.json.Value) bool {
+    return closureBoolField(row, "finding_bearing_workflow") == true or
+        closureBoolField(row, "findings_present") == true or
+        closureCount(row, &.{ "findings_total", "findings", "raw_claims" }) > 0;
+}
+
+fn closureCompressionReady(row: std.json.Value) bool {
+    const value = stringField(row, "compression_state") orelse stringField(row, "closure_compression") orelse return false;
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    return trimmed.len != 0 and !std.ascii.eqlIgnoreCase(trimmed, "NONE");
+}
+
+fn closureStrictProgress(row: std.json.Value) i64 {
+    if (closureIntField(row, "strict_progress")) |value| return value;
+    if (objectField(row, "potential")) |potential| {
+        if (closureIntField(potential, "strict_progress")) |value| return value;
+    }
+    if (objectField(row, "review_potential")) |potential| {
+        if (closureBoolField(potential, "strict_progress") == true) return 1;
+    }
+    return 0;
+}
+
+fn closureWoundTestsMapped(row: std.json.Value, wound_tests: i64) bool {
+    if (wound_tests <= 0) return true;
+    if (closureBoolField(row, "wound_specific_tests_class_mapped") == true or closureBoolField(row, "wound_specific_class_mapped") == true) return true;
+    return closureCount(row, &.{"class_mapped_wound_specific_tests"}) >= wound_tests;
+}
+
+fn closureAcRebased(row: std.json.Value) bool {
+    return closureBoolField(row, "ac_rebased") == true or
+        closureBoolField(row, "explicit_ac_rebase") == true or
+        stringField(row, "ac_rebase_ref") != null;
+}
+
+fn closureOpenBatchCount(row: std.json.Value) i64 {
+    const direct = closureCount(row, &.{ "open_batches", "open_batches_total", "open_batch_ids" });
+    if (direct > 0) return direct;
+    if (objectField(row, "review")) |review| return closureCount(review, &.{"open_batch_ids"});
+    return 0;
+}
+
+fn closureUnresolvedConformanceCount(row: std.json.Value) i64 {
+    const conformance = objectField(row, "conformance") orelse return 0;
+    return closureCount(conformance, &.{ "novel_in_horizon_counterexamples", "unknown_counterexamples", "unresolved_counterexamples", "accepted_counterexamples" });
+}
+
+fn closureUnresolvedHoldoutCount(row: std.json.Value) i64 {
+    const holdout = objectField(row, "terminal_holdout") orelse return 0;
+    return closureCount(holdout, &.{ "unknown_counterexamples", "in_horizon_counterexamples", "novel_in_horizon_counterexamples", "unresolved_counterexamples" });
+}
+
+fn closureProofOrDeliveryStale(row: std.json.Value) bool {
+    const proof_basis = objectField(row, "proof_basis");
+    const delivery = objectField(row, "delivery");
+    const gate = objectField(row, "gate");
+    return closureBoolFieldOpt(proof_basis, "all_laws_covered") == false or
+        closureBoolFieldOpt(delivery, "current_head_validation_passed") == false or
+        closureBoolFieldOpt(gate, "proof_current") == false or
+        closureBoolFieldOpt(gate, "delivery_current") == false;
+}
+
+fn closureCount(row: std.json.Value, keys: []const []const u8) i64 {
+    for (keys) |key| {
+        if (closureIntField(row, key)) |value| return value;
+    }
+    return 0;
+}
+
+fn closureBoolFieldOpt(value: ?std.json.Value, key: []const u8) ?bool {
+    return if (value) |actual| closureBoolField(actual, key) else null;
+}
+
+fn closureBoolField(value: std.json.Value, key: []const u8) ?bool {
+    const child = objectField(value, key) orelse return null;
+    return switch (child) {
+        .bool => |b| b,
+        .integer => |n| if (n == 0) false else if (n == 1) true else null,
+        .string => |s| closureBoolishString(s),
+        else => null,
+    };
+}
+
+fn closureBoolishString(value: []const u8) ?bool {
+    const folded = std.mem.trim(u8, value, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(folded, "true") or std.ascii.eqlIgnoreCase(folded, "yes") or std.ascii.eqlIgnoreCase(folded, "pass") or std.ascii.eqlIgnoreCase(folded, "passed") or std.mem.eql(u8, folded, "1")) return true;
+    if (std.ascii.eqlIgnoreCase(folded, "false") or std.ascii.eqlIgnoreCase(folded, "no") or std.ascii.eqlIgnoreCase(folded, "fail") or std.ascii.eqlIgnoreCase(folded, "failed") or std.ascii.eqlIgnoreCase(folded, "none") or std.mem.eql(u8, folded, "0")) return false;
+    return null;
+}
+
+fn closureIntField(value: std.json.Value, key: []const u8) ?i64 {
+    const child = objectField(value, key) orelse return null;
+    return switch (child) {
+        .bool => |b| if (b) 1 else 0,
+        .integer => |n| n,
+        .array => |arr| @intCast(arr.items.len),
+        .object => |obj| @intCast(obj.count()),
+        .string => |s| std.fmt.parseInt(i64, std.mem.trim(u8, s, " \t\r\n"), 10) catch null,
+        else => null,
+    };
+}
+
+fn writeClosureGateJson(allocator: std.mem.Allocator, allowed: bool, violations: []const ClosureViolation) !void {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"closure_allowed\":");
+    try out.writer.writeAll(if (allowed) "true" else "false");
+    try out.writer.writeAll(",\"status\":");
+    try writeJsonString(&out.writer, if (allowed) "allowed" else "blocked");
+    try out.writer.writeAll(",\"violations\":[");
+    for (violations, 0..) |violation, i| {
+        if (i > 0) try out.writer.writeByte(',');
+        try out.writer.writeAll("{\"scope\":");
+        try writeJsonString(&out.writer, violation.scope);
+        if (violation.run_id) |run_id| {
+            try out.writer.writeAll(",\"run_id\":");
+            try writeJsonString(&out.writer, run_id);
+        }
+        try out.writer.writeAll(",\"code\":");
+        try writeJsonString(&out.writer, violation.code);
+        try out.writer.writeAll(",\"detail\":");
+        try writeJsonString(&out.writer, violation.detail);
+        try out.writer.writeByte('}');
+    }
+    try out.writer.writeAll("],\"legal_next_actions\":");
+    try writeStringArray(&out.writer, if (allowed) &.{} else ClosureGateLegalNextActions[0..]);
+    try out.writer.writeAll("}\n");
+    try writeStdoutAlloc(allocator, &out);
+}
+
+fn writeClosureGateText(allocator: std.mem.Allocator, allowed: bool, violation_count: usize) !void {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    if (allowed) {
+        try out.writer.writeAll("closure allowed\n");
+    } else {
+        try out.writer.writeAll("closure gate failed\n");
+        try out.writer.print("remaining authority gaps: {d}\nlegal_next_actions: ", .{violation_count});
+        try writeStringArray(&out.writer, ClosureGateLegalNextActions[0..]);
+        try out.writer.writeByte('\n');
+    }
+    try writeStdoutAlloc(allocator, &out);
+}
+
+fn appendMutationGateReasons(allocator: std.mem.Allocator, target: *std.ArrayList([]const u8), reasons: []const []const u8) !void {
+    for (reasons) |reason| try appendUniqueMutationGateReason(allocator, target, normalizeMutationGateReason(reason));
+}
+
+fn appendUniqueMutationGateReason(allocator: std.mem.Allocator, target: *std.ArrayList([]const u8), reason: []const u8) !void {
+    for (target.items) |existing| {
+        if (std.mem.eql(u8, existing, reason)) return;
+    }
+    try target.append(allocator, reason);
+}
+
+fn normalizeMutationGateReason(reason: []const u8) []const u8 {
+    if (std.mem.eql(u8, reason, "missing_chain_version") or std.mem.eql(u8, reason, "missing_chain_identity")) return "rac_v1";
+    if (std.mem.eql(u8, reason, "missing_artifact_state") or std.mem.eql(u8, reason, "artifact_state_stale")) return "artifact_state";
+    if (std.mem.eql(u8, reason, "missing_review_claim")) return "review_claim";
+    if (std.mem.eql(u8, reason, "missing_acceptance_contract") or std.mem.eql(u8, reason, "missing_horizon") or std.mem.eql(u8, reason, "missing_law_refs") or std.mem.eql(u8, reason, "outside_horizon") or std.mem.eql(u8, reason, "unrelated_or_rejected")) return "ac_horizon_relation";
+    if (std.mem.eql(u8, reason, "invalid_cex")) return "confirmed_cex";
+    if (std.mem.eql(u8, reason, "unsealed_batch")) return "sealed_batch";
+    if (std.mem.eql(u8, reason, "missing_ceb_class") or std.mem.eql(u8, reason, "ceb_class_not_accepted")) return "ceb_class";
+    if (std.mem.eql(u8, reason, "missing_mbk_or_rc") or std.mem.eql(u8, reason, "missing_transition")) return "mbk_transition";
+    if (std.mem.eql(u8, reason, "missing_proof_obligation")) return "proof_obligation";
+    if (std.mem.eql(u8, reason, "realization_not_allowed")) return "realization_allowed";
+    if (std.mem.eql(u8, reason, "mutation_gate_disagrees") or std.mem.eql(u8, reason, "incomplete_chain")) return "gate_mutation_allowed";
+    return reason;
+}
+
+fn allStringFieldsPresent(value: ?std.json.Value, fields: []const []const u8) bool {
+    const actual = value orelse return false;
+    for (fields) |field| {
+        const text = stringField(actual, field) orelse return false;
+        if (text.len == 0) return false;
+    }
+    return true;
+}
+
+fn nonEmptyStringFieldOpt(value: ?std.json.Value, key: []const u8) bool {
+    const actual = value orelse return false;
+    const text = stringField(actual, key) orelse return false;
+    return text.len != 0;
+}
+
+fn stringArrayNonEmpty(value_opt: ?std.json.Value) bool {
+    const value = value_opt orelse return false;
+    return switch (value) {
+        .array => |arr| blk: {
+            if (arr.items.len == 0) break :blk false;
+            for (arr.items) |item| switch (item) {
+                .string => |text| {
+                    if (text.len == 0) break :blk false;
+                },
+                else => break :blk false,
+            };
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+fn isMutationLiability(value: []const u8) bool {
+    return std.mem.eql(u8, value, "introduced_by_current_diff") or
+        std.mem.eql(u8, value, "exposed_and_required_by_current_acceptance") or
+        std.mem.eql(u8, value, "preexisting_but_blocks_current_invariant");
+}
+
+fn isMutationBatchMode(value: []const u8) bool {
+    return std.mem.eql(u8, value, "discovery") or std.mem.eql(u8, value, "conformance");
+}
+
+fn stringFieldOpt(value: ?std.json.Value, key: []const u8) ?[]const u8 {
+    return if (value) |actual| stringField(actual, key) else null;
+}
+
+fn boolFieldOpt(value: ?std.json.Value, key: []const u8) ?bool {
+    return if (value) |actual| boolField(actual, key) else null;
+}
+
+fn hasNonMutationDisposition(value: []const u8) bool {
+    return std.mem.eql(u8, value, "refuted") or std.mem.eql(u8, value, "stale") or std.mem.eql(u8, value, "outside_horizon") or std.mem.eql(u8, value, "contract_invalidating") or std.mem.eql(u8, value, "unknown");
+}
+
+fn nonMutationViolationsOnly(values: []const []const u8) bool {
+    for (values) |value| {
+        if (!std.mem.eql(u8, value, "invalid_cex") and !std.mem.eql(u8, value, "ceb_class_not_accepted") and !std.mem.eql(u8, value, "realization_not_allowed") and !std.mem.eql(u8, value, "mutation_gate_disagrees") and !std.mem.eql(u8, value, "outside_horizon") and !std.mem.eql(u8, value, "unrelated_or_rejected")) return false;
+    }
+    return true;
+}
+
+fn yamlScalarDup(allocator: std.mem.Allocator, text: []const u8, key: []const u8) ![]const u8 {
+    return allocator.dupe(u8, try yamlScalarTemp(text, key));
+}
+
+fn yamlScalarTemp(text: []const u8, key: []const u8) ![]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        if (!std.mem.eql(u8, name, key)) continue;
+        var value = yamlTrimInlineComment(std.mem.trim(u8, line[colon + 1 ..], " \t"));
+        if (value.len >= 2 and ((value[0] == '"' and value[value.len - 1] == '"') or (value[0] == '\'' and value[value.len - 1] == '\''))) value = value[1 .. value.len - 1];
+        return value;
+    }
+    return "";
+}
+
+fn yamlTrimInlineComment(value: []const u8) []const u8 {
+    var in_single = false;
+    var in_double = false;
+    for (value, 0..) |char, index| {
+        if (char == '\'' and !in_double) {
+            in_single = !in_single;
+        } else if (char == '"' and !in_single) {
+            in_double = !in_double;
+        } else if (char == '#' and !in_single and !in_double) {
+            return std.mem.trim(u8, value[0..index], " \t");
+        }
+    }
+    return std.mem.trim(u8, value, " \t");
+}
+
+fn yamlIndent(raw: []const u8) usize {
+    var count: usize = 0;
+    while (count < raw.len and raw[count] == ' ') count += 1;
+    return count;
+}
+
+fn yamlHasValue(text: []const u8, key: []const u8) bool {
+    return (yamlScalarTemp(text, key) catch "").len != 0;
+}
+
+fn yamlBool(text: []const u8, key: []const u8) ?bool {
+    const value = yamlScalarTemp(text, key) catch return null;
+    if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "yes")) return true;
+    if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "no")) return false;
+    return null;
+}
+
+fn yamlHasNonEmptyArray(text: []const u8, key: []const u8) bool {
+    const value = yamlScalarTemp(text, key) catch "";
+    if (value.len != 0 and !std.mem.eql(u8, value, "[]")) return true;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var saw_key = false;
+    var key_indent: usize = 0;
+    while (lines.next()) |raw| {
+        const line = raw;
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+        if (!saw_key) {
+            const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
+            const name = std.mem.trim(u8, trimmed[0..colon], " \t");
+            if (std.mem.eql(u8, name, key)) {
+                saw_key = true;
+                key_indent = yamlIndent(line);
+            }
+            continue;
+        }
+        const indent = yamlIndent(line);
+        if (indent <= key_indent) return false;
+        if (std.mem.startsWith(u8, trimmed, "- ")) {
+            const item = yamlTrimInlineComment(std.mem.trim(u8, trimmed[2..], " \t"));
+            return item.len != 0 and !std.mem.eql(u8, item, "null");
+        }
+    }
+    return false;
 }
 
 fn printSchema(allocator: std.mem.Allocator, args: Args) !u8 {
@@ -2572,6 +3611,7 @@ fn schemaRootName(artifact: []const u8) []const u8 {
     if (std.mem.eql(u8, artifact, "construct-map")) return "kernel_realization_map";
     if (std.mem.eql(u8, artifact, "proof-plan")) return "proof_plan";
     if (std.mem.eql(u8, artifact, "holdout")) return "holdout";
+    if (std.mem.eql(u8, artifact, "authority-chain")) return "resolve_authority_chain";
     return "minimum_behavioral_kernel_certificate";
 }
 
@@ -2590,6 +3630,7 @@ fn writeRequiredFields(writer: anytype, artifact: []const u8) !void {
     if (std.mem.eql(u8, artifact, "construct-map")) return writer.writeAll("[\"map_version\",\"kernel_fingerprint\",\"realization_tree_fingerprint\",\"constructs\",\"proof_actions\"]");
     if (std.mem.eql(u8, artifact, "proof-plan")) return writer.writeAll("[\"plan_version\",\"kernel_fingerprint\",\"realization_tree_fingerprint\",\"actions\"]");
     if (std.mem.eql(u8, artifact, "holdout")) return writer.writeAll("[\"holdout_version\",\"stage\",\"verdict\",\"refs\",\"gate\"]");
+    if (std.mem.eql(u8, artifact, "authority-chain")) return writer.writeAll("[\"resolve_authority_chain\",\"chain_version\",\"chain_id\",\"campaign_id\",\"artifact_state\",\"review_claim\",\"acceptance\",\"adjudication\",\"batch\",\"compression\",\"realization\",\"gate\"]");
     return writer.writeAll("[\"certificate_version\",\"certificate_id\",\"stage\",\"campaign\",\"acceptance\",\"observations\",\"kernel\",\"semantic_surface\",\"proof_basis\",\"delivery\",\"closure_horizon\",\"gate\"]");
 }
 
@@ -2608,6 +3649,7 @@ fn writeExampleValue(writer: anytype, artifact: []const u8) !void {
     if (std.mem.eql(u8, artifact, "construct-map")) return writer.writeAll("{\"map_version\":\"KRM-v1\",\"kernel_fingerprint\":\"sha256:kernel\",\"realization_tree_fingerprint\":\"sha256:tree\",\"constructs\":[],\"proof_actions\":[]}");
     if (std.mem.eql(u8, artifact, "proof-plan")) return writer.writeAll("{\"plan_version\":\"RCP-v1\",\"kernel_fingerprint\":\"sha256:kernel\",\"realization_tree_fingerprint\":\"sha256:tree\",\"actions\":[]}");
     if (std.mem.eql(u8, artifact, "holdout")) return writer.writeAll("{\"holdout_version\":\"RCH-v1\",\"stage\":\"kernel\",\"verdict\":\"clean\",\"refs\":[],\"gate\":{\"blocks\":false}}");
+    if (std.mem.eql(u8, artifact, "authority-chain")) return writer.writeAll("{\"resolve_authority_chain\":{\"chain_version\":\"RAC-v1\",\"chain_id\":\"RAC-example\",\"campaign_id\":\"c3-example\",\"artifact_state\":{\"base_sha\":\"base\",\"head_sha\":\"head\",\"dirty_fingerprint\":\"clean\",\"review_receipt\":\"review.example\"},\"review_claim\":{\"claim_id\":\"claim.example\",\"source\":\"review\",\"statement\":\"accepted finding\",\"suggested_repair\":\"owner-scoped repair\"},\"acceptance\":{\"contract_id\":\"ac.example\",\"contract_fingerprint\":\"sha256:ac\",\"horizon_fingerprint\":\"sha256:horizon\",\"law_refs\":[\"law.example\"],\"relation\":\"directly_entailed\"},\"adjudication\":{\"cex_id\":\"cex.example\",\"validity\":\"confirmed\",\"liability\":\"introduced_by_current_diff\",\"novelty\":\"new_equivalence_class\",\"disposition\":\"accepted\",\"minimal_trace_ref\":\"trace.example\"},\"batch\":{\"batch_id\":\"batch.example\",\"sealed\":true,\"mode\":\"conformance\"},\"compression\":{\"ceb_id\":\"basis.example\",\"class_id\":\"class.example\",\"class_status\":\"accepted\",\"quotient_witness_ref\":\"witness.example\",\"mbk_id\":\"mbk.example\",\"rc_id\":\"rc.example\",\"transition_ref\":\"transition.example\",\"proof_obligation_ref\":\"proof.example\"},\"realization\":{\"allowed\":true,\"target_owner\":\"owner.example\",\"target_boundary\":\"path:src/example.zig\",\"forbidden_expansions\":[]},\"gate\":{\"current_artifact_state\":\"yes\",\"complete_chain\":\"yes\",\"mutation_allowed\":\"yes\"}}}");
     return writer.writeAll("{\"minimum_behavioral_kernel_certificate\":{\"certificate_version\":\"MBKC-v1\",\"certificate_id\":\"sha256:canonical-content\",\"stage\":\"kernel_accepted\",\"campaign\":{},\"acceptance\":{},\"observations\":{},\"kernel\":{},\"kernel_review\":{},\"realization_designs\":{},\"selected_design\":{},\"realization_map\":{},\"semantic_surface\":{},\"proof_basis\":{},\"negative_evidence\":{},\"holdouts\":{},\"delivery\":{},\"closure_horizon\":{},\"gate\":{\"kernel_allowed\":true,\"realization_allowed\":false,\"apply_allowed\":false,\"commit_allowed\":false,\"push_allowed\":false,\"tuple_closure_allowed\":false,\"terminal_closure_allowed\":false}}}");
 }
 
@@ -5681,6 +6723,13 @@ fn containsString(items: []const []const u8, value: []const u8) bool {
     return false;
 }
 
+fn containsClosureCode(items: []const ClosureViolation, value: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item.code, value)) return true;
+    }
+    return false;
+}
+
 fn constructMapHasOrphan(value: std.json.Value) bool {
     const constructs = objectField(value, "constructs") orelse return true;
     return switch (constructs) {
@@ -6503,6 +7552,83 @@ test "parseArgs accepts canonical nested command tokens" {
     const reduction_args = try parseArgs(&reduction);
     try std.testing.expectEqual(Command.reduction_accept, reduction_args.command);
     try std.testing.expectEqualStrings("/tmp/repo", reduction_args.cwd);
+
+    const authority_init = [_][]const u8{
+        "resolve-c3",
+        "authority-chain",
+        "init",
+        "--campaign",
+        "campaign.one",
+        "--artifact-state",
+        "artifact-state.json",
+        "--review-claim",
+        "claim.json",
+        "--acceptance",
+        "ac-v2.json",
+        "--cex",
+        "cex-v1.json",
+        "--batch",
+        "rb-v1.json",
+        "--basis",
+        "ceb-v2.json",
+        "--kernel",
+        "mbk-v1.json",
+        "--reduction",
+        "rc-v1.json",
+        "--proof-obligation",
+        "proof.one",
+        "--realization-target",
+        "target.json",
+        "--output",
+        "rac.yaml",
+    };
+    const authority_init_args = try parseArgs(&authority_init);
+    try std.testing.expectEqual(Command.authority_chain_init, authority_init_args.command);
+    try std.testing.expectEqualStrings("campaign.one", authority_init_args.campaign_id.?);
+    try std.testing.expectEqualStrings("artifact-state.json", authority_init_args.artifact_state.?);
+    try std.testing.expectEqualStrings("claim.json", authority_init_args.review_claim.?);
+    try std.testing.expectEqualStrings("ac-v2.json", authority_init_args.acceptance.?);
+    try std.testing.expectEqualStrings("cex-v1.json", authority_init_args.cex.?);
+    try std.testing.expectEqualStrings("rb-v1.json", authority_init_args.batch.?);
+    try std.testing.expectEqualStrings("ceb-v2.json", authority_init_args.basis.?);
+    try std.testing.expectEqualStrings("mbk-v1.json", authority_init_args.kernel.?);
+    try std.testing.expectEqualStrings("rc-v1.json", authority_init_args.reduction.?);
+    try std.testing.expectEqualStrings("proof.one", authority_init_args.proof_obligation.?);
+    try std.testing.expectEqualStrings("target.json", authority_init_args.realization_target.?);
+    try std.testing.expectEqualStrings("rac.yaml", authority_init_args.output.?);
+
+    const authority_check = [_][]const u8{
+        "resolve-c3",
+        "authority-chain",
+        "check",
+        "--chain",
+        "rac.yaml",
+        "--format",
+        "json",
+    };
+    const authority_check_args = try parseArgs(&authority_check);
+    try std.testing.expectEqual(Command.authority_chain_check, authority_check_args.command);
+    try std.testing.expectEqualStrings("rac.yaml", authority_check_args.chain.?);
+    try std.testing.expectEqualStrings("json", authority_check_args.format.?);
+
+    const mutation_gate = [_][]const u8{
+        "resolve-c3",
+        "mutation-gate",
+        "--campaign",
+        "campaign",
+        "--review-claim-id",
+        "claim",
+        "--artifact-state",
+        "artifact-state.json",
+        "--format",
+        "json",
+    };
+    const mutation_gate_args = try parseArgs(&mutation_gate);
+    try std.testing.expectEqual(Command.mutation_gate, mutation_gate_args.command);
+    try std.testing.expectEqualStrings("campaign", mutation_gate_args.campaign_id.?);
+    try std.testing.expectEqualStrings("claim", mutation_gate_args.review_claim_id.?);
+    try std.testing.expectEqualStrings("artifact-state.json", mutation_gate_args.artifact_state.?);
+    try std.testing.expectEqualStrings("json", mutation_gate_args.format.?);
 }
 
 test "schema discovery advertises intent closed artifacts" {
@@ -6523,8 +7649,403 @@ test "schema discovery advertises intent closed artifacts" {
     try std.testing.expect(knownSchemaArtifact("counterexample-basis-v2"));
     try std.testing.expect(knownSchemaArtifact("review-potential"));
     try std.testing.expect(knownSchemaArtifact("kernel"));
+    try std.testing.expect(knownSchemaArtifact("authority-chain"));
     try std.testing.expect(knownSchemaArtifact("mbkc"));
     try std.testing.expect(!knownSchemaArtifact("candidate"));
+    try std.testing.expectEqualStrings("resolve_authority_chain", schemaRootName("authority-chain"));
+
+    var rac_fields_out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer rac_fields_out.deinit();
+    try writeRequiredFields(&rac_fields_out.writer, "authority-chain");
+    const rac_fields = try rac_fields_out.toOwnedSlice();
+    defer std.testing.allocator.free(rac_fields);
+    try std.testing.expect(std.mem.containsAtLeast(u8, rac_fields, 1, "resolve_authority_chain"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, rac_fields, 1, "chain_version"));
+}
+
+fn validRacFactsForTest() RacFacts {
+    return .{
+        .chain_id = "RAC-test",
+        .campaign_id = "campaign-test",
+        .chain_version_ok = true,
+        .artifact_state_complete = true,
+        .review_claim_present = true,
+        .acceptance_contract_present = true,
+        .horizon_present = true,
+        .law_refs_present = true,
+        .relation = "directly_entailed",
+        .cex_confirmed = true,
+        .adjudication_disposition = "accepted",
+        .batch_sealed = true,
+        .ceb_class_present = true,
+        .ceb_class_accepted = true,
+        .mbk_present = true,
+        .rc_present = true,
+        .transition_present = true,
+        .proof_obligation_present = true,
+        .realization_allowed = true,
+        .gate_current_yes = true,
+        .gate_complete_yes = true,
+        .gate_mutation_yes = true,
+    };
+}
+
+fn expectRacReason(facts: RacFacts, reason: []const u8) !void {
+    var missing = std.ArrayList([]const u8).empty;
+    defer missing.deinit(std.testing.allocator);
+    var violations = std.ArrayList([]const u8).empty;
+    defer violations.deinit(std.testing.allocator);
+    try validateRacFacts(std.testing.allocator, facts, &missing, &violations);
+    try std.testing.expect(containsString(missing.items, reason) or containsString(violations.items, reason));
+}
+
+test "RAC-v1 validation covers fail-closed reasons" {
+    const valid = validRacFactsForTest();
+    var missing = std.ArrayList([]const u8).empty;
+    defer missing.deinit(std.testing.allocator);
+    var violations = std.ArrayList([]const u8).empty;
+    defer violations.deinit(std.testing.allocator);
+    try validateRacFacts(std.testing.allocator, valid, &missing, &violations);
+    try std.testing.expectEqual(@as(usize, 0), missing.items.len);
+    try std.testing.expectEqual(@as(usize, 0), violations.items.len);
+
+    var missing_chain = valid;
+    missing_chain.chain_version_ok = false;
+    try expectRacReason(missing_chain, "missing_chain_version");
+
+    var missing_identity = valid;
+    missing_identity.chain_id = "";
+    try expectRacReason(missing_identity, "missing_chain_identity");
+
+    var missing_artifact = valid;
+    missing_artifact.artifact_state_complete = false;
+    try expectRacReason(missing_artifact, "missing_artifact_state");
+
+    var missing_claim = valid;
+    missing_claim.review_claim_present = false;
+    try expectRacReason(missing_claim, "missing_review_claim");
+
+    var missing_acceptance = valid;
+    missing_acceptance.acceptance_contract_present = false;
+    try expectRacReason(missing_acceptance, "missing_acceptance_contract");
+
+    var missing_horizon = valid;
+    missing_horizon.horizon_present = false;
+    try expectRacReason(missing_horizon, "missing_horizon");
+
+    var missing_laws = valid;
+    missing_laws.law_refs_present = false;
+    try expectRacReason(missing_laws, "missing_law_refs");
+
+    var outside = valid;
+    outside.relation = "outside_horizon";
+    try expectRacReason(outside, "outside_horizon");
+
+    var contract_invalidating = valid;
+    contract_invalidating.relation = "contract_invalidating";
+    try expectRacReason(contract_invalidating, "outside_horizon");
+
+    var unrelated = valid;
+    unrelated.relation = "unrelated";
+    try expectRacReason(unrelated, "unrelated_or_rejected");
+
+    var invalid_cex = valid;
+    invalid_cex.cex_confirmed = false;
+    try expectRacReason(invalid_cex, "invalid_cex");
+
+    var unsealed = valid;
+    unsealed.batch_sealed = false;
+    try expectRacReason(unsealed, "unsealed_batch");
+
+    var missing_class = valid;
+    missing_class.ceb_class_present = false;
+    try expectRacReason(missing_class, "missing_ceb_class");
+
+    var rejected_class = valid;
+    rejected_class.ceb_class_accepted = false;
+    try expectRacReason(rejected_class, "ceb_class_not_accepted");
+
+    var missing_mbk = valid;
+    missing_mbk.mbk_present = false;
+    try expectRacReason(missing_mbk, "missing_mbk_or_rc");
+
+    var missing_transition = valid;
+    missing_transition.transition_present = false;
+    try expectRacReason(missing_transition, "missing_transition");
+
+    var missing_proof = valid;
+    missing_proof.proof_obligation_present = false;
+    try expectRacReason(missing_proof, "missing_proof_obligation");
+
+    var stale = valid;
+    stale.gate_current_yes = false;
+    try expectRacReason(stale, "artifact_state_stale");
+
+    var not_allowed = valid;
+    not_allowed.realization_allowed = false;
+    try expectRacReason(not_allowed, "realization_not_allowed");
+
+    var disagrees = valid;
+    disagrees.gate_mutation_yes = false;
+    try expectRacReason(disagrees, "mutation_gate_disagrees");
+
+    var incomplete = valid;
+    incomplete.gate_complete_yes = false;
+    try expectRacReason(incomplete, "incomplete_chain");
+    try std.testing.expect(!nonMutationViolationsOnly(&.{"incomplete_chain"}));
+}
+
+test "RAC-v1 parser accepts JSON and YAML facts" {
+    const json_text =
+        \\{"resolve_authority_chain":{"chain_version":"RAC-v1","chain_id":"RAC-json","campaign_id":"campaign-json","artifact_state":{"base_sha":"b","head_sha":"h","dirty_fingerprint":"clean","review_receipt":"rr"},"review_claim":{"claim_id":"claim","source":"review","statement":"accepted finding"},"acceptance":{"contract_id":"ac","contract_fingerprint":"sha256:ac","horizon_fingerprint":"sha256:h","law_refs":["law"],"relation":"directly_entailed"},"adjudication":{"cex_id":"cex","validity":"confirmed","liability":"introduced_by_current_diff","novelty":"new_equivalence_class","disposition":"accepted","minimal_trace_ref":"trace"},"batch":{"batch_id":"batch","sealed":true,"mode":"conformance"},"compression":{"ceb_id":"ceb","class_id":"class","class_status":"accepted","quotient_witness_ref":"w","mbk_id":"mbk","rc_id":"rc","transition_ref":"t","proof_obligation_ref":"p"},"realization":{"allowed":true,"target_owner":"owner","target_boundary":"path:src"},"gate":{"current_artifact_state":"yes","complete_chain":"yes","mutation_allowed":"yes"}}}
+    ;
+    const json_facts = try parseRacFacts(std.testing.allocator, json_text);
+    defer deinitParsedRacFacts(std.testing.allocator, json_facts);
+    try std.testing.expect(json_facts.chain_version_ok);
+    try std.testing.expectEqualStrings("RAC-json", json_facts.chain_id);
+    try std.testing.expectEqualStrings("b", json_facts.artifact_base_sha);
+    try std.testing.expectEqualStrings("claim", json_facts.review_claim_id);
+    try std.testing.expect(json_facts.realization_allowed);
+
+    const yaml_text =
+        \\resolve_authority_chain:
+        \\  chain_version: RAC-v1
+        \\  chain_id: RAC-yaml
+        \\  campaign_id: campaign-yaml
+        \\  artifact_state:
+        \\    base_sha: b
+        \\    head_sha: h
+        \\    dirty_fingerprint: clean
+        \\    review_receipt: rr
+        \\  review_claim:
+        \\    claim_id: claim
+        \\    source: review
+        \\    statement: accepted finding
+        \\  acceptance:
+        \\    contract_id: ac
+        \\    contract_fingerprint: sha256:ac
+        \\    horizon_fingerprint: sha256:h
+        \\    law_refs:
+        \\      - law
+        \\    relation: directly_entailed
+        \\  adjudication:
+        \\    cex_id: cex
+        \\    validity: confirmed
+        \\    liability: introduced_by_current_diff
+        \\    novelty: new_equivalence_class
+        \\    disposition: accepted
+        \\    minimal_trace_ref: trace
+        \\  batch:
+        \\    batch_id: batch
+        \\    sealed: true
+        \\    mode: conformance
+        \\  compression:
+        \\    ceb_id: ceb
+        \\    class_id: class
+        \\    class_status: accepted
+        \\    quotient_witness_ref: w
+        \\    mbk_id: mbk
+        \\    rc_id: rc
+        \\    transition_ref: t
+        \\    proof_obligation_ref: p
+        \\  realization:
+        \\    allowed: true
+        \\    target_owner: owner
+        \\    target_boundary: path:src
+        \\  gate:
+        \\    current_artifact_state: yes
+        \\    complete_chain: yes
+        \\    mutation_allowed: yes
+    ;
+    const yaml_facts = try parseRacFacts(std.testing.allocator, yaml_text);
+    defer deinitParsedRacFacts(std.testing.allocator, yaml_facts);
+    try std.testing.expect(yaml_facts.chain_version_ok);
+    try std.testing.expectEqualStrings("RAC-yaml", yaml_facts.chain_id);
+    try std.testing.expectEqualStrings("h", yaml_facts.artifact_head_sha);
+    try std.testing.expectEqualStrings("claim", yaml_facts.review_claim_id);
+    try std.testing.expect(yaml_facts.law_refs_present);
+    try std.testing.expect(yaml_facts.gate_mutation_yes);
+
+    const commented_yaml =
+        \\resolve_authority_chain:
+        \\  chain_version: RAC-v1 # generated
+        \\  chain_id: RAC-yaml
+        \\  campaign_id: campaign-yaml
+        \\  artifact_state:
+        \\    base_sha: b
+        \\    head_sha: h
+        \\    dirty_fingerprint: clean
+        \\    review_receipt: rr
+        \\  review_claim:
+        \\    claim_id: claim
+        \\    source: review
+        \\    statement: accepted finding
+        \\  acceptance:
+        \\    contract_id: ac
+        \\    contract_fingerprint: sha256:ac
+        \\    horizon_fingerprint: sha256:h
+        \\    law_refs:
+        \\      - law # accepted law
+        \\    relation: directly_entailed
+        \\  adjudication:
+        \\    cex_id: cex
+        \\    validity: confirmed
+        \\    liability: introduced_by_current_diff
+        \\    novelty: new_equivalence_class
+        \\    disposition: accepted
+        \\    minimal_trace_ref: trace
+        \\  batch:
+        \\    batch_id: batch
+        \\    sealed: true
+        \\    mode: conformance
+        \\  compression:
+        \\    ceb_id: ceb
+        \\    class_id: class
+        \\    class_status: accepted
+        \\    quotient_witness_ref: w
+        \\    mbk_id: mbk
+        \\    rc_id: rc
+        \\    transition_ref: t
+        \\    proof_obligation_ref: p
+        \\  realization:
+        \\    allowed: true
+        \\    target_owner: owner
+        \\    target_boundary: path:src
+        \\  gate:
+        \\    current_artifact_state: yes
+        \\    complete_chain: yes
+        \\    mutation_allowed: yes
+    ;
+    const commented_facts = try parseRacFacts(std.testing.allocator, commented_yaml);
+    defer deinitParsedRacFacts(std.testing.allocator, commented_facts);
+    try std.testing.expect(commented_facts.chain_version_ok);
+    try std.testing.expect(commented_facts.law_refs_present);
+
+    const empty_laws_yaml =
+        \\resolve_authority_chain:
+        \\  chain_version: RAC-v1
+        \\  chain_id: RAC-yaml
+        \\  campaign_id: campaign-yaml
+        \\  acceptance:
+        \\    law_refs:
+        \\    relation: directly_entailed
+        \\  realization:
+        \\    forbidden_expansions:
+        \\      - unrelated-list-item
+    ;
+    const empty_laws_facts = try parseRacFacts(std.testing.allocator, empty_laws_yaml);
+    defer deinitParsedRacFacts(std.testing.allocator, empty_laws_facts);
+    try std.testing.expect(!empty_laws_facts.law_refs_present);
+}
+
+test "mutation-gate blocks valid non-mutation RAC and normalizes reasons" {
+    var facts = validRacFactsForTest();
+    var missing = std.ArrayList([]const u8).empty;
+    defer missing.deinit(std.testing.allocator);
+    var violations = std.ArrayList([]const u8).empty;
+    defer violations.deinit(std.testing.allocator);
+    try validateRacFacts(std.testing.allocator, facts, &missing, &violations);
+    try std.testing.expectEqual(@as(usize, 0), missing.items.len);
+    try std.testing.expectEqual(@as(usize, 0), violations.items.len);
+
+    facts.realization_allowed = false;
+    facts.gate_mutation_yes = false;
+    try validateRacFacts(std.testing.allocator, facts, &missing, &violations);
+    if (!facts.gate_mutation_yes) try violations.append(std.testing.allocator, "mutation_gate_disagrees");
+    var normalized = std.ArrayList([]const u8).empty;
+    defer normalized.deinit(std.testing.allocator);
+    try appendMutationGateReasons(std.testing.allocator, &normalized, missing.items);
+    try appendMutationGateReasons(std.testing.allocator, &normalized, violations.items);
+    try std.testing.expect(containsString(normalized.items, "realization_allowed"));
+    try std.testing.expect(containsString(normalized.items, "gate_mutation_allowed"));
+}
+
+test "mutation-gate integrated mode compares supplied artifact state" {
+    const json_text =
+        \\{"resolve_authority_chain":{"chain_version":"RAC-v1","chain_id":"RAC-json","campaign_id":"campaign-json","artifact_state":{"base_sha":"b","head_sha":"h","dirty_fingerprint":"clean","review_receipt":"rr"},"review_claim":{"claim_id":"claim","source":"review","statement":"accepted finding"},"acceptance":{"contract_id":"ac","contract_fingerprint":"sha256:ac","horizon_fingerprint":"sha256:h","law_refs":["law"],"relation":"directly_entailed"},"adjudication":{"cex_id":"cex","validity":"confirmed","liability":"introduced_by_current_diff","novelty":"new_equivalence_class","disposition":"accepted","minimal_trace_ref":"trace"},"batch":{"batch_id":"batch","sealed":true,"mode":"conformance"},"compression":{"ceb_id":"ceb","class_id":"class","class_status":"accepted","quotient_witness_ref":"w","mbk_id":"mbk","rc_id":"rc","transition_ref":"t","proof_obligation_ref":"p"},"realization":{"allowed":true,"target_owner":"owner","target_boundary":"path:src"},"gate":{"current_artifact_state":"yes","complete_chain":"yes","mutation_allowed":"yes"}}}
+    ;
+    const facts = try parseRacFacts(std.testing.allocator, json_text);
+    defer deinitParsedRacFacts(std.testing.allocator, facts);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(Io, .{
+        .sub_path = "artifact-state.json",
+        .data = "{\"base_sha\":\"b\",\"head_sha\":\"h\",\"dirty_fingerprint\":\"clean\",\"review_receipt\":\"rr\"}\n",
+    });
+    try tmp.dir.writeFile(Io, .{
+        .sub_path = "stale.json",
+        .data = "{\"base_sha\":\"b\",\"head_sha\":\"stale\",\"dirty_fingerprint\":\"clean\",\"review_receipt\":\"rr\"}\n",
+    });
+    const cwd = try tmp.dir.realPathFileAlloc(Io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const good_path = try std.fs.path.join(std.testing.allocator, &.{ cwd, "artifact-state.json" });
+    defer std.testing.allocator.free(good_path);
+    const stale_path = try std.fs.path.join(std.testing.allocator, &.{ cwd, "stale.json" });
+    defer std.testing.allocator.free(stale_path);
+
+    try std.testing.expect(try artifactStateMatches(std.testing.allocator, good_path, facts));
+    try std.testing.expect(!try artifactStateMatches(std.testing.allocator, stale_path, facts));
+}
+
+test "closure-gate blocks material authority gaps" {
+    const json_text =
+        \\{"campaign_id":"C3-test","run_id":"run-1","c3_required":true,"c3_entered":false,"c3_closed":false,"compression_state":"NONE","finding_bearing_workflow":true,"batches_total":0,"open_batch_ids":["RB-open"],"kernel":{"accepted":false},"potential":{"strict_progress":0},"delivery_closed":false,"terminal_closed":false,"orphan_code_constructs":1,"unmapped_proof_actions":1,"wound_specific_tests":1,"semantic_surface_delta":1,"conformance":{"novel_in_horizon_counterexamples":1},"terminal_holdout":{"unknown_counterexamples":1},"proof_basis":{"all_laws_covered":"no"},"delivery":{"current_head_validation_passed":"no"}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_text, .{});
+    defer parsed.deinit();
+
+    var violations = std.ArrayList(ClosureViolation).empty;
+    defer deinitClosureViolations(std.testing.allocator, &violations);
+    try collectClosureRunViolations(std.testing.allocator, parsed.value, &violations);
+
+    try std.testing.expect(containsClosureCode(violations.items, "compression_state_none"));
+    try std.testing.expect(containsClosureCode(violations.items, "c3_required_without_c3_closure"));
+    try std.testing.expect(containsClosureCode(violations.items, "c3_required_without_c3_entry"));
+    try std.testing.expect(containsClosureCode(violations.items, "finding_workflow_without_batches"));
+    try std.testing.expect(containsClosureCode(violations.items, "open_batches"));
+    try std.testing.expect(containsClosureCode(violations.items, "delivery_not_closed"));
+    try std.testing.expect(containsClosureCode(violations.items, "delivery_closed_without_terminal_closure"));
+    try std.testing.expect(containsClosureCode(violations.items, "strict_progress_zero"));
+    try std.testing.expect(containsClosureCode(violations.items, "kernel_not_accepted"));
+    try std.testing.expect(containsClosureCode(violations.items, "orphan_code_constructs"));
+    try std.testing.expect(containsClosureCode(violations.items, "unmapped_proof_actions"));
+    try std.testing.expect(containsClosureCode(violations.items, "unmapped_wound_specific_tests"));
+    try std.testing.expect(containsClosureCode(violations.items, "semantic_surface_delta_without_ac_rebase"));
+    try std.testing.expect(containsClosureCode(violations.items, "unresolved_conformance_evidence"));
+    try std.testing.expect(containsClosureCode(violations.items, "unresolved_terminal_holdout_evidence"));
+    try std.testing.expect(containsClosureCode(violations.items, "proof_or_delivery_not_current"));
+}
+
+test "closure-gate permits healthy material row helpers" {
+    const json_text =
+        \\{"campaign_id":"C3-test","run_id":"run-1","c3_required":true,"c3_entered":true,"c3_closed":true,"compression_state":"CEB-v2","finding_bearing_workflow":true,"batches_total":2,"kernel":{"accepted":true},"potential":{"strict_progress":1},"delivery_closed":true,"terminal_closed":true,"orphan_code_constructs":0,"unmapped_proof_actions":0,"wound_specific_tests":1,"wound_specific_tests_class_mapped":true,"semantic_surface_delta":1,"explicit_ac_rebase":true}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_text, .{});
+    defer parsed.deinit();
+
+    var violations = std.ArrayList(ClosureViolation).empty;
+    defer deinitClosureViolations(std.testing.allocator, &violations);
+    try collectClosureRunViolations(std.testing.allocator, parsed.value, &violations);
+
+    try std.testing.expect(closureMaterial(parsed.value));
+    try std.testing.expectEqual(@as(usize, 0), violations.items.len);
+}
+
+test "RAC-v1 non-mutation route can be valid without mutation authority" {
+    var facts = validRacFactsForTest();
+    facts.cex_confirmed = false;
+    facts.adjudication_disposition = "refuted";
+    facts.realization_allowed = false;
+    facts.gate_mutation_yes = false;
+    var missing = std.ArrayList([]const u8).empty;
+    defer missing.deinit(std.testing.allocator);
+    var violations = std.ArrayList([]const u8).empty;
+    defer violations.deinit(std.testing.allocator);
+    try validateRacFacts(std.testing.allocator, facts, &missing, &violations);
+    try std.testing.expectEqual(@as(usize, 0), missing.items.len);
+    try std.testing.expect(hasNonMutationDisposition(facts.adjudication_disposition));
+    try std.testing.expect(nonMutationViolationsOnly(violations.items));
 }
 
 test "initial material state writes v3 intent closed protocol projection" {
