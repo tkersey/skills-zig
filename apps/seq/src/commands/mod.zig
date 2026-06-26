@@ -866,6 +866,7 @@ const Options = struct {
     command_action: ?[]const u8 = null,
     include_workers: bool = false,
     include_excerpts: bool = false,
+    emit_count_evidence: bool = false,
     index_mode: []const u8 = "auto",
     actuation_strict: bool = false,
     execution_policy_strict: bool = false,
@@ -1147,10 +1148,11 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\  raw $resolve mentions are denominator candidates only; true sessions require assistant workflow or tool evidence
         ,
         .review_compiler_audit =>
-        \\usage: seq review-compiler-audit [--protocol auto|legacy-cleanroom|c3|c3-mrpc|mbk|mbk-v1-legacy-open-horizon|intent-closed-cegis-v1|mixed|none] [--mode summary|runs|batches|counterexamples|potential|closure|report|evidence] --since <iso> --until <iso> --repo <path> [--artifact-root <path>] [--strict] [--exclude-current] [--format table|json|jsonl|markdown]
+        \\usage: seq review-compiler-audit [--protocol auto|legacy-cleanroom|c3|c3-mrpc|mbk|mbk-v1-legacy-open-horizon|intent-closed-cegis-v1|mixed|none] [--mode summary|runs|batches|counterexamples|potential|closure|report|evidence] [--emit-count-evidence] --since <iso> --until <iso> --repo <path> [--artifact-root <path>] [--strict] [--exclude-current] [--format table|json|jsonl|markdown]
         \\extra options:
         \\  --protocol <name>         auto (default) | legacy-cleanroom | c3 | c3-mrpc | mbk | mbk-v1-legacy-open-horizon | intent-closed-cegis-v1 | mixed | none
         \\  --mode <name>             summary (default) | runs | batches | counterexamples | potential | closure | report | evidence
+        \\  --emit-count-evidence     Emit per-count evidence rows; equivalent to --mode evidence
         \\  --artifact-root <path>    Include controller artifact root in corpus/report metadata
         \\  --strict                  Exit 2 for hard current intent-closed/C3 closure failures
         \\  --repo <path>             Match session cwd/tool cwd against this repo root or descendants
@@ -1182,7 +1184,7 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\usage: seq goal-audit [--mode summary|rows] [--workflow review|resolve|review,resolve] [--duration-gte <seconds|minutes|hours>] [--status <name>] [--contains <text>] [--since <iso>] [--until <iso>] [--path <jsonl>|--session-id <id>] [--exclude-current] [--show-query] [--limit N] [--format table|json|csv|jsonl]
         ,
         .workflow_audit =>
-        \\usage: seq workflow-audit --workflow <name> [--mode summary|signals|outcomes|sessions|report|term-summary|cohort-report] [--term-group <name=csv>] [--examples N] [--unique-by snippet|path-snippet] [--last <Nm|Nh|Nd>|--since <iso>] [--until <iso>] [--exclude-current] [--workdir <path>] [--limit N] [--format table|json|csv|jsonl|markdown]
+        \\usage: seq workflow-audit --workflow <name> [--mode summary|signals|outcomes|sessions|report|term-summary|cohort-report|provenance] [--term-group <name=csv>] [--examples N] [--unique-by snippet|path-snippet] [--last <Nm|Nh|Nd>|--since <iso>] [--until <iso>] [--exclude-current] [--workdir <path>] [--limit N] [--format table|json|csv|jsonl|markdown]
         ,
         .workflow_overlap =>
         \\usage: seq workflow-overlap --workflow <a,b> [--mode summary|sessions] [--since <iso>] [--until <iso>] [--workdir <path>] [--limit N] [--format table|json|csv|jsonl]
@@ -1712,6 +1714,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.include_raw, supports_include_raw, "--include-raw", cmd);
     try ensureOptionAllowed(opts.include_workers, cmd == .skill_decision_audit or cmd == .decision_capsule or cmd == .actuation_audit or cmd == .execution_policy_audit, "--include-workers", cmd);
     try ensureOptionAllowed(opts.include_excerpts, cmd == .skill_decision_audit or cmd == .decision_capsule or cmd == .actuation_audit, "--include-excerpts", cmd);
+    try ensureOptionAllowed(opts.emit_count_evidence, cmd == .review_compiler_audit, "--emit-count-evidence", cmd);
     try ensureOptionAllowed(opts.actuation_strict, cmd == .actuation_audit, "--strict", cmd);
     try ensureOptionAllowed(opts.execution_policy_strict, cmd == .execution_policy_audit, "--strict", cmd);
     try ensureOptionAllowed(opts.st_workspace_strict, cmd == .st_workspace_audit, "--strict", cmd);
@@ -2118,7 +2121,8 @@ fn isValidWorkflowAuditMode(text: []const u8) bool {
         std.mem.eql(u8, text, "sessions") or
         std.mem.eql(u8, text, "report") or
         std.mem.eql(u8, text, "cohort-report") or
-        std.mem.eql(u8, text, "term-summary");
+        std.mem.eql(u8, text, "term-summary") or
+        std.mem.eql(u8, text, "provenance");
 }
 
 fn isValidSkillBlocksMode(text: []const u8) bool {
@@ -3228,6 +3232,9 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
             \\      "dcp_validation_v1": true,
             \\      "review_compiler_provenance_v1": true,
             \\      "review_compiler_run_ledger_v1": true,
+            \\      "c3_count_evidence_refs_v1": true,
+            \\      "workflow_filename_false_positive_guard_v1": true,
+            \\      "workflow_provenance_mode_v1": true,
             \\      "resolve_acceptance_contract_v2": true,
             \\      "resolve_review_batch_v1": true,
             \\      "resolve_review_aperture_v1": true,
@@ -3241,6 +3248,10 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
             \\      "actuation_audit_v1": true,
             \\      "execution_policy_audit_v1": true,
             \\      "st_workspace_audit_v1": true,
+            \\      "st_graph_control_receipt_v1": true,
+            \\      "st_graph_repair_receipt_v1": true,
+            \\      "st_artifact_maintenance_receipt_v1": true,
+            \\      "st_ledger_only_detection_v1": true,
             \\      "st_workspace_dataset_v1": true,
             \\      "st_plan_namespace_v1": true,
             \\      "st_claim_fencing_v1": true,
@@ -3290,6 +3301,9 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
         .{ .name = "dcp_validation_v1", .enabled = true },
         .{ .name = "review_compiler_provenance_v1", .enabled = true },
         .{ .name = "review_compiler_run_ledger_v1", .enabled = true },
+        .{ .name = "c3_count_evidence_refs_v1", .enabled = true },
+        .{ .name = "workflow_filename_false_positive_guard_v1", .enabled = true },
+        .{ .name = "workflow_provenance_mode_v1", .enabled = true },
         .{ .name = "resolve_acceptance_contract_v2", .enabled = true },
         .{ .name = "resolve_review_batch_v1", .enabled = true },
         .{ .name = "resolve_review_aperture_v1", .enabled = true },
@@ -3303,6 +3317,10 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
         .{ .name = "actuation_audit_v1", .enabled = true },
         .{ .name = "execution_policy_audit_v1", .enabled = true },
         .{ .name = "st_workspace_audit_v1", .enabled = true },
+        .{ .name = "st_graph_control_receipt_v1", .enabled = true },
+        .{ .name = "st_graph_repair_receipt_v1", .enabled = true },
+        .{ .name = "st_artifact_maintenance_receipt_v1", .enabled = true },
+        .{ .name = "st_ledger_only_detection_v1", .enabled = true },
         .{ .name = "st_workspace_dataset_v1", .enabled = true },
         .{ .name = "st_plan_namespace_v1", .enabled = true },
         .{ .name = "st_claim_fencing_v1", .enabled = true },
@@ -5709,6 +5727,7 @@ const workflow_audit_summary_columns = [_][]const u8{ "source_kind", "signal_kin
 const workflow_audit_signal_columns = [_][]const u8{ "timestamp", "path", "source_kind", "signal_kind", "name", "outcome_kind", "snippet", "contamination_flags" };
 const workflow_audit_outcome_columns = [_][]const u8{ "outcome_kind", "mentions", "sessions" };
 const workflow_audit_session_columns = [_][]const u8{ "path", "signals", "first_seen", "last_seen" };
+const workflow_audit_provenance_columns = [_][]const u8{ "session_id", "workflow_name", "evidence_class", "source", "timestamp", "ref", "reason", "path" };
 const workflow_audit_term_summary_columns = [_][]const u8{ "term_group", "terms", "matched_rows", "unique_snippets", "sessions", "examples" };
 const skill_block_term_count_columns = [_][]const u8{ "skill", "block_hash", "term_group", "terms", "matched", "term_occurrence_count", "block_occurrence_count", "first_seen_timestamp", "last_seen_timestamp" };
 const skill_block_term_summary_columns = [_][]const u8{ "skill", "term_group", "terms", "blocks_scanned", "matching_blocks", "term_occurrence_count", "examples" };
@@ -5766,6 +5785,20 @@ fn cmdWorkflowAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opt
     if (std.mem.eql(u8, mode, "term-summary")) {
         if (fmt == .markdown) return error.InvalidFormatForCommand;
         return cmdWorkflowTermSummaryRaw(allocator, sessions_root, opts, fmt);
+    }
+
+    if (std.mem.eql(u8, mode, "provenance")) {
+        var rows = try collectWorkflowProvenanceRows(allocator, sessions_root, opts);
+        defer deinitQueryRows(allocator, &rows);
+        const query_spec = try workflowAuditQueryForMode(mode, opts.limit);
+        var result = try query.execute(allocator, rows.items, query_spec);
+        defer result.deinit(allocator);
+        if (fmt == .markdown) {
+            try writeWorkflowAuditModeMarkdown(allocator, workflow, mode, result.rows.items, workflowAuditColumnsForMode(mode) orelse return error.InvalidModeArg, opts.out_path);
+            return;
+        }
+        try output.writeOutput(allocator, fmt, result.rows.items, workflowAuditColumnsForMode(mode), opts.out_path);
+        return;
     }
 
     var rows = try collectWorkflowAuditRows(allocator, sessions_root, opts);
@@ -5852,6 +5885,14 @@ fn workflowAuditQueryForMode(mode: []const u8, limit: usize) !spec.QuerySpec {
         };
     }
 
+    if (std.mem.eql(u8, mode, "provenance")) {
+        return .{
+            .select = workflow_audit_provenance_columns[0..],
+            .sort = &.{.{ .field = "timestamp", .descending = true }},
+            .limit = if (limit > 0) limit else 100,
+        };
+    }
+
     return error.InvalidModeArg;
 }
 
@@ -5862,8 +5903,67 @@ fn workflowAuditColumnsForMode(mode: []const u8) ?[]const []const u8 {
     if (std.mem.eql(u8, mode, "sessions")) return workflow_audit_session_columns[0..];
     if (std.mem.eql(u8, mode, "report")) return workflow_audit_signal_columns[0..];
     if (std.mem.eql(u8, mode, "cohort-report")) return workflow_audit_signal_columns[0..];
+    if (std.mem.eql(u8, mode, "provenance")) return workflow_audit_provenance_columns[0..];
     if (std.mem.eql(u8, mode, "term-summary")) return workflow_audit_term_summary_columns[0..];
     return null;
+}
+
+fn collectWorkflowProvenanceRows(
+    allocator: std.mem.Allocator,
+    sessions_root: []const u8,
+    opts: Options,
+) !std.ArrayList(query.Row) {
+    const workflow = opts.workflow orelse return error.MissingWorkflowArg;
+
+    var workdir_paths = StringSet.init(allocator);
+    var has_workdir_filter = false;
+    defer if (has_workdir_filter) workdir_paths.deinit();
+    if (opts.workdir_text != null) {
+        has_workdir_filter = true;
+        try collectWorkdirSessionPaths(allocator, sessions_root, opts, &workdir_paths);
+    }
+
+    const day_filter = deriveSessionDayPathFilter("workflow_provenance", &.{});
+    var paths = try collectJsonlPaths(allocator, sessions_root, day_filter);
+    defer freePathList(allocator, &paths);
+    const exclude_path = if (opts.exclude_current) try QueryLiftCommands.resolveCurrentSessionPathForExclusion(allocator, sessions_root) else null;
+    defer if (exclude_path) |path| allocator.free(path);
+
+    var out: std.ArrayList(query.Row) = .empty;
+    errdefer deinitQueryRows(allocator, &out);
+    for (paths.items) |path| {
+        if (exclude_path) |excluded| {
+            if (std.mem.eql(u8, path, excluded)) continue;
+        }
+        if (has_workdir_filter and !workdir_paths.contains(path)) continue;
+
+        var parsed = canonical_trace.parseSessionTrace(allocator, path, traceParseOptions(opts)) catch continue;
+        defer parsed.deinit(allocator);
+        if (!resolveSessionOverlapsWindow(parsed.session.start_time, parsed.session.end_time, opts)) continue;
+
+        const content = (try readFileAllocOrSkip(allocator, path)) orelse continue;
+        defer allocator.free(content);
+        const messages = datasets.messages.parseJsonl(allocator, path, content, .{
+            .include_user = true,
+            .include_assistant = true,
+            .strip_echo_assistant = true,
+            .skip_meta_user_messages = true,
+            .dedupe_by_role_and_text = true,
+            .strip_skill_blocks = true,
+        }) catch continue;
+        defer datasets.messages.freeRows(allocator, messages);
+
+        for (messages) |message| {
+            if (!timestampSatisfiesBounds(message.timestamp, opts)) continue;
+            try appendMessageWorkflowProvenanceRows(allocator, &out, workflow, parsed.session.session_id, path, message);
+        }
+        for (parsed.tools.items) |tool| {
+            if (!toolTimestampSatisfiesBounds(parsed, tool, opts)) continue;
+            try appendToolWorkflowProvenanceRows(allocator, &out, workflow, parsed.session.session_id, path, parsed, tool);
+        }
+    }
+
+    return out;
 }
 
 const TermGroup = struct {
@@ -6391,6 +6491,193 @@ fn appendWorkflowAuditRowsForPath(
     var filtered_derived = try query.execute(allocator, derived_rows.items, signal_query);
     defer filtered_derived.deinit(allocator);
     try appendMovedRows(allocator, out_rows, &filtered_derived.rows);
+}
+
+fn appendMessageWorkflowProvenanceRows(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    workflow: []const u8,
+    session_id: ?[]const u8,
+    path: []const u8,
+    message: datasets.messages.MessageRow,
+) !void {
+    if (containsDollarWorkflowMention(message.text, workflow)) {
+        try appendWorkflowProvenanceRow(allocator, out_rows, .{
+            .session_id = session_id,
+            .workflow_name = workflow,
+            .evidence_class = "explicit_workflow_declaration",
+            .source = sourceKindForRole(message.role),
+            .timestamp = message.timestamp,
+            .ref = message.text,
+            .reason = "dollar_workflow_declaration",
+            .path = path,
+        });
+        return;
+    }
+
+    if (!std.mem.eql(u8, workflow, "resolve-c3")) {
+        if (containsIgnoreCaseAscii(message.text, workflow)) {
+            try appendWorkflowProvenanceRow(allocator, out_rows, .{
+                .session_id = session_id,
+                .workflow_name = workflow,
+                .evidence_class = "filename_or_path_mention",
+                .source = sourceKindForRole(message.role),
+                .timestamp = message.timestamp,
+                .ref = message.text,
+                .reason = "workflow_name_text_mention",
+                .path = path,
+            });
+        }
+        return;
+    }
+
+    if (containsAuthoritativeC3EventText(message.text)) {
+        try appendWorkflowProvenanceRow(allocator, out_rows, .{
+            .session_id = session_id,
+            .workflow_name = workflow,
+            .evidence_class = "controller_event",
+            .source = sourceKindForRole(message.role),
+            .timestamp = message.timestamp,
+            .ref = message.text,
+            .reason = "resolve_c3_controller_event",
+            .path = path,
+        });
+    } else if (containsDeclaredC3WorkflowEvidence(message.text)) {
+        try appendWorkflowProvenanceRow(allocator, out_rows, .{
+            .session_id = session_id,
+            .workflow_name = workflow,
+            .evidence_class = "explicit_workflow_declaration",
+            .source = sourceKindForRole(message.role),
+            .timestamp = message.timestamp,
+            .ref = message.text,
+            .reason = "resolve_c3_explicit_declaration",
+            .path = path,
+        });
+    } else if (containsIncidentalC3ArtifactMention(message.text)) {
+        try appendWorkflowProvenanceRow(allocator, out_rows, .{
+            .session_id = session_id,
+            .workflow_name = workflow,
+            .evidence_class = if (containsArtifactRepairCue(message.text)) "artifact_under_repair" else "filename_or_path_mention",
+            .source = sourceKindForRole(message.role),
+            .timestamp = message.timestamp,
+            .ref = message.text,
+            .reason = if (containsArtifactRepairCue(message.text)) "artifact_repair_text" else "resolve_c3_filename_or_path_mention",
+            .path = path,
+        });
+    }
+}
+
+fn appendToolWorkflowProvenanceRows(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    workflow: []const u8,
+    session_id: ?[]const u8,
+    path: []const u8,
+    parsed: canonical_trace.CanonicalSessionTrace,
+    tool: canonical_trace.ToolLifecycleRecord,
+) !void {
+    const tool_text = reviewCompilerToolText(tool);
+    const timestamp = toolTimestamp(parsed, tool);
+    if (std.mem.eql(u8, workflow, "resolve-c3")) {
+        if (reviewCompilerToolIsCompletedC3Controller(tool)) {
+            try appendWorkflowProvenanceRow(allocator, out_rows, .{
+                .session_id = session_id,
+                .workflow_name = workflow,
+                .evidence_class = "controller_invocation",
+                .source = "tool_call",
+                .timestamp = timestamp,
+                .ref = tool.command_text orelse tool_text,
+                .reason = "resolve_c3_controller_invocation",
+                .path = path,
+            });
+            return;
+        }
+        if (toolHasIncidentalC3Mention(tool)) {
+            try appendWorkflowProvenanceRow(allocator, out_rows, .{
+                .session_id = session_id,
+                .workflow_name = workflow,
+                .evidence_class = if (tool.kind == .patch_apply or containsArtifactRepairCue(tool_text)) "artifact_under_repair" else "filename_or_path_mention",
+                .source = "tool_call",
+                .timestamp = timestamp,
+                .ref = tool_text,
+                .reason = if (tool.kind == .patch_apply or containsArtifactRepairCue(tool_text)) "artifact_repair_tool" else "resolve_c3_filename_or_path_mention",
+                .path = path,
+            });
+        }
+        return;
+    }
+
+    if (toolNameMatchesWorkflow(tool, workflow)) {
+        try appendWorkflowProvenanceRow(allocator, out_rows, .{
+            .session_id = session_id,
+            .workflow_name = workflow,
+            .evidence_class = "controller_invocation",
+            .source = "tool_call",
+            .timestamp = timestamp,
+            .ref = tool.command_text orelse tool_text,
+            .reason = "tool_name_matches_workflow",
+            .path = path,
+        });
+    } else if (containsIgnoreCaseAscii(tool_text, workflow)) {
+        try appendWorkflowProvenanceRow(allocator, out_rows, .{
+            .session_id = session_id,
+            .workflow_name = workflow,
+            .evidence_class = "filename_or_path_mention",
+            .source = "tool_call",
+            .timestamp = timestamp,
+            .ref = tool_text,
+            .reason = "workflow_name_tool_text_mention",
+            .path = path,
+        });
+    }
+}
+
+const WorkflowProvenanceInput = struct {
+    session_id: ?[]const u8,
+    workflow_name: []const u8,
+    evidence_class: []const u8,
+    source: []const u8,
+    timestamp: ?[]const u8,
+    ref: []const u8,
+    reason: []const u8,
+    path: []const u8,
+};
+
+fn appendWorkflowProvenanceRow(
+    allocator: std.mem.Allocator,
+    out_rows: *std.ArrayList(query.Row),
+    input: WorkflowProvenanceInput,
+) !void {
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    try putOptionalString(&row, "session_id", input.session_id);
+    try row.putStaticKey("workflow_name", .{ .string = input.workflow_name });
+    try row.putStaticKey("evidence_class", .{ .string = input.evidence_class });
+    try row.putStaticKey("source", .{ .string = input.source });
+    try putOptionalString(&row, "timestamp", input.timestamp);
+    try row.putStaticKey("ref", .{ .string = input.ref[0..@min(input.ref.len, 240)] });
+    try row.putStaticKey("reason", .{ .string = input.reason });
+    try row.putStaticKey("path", .{ .string = input.path });
+    try out_rows.append(allocator, row);
+}
+
+fn containsArtifactRepairCue(text: []const u8) bool {
+    return containsAnyIgnoreCaseAscii(text, &.{
+        "artifact_under_repair",
+        "artifact repair",
+        "artifact maintenance",
+        "delete_sidecar",
+        "sidecar",
+        "retiring",
+        "retired",
+        "duplicate sidecar",
+    });
+}
+
+fn toolNameMatchesWorkflow(tool: canonical_trace.ToolLifecycleRecord, workflow: []const u8) bool {
+    const tool_name = tool.tool_name orelse return false;
+    return std.mem.eql(u8, tool_name, workflow) or
+        std.mem.eql(u8, pathBasenameSlice(tool_name), workflow);
 }
 
 fn appendTextWorkflowSignalRowsForPath(
@@ -8274,7 +8561,7 @@ fn cmdReviewCompilerAudit(allocator: std.mem.Allocator, sessions_root: []const u
         if (signals.true_c3) try addReviewCompilerC3IncludedSession(allocator, &audit, signals, parsed.session.session_id, path);
     }
 
-    const mode = opts.mode orelse "summary";
+    const mode = if (opts.emit_count_evidence) "evidence" else opts.mode orelse "summary";
     const fmt = if (opts.format_set) opts.format else if (std.mem.eql(u8, mode, "summary") or std.mem.eql(u8, mode, "report")) output.Format.markdown else output.Format.table;
     if (opts.review_compiler_strict and hasStrictReviewCompilerFailure(audit)) std.process.exit(2);
     if (std.mem.eql(u8, mode, "runs")) return writeReviewCompilerRunsMode(allocator, audit, fmt, opts.out_path);
@@ -23507,6 +23794,8 @@ fn parseOptions(args: []const []const u8) !Options {
             opts.include_workers = true;
         } else if (std.mem.eql(u8, arg, "--include-excerpts")) {
             opts.include_excerpts = true;
+        } else if (std.mem.eql(u8, arg, "--emit-count-evidence")) {
+            opts.emit_count_evidence = true;
         } else if (std.mem.eql(u8, arg, "--include-parts")) {
             opts.include_raw = true;
         } else if (std.mem.eql(u8, arg, "--include-body")) {
@@ -25582,7 +25871,7 @@ test "capabilities advertises resolve intent closed audit flags" {
     }, output_path);
     defer std.testing.allocator.free(got);
 
-    try std.testing.expect(std.mem.indexOf(u8, got, "\"version\": \"0.3.15\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"version\": \"0.3.16\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_acceptance_contract_v2\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_review_batch_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_review_aperture_v1\": true") != null);
@@ -25592,6 +25881,9 @@ test "capabilities advertises resolve intent closed audit flags" {
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_intent_closed_audit_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"internal_context_not_success_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"execution_policy_audit_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"c3_count_evidence_refs_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"workflow_provenance_mode_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"st_graph_control_receipt_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"epg_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"policy_transition_dataset_v1\": true") != null);
 }
@@ -25946,6 +26238,25 @@ test "review-compiler-audit c3 protocol reports closure compression state" {
     try std.testing.expect(std.mem.indexOf(u8, markdown, "included_sessions:") != null);
     try std.testing.expect(std.mem.indexOf(u8, markdown, "session_id: \"c3-uncompressed-closed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, markdown, "reason: \"closed_material_c3_missing_compression_evidence\"") != null);
+
+    const evidence_output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "review-compiler-count-evidence.json" });
+    defer std.testing.allocator.free(evidence_output_path);
+    const evidence = try runCommandWithOutput(std.testing.allocator, .review_compiler_audit, &.{
+        "--root",                root_abs,
+        "--protocol",            "c3",
+        "--since",               "2026-05-13T00:00:00Z",
+        "--until",               "2026-05-14T00:00:00Z",
+        "--repo",                "/repo",
+        "--emit-count-evidence", "--format",
+        "json",
+    }, evidence_output_path);
+    defer std.testing.allocator.free(evidence);
+
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "\"signal\": \"required\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "\"signal\": \"entered\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "\"signal\": \"closed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "\"reason\": \"c3_begin_signal_present\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "\"reason\": \"c3_closed_signal_present\"") != null);
 }
 
 test "review-compiler-audit c3 protocol attributes orphan closure counts" {
@@ -26026,6 +26337,29 @@ test "review-compiler-audit c3 protocol treats resolve-c3 artifact repair as inc
     try std.testing.expect(std.mem.indexOf(u8, got, "\"delivery_closed\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"included_sessions\": []") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"summary_state\": \"NONE\"") != null);
+
+    const controller =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-15T09:00:00Z\",\"payload\":{\"id\":\"c3-controller-invoked\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T09:00:01Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"c1\",\"call_id\":\"resolve-c3-begin\",\"command\":\"resolve-c3 begin --repo /repo\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"event=begin controller=resolve-c3\"}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/15/rollout-c3-controller.jsonl", .data = controller });
+
+    const provenance_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "workflow-provenance.json" });
+    defer std.testing.allocator.free(provenance_path);
+    const provenance = try runCommandWithOutput(std.testing.allocator, .workflow_audit, &.{
+        "--root",     root_abs,
+        "--workflow", "resolve-c3",
+        "--mode",     "provenance",
+        "--since",    "2026-05-15T00:00:00Z",
+        "--until",    "2026-05-16T00:00:00Z",
+        "--format",   "json",
+    }, provenance_path);
+    defer std.testing.allocator.free(provenance);
+
+    try std.testing.expect(std.mem.indexOf(u8, provenance, "\"workflow_name\": \"resolve-c3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, provenance, "\"evidence_class\": \"artifact_under_repair\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, provenance, "\"evidence_class\": \"controller_invocation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, provenance, "\"reason\": \"artifact_repair_tool\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, provenance, "\"reason\": \"resolve_c3_controller_invocation\"") != null);
 }
 
 test "review-compiler-audit mbk protocol audits kernel, surface, proof, closure, and bypass counters" {
