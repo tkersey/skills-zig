@@ -1791,9 +1791,16 @@ const GraphCommand = enum {
     audit,
     apply,
     debt,
+    receipt,
+    repair,
     insights,
     polish,
     schema,
+};
+
+const ArtifactMaintenanceCommand = enum {
+    none,
+    record,
 };
 
 const IntakeCommand = enum {
@@ -2163,6 +2170,7 @@ pub const Command = enum {
     add_comment,
     assert_projection,
     aperture,
+    artifact_maintenance,
     blocked,
     capabilities,
     claim,
@@ -2229,6 +2237,7 @@ const command_defs = [_]CommandDef{
     .{ .name = "prime", .command = .prime },
     .{ .name = "assert-projection", .command = .assert_projection },
     .{ .name = "aperture", .command = .aperture },
+    .{ .name = "artifact-maintenance", .command = .artifact_maintenance },
     .{ .name = "complete", .command = .complete },
     .{ .name = "reconcile-codex", .command = .reconcile_codex },
     .{ .name = "import-proposed-plan", .command = .import_proposed_plan },
@@ -2308,6 +2317,7 @@ const OutputFormat = enum {
 pub const Args = struct {
     command: Command,
     graph_command: GraphCommand = .none,
+    artifact_maintenance_command: ArtifactMaintenanceCommand = .none,
     intake_command: IntakeCommand = .none,
     debt_command: DebtCommand = .none,
     polish_command: PolishCommand = .none,
@@ -2363,6 +2373,9 @@ pub const Args = struct {
     action_id: ?[]const u8 = null,
     evidence_ref: ?[]const u8 = null,
     artifact_ref: ?[]const u8 = null,
+    operation: ?[]const u8 = null,
+    artifact_path: ?[]const u8 = null,
+    mentioned_workflow: ?[]const u8 = null,
     reason: ?[]const u8 = null,
     now: ?[]const u8 = null,
     transcript_path: ?[]const u8 = null,
@@ -2393,6 +2406,9 @@ pub const Args = struct {
     backlog_only: bool = false,
     preview: bool = false,
     dry_run: bool = false,
+    write_receipt: bool = false,
+    from_last_failure: bool = false,
+    controller_invocation: bool = false,
     allow_unproven: bool = false,
     include_completed_context: bool = false,
     include_waiting_pending_set: bool = false,
@@ -2661,6 +2677,7 @@ fn commandHelpText(command: Command) []const u8 {
         .doctor => DoctorHelpText,
         .prime => PrimeHelpText,
         .assert_projection => AssertProjectionHelpText,
+        .artifact_maintenance => GraphHelpText,
         .reconcile_codex => ReconcileCodexHelpText,
         .import_proposed_plan => ImportProposedPlanHelpText,
         .guard_session_start => GuardSessionStartHelpText,
@@ -2700,6 +2717,8 @@ fn graphHelpTextForArgv(argv: []const []const u8) []const u8 {
         .schema => GraphSchemaHelpText,
         .apply => GraphApplyHelpText,
         .audit => GraphAuditHelpText,
+        .receipt => GraphAuditHelpText,
+        .repair => GraphAuditHelpText,
         .insights => GraphInsightsHelpText,
         .polish => GraphPolishHelpText,
         .debt => GraphDebtHelpText,
@@ -2815,6 +2834,11 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.debt_command = parseDebtCommand(argv[3]) orelse return error.UnknownCommand;
             i = 4;
         }
+    }
+    if (args.command == .artifact_maintenance) {
+        if (argv.len < 3) return error.MissingCommand;
+        args.artifact_maintenance_command = parseArtifactMaintenanceCommand(argv[2]) orelse return error.UnknownCommand;
+        i = 3;
     }
     if (args.command == .intake) {
         if (argv.len < 3) return error.MissingCommand;
@@ -3261,6 +3285,49 @@ fn parseArgs(argv: []const []const u8) !Args {
                     i += 1;
                     if (i >= argv.len) return error.MissingValue;
                     args.reason = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--from-last-failure")) {
+                    args.from_last_failure = true;
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--write-receipt")) {
+                    args.write_receipt = true;
+                    continue;
+                }
+                return error.InvalidGraphArg;
+            },
+            .artifact_maintenance => {
+                if (std.mem.eql(u8, token, "--operation")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.operation = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--path")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.artifact_path = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--mentioned-workflow")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.mentioned_workflow = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--reason")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingValue;
+                    args.reason = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--write-receipt")) {
+                    args.write_receipt = true;
+                    continue;
+                }
+                if (std.mem.eql(u8, token, "--controller-invocation")) {
+                    args.controller_invocation = true;
                     continue;
                 }
                 return error.InvalidGraphArg;
@@ -3893,6 +3960,13 @@ fn parseArgs(argv: []const []const u8) !Args {
             if (args.graph_command == .debt and (args.debt_command == .waive or args.debt_command == .resolve) and args.id == null) return error.MissingIdValue;
             if (args.graph_command == .debt and args.debt_command == .waive and args.reason == null) return error.MissingReason;
         },
+        .artifact_maintenance => {
+            if (args.artifact_maintenance_command == .record) {
+                if (args.operation == null) return error.MissingValue;
+                if (args.artifact_path == null) return error.MissingValue;
+                if (args.reason == null) return error.MissingReason;
+            } else return error.MissingCommand;
+        },
         .workspace => {},
         .plan => {
             if ((args.plan_command == .create or args.plan_command == .show) and args.plan_id == null) return error.MissingPlanScope;
@@ -3955,9 +4029,16 @@ fn parseGraphCommand(raw: []const u8) ?GraphCommand {
     if (std.mem.eql(u8, raw, "schema")) return .schema;
     if (std.mem.eql(u8, raw, "apply")) return .apply;
     if (std.mem.eql(u8, raw, "audit")) return .audit;
+    if (std.mem.eql(u8, raw, "receipt")) return .receipt;
+    if (std.mem.eql(u8, raw, "repair")) return .repair;
     if (std.mem.eql(u8, raw, "insights")) return .insights;
     if (std.mem.eql(u8, raw, "polish")) return .polish;
     if (std.mem.eql(u8, raw, "debt")) return .debt;
+    return null;
+}
+
+fn parseArtifactMaintenanceCommand(raw: []const u8) ?ArtifactMaintenanceCommand {
+    if (std.mem.eql(u8, raw, "record")) return .record;
     return null;
 }
 
@@ -4467,6 +4548,7 @@ fn runCommand(allocator: std.mem.Allocator, args: Args) !u8 {
         .import_mesh_results => cmdImportMeshResults(allocator, resolved_args),
         .intake => cmdIntake(allocator, resolved_args),
         .graph => cmdGraph(allocator, resolved_args),
+        .artifact_maintenance => cmdArtifactMaintenance(allocator, resolved_args),
         .aperture => cmdAperture(allocator, resolved_args),
         .compile => cmdCompile(allocator, resolved_args),
         .workspace => cmdWorkspace(allocator, resolved_args),
@@ -9436,11 +9518,132 @@ fn cmdGraph(allocator: std.mem.Allocator, args: Args) !u8 {
         .schema => try cmdGraphSchema(allocator, args),
         .apply => try cmdGraphApply(allocator, args),
         .audit => try cmdGraphAudit(allocator, args),
+        .receipt => try cmdGraphReceipt(allocator, args),
+        .repair => try cmdGraphRepair(allocator, args),
         .insights => try cmdGraphInsights(allocator, args),
         .polish => try cmdGraphPolish(allocator, args),
         .debt => try cmdGraphDebt(allocator, args),
         .none => error.MissingCommand,
     };
+}
+
+fn cmdGraphReceipt(allocator: std.mem.Allocator, args: Args) !u8 {
+    const loaded = try loadValidatedState(allocator, args.file, args.allow_multiple_in_progress);
+    var state = loaded.state;
+    defer state.deinit();
+    const fps = try computeGraphFingerprints(allocator, &state);
+    state.graph.fingerprints = fps;
+    const audit = try auditGraph(allocator, &state, .execution_ready);
+    const selected_ids = if (args.ids.len > 0) try parseCliIds(allocator, args.ids) else try selectedInPlanIdsAlloc(allocator, &state);
+    const receipt_id = try gcrReceiptIdAlloc(allocator, loaded.latest_seq, fps.structure);
+    defer allocator.free(receipt_id);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeWorkspaceGraphControlReceiptJson(allocator, &out.writer, args, &state, loaded.latest_seq, fps, audit, selected_ids, receipt_id, false);
+    const payload = try out.toOwnedSlice();
+    if (args.write_receipt) {
+        const plan_id = args.plan_id orelse "default";
+        const dir = try std.fs.path.join(allocator, &.{ args.workspace, "plans", plan_id, "receipts" });
+        defer allocator.free(dir);
+        try durable_store.ensureDirectoryPathNoSymlinks(dir);
+        const filename = try std.fmt.allocPrint(allocator, "{s}.json", .{receipt_id});
+        defer allocator.free(filename);
+        const path = try std.fs.path.join(allocator, &.{ dir, filename });
+        defer allocator.free(path);
+        try writeTextAtomic(allocator, path, payload);
+    }
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    try stdout_writer.interface.writeAll(payload);
+    try stdout_writer.interface.writeByte('\n');
+    return 0;
+}
+
+fn cmdGraphRepair(allocator: std.mem.Allocator, args: Args) !u8 {
+    _ = args.from_last_failure;
+    var plan_sequence: i64 = 0;
+    if (loadValidatedState(allocator, args.file, args.allow_multiple_in_progress)) |loaded| {
+        var mutable_state = loaded.state;
+        defer mutable_state.deinit();
+        plan_sequence = loaded.latest_seq;
+    } else |_| {}
+    const now = try nowUtcAlloc(allocator);
+    const repair_id = try std.fmt.allocPrint(allocator, "GRR-{s}", .{now});
+    defer allocator.free(repair_id);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"graph_repair_receipt\":{\"receipt_version\":\"GRR-v1\",\"repair_id\":");
+    try std.json.Stringify.value(repair_id, .{}, writer);
+    try writer.writeAll(",\"workspace\":{\"workspace_id\":");
+    try std.json.Stringify.value(args.workspace, .{}, writer);
+    try writer.writeAll(",\"workspace_sequence\":0},\"plan_id\":");
+    try std.json.Stringify.value(args.plan_id orelse "", .{}, writer);
+    try writer.writeAll(",\"plan_sequence\":");
+    try writer.print("{d}", .{plan_sequence});
+    try writer.writeAll(",\"command\":\"st graph repair\",\"failure_class\":\"unknown\",\"observed_exit_code\":2,\"blocking_debt\":[],\"graph_invariants_lost\":[],\"repair_actions\":[\"inspect-last-failure\",\"rerun-after-repair\"],\"waived_items\":[],\"current_status\":\"blocked\",\"execution_allowed\":false}}");
+    const payload = try out.toOwnedSlice();
+    const plan_id = args.plan_id orelse "default";
+    const dir = try std.fs.path.join(allocator, &.{ args.workspace, "plans", plan_id, "repair" });
+    defer allocator.free(dir);
+    try durable_store.ensureDirectoryPathNoSymlinks(dir);
+    const filename = try std.fmt.allocPrint(allocator, "{s}.json", .{repair_id});
+    defer allocator.free(filename);
+    const path = try std.fs.path.join(allocator, &.{ dir, filename });
+    defer allocator.free(path);
+    try writeTextAtomic(allocator, path, payload);
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    try stdout_writer.interface.writeAll(payload);
+    try stdout_writer.interface.writeByte('\n');
+    return 0;
+}
+
+fn cmdArtifactMaintenance(allocator: std.mem.Allocator, args: Args) !u8 {
+    return switch (args.artifact_maintenance_command) {
+        .record => try cmdArtifactMaintenanceRecord(allocator, args),
+        .none => error.MissingCommand,
+    };
+}
+
+fn cmdArtifactMaintenanceRecord(allocator: std.mem.Allocator, args: Args) !u8 {
+    const now = try nowUtcAlloc(allocator);
+    const maintenance_id = try std.fmt.allocPrint(allocator, "AMR-{s}", .{now});
+    defer allocator.free(maintenance_id);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"st_artifact_maintenance_receipt\":{\"receipt_version\":\"AMR-v1\",\"maintenance_id\":");
+    try std.json.Stringify.value(maintenance_id, .{}, writer);
+    try writer.writeAll(",\"workspace\":");
+    try std.json.Stringify.value(args.workspace, .{}, writer);
+    try writer.writeAll(",\"operation\":");
+    try std.json.Stringify.value(args.operation.?, .{}, writer);
+    try writer.writeAll(",\"governing_workflow\":\"st\",\"artifact_paths\":[");
+    try std.json.Stringify.value(args.artifact_path.?, .{}, writer);
+    try writer.writeAll("],\"mentioned_workflow_names\":[");
+    if (args.mentioned_workflow) |workflow| try std.json.Stringify.value(workflow, .{}, writer);
+    try writer.writeAll("],\"activation_signal\":false,\"controller_invocation\":");
+    try writer.writeAll(if (args.controller_invocation) "true" else "false");
+    try writer.writeAll(",\"reason\":");
+    try std.json.Stringify.value(args.reason.?, .{}, writer);
+    try writer.writeAll(",\"evidence_refs\":[]}}");
+    const payload = try out.toOwnedSlice();
+
+    if (args.write_receipt) {
+        const dir = try std.fs.path.join(allocator, &.{ args.workspace, "maintenance" });
+        defer allocator.free(dir);
+        try durable_store.ensureDirectoryPathNoSymlinks(dir);
+        const filename = try std.fmt.allocPrint(allocator, "{s}.json", .{maintenance_id});
+        defer allocator.free(filename);
+        const path = try std.fs.path.join(allocator, &.{ dir, filename });
+        defer allocator.free(path);
+        try writeTextAtomic(allocator, path, payload);
+    }
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    try stdout_writer.interface.writeAll(payload);
+    try stdout_writer.interface.writeByte('\n');
+    return 0;
 }
 
 fn cmdIntake(allocator: std.mem.Allocator, args: Args) !u8 {
@@ -9461,7 +9664,7 @@ fn cmdCapabilities(allocator: std.mem.Allocator, args: Args) !u8 {
     const stdout = &stdout_writer.interface;
     try stdout.writeAll("{\"st_capabilities\":{\"version\":");
     try std.json.Stringify.value(Version, .{}, stdout);
-    try stdout.writeAll(",\"storage\":{\"ledger_artifact_root_v1\":true,\"workspace_v1\":true,\"workspace_schema\":\"STW-v1\",\"plan_graph_schema\":4,\"transaction_journal_v1\":true,\"compare_and_swap_v1\":true},\"plans\":{\"plan_namespace_v1\":true,\"qualified_refs_v1\":true,\"cross_plan_dependencies_v1\":true,\"plan_bundle_import_export_v1\":true},\"concurrency\":{\"workspace_claim_v1\":true,\"resource_grammar_v1\":true,\"fencing_token_v1\":true,\"session_view_v1\":true,\"workspace_aperture_v1\":true},\"git\":{\"external_worktree_v1\":true,\"changeset_v1\":true,\"serialized_integration_v1\":true,\"branch_epoch_v1\":true},\"proof\":{\"proof_receipt_v3\":true,\"dependency_cut_invalidation_v1\":true},\"control\":{\"gcr_v2\":true},\"schema_versions\":{\"readable\":[3,4],\"writable\":[3,4],\"graph_envelope\":[1,2]},\"features\":{\"intake_check\":true,\"intake_normalize\":true,\"graph_control_receipt\":true,\"gcr_v2\":true,\"safe_parallel_wave\":true,\"proof_basis\":true,\"multi_proof_receipts\":true,\"proof_receipt_v3\":true,\"proof_invalidation\":true,\"workspace_init\":true,\"workspace_status\":true,\"workspace_audit\":true,\"workspace_doctor\":true,\"workspace_recover\":true,\"workspace_export\":true,\"workspace_import\":true,\"workspace_migrate\":true,\"workspace_transactions\":true,\"resource_grammar\":true,\"workspace_claims\":true,\"fencing_tokens\":true,\"session_views\":true,\"workspace_aperture\":true,\"external_worktrees\":true,\"changesets\":true,\"serialized_integration\":true,\"plan_create\":true,\"plan_list\":true,\"plan_show\":true,\"plan_pause\":true,\"plan_resume\":true,\"plan_complete\":true,\"plan_archive\":true,\"qualified_refs\":true,\"plan_link\":true,\"plan_unlink\":true}}}\n");
+    try stdout.writeAll(",\"storage\":{\"ledger_artifact_root_v1\":true,\"workspace_v1\":true,\"workspace_schema\":\"STW-v1\",\"plan_graph_schema\":4,\"transaction_journal_v1\":true,\"compare_and_swap_v1\":true},\"plans\":{\"plan_namespace_v1\":true,\"qualified_refs_v1\":true,\"cross_plan_dependencies_v1\":true,\"plan_bundle_import_export_v1\":true},\"concurrency\":{\"workspace_claim_v1\":true,\"resource_grammar_v1\":true,\"fencing_token_v1\":true,\"session_view_v1\":true,\"workspace_aperture_v1\":true},\"git\":{\"external_worktree_v1\":true,\"changeset_v1\":true,\"serialized_integration_v1\":true,\"branch_epoch_v1\":true},\"proof\":{\"proof_receipt_v3\":true,\"dependency_cut_invalidation_v1\":true},\"control\":{\"gcr_v2\":true,\"graph_intelligence_receipt_v1\":true,\"graph_repair_receipt_v1\":true,\"st_artifact_maintenance_receipt_v1\":true,\"ledger_mode_v1\":true},\"graph\":{\"critical_path_v1\":true,\"parallel_width_v1\":true,\"proof_cut_v1\":true,\"selected_vs_unselected_frontier_v1\":true},\"schema_versions\":{\"readable\":[3,4],\"writable\":[3,4],\"graph_envelope\":[1,2]},\"features\":{\"intake_check\":true,\"intake_normalize\":true,\"graph_control_receipt\":true,\"gcr_v2\":true,\"safe_parallel_wave\":true,\"proof_basis\":true,\"multi_proof_receipts\":true,\"proof_receipt_v3\":true,\"proof_invalidation\":true,\"workspace_init\":true,\"workspace_status\":true,\"workspace_audit\":true,\"workspace_doctor\":true,\"workspace_recover\":true,\"workspace_export\":true,\"workspace_import\":true,\"workspace_migrate\":true,\"workspace_transactions\":true,\"resource_grammar\":true,\"workspace_claims\":true,\"fencing_tokens\":true,\"session_views\":true,\"workspace_aperture\":true,\"external_worktrees\":true,\"changesets\":true,\"serialized_integration\":true,\"plan_create\":true,\"plan_list\":true,\"plan_show\":true,\"plan_pause\":true,\"plan_resume\":true,\"plan_complete\":true,\"plan_archive\":true,\"qualified_refs\":true,\"plan_link\":true,\"plan_unlink\":true}}}\n");
     return 0;
 }
 
@@ -12667,6 +12870,138 @@ fn maybeWriteWorkspaceGraphControlReceiptJson(
     try writer.writeByte('\n');
 }
 
+fn writeGraphComponentsArray(allocator: std.mem.Allocator, writer: anytype, state: *const ItemState, index: GraphIndex) !void {
+    var visited = try allocator.alloc(bool, state.items.items.len);
+    defer allocator.free(visited);
+    @memset(visited, false);
+    try writer.writeByte('[');
+    var emitted: usize = 0;
+    for (state.items.items, 0..) |_, start| {
+        if (visited[start]) continue;
+        var queue = std.ArrayList(usize).empty;
+        defer queue.deinit(allocator);
+        try queue.append(allocator, start);
+        visited[start] = true;
+        if (emitted > 0) try writer.writeByte(',');
+        try writer.writeAll("{\"component_id\":");
+        try writer.print("\"c{d}\"", .{emitted + 1});
+        try writer.writeAll(",\"node_ids\":[");
+        var cursor: usize = 0;
+        while (cursor < queue.items.len) : (cursor += 1) {
+            const idx = queue.items[cursor];
+            if (cursor > 0) try writer.writeByte(',');
+            try std.json.Stringify.value(state.items.items[idx].id, .{}, writer);
+            for (index.predecessors[idx]) |neighbor| {
+                if (!visited[neighbor]) {
+                    visited[neighbor] = true;
+                    try queue.append(allocator, neighbor);
+                }
+            }
+            for (index.successors[idx]) |neighbor| {
+                if (!visited[neighbor]) {
+                    visited[neighbor] = true;
+                    try queue.append(allocator, neighbor);
+                }
+            }
+        }
+        try writer.writeAll("]}");
+        emitted += 1;
+    }
+    try writer.writeByte(']');
+}
+
+fn writeRootsArray(writer: anytype, state: *const ItemState, index: GraphIndex) !void {
+    try writer.writeByte('[');
+    var emitted: usize = 0;
+    for (state.items.items, 0..) |item, idx| {
+        if (index.predecessors[idx].len != 0) continue;
+        if (emitted > 0) try writer.writeByte(',');
+        try std.json.Stringify.value(item.id, .{}, writer);
+        emitted += 1;
+    }
+    try writer.writeByte(']');
+}
+
+fn writeLeavesArray(writer: anytype, state: *const ItemState, index: GraphIndex) !void {
+    try writer.writeByte('[');
+    var emitted: usize = 0;
+    for (state.items.items, 0..) |item, idx| {
+        if (index.successors[idx].len != 0) continue;
+        if (emitted > 0) try writer.writeByte(',');
+        try std.json.Stringify.value(item.id, .{}, writer);
+        emitted += 1;
+    }
+    try writer.writeByte(']');
+}
+
+fn writeDownstreamUnlocksArray(writer: anytype, state: *const ItemState, index: GraphIndex, ready_ids: []const []const u8) !void {
+    try writer.writeByte('[');
+    for (ready_ids, 0..) |id, ridx| {
+        if (ridx > 0) try writer.writeByte(',');
+        try writer.writeAll("{\"node_id\":");
+        try std.json.Stringify.value(id, .{}, writer);
+        try writer.writeAll(",\"unlock_count\":");
+        const node_idx = index.item_index_by_id.get(id) orelse {
+            try writer.writeAll("0,\"unlock_refs\":[]}");
+            continue;
+        };
+        var count: usize = 0;
+        for (index.successors[node_idx]) |successor_idx| {
+            const successor = state.items.items[successor_idx];
+            if (successor.status != .pending) continue;
+            var would_be_ready = true;
+            for (index.predecessors[successor_idx]) |pred_idx| {
+                if (pred_idx == node_idx) continue;
+                if (state.items.items[pred_idx].status != .completed) {
+                    would_be_ready = false;
+                    break;
+                }
+            }
+            if (would_be_ready) count += 1;
+        }
+        try writer.print("{d},\"unlock_refs\":[", .{count});
+        var emitted: usize = 0;
+        for (index.successors[node_idx]) |successor_idx| {
+            const successor = state.items.items[successor_idx];
+            if (successor.status != .pending) continue;
+            var would_be_ready = true;
+            for (index.predecessors[successor_idx]) |pred_idx| {
+                if (pred_idx == node_idx) continue;
+                if (state.items.items[pred_idx].status != .completed) {
+                    would_be_ready = false;
+                    break;
+                }
+            }
+            if (!would_be_ready) continue;
+            if (emitted > 0) try writer.writeByte(',');
+            try std.json.Stringify.value(successor.id, .{}, writer);
+            emitted += 1;
+        }
+        try writer.writeAll("]}");
+    }
+    try writer.writeByte(']');
+}
+
+fn writeHighFanoutArray(writer: anytype, state: *const ItemState, index: GraphIndex) !void {
+    try writer.writeByte('[');
+    var emitted: usize = 0;
+    for (state.items.items, 0..) |item, idx| {
+        if (index.successors[idx].len < 2) continue;
+        if (emitted > 0) try writer.writeByte(',');
+        try std.json.Stringify.value(item.id, .{}, writer);
+        emitted += 1;
+    }
+    try writer.writeByte(']');
+}
+
+fn selectedHaveRequiredProofCoverage(state: *const ItemState, selected_ids: []const []const u8) bool {
+    for (selected_ids) |id| {
+        const item = state.getConst(id) orelse return false;
+        if (proofObligationsForItem(item.*).len == 0) return false;
+    }
+    return true;
+}
+
 fn writeWorkspaceGraphControlReceiptJson(
     allocator: std.mem.Allocator,
     writer: anytype,
@@ -12762,10 +13097,60 @@ fn writeWorkspaceGraphControlReceiptJson(
         }
     }
 
+    const ready_ids = try readyItemIds(allocator, state);
+    const blocked_ids = try blockedItemIds(allocator, state);
+    const roots_ready_partition_ok = blk: {
+        var count: usize = selected_ids.len;
+        for (ready_ids) |id| {
+            if (!containsString(selected_ids, id)) count += 1;
+        }
+        break :blk count == ready_ids.len;
+    };
+    if (selected_ids.len == 0) try denials.append(allocator, "selected_frontier_empty");
+    for (selected_ids) |id| {
+        if (!containsString(ready_ids, id)) try denials.append(allocator, "selected_not_ready");
+    }
+    if (!roots_ready_partition_ok) try denials.append(allocator, "ready_frontier_partition_invalid");
+    const graph_debt = try computeGraphDebtAlloc(allocator, state, try nowUtcAlloc(allocator));
+
+    var graph_index = try buildGraphIndex(allocator, state);
+    defer graph_index.deinit(allocator);
+    var critical_depth: ?i64 = null;
+    var critical_path: []const usize = &.{};
+    if (graph_index.valid()) {
+        const depths = try criticalDepthsAlloc(allocator, state, graph_index);
+        critical_depth = criticalPathLengthFromDepths(depths);
+        critical_path = try criticalPathIndexesAlloc(allocator, state, graph_index, depths);
+    } else {
+        try denials.append(allocator, "graph_intelligence_unavailable");
+    }
+    if (critical_depth == null) try denials.append(allocator, "critical_path_missing");
+
+    var proof_actions = std.ArrayList(ProofAction).empty;
+    for (state.graph.proof_actions) |action| try proof_actions.append(allocator, action);
+    try appendSyntheticProofActions(allocator, state, &proof_actions);
+    const proof_basis = try directProofBasisAlloc(allocator, state, proof_actions.items);
+    const proof_summary = if (selected_ids.len == 0)
+        ProofObligationSummary{ .total = 0, .satisfied = 0, .missing = &.{} }
+    else
+        try proofObligationSummaryForIdsAlloc(allocator, state, selected_ids);
+    const proof_cut_kind: []const u8 = if (proof_summary.total == 0)
+        "exact"
+    else if (proof_basis.actions.len > 0)
+        "approximation"
+    else
+        "unavailable";
+    if (std.mem.eql(u8, proof_cut_kind, "unavailable")) try denials.append(allocator, "missing_proof_cut");
+    if (proof_summary.total > 0 and proof_basis.actions.len == 0) try denials.append(allocator, "minimum_proof_cut_empty");
+    if (!selectedHaveRequiredProofCoverage(state, selected_ids)) try denials.append(allocator, "selected_proof_obligation_missing");
+    if (countActiveGraphDebt(graph_debt, "blocking") != 0) try denials.append(allocator, "blocking_graph_debt");
+
     const execution_allowed = denials.items.len == 0;
     const receipt_id = try std.fmt.allocPrint(allocator, "GCR2-{d}-{s}", .{ seq, fps.structure["sha256:".len..@min(fps.structure.len, "sha256:".len + 8)] });
     defer allocator.free(receipt_id);
     try writer.writeAll("{\"graph_control_receipt\":{\"receipt_version\":\"GCR-v2\",\"receipt_id\":");
+    try std.json.Stringify.value(receipt_id, .{}, writer);
+    try writer.writeAll(",\"gcr_id\":");
     try std.json.Stringify.value(receipt_id, .{}, writer);
     try writer.writeAll(",\"extends\":");
     try std.json.Stringify.value(gcr_v1_id, .{}, writer);
@@ -12793,7 +13178,97 @@ fn writeWorkspaceGraphControlReceiptJson(
     try std.json.Stringify.value(workspace_obj.get("target_branch") orelse std.json.Value{ .null = {} }, .{}, writer);
     try writer.writeAll(",\"target_head\":");
     try std.json.Stringify.value(workspace_obj.get("target_head") orelse std.json.Value{ .null = {} }, .{}, writer);
-    try writer.writeAll("},\"claim\":{\"claim_id\":");
+    try writer.writeAll("},\"graph\":{\"nodes\":");
+    try writer.print("{d}", .{state.items.items.len});
+    try writer.writeAll(",\"edges\":");
+    try writer.print("{d}", .{hardEdgeCount(state)});
+    try writer.writeAll(",\"roots\":");
+    if (graph_index.valid()) try writeRootsArray(writer, state, graph_index) else try writer.writeAll("[]");
+    try writer.writeAll(",\"leaves\":");
+    if (graph_index.valid()) try writeLeavesArray(writer, state, graph_index) else try writer.writeAll("[]");
+    try writer.writeAll(",\"components\":");
+    if (graph_index.valid()) try writeGraphComponentsArray(allocator, writer, state, graph_index) else try writer.writeAll("[]");
+    try writer.writeAll(",\"ready_frontier\":");
+    try writeStringListArray(writer, ready_ids);
+    try writer.writeAll(",\"blocked_frontier\":");
+    try writeStringListArray(writer, blocked_ids);
+    try writer.writeAll(",\"selected_frontier\":");
+    try writeStringListArray(writer, selected_ids);
+    try writer.writeAll(",\"unselected_ready\":[");
+    var emitted_unselected: usize = 0;
+    for (ready_ids) |id| {
+        if (containsString(selected_ids, id)) continue;
+        if (emitted_unselected > 0) try writer.writeByte(',');
+        try std.json.Stringify.value(id, .{}, writer);
+        emitted_unselected += 1;
+    }
+    try writer.writeAll("],\"critical_path\":");
+    try writeItemIndexPath(writer, state, critical_path);
+    try writer.writeAll(",\"downstream_unlocks\":");
+    if (graph_index.valid()) try writeDownstreamUnlocksArray(writer, state, graph_index, ready_ids) else try writer.writeAll("[]");
+    try writer.writeAll(",\"parallel_width\":");
+    try writer.print("{d}", .{ready_ids.len});
+    try writer.writeAll(",\"parallel_width_kind\":\"approximation\",\"antichain_candidates\":");
+    try writeStringListArray(writer, ready_ids);
+    try writer.writeAll(",\"high_fanout_nodes\":");
+    if (graph_index.valid()) try writeHighFanoutArray(writer, state, graph_index) else try writer.writeAll("[]");
+    try writer.writeAll(",\"articulation_nodes\":[],\"graph_debt\":");
+    try writeGraphDebtFilteredArray(writer, graph_debt, "blocking");
+    try writer.writeAll(",\"gate\":\"execution-ready\",\"gate_passed\":");
+    try writer.writeAll(if (audit.errors == 0 and countActiveGraphDebt(graph_debt, "blocking") == 0) "true" else "false");
+    try writer.writeAll("},\"proof\":{\"obligations\":");
+    try writeStringListArray(writer, proof_summary.missing);
+    try writer.writeAll(",\"missing\":");
+    try writeStringListArray(writer, proof_summary.missing);
+    try writer.writeAll(",\"minimum_proof_cut\":[");
+    for (proof_basis.actions, 0..) |action, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try std.json.Stringify.value(action.id, .{}, writer);
+    }
+    try writer.writeAll("],\"proof_cut_kind\":");
+    try std.json.Stringify.value(proof_cut_kind, .{}, writer);
+    try writer.writeAll(",\"approximation_reason\":");
+    try std.json.Stringify.value(if (std.mem.eql(u8, proof_cut_kind, "approximation")) "direct-command-dedup basis over selected proof obligations; invalidated by obligation, command, branch epoch, resource, or graph-fingerprint changes" else "", .{}, writer);
+    try writer.writeAll("},\"aperture_decision\":{\"selected_nodes\":[");
+    for (selected_ids, 0..) |id, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writer.writeAll("{\"node_id\":");
+        try std.json.Stringify.value(id, .{}, writer);
+        try writer.writeAll(",\"reason\":\"ready frontier member selected by deterministic aperture order\"}");
+    }
+    try writer.writeAll("],\"why_selected\":[");
+    for (selected_ids, 0..) |id, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writer.writeAll("{\"node_id\":");
+        try std.json.Stringify.value(id, .{}, writer);
+        try writer.writeAll(",\"reasons\":[\"ready_frontier\",\"within_aperture_limit\",\"lock_compatible\"]}");
+    }
+    try writer.writeAll("],\"why_not_parallelized\":[");
+    for (selected_ids, 0..) |id, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writer.writeAll("{\"node_id\":");
+        try std.json.Stringify.value(id, .{}, writer);
+        try writer.writeAll(",\"reasons\":[\"parallel_width_approximation\"]}");
+    }
+    try writer.writeAll("],\"why_unselected_ready_waits\":[");
+    emitted_unselected = 0;
+    for (ready_ids) |id| {
+        if (containsString(selected_ids, id)) continue;
+        if (emitted_unselected > 0) try writer.writeByte(',');
+        try writer.writeAll("{\"node_id\":");
+        try std.json.Stringify.value(id, .{}, writer);
+        try writer.writeAll(",\"reasons\":[\"aperture_limit_or_lock_conflict\"]}");
+        emitted_unselected += 1;
+    }
+    try writer.writeAll("],\"fairness_state\":\"deterministic-local\",\"scheduler_version\":\"aperture-score-v1\"},\"session_projection\":{\"view_id\":");
+    try std.json.Stringify.value(projection_digest, .{}, writer);
+    try writer.writeAll(",\"session_id\":");
+    try std.json.Stringify.value(session_id, .{}, writer);
+    try writer.writeAll(",\"selected_task_ids\":");
+    try writeStringListArray(writer, selected_ids);
+    try writer.writeAll(",\"projection_digest\":");
+    try std.json.Stringify.value(projection_digest, .{}, writer);
+    try writer.writeAll("},\"ledger_mode\":{\"active\":false,\"reason\":\"workspace graph control receipt\",\"allowed_operations\":[],\"material_execution_allowed\":false},\"claim\":{\"claim_id\":");
     try std.json.Stringify.value(claim_id, .{}, writer);
     try writer.writeAll(",\"fencing_token\":");
     try writer.print("{d}", .{token});
@@ -12823,7 +13298,11 @@ fn writeWorkspaceGraphControlReceiptJson(
     try writer.writeAll(if (claim_value != null and !containsString(denials.items, "fencing_token_stale")) "true" else "false");
     try writer.writeAll(",\"session_view\":");
     try writer.writeAll(if (!containsString(denials.items, "view_stale") and !containsString(denials.items, "session_unbound") and !containsString(denials.items, "session_plan_mismatch")) "true" else "false");
-    try writer.writeAll("},\"gate\":{\"execution_allowed\":");
+    try writer.writeAll("},\"execution_allowed\":");
+    try std.json.Stringify.value(if (execution_allowed) "yes" else "no", .{}, writer);
+    try writer.writeAll(",\"denial_reasons\":");
+    try writeStringListArray(writer, denials.items);
+    try writer.writeAll(",\"gate\":{\"execution_allowed\":");
     try std.json.Stringify.value(if (execution_allowed) "yes" else "no", .{}, writer);
     try writer.writeAll(",\"denials\":");
     try writeStringListArray(writer, denials.items);
@@ -19797,6 +20276,14 @@ test "GCR-v2 binds workspace claim, session view, and registry graph fingerprint
     try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"execution_allowed\":\"yes\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"graph_fingerprints\":{\"structure\":\"sha256:") != null);
     try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"registry_graph_fingerprints\":{}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"ready_frontier\":[\"st-001\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"selected_frontier\":[\"st-001\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"unselected_ready\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"critical_path\":[\"st-001\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"parallel_width\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"proof_cut_kind\":\"approximation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"minimum_proof_cut\":[\"proof-action-direct-st-001-proof-001\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"denial_reasons\":[]") != null);
 
     const workspace_file = try std.fs.path.join(allocator, &.{ workspace_path, "workspace.jsonl" });
     const workspace_line = try readLastJsonlLine(allocator, workspace_file);
@@ -19824,6 +20311,7 @@ test "GCR-v2 binds workspace claim, session view, and registry graph fingerprint
     }, &state, 2, fps, audit, &.{"st-001"}, "GCR-test", false);
     const stale_json = try stale_writer.toOwnedSlice();
     try std.testing.expect(std.mem.indexOf(u8, stale_json, "\"execution_allowed\":\"no\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stale_json, "\"denial_reasons\":[\"gcr_stale\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, stale_json, "\"gcr_stale\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, stale_json, "\"graph_fingerprints\":false") != null);
 }
