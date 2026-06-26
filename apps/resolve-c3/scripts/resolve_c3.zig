@@ -1495,7 +1495,7 @@ fn closureGate(allocator: std.mem.Allocator, args: Args) !u8 {
         try collectClosureRunViolations(allocator, parsed_run.value, &violations);
     }
 
-    if (closureMaterial(campaign_summary) and material_rows == 0 and closureCount(campaign_summary, &.{ "runs_total", "material_runs_total" }) == 0) {
+    if (closureMaterial(campaign_summary) and material_rows == 0) {
         try appendClosureViolation(allocator, &violations, "campaign", null, "material_campaign_without_runs", "material campaign has no material runs");
     }
     if (any_material) {
@@ -1523,19 +1523,25 @@ fn deinitClosureViolations(allocator: std.mem.Allocator, violations: *std.ArrayL
 
 fn collectClosureRunViolations(allocator: std.mem.Allocator, row: std.json.Value, violations: *std.ArrayList(ClosureViolation)) !void {
     const run_id = stringField(row, "run_id");
-    if (closureBoolField(row, "c3_required") == true and closureBoolField(row, "c3_closed") != true) {
-        try appendClosureViolation(allocator, violations, "run", run_id, "c3_required_without_c3_closure", "c3_required=true and c3_closed=false");
+    if (closureBoolField(row, "c3_closed") != true) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "c3_required_without_c3_closure", "material run requires c3_closed=true");
     }
-    if (closureBoolField(row, "c3_required") == true and closureBoolField(row, "c3_entered") != true) {
-        try appendClosureViolation(allocator, violations, "run", run_id, "c3_required_without_c3_entry", "c3_required=true while c3_entered is not true");
+    if (closureBoolField(row, "c3_entered") != true) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "c3_required_without_c3_entry", "material run requires c3_entered=true");
     }
-    if (closureCompressionNone(row)) {
-        try appendClosureViolation(allocator, violations, "run", run_id, "compression_state_none", "compression_state=NONE");
+    if (!closureCompressionReady(row)) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "compression_state_none", "compression_state missing or NONE");
     }
     if (closureFindingBearing(row) and closureCount(row, &.{"batches_total"}) == 0) {
         try appendClosureViolation(allocator, violations, "run", run_id, "finding_workflow_without_batches", "batches_total=0 for a finding-bearing workflow");
     }
-    if (closureBoolField(row, "delivery_closed") == true and closureBoolField(row, "terminal_closed") != true) {
+    if (closureOpenBatchCount(row) > 0) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "open_batches", "open batch indicators remain before closure");
+    }
+    if (closureBoolField(row, "delivery_closed") != true) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "delivery_not_closed", "delivery_closed is not true");
+    }
+    if (closureBoolField(row, "terminal_closed") != true) {
         try appendClosureViolation(allocator, violations, "run", run_id, "delivery_closed_without_terminal_closure", "delivery_closed=true while terminal_closed=false");
     }
     if (closureStrictProgress(row) == 0) {
@@ -1565,6 +1571,15 @@ fn collectClosureRunViolations(allocator: std.mem.Allocator, row: std.json.Value
     if (surface_delta > 0 and !closureAcRebased(row)) {
         try appendClosureViolation(allocator, violations, "run", run_id, "semantic_surface_delta_without_ac_rebase", "semantic_surface_delta > 0 without explicit AC rebase");
     }
+    if (closureUnresolvedConformanceCount(row) > 0) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "unresolved_conformance_evidence", "conformance unresolved counterexamples remain");
+    }
+    if (closureUnresolvedHoldoutCount(row) > 0) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "unresolved_terminal_holdout_evidence", "terminal holdout unresolved counterexamples remain");
+    }
+    if (closureProofOrDeliveryStale(row)) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "proof_or_delivery_not_current", "proof or delivery current gate is not true");
+    }
 }
 
 fn appendClosureViolation(allocator: std.mem.Allocator, target: *std.ArrayList(ClosureViolation), scope: []const u8, run_id: ?[]const u8, code: []const u8, detail: []const u8) !void {
@@ -1588,7 +1603,7 @@ fn closureGateCouldNotEvaluate(allocator: std.mem.Allocator, reason: []const u8)
 
 fn closureSummaryCampaign(summary: std.json.Value, campaign_id: []const u8) std.json.Value {
     const direct_id = closureCampaignId(summary);
-    if (direct_id.len == 0 or std.mem.eql(u8, direct_id, campaign_id)) return summary;
+    if (std.mem.eql(u8, direct_id, campaign_id)) return summary;
     const campaigns = objectField(summary, "campaigns") orelse return std.json.Value{ .null = {} };
     switch (campaigns) {
         .array => |arr| {
@@ -1601,6 +1616,7 @@ fn closureSummaryCampaign(summary: std.json.Value, campaign_id: []const u8) std.
         },
         else => {},
     }
+    if (direct_id.len == 0 and objectField(summary, "campaigns") == null) return summary;
     return std.json.Value{ .null = {} };
 }
 
@@ -1622,9 +1638,10 @@ fn closureFindingBearing(row: std.json.Value) bool {
         closureCount(row, &.{ "findings_total", "findings", "raw_claims" }) > 0;
 }
 
-fn closureCompressionNone(row: std.json.Value) bool {
+fn closureCompressionReady(row: std.json.Value) bool {
     const value = stringField(row, "compression_state") orelse stringField(row, "closure_compression") orelse return false;
-    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "NONE");
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    return trimmed.len != 0 and !std.ascii.eqlIgnoreCase(trimmed, "NONE");
 }
 
 fn closureStrictProgress(row: std.json.Value) i64 {
@@ -1648,6 +1665,33 @@ fn closureAcRebased(row: std.json.Value) bool {
     return closureBoolField(row, "ac_rebased") == true or
         closureBoolField(row, "explicit_ac_rebase") == true or
         stringField(row, "ac_rebase_ref") != null;
+}
+
+fn closureOpenBatchCount(row: std.json.Value) i64 {
+    const direct = closureCount(row, &.{ "open_batches", "open_batches_total", "open_batch_ids" });
+    if (direct > 0) return direct;
+    if (objectField(row, "review")) |review| return closureCount(review, &.{"open_batch_ids"});
+    return 0;
+}
+
+fn closureUnresolvedConformanceCount(row: std.json.Value) i64 {
+    const conformance = objectField(row, "conformance") orelse return 0;
+    return closureCount(conformance, &.{ "novel_in_horizon_counterexamples", "unknown_counterexamples", "unresolved_counterexamples", "accepted_counterexamples" });
+}
+
+fn closureUnresolvedHoldoutCount(row: std.json.Value) i64 {
+    const holdout = objectField(row, "terminal_holdout") orelse return 0;
+    return closureCount(holdout, &.{ "unknown_counterexamples", "in_horizon_counterexamples", "novel_in_horizon_counterexamples", "unresolved_counterexamples" });
+}
+
+fn closureProofOrDeliveryStale(row: std.json.Value) bool {
+    const proof_basis = objectField(row, "proof_basis");
+    const delivery = objectField(row, "delivery");
+    const gate = objectField(row, "gate");
+    return closureBoolFieldOpt(proof_basis, "all_laws_covered") == false or
+        closureBoolFieldOpt(delivery, "current_head_validation_passed") == false or
+        closureBoolFieldOpt(gate, "proof_current") == false or
+        closureBoolFieldOpt(gate, "delivery_current") == false;
 }
 
 fn closureCount(row: std.json.Value, keys: []const []const u8) i64 {
@@ -1683,6 +1727,8 @@ fn closureIntField(value: std.json.Value, key: []const u8) ?i64 {
     return switch (child) {
         .bool => |b| if (b) 1 else 0,
         .integer => |n| n,
+        .array => |arr| @intCast(arr.items.len),
+        .object => |obj| @intCast(obj.count()),
         .string => |s| std.fmt.parseInt(i64, std.mem.trim(u8, s, " \t\r\n"), 10) catch null,
         else => null,
     };
@@ -7944,7 +7990,7 @@ test "mutation-gate integrated mode compares supplied artifact state" {
 
 test "closure-gate blocks material authority gaps" {
     const json_text =
-        \\{"campaign_id":"C3-test","run_id":"run-1","c3_required":true,"c3_entered":true,"c3_closed":true,"compression_state":"NONE","finding_bearing_workflow":true,"batches_total":0,"kernel":{"accepted":false},"potential":{"strict_progress":0},"delivery_closed":true,"terminal_closed":false,"orphan_code_constructs":1,"unmapped_proof_actions":1,"wound_specific_tests":1,"semantic_surface_delta":1}
+        \\{"campaign_id":"C3-test","run_id":"run-1","c3_required":true,"c3_entered":false,"c3_closed":false,"compression_state":"NONE","finding_bearing_workflow":true,"batches_total":0,"open_batch_ids":["RB-open"],"kernel":{"accepted":false},"potential":{"strict_progress":0},"delivery_closed":false,"terminal_closed":false,"orphan_code_constructs":1,"unmapped_proof_actions":1,"wound_specific_tests":1,"semantic_surface_delta":1,"conformance":{"novel_in_horizon_counterexamples":1},"terminal_holdout":{"unknown_counterexamples":1},"proof_basis":{"all_laws_covered":"no"},"delivery":{"current_head_validation_passed":"no"}}
     ;
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_text, .{});
     defer parsed.deinit();
@@ -7954,7 +8000,11 @@ test "closure-gate blocks material authority gaps" {
     try collectClosureRunViolations(std.testing.allocator, parsed.value, &violations);
 
     try std.testing.expect(containsClosureCode(violations.items, "compression_state_none"));
+    try std.testing.expect(containsClosureCode(violations.items, "c3_required_without_c3_closure"));
+    try std.testing.expect(containsClosureCode(violations.items, "c3_required_without_c3_entry"));
     try std.testing.expect(containsClosureCode(violations.items, "finding_workflow_without_batches"));
+    try std.testing.expect(containsClosureCode(violations.items, "open_batches"));
+    try std.testing.expect(containsClosureCode(violations.items, "delivery_not_closed"));
     try std.testing.expect(containsClosureCode(violations.items, "delivery_closed_without_terminal_closure"));
     try std.testing.expect(containsClosureCode(violations.items, "strict_progress_zero"));
     try std.testing.expect(containsClosureCode(violations.items, "kernel_not_accepted"));
@@ -7962,6 +8012,9 @@ test "closure-gate blocks material authority gaps" {
     try std.testing.expect(containsClosureCode(violations.items, "unmapped_proof_actions"));
     try std.testing.expect(containsClosureCode(violations.items, "unmapped_wound_specific_tests"));
     try std.testing.expect(containsClosureCode(violations.items, "semantic_surface_delta_without_ac_rebase"));
+    try std.testing.expect(containsClosureCode(violations.items, "unresolved_conformance_evidence"));
+    try std.testing.expect(containsClosureCode(violations.items, "unresolved_terminal_holdout_evidence"));
+    try std.testing.expect(containsClosureCode(violations.items, "proof_or_delivery_not_current"));
 }
 
 test "closure-gate permits healthy material row helpers" {
