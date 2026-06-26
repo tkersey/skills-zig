@@ -5319,13 +5319,23 @@ fn workspaceWorkingTreeFingerprintAlloc(allocator: std.mem.Allocator, workspace_
     defer if (head_owned) |head| allocator.free(head);
     const status_owned = gitCapture(allocator, repo_root, &.{ "status", "--porcelain=v1", "--untracked-files=no" }) catch null;
     defer if (status_owned) |status| allocator.free(status);
+    const worktree_diff_owned = gitCapture(allocator, repo_root, &.{ "diff", "--no-ext-diff", "--binary" }) catch null;
+    defer if (worktree_diff_owned) |diff| allocator.free(diff);
+    const index_diff_owned = gitCapture(allocator, repo_root, &.{ "diff", "--cached", "--no-ext-diff", "--binary" }) catch null;
+    defer if (index_diff_owned) |diff| allocator.free(diff);
     const head = head_owned orelse "unknown";
     const status = status_owned orelse "";
+    const worktree_diff = worktree_diff_owned orelse "";
+    const index_diff = index_diff_owned orelse "";
     var payload: std.Io.Writer.Allocating = .init(allocator);
     defer payload.deinit();
     try payload.writer.writeAll(head);
     try payload.writer.writeByte('\n');
     try payload.writer.writeAll(status);
+    try payload.writer.writeByte('\n');
+    try payload.writer.writeAll(index_diff);
+    try payload.writer.writeByte('\n');
+    try payload.writer.writeAll(worktree_diff);
     const bytes = try payload.toOwnedSlice();
     defer allocator.free(bytes);
     return hashTextSha256Alloc(allocator, bytes);
@@ -7760,62 +7770,38 @@ fn writeWorkspaceResourcesArray(writer: anytype, resources: []const WorkspaceRes
     try writer.writeByte(']');
 }
 
-fn writeWorkspaceResourceRootString(writer: anytype, resource: WorkspaceResource) !void {
-    switch (resource.kind) {
-        .path => {
-            try writer.writeAll("\"path:");
-            try writer.writeAll(resource.primary);
-            try writer.writeByte('"');
-        },
-        .symbol => {
-            try writer.writeAll("\"symbol:");
-            try writer.writeAll(resource.primary);
-            try writer.writeByte('#');
-            try writer.writeAll(resource.secondary);
-            try writer.writeByte('"');
-        },
-        .generated => {
-            try writer.writeAll("\"generated:");
-            try writer.writeAll(resource.primary);
-            try writer.writeByte('"');
-        },
-        .schema => {
-            try writer.writeAll("\"schema:");
-            try writer.writeAll(resource.primary);
-            try writer.writeByte('"');
-        },
-        .service => {
-            try writer.writeAll("\"service:");
-            try writer.writeAll(resource.primary);
-            try writer.writeByte('"');
-        },
-        .git_index => try writer.writeAll("\"git:index\""),
-        .git_branch => {
-            try writer.writeAll("\"git:branch:");
-            try writer.writeAll(resource.primary);
-            try writer.writeByte('"');
-        },
-        .repo_all => try writer.writeAll("\"repo:all\""),
-    }
+fn workspaceResourceRootAlloc(allocator: std.mem.Allocator, resource: WorkspaceResource) ![]u8 {
+    return switch (resource.kind) {
+        .path => try std.fmt.allocPrint(allocator, "path:{s}", .{resource.primary}),
+        .symbol => try std.fmt.allocPrint(allocator, "symbol:{s}#{s}", .{ resource.primary, resource.secondary }),
+        .generated => try std.fmt.allocPrint(allocator, "generated:{s}", .{resource.primary}),
+        .schema => try std.fmt.allocPrint(allocator, "schema:{s}", .{resource.primary}),
+        .service => try std.fmt.allocPrint(allocator, "service:{s}", .{resource.primary}),
+        .git_index => try allocator.dupe(u8, "git:index"),
+        .git_branch => try std.fmt.allocPrint(allocator, "git:branch:{s}", .{resource.primary}),
+        .repo_all => try allocator.dupe(u8, "repo:all"),
+    };
 }
 
-fn writeWorkspaceCoordinationResourceObject(writer: anytype, resource: WorkspaceResource) !void {
+fn writeWorkspaceCoordinationResourceObject(allocator: std.mem.Allocator, writer: anytype, resource: WorkspaceResource) !void {
+    const root = try workspaceResourceRootAlloc(allocator, resource);
+    defer allocator.free(root);
     try writer.writeByte('{');
     try writer.writeAll("\"root\":");
-    try writeWorkspaceResourceRootString(writer, resource);
+    try std.json.Stringify.value(root, .{}, writer);
     try writer.writeAll(",\"mode\":");
     try std.json.Stringify.value(workspaceResourceModeString(resource.mode), .{}, writer);
     try writer.writeByte('}');
 }
 
-fn writeWorkspaceCoordinationResourcesArray(writer: anytype, resources_value: ?std.json.Value) !void {
+fn writeWorkspaceCoordinationResourcesArray(allocator: std.mem.Allocator, writer: anytype, resources_value: ?std.json.Value) !void {
     try writer.writeByte('[');
     if (resources_value) |resources| {
         if (resources == .array) {
             for (resources.array.items, 0..) |entry, idx| {
                 if (idx != 0) try writer.writeByte(',');
                 const resource = try workspaceResourceFromJson(entry);
-                try writeWorkspaceCoordinationResourceObject(writer, resource);
+                try writeWorkspaceCoordinationResourceObject(allocator, writer, resource);
             }
         }
     }
@@ -10893,7 +10879,7 @@ fn cmdCompileAperture(allocator: std.mem.Allocator, args: Args) !u8 {
     const now = try nowUtcAlloc(allocator);
     state.graph.debt = try computeGraphDebtAlloc(allocator, &state, now);
 
-    const workspace_gcr_mode = args.workspace_explicit;
+    const workspace_gcr_mode = workspaceModeRequested(args);
     const seq_after = if (args.preview or workspace_gcr_mode) parsed.latest_seq else parsed.latest_seq + 1;
     const fps = try computeGraphFingerprints(allocator, &state);
     state.graph.fingerprints = fps;
@@ -13210,6 +13196,7 @@ fn writeWorkspaceGraphControlReceiptJson(
             if ((intField(parsed_view.value, "workspace_sequence") orelse -1) != workspace_sequence) try denials.append(allocator, "view_stale");
             if ((intField(parsed_view.value, "plan_sequence") orelse -1) != plan_sequence) try denials.append(allocator, "view_stale");
             if ((intField(parsed_view.value, "branch_epoch") orelse -1) != branch_epoch) try denials.append(allocator, "branch_epoch_stale");
+            if (!jsonStringArrayMatchesSlice(parsed_view.value.object.get("selected_item_ids"), selected_ids)) try denials.append(allocator, "session_selection_mismatch");
         }
     }
 
@@ -13329,7 +13316,7 @@ fn writeWorkspaceGraphControlReceiptJson(
     try writer.print("{d}", .{branch_epoch});
     try writer.writeAll(",\"resources\":");
     if (claim_value) |claim| {
-        try writeWorkspaceCoordinationResourcesArray(writer, claim.object.get("resources"));
+        try writeWorkspaceCoordinationResourcesArray(allocator, writer, claim.object.get("resources"));
     } else {
         try writer.writeAll("[]");
     }
@@ -14451,6 +14438,17 @@ fn containsString(haystack: []const []const u8, needle: []const u8) bool {
         if (std.mem.eql(u8, item, needle)) return true;
     }
     return false;
+}
+
+fn jsonStringArrayMatchesSlice(value: ?std.json.Value, expected: []const []const u8) bool {
+    const array_value = value orelse return false;
+    if (array_value != .array) return false;
+    if (array_value.array.items.len != expected.len) return false;
+    for (array_value.array.items, 0..) |item, idx| {
+        if (item != .string) return false;
+        if (!std.mem.eql(u8, item.string, expected[idx])) return false;
+    }
+    return true;
 }
 
 fn normalizeScopeToken(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
@@ -20486,6 +20484,28 @@ test "GCR-v2 binds workspace claim, session view, and registry graph fingerprint
     try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"projection\":{\"view_id\":\"sha256:") != null);
     try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"session_id\":\"s1\",\"selected_task_ids\":[\"st-001\"],\"projection_digest\":\"sha256:") != null);
     try std.testing.expect(std.mem.indexOf(u8, allowed_json, "\"denial_reasons\":[]") != null);
+
+    const quoted_resource = try parseWorkspaceResource(allocator, "path:src/\"quoted\".zig", .write);
+    var quoted_resource_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer quoted_resource_writer.deinit();
+    try writeWorkspaceCoordinationResourceObject(allocator, &quoted_resource_writer.writer, quoted_resource);
+    const quoted_resource_json = try quoted_resource_writer.toOwnedSlice();
+    try std.testing.expect(std.mem.indexOf(u8, quoted_resource_json, "\"root\":\"path:src/\\\"quoted\\\".zig\"") != null);
+
+    var mismatched_selection_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer mismatched_selection_writer.deinit();
+    try writeWorkspaceGraphControlReceiptJson(allocator, &mismatched_selection_writer.writer, .{
+        .command = .compile,
+        .workspace = workspace_path,
+        .file = plan_path,
+        .plan_id = "default",
+        .session_id = "s1",
+        .claim_id = "claim-1",
+        .fencing_token = "1",
+    }, &state, 2, fps, audit, &.{"st-002"}, "GCR-test", false);
+    const mismatched_selection_json = try mismatched_selection_writer.toOwnedSlice();
+    try std.testing.expect(std.mem.indexOf(u8, mismatched_selection_json, "\"execution_allowed\":\"no\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, mismatched_selection_json, "\"session_selection_mismatch\"") != null);
 
     const workspace_file = try std.fs.path.join(allocator, &.{ workspace_path, "workspace.jsonl" });
     const workspace_line = try readLastJsonlLine(allocator, workspace_file);
