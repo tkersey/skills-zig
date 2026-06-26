@@ -51,6 +51,7 @@ Binary output:
 ./zig-out/bin/seq workflow-audit --workflow fixed-point-driver --mode report --format markdown
 ./zig-out/bin/seq workflow-audit --workflow fixed-point-driver --mode cohort-report --last 7d --format markdown
 ./zig-out/bin/seq workflow-audit --workflow fixed-point-driver --mode term-summary --term-group additive=add,added,patch --term-group reductive=delete,remove,refactor --since 2026-05-02T00:00:00-07:00 --format table
+./zig-out/bin/seq workflow-audit --workflow resolve-c3 --mode provenance --since 2026-05-01T00:00:00Z --until 2026-06-01T00:00:00Z --format table
 ./zig-out/bin/seq skill-blocks --skill fixed-point-driver --mode term-summary --term-group ablation=ablative,ablation --term-group isomorphism=isomorphic,isomorphism --since 2026-05-02T00:00:00-07:00 --format table
 ./zig-out/bin/seq workflow-overlap --workflow fixed-point-driver,review-adjudication --since 2026-05-02T00:00:00-07:00 --format table
 ./zig-out/bin/seq find-session --root ~/.codex/sessions --prompt "learnings recall" --since 2026-03-08T00:00:00Z --until 2026-03-10T23:59:59Z --limit 5 --format table
@@ -123,6 +124,7 @@ seq query --root ~/.codex/sessions --spec '{"dataset":"messages","joins":[{"data
 - emits `summary`, `signals`, `outcomes`, `sessions`, `report`, `term-summary`, or `cohort-report` modes
 - `term-summary` accepts repeated `--term-group <name=csv>` flags, `--examples N`, and `--unique-by snippet|path-snippet` for native phrase-bucket rollups without shell `jq`
 - `cohort-report` emits a Markdown-by-default or JSON workflow cohort packet with one direct cohort path selection, summary/outcome/session/evidence sections, and a replaced raw-query map for common `seq query` rollups
+- `provenance` emits controller-grade and non-controller evidence classes for one workflow; `artifact_under_repair` and `filename_or_path_mention` are never controller invocation evidence by themselves
 - supports `--since`, `--until`, `--workdir`, `--limit`, and `--format table|json|csv|jsonl|markdown`
 
 Examples:
@@ -132,6 +134,7 @@ seq workflow-audit --root ~/.codex/sessions --workflow fixed-point-driver --mode
 seq workflow-audit --root ~/.codex/sessions --workflow fixed-point-driver --mode cohort-report --last 7d --format markdown
 seq workflow-audit --root ~/.codex/sessions --workflow fixed-point-driver --mode cohort-report --last 7d --format json
 seq workflow-audit --root ~/.codex/sessions --workflow fixed-point-driver --mode term-summary --term-group additive=add,added,patch --term-group reductive=delete,remove,refactor --format table
+seq workflow-audit --root ~/.codex/sessions --workflow resolve-c3 --mode provenance --since 2026-05-01T00:00:00Z --until 2026-06-01T00:00:00Z --format json
 seq workflow-overlap --root ~/.codex/sessions --workflow fixed-point-driver,review-adjudication --mode summary --since 2026-05-02T00:00:00-07:00 --format table
 seq workflow-overlap --root ~/.codex/sessions --workflow fixed-point-driver,review-adjudication --mode sessions --limit 20 --format jsonl
 ```
@@ -159,6 +162,7 @@ seq resolve-churn-audit --root ~/.codex/sessions --since 2026-05-01T00:00:00Z --
 - keeps historical `legacy-cleanroom` and C3/MRPC counts separate; `c3-mrpc` is an explicit alias for the existing MRPC-era `c3` behavior
 - reports C3/MRPC `closure_compression` state for closed runs, including `CLOSED_UNCOMPRESSED` when material closed sessions lack basis, tournament, ablation, proof, holdout, permit, or bypass-free MRPC evidence
 - emits C3/MRPC `denominator.included_sessions` rows so each true C3 session carries its `session_id`, path, protocol, classification, `c3_required` / `c3_entered` / `c3_closed` booleans, and evidence refs for the native count and closure-compression decisions
+- `--emit-count-evidence` emits the per-count evidence table directly; it is equivalent to `--mode evidence`
 - marks absence-derived evidence explicitly with `source: "absent"` and deterministic reasons such as `no_c3_begin_signal`; aggregate `closure_compression` remains the cohort summary
 - reports MBK semantic-surface metrics separately from base-relative Git tree metrics
 
@@ -166,6 +170,7 @@ Examples:
 ```bash
 seq review-compiler-audit --root ~/.codex/sessions --protocol auto --since 2026-05-01T00:00:00-07:00 --until 2026-06-01T00:00:00-07:00 --repo /Users/tk/workspace/tk/skills-zig --exclude-current --format markdown
 seq review-compiler-audit --root ~/.codex/sessions --protocol c3 --since 2026-05-01T00:00:00Z --until 2026-06-01T00:00:00Z --repo /Users/tk/workspace/tk/skills-zig --format json
+seq review-compiler-audit --root ~/.codex/sessions --protocol c3 --since 2026-05-01T00:00:00Z --until 2026-06-01T00:00:00Z --repo /Users/tk/workspace/tk/skills-zig --emit-count-evidence --format table
 seq review-compiler-audit --root ~/.codex/sessions --protocol c3-mrpc --since 2026-05-01T00:00:00Z --until 2026-06-01T00:00:00Z --repo /Users/tk/workspace/tk/skills-zig --format json
 seq review-compiler-audit --root ~/.codex/sessions --protocol mbk --since 2026-05-01T00:00:00Z --until 2026-06-01T00:00:00Z --repo /Users/tk/workspace/tk/skills-zig --format json
 seq review-compiler-audit --root ~/.codex/sessions --protocol legacy-cleanroom --since 2026-05-01T00:00:00Z --until 2026-06-01T00:00:00Z --repo /Users/tk/workspace/tk/skills-zig --format json
