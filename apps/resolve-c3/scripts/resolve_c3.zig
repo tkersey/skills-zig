@@ -106,6 +106,7 @@ const HelpText =
     \\  resolve-c3 migrate mrpc|intent-closed
     \\  resolve-c3 authority-chain init|check
     \\  resolve-c3 mutation-gate
+    \\  resolve-c3 closure-gate
     \\
     \\legacy aliases remain available for MRPC-v1 state, but MBKC-v1 commands are the material surface.
     \\
@@ -137,7 +138,9 @@ const HelpText =
     \\  --realization-target PATH   RAC-v1 realization target JSON
     \\  --output PATH               RAC-v1 init output path
     \\  --chain PATH                RAC-v1 authority chain path
-    \\  --format text|json          RAC-v1 check output format
+    \\  --summary PATH              seq resolve summary JSON for closure-gate
+    \\  --runs PATH                 seq resolve runs JSONL for closure-gate
+    \\  --format text|json          gate output format
     \\  --mode MODE                Review mode or plan mode
     \\  --head SHA                 Artifact head for review batch begin
     \\  --stage candidate|delivery Holdout stage
@@ -248,6 +251,16 @@ const MutationGateLegalNextActions = [_][]const u8{
     "reject_finding",
     "block",
 };
+const ClosureGateLegalNextActions = [_][]const u8{
+    "enter_or_repair_c3",
+    "seal_batches",
+    "compile_compression",
+    "accept_kernel",
+    "map_or_delete_orphans",
+    "map_proof_actions",
+    "reduce_semantic_surface_or_rebase_ac",
+    "rerun_terminal_holdout",
+};
 
 const Command = enum {
     capabilities,
@@ -318,6 +331,7 @@ const Command = enum {
     authority_chain_init,
     authority_chain_check,
     mutation_gate,
+    closure_gate,
     doctor,
     init,
     paths,
@@ -378,6 +392,8 @@ const Args = struct {
     realization_target: ?[]const u8 = null,
     output: ?[]const u8 = null,
     chain: ?[]const u8 = null,
+    summary: ?[]const u8 = null,
+    runs: ?[]const u8 = null,
     format: ?[]const u8 = null,
     mode: ?[]const u8 = null,
     head: ?[]const u8 = null,
@@ -604,6 +620,10 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.output = try optionValue(argv, &i);
         } else if (std.mem.eql(u8, token, "--chain")) {
             args.chain = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--summary")) {
+            args.summary = try optionValue(argv, &i);
+        } else if (std.mem.eql(u8, token, "--runs")) {
+            args.runs = try optionValue(argv, &i);
         } else if (std.mem.eql(u8, token, "--format")) {
             args.format = try optionValue(argv, &i);
         } else if (std.mem.eql(u8, token, "--mode")) {
@@ -673,6 +693,10 @@ fn parseCommandTokens(argv: []const []const u8, first_option_index: *usize) !Com
     if (std.mem.eql(u8, primary, "mutation-gate")) {
         first_option_index.* = 2;
         return .mutation_gate;
+    }
+    if (std.mem.eql(u8, primary, "closure-gate")) {
+        first_option_index.* = 2;
+        return .closure_gate;
     }
     if (std.mem.eql(u8, primary, "counterexample")) {
         if (argv.len < 3) return error.MissingCommand;
@@ -951,6 +975,7 @@ fn run(allocator: std.mem.Allocator, args: Args, process_io: std.Io) !u8 {
         .authority_chain_init => authorityChainSurface(allocator, args, "init"),
         .authority_chain_check => authorityChainSurface(allocator, args, "check"),
         .mutation_gate => mutationGate(allocator, args),
+        .closure_gate => closureGate(allocator, args),
         .doctor => printDoctor(allocator, args),
         .init => initState(allocator, args),
         .paths => printPaths(allocator, args),
@@ -987,7 +1012,7 @@ fn run(allocator: std.mem.Allocator, args: Args, process_io: std.Io) !u8 {
 
 fn printCapabilities(allocator: std.mem.Allocator) !u8 {
     try writeStdoutBytes(allocator,
-        \\{"resolve_c3_capabilities":{"version":"0.3.2","protocol_profiles":{"intent_closed_cegis_v1":true,"mbkc_v1":true,"mrpc_v1_read":true,"rac_v1":true},"state_versions":{"readable":[1,2,3],"writable":[3]},"certificate_versions":{"readable":["MRPC-v1","MBKC-v1","RAC-v1"],"writable":["MBKC-v1","RAC-v1"]},"features":{"acceptance_contract_v2":true,"sealed_review_horizon_v1":true,"review_batch_v1":true,"review_aperture_v1":true,"counterexample_v1":true,"counterexample_basis_v2":true,"minimum_behavioral_kernel_v1":true,"reduction_certificate_v1":true,"review_potential_v1":true,"intent_closed_conformance_v1":true,"terminal_holdout_v1":true,"semantic_surface_v1":true,"proof_compression_v1":true,"authority_chain_rac_v1":true,"mutation_gate_rac_v1":true,"physical_apply":true,"physical_commit":true,"physical_push":true,"closure_horizon_v1":true,"mutation_guard_v2":true,"mbkc_v1":true,"mrpc_v1_read":true}}}
+        \\{"resolve_c3_capabilities":{"version":"0.3.3","protocol_profiles":{"intent_closed_cegis_v1":true,"mbkc_v1":true,"mrpc_v1_read":true,"rac_v1":true},"state_versions":{"readable":[1,2,3],"writable":[3]},"certificate_versions":{"readable":["MRPC-v1","MBKC-v1","RAC-v1"],"writable":["MBKC-v1","RAC-v1"]},"features":{"acceptance_contract_v2":true,"sealed_review_horizon_v1":true,"review_batch_v1":true,"review_aperture_v1":true,"counterexample_v1":true,"counterexample_basis_v2":true,"minimum_behavioral_kernel_v1":true,"reduction_certificate_v1":true,"review_potential_v1":true,"intent_closed_conformance_v1":true,"terminal_holdout_v1":true,"semantic_surface_v1":true,"proof_compression_v1":true,"authority_chain_rac_v1":true,"mutation_gate_rac_v1":true,"closure_gate_v1":true,"physical_apply":true,"physical_commit":true,"physical_push":true,"closure_horizon_v1":true,"mutation_guard_v2":true,"mbkc_v1":true,"mrpc_v1_read":true}}}
         \\
     );
     return 0;
@@ -1372,6 +1397,294 @@ fn mutationGateCouldNotEvaluate(allocator: std.mem.Allocator, reason: []const u8
     try out.writer.writeAll("}\n");
     try writeStdoutAlloc(allocator, &out);
     return 3;
+}
+
+const ClosureViolation = struct {
+    scope: []const u8,
+    run_id: ?[]const u8 = null,
+    code: []const u8,
+    detail: []const u8,
+};
+
+fn closureGate(allocator: std.mem.Allocator, args: Args) !u8 {
+    const campaign_id = args.campaign_id orelse return closureGateCouldNotEvaluate(allocator, "missing --campaign");
+    const summary_path = args.summary orelse return closureGateCouldNotEvaluate(allocator, "missing --summary");
+    const runs_path = args.runs orelse return closureGateCouldNotEvaluate(allocator, "missing --runs");
+    const format = args.format orelse "json";
+    if (!std.mem.eql(u8, format, "text") and !std.mem.eql(u8, format, "json")) return closureGateCouldNotEvaluate(allocator, "unsupported output format");
+
+    const summary_bytes = readFileOrStdin(allocator, summary_path) catch return closureGateCouldNotEvaluate(allocator, "could not read summary");
+    defer allocator.free(summary_bytes);
+    var parsed_summary = std.json.parseFromSlice(std.json.Value, allocator, summary_bytes, .{}) catch return closureGateCouldNotEvaluate(allocator, "summary must be JSON");
+    defer parsed_summary.deinit();
+    const campaign_summary = closureSummaryCampaign(parsed_summary.value, campaign_id);
+
+    const runs_bytes = readFileOrStdin(allocator, runs_path) catch return closureGateCouldNotEvaluate(allocator, "could not read runs");
+    defer allocator.free(runs_bytes);
+
+    var violations = std.ArrayList(ClosureViolation).empty;
+    defer deinitClosureViolations(allocator, &violations);
+
+    var material_rows: usize = 0;
+    var any_material = closureMaterial(campaign_summary);
+    var max_strict_progress = closureStrictProgress(campaign_summary);
+    var campaign_orphans = closureCount(campaign_summary, &.{"orphan_code_constructs"}) > 0;
+    var campaign_unmapped = closureCount(campaign_summary, &.{"unmapped_proof_actions"}) > 0;
+    var campaign_surface_delta = closureCount(campaign_summary, &.{"semantic_surface_delta"}) > 0 and !closureAcRebased(campaign_summary);
+
+    var lines = std.mem.splitScalar(u8, runs_bytes, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r\n");
+        if (line.len == 0) continue;
+        var parsed_run = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return closureGateCouldNotEvaluate(allocator, "runs row must be JSON");
+        defer parsed_run.deinit();
+        if (!closureCampaignMatches(parsed_run.value, campaign_id)) continue;
+        if (!closureMaterial(parsed_run.value)) continue;
+
+        material_rows += 1;
+        any_material = true;
+        const run_progress = closureStrictProgress(parsed_run.value);
+        if (run_progress > max_strict_progress) max_strict_progress = run_progress;
+        if (closureCount(parsed_run.value, &.{"orphan_code_constructs"}) > 0) campaign_orphans = true;
+        if (closureCount(parsed_run.value, &.{"unmapped_proof_actions"}) > 0) campaign_unmapped = true;
+        if (closureCount(parsed_run.value, &.{"semantic_surface_delta"}) > 0 and !closureAcRebased(parsed_run.value)) campaign_surface_delta = true;
+
+        try collectClosureRunViolations(allocator, parsed_run.value, &violations);
+    }
+
+    if (closureMaterial(campaign_summary) and material_rows == 0 and closureCount(campaign_summary, &.{ "runs_total", "material_runs_total" }) == 0) {
+        try appendClosureViolation(allocator, &violations, "campaign", null, "material_campaign_without_runs", "material campaign has no material runs");
+    }
+    if (any_material) {
+        if (max_strict_progress == 0) try appendClosureViolation(allocator, &violations, "campaign", null, "campaign_strict_progress_zero", "potential.strict_progress=0 for a material campaign");
+        if (campaign_orphans) try appendClosureViolation(allocator, &violations, "campaign", null, "campaign_orphan_code_constructs", "orphan_code_constructs > 0");
+        if (campaign_unmapped) try appendClosureViolation(allocator, &violations, "campaign", null, "campaign_unmapped_proof_actions", "unmapped_proof_actions > 0");
+        if (campaign_surface_delta) try appendClosureViolation(allocator, &violations, "campaign", null, "campaign_semantic_surface_delta_without_ac_rebase", "semantic_surface_delta > 0 without explicit AC rebase");
+    }
+
+    const allowed = violations.items.len == 0;
+    if (std.mem.eql(u8, format, "json")) {
+        try writeClosureGateJson(allocator, allowed, violations.items);
+    } else {
+        try writeClosureGateText(allocator, allowed, violations.items.len);
+    }
+    return if (allowed) 0 else 2;
+}
+
+fn deinitClosureViolations(allocator: std.mem.Allocator, violations: *std.ArrayList(ClosureViolation)) void {
+    for (violations.items) |violation| {
+        if (violation.run_id) |run_id| allocator.free(run_id);
+    }
+    violations.deinit(allocator);
+}
+
+fn collectClosureRunViolations(allocator: std.mem.Allocator, row: std.json.Value, violations: *std.ArrayList(ClosureViolation)) !void {
+    const run_id = stringField(row, "run_id");
+    if (closureBoolField(row, "c3_required") == true and closureBoolField(row, "c3_closed") != true) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "c3_required_without_c3_closure", "c3_required=true and c3_closed=false");
+    }
+    if (closureBoolField(row, "c3_required") == true and closureBoolField(row, "c3_entered") != true) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "c3_required_without_c3_entry", "c3_required=true while c3_entered is not true");
+    }
+    if (closureCompressionNone(row)) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "compression_state_none", "compression_state=NONE");
+    }
+    if (closureFindingBearing(row) and closureCount(row, &.{"batches_total"}) == 0) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "finding_workflow_without_batches", "batches_total=0 for a finding-bearing workflow");
+    }
+    if (closureBoolField(row, "delivery_closed") == true and closureBoolField(row, "terminal_closed") != true) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "delivery_closed_without_terminal_closure", "delivery_closed=true while terminal_closed=false");
+    }
+    if (closureStrictProgress(row) == 0) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "strict_progress_zero", "potential.strict_progress=0 for a material campaign");
+    }
+    const kernel = objectField(row, "kernel");
+    if (closureBoolFieldOpt(kernel, "accepted") != true and closureBoolField(row, "kernel_accepted") != true) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "kernel_not_accepted", "kernel.accepted is not true");
+    }
+    const orphan_count = closureCount(row, &.{"orphan_code_constructs"});
+    const nested_orphans = if (objectField(row, "realization_map")) |m| closureCount(m, &.{"orphan_code_constructs"}) else 0;
+    if (orphan_count > 0 or nested_orphans > 0) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "orphan_code_constructs", "orphan_code_constructs > 0");
+    }
+    const unmapped_count = closureCount(row, &.{"unmapped_proof_actions"});
+    const nested_unmapped = if (objectField(row, "proof_basis")) |p| closureCount(p, &.{"unmapped_proof_actions"}) else 0;
+    if (unmapped_count > 0 or nested_unmapped > 0) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "unmapped_proof_actions", "unmapped_proof_actions > 0");
+    }
+    const wound_count = closureCount(row, &.{"wound_specific_tests"});
+    const nested_wound = if (objectField(row, "proof_basis")) |p| closureCount(p, &.{"wound_specific_tests"}) else 0;
+    const total_wound = @max(wound_count, nested_wound);
+    if (total_wound > 0 and !closureWoundTestsMapped(row, total_wound)) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "unmapped_wound_specific_tests", "wound_specific_tests > 0 without class mapping");
+    }
+    const surface_delta = closureCount(row, &.{"semantic_surface_delta"});
+    if (surface_delta > 0 and !closureAcRebased(row)) {
+        try appendClosureViolation(allocator, violations, "run", run_id, "semantic_surface_delta_without_ac_rebase", "semantic_surface_delta > 0 without explicit AC rebase");
+    }
+}
+
+fn appendClosureViolation(allocator: std.mem.Allocator, target: *std.ArrayList(ClosureViolation), scope: []const u8, run_id: ?[]const u8, code: []const u8, detail: []const u8) !void {
+    try target.append(allocator, .{
+        .scope = scope,
+        .run_id = if (run_id) |id| try allocator.dupe(u8, id) else null,
+        .code = code,
+        .detail = detail,
+    });
+}
+
+fn closureGateCouldNotEvaluate(allocator: std.mem.Allocator, reason: []const u8) !u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"closure_allowed\":false,\"status\":\"error\",\"violations\":[{\"scope\":\"input\",\"code\":\"could_not_evaluate_input\",\"detail\":");
+    try writeJsonString(&out.writer, reason);
+    try out.writer.writeAll("}],\"legal_next_actions\":[\"block\"]}\n");
+    try writeStdoutAlloc(allocator, &out);
+    return 3;
+}
+
+fn closureSummaryCampaign(summary: std.json.Value, campaign_id: []const u8) std.json.Value {
+    const direct_id = closureCampaignId(summary);
+    if (direct_id.len == 0 or std.mem.eql(u8, direct_id, campaign_id)) return summary;
+    const campaigns = objectField(summary, "campaigns") orelse return std.json.Value{ .null = {} };
+    switch (campaigns) {
+        .array => |arr| {
+            for (arr.items) |row| {
+                if (std.mem.eql(u8, closureCampaignId(row), campaign_id)) return row;
+            }
+        },
+        .object => |obj| {
+            if (obj.get(campaign_id)) |value| return value;
+        },
+        else => {},
+    }
+    return std.json.Value{ .null = {} };
+}
+
+fn closureCampaignMatches(row: std.json.Value, campaign_id: []const u8) bool {
+    return std.mem.eql(u8, closureCampaignId(row), campaign_id);
+}
+
+fn closureCampaignId(row: std.json.Value) []const u8 {
+    return stringField(row, "campaign_id") orelse stringField(row, "campaign") orelse "";
+}
+
+fn closureMaterial(row: std.json.Value) bool {
+    return closureBoolField(row, "c3_required") == true or closureFindingBearing(row);
+}
+
+fn closureFindingBearing(row: std.json.Value) bool {
+    return closureBoolField(row, "finding_bearing_workflow") == true or
+        closureBoolField(row, "findings_present") == true or
+        closureCount(row, &.{ "findings_total", "findings", "raw_claims" }) > 0;
+}
+
+fn closureCompressionNone(row: std.json.Value) bool {
+    const value = stringField(row, "compression_state") orelse stringField(row, "closure_compression") orelse return false;
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t\r\n"), "NONE");
+}
+
+fn closureStrictProgress(row: std.json.Value) i64 {
+    if (closureIntField(row, "strict_progress")) |value| return value;
+    if (objectField(row, "potential")) |potential| {
+        if (closureIntField(potential, "strict_progress")) |value| return value;
+    }
+    if (objectField(row, "review_potential")) |potential| {
+        if (closureBoolField(potential, "strict_progress") == true) return 1;
+    }
+    return 0;
+}
+
+fn closureWoundTestsMapped(row: std.json.Value, wound_tests: i64) bool {
+    if (wound_tests <= 0) return true;
+    if (closureBoolField(row, "wound_specific_tests_class_mapped") == true or closureBoolField(row, "wound_specific_class_mapped") == true) return true;
+    return closureCount(row, &.{"class_mapped_wound_specific_tests"}) >= wound_tests;
+}
+
+fn closureAcRebased(row: std.json.Value) bool {
+    return closureBoolField(row, "ac_rebased") == true or
+        closureBoolField(row, "explicit_ac_rebase") == true or
+        stringField(row, "ac_rebase_ref") != null;
+}
+
+fn closureCount(row: std.json.Value, keys: []const []const u8) i64 {
+    for (keys) |key| {
+        if (closureIntField(row, key)) |value| return value;
+    }
+    return 0;
+}
+
+fn closureBoolFieldOpt(value: ?std.json.Value, key: []const u8) ?bool {
+    return if (value) |actual| closureBoolField(actual, key) else null;
+}
+
+fn closureBoolField(value: std.json.Value, key: []const u8) ?bool {
+    const child = objectField(value, key) orelse return null;
+    return switch (child) {
+        .bool => |b| b,
+        .integer => |n| if (n == 0) false else if (n == 1) true else null,
+        .string => |s| closureBoolishString(s),
+        else => null,
+    };
+}
+
+fn closureBoolishString(value: []const u8) ?bool {
+    const folded = std.mem.trim(u8, value, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(folded, "true") or std.ascii.eqlIgnoreCase(folded, "yes") or std.ascii.eqlIgnoreCase(folded, "pass") or std.ascii.eqlIgnoreCase(folded, "passed") or std.mem.eql(u8, folded, "1")) return true;
+    if (std.ascii.eqlIgnoreCase(folded, "false") or std.ascii.eqlIgnoreCase(folded, "no") or std.ascii.eqlIgnoreCase(folded, "fail") or std.ascii.eqlIgnoreCase(folded, "failed") or std.ascii.eqlIgnoreCase(folded, "none") or std.mem.eql(u8, folded, "0")) return false;
+    return null;
+}
+
+fn closureIntField(value: std.json.Value, key: []const u8) ?i64 {
+    const child = objectField(value, key) orelse return null;
+    return switch (child) {
+        .bool => |b| if (b) 1 else 0,
+        .integer => |n| n,
+        .string => |s| std.fmt.parseInt(i64, std.mem.trim(u8, s, " \t\r\n"), 10) catch null,
+        else => null,
+    };
+}
+
+fn writeClosureGateJson(allocator: std.mem.Allocator, allowed: bool, violations: []const ClosureViolation) !void {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"closure_allowed\":");
+    try out.writer.writeAll(if (allowed) "true" else "false");
+    try out.writer.writeAll(",\"status\":");
+    try writeJsonString(&out.writer, if (allowed) "allowed" else "blocked");
+    try out.writer.writeAll(",\"violations\":[");
+    for (violations, 0..) |violation, i| {
+        if (i > 0) try out.writer.writeByte(',');
+        try out.writer.writeAll("{\"scope\":");
+        try writeJsonString(&out.writer, violation.scope);
+        if (violation.run_id) |run_id| {
+            try out.writer.writeAll(",\"run_id\":");
+            try writeJsonString(&out.writer, run_id);
+        }
+        try out.writer.writeAll(",\"code\":");
+        try writeJsonString(&out.writer, violation.code);
+        try out.writer.writeAll(",\"detail\":");
+        try writeJsonString(&out.writer, violation.detail);
+        try out.writer.writeByte('}');
+    }
+    try out.writer.writeAll("],\"legal_next_actions\":");
+    try writeStringArray(&out.writer, if (allowed) &.{} else ClosureGateLegalNextActions[0..]);
+    try out.writer.writeAll("}\n");
+    try writeStdoutAlloc(allocator, &out);
+}
+
+fn writeClosureGateText(allocator: std.mem.Allocator, allowed: bool, violation_count: usize) !void {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    if (allowed) {
+        try out.writer.writeAll("closure allowed\n");
+    } else {
+        try out.writer.writeAll("closure gate failed\n");
+        try out.writer.print("remaining authority gaps: {d}\nlegal_next_actions: ", .{violation_count});
+        try writeStringArray(&out.writer, ClosureGateLegalNextActions[0..]);
+        try out.writer.writeByte('\n');
+    }
+    try writeStdoutAlloc(allocator, &out);
 }
 
 fn appendMutationGateReasons(allocator: std.mem.Allocator, target: *std.ArrayList([]const u8), reasons: []const []const u8) !void {
@@ -6257,6 +6570,13 @@ fn containsString(items: []const []const u8, value: []const u8) bool {
     return false;
 }
 
+fn containsClosureCode(items: []const ClosureViolation, value: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item.code, value)) return true;
+    }
+    return false;
+}
+
 fn constructMapHasOrphan(value: std.json.Value) bool {
     const constructs = objectField(value, "constructs") orelse return true;
     return switch (constructs) {
@@ -7414,6 +7734,43 @@ test "mutation-gate integrated mode compares supplied artifact state" {
 
     try std.testing.expect(try artifactStateMatches(std.testing.allocator, good_path, facts));
     try std.testing.expect(!try artifactStateMatches(std.testing.allocator, stale_path, facts));
+}
+
+test "closure-gate blocks material authority gaps" {
+    const json_text =
+        \\{"campaign_id":"C3-test","run_id":"run-1","c3_required":true,"c3_entered":true,"c3_closed":true,"compression_state":"NONE","finding_bearing_workflow":true,"batches_total":0,"kernel":{"accepted":false},"potential":{"strict_progress":0},"delivery_closed":true,"terminal_closed":false,"orphan_code_constructs":1,"unmapped_proof_actions":1,"wound_specific_tests":1,"semantic_surface_delta":1}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_text, .{});
+    defer parsed.deinit();
+
+    var violations = std.ArrayList(ClosureViolation).empty;
+    defer deinitClosureViolations(std.testing.allocator, &violations);
+    try collectClosureRunViolations(std.testing.allocator, parsed.value, &violations);
+
+    try std.testing.expect(containsClosureCode(violations.items, "compression_state_none"));
+    try std.testing.expect(containsClosureCode(violations.items, "finding_workflow_without_batches"));
+    try std.testing.expect(containsClosureCode(violations.items, "delivery_closed_without_terminal_closure"));
+    try std.testing.expect(containsClosureCode(violations.items, "strict_progress_zero"));
+    try std.testing.expect(containsClosureCode(violations.items, "kernel_not_accepted"));
+    try std.testing.expect(containsClosureCode(violations.items, "orphan_code_constructs"));
+    try std.testing.expect(containsClosureCode(violations.items, "unmapped_proof_actions"));
+    try std.testing.expect(containsClosureCode(violations.items, "unmapped_wound_specific_tests"));
+    try std.testing.expect(containsClosureCode(violations.items, "semantic_surface_delta_without_ac_rebase"));
+}
+
+test "closure-gate permits healthy material row helpers" {
+    const json_text =
+        \\{"campaign_id":"C3-test","run_id":"run-1","c3_required":true,"c3_entered":true,"c3_closed":true,"compression_state":"CEB-v2","finding_bearing_workflow":true,"batches_total":2,"kernel":{"accepted":true},"potential":{"strict_progress":1},"delivery_closed":true,"terminal_closed":true,"orphan_code_constructs":0,"unmapped_proof_actions":0,"wound_specific_tests":1,"wound_specific_tests_class_mapped":true,"semantic_surface_delta":1,"explicit_ac_rebase":true}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_text, .{});
+    defer parsed.deinit();
+
+    var violations = std.ArrayList(ClosureViolation).empty;
+    defer deinitClosureViolations(std.testing.allocator, &violations);
+    try collectClosureRunViolations(std.testing.allocator, parsed.value, &violations);
+
+    try std.testing.expect(closureMaterial(parsed.value));
+    try std.testing.expectEqual(@as(usize, 0), violations.items.len);
 }
 
 test "RAC-v1 non-mutation route can be valid without mutation authority" {
