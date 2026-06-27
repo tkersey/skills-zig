@@ -234,6 +234,14 @@ fn scanSessionPath(
         if (stringField(root, "timestamp")) |timestamp| {
             if (!withinWindow(timestamp, params)) continue;
         }
+
+        if (optEql(stringField(root, "type"), "session_meta")) {
+            if (objectField(root, "payload")) |meta| {
+                if (stringField(meta, "id")) |id| session_id = id;
+            }
+            continue;
+        }
+
         const payload = objectField(root, "payload") orelse continue;
         const payload_type = stringField(payload, "type") orelse continue;
 
@@ -259,14 +267,15 @@ fn scanSessionPath(
                 .session_id = session_id,
                 .timestamp = ts,
                 .command = cmd,
-                .cwd = stringField(args_obj, "workdir"),
+                .cwd = nullableString(args_obj, "workdir") orelse nullableString(args_obj, "cwd"),
             });
             continue;
         }
 
-        if (std.mem.eql(u8, payload_type, "exec_command_end")) {
+        if (std.mem.eql(u8, payload_type, "exec_command_end") or std.mem.eql(u8, payload_type, "function_call_output")) {
             const call_id = stringField(payload, "call_id") orelse continue;
-            const call = pending.get(call_id) orelse continue;
+            var call = pending.get(call_id) orelse continue;
+            if (call.cwd == null) call.cwd = nullableString(payload, "cwd");
             const stdout = stringField(payload, "stdout") orelse stringField(payload, "output") orelse "";
             const stderr = stringField(payload, "stderr") orelse "";
             try appendRowsFromCommandText(allocator, stdout, stderr, call, path, params, audit, dedupe);
@@ -297,10 +306,10 @@ fn scanReceiptGlob(
         try scanReceiptPath(allocator, glob, params, audit, dedupe);
         return;
     }
-    const slash = std.mem.lastIndexOfScalar(u8, glob, '/') orelse return;
-    const dir_path = if (slash == 0) "/" else glob[0..slash];
-    const pattern = glob[slash + 1 ..];
-    var dir = std.Io.Dir.openDirAbsolute(defaultIo(), dir_path, .{ .iterate = true }) catch return;
+    const slash = std.mem.lastIndexOfScalar(u8, glob, '/');
+    const dir_path = if (slash) |idx| if (idx == 0) "/" else glob[0..idx] else params.root;
+    const pattern = if (slash) |idx| glob[idx + 1 ..] else glob;
+    var dir = std.Io.Dir.cwd().openDir(defaultIo(), dir_path, .{ .iterate = true }) catch return;
     defer dir.close(defaultIo());
     var iter = dir.iterate();
     while (try iter.next(defaultIo())) |entry| {
@@ -355,8 +364,10 @@ fn appendRowsFromReceiptText(
 ) !void {
     var cursor: usize = 0;
     var found = false;
+    var receipt_index: usize = 0;
     while (findJsonObject(text, &cursor)) |json_text| {
         found = true;
+        receipt_index += 1;
         var row = classifyReceiptText(allocator, json_text, .{
             .session_id = "",
             .cwd = null,
@@ -369,7 +380,9 @@ fn appendRowsFromReceiptText(
             row.deinit();
             continue;
         }
-        if (try claimDedupeKey(allocator, row, path, "", dedupe)) {
+        var fallback_buf: [64]u8 = undefined;
+        const fallback = std.fmt.bufPrint(fallback_buf[0..], "receipt:{d}", .{receipt_index}) catch "receipt";
+        if (try claimDedupeKey(allocator, row, path, fallback, dedupe)) {
             try audit.rows.append(allocator, row);
         } else {
             row.deinit();
@@ -390,21 +403,22 @@ fn classifyReceiptText(allocator: std.mem.Allocator, text: []const u8, ctx: Clas
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
     defer parsed.deinit();
     const root = object(parsed.value) orelse return error.InvalidReceipt;
+    if (!looksLikeReceiptObject(root)) return error.InvalidReceipt;
     return classifyReceiptObject(allocator, root, ctx);
 }
 
 fn classifyReceiptObject(allocator: std.mem.Allocator, root: std.json.ObjectMap, ctx: ClassifyContext) !query.Row {
     const verdict = objectField(root, "reviewVerdict");
-    const failure_code_raw = stringField(root, "failureCode");
-    const review_thread_id = nullableString(root, "reviewThreadId") orelse if (verdict) |v| nullableString(v, "reviewThreadId") else null;
-    const review_turn_id = nullableString(root, "reviewTurnId") orelse if (verdict) |v| nullableString(v, "reviewTurnId") else null;
-    const base_sha = nullableString(root, "baseSha") orelse if (verdict) |v| nullableString(v, "baseSha") else null;
-    const head_sha = nullableString(root, "headSha") orelse if (verdict) |v| nullableString(v, "headSha") else null;
-    const target_fingerprint = nullableString(root, "targetFingerprint") orelse if (verdict) |v| nullableString(v, "targetFingerprint") else null;
-    const review_count = intField(root, "reviewCount") orelse 0;
-    const last_review_thread_id = nullableString(root, "lastReviewThreadId");
-    const last_head_sha = nullableString(root, "lastHeadSha");
-    const verdict_status = if (verdict) |v| nullableString(v, "status") else null;
+    const failure_code_raw = nullableStringAny(root, &.{ "failureCode", "failure_code" });
+    const review_thread_id = nullableStringAny(root, &.{ "reviewThreadId", "review_thread_id" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "reviewThreadId", "review_thread_id" }) else null;
+    const review_turn_id = nullableStringAny(root, &.{ "reviewTurnId", "review_turn_id" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "reviewTurnId", "review_turn_id" }) else null;
+    const base_sha = nullableStringAny(root, &.{ "baseSha", "base_sha" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "baseSha", "base_sha" }) else null;
+    const head_sha = nullableStringAny(root, &.{ "headSha", "head_sha" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "headSha", "head_sha" }) else null;
+    const target_fingerprint = nullableStringAny(root, &.{ "targetFingerprint", "target_fingerprint" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "targetFingerprint", "target_fingerprint" }) else null;
+    const review_count = intFieldAny(root, &.{ "reviewCount", "review_count" }) orelse 0;
+    const last_review_thread_id = nullableStringAny(root, &.{ "lastReviewThreadId", "last_review_thread_id" });
+    const last_head_sha = nullableStringAny(root, &.{ "lastHeadSha", "last_head_sha" });
+    const verdict_status = if (verdict) |v| nullableString(v, "status") else nullableString(root, "status");
 
     const legacy_pre_review_transport =
         optEql(failure_code_raw, "lane_transport_lost") and
@@ -415,27 +429,27 @@ fn classifyReceiptObject(allocator: std.mem.Allocator, root: std.json.ObjectMap,
         verdict == null;
 
     const failure_code = if (legacy_pre_review_transport) "pre_review_lane_transport_lost" else failure_code_raw;
-    const phase = stringField(root, "reviewAttemptPhase") orelse inferPhase(root, verdict, review_thread_id, failure_code, legacy_pre_review_transport);
-    const review_attempt_exists = boolField(root, "reviewAttemptExists") orelse (review_thread_id != null);
-    const proof_verdict_exists = boolField(root, "proofVerdictExists") orelse tupleBoundVerdict(verdict, base_sha, head_sha, target_fingerprint);
-    const backend_class = if (verdict) |v| nullableString(v, "backendClass") orelse ctx.default_backend_class else ctx.default_backend_class;
-    const record_path = nullableString(root, "recordPath") orelse if (verdict) |v| nullableString(v, "recordPath") else null;
-    const event_log_path = nullableString(root, "eventLogPath") orelse if (verdict) |v| nullableString(v, "eventLogPath") else null;
-    const finding_count = if (verdict) |v| intField(v, "findingCount") orelse 0 else intField(root, "findingCount") orelse 0;
+    const phase = nullableStringAny(root, &.{ "reviewAttemptPhase", "review_attempt_phase" }) orelse inferPhase(root, verdict, review_thread_id, failure_code, legacy_pre_review_transport);
+    const review_attempt_exists = boolFieldAny(root, &.{ "reviewAttemptExists", "review_attempt_exists" }) orelse (review_thread_id != null);
+    const proof_verdict_exists = boolFieldAny(root, &.{ "proofVerdictExists", "proof_verdict_exists" }) orelse tupleBoundVerdict(root, verdict, base_sha, head_sha, target_fingerprint);
+    const backend_class = (if (verdict) |v| nullableStringAny(v, &.{ "backendClass", "backend_class" }) else null) orelse nullableStringAny(root, &.{ "backendClass", "backend_class" }) orelse ctx.default_backend_class;
+    const record_path = nullableStringAny(root, &.{ "recordPath", "record_path" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "recordPath", "record_path" }) else null;
+    const event_log_path = nullableStringAny(root, &.{ "eventLogPath", "event_log_path" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "eventLogPath", "event_log_path" }) else null;
+    const finding_count = if (verdict) |v| intFieldAny(v, &.{ "findingCount", "finding_count" }) orelse 0 else intFieldAny(root, &.{ "findingCount", "finding_count" }) orelse 0;
 
     var row = query.Row.init(allocator);
     errdefer row.deinit();
     try putStringOrNull(&row, "session_id", nonEmpty(ctx.session_id));
-    try putStringOrNull(&row, "cwd", nullableString(root, "cwd") orelse ctx.cwd);
+    try putStringOrNull(&row, "cwd", nullableStringAny(root, &.{ "cwd", "workdir" }) orelse ctx.cwd);
     try row.putStaticKey("command_surface", .{ .string = ctx.command_surface });
     try row.putStaticKey("backend_class", .{ .string = backend_class });
     try row.putStaticKey("review_attempt_phase", .{ .string = phase });
     try row.putStaticKey("review_attempt_exists", .{ .bool = review_attempt_exists });
     try row.putStaticKey("proof_verdict_exists", .{ .bool = proof_verdict_exists });
     try putStringOrNull(&row, "failure_code", failure_code);
-    try putStringOrNull(&row, "failure_class", nullableString(root, "failureClass"));
-    try putBoolOrNull(&row, "retryable_same_tuple_now", boolField(root, "retryableSameTupleNow"));
-    try putStringOrNull(&row, "lane_id", nullableString(root, "laneId"));
+    try putStringOrNull(&row, "failure_class", nullableStringAny(root, &.{ "failureClass", "failure_class" }));
+    try putBoolOrNull(&row, "retryable_same_tuple_now", boolFieldAny(root, &.{ "retryableSameTupleNow", "retryable_same_tuple_now" }));
+    try putStringOrNull(&row, "lane_id", nullableStringAny(root, &.{ "laneId", "lane_id" }));
     try row.putStaticKey("review_count", .{ .int = review_count });
     try putStringOrNull(&row, "last_review_thread_id", last_review_thread_id);
     try putStringOrNull(&row, "review_thread_id", review_thread_id);
@@ -446,7 +460,7 @@ fn classifyReceiptObject(allocator: std.mem.Allocator, root: std.json.ObjectMap,
     try putStringOrNull(&row, "review_verdict_status", verdict_status);
     try row.putStaticKey("finding_count", .{ .int = finding_count });
     try row.putStaticKey("account_resource_signal", .{ .bool = accountResourceSignal(root, verdict) });
-    try row.putStaticKey("transport_signal", .{ .bool = transportSignal(failure_code, nullableString(root, "failureClass")) });
+    try row.putStaticKey("transport_signal", .{ .bool = transportSignal(failure_code, nullableStringAny(root, &.{ "failureClass", "failure_class" })) });
     try putStringOrNull(&row, "record_path", record_path);
     try putStringOrNull(&row, "event_log_path", event_log_path);
     return row;
@@ -472,7 +486,7 @@ fn summarize(rows: []const query.Row) Summary {
             out.pre_review_lane_transport_lost_count += 1;
             has_pre_review_failure = true;
         }
-        if (optEql(failure_code, "review_transport_lost") or (optEql(scalarString(row, "failure_class"), "transport") and attempt_exists)) {
+        if (scalarBool(row, "transport_signal") and attempt_exists) {
             out.review_attempt_transport_failure_count += 1;
             has_degraded = true;
         }
@@ -482,8 +496,8 @@ fn summarize(rows: []const query.Row) Summary {
             out.account_resource_exhausted_count += 1;
             has_degraded = true;
         }
-        if (optEql(status, "timeout") and attempt_exists) out.timeout_with_handle_count += 1;
-        if (optEql(failure_code, "duplicate_prevented") or optEql(phase, "review_waiting")) out.duplicate_prevented_count += 1;
+        if ((optEql(status, "timeout") or optEql(phase, "review_waiting")) and attempt_exists) out.timeout_with_handle_count += 1;
+        if (optEql(failure_code, "duplicate_prevented")) out.duplicate_prevented_count += 1;
         if (std.mem.indexOf(u8, backend orelse "", "cas-start-wait") != null or std.mem.indexOf(u8, backend orelse "", "cas-native-fallback") != null) {
             if (proof_exists) out.start_wait_normalized_count += 1 else out.start_wait_unormalized_count += 1;
             has_degraded = true;
@@ -495,11 +509,13 @@ fn summarize(rows: []const query.Row) Summary {
         }
     }
 
-    out.lane_backend_status = if (has_lane_proof and !has_pre_review_failure)
+    out.lane_backend_status = if (has_degraded or (has_pre_review_failure and has_proof))
+        "degraded"
+    else if (has_lane_proof)
         "proven"
-    else if (has_pre_review_failure and !has_proof)
+    else if (has_pre_review_failure)
         "failing_pre_review"
-    else if (has_proof or has_degraded or has_pre_review_failure)
+    else if (has_proof)
         "degraded"
     else
         "unproven";
@@ -524,19 +540,19 @@ fn inferPhase(
     return "pre_lane_start";
 }
 
-fn tupleBoundVerdict(verdict: ?std.json.ObjectMap, base: ?[]const u8, head: ?[]const u8, fingerprint: ?[]const u8) bool {
-    const v = verdict orelse return false;
+fn tupleBoundVerdict(root: std.json.ObjectMap, verdict: ?std.json.ObjectMap, base: ?[]const u8, head: ?[]const u8, fingerprint: ?[]const u8) bool {
+    const v = verdict orelse root;
     return base != null and head != null and fingerprint != null and
-        optEql(nullableString(v, "baseSha"), base.?) and
-        optEql(nullableString(v, "headSha"), head.?) and
-        optEql(nullableString(v, "targetFingerprint"), fingerprint.?);
+        optEql(nullableStringAny(v, &.{ "baseSha", "base_sha" }), base.?) and
+        optEql(nullableStringAny(v, &.{ "headSha", "head_sha" }), head.?) and
+        optEql(nullableStringAny(v, &.{ "targetFingerprint", "target_fingerprint" }), fingerprint.?);
 }
 
 fn accountResourceSignal(root: std.json.ObjectMap, verdict: ?std.json.ObjectMap) bool {
-    if (optEql(nullableString(root, "failureCode"), "account_resource_exhausted")) return true;
+    if (optEql(nullableStringAny(root, &.{ "failureCode", "failure_code" }), "account_resource_exhausted")) return true;
     if (verdict) |v| {
         if (optEql(nullableString(v, "status"), "account_resource_exhausted")) return true;
-        if (optEql(nullableString(v, "failureCode"), "account_resource_exhausted")) return true;
+        if (optEql(nullableStringAny(v, &.{ "failureCode", "failure_code" }), "account_resource_exhausted")) return true;
     }
     return containsAccountSignal(root);
 }
@@ -570,11 +586,11 @@ fn rowMatchesFilters(row: query.Row, params: Params) bool {
     }
     if (params.repo) |want| {
         const cwd = scalarString(row, "cwd") orelse "";
-        if (!std.mem.startsWith(u8, cwd, want)) return false;
+        if (!pathMatchesScope(cwd, want)) return false;
     }
     if (params.workdir) |want| {
         const cwd = scalarString(row, "cwd") orelse "";
-        if (!std.mem.startsWith(u8, cwd, want)) return false;
+        if (!pathMatchesScope(cwd, want)) return false;
     }
     if (params.base_sha) |want| if (!optEql(scalarString(row, "base_sha"), want)) return false;
     if (params.head_sha) |want| if (!optEql(scalarString(row, "head_sha"), want)) return false;
@@ -583,6 +599,17 @@ fn rowMatchesFilters(row: query.Row, params: Params) bool {
         if (optEql(scalarString(row, "session_id"), current)) return false;
     }
     return true;
+}
+
+fn pathMatchesScope(path: []const u8, scope: []const u8) bool {
+    if (scope.len == 0) return false;
+    var trimmed_scope = scope;
+    while (trimmed_scope.len > 1 and trimmed_scope[trimmed_scope.len - 1] == '/') {
+        trimmed_scope = trimmed_scope[0 .. trimmed_scope.len - 1];
+    }
+    if (std.mem.eql(u8, path, trimmed_scope)) return true;
+    if (!std.mem.startsWith(u8, path, trimmed_scope)) return false;
+    return path.len > trimmed_scope.len and path[trimmed_scope.len] == '/';
 }
 
 fn claimDedupeKey(
@@ -607,6 +634,26 @@ fn looksLikeCasReviewCommand(cmd: []const u8) bool {
     return std.mem.indexOf(u8, cmd, "cas review_session") != null or
         std.mem.indexOf(u8, cmd, "cas_review_session") != null or
         std.mem.indexOf(u8, cmd, "review_session") != null;
+}
+
+fn looksLikeReceiptObject(root: std.json.ObjectMap) bool {
+    if (objectField(root, "reviewVerdict") != null) return true;
+    if (nullableStringAny(root, &.{ "reviewThreadId", "review_thread_id" }) != null) return true;
+    if (nullableStringAny(root, &.{ "reviewAttemptPhase", "review_attempt_phase" }) != null) return true;
+    if (nullableStringAny(root, &.{ "failureCode", "failure_code" }) != null) return true;
+    if (intFieldAny(root, &.{ "reviewCount", "review_count" }) != null) return true;
+    if (nullableStringAny(root, &.{ "baseSha", "base_sha" }) != null and nullableStringAny(root, &.{ "headSha", "head_sha" }) != null and nullableStringAny(root, &.{ "targetFingerprint", "target_fingerprint" }) != null) return true;
+    if (nullableString(root, "status")) |status| {
+        return optEql(status, "clean") or
+            optEql(status, "findings") or
+            optEql(status, "timeout") or
+            optEql(status, "transport_failure") or
+            optEql(status, "account_resource_exhausted") or
+            optEql(status, "parse_mismatch") or
+            optEql(status, "incomplete") or
+            optEql(status, "no_attempt");
+    }
+    return false;
 }
 
 fn backendFromCommand(cmd: []const u8) []const u8 {
@@ -703,6 +750,13 @@ fn nullableString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     };
 }
 
+fn nullableStringAny(obj: std.json.ObjectMap, keys: []const []const u8) ?[]const u8 {
+    for (keys) |key| {
+        if (nullableString(obj, key)) |value| return value;
+    }
+    return null;
+}
+
 fn boolField(obj: std.json.ObjectMap, key: []const u8) ?bool {
     const value = obj.get(key) orelse return null;
     return switch (value) {
@@ -711,12 +765,26 @@ fn boolField(obj: std.json.ObjectMap, key: []const u8) ?bool {
     };
 }
 
+fn boolFieldAny(obj: std.json.ObjectMap, keys: []const []const u8) ?bool {
+    for (keys) |key| {
+        if (boolField(obj, key)) |value| return value;
+    }
+    return null;
+}
+
 fn intField(obj: std.json.ObjectMap, key: []const u8) ?i64 {
     const value = obj.get(key) orelse return null;
     return switch (value) {
         .integer => |v| v,
         else => null,
     };
+}
+
+fn intFieldAny(obj: std.json.ObjectMap, keys: []const []const u8) ?i64 {
+    for (keys) |key| {
+        if (intField(obj, key)) |value| return value;
+    }
+    return null;
 }
 
 fn putStringOrNull(row: *query.Row, key: []const u8, value: ?[]const u8) !void {
@@ -791,5 +859,128 @@ test "tuple-bound review verdict proves normalized verdict" {
 
     const summary = summarize(&.{row});
     try std.testing.expectEqual(@as(i64, 1), summary.completed_clean_count);
+    try std.testing.expectEqualStrings("degraded", summary.lane_backend_status);
+}
+
+test "standard response item output is audited with top-level session meta" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "session.jsonl", .data =
+        \\{"type":"session_meta","timestamp":"2026-06-27T01:00:00Z","payload":{"id":"sess-standard"}}
+        \\{"type":"response_item","timestamp":"2026-06-27T01:00:01Z","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"cas review_session start --wait --json\",\"cwd\":\"/repo\"}"}}
+        \\{"type":"response_item","timestamp":"2026-06-27T01:00:02Z","payload":{"type":"function_call_output","call_id":"call-1","output":"{\"reviewThreadId\":\"thr_1\",\"baseSha\":\"b\",\"headSha\":\"h\",\"targetFingerprint\":\"t\",\"reviewVerdict\":{\"status\":\"clean\",\"clean\":true,\"findingCount\":0,\"failureCode\":null,\"baseSha\":\"b\",\"headSha\":\"h\",\"targetFingerprint\":\"t\",\"reviewThreadId\":\"thr_1\",\"backendClass\":\"cas-start-wait\"}}\n"}}
+        \\
+    });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "session.jsonl" });
+    defer std.testing.allocator.free(path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .path = path,
+        .session_id = "sess-standard",
+        .repo = "/repo",
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), audit.rows.items.len);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_clean_count);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.start_wait_normalized_count);
+    try std.testing.expectEqualStrings("sess-standard", scalarString(audit.rows.items[0], "session_id").?);
+}
+
+test "basename receipt glob keeps handle-less receipts distinct and skips non-receipts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "receipts.json", .data =
+        \\{"type":"unrelated","status":"ok"}
+        \\{"failureCode":"pre_review_lane_transport_lost","reviewAttemptPhase":"pre_review_start","baseSha":"b1","headSha":"h1","targetFingerprint":"t1"}
+        \\{"failureCode":"pre_review_lane_transport_lost","reviewAttemptPhase":"pre_review_start","baseSha":"b2","headSha":"h2","targetFingerprint":"t2"}
+        \\
+    });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .receipt_globs = &.{"*.json"},
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), audit.rows.items.len);
+    try std.testing.expectEqual(@as(i64, 2), audit.summary.pre_review_lane_transport_lost_count);
+}
+
+test "snake-case root verdict receipts are normalized" {
+    var row = try classifyReceiptText(std.testing.allocator,
+        \\{"status":"clean","backend_class":"cas-lane","finding_count":0,"base_sha":"b","head_sha":"h","target_fingerprint":"t","review_thread_id":"thr_1","review_turn_id":"turn_1","proof_verdict_exists":true,"review_attempt_phase":"normalized_verdict"}
+    , .{
+        .session_id = "",
+        .cwd = null,
+        .command_surface = "receipt",
+        .source_path = "/tmp/receipt.json",
+        .default_backend_class = "cas-receipt-normalized",
+    });
+    defer row.deinit();
+
+    try std.testing.expectEqualStrings("cas-lane", scalarString(row, "backend_class").?);
+    try std.testing.expectEqualStrings("clean", scalarString(row, "review_verdict_status").?);
+    try std.testing.expect(scalarBool(row, "review_attempt_exists"));
+    try std.testing.expect(scalarBool(row, "proof_verdict_exists"));
+
+    const summary = summarize(&.{row});
+    try std.testing.expectEqual(@as(i64, 1), summary.completed_clean_count);
+    try std.testing.expectEqualStrings("proven", summary.lane_backend_status);
+}
+
+test "repo scope matching is path-boundary safe" {
+    try std.testing.expect(pathMatchesScope("/tmp/repo", "/tmp/repo"));
+    try std.testing.expect(pathMatchesScope("/tmp/repo/sub", "/tmp/repo"));
+    try std.testing.expect(!pathMatchesScope("/tmp/repo-old", "/tmp/repo"));
+}
+
+test "summary separates review transport timeout duplicate and degraded lane proof" {
+    var transport_row = try classifyReceiptText(std.testing.allocator,
+        \\{"reviewThreadId":"thr_transport","failureCode":"lane_transport_lost","reviewAttemptPhase":"review_terminal","baseSha":"b","headSha":"h","targetFingerprint":"t"}
+    , .{
+        .session_id = "sess",
+        .cwd = "/repo",
+        .command_surface = "cas review_session lane review",
+        .source_path = "/tmp/session.jsonl",
+        .default_backend_class = "cas-lane",
+    });
+    defer transport_row.deinit();
+
+    var waiting_row = try classifyReceiptText(std.testing.allocator,
+        \\{"reviewThreadId":"thr_waiting","reviewAttemptPhase":"review_waiting","timedOut":true,"baseSha":"b","headSha":"h","targetFingerprint":"t"}
+    , .{
+        .session_id = "sess",
+        .cwd = "/repo",
+        .command_surface = "cas review_session lane review",
+        .source_path = "/tmp/session.jsonl",
+        .default_backend_class = "cas-lane",
+    });
+    defer waiting_row.deinit();
+
+    var proof_row = try classifyReceiptText(std.testing.allocator,
+        \\{"reviewThreadId":"thr_clean","baseSha":"b","headSha":"h","targetFingerprint":"t","reviewVerdict":{"status":"clean","clean":true,"findingCount":0,"failureCode":null,"baseSha":"b","headSha":"h","targetFingerprint":"t","reviewThreadId":"thr_clean","backendClass":"cas-lane"}}
+    , .{
+        .session_id = "sess",
+        .cwd = "/repo",
+        .command_surface = "cas review_session lane review",
+        .source_path = "/tmp/session.jsonl",
+        .default_backend_class = "cas-lane",
+    });
+    defer proof_row.deinit();
+
+    const summary = summarize(&.{ transport_row, waiting_row, proof_row });
+    try std.testing.expectEqual(@as(i64, 1), summary.review_attempt_transport_failure_count);
+    try std.testing.expectEqual(@as(i64, 1), summary.timeout_with_handle_count);
+    try std.testing.expectEqual(@as(i64, 0), summary.duplicate_prevented_count);
     try std.testing.expectEqualStrings("degraded", summary.lane_backend_status);
 }
