@@ -177,6 +177,20 @@ seq review-compiler-audit --root ~/.codex/sessions --protocol mbk --since 2026-0
 seq review-compiler-audit --root ~/.codex/sessions --protocol legacy-cleanroom --since 2026-05-01T00:00:00Z --until 2026-06-01T00:00:00Z --repo /Users/tk/workspace/tk/skills-zig --format json
 ```
 
+`cas-review-audit` projects CAS review-session receipts and shell outputs into the shared review-proof plane:
+- accepts bounded session selectors (`--session-id`, `--path`, `--repo`, `--workdir`, `--since`, `--until`, `--last`) plus persisted receipts via `--receipt-path` or `--receipt-glob`
+- emits one projection row per receipt-like JSON surface with review attempt phase, attempt/proof booleans, tuple identity, backend class, failure class, and normalized verdict status
+- classifies legacy `lane_transport_lost` receipts with no review thread and no review count as `pre_review_lane_transport_lost`
+- reports derived counts for pre-review lane deaths, review-attempt transport failures, clean/findings verdicts, account exhaustion, timeouts with handles, duplicate prevention, and start-wait normalization
+- summarizes persistent-lane backend readiness as `proven`, `unproven`, `failing_pre_review`, or `degraded`
+
+Examples:
+```bash
+seq cas-review-audit --root ~/.codex/sessions --path rollout.jsonl --mode rows --format jsonl
+seq cas-review-audit --receipt-path start-wait.json --base-sha <base> --head-sha <head> --target-fingerprint <fp> --mode summary --format json
+seq cas-review-audit --root ~/.codex/sessions --repo /path/to/repo --last 7d --mode report --format markdown
+```
+
 `skill-blocks` is the exact-body surface for injected `<skill>...</skill>` content:
 - defaults to `--mode blocks --history distinct --format jsonl`, preserving the existing exact block export contract
 - `--mode body` emits exactly one selected `block_text` directly, replacing shell `jq -r '.[0].block_text'`; narrow with `--history latest`, `--session-id`, `--path`, or time filters if more than one distinct body matches
