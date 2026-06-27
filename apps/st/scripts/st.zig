@@ -5323,10 +5323,13 @@ fn workspaceWorkingTreeFingerprintAlloc(allocator: std.mem.Allocator, workspace_
     defer if (worktree_diff_owned) |diff| allocator.free(diff);
     const index_diff_owned = gitCapture(allocator, repo_root, &.{ "diff", "--cached", "--no-ext-diff", "--binary" }) catch null;
     defer if (index_diff_owned) |diff| allocator.free(diff);
+    const untracked_owned = gitCapture(allocator, repo_root, &.{ "ls-files", "--others", "--exclude-standard", "-z" }) catch null;
+    defer if (untracked_owned) |untracked| allocator.free(untracked);
     const head = head_owned orelse "unknown";
     const status = status_owned orelse "";
     const worktree_diff = worktree_diff_owned orelse "";
     const index_diff = index_diff_owned orelse "";
+    const untracked = untracked_owned orelse "";
     var payload: std.Io.Writer.Allocating = .init(allocator);
     defer payload.deinit();
     try payload.writer.writeAll(head);
@@ -5336,6 +5339,20 @@ fn workspaceWorkingTreeFingerprintAlloc(allocator: std.mem.Allocator, workspace_
     try payload.writer.writeAll(index_diff);
     try payload.writer.writeByte('\n');
     try payload.writer.writeAll(worktree_diff);
+    try payload.writer.writeByte('\n');
+    var untracked_iter = std.mem.splitScalar(u8, untracked, 0);
+    while (untracked_iter.next()) |rel_path| {
+        if (rel_path.len == 0) continue;
+        try payload.writer.writeAll("untracked:");
+        try payload.writer.writeAll(rel_path);
+        try payload.writer.writeByte('\n');
+        const abs_path = std.fs.path.join(allocator, &.{ repo_root, rel_path }) catch continue;
+        defer allocator.free(abs_path);
+        const content = readFileAlloc(allocator, abs_path, 32 * 1024 * 1024) catch continue;
+        defer allocator.free(content);
+        try payload.writer.writeAll(content);
+        try payload.writer.writeByte('\n');
+    }
     const bytes = try payload.toOwnedSlice();
     defer allocator.free(bytes);
     return hashTextSha256Alloc(allocator, bytes);
@@ -13182,21 +13199,25 @@ fn writeWorkspaceGraphControlReceiptJson(
         if (view_bytes.len > 0) {
             var parsed_view = try std.json.parseFromSlice(std.json.Value, allocator, view_bytes, .{});
             defer parsed_view.deinit();
-            if (stringField(parsed_view.value, "projection_digest")) |digest| {
-                projection_digest_owned = try allocator.dupe(u8, digest);
-                projection_digest = projection_digest_owned.?;
+            if (parsed_view.value != .object) {
+                try denials.append(allocator, "session_view_invalid");
+            } else {
+                if (stringField(parsed_view.value, "projection_digest")) |digest| {
+                    projection_digest_owned = try allocator.dupe(u8, digest);
+                    projection_digest = projection_digest_owned.?;
+                }
+                if (stringField(parsed_view.value, "executor")) |executor| {
+                    coordination_executor_owned = try allocator.dupe(u8, executor);
+                    coordination_executor = coordination_executor_owned.?;
+                }
+                if (!std.mem.eql(u8, stringField(parsed_view.value, "plan_id") orelse "", plan_id_owned)) try denials.append(allocator, "session_plan_mismatch");
+                if (!std.mem.eql(u8, stringField(parsed_view.value, "claim_id") orelse "", claim_id)) try denials.append(allocator, "view_stale");
+                if ((intField(parsed_view.value, "fencing_token") orelse -1) != token) try denials.append(allocator, "view_stale");
+                if ((intField(parsed_view.value, "workspace_sequence") orelse -1) != workspace_sequence) try denials.append(allocator, "view_stale");
+                if ((intField(parsed_view.value, "plan_sequence") orelse -1) != plan_sequence) try denials.append(allocator, "view_stale");
+                if ((intField(parsed_view.value, "branch_epoch") orelse -1) != branch_epoch) try denials.append(allocator, "branch_epoch_stale");
+                if (!jsonStringArrayMatchesSlice(parsed_view.value.object.get("selected_item_ids"), selected_ids)) try denials.append(allocator, "session_selection_mismatch");
             }
-            if (stringField(parsed_view.value, "executor")) |executor| {
-                coordination_executor_owned = try allocator.dupe(u8, executor);
-                coordination_executor = coordination_executor_owned.?;
-            }
-            if (!std.mem.eql(u8, stringField(parsed_view.value, "plan_id") orelse "", plan_id_owned)) try denials.append(allocator, "session_plan_mismatch");
-            if (!std.mem.eql(u8, stringField(parsed_view.value, "claim_id") orelse "", claim_id)) try denials.append(allocator, "view_stale");
-            if ((intField(parsed_view.value, "fencing_token") orelse -1) != token) try denials.append(allocator, "view_stale");
-            if ((intField(parsed_view.value, "workspace_sequence") orelse -1) != workspace_sequence) try denials.append(allocator, "view_stale");
-            if ((intField(parsed_view.value, "plan_sequence") orelse -1) != plan_sequence) try denials.append(allocator, "view_stale");
-            if ((intField(parsed_view.value, "branch_epoch") orelse -1) != branch_epoch) try denials.append(allocator, "branch_epoch_stale");
-            if (!jsonStringArrayMatchesSlice(parsed_view.value.object.get("selected_item_ids"), selected_ids)) try denials.append(allocator, "session_selection_mismatch");
         }
     }
 

@@ -8667,10 +8667,7 @@ fn addReviewCompilerMaterialRun(
         signals.mbk_semantic_surface_after - signals.mbk_semantic_surface_before
     else
         0;
-    const closure_gate_status: []const u8 = if (std.mem.eql(u8, signals.mbk_closure_gate_status, "missing") and signals.mbk_terminal_closed_seen and signals.mbk_tuple_closed_seen)
-        "passed"
-    else
-        signals.mbk_closure_gate_status;
+    const closure_gate_status: []const u8 = signals.mbk_closure_gate_status;
     const mutation_gate_status: []const u8 = if (std.mem.eql(u8, signals.mbk_mutation_gate_status, "missing") and signals.mbk_rac_mutation_allowed > 0)
         "passed"
     else
@@ -9288,6 +9285,7 @@ fn recordReviewCompilerMessages(
             recordReviewCompilerSignalTime(signals, .permit, message.timestamp);
         }
 
+        const positive_evidence_contamination = isReviewCompilerPositiveEvidenceContamination(text);
         if (containsAnyIgnoreCaseAscii(text, &.{ "review_lab", "review lab", "disposable lab", "lab worktree", "scratch worktree" })) {
             signals.lab_context_seen = true;
         }
@@ -9313,9 +9311,11 @@ fn recordReviewCompilerMessages(
         if (containsAnyIgnoreCaseAscii(text, &.{ "holdout_findings_added_to_scope", "holdout findings added" })) audit.legacy_cleanroom.review_horizon.holdout_findings_added_to_scope += 1;
         if (containsAnyIgnoreCaseAscii(text, &.{ "holdout_followups_captured", "holdout followups captured", "holdout follow-ups captured" })) audit.legacy_cleanroom.review_horizon.holdout_followups_captured += 1;
 
-        const c3_source: []const u8 = if (containsAuthoritativeC3EventText(text)) "controller_event" else "message";
-        recordReviewCompilerC3Text(audit, text, message.timestamp, c3_source, signals);
-        if (signals.true_mbk) try recordReviewCompilerMBKText(allocator, audit, text, message.timestamp, signals, session_id, "message");
+        if (!positive_evidence_contamination) {
+            const c3_source: []const u8 = if (containsAuthoritativeC3EventText(text)) "controller_event" else "message";
+            recordReviewCompilerC3Text(audit, text, message.timestamp, c3_source, signals);
+            if (signals.true_mbk) try recordReviewCompilerMBKText(allocator, audit, text, message.timestamp, signals, session_id, "message");
+        }
     }
 }
 
@@ -9558,8 +9558,18 @@ fn recordReviewCompilerMBKRunProjectionSignals(signals: *ReviewCompilerSessionSi
     if (extractReviewCompilerNamedUsize(text, "unmapped_proof_actions")) |value| signals.mbk_unmapped_proof_actions += value;
     if (extractReviewCompilerNamedUsize(text, "wound_specific_tests")) |value| signals.mbk_wound_specific_tests += value;
     if (containsAnyIgnoreCaseAscii(text, &.{ "wound_specific_test", "wound-specific test", "wound specific test" }) and signals.mbk_wound_specific_tests == 0) signals.mbk_wound_specific_tests += 1;
-    if (containsAnyIgnoreCaseAscii(text, &.{ "wound_specific_tests_class_mapped", "wound-specific tests class mapped", "wound specific tests class mapped" })) signals.mbk_wound_specific_tests_class_mapped = true;
-    if (containsAnyIgnoreCaseAscii(text, &.{ "ac_rebased", "explicit_ac_rebase", "approved_rebaseline" })) signals.mbk_ac_rebased = true;
+    if (extractReviewCompilerNamedBool(text, "wound_specific_tests_class_mapped")) |value| {
+        signals.mbk_wound_specific_tests_class_mapped = value;
+    } else if (containsAnyIgnoreCaseAscii(text, &.{ "wound-specific tests class mapped", "wound specific tests class mapped" })) {
+        signals.mbk_wound_specific_tests_class_mapped = true;
+    }
+    if (extractReviewCompilerNamedBool(text, "ac_rebased")) |value| {
+        signals.mbk_ac_rebased = value;
+    } else if (extractReviewCompilerNamedBool(text, "explicit_ac_rebase")) |value| {
+        signals.mbk_ac_rebased = value;
+    } else if (containsAnyIgnoreCaseAscii(text, &.{"approved_rebaseline"})) {
+        signals.mbk_ac_rebased = true;
+    }
 
     if (containsAnyIgnoreCaseAscii(text, &.{ "RAC-v1", "resolve_authority_chain", "authority-chain" })) signals.mbk_rac_total += 1;
     if (containsAnyIgnoreCaseAscii(text, &.{ "RAC-v1 valid", "\"complete_chain\":\"yes\"", "\"complete_chain\": \"yes\"", "complete_chain: yes" })) signals.mbk_rac_valid += 1;
@@ -9641,7 +9651,7 @@ fn recordMBKSurfaceNumbers(mbk: *ReviewCompilerAudit.MBK, text: []const u8) void
 fn extractReviewCompilerNamedUsize(text: []const u8, key: []const u8) ?usize {
     var search_start: usize = 0;
     while (std.mem.indexOfPos(u8, text, search_start, key)) |idx| {
-        var cursor = idx + key.len;
+        var cursor = reviewCompilerNamedValueCursor(text, idx + key.len);
         while (cursor < text.len and (std.ascii.isWhitespace(text[cursor]) or text[cursor] == ':' or text[cursor] == '=')) : (cursor += 1) {}
         const start = cursor;
         while (cursor < text.len and std.ascii.isDigit(text[cursor])) : (cursor += 1) {}
@@ -9649,6 +9659,27 @@ fn extractReviewCompilerNamedUsize(text: []const u8, key: []const u8) ?usize {
         search_start = idx + key.len;
     }
     return null;
+}
+
+fn extractReviewCompilerNamedBool(text: []const u8, key: []const u8) ?bool {
+    var search_start: usize = 0;
+    while (std.mem.indexOfPos(u8, text, search_start, key)) |idx| {
+        var cursor = reviewCompilerNamedValueCursor(text, idx + key.len);
+        while (cursor < text.len and (std.ascii.isWhitespace(text[cursor]) or text[cursor] == ':' or text[cursor] == '=')) : (cursor += 1) {}
+        if (cursor < text.len and text[cursor] == '"') cursor += 1;
+        if (cursor + 4 <= text.len and std.ascii.eqlIgnoreCase(text[cursor .. cursor + 4], "true")) return true;
+        if (cursor + 5 <= text.len and std.ascii.eqlIgnoreCase(text[cursor .. cursor + 5], "false")) return false;
+        if (cursor + 3 <= text.len and std.ascii.eqlIgnoreCase(text[cursor .. cursor + 3], "yes")) return true;
+        if (cursor + 2 <= text.len and std.ascii.eqlIgnoreCase(text[cursor .. cursor + 2], "no")) return false;
+        search_start = idx + key.len;
+    }
+    return null;
+}
+
+fn reviewCompilerNamedValueCursor(text: []const u8, start: usize) usize {
+    var cursor = start;
+    while (cursor < text.len and (std.ascii.isWhitespace(text[cursor]) or text[cursor] == '"')) : (cursor += 1) {}
+    return cursor;
 }
 
 fn recordReviewCompilerSignalTime(signals: *ReviewCompilerSessionSignals, kind: ReviewCompilerSignalTimeKind, timestamp: ?[]const u8) void {
@@ -9687,7 +9718,9 @@ fn recordReviewCompilerTools(
             noteReviewCompilerIncidentalC3(signals, if (tool.kind == .patch_apply) "artifact_under_repair" else "filename_or_path_mention");
         }
         if (signals.true_mbk and containsReviewCompilerMBKToolAccountingCue(tool_text)) {
-            try recordReviewCompilerMBKText(allocator, audit, tool_text, toolTimestamp(parsed, tool), signals, parsed.session.session_id, "tool");
+            if (!isReviewCompilerPositiveEvidenceContamination(tool_text)) {
+                try recordReviewCompilerMBKText(allocator, audit, tool_text, toolTimestamp(parsed, tool), signals, parsed.session.session_id, "tool");
+            }
         }
 
         if (tool.kind == .patch_apply and tool.lifecycle_status == .completed and tool.patch_success != false) {
@@ -10913,6 +10946,9 @@ fn reviewCompilerHasMechanicallyClosedMaterialRun(audit: ReviewCompilerAudit) bo
             row.potential_strict_progress > 0 and
             row.delivery_closed and
             row.terminal_closed and
+            row.rac_valid > 0 and
+            row.rac_mutation_allowed > 0 and
+            std.mem.eql(u8, row.mutation_gate_status, "passed") and
             std.mem.eql(u8, row.closure_gate_status, "passed"))
         {
             return true;
@@ -10922,7 +10958,9 @@ fn reviewCompilerHasMechanicallyClosedMaterialRun(audit: ReviewCompilerAudit) bo
 }
 
 fn writeReviewCompilerMaterialRunJson(writer: anytype, row: ReviewCompilerAudit.MaterialRun) !void {
-    try writer.writeAll("{ \"session_id\": ");
+    try writer.writeAll("{ \"run_version\": ");
+    try output.writeJsonString(writer, resolve_intent_closed.run_version);
+    try writer.writeAll(", \"session_id\": ");
     if (row.session_id) |id| try output.writeJsonString(writer, id) else try writer.writeAll("null");
     try writer.writeAll(", \"run_id\": ");
     try output.writeJsonString(writer, row.run_id);
@@ -26665,7 +26703,8 @@ test "review-compiler-audit mbk protocol audits kernel, surface, proof, closure,
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T09:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"l1\",\"message\":\"review-compiler-audit pasted labels only: local_surface_family wound_specific_test tuple_closed.\"}}\n";
     const true_mbk =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-14T10:00:00Z\",\"payload\":{\"id\":\"mbk-true\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T10:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"m1\",\"message\":\"MBKC-v1 minimum_behavioral_kernel\\nresolve-c3 campaign begin\\ncampaign-began\\nmaterial_kernel_required\\nfixed_base_pass\\nbase_reset_violation\\nreview_ready_baseline\\nprior_closure_head_used_as_new_base\\nrebaseline_decision\\nobservation-added raw_finding\\nbranch_liabilities:\\n  - F1\\nadditional_witness\\nlocal_surface_family\\nwound_specific_test\\nwound_specific_tests_class_mapped\\nkernel_law\\ndesign-registered route_class\\ndesign-selected\\nrealization_from_campaign_base\\nsurface_retired\\nbatches_total: 2\\nstrict_progress: 1\\nRAC-v1 valid mutation_allowed: yes\\nmutation_gate.status=passed\\nclosure_gate.status=passed\\nreview_ready_baseline_semantic_surface: 5\\nreview_ready_baseline_governing_laws: 1\\nreview_ready_baseline_realization_surface: 3\\nreview_ready_baseline_proof_families: 1\\nterminal_semantic_surface: 7\\nterminal_governing_laws: 2\\nterminal_realization_surface: 4\\nterminal_proof_families: 2\\ngit_files_changed: 9\\ngit_insertions: 20\\ngit_deletions: 4\\nproof_family\\nproof_run\\nstate_only_apply\\nkernel-accepted\\ntuple-closed\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T10:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"m1\",\"message\":\"MBKC-v1 minimum_behavioral_kernel\\nresolve-c3 campaign begin\\ncampaign-began\\nmaterial_kernel_required\\nfixed_base_pass\\nbase_reset_violation\\nreview_ready_baseline\\nprior_closure_head_used_as_new_base\\nrebaseline_decision\\nobservation-added raw_finding\\nbranch_liabilities:\\n  - F1\\nadditional_witness\\nlocal_surface_family\\nwound_specific_test\\nwound_specific_tests_class_mapped: true\\nkernel_law\\ndesign-registered route_class\\ndesign-selected\\nrealization_from_campaign_base\\nsurface_retired\\nbatches_total: 2\\nstrict_progress: 1\\nRAC-v1 valid mutation_allowed: yes\\nmutation_gate.status=passed\\nclosure_gate.status=passed\\nreview_ready_baseline_semantic_surface: 5\\nreview_ready_baseline_governing_laws: 1\\nreview_ready_baseline_realization_surface: 3\\nreview_ready_baseline_proof_families: 1\\nterminal_semantic_surface: 7\\nterminal_governing_laws: 2\\nterminal_realization_surface: 4\\nterminal_proof_families: 2\\ngit_files_changed: 9\\ngit_insertions: 20\\ngit_deletions: 4\\nproof_family\\nproof_run\\nstate_only_apply\\nkernel-accepted\\ntuple-closed\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T10:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"m1\",\"message\":\"generated report quoted example: MBKC-v1 batches_total: 99 closure_gate.status=passed wound_specific_tests_class_mapped: false\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T10:00:02Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"m1\",\"call_id\":\"ctl-apply\",\"command\":\"resolve-c3 apply\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"applied\"}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-05-14T10:00:03Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"apply_patch\",\"call_id\":\"raw-patch\",\"arguments\":\"*** Update File: apps/seq/src/lib.zig\\n+raw\\n\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T10:00:04Z\",\"payload\":{\"type\":\"patch_apply_end\",\"turn_id\":\"m1\",\"call_id\":\"raw-patch\",\"success\":true,\"cwd\":\"/repo\",\"changes\":{\"files\":1}}}\n" ++
@@ -26745,6 +26784,7 @@ test "review-compiler-audit mbk protocol audits kernel, surface, proof, closure,
     }, runs_output_path);
     defer std.testing.allocator.free(runs_got);
 
+    try std.testing.expect(std.mem.indexOf(u8, runs_got, "\"run_version\": ") != null);
     try std.testing.expect(std.mem.indexOf(u8, runs_got, "\"session_id\": \"mbk-true\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, runs_got, "\"run_id\": \"mbk-true\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, runs_got, "\"repo\": \"/repo\"") != null);
@@ -26825,6 +26865,33 @@ test "review-compiler-audit mbk surface snapshots aggregate across evidence rows
     try std.testing.expectEqual(@as(usize, 18), mbk.git_tree_metrics.insertions);
     try std.testing.expectEqual(@as(usize, 8), mbk.git_tree_metrics.deletions);
     try std.testing.expectEqual(@as(i64, 10), mbk.git_tree_metrics.net_lines);
+}
+
+test "review-compiler-audit mbk projection parses quoted values and preserves missing gates" {
+    try std.testing.expectEqual(@as(?usize, 2), extractReviewCompilerNamedUsize("{\"batches_total\": 2}", "batches_total"));
+    try std.testing.expectEqual(@as(?usize, 2), extractReviewCompilerNamedUsize("{\"semantic_surface_delta\": 2}", "semantic_surface_delta"));
+    try std.testing.expectEqual(@as(?bool, false), extractReviewCompilerNamedBool("{\"wound_specific_tests_class_mapped\": false}", "wound_specific_tests_class_mapped"));
+    try std.testing.expectEqual(@as(?bool, false), extractReviewCompilerNamedBool("{\"ac_rebased\": false}", "ac_rebased"));
+
+    const signals = ReviewCompilerSessionSignals{
+        .mbk_material_kernel_required_seen = true,
+        .mbk_begin_seen = true,
+        .mbk_tuple_closed_seen = true,
+        .mbk_terminal_closed_seen = true,
+        .mbk_kernel_accepted_seen = true,
+        .mbk_batches_total = 1,
+        .mbk_potential_strict_progress = 1,
+        .mbk_rac_total = 1,
+        .mbk_rac_valid = 1,
+        .mbk_rac_mutation_allowed = 1,
+        .mbk_mutation_gate_status = "passed",
+    };
+    var audit = ReviewCompilerAudit{};
+    defer audit.deinit(std.testing.allocator);
+    try addReviewCompilerMaterialRun(std.testing.allocator, &audit, signals, "mbk-missing-closure-gate", "/repo");
+
+    try std.testing.expectEqualStrings("missing", audit.material_runs.items[0].closure_gate_status);
+    try std.testing.expect(!reviewCompilerHasMechanicallyClosedMaterialRun(audit));
 }
 
 fn runCommandWithOutput(
