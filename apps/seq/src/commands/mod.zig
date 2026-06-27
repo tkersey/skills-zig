@@ -25,6 +25,7 @@ const actuation_proof = @import("../actuation/proof.zig");
 const actuation_compaction = @import("../actuation/compaction.zig");
 const actuation_workers = @import("../actuation/workers.zig");
 const actuation_surface = @import("../actuation/surface.zig");
+const cas_review_audit = @import("../cas_review_audit.zig");
 const execution_policy_audit = @import("../execution_policy/mod.zig");
 const st_workspace_audit = @import("../st_workspace_audit.zig");
 const resolve_intent_closed = @import("../resolve_intent_closed/mod.zig");
@@ -836,6 +837,13 @@ const Options = struct {
     workspace_root_text: ?[]const u8 = null,
     workspace_id_text: ?[]const u8 = null,
     plan_text: ?[]const u8 = null,
+    receipt_path_texts: [32]?[]const u8 = [_]?[]const u8{null} ** 32,
+    receipt_path_count: usize = 0,
+    receipt_glob_texts: [32]?[]const u8 = [_]?[]const u8{null} ** 32,
+    receipt_glob_count: usize = 0,
+    base_sha_text: ?[]const u8 = null,
+    head_sha_text: ?[]const u8 = null,
+    target_fingerprint_text: ?[]const u8 = null,
     state_db_path: ?[]const u8 = null,
     memory_root_text: ?[]const u8 = null,
     extensions_root_text: ?[]const u8 = null,
@@ -933,6 +941,7 @@ pub fn run(
         .adjudication_audit => try cmdAdjudicationAudit(allocator, sessions_root, opts),
         .resolve_churn_audit => try cmdResolveChurnAudit(allocator, sessions_root, opts),
         .review_compiler_audit => try cmdReviewCompilerAudit(allocator, sessions_root, opts),
+        .cas_review_audit => try cmdCasReviewAudit(allocator, sessions_root, opts),
         .goal_audit => try QueryLiftCommands.cmdGoalAudit(allocator, sessions_root, opts),
         .workflow_audit => try cmdWorkflowAudit(allocator, sessions_root, opts),
         .workflow_overlap => try cmdWorkflowOverlap(allocator, sessions_root, opts),
@@ -1159,6 +1168,14 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\  --exclude-current         Exclude the current CODEX_THREAD_ID session
         \\  path mentions are candidates only; true C3 governance requires controller evidence or explicit workflow declaration
         ,
+        .cas_review_audit =>
+        \\usage: seq cas-review-audit [--path <rollout.jsonl>|--receipt-path <json>|--repo <path>] [--base-sha <sha>] [--head-sha <sha>] [--target-fingerprint <fp>] [--mode summary|rows|report] [--format table|json|csv|jsonl|markdown]
+        \\extra options:
+        \\  --receipt-path <path>       Include a persisted review-session receipt
+        \\  --receipt-glob <glob>       Include persisted review-session receipts matching a simple * glob
+        \\  --mode <name>               summary (default) | rows | report
+        \\  --format markdown           Only valid with --mode report
+        ,
         .actuation_audit =>
         \\usage: seq actuation-audit --root <path> [--session-id <id>|--path <rollout.jsonl>|(--repo <path>|--workdir <path>) (--since <iso>|--until <iso>|--last <duration>)] [--include-workers] [--mode summary|runs|slices|proof|compactions|decisions|report] [--strict] [--include-excerpts] [--format table|json|jsonl|csv|markdown]
         \\extra options:
@@ -1285,6 +1302,7 @@ fn commandSupportsExcludeCurrent(cmd: lib.Command) bool {
         std.mem.eql(u8, name, "token_window") or
         std.mem.eql(u8, name, "resolve_churn_audit") or
         std.mem.eql(u8, name, "review_compiler_audit") or
+        std.mem.eql(u8, name, "cas_review_audit") or
         std.mem.eql(u8, name, "workflow_audit") or
         std.mem.eql(u8, name, "goal_audit") or
         std.mem.eql(u8, name, "skill_decision_audit");
@@ -1326,6 +1344,12 @@ fn validateFormatForCommand(cmd: lib.Command, opts: Options) !void {
             if (fmt == .dot) return error.InvalidFormatForCommand;
             const mode = opts.mode orelse "summary";
             if (!isValidActuationAuditMode(mode)) return error.InvalidModeArg;
+            if (fmt == .markdown and !std.mem.eql(u8, mode, "report")) return error.InvalidFormatForCommand;
+        },
+        .cas_review_audit => {
+            if (fmt == .dot) return error.InvalidFormatForCommand;
+            const mode = opts.mode orelse "summary";
+            if (!isValidCasReviewAuditMode(mode)) return error.InvalidModeArg;
             if (fmt == .markdown and !std.mem.eql(u8, mode, "report")) return error.InvalidFormatForCommand;
         },
         .execution_policy_audit => {
@@ -1425,16 +1449,16 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_tool = cmd == .opencode_events or cmd == .artifact_search or cmd == .tool_audit or cmd == .tool_search;
     const supports_executable = cmd == .tool_audit or cmd == .tool_search;
     const supports_workdir = switch (cmd) {
-        .artifact_search, .tool_audit, .tool_search, .workdir_report, .workflow_audit, .workflow_overlap, .skill_decision_audit, .actuation_audit => true,
+        .artifact_search, .tool_audit, .tool_search, .workdir_report, .workflow_audit, .workflow_overlap, .skill_decision_audit, .actuation_audit, .cas_review_audit => true,
         else => false,
     };
     const supports_repo = switch (cmd) {
-        .plan_search, .sessions, .resolve_churn_audit, .review_compiler_audit, .skill_decision_audit, .decision_capsule, .actuation_audit, .execution_policy_audit, .st_workspace_audit => true,
+        .plan_search, .sessions, .resolve_churn_audit, .review_compiler_audit, .skill_decision_audit, .decision_capsule, .actuation_audit, .cas_review_audit, .execution_policy_audit, .st_workspace_audit => true,
         else => false,
     };
     const supports_status = cmd == .opencode_events or cmd == .turns or cmd == .goal_audit;
     const supports_mode = switch (cmd) {
-        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .skill_decision_audit, .skill_success_rank, .skill_blocks, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit, .workflow_overlap, .adjudication_audit, .review_compiler_audit, .goal_audit, .decision_capsule, .actuation_audit, .execution_policy_audit, .st_workspace_audit => true,
+        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .skill_decision_audit, .skill_success_rank, .skill_blocks, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit, .workflow_overlap, .adjudication_audit, .review_compiler_audit, .cas_review_audit, .goal_audit, .decision_capsule, .actuation_audit, .execution_policy_audit, .st_workspace_audit => true,
         else => false,
     };
     const supports_kind = cmd == .artifact_search or cmd == .skill_contract;
@@ -1488,6 +1512,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .adjudication_audit,
         .resolve_churn_audit,
         .review_compiler_audit,
+        .cas_review_audit,
         .goal_audit,
         .memory_map,
         .memory_history,
@@ -1535,6 +1560,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .adjudication_audit,
         .resolve_churn_audit,
         .review_compiler_audit,
+        .cas_review_audit,
         .goal_audit,
         .memory_map,
         .memory_history,
@@ -1616,7 +1642,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_window_hours = cmd == .token_window;
     const supports_duration_gte = cmd == .goal_audit;
     const supports_since_cursor = cmd == .skill_evidence or cmd == .skill_decision_audit;
-    const supports_last = cmd == .token_usage or cmd == .token_cost or cmd == .skill_audit or cmd == .skill_evidence or cmd == .skill_decision_audit or cmd == .actuation_audit or cmd == .execution_policy_audit or cmd == .st_workspace_audit or cmd == .skill_success_rank or cmd == .skill_cohort or cmd == .workflow_audit or cmd == .adjudication_audit or cmd == .message_audit or cmd == .message_search or cmd == .tool_audit or cmd == .tool_search or cmd == .skill_blocks;
+    const supports_last = cmd == .token_usage or cmd == .token_cost or cmd == .skill_audit or cmd == .skill_evidence or cmd == .skill_decision_audit or cmd == .actuation_audit or cmd == .cas_review_audit or cmd == .execution_policy_audit or cmd == .st_workspace_audit or cmd == .skill_success_rank or cmd == .skill_cohort or cmd == .workflow_audit or cmd == .adjudication_audit or cmd == .message_audit or cmd == .message_search or cmd == .tool_audit or cmd == .tool_search or cmd == .skill_blocks;
     const supports_include_root_equivalent = cmd == .adjudication_audit;
     const supports_bundle_dir = cmd == .adjudication_audit;
     const supports_artifact_root = cmd == .review_compiler_audit;
@@ -1666,6 +1692,11 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.workspace_root_text != null, supports_workspace_root, "--workspace-root", cmd);
     try ensureOptionAllowed(opts.workspace_id_text != null, cmd == .st_workspace_audit, "--workspace-id", cmd);
     try ensureOptionAllowed(opts.plan_text != null, cmd == .st_workspace_audit, "--plan", cmd);
+    try ensureOptionAllowed(opts.receipt_path_count > 0, cmd == .cas_review_audit, "--receipt-path", cmd);
+    try ensureOptionAllowed(opts.receipt_glob_count > 0, cmd == .cas_review_audit, "--receipt-glob", cmd);
+    try ensureOptionAllowed(opts.base_sha_text != null, cmd == .cas_review_audit, "--base-sha", cmd);
+    try ensureOptionAllowed(opts.head_sha_text != null, cmd == .cas_review_audit, "--head-sha", cmd);
+    try ensureOptionAllowed(opts.target_fingerprint_text != null, cmd == .cas_review_audit, "--target-fingerprint", cmd);
     try ensureOptionAllowed(opts.dataset != null, supports_dataset, "--dataset", cmd);
     try ensureOptionAllowed(opts.spec_text != null, supports_spec_text, "--spec", cmd);
     try ensureOptionAllowed(opts.contains != null, supports_contains, "--contains", cmd);
@@ -1908,6 +1939,15 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
             return error.MissingArgValue;
         }
     }
+    if (cmd == .cas_review_audit) {
+        if (opts.mode) |text| {
+            if (!isValidCasReviewAuditMode(text)) return error.InvalidModeArg;
+        }
+        if (!hasCasReviewAuditScope(opts)) {
+            printCliError("error: cas-review-audit requires --session-id, --path, --receipt-path, --receipt-glob, --repo, --workdir, --since, --until, or --last\n", .{});
+            return error.MissingArgValue;
+        }
+    }
     if (cmd == .execution_policy_audit) {
         if (opts.mode) |text| {
             if (!isValidExecutionPolicyAuditMode(text)) return error.InvalidModeArg;
@@ -1949,6 +1989,7 @@ fn commandSupportsPath(cmd: lib.Command) bool {
         .skill_evidence,
         .skill_decision_audit,
         .actuation_audit,
+        .cas_review_audit,
         .execution_policy_audit,
         .decision_capsule,
         .skill_blocks,
@@ -1978,6 +2019,7 @@ fn commandSupportsSessionId(cmd: lib.Command) bool {
         .skill_evidence,
         .skill_decision_audit,
         .actuation_audit,
+        .cas_review_audit,
         .execution_policy_audit,
         .st_workspace_audit,
         .decision_capsule,
@@ -2152,6 +2194,12 @@ fn isValidActuationAuditMode(text: []const u8) bool {
         std.mem.eql(u8, text, "report");
 }
 
+fn isValidCasReviewAuditMode(text: []const u8) bool {
+    return std.mem.eql(u8, text, "summary") or
+        std.mem.eql(u8, text, "rows") or
+        std.mem.eql(u8, text, "report");
+}
+
 fn isValidExecutionPolicyAuditMode(text: []const u8) bool {
     return std.mem.eql(u8, text, "summary") or
         std.mem.eql(u8, text, "runs") or
@@ -2208,6 +2256,18 @@ fn hasActuationAuditScope(opts: Options) bool {
     const has_repo_scope = opts.repo_text != null or opts.workdir_text != null;
     const has_window = opts.since != null or opts.until != null or opts.last_text != null;
     return has_repo_scope and has_window;
+}
+
+fn hasCasReviewAuditScope(opts: Options) bool {
+    return opts.session_id != null or
+        opts.path != null or
+        opts.receipt_path_count > 0 or
+        opts.receipt_glob_count > 0 or
+        opts.repo_text != null or
+        opts.workdir_text != null or
+        opts.since != null or
+        opts.until != null or
+        opts.last_text != null;
 }
 
 fn hasExecutionPolicyAuditScope(opts: Options) bool {
@@ -3211,6 +3271,77 @@ fn cmdDatasetSchema(allocator: std.mem.Allocator, opts: Options) !void {
     try output.writeOutput(allocator, opts.format, rows.items, cols[0..], opts.out_path);
 }
 
+fn cmdCasReviewAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    const mode = try cas_review_audit.Mode.parse(opts.mode);
+
+    var receipt_paths_buf: [32][]const u8 = undefined;
+    for (0..opts.receipt_path_count) |idx| {
+        receipt_paths_buf[idx] = opts.receipt_path_texts[idx].?;
+    }
+    var receipt_globs_buf: [32][]const u8 = undefined;
+    for (0..opts.receipt_glob_count) |idx| {
+        receipt_globs_buf[idx] = opts.receipt_glob_texts[idx].?;
+    }
+
+    var current_session_owned: ?[]u8 = null;
+    defer if (current_session_owned) |text| allocator.free(text);
+    if (opts.exclude_current) {
+        current_session_owned = getEnvVarOwned(allocator, "CODEX_THREAD_ID") catch null;
+    }
+
+    const until_ms = if (opts.until) |raw_until| time_utils.parseIsoTimestampMillis(raw_until) orelse return error.InvalidTimestampArg else null;
+    const since_ms = if (opts.last_text) |raw_last| blk: {
+        const duration_ms = try parseLastWindowMillis(raw_last);
+        const anchor_ms = until_ms orelse currentUnixMillis();
+        break :blk anchor_ms - duration_ms;
+    } else if (opts.since) |raw_since| time_utils.parseIsoTimestampMillis(raw_since) orelse return error.InvalidTimestampArg else null;
+    const effective_until_ms = if (opts.last_text != null) (until_ms orelse currentUnixMillis()) else until_ms;
+
+    var audit = try cas_review_audit.compile(allocator, .{
+        .root = sessions_root,
+        .path = opts.path,
+        .session_id = opts.session_id,
+        .repo = opts.repo_text,
+        .workdir = opts.workdir_text,
+        .since = opts.since,
+        .until = opts.until,
+        .since_ms = since_ms,
+        .until_ms = effective_until_ms,
+        .exclude_current_session_id = current_session_owned,
+        .receipt_paths = receipt_paths_buf[0..opts.receipt_path_count],
+        .receipt_globs = receipt_globs_buf[0..opts.receipt_glob_count],
+        .base_sha = opts.base_sha_text,
+        .head_sha = opts.head_sha_text,
+        .target_fingerprint = opts.target_fingerprint_text,
+    });
+    defer audit.deinit(allocator);
+
+    switch (mode) {
+        .rows => try output.writeOutput(allocator, opts.format, audit.rows.items, cas_review_audit.projection_fields[0..], opts.out_path),
+        .summary => {
+            var rows: std.ArrayList(query.Row) = .empty;
+            defer deinitQueryRows(allocator, &rows);
+            try rows.append(allocator, try cas_review_audit.summaryRow(allocator, audit.summary));
+            try output.writeOutput(allocator, opts.format, rows.items, cas_review_audit.summary_fields[0..], opts.out_path);
+        },
+        .report => {
+            if (opts.format == .markdown) {
+                var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+                defer writer_alloc.deinit();
+                try cas_review_audit.writeReport(&writer_alloc.writer, audit.summary);
+                const rendered = try writer_alloc.toOwnedSlice();
+                defer allocator.free(rendered);
+                try writeTextOutput(rendered, opts.out_path);
+            } else {
+                var rows: std.ArrayList(query.Row) = .empty;
+                defer deinitQueryRows(allocator, &rows);
+                try rows.append(allocator, try cas_review_audit.summaryRow(allocator, audit.summary));
+                try output.writeOutput(allocator, opts.format, rows.items, cas_review_audit.summary_fields[0..], opts.out_path);
+            }
+        },
+    }
+}
+
 fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
     if (opts.format == .json) {
         var writer_alloc = std.Io.Writer.Allocating.init(allocator);
@@ -3232,6 +3363,7 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
             \\      "dcp_validation_v1": true,
             \\      "review_compiler_provenance_v1": true,
             \\      "review_compiler_run_ledger_v1": true,
+            \\      "cas_review_audit_v1": true,
             \\      "c3_count_evidence_refs_v1": true,
             \\      "workflow_filename_false_positive_guard_v1": true,
             \\      "workflow_provenance_mode_v1": true,
@@ -3301,6 +3433,7 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
         .{ .name = "dcp_validation_v1", .enabled = true },
         .{ .name = "review_compiler_provenance_v1", .enabled = true },
         .{ .name = "review_compiler_run_ledger_v1", .enabled = true },
+        .{ .name = "cas_review_audit_v1", .enabled = true },
         .{ .name = "c3_count_evidence_refs_v1", .enabled = true },
         .{ .name = "workflow_filename_false_positive_guard_v1", .enabled = true },
         .{ .name = "workflow_provenance_mode_v1", .enabled = true },
@@ -24085,6 +24218,30 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.plan_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--receipt-path")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            if (opts.receipt_path_count >= opts.receipt_path_texts.len) return error.InvalidLimit;
+            opts.receipt_path_texts[opts.receipt_path_count] = args[i];
+            opts.receipt_path_count += 1;
+        } else if (std.mem.eql(u8, arg, "--receipt-glob")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            if (opts.receipt_glob_count >= opts.receipt_glob_texts.len) return error.InvalidLimit;
+            opts.receipt_glob_texts[opts.receipt_glob_count] = args[i];
+            opts.receipt_glob_count += 1;
+        } else if (std.mem.eql(u8, arg, "--base-sha")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.base_sha_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--head-sha")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.head_sha_text = args[i];
+        } else if (std.mem.eql(u8, arg, "--target-fingerprint")) {
+            i += 1;
+            if (i >= args.len) return error.MissingArgValue;
+            opts.target_fingerprint_text = args[i];
         } else if (std.mem.eql(u8, arg, "--state-db-path")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -26199,7 +26356,7 @@ test "capabilities advertises resolve intent closed audit flags" {
     }, output_path);
     defer std.testing.allocator.free(got);
 
-    try std.testing.expect(std.mem.indexOf(u8, got, "\"version\": \"0.3.17\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"version\": \"0.3.18\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_acceptance_contract_v2\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_review_batch_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_review_aperture_v1\": true") != null);

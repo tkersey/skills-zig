@@ -36,6 +36,7 @@ comptime {
     _ = @import("historical_decisions.zig");
     _ = @import("decision_capsule.zig");
     _ = @import("actuation_audit.zig");
+    _ = @import("cas_review_audit.zig");
     _ = @import("resolve_intent_closed/mod.zig");
     _ = @import("datasets/tool_calls.zig");
     _ = @import("datasets/memory_files.zig");
@@ -93,6 +94,7 @@ test "bootstrap parse coverage" {
     try std.testing.expectEqual(lib.Command.goal_audit, lib.parseCommand("goal-audit"));
     try std.testing.expectEqual(lib.Command.resolve_churn_audit, lib.parseCommand("resolve-churn-audit"));
     try std.testing.expectEqual(lib.Command.review_compiler_audit, lib.parseCommand("review-compiler-audit"));
+    try std.testing.expectEqual(lib.Command.cas_review_audit, lib.parseCommand("cas-review-audit"));
     try std.testing.expectEqual(lib.Command.workflow_audit, lib.parseCommand("workflow-audit"));
     try std.testing.expectEqual(lib.Command.workflow_overlap, lib.parseCommand("workflow-overlap"));
     try std.testing.expectEqual(lib.Command.session_tooling, lib.parseCommand("session-tooling"));
