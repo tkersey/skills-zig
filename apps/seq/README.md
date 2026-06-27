@@ -165,6 +165,7 @@ seq resolve-churn-audit --root ~/.codex/sessions --since 2026-05-01T00:00:00Z --
 - `--emit-count-evidence` emits the per-count evidence table directly; it is equivalent to `--mode evidence`
 - marks absence-derived evidence explicitly with `source: "absent"` and deterministic reasons such as `no_c3_begin_signal`; aggregate `closure_compression` remains the cohort summary
 - reports MBK semantic-surface metrics separately from base-relative Git tree metrics
+- in `--mode summary --format json` and `--mode runs --format jsonl`, emits flat authority-transfer fields for candidate/material sessions, tuple and terminal closure, RAC/mutation/closure gates, semantic-surface delta, orphan/unmapped/wound counters, and the `no mechanically closed material resolve run found` falsifier when no material run satisfies the mechanical closure predicate
 
 Examples:
 ```bash

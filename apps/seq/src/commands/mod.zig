@@ -7766,6 +7766,7 @@ const ReviewCompilerAudit = struct {
     legacy_cleanroom: LegacyCleanroom = .{},
     c3: C3 = .{},
     mbk: MBK = .{},
+    material_runs: std.ArrayList(MaterialRun) = .empty,
 
     const Denominator = struct {
         candidate_sessions: usize = 0,
@@ -7829,6 +7830,44 @@ const ReviewCompilerAudit = struct {
             allocator.free(self.lifecycle);
             allocator.free(self.compression);
             self.evidence.deinit(allocator);
+        }
+    };
+
+    const MaterialRun = struct {
+        session_id: ?[]u8 = null,
+        run_id: []u8,
+        repo: []u8,
+        protocol: []u8,
+        material: bool,
+        c3_required: bool,
+        c3_entered: bool,
+        c3_closed: bool,
+        delivery_closed: bool,
+        terminal_closed: bool,
+        compression_state: []u8,
+        batches_total: usize = 0,
+        kernel_accepted: bool = false,
+        potential_strict_progress: usize = 0,
+        semantic_surface_delta: usize = 0,
+        ac_rebased: bool = false,
+        rac_total: usize = 0,
+        rac_valid: usize = 0,
+        rac_mutation_allowed: usize = 0,
+        mutation_gate_status: []u8,
+        closure_gate_status: []u8,
+        orphan_code_constructs: usize = 0,
+        unmapped_proof_actions: usize = 0,
+        wound_specific_tests: usize = 0,
+        wound_specific_tests_class_mapped: bool = false,
+
+        fn deinit(self: MaterialRun, allocator: std.mem.Allocator) void {
+            if (self.session_id) |id| allocator.free(id);
+            allocator.free(self.run_id);
+            allocator.free(self.repo);
+            allocator.free(self.protocol);
+            allocator.free(self.compression_state);
+            allocator.free(self.mutation_gate_status);
+            allocator.free(self.closure_gate_status);
         }
     };
 
@@ -8242,6 +8281,8 @@ const ReviewCompilerAudit = struct {
     fn deinit(self: *ReviewCompilerAudit, allocator: std.mem.Allocator) void {
         self.denominator.deinit(allocator);
         self.mbk.deinit(allocator);
+        for (self.material_runs.items) |item| item.deinit(allocator);
+        self.material_runs.deinit(allocator);
     }
 };
 
@@ -8351,6 +8392,21 @@ const ReviewCompilerSessionSignals = struct {
     mbk_clean_review_seen: bool = false,
     mbk_isolated_conformance_seen: bool = false,
     mbk_material_kernel_required_seen: bool = false,
+    mbk_batches_total: usize = 0,
+    mbk_potential_strict_progress: usize = 0,
+    mbk_semantic_surface_before: usize = 0,
+    mbk_semantic_surface_after: usize = 0,
+    mbk_semantic_surface_delta: usize = 0,
+    mbk_orphan_code_constructs: usize = 0,
+    mbk_unmapped_proof_actions: usize = 0,
+    mbk_wound_specific_tests: usize = 0,
+    mbk_wound_specific_tests_class_mapped: bool = false,
+    mbk_ac_rebased: bool = false,
+    mbk_rac_total: usize = 0,
+    mbk_rac_valid: usize = 0,
+    mbk_rac_mutation_allowed: usize = 0,
+    mbk_mutation_gate_status: []const u8 = "missing",
+    mbk_closure_gate_status: []const u8 = "missing",
 };
 
 fn cmdResolveChurnAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
@@ -8558,6 +8614,7 @@ fn cmdReviewCompilerAudit(allocator: std.mem.Allocator, sessions_root: []const u
         try recordReviewCompilerMessages(allocator, &audit, messages, opts, &signals, parsed.session.session_id);
         try recordReviewCompilerTools(allocator, &audit, parsed, repo_root, opts, &signals);
         finalizeReviewCompilerCompliance(&audit, signals);
+        if (signals.true_mbk) try addReviewCompilerMaterialRun(allocator, &audit, signals, parsed.session.session_id, repo_root);
         if (signals.true_c3) try addReviewCompilerC3IncludedSession(allocator, &audit, signals, parsed.session.session_id, path);
     }
 
@@ -8593,6 +8650,55 @@ fn addReviewCompilerExclusionWithGovernance(
         .reason = try allocator.dupe(u8, reason),
         .governance = try allocator.dupe(u8, governance),
         .delivery_closed = delivery_closed,
+    });
+}
+
+fn addReviewCompilerMaterialRun(
+    allocator: std.mem.Allocator,
+    audit: *ReviewCompilerAudit,
+    signals: ReviewCompilerSessionSignals,
+    session_id: ?[]const u8,
+    repo_root: []const u8,
+) !void {
+    const run_id_source = session_id orelse "unknown-session";
+    const semantic_delta = if (signals.mbk_semantic_surface_delta != 0)
+        signals.mbk_semantic_surface_delta
+    else if (signals.mbk_semantic_surface_after >= signals.mbk_semantic_surface_before)
+        signals.mbk_semantic_surface_after - signals.mbk_semantic_surface_before
+    else
+        0;
+    const closure_gate_status: []const u8 = signals.mbk_closure_gate_status;
+    const mutation_gate_status: []const u8 = if (std.mem.eql(u8, signals.mbk_mutation_gate_status, "missing") and signals.mbk_rac_mutation_allowed > 0)
+        "passed"
+    else
+        signals.mbk_mutation_gate_status;
+
+    try audit.material_runs.append(allocator, .{
+        .session_id = if (session_id) |id| try allocator.dupe(u8, id) else null,
+        .run_id = try allocator.dupe(u8, run_id_source),
+        .repo = try allocator.dupe(u8, repo_root),
+        .protocol = try allocator.dupe(u8, "mbk"),
+        .material = signals.mbk_material_kernel_required_seen,
+        .c3_required = signals.mbk_material_kernel_required_seen,
+        .c3_entered = signals.mbk_begin_seen,
+        .c3_closed = signals.mbk_tuple_closed_seen,
+        .delivery_closed = signals.mbk_tuple_closed_seen,
+        .terminal_closed = signals.mbk_terminal_closed_seen,
+        .compression_state = try allocator.dupe(u8, if (signals.mbk_tuple_closed_seen) "MBKC-v1" else "NONE"),
+        .batches_total = signals.mbk_batches_total,
+        .kernel_accepted = signals.mbk_kernel_accepted_seen,
+        .potential_strict_progress = signals.mbk_potential_strict_progress,
+        .semantic_surface_delta = semantic_delta,
+        .ac_rebased = signals.mbk_ac_rebased,
+        .rac_total = signals.mbk_rac_total,
+        .rac_valid = signals.mbk_rac_valid,
+        .rac_mutation_allowed = signals.mbk_rac_mutation_allowed,
+        .mutation_gate_status = try allocator.dupe(u8, mutation_gate_status),
+        .closure_gate_status = try allocator.dupe(u8, closure_gate_status),
+        .orphan_code_constructs = signals.mbk_orphan_code_constructs,
+        .unmapped_proof_actions = signals.mbk_unmapped_proof_actions,
+        .wound_specific_tests = signals.mbk_wound_specific_tests,
+        .wound_specific_tests_class_mapped = signals.mbk_wound_specific_tests_class_mapped,
     });
 }
 
@@ -8672,6 +8778,10 @@ fn writeReviewCompilerRunsJsonl(allocator: std.mem.Allocator, audit: ReviewCompi
         try writeReviewCompilerIncludedSessionJson(writer, row);
         try writer.writeByte('\n');
     }
+    for (audit.material_runs.items) |row| {
+        try writeReviewCompilerMaterialRunJson(writer, row);
+        try writer.writeByte('\n');
+    }
     const rendered = try writer_alloc.toOwnedSlice();
     defer allocator.free(rendered);
     if (out_path) |path| try ensureParentDir(path);
@@ -8713,6 +8823,23 @@ fn appendReviewCompilerRunRows(allocator: std.mem.Allocator, rows: *std.ArrayLis
         try row.putStaticKey("c3_entered", .{ .bool = item.c3_entered });
         try row.putStaticKey("c3_closed", .{ .bool = item.c3_closed });
         try row.putStaticKey("compression", .{ .string = item.compression });
+        try rows.append(allocator, row);
+    }
+    for (audit.material_runs.items) |item| {
+        var row = query.Row.init(allocator);
+        errdefer row.deinit();
+        try row.putStaticKey("run_version", .{ .string = resolve_intent_closed.run_version });
+        try putOptionalString(&row, "session_id", item.session_id);
+        try row.putStaticKey("path", .{ .string = item.repo });
+        try row.putStaticKey("protocol", .{ .string = item.protocol });
+        try row.putStaticKey("classification", .{ .string = if (item.material) "material" else "candidate" });
+        try row.putStaticKey("governance", .{ .string = "authoritative" });
+        try row.putStaticKey("lifecycle", .{ .string = if (item.terminal_closed) "valid" else "open" });
+        try row.putStaticKey("delivery_closed", .{ .bool = item.delivery_closed });
+        try row.putStaticKey("c3_required", .{ .bool = item.c3_required });
+        try row.putStaticKey("c3_entered", .{ .bool = item.c3_entered });
+        try row.putStaticKey("c3_closed", .{ .bool = item.c3_closed });
+        try row.putStaticKey("compression", .{ .string = item.compression_state });
         try rows.append(allocator, row);
     }
 }
@@ -8848,16 +8975,18 @@ fn summarizeReviewCompilerSession(
     var signals = ReviewCompilerSessionSignals{};
     for (messages) |message| {
         if (!timestampSatisfiesBounds(message.timestamp, opts)) continue;
+        const positive_evidence_contamination = isReviewCompilerPositiveEvidenceContamination(message.text);
         if (containsReviewCompilerCandidateCue(message.text)) signals.candidate = true;
-        if (containsIncidentalC3ArtifactMention(message.text)) {
+        if (!positive_evidence_contamination and containsIncidentalC3ArtifactMention(message.text)) {
             signals.candidate = true;
             noteReviewCompilerIncidentalC3(&signals, "filename_or_path_mention");
         }
-        if (containsGenericDeliveryClosure(message.text)) {
+        if (!positive_evidence_contamination and containsGenericDeliveryClosure(message.text)) {
             signals.delivery_closed_seen = true;
             signals.closure_provenance = "generic_delivery_closure";
         }
         if (!std.mem.eql(u8, message.role, "assistant")) continue;
+        if (positive_evidence_contamination) continue;
         if (containsTrueReviewCompilerAssistantEvidence(message.text)) {
             signals.candidate = true;
             signals.true_legacy = true;
@@ -8884,6 +9013,8 @@ fn summarizeReviewCompilerSession(
     }
     for (parsed.tools.items) |tool| {
         if (!toolTimestampSatisfiesBounds(parsed, tool, opts)) continue;
+        const tool_text = reviewCompilerToolText(tool);
+        if (isReviewCompilerPositiveEvidenceContamination(tool_text)) continue;
         if (toolHasIncidentalC3Mention(tool)) {
             signals.candidate = true;
             noteReviewCompilerIncidentalC3(&signals, if (tool.kind == .patch_apply) "artifact_under_repair" else "filename_or_path_mention");
@@ -8893,8 +9024,8 @@ fn summarizeReviewCompilerSession(
             noteReviewCompilerAuthoritativeC3(&signals, "controller_invocation");
             signals.true_c3 = true;
             signals.true_resolve = true;
-            const tool_text = tool.command_text orelse reviewCompilerToolText(tool);
-            recordReviewCompilerEvidenceRef(&signals.true_c3_evidence, "tool_call", toolTimestamp(parsed, tool), tool_text);
+            const controller_tool_text = tool.command_text orelse reviewCompilerToolText(tool);
+            recordReviewCompilerEvidenceRef(&signals.true_c3_evidence, "tool_call", toolTimestamp(parsed, tool), controller_tool_text);
         }
         if (toolHasMBKEvidence(tool)) {
             signals.candidate = true;
@@ -8963,6 +9094,21 @@ fn containsReviewCompilerCandidateCue(text: []const u8) bool {
             "ablation_certificate",
             "compiled_delivery_permit",
         });
+}
+
+fn isReviewCompilerPositiveEvidenceContamination(text: []const u8) bool {
+    return containsAnyIgnoreCaseAscii(text, &.{
+        "review-compiler-audit pasted",
+        "current audit prompt",
+        "generated report",
+        "quoted example",
+        "skill-body schema",
+        "schema example",
+        "required summary fields",
+        "required run fields",
+        "falsifier query",
+        "contamination policy",
+    });
 }
 
 fn containsTrueMBKEvidence(text: []const u8) bool {
@@ -9139,6 +9285,7 @@ fn recordReviewCompilerMessages(
             recordReviewCompilerSignalTime(signals, .permit, message.timestamp);
         }
 
+        const positive_evidence_contamination = isReviewCompilerPositiveEvidenceContamination(text);
         if (containsAnyIgnoreCaseAscii(text, &.{ "review_lab", "review lab", "disposable lab", "lab worktree", "scratch worktree" })) {
             signals.lab_context_seen = true;
         }
@@ -9164,9 +9311,11 @@ fn recordReviewCompilerMessages(
         if (containsAnyIgnoreCaseAscii(text, &.{ "holdout_findings_added_to_scope", "holdout findings added" })) audit.legacy_cleanroom.review_horizon.holdout_findings_added_to_scope += 1;
         if (containsAnyIgnoreCaseAscii(text, &.{ "holdout_followups_captured", "holdout followups captured", "holdout follow-ups captured" })) audit.legacy_cleanroom.review_horizon.holdout_followups_captured += 1;
 
-        const c3_source: []const u8 = if (containsAuthoritativeC3EventText(text)) "controller_event" else "message";
-        recordReviewCompilerC3Text(audit, text, message.timestamp, c3_source, signals);
-        if (signals.true_mbk) try recordReviewCompilerMBKText(allocator, audit, text, message.timestamp, signals, session_id, "message");
+        if (!positive_evidence_contamination) {
+            const c3_source: []const u8 = if (containsAuthoritativeC3EventText(text)) "controller_event" else "message";
+            recordReviewCompilerC3Text(audit, text, message.timestamp, c3_source, signals);
+            if (signals.true_mbk) try recordReviewCompilerMBKText(allocator, audit, text, message.timestamp, signals, session_id, "message");
+        }
     }
 }
 
@@ -9291,6 +9440,7 @@ fn recordReviewCompilerMBKText(
     session_id: ?[]const u8,
     source: []const u8,
 ) !void {
+    recordReviewCompilerMBKRunProjectionSignals(signals, text);
     if (containsAnyIgnoreCaseAscii(text, &.{ "clean_review_session", "clean review session", "clean_review: true" })) signals.mbk_clean_review_seen = true;
     if (containsAnyIgnoreCaseAscii(text, &.{ "isolated_conformance_session", "isolated conformance session", "isolated_conformance" })) signals.mbk_isolated_conformance_seen = true;
     if (containsAnyIgnoreCaseAscii(text, &.{ "material_kernel_required", "material kernel required" })) signals.mbk_material_kernel_required_seen = true;
@@ -9386,6 +9536,50 @@ fn recordReviewCompilerMBKText(
     if (containsAnyIgnoreCaseAscii(text, &.{ "terminal_closure_with_new_evidence", "terminal closure with new evidence" })) audit.mbk.closure.terminal_closure_with_new_evidence += 1;
 }
 
+fn recordReviewCompilerMBKRunProjectionSignals(signals: *ReviewCompilerSessionSignals, text: []const u8) void {
+    if (extractReviewCompilerNamedUsize(text, "batches_total")) |value| signals.mbk_batches_total += value;
+    if (extractReviewCompilerNamedUsize(text, "potential.strict_progress")) |value| {
+        signals.mbk_potential_strict_progress += value;
+    } else if (extractReviewCompilerNamedUsize(text, "strict_progress")) |value| {
+        signals.mbk_potential_strict_progress += value;
+    } else if (containsAnyIgnoreCaseAscii(text, &.{ "\"strict_progress\":true", "\"strict_progress\": true", "strict_progress: true", "strict_progress=true" })) {
+        signals.mbk_potential_strict_progress += 1;
+    }
+
+    if (extractReviewCompilerNamedUsize(text, "review_ready_baseline_semantic_surface")) |value| signals.mbk_semantic_surface_before += value;
+    if (extractReviewCompilerNamedUsize(text, "terminal_semantic_surface")) |value| signals.mbk_semantic_surface_after += value;
+    if (extractReviewCompilerNamedUsize(text, "semantic_surface_delta")) |value| {
+        signals.mbk_semantic_surface_delta += value;
+    } else if (extractReviewCompilerNamedUsize(text, "delta_semantic_surface")) |value| {
+        signals.mbk_semantic_surface_delta += value;
+    }
+
+    if (extractReviewCompilerNamedUsize(text, "orphan_code_constructs")) |value| signals.mbk_orphan_code_constructs += value;
+    if (extractReviewCompilerNamedUsize(text, "unmapped_proof_actions")) |value| signals.mbk_unmapped_proof_actions += value;
+    if (extractReviewCompilerNamedUsize(text, "wound_specific_tests")) |value| signals.mbk_wound_specific_tests += value;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "wound_specific_test", "wound-specific test", "wound specific test" }) and signals.mbk_wound_specific_tests == 0) signals.mbk_wound_specific_tests += 1;
+    if (extractReviewCompilerNamedBool(text, "wound_specific_tests_class_mapped")) |value| {
+        signals.mbk_wound_specific_tests_class_mapped = value;
+    } else if (containsAnyIgnoreCaseAscii(text, &.{ "wound-specific tests class mapped", "wound specific tests class mapped" })) {
+        signals.mbk_wound_specific_tests_class_mapped = true;
+    }
+    if (extractReviewCompilerNamedBool(text, "ac_rebased")) |value| {
+        signals.mbk_ac_rebased = value;
+    } else if (extractReviewCompilerNamedBool(text, "explicit_ac_rebase")) |value| {
+        signals.mbk_ac_rebased = value;
+    } else if (containsAnyIgnoreCaseAscii(text, &.{"approved_rebaseline"})) {
+        signals.mbk_ac_rebased = true;
+    }
+
+    if (containsAnyIgnoreCaseAscii(text, &.{ "RAC-v1", "resolve_authority_chain", "authority-chain" })) signals.mbk_rac_total += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "RAC-v1 valid", "\"complete_chain\":\"yes\"", "\"complete_chain\": \"yes\"", "complete_chain: yes" })) signals.mbk_rac_valid += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "\"mutation_allowed\":\"yes\"", "\"mutation_allowed\": \"yes\"", "mutation_allowed: yes", "gate_mutation_allowed" })) signals.mbk_rac_mutation_allowed += 1;
+    if (containsAnyIgnoreCaseAscii(text, &.{ "mutation_gate.status=passed", "\"mutation_gate.status\":\"passed\"", "\"mutation_gate\":{\"status\":\"passed\"", "mutation_gate_passed" })) signals.mbk_mutation_gate_status = "passed";
+    if (containsAnyIgnoreCaseAscii(text, &.{ "mutation_gate.status=failed", "\"mutation_gate.status\":\"failed\"", "\"mutation_gate\":{\"status\":\"failed\"", "mutation_gate_failed" })) signals.mbk_mutation_gate_status = "failed";
+    if (containsAnyIgnoreCaseAscii(text, &.{ "closure_gate.status=passed", "\"closure_gate.status\":\"passed\"", "\"closure_gate\":{\"status\":\"passed\"", "closure_gate_passed" })) signals.mbk_closure_gate_status = "passed";
+    if (containsAnyIgnoreCaseAscii(text, &.{ "closure_gate.status=failed", "\"closure_gate.status\":\"failed\"", "\"closure_gate\":{\"status\":\"failed\"", "closure_gate_failed" })) signals.mbk_closure_gate_status = "failed";
+}
+
 const ReviewCompilerC3TimeKind = enum { begin, closed, aborted };
 const ReviewCompilerMBKTimeKind = enum { begin, terminal };
 
@@ -9457,7 +9651,7 @@ fn recordMBKSurfaceNumbers(mbk: *ReviewCompilerAudit.MBK, text: []const u8) void
 fn extractReviewCompilerNamedUsize(text: []const u8, key: []const u8) ?usize {
     var search_start: usize = 0;
     while (std.mem.indexOfPos(u8, text, search_start, key)) |idx| {
-        var cursor = idx + key.len;
+        var cursor = reviewCompilerNamedValueCursor(text, idx + key.len);
         while (cursor < text.len and (std.ascii.isWhitespace(text[cursor]) or text[cursor] == ':' or text[cursor] == '=')) : (cursor += 1) {}
         const start = cursor;
         while (cursor < text.len and std.ascii.isDigit(text[cursor])) : (cursor += 1) {}
@@ -9465,6 +9659,27 @@ fn extractReviewCompilerNamedUsize(text: []const u8, key: []const u8) ?usize {
         search_start = idx + key.len;
     }
     return null;
+}
+
+fn extractReviewCompilerNamedBool(text: []const u8, key: []const u8) ?bool {
+    var search_start: usize = 0;
+    while (std.mem.indexOfPos(u8, text, search_start, key)) |idx| {
+        var cursor = reviewCompilerNamedValueCursor(text, idx + key.len);
+        while (cursor < text.len and (std.ascii.isWhitespace(text[cursor]) or text[cursor] == ':' or text[cursor] == '=')) : (cursor += 1) {}
+        if (cursor < text.len and text[cursor] == '"') cursor += 1;
+        if (cursor + 4 <= text.len and std.ascii.eqlIgnoreCase(text[cursor .. cursor + 4], "true")) return true;
+        if (cursor + 5 <= text.len and std.ascii.eqlIgnoreCase(text[cursor .. cursor + 5], "false")) return false;
+        if (cursor + 3 <= text.len and std.ascii.eqlIgnoreCase(text[cursor .. cursor + 3], "yes")) return true;
+        if (cursor + 2 <= text.len and std.ascii.eqlIgnoreCase(text[cursor .. cursor + 2], "no")) return false;
+        search_start = idx + key.len;
+    }
+    return null;
+}
+
+fn reviewCompilerNamedValueCursor(text: []const u8, start: usize) usize {
+    var cursor = start;
+    while (cursor < text.len and (std.ascii.isWhitespace(text[cursor]) or text[cursor] == '"')) : (cursor += 1) {}
+    return cursor;
 }
 
 fn recordReviewCompilerSignalTime(signals: *ReviewCompilerSessionSignals, kind: ReviewCompilerSignalTimeKind, timestamp: ?[]const u8) void {
@@ -9503,7 +9718,9 @@ fn recordReviewCompilerTools(
             noteReviewCompilerIncidentalC3(signals, if (tool.kind == .patch_apply) "artifact_under_repair" else "filename_or_path_mention");
         }
         if (signals.true_mbk and containsReviewCompilerMBKToolAccountingCue(tool_text)) {
-            try recordReviewCompilerMBKText(allocator, audit, tool_text, toolTimestamp(parsed, tool), signals, parsed.session.session_id, "tool");
+            if (!isReviewCompilerPositiveEvidenceContamination(tool_text)) {
+                try recordReviewCompilerMBKText(allocator, audit, tool_text, toolTimestamp(parsed, tool), signals, parsed.session.session_id, "tool");
+            }
         }
 
         if (tool.kind == .patch_apply and tool.lifecycle_status == .completed and tool.patch_success != false) {
@@ -10590,6 +10807,7 @@ fn writeReviewCompilerAuditJson(allocator: std.mem.Allocator, audit: ReviewCompi
 
     try writer.writeAll("{\n  \"review_compiler_audit\": {\n");
     try writer.print("    \"protocol\": \"{s}\",\n", .{audit.outputProtocol().label()});
+    try writeReviewCompilerAuthoritySummaryJsonFields(writer, audit);
     if (reviewCompilerProtocolIsMBK(audit.outputProtocol())) {
         try writeReviewCompilerMBKJsonFields(writer, audit.mbk);
         try writer.writeAll("  }\n}\n");
@@ -10660,6 +10878,55 @@ fn writeReviewCompilerAuditJson(allocator: std.mem.Allocator, audit: ReviewCompi
     try writeTextOutput(rendered, out_path);
 }
 
+fn writeReviewCompilerAuthoritySummaryJsonFields(writer: anytype, audit: ReviewCompilerAudit) !void {
+    const protocol = audit.outputProtocol();
+    const mbk_protocol = reviewCompilerProtocolIsMBK(protocol);
+    const candidate_sessions = if (mbk_protocol) audit.mbk.denominator.candidate_sessions else audit.denominator.candidate_sessions;
+    const true_resolve_sessions = if (mbk_protocol) audit.mbk.denominator.true_resolve_sessions else audit.denominator.true_resolve_sessions;
+    const tuple_closed_sessions = if (mbk_protocol) audit.mbk.denominator.tuple_closed_sessions else audit.denominator.c3_closed_sessions;
+    const terminal_closed_sessions = if (mbk_protocol) audit.mbk.denominator.terminal_closed_sessions else audit.c3.delivery.closed_runs;
+    var material_runs_total: usize = 0;
+    var material_runs_with_rac: usize = 0;
+    var material_runs_with_mutation_gate: usize = 0;
+    var material_runs_with_closure_gate: usize = 0;
+    for (audit.material_runs.items) |row| {
+        if (!row.material) continue;
+        material_runs_total += 1;
+        if (row.rac_total > 0) material_runs_with_rac += 1;
+        if (!std.mem.eql(u8, row.mutation_gate_status, "missing")) material_runs_with_mutation_gate += 1;
+        if (!std.mem.eql(u8, row.closure_gate_status, "missing")) material_runs_with_closure_gate += 1;
+    }
+    if (!mbk_protocol and material_runs_total == 0) {
+        material_runs_total = audit.denominator.c3_required_sessions;
+    }
+
+    const mechanically_closed = reviewCompilerHasMechanicallyClosedMaterialRun(audit);
+    try writer.print("    \"candidate_sessions\": {d},\n", .{candidate_sessions});
+    try writer.print("    \"true_resolve_sessions\": {d},\n", .{true_resolve_sessions});
+    try writer.print("    \"tuple_closed_sessions\": {d},\n", .{tuple_closed_sessions});
+    try writer.print("    \"terminal_closed_sessions\": {d},\n", .{terminal_closed_sessions});
+    try writer.print("    \"material_runs_total\": {d},\n", .{material_runs_total});
+    try writer.print("    \"material_runs_with_rac\": {d},\n", .{material_runs_with_rac});
+    try writer.print("    \"material_runs_with_mutation_gate\": {d},\n", .{material_runs_with_mutation_gate});
+    try writer.print("    \"material_runs_with_closure_gate\": {d},\n", .{material_runs_with_closure_gate});
+    try writer.print("    \"uncompiled_review_text_mutations\": {d},\n", .{audit.c3.compliance.direct_review_to_delivery_mutation});
+    try writer.print("    \"raw_delivery_mutations_while_active\": {d},\n", .{audit.mbk.controller.raw_delivery_mutations_while_active + audit.c3.lab_vs_delivery.raw_delivery_mutations_while_frozen});
+    try writer.print("    \"state_only_apply_violations\": {d},\n", .{audit.mbk.controller.state_only_apply_violations});
+    try writer.print("    \"state_only_commit_violations\": {d},\n", .{audit.mbk.controller.state_only_commit_violations});
+    try writer.print("    \"state_only_push_violations\": {d},\n", .{audit.mbk.controller.state_only_push_violations});
+    try writer.print("    \"semantic_surface_before\": {d},\n", .{audit.mbk.semantic_surface.review_ready_baseline.semantic_surface});
+    try writer.print("    \"semantic_surface_after\": {d},\n", .{audit.mbk.semantic_surface.terminal.semantic_surface});
+    try writer.print("    \"semantic_surface_delta\": {d},\n", .{audit.mbk.semantic_surface.delta.semantic_surface});
+    try writer.print("    \"orphan_code_constructs\": {d},\n", .{audit.mbk.realization.orphan_code_constructs});
+    try writer.print("    \"unmapped_proof_actions\": {d},\n", .{audit.mbk.proof.unmapped_proof_actions});
+    try writer.print("    \"wound_specific_tests\": {d},\n", .{audit.mbk.proof.wound_specific_tests});
+    try writer.writeAll("    \"mechanical_closure_falsifier\": { \"status\": ");
+    try output.writeJsonString(writer, if (mechanically_closed) "passed" else "not_found");
+    try writer.writeAll(", \"message\": ");
+    try output.writeJsonString(writer, if (mechanically_closed) "mechanically closed material resolve run found" else "no mechanically closed material resolve run found");
+    try writer.writeAll(" },\n");
+}
+
 fn writeReviewCompilerClosureCompressionJson(writer: anytype, closure: ReviewCompilerAudit.ClosureCompression) !void {
     const missing = closure.missing_compression_evidence;
     try writer.print("    \"closure_compression\": {{ \"summary_state\": ", .{});
@@ -10667,9 +10934,70 @@ fn writeReviewCompilerClosureCompressionJson(writer: anytype, closure: ReviewCom
     try writer.print(", \"closed_total\": {d}, \"closed_compressed\": {d}, \"closed_uncompressed\": {d}, \"blocked\": {d}, \"compression_not_required\": {d}, \"missing_compression_evidence\": {{ \"basis\": {d}, \"tournament\": {d}, \"ablation\": {d}, \"proof\": {d}, \"holdout\": {d}, \"permit\": {d}, \"stale_mrpc\": {d}, \"direct_review_to_delivery_mutation\": {d}, \"commit_or_push_bypass\": {d} }} }}", .{ closure.closed_total, closure.closed_compressed, closure.closed_uncompressed, closure.blocked, closure.compression_not_required, missing.basis, missing.tournament, missing.ablation, missing.proof, missing.holdout, missing.permit, missing.stale_mrpc, missing.direct_review_to_delivery_mutation, missing.commit_or_push_bypass });
 }
 
+fn reviewCompilerHasMechanicallyClosedMaterialRun(audit: ReviewCompilerAudit) bool {
+    for (audit.material_runs.items) |row| {
+        if (row.material and
+            row.c3_required and
+            row.c3_entered and
+            row.c3_closed and
+            !std.mem.eql(u8, row.compression_state, "NONE") and
+            row.batches_total > 0 and
+            row.kernel_accepted and
+            row.potential_strict_progress > 0 and
+            row.delivery_closed and
+            row.terminal_closed and
+            row.rac_valid > 0 and
+            row.rac_mutation_allowed > 0 and
+            std.mem.eql(u8, row.mutation_gate_status, "passed") and
+            std.mem.eql(u8, row.closure_gate_status, "passed"))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn writeReviewCompilerMaterialRunJson(writer: anytype, row: ReviewCompilerAudit.MaterialRun) !void {
+    try writer.writeAll("{ \"run_version\": ");
+    try output.writeJsonString(writer, resolve_intent_closed.run_version);
+    try writer.writeAll(", \"session_id\": ");
+    if (row.session_id) |id| try output.writeJsonString(writer, id) else try writer.writeAll("null");
+    try writer.writeAll(", \"run_id\": ");
+    try output.writeJsonString(writer, row.run_id);
+    try writer.writeAll(", \"repo\": ");
+    try output.writeJsonString(writer, row.repo);
+    try writer.writeAll(", \"protocol\": ");
+    try output.writeJsonString(writer, row.protocol);
+    try writer.print(", \"material\": {any}, \"c3_required\": {any}, \"c3_entered\": {any}, \"c3_closed\": {any}, \"delivery_closed\": {any}, \"terminal_closed\": {any}", .{ row.material, row.c3_required, row.c3_entered, row.c3_closed, row.delivery_closed, row.terminal_closed });
+    try writer.writeAll(", \"compression_state\": ");
+    try output.writeJsonString(writer, row.compression_state);
+    try writer.print(", \"batches_total\": {d}, \"kernel.accepted\": {any}, \"potential.strict_progress\": {d}, \"semantic_surface_delta\": {d}, \"ac_rebased\": {any}", .{ row.batches_total, row.kernel_accepted, row.potential_strict_progress, row.semantic_surface_delta, row.ac_rebased });
+    try writer.print(", \"rac.total\": {d}, \"rac.valid\": {d}, \"rac.mutation_allowed\": {d}", .{ row.rac_total, row.rac_valid, row.rac_mutation_allowed });
+    try writer.writeAll(", \"mutation_gate.status\": ");
+    try output.writeJsonString(writer, row.mutation_gate_status);
+    try writer.writeAll(", \"closure_gate.status\": ");
+    try output.writeJsonString(writer, row.closure_gate_status);
+    try writer.print(", \"orphan_code_constructs\": {d}, \"unmapped_proof_actions\": {d}, \"wound_specific_tests\": {d}, \"wound_specific_tests_class_mapped\": {any} }}", .{ row.orphan_code_constructs, row.unmapped_proof_actions, row.wound_specific_tests, row.wound_specific_tests_class_mapped });
+}
+
 fn writeReviewCompilerIncludedSessionJson(writer: anytype, row: ReviewCompilerAudit.IncludedSession) !void {
     try writer.writeAll("{ \"run_version\": ");
     try output.writeJsonString(writer, resolve_intent_closed.run_version);
+    try writer.writeAll(", \"session_id\": ");
+    if (row.session_id) |top_id| try output.writeJsonString(writer, top_id) else try writer.writeAll("null");
+    try writer.writeAll(", \"run_id\": ");
+    if (row.session_id) |run_id| try output.writeJsonString(writer, run_id) else try output.writeJsonString(writer, pathBasenameSlice(row.path));
+    try writer.writeAll(", \"repo\": ");
+    try output.writeJsonString(writer, row.path);
+    try writer.writeAll(", \"protocol\": ");
+    try output.writeJsonString(writer, row.protocol);
+    try writer.print(", \"material\": {any}, \"c3_required\": {any}, \"c3_entered\": {any}, \"c3_closed\": {any}, \"delivery_closed\": {any}, \"terminal_closed\": {any}", .{ row.c3_required, row.c3_required, row.c3_entered, row.c3_closed, row.delivery_closed, row.c3_closed });
+    try writer.writeAll(", \"compression_state\": ");
+    try output.writeJsonString(writer, row.compression);
+    try writer.print(", \"batches_total\": 0, \"kernel.accepted\": false, \"potential.strict_progress\": 0, \"semantic_surface_delta\": 0, \"ac_rebased\": false, \"rac.total\": 0, \"rac.valid\": 0, \"rac.mutation_allowed\": 0", .{});
+    try writer.writeAll(", \"mutation_gate.status\": \"missing\", \"closure_gate.status\": ");
+    try output.writeJsonString(writer, if (row.c3_closed and row.c3_required and !std.mem.eql(u8, row.compression, "NONE")) "passed" else "missing");
+    try writer.writeAll(", \"orphan_code_constructs\": 0, \"unmapped_proof_actions\": 0, \"wound_specific_tests\": 0, \"wound_specific_tests_class_mapped\": false");
     try writer.writeAll(", \"identity\": { \"session_id\": ");
     if (row.session_id) |id| try output.writeJsonString(writer, id) else try writer.writeAll("null");
     try writer.writeAll(", \"path\": ");
@@ -10714,11 +11042,11 @@ fn writeReviewCompilerIncludedSessionJson(writer: anytype, row: ReviewCompilerAu
     try writer.writeAll(", \"verdict\": ");
     try output.writeJsonString(writer, reviewCompilerVerdictForSession(row));
     try writer.writeAll(", \"limitations\": [\"controller_artifact_projection_pending\"]");
-    try writer.writeAll(", \"session_id\": ");
+    try writer.writeAll(", \"legacy_session_id\": ");
     if (row.session_id) |id2| try output.writeJsonString(writer, id2) else try writer.writeAll("null");
     try writer.writeAll(", \"path\": ");
     try output.writeJsonString(writer, row.path);
-    try writer.writeAll(", \"protocol\": ");
+    try writer.writeAll(", \"legacy_protocol\": ");
     try output.writeJsonString(writer, row.protocol);
     try writer.writeAll(", \"classification\": ");
     try output.writeJsonString(writer, row.classification);
@@ -25871,7 +26199,7 @@ test "capabilities advertises resolve intent closed audit flags" {
     }, output_path);
     defer std.testing.allocator.free(got);
 
-    try std.testing.expect(std.mem.indexOf(u8, got, "\"version\": \"0.3.16\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"version\": \"0.3.17\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_acceptance_contract_v2\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_review_batch_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_review_aperture_v1\": true") != null);
@@ -26375,7 +26703,8 @@ test "review-compiler-audit mbk protocol audits kernel, surface, proof, closure,
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T09:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"l1\",\"message\":\"review-compiler-audit pasted labels only: local_surface_family wound_specific_test tuple_closed.\"}}\n";
     const true_mbk =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-14T10:00:00Z\",\"payload\":{\"id\":\"mbk-true\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T10:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"m1\",\"message\":\"MBKC-v1 minimum_behavioral_kernel\\nresolve-c3 campaign begin\\ncampaign-began\\nmaterial_kernel_required\\nfixed_base_pass\\nbase_reset_violation\\nreview_ready_baseline\\nprior_closure_head_used_as_new_base\\nrebaseline_decision\\nobservation-added raw_finding\\nbranch_liabilities:\\n  - F1\\nadditional_witness\\nlocal_surface_family\\nwound_specific_test\\nkernel_law\\ndesign-registered route_class\\ndesign-selected\\nrealization_from_campaign_base\\nsurface_retired\\nreview_ready_baseline_semantic_surface: 5\\nreview_ready_baseline_governing_laws: 1\\nreview_ready_baseline_realization_surface: 3\\nreview_ready_baseline_proof_families: 1\\nterminal_semantic_surface: 7\\nterminal_governing_laws: 2\\nterminal_realization_surface: 4\\nterminal_proof_families: 2\\ngit_files_changed: 9\\ngit_insertions: 20\\ngit_deletions: 4\\nproof_family\\nproof_run\\nstate_only_apply\\nkernel-accepted\\ntuple-closed\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T10:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"m1\",\"message\":\"MBKC-v1 minimum_behavioral_kernel\\nresolve-c3 campaign begin\\ncampaign-began\\nmaterial_kernel_required\\nfixed_base_pass\\nbase_reset_violation\\nreview_ready_baseline\\nprior_closure_head_used_as_new_base\\nrebaseline_decision\\nobservation-added raw_finding\\nbranch_liabilities:\\n  - F1\\nadditional_witness\\nlocal_surface_family\\nwound_specific_test\\nwound_specific_tests_class_mapped: true\\nkernel_law\\ndesign-registered route_class\\ndesign-selected\\nrealization_from_campaign_base\\nsurface_retired\\nbatches_total: 2\\nstrict_progress: 1\\nRAC-v1 valid mutation_allowed: yes\\nmutation_gate.status=passed\\nclosure_gate.status=passed\\nreview_ready_baseline_semantic_surface: 5\\nreview_ready_baseline_governing_laws: 1\\nreview_ready_baseline_realization_surface: 3\\nreview_ready_baseline_proof_families: 1\\nterminal_semantic_surface: 7\\nterminal_governing_laws: 2\\nterminal_realization_surface: 4\\nterminal_proof_families: 2\\ngit_files_changed: 9\\ngit_insertions: 20\\ngit_deletions: 4\\nproof_family\\nproof_run\\nstate_only_apply\\nkernel-accepted\\ntuple-closed\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T10:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"m1\",\"message\":\"generated report quoted example: MBKC-v1 batches_total: 99 closure_gate.status=passed wound_specific_tests_class_mapped: false\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T10:00:02Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"m1\",\"call_id\":\"ctl-apply\",\"command\":\"resolve-c3 apply\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"applied\"}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-05-14T10:00:03Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"apply_patch\",\"call_id\":\"raw-patch\",\"arguments\":\"*** Update File: apps/seq/src/lib.zig\\n+raw\\n\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T10:00:04Z\",\"payload\":{\"type\":\"patch_apply_end\",\"turn_id\":\"m1\",\"call_id\":\"raw-patch\",\"success\":true,\"cwd\":\"/repo\",\"changes\":{\"files\":1}}}\n" ++
@@ -26405,6 +26734,16 @@ test "review-compiler-audit mbk protocol audits kernel, surface, proof, closure,
     try std.testing.expect(std.mem.indexOf(u8, got, "\"protocol\": \"mbk\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"candidate_sessions\": 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"true_resolve_sessions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"material_runs_total\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"material_runs_with_rac\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"material_runs_with_mutation_gate\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"material_runs_with_closure_gate\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"tuple_closed_sessions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"terminal_closed_sessions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"semantic_surface_before\": 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"semantic_surface_after\": 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"semantic_surface_delta\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"mechanically closed material resolve run found\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"reason\": \"candidate_without_mbk_evidence\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"material_kernel_required_sessions\": 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"kernel_campaign_entered_sessions\": 1") != null);
@@ -26432,6 +26771,40 @@ test "review-compiler-audit mbk protocol audits kernel, surface, proof, closure,
     try std.testing.expect(std.mem.indexOf(u8, got, "\"terminal_closed\": 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"evidence_ledger\"") != null);
 
+    const runs_output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "review-compiler-mbk-runs.jsonl" });
+    defer std.testing.allocator.free(runs_output_path);
+    const runs_got = try runCommandWithOutput(std.testing.allocator, .review_compiler_audit, &.{
+        "--root",     root_abs,
+        "--protocol", "mbk",
+        "--mode",     "runs",
+        "--since",    "2026-05-14T00:00:00Z",
+        "--until",    "2026-05-15T00:00:00Z",
+        "--repo",     "/repo",
+        "--format",   "jsonl",
+    }, runs_output_path);
+    defer std.testing.allocator.free(runs_got);
+
+    try std.testing.expect(std.mem.indexOf(u8, runs_got, "\"run_version\": ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runs_got, "\"session_id\": \"mbk-true\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runs_got, "\"run_id\": \"mbk-true\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runs_got, "\"repo\": \"/repo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runs_got, "\"material\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runs_got, "\"c3_required\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runs_got, "\"c3_entered\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runs_got, "\"c3_closed\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runs_got, "\"terminal_closed\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runs_got, "\"compression_state\": \"MBKC-v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runs_got, "\"batches_total\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runs_got, "\"kernel.accepted\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runs_got, "\"potential.strict_progress\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runs_got, "\"semantic_surface_delta\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runs_got, "\"rac.total\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runs_got, "\"rac.valid\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runs_got, "\"rac.mutation_allowed\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runs_got, "\"mutation_gate.status\": \"passed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runs_got, "\"closure_gate.status\": \"passed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runs_got, "\"wound_specific_tests_class_mapped\": true") != null);
+
     const auto_output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "review-compiler-mbk-auto.json" });
     defer std.testing.allocator.free(auto_output_path);
     const auto_got = try runCommandWithOutput(std.testing.allocator, .review_compiler_audit, &.{
@@ -26450,6 +26823,38 @@ test "review-compiler-audit mbk protocol audits kernel, surface, proof, closure,
     try std.testing.expect(std.mem.indexOf(u8, auto_got, "\"reason\": \"candidate_without_mbk_evidence\"") != null);
 }
 
+test "review-compiler-audit excludes generated examples from positive workflow evidence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/16");
+    const generated_example =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-16T08:00:00Z\",\"payload\":{\"id\":\"mbk-generated-example\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-16T08:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"g1\",\"message\":\"generated report quoted example: MBKC-v1 material_kernel_required kernel-accepted terminal-closed closure_gate.status=passed wound_specific_test\"}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/16/rollout-mbk-generated-example.jsonl", .data = generated_example });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "review-compiler-mbk-contamination.json" });
+    defer std.testing.allocator.free(output_path);
+
+    const got = try runCommandWithOutput(std.testing.allocator, .review_compiler_audit, &.{
+        "--root",     root_abs,
+        "--protocol", "mbk",
+        "--since",    "2026-05-16T00:00:00Z",
+        "--until",    "2026-05-17T00:00:00Z",
+        "--repo",     "/repo",
+        "--format",   "json",
+    }, output_path);
+    defer std.testing.allocator.free(got);
+
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"candidate_sessions\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"true_resolve_sessions\": 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"material_runs_total\": 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"wound_specific_tests\": 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "no mechanically closed material resolve run found") != null);
+}
+
 test "review-compiler-audit mbk surface snapshots aggregate across evidence rows" {
     var mbk = ReviewCompilerAudit.MBK{};
     recordMBKSurfaceNumbers(&mbk, "review_ready_baseline_semantic_surface: 2 terminal_semantic_surface: 5 git_insertions: 7 git_deletions: 3");
@@ -26460,6 +26865,33 @@ test "review-compiler-audit mbk surface snapshots aggregate across evidence rows
     try std.testing.expectEqual(@as(usize, 18), mbk.git_tree_metrics.insertions);
     try std.testing.expectEqual(@as(usize, 8), mbk.git_tree_metrics.deletions);
     try std.testing.expectEqual(@as(i64, 10), mbk.git_tree_metrics.net_lines);
+}
+
+test "review-compiler-audit mbk projection parses quoted values and preserves missing gates" {
+    try std.testing.expectEqual(@as(?usize, 2), extractReviewCompilerNamedUsize("{\"batches_total\": 2}", "batches_total"));
+    try std.testing.expectEqual(@as(?usize, 2), extractReviewCompilerNamedUsize("{\"semantic_surface_delta\": 2}", "semantic_surface_delta"));
+    try std.testing.expectEqual(@as(?bool, false), extractReviewCompilerNamedBool("{\"wound_specific_tests_class_mapped\": false}", "wound_specific_tests_class_mapped"));
+    try std.testing.expectEqual(@as(?bool, false), extractReviewCompilerNamedBool("{\"ac_rebased\": false}", "ac_rebased"));
+
+    const signals = ReviewCompilerSessionSignals{
+        .mbk_material_kernel_required_seen = true,
+        .mbk_begin_seen = true,
+        .mbk_tuple_closed_seen = true,
+        .mbk_terminal_closed_seen = true,
+        .mbk_kernel_accepted_seen = true,
+        .mbk_batches_total = 1,
+        .mbk_potential_strict_progress = 1,
+        .mbk_rac_total = 1,
+        .mbk_rac_valid = 1,
+        .mbk_rac_mutation_allowed = 1,
+        .mbk_mutation_gate_status = "passed",
+    };
+    var audit = ReviewCompilerAudit{};
+    defer audit.deinit(std.testing.allocator);
+    try addReviewCompilerMaterialRun(std.testing.allocator, &audit, signals, "mbk-missing-closure-gate", "/repo");
+
+    try std.testing.expectEqualStrings("missing", audit.material_runs.items[0].closure_gate_status);
+    try std.testing.expect(!reviewCompilerHasMechanicallyClosedMaterialRun(audit));
 }
 
 fn runCommandWithOutput(
