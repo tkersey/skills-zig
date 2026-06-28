@@ -4,6 +4,9 @@ const durable_store = @import("durable_store");
 const std = @import("std");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
+pub const LegacyLearningsPath = ".learnings.jsonl";
+pub const DefaultLearningsPath = ".ledger/learnings/learnings.jsonl";
+
 pub const Surface = struct {
     program_name: []const u8,
     usage_line: []const u8,
@@ -18,7 +21,7 @@ const StandaloneSurface = Surface{
     \\
     \\usage: append_learning [-h] [--status STATUS] --learning LEARNING [--evidence EVIDENCE] [--application APPLICATION] [--tag TAG] [--related-id RELATED_ID] [--supersedes-id SUPERSEDES_ID] [--repo REPO] [--path PATH] [--source SOURCE] [--allow-duplicate] [--quality-mode {strict,best_effort}] [--allow-temp-path]
     \\
-    \\Append a structured learning record to repo-root .learnings.jsonl.
+    \\Append a structured learning record to repo-local .ledger/learnings/learnings.jsonl.
     \\
     \\options:
     \\  -h, --help            show this help message and exit
@@ -52,7 +55,7 @@ const SubcommandSurface = Surface{
     \\
     \\usage: learnings append [-h] [--status STATUS] --learning LEARNING [--evidence EVIDENCE] [--application APPLICATION] [--tag TAG] [--related-id RELATED_ID] [--supersedes-id SUPERSEDES_ID] [--repo REPO] [--path PATH] [--source SOURCE] [--allow-duplicate] [--quality-mode {strict,best_effort}] [--allow-temp-path]
     \\
-    \\Append a structured learning record to repo-root .learnings.jsonl.
+    \\Append a structured learning record to repo-local .ledger/learnings/learnings.jsonl.
     \\
     \\options:
     \\  -h, --help            show this help message and exit
@@ -133,7 +136,8 @@ const Options = struct {
     related_ids: std.ArrayListUnmanaged([]const u8) = .empty,
     supersedes_id: []const u8 = "",
     repo: []const u8 = "",
-    path: []const u8 = ".learnings.jsonl",
+    path: []const u8 = DefaultLearningsPath,
+    path_explicit: bool = false,
     source: []const u8 = "skill:learnings",
     allow_duplicate: bool = false,
     quality_mode: QualityMode = .strict,
@@ -281,6 +285,7 @@ pub fn runWithAllocator(
             i += 1;
             if (i >= args.len) exitParseError(surface, "argument --path: expected one argument", .{});
             opts.path = args[i];
+            opts.path_explicit = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "--source")) {
@@ -412,7 +417,7 @@ pub fn runWithAllocator(
     const repo = if (repo_override.len == 0) try inferRepoSlugAlloc(allocator, repo_root) else try allocator.dupe(u8, repo_override);
     defer allocator.free(repo);
 
-    const output_path = try resolveOutputPathAlloc(allocator, repo_root, opts.path);
+    const output_path = try resolveWritePathAlloc(allocator, repo_root, opts.path, opts.path_explicit);
     defer allocator.free(output_path);
 
     if (!opts.allow_duplicate) {
@@ -976,6 +981,25 @@ fn resolveOutputPathAlloc(allocator: std.mem.Allocator, repo_root: []const u8, r
     return std.fs.path.join(allocator, &.{ repo_root, raw_path });
 }
 
+fn resolveWritePathAlloc(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    raw_path: []const u8,
+    path_explicit: bool,
+) ![]u8 {
+    if (path_explicit) return resolveOutputPathAlloc(allocator, repo_root, raw_path);
+
+    const next_path = try resolveOutputPathAlloc(allocator, repo_root, DefaultLearningsPath);
+    errdefer allocator.free(next_path);
+    if (durable_store.fileExists(next_path)) return next_path;
+
+    const legacy_path = try resolveOutputPathAlloc(allocator, repo_root, LegacyLearningsPath);
+    defer allocator.free(legacy_path);
+    if (durable_store.fileExists(legacy_path)) return error.MigrationRequired;
+
+    return next_path;
+}
+
 fn appendJsonLine(path: []const u8, json_line: []const u8) !void {
     return durable_store.appendLineAtomic(std.heap.page_allocator, path, json_line, 64 * 1024 * 1024);
 }
@@ -1208,6 +1232,37 @@ test "discoverRepoRootAlloc walks to git ancestor" {
     const resolved_nested = try discoverRepoRootAlloc(std.testing.allocator, nested_abs);
     defer std.testing.allocator.free(resolved_nested);
     try std.testing.expectEqualStrings(root_abs, resolved_nested);
+}
+
+test "append default writes .ledger/learnings/learnings.jsonl" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const expected_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, DefaultLearningsPath });
+    defer std.testing.allocator.free(expected_path);
+
+    const resolved = try resolveWritePathAlloc(std.testing.allocator, root_abs, DefaultLearningsPath, false);
+    defer std.testing.allocator.free(resolved);
+    try std.testing.expectEqualStrings(expected_path, resolved);
+}
+
+test "legacy-only append fails with MigrationRequired" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), ".git");
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const legacy_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, LegacyLearningsPath });
+    defer std.testing.allocator.free(legacy_path);
+    try durable_store.writeTextAtomic(std.testing.allocator, legacy_path, "{\"id\":\"lrn-legacy\"}\n");
+
+    try std.testing.expectError(
+        error.MigrationRequired,
+        resolveWritePathAlloc(std.testing.allocator, root_abs, DefaultLearningsPath, false),
+    );
 }
 
 test "encodeRecordJsonAlloc returns a populated JSON object" {

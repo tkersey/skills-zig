@@ -7,7 +7,7 @@ Repo-local durable negative evidence ledger.
 Default store:
 
 ```bash
-.ledger/negative-ledger.jsonl
+.ledger/negative-ledger/events.jsonl
 ```
 
 ## Commands
@@ -25,9 +25,19 @@ ledger export --id NEG-000001 --format memory-note
 ledger handoff
 ledger compact
 ledger doctor
+ledger migrate --mode copy
 ```
 
 Use `--file PATH` to point at a non-default store.
+
+Path migration:
+
+```bash
+ledger migrate \
+  --from .ledger/negative-ledger.jsonl \
+  --to .ledger/negative-ledger/events.jsonl \
+  --mode copy
+```
 
 ## Capture
 
@@ -85,7 +95,7 @@ Example shape:
     "checked": true,
     "query_or_map": "yes",
     "ledger_cli": "ledger",
-    "store": ".ledger/negative-ledger.jsonl",
+    "store": ".ledger/negative-ledger/events.jsonl",
     "command": "ledger map --route review-route --cluster same-cluster --artifact HEAD",
     "exit_code": 0,
     "ledger_available": true,

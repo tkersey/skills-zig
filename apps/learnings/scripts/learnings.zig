@@ -10,6 +10,9 @@ const query_spec = seq_bundle.query_spec;
 
 const Version = core_cli.normalizeVersion(app_meta.version);
 const ProgramName = "learnings";
+const LegacyLearningsPath = append_learning_cli.LegacyLearningsPath;
+const DefaultLearningsPath = append_learning_cli.DefaultLearningsPath;
+const MaxLearningsBytes = 64 * 1024 * 1024;
 const HelpSurface = core_cli.HelpSurface{
     .executable_name = "learnings",
     .help_text = UsageText,
@@ -18,12 +21,12 @@ const HelpSurface = core_cli.HelpSurface{
 const UsageText =
     \\learnings
     \\
-    \\usage: learnings [-h] [--path PATH] {append,datasets,dataset-schema,query,recent,recall,codify-candidates,quality-audit,value-report,memory-digest} ...
+    \\usage: learnings [-h] [--path PATH] {append,datasets,dataset-schema,query,recent,recall,codify-candidates,quality-audit,value-report,memory-digest,migrate,doctor,path} ...
     \\
-    \\Mine, recall, and promote records from repo-root .learnings.jsonl.
+    \\Mine, recall, and promote records from repo-local .ledger/learnings/learnings.jsonl.
     \\
     \\positional arguments:
-    \\  {append,datasets,dataset-schema,query,recent,recall,codify-candidates,quality-audit,value-report,memory-digest}
+    \\  {append,datasets,dataset-schema,query,recent,recall,codify-candidates,quality-audit,value-report,memory-digest,migrate,doctor,path}
     \\    append              Append a structured learning record
     \\    datasets            List datasets
     \\    dataset-schema      Show dataset schema
@@ -34,6 +37,9 @@ const UsageText =
     \\    quality-audit       Summarize learning capture quality and contract health
     \\    value-report        Compare recall-loaded sessions against a non-recall comparator
     \\    memory-digest       Generate a disposable cross-repo memory consolidation digest
+    \\    migrate             Copy or move legacy .learnings.jsonl into .ledger/learnings/learnings.jsonl
+    \\    doctor              Report learnings store path status
+    \\    path                Print the resolved default learnings path
     \\
     \\options:
     \\  -h, --help            show this help message and exit
@@ -165,6 +171,7 @@ const LearningsTextMarkers = [_][]const u8{
     "append_learning",
     "run_learnings_tool",
     "learnings recall",
+    ".ledger/learnings/learnings.jsonl",
     ".learnings.jsonl",
     "skill:learnings",
 };
@@ -225,10 +232,18 @@ const Command = enum {
     quality_audit,
     value_report,
     memory_digest,
+    migrate,
+    doctor,
+    path,
+};
+
+const MigrationMode = enum {
+    copy,
+    move,
 };
 
 const Args = struct {
-    path: []const u8 = ".learnings.jsonl",
+    path: []const u8 = DefaultLearningsPath,
     path_explicit: bool = false,
     sessions_root: []const u8 = "",
     since: []const u8 = "",
@@ -246,6 +261,12 @@ const Args = struct {
     min_count: usize = 3,
     scan_root: []const u8 = "",
     append_args_start: usize = 0,
+    migrate_from: []const u8 = LegacyLearningsPath,
+    migrate_to: []const u8 = DefaultLearningsPath,
+    migrate_mode: MigrationMode = .copy,
+    dry_run: bool = false,
+    allow_existing_target: bool = false,
+    remove_legacy: bool = false,
 };
 
 const RecallCandidate = struct {
@@ -384,46 +405,64 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(cwd);
     const repo_root = try discoverRepoRootAlloc(allocator, cwd);
     defer allocator.free(repo_root);
-    const jsonl_path = try resolveJsonlPathAlloc(allocator, repo_root, parsed.path);
-    defer allocator.free(jsonl_path);
 
     switch (parsed.command orelse unreachable) {
         .append => unreachable,
         .datasets => try cmdDatasets(allocator),
         .dataset_schema => try cmdDatasetSchema(allocator, parsed.dataset.?),
-        .query => try cmdQuery(allocator, repo_root, jsonl_path, parsed.spec.?),
-        .recent => try cmdRecent(allocator, repo_root, jsonl_path, if (parsed.limit == 0) 20 else parsed.limit),
-        .recall => try cmdRecall(
-            allocator,
-            repo_root,
-            jsonl_path,
-            parsed.query.?,
-            parsed.paths,
-            if (parsed.limit == 0) 8 else parsed.limit,
-            parsed.format,
-            parsed.drop_superseded,
-        ),
-        .codify_candidates => try cmdCodifyCandidates(
-            allocator,
-            repo_root,
-            jsonl_path,
-            if (parsed.limit == 0) 20 else parsed.limit,
-            parsed.min_count,
-            parsed.format,
-            parsed.drop_superseded,
-        ),
-        .quality_audit => try cmdQualityAudit(
-            allocator,
-            jsonl_path,
-            parsed.since,
-            parsed.until,
-            parsed.format,
-            parsed.output,
-        ),
+        .query => {
+            const jsonl_path = try resolveReadJsonlPathAlloc(allocator, repo_root, parsed.path, parsed.path_explicit);
+            defer allocator.free(jsonl_path);
+            try cmdQuery(allocator, repo_root, jsonl_path, parsed.spec.?);
+        },
+        .recent => {
+            const jsonl_path = try resolveReadJsonlPathAlloc(allocator, repo_root, parsed.path, parsed.path_explicit);
+            defer allocator.free(jsonl_path);
+            try cmdRecent(allocator, repo_root, jsonl_path, if (parsed.limit == 0) 20 else parsed.limit);
+        },
+        .recall => {
+            const jsonl_path = try resolveReadJsonlPathAlloc(allocator, repo_root, parsed.path, parsed.path_explicit);
+            defer allocator.free(jsonl_path);
+            try cmdRecall(
+                allocator,
+                repo_root,
+                jsonl_path,
+                parsed.query.?,
+                parsed.paths,
+                if (parsed.limit == 0) 8 else parsed.limit,
+                parsed.format,
+                parsed.drop_superseded,
+            );
+        },
+        .codify_candidates => {
+            const jsonl_path = try resolveReadJsonlPathAlloc(allocator, repo_root, parsed.path, parsed.path_explicit);
+            defer allocator.free(jsonl_path);
+            try cmdCodifyCandidates(
+                allocator,
+                repo_root,
+                jsonl_path,
+                if (parsed.limit == 0) 20 else parsed.limit,
+                parsed.min_count,
+                parsed.format,
+                parsed.drop_superseded,
+            );
+        },
+        .quality_audit => {
+            const jsonl_path = try resolveReadJsonlPathAlloc(allocator, repo_root, parsed.path, parsed.path_explicit);
+            defer allocator.free(jsonl_path);
+            try cmdQualityAudit(
+                allocator,
+                jsonl_path,
+                parsed.since,
+                parsed.until,
+                parsed.format,
+                parsed.output,
+            );
+        },
         .value_report => try cmdValueReport(
             allocator,
             repo_root,
-            jsonl_path,
+            parsed.path,
             parsed.sessions_root,
             parsed.since,
             parsed.until,
@@ -441,6 +480,9 @@ pub fn main(init: std.process.Init) !void {
             init.environ_map.get("CODEX_HOME") orelse "",
             true,
         ),
+        .migrate => std.process.exit(try cmdMigrate(allocator, repo_root, parsed)),
+        .doctor => try cmdDoctor(allocator, repo_root),
+        .path => try cmdPath(allocator, repo_root, parsed.path, parsed.path_explicit),
     }
 }
 
@@ -497,6 +539,18 @@ fn parseArgs(argv: []const []const u8) !Args {
         }
         if (std.mem.eql(u8, arg, "memory-digest")) {
             args.command = .memory_digest;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "migrate")) {
+            args.command = .migrate;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "doctor")) {
+            args.command = .doctor;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "path")) {
+            args.command = .path;
             continue;
         }
 
@@ -680,6 +734,47 @@ fn parseArgs(argv: []const []const u8) !Args {
                 }
                 return error.InvalidMemoryDigestArg;
             },
+            .migrate => {
+                if (std.mem.eql(u8, arg, "--from")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingFromValue;
+                    args.migrate_from = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--to")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingToValue;
+                    args.migrate_to = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--mode")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingModeValue;
+                    if (std.mem.eql(u8, argv[i], "copy")) {
+                        args.migrate_mode = .copy;
+                    } else if (std.mem.eql(u8, argv[i], "move")) {
+                        args.migrate_mode = .move;
+                    } else {
+                        return error.InvalidMigrationMode;
+                    }
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--dry-run")) {
+                    args.dry_run = true;
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--allow-existing-target")) {
+                    args.allow_existing_target = true;
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--remove-legacy")) {
+                    args.remove_legacy = true;
+                    continue;
+                }
+                return error.InvalidMigrateArg;
+            },
+            .doctor => return error.InvalidDoctorArg,
+            .path => return error.InvalidPathArg,
             .datasets => return error.InvalidDatasetsArg,
         }
     }
@@ -746,6 +841,18 @@ fn printParseError(err: anyerror, argv: []const []const u8) noreturn {
         error.MissingScanRootValue => {
             stderr.print("error: argument --scan-root: expected one argument\n", .{}) catch {};
         },
+        error.MissingFromValue => {
+            stderr.print("error: argument --from: expected one argument\n", .{}) catch {};
+        },
+        error.MissingToValue => {
+            stderr.print("error: argument --to: expected one argument\n", .{}) catch {};
+        },
+        error.MissingModeValue => {
+            stderr.print("error: argument --mode: expected one argument\n", .{}) catch {};
+        },
+        error.InvalidMigrationMode => {
+            stderr.print("error: argument --mode: expected copy or move\n", .{}) catch {};
+        },
         error.InvalidPositiveInt => {
             stderr.print("error: expected non-negative integer\n", .{}) catch {};
         },
@@ -758,6 +865,9 @@ fn printParseError(err: anyerror, argv: []const []const u8) noreturn {
         error.InvalidQualityAuditArg,
         error.InvalidValueReportArg,
         error.InvalidMemoryDigestArg,
+        error.InvalidMigrateArg,
+        error.InvalidDoctorArg,
+        error.InvalidPathArg,
         error.ConflictingPathValue,
         => {
             stderr.print("error: invalid arguments\n", .{}) catch {};
@@ -791,6 +901,322 @@ fn cmdAppend(
         const stderr = &stderr_writer.interface;
         try stderr.print("memory-digest warning: {s}\n", .{@errorName(err)});
     };
+}
+
+const JsonlStats = struct {
+    records: usize = 0,
+    blank_lines: usize = 0,
+    sha256: []u8,
+    ids: std.StringHashMap([]u8),
+
+    fn deinit(self: *JsonlStats, allocator: std.mem.Allocator) void {
+        allocator.free(self.sha256);
+        var it = self.ids.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        self.ids.deinit();
+    }
+};
+
+fn cmdMigrate(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !u8 {
+    const from_path = try resolveJsonlPathAlloc(allocator, repo_root, args.migrate_from);
+    defer allocator.free(from_path);
+    const to_path = try resolveJsonlPathAlloc(allocator, repo_root, args.migrate_to);
+    defer allocator.free(to_path);
+
+    const source_bytes = durable_store.readRegularFileNoSymlink(allocator, from_path, MaxLearningsBytes) catch |err| {
+        try printMigrationFailure(allocator, from_path, to_path, "source_unreadable", @errorName(err));
+        return 1;
+    };
+    defer allocator.free(source_bytes);
+
+    var source_stats = validateJsonlBytes(allocator, source_bytes) catch |err| {
+        try printMigrationFailure(allocator, from_path, to_path, "invalid_source_jsonl", @errorName(err));
+        return 1;
+    };
+    defer source_stats.deinit(allocator);
+
+    if (args.dry_run) {
+        try printMigrationResult(allocator, .{
+            .status = "would_migrate",
+            .from = from_path,
+            .to = to_path,
+            .mode = migrationModeText(args.migrate_mode),
+            .records = source_stats.records,
+            .blank_lines = source_stats.blank_lines,
+            .source_sha256 = source_stats.sha256,
+            .target_sha256 = source_stats.sha256,
+            .legacy_left_in_place = true,
+        });
+        return 0;
+    }
+
+    if (durable_store.fileExists(to_path)) {
+        const target_bytes = durable_store.readRegularFileNoSymlink(allocator, to_path, MaxLearningsBytes) catch |err| {
+            try printMigrationFailure(allocator, from_path, to_path, "target_unreadable", @errorName(err));
+            return 1;
+        };
+        defer allocator.free(target_bytes);
+
+        var target_stats = validateJsonlBytes(allocator, target_bytes) catch |err| {
+            try printMigrationFailure(allocator, from_path, to_path, "invalid_target_jsonl", @errorName(err));
+            return 1;
+        };
+        defer target_stats.deinit(allocator);
+
+        if (std.mem.eql(u8, source_bytes, target_bytes)) {
+            try maybeRemoveLegacy(args, from_path);
+            try printMigrationResult(allocator, .{
+                .status = "already_migrated",
+                .from = from_path,
+                .to = to_path,
+                .mode = migrationModeText(args.migrate_mode),
+                .records = source_stats.records,
+                .blank_lines = source_stats.blank_lines,
+                .source_sha256 = source_stats.sha256,
+                .target_sha256 = target_stats.sha256,
+                .legacy_left_in_place = !args.remove_legacy and args.migrate_mode == .copy,
+            });
+            return 0;
+        }
+
+        if (!args.allow_existing_target) {
+            try printMigrationFailure(allocator, from_path, to_path, "target_exists_with_different_bytes", "use --allow-existing-target for safe merge");
+            return 1;
+        }
+
+        const merged = mergeJsonlBytesByIdAlloc(allocator, target_bytes, &target_stats, source_bytes, &source_stats) catch |err| {
+            try printMigrationFailure(allocator, from_path, to_path, "target_exists_with_conflicting_rows", @errorName(err));
+            return 1;
+        };
+        defer allocator.free(merged);
+
+        try durable_store.writeTextAtomic(allocator, to_path, merged);
+        const target_sha = try sha256HexAlloc(allocator, merged);
+        defer allocator.free(target_sha);
+        try maybeRemoveLegacy(args, from_path);
+        try printMigrationResult(allocator, .{
+            .status = "merged",
+            .from = from_path,
+            .to = to_path,
+            .mode = migrationModeText(args.migrate_mode),
+            .records = source_stats.records,
+            .blank_lines = source_stats.blank_lines,
+            .source_sha256 = source_stats.sha256,
+            .target_sha256 = target_sha,
+            .legacy_left_in_place = !args.remove_legacy and args.migrate_mode == .copy,
+        });
+        return 0;
+    }
+
+    try durable_store.writeTextCreateNew(allocator, to_path, source_bytes, .{ .reject_symlinks = true });
+    var target_stats = validateJsonlBytes(allocator, source_bytes) catch unreachable;
+    defer target_stats.deinit(allocator);
+    try maybeRemoveLegacy(args, from_path);
+    try printMigrationResult(allocator, .{
+        .status = "migrated",
+        .from = from_path,
+        .to = to_path,
+        .mode = migrationModeText(args.migrate_mode),
+        .records = source_stats.records,
+        .blank_lines = source_stats.blank_lines,
+        .source_sha256 = source_stats.sha256,
+        .target_sha256 = target_stats.sha256,
+        .legacy_left_in_place = !args.remove_legacy and args.migrate_mode == .copy,
+    });
+    return 0;
+}
+
+fn cmdDoctor(allocator: std.mem.Allocator, repo_root: []const u8) !void {
+    const next_path = try resolveJsonlPathAlloc(allocator, repo_root, DefaultLearningsPath);
+    defer allocator.free(next_path);
+    const legacy_path = try resolveJsonlPathAlloc(allocator, repo_root, LegacyLearningsPath);
+    defer allocator.free(legacy_path);
+    const next_exists = durable_store.fileExists(next_path);
+    const legacy_exists = durable_store.fileExists(legacy_path);
+    const status =
+        if (next_exists) "migrated" else if (legacy_exists) "legacy-only" else "missing";
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"command\":\"doctor\",\"status\":");
+    try writeJsonString(stdout, status);
+    try stdout.writeAll(",\"default_path\":");
+    try writeJsonString(stdout, DefaultLearningsPath);
+    try stdout.print(",\"default_exists\":{s},\"legacy_exists\":{s}}}\n", .{
+        if (next_exists) "true" else "false",
+        if (legacy_exists) "true" else "false",
+    });
+}
+
+fn cmdPath(allocator: std.mem.Allocator, repo_root: []const u8, raw_path: []const u8, path_explicit: bool) !void {
+    const resolved = try resolveReadJsonlPathAlloc(allocator, repo_root, raw_path, path_explicit);
+    defer allocator.free(resolved);
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    try stdout_writer.interface.print("{s}\n", .{resolved});
+}
+
+const MigrationPrint = struct {
+    status: []const u8,
+    from: []const u8,
+    to: []const u8,
+    mode: []const u8,
+    records: usize,
+    blank_lines: usize,
+    source_sha256: []const u8,
+    target_sha256: []const u8,
+    legacy_left_in_place: bool,
+};
+
+fn printMigrationResult(allocator: std.mem.Allocator, result: MigrationPrint) !void {
+    _ = allocator;
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"command\":\"migrate\",\"status\":");
+    try writeJsonString(stdout, result.status);
+    try stdout.writeAll(",\"from\":");
+    try writeJsonString(stdout, result.from);
+    try stdout.writeAll(",\"to\":");
+    try writeJsonString(stdout, result.to);
+    try stdout.writeAll(",\"mode\":");
+    try writeJsonString(stdout, result.mode);
+    try stdout.print(",\"records\":{d},\"blank_lines\":{d},\"source_sha256\":", .{ result.records, result.blank_lines });
+    try writeJsonString(stdout, result.source_sha256);
+    try stdout.writeAll(",\"target_sha256\":");
+    try writeJsonString(stdout, result.target_sha256);
+    try stdout.print(",\"legacy_left_in_place\":{s}}}\n", .{if (result.legacy_left_in_place) "true" else "false"});
+}
+
+fn printMigrationFailure(allocator: std.mem.Allocator, from_path: []const u8, to_path: []const u8, reason: []const u8, detail: []const u8) !void {
+    _ = allocator;
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"command\":\"migrate\",\"status\":\"failed\",\"reason\":");
+    try writeJsonString(stdout, reason);
+    try stdout.writeAll(",\"detail\":");
+    try writeJsonString(stdout, detail);
+    try stdout.writeAll(",\"from\":");
+    try writeJsonString(stdout, from_path);
+    try stdout.writeAll(",\"to\":");
+    try writeJsonString(stdout, to_path);
+    try stdout.writeAll("}\n");
+}
+
+fn migrationModeText(mode: MigrationMode) []const u8 {
+    return switch (mode) {
+        .copy => "copy",
+        .move => "move",
+    };
+}
+
+fn maybeRemoveLegacy(args: Args, from_path: []const u8) !void {
+    if (args.migrate_mode != .move and !args.remove_legacy) return;
+    try deleteFilePath(from_path);
+}
+
+fn deleteFilePath(path: []const u8) !void {
+    const parent = std.fs.path.dirname(path) orelse ".";
+    const base = std.fs.path.basename(path);
+    if (std.fs.path.isAbsolute(path)) {
+        var dir = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), parent, .{ .follow_symlinks = false });
+        defer dir.close(std.Io.Threaded.global_single_threaded.io());
+        try dir.deleteFile(std.Io.Threaded.global_single_threaded.io(), base);
+        return;
+    }
+    try std.Io.Dir.cwd().deleteFile(std.Io.Threaded.global_single_threaded.io(), path);
+}
+
+fn validateJsonlBytes(allocator: std.mem.Allocator, bytes: []const u8) !JsonlStats {
+    var stats = JsonlStats{
+        .sha256 = try sha256HexAlloc(allocator, bytes),
+        .ids = std.StringHashMap([]u8).init(allocator),
+    };
+    errdefer stats.deinit(allocator);
+
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r\n");
+        if (line.len == 0) {
+            stats.blank_lines += 1;
+            continue;
+        }
+
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return error.InvalidJsonLine;
+        defer parsed.deinit();
+        const obj = switch (parsed.value) {
+            .object => |value| value,
+            else => return error.InvalidJsonLine,
+        };
+        const id = jsonObjectString(obj, "id");
+        if (id.len == 0) return error.MissingLearningId;
+
+        const gop = try stats.ids.getOrPut(id);
+        if (gop.found_existing) return error.DuplicateLearningId;
+        gop.key_ptr.* = try allocator.dupe(u8, id);
+        gop.value_ptr.* = try allocator.dupe(u8, line);
+        stats.records += 1;
+    }
+
+    return stats;
+}
+
+fn mergeJsonlBytesByIdAlloc(
+    allocator: std.mem.Allocator,
+    target_bytes: []const u8,
+    target_stats: *JsonlStats,
+    source_bytes: []const u8,
+    source_stats: *JsonlStats,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, target_bytes);
+    if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') try out.append(allocator, '\n');
+
+    var lines = std.mem.splitScalar(u8, source_bytes, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r\n");
+        if (line.len == 0) continue;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return error.InvalidJsonLine;
+        defer parsed.deinit();
+        const obj = switch (parsed.value) {
+            .object => |value| value,
+            else => return error.InvalidJsonLine,
+        };
+        const id = jsonObjectString(obj, "id");
+        if (target_stats.ids.get(id)) |existing_line| {
+            if (!std.mem.eql(u8, existing_line, source_stats.ids.get(id).?)) return error.ConflictingLearningId;
+            continue;
+        }
+        try out.appendSlice(allocator, raw_line);
+        try out.append(allocator, '\n');
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn sha256HexAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return allocator.dupe(u8, hex[0..]);
+}
+
+fn writeJsonString(writer: anytype, text: []const u8) !void {
+    try writer.writeByte('"');
+    for (text) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => try writer.writeByte(c),
+        }
+    }
+    try writer.writeByte('"');
 }
 
 fn appendArgsRequestHelpOrVersion(args: []const []const u8) bool {
@@ -864,7 +1290,7 @@ fn cmdDatasets(allocator: std.mem.Allocator) !void {
         rows.deinit(allocator);
     }
 
-    try appendDatasetRow(allocator, &rows, "learnings", "Learning records from .learnings.jsonl (1 row per record)");
+    try appendDatasetRow(allocator, &rows, "learnings", "Learning records from .ledger/learnings/learnings.jsonl (1 row per record)");
     try appendDatasetRow(allocator, &rows, "learning_paths", "Exploded context.paths (1 row per record-path)");
     try appendDatasetRow(allocator, &rows, "learning_tags", "Exploded tags (1 row per record-tag)");
 
@@ -898,7 +1324,7 @@ fn cmdDatasetSchema(allocator: std.mem.Allocator, dataset: []const u8) !void {
 
     if (std.mem.eql(u8, dataset, "learnings")) {
         try stdout.print("Dataset: learnings\n", .{});
-        try stdout.print("Description: Learning records from .learnings.jsonl (1 row per record)\n", .{});
+        try stdout.print("Description: Learning records from .ledger/learnings/learnings.jsonl (1 row per record)\n", .{});
         try stdout.print("Fields:\n", .{});
         for (LearningsFields) |field| {
             try stdout.print("- {s}\n", .{field});
@@ -1752,12 +2178,18 @@ fn collectLearningFilesUnder(
     root_abs: []const u8,
     max_depth: usize,
 ) !void {
-    if (std.mem.endsWith(u8, root_abs, "/.learnings.jsonl")) {
+    if (std.mem.endsWith(u8, root_abs, "/" ++ DefaultLearningsPath) or std.mem.endsWith(u8, root_abs, "/" ++ LegacyLearningsPath)) {
         try appendUniqueLearningFile(allocator, files, seen, root_abs);
         return;
     }
 
-    const direct_learning_file = try std.fs.path.join(allocator, &.{ root_abs, ".learnings.jsonl" });
+    const direct_next_learning_file = try std.fs.path.join(allocator, &.{ root_abs, DefaultLearningsPath });
+    defer allocator.free(direct_next_learning_file);
+    if (fileExistsAbsolute(direct_next_learning_file)) {
+        try appendUniqueLearningFile(allocator, files, seen, direct_next_learning_file);
+    }
+
+    const direct_learning_file = try std.fs.path.join(allocator, &.{ root_abs, LegacyLearningsPath });
     defer allocator.free(direct_learning_file);
     if (fileExistsAbsolute(direct_learning_file)) {
         try appendUniqueLearningFile(allocator, files, seen, direct_learning_file);
@@ -1943,7 +2375,7 @@ fn renderMemoryDigestAlloc(
         \\
         \\generated_at: {s}
         \\generator: learnings memory-digest
-        \\source: .learnings.jsonl
+        \\source: .ledger/learnings/learnings.jsonl
         \\source_repo: multiple
         \\source_count: {d}
         \\source_branch_policy: preserve per-entry branch; do not globalize branch-local guidance
@@ -3880,9 +4312,36 @@ fn resolveJsonlPathAlloc(
     repo_root: []const u8,
     raw_path: []const u8,
 ) ![]u8 {
-    const effective = if (raw_path.len == 0) ".learnings.jsonl" else raw_path;
+    const effective = if (raw_path.len == 0) DefaultLearningsPath else raw_path;
     if (std.fs.path.isAbsolute(effective)) return allocator.dupe(u8, effective);
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ repo_root, effective });
+}
+
+fn resolveReadJsonlPathAlloc(
+    allocator: std.mem.Allocator,
+    repo_root: []const u8,
+    raw_path: []const u8,
+    path_explicit: bool,
+) ![]u8 {
+    if (path_explicit) return resolveJsonlPathAlloc(allocator, repo_root, raw_path);
+
+    const next_path = try resolveJsonlPathAlloc(allocator, repo_root, DefaultLearningsPath);
+    errdefer allocator.free(next_path);
+    if (durable_store.fileExists(next_path)) return next_path;
+
+    const legacy_path = try resolveJsonlPathAlloc(allocator, repo_root, LegacyLearningsPath);
+    if (durable_store.fileExists(legacy_path)) {
+        allocator.free(next_path);
+        var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        try stderr_writer.interface.print(
+            "migration-hint: reading legacy {s}; run `learnings migrate --mode copy` to create {s}\n",
+            .{ LegacyLearningsPath, DefaultLearningsPath },
+        );
+        return legacy_path;
+    }
+
+    allocator.free(legacy_path);
+    return next_path;
 }
 
 fn normalizeRepoProbePathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -4062,6 +4521,103 @@ test "parse args memory-digest" {
     try std.testing.expectEqualStrings("2026-03-01", parsed.since);
     try std.testing.expectEqual(@as(usize, 7), parsed.limit);
     try std.testing.expectEqualStrings("digest.md", parsed.output);
+}
+
+test "migrate copies legacy rows preserving byte content" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), ".ledger/learnings");
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const source_path = try std.fs.path.join(std.testing.allocator, &.{ root, LegacyLearningsPath });
+    defer std.testing.allocator.free(source_path);
+    const target_path = try std.fs.path.join(std.testing.allocator, &.{ root, DefaultLearningsPath });
+    defer std.testing.allocator.free(target_path);
+
+    const payload =
+        "{\"id\":\"lrn-1\",\"captured_at\":\"2026-06-21T00:00:00Z\",\"status\":\"do_more\",\"learning\":\"When migrating, preserve bytes.\",\"evidence\":[],\"application\":\"Verify sha.\",\"context\":{\"repo\":\"r\",\"branch\":\"main\",\"paths\":[]},\"fingerprint\":\"fp\",\"tags\":[],\"related_ids\":[]}\n";
+    try durable_store.writeTextAtomic(std.testing.allocator, source_path, payload);
+    const source_bytes = try durable_store.readRegularFileNoSymlink(std.testing.allocator, source_path, MaxLearningsBytes);
+    defer std.testing.allocator.free(source_bytes);
+    var stats = try validateJsonlBytes(std.testing.allocator, source_bytes);
+    defer stats.deinit(std.testing.allocator);
+    try durable_store.writeTextCreateNew(std.testing.allocator, target_path, source_bytes, .{ .reject_symlinks = true });
+    const copied = try durable_store.readFileAlloc(std.testing.allocator, target_path, MaxLearningsBytes);
+    defer std.testing.allocator.free(copied);
+    try std.testing.expectEqualStrings(payload, copied);
+}
+
+test "migrate refuses invalid JSONL" {
+    try std.testing.expectError(error.InvalidJsonLine, validateJsonlBytes(std.testing.allocator, "{bad json}\n"));
+}
+
+test "migrate refuses target with conflicting existing IDs" {
+    var source_stats = try validateJsonlBytes(std.testing.allocator, "{\"id\":\"lrn-1\",\"learning\":\"new\"}\n");
+    defer source_stats.deinit(std.testing.allocator);
+    var target_stats = try validateJsonlBytes(std.testing.allocator, "{\"id\":\"lrn-1\",\"learning\":\"old\"}\n");
+    defer target_stats.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.ConflictingLearningId,
+        mergeJsonlBytesByIdAlloc(
+            std.testing.allocator,
+            "{\"id\":\"lrn-1\",\"learning\":\"old\"}\n",
+            &target_stats,
+            "{\"id\":\"lrn-1\",\"learning\":\"new\"}\n",
+            &source_stats,
+        ),
+    );
+}
+
+test "migrate idempotent when target has same rows" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), ".ledger/learnings");
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const source_path = try std.fs.path.join(std.testing.allocator, &.{ root, LegacyLearningsPath });
+    defer std.testing.allocator.free(source_path);
+    const target_path = try std.fs.path.join(std.testing.allocator, &.{ root, DefaultLearningsPath });
+    defer std.testing.allocator.free(target_path);
+
+    const payload = "{\"id\":\"lrn-1\",\"learning\":\"same\"}\n";
+    try durable_store.writeTextAtomic(std.testing.allocator, source_path, payload);
+    try durable_store.writeTextAtomic(std.testing.allocator, target_path, payload);
+    const source_bytes = try durable_store.readRegularFileNoSymlink(std.testing.allocator, source_path, MaxLearningsBytes);
+    defer std.testing.allocator.free(source_bytes);
+    const target_bytes = try durable_store.readRegularFileNoSymlink(std.testing.allocator, target_path, MaxLearningsBytes);
+    defer std.testing.allocator.free(target_bytes);
+    try std.testing.expectEqualStrings(source_bytes, target_bytes);
+}
+
+test "read commands resolve new path by default" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), ".ledger/learnings");
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const target_path = try std.fs.path.join(std.testing.allocator, &.{ root, DefaultLearningsPath });
+    defer std.testing.allocator.free(target_path);
+    try durable_store.writeTextAtomic(std.testing.allocator, target_path, "{\"id\":\"lrn-1\"}\n");
+
+    const resolved = try resolveReadJsonlPathAlloc(std.testing.allocator, root, DefaultLearningsPath, false);
+    defer std.testing.allocator.free(resolved);
+    try std.testing.expectEqualStrings(target_path, resolved);
+}
+
+test "legacy read resolves compatibility path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const legacy_path = try std.fs.path.join(std.testing.allocator, &.{ root, LegacyLearningsPath });
+    defer std.testing.allocator.free(legacy_path);
+    try durable_store.writeTextAtomic(std.testing.allocator, legacy_path, "{\"id\":\"lrn-1\"}\n");
+
+    const resolved = try resolveReadJsonlPathAlloc(std.testing.allocator, root, DefaultLearningsPath, false);
+    defer std.testing.allocator.free(resolved);
+    try std.testing.expectEqualStrings(legacy_path, resolved);
 }
 
 test "default memory digest path uses Codex memories extensions root" {

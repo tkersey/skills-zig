@@ -4,7 +4,8 @@ const durable_store = @import("durable_store");
 const std = @import("std");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
-const DefaultStorePath = ".ledger/negative-ledger.jsonl";
+const LegacyStorePath = ".ledger/negative-ledger.jsonl";
+const DefaultStorePath = ".ledger/negative-ledger/events.jsonl";
 const MaxStoreBytes = 64 * 1024 * 1024;
 const MaxInputBytes = 4 * 1024 * 1024;
 
@@ -13,7 +14,7 @@ const HelpText =
     \\
     \\Durable negative-evidence ledger.
     \\
-    \\usage: ledger {init,capture,query,map,status,reopen,export,compact,handoff,show,doctor} [options]
+    \\usage: ledger {init,capture,query,map,status,reopen,export,compact,handoff,show,doctor,migrate} [options]
     \\
     \\commands:
     \\  init       Create the ledger store if missing
@@ -27,12 +28,16 @@ const HelpText =
     \\  handoff    Emit active exclusions for handoff
     \\  show       Show one NEG record by --id
     \\  doctor     Validate JSONL store integrity
+    \\  migrate    Copy or move legacy .ledger/negative-ledger.jsonl into .ledger/negative-ledger/events.jsonl
     \\
     \\options:
-    \\  --file PATH       Store path (default: .ledger/negative-ledger.jsonl)
+    \\  --file PATH       Store path (default: .ledger/negative-ledger/events.jsonl)
     \\  --json PATH|-     Capture input JSON
     \\  --id NEG-ID       Record id for show/reopen/status/export
-    \\  --to STATUS       Target status for status
+    \\  --to VALUE        Target status for status, target path for migrate
+    \\  --from PATH       Legacy store path for migrate
+    \\  --mode MODE       copy|move for migrate
+    \\  --dry-run         Report migrate outcome without writing
     \\  --reason TEXT     Reason for status
     \\  --format FORMAT   full|memory-note for export
     \\  --cluster ID      Current route cluster for map
@@ -59,11 +64,21 @@ const Command = enum {
     handoff,
     show,
     doctor,
+    migrate,
+};
+
+const MigrationMode = enum {
+    copy,
+    move,
 };
 
 const Args = struct {
     command: Command,
     file: []const u8 = DefaultStorePath,
+    migrate_from: []const u8 = LegacyStorePath,
+    migrate_to: []const u8 = DefaultStorePath,
+    migrate_mode: MigrationMode = .copy,
+    dry_run: bool = false,
     json_path: ?[]const u8 = null,
     id: ?[]const u8 = null,
     to_status: ?[]const u8 = null,
@@ -207,6 +222,29 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i >= argv.len) return error.MissingValue;
             args.file = argv[i];
+            args.migrate_to = argv[i];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--from")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.migrate_from = argv[i];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--mode")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            if (std.mem.eql(u8, argv[i], "copy")) {
+                args.migrate_mode = .copy;
+            } else if (std.mem.eql(u8, argv[i], "move")) {
+                args.migrate_mode = .move;
+            } else {
+                return error.InvalidMigrationMode;
+            }
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--dry-run")) {
+            args.dry_run = true;
             continue;
         }
         if (std.mem.eql(u8, token, "--json")) {
@@ -224,7 +262,12 @@ fn parseArgs(argv: []const []const u8) !Args {
         if (std.mem.eql(u8, token, "--to")) {
             i += 1;
             if (i >= argv.len) return error.MissingValue;
-            args.to_status = argv[i];
+            if (args.command == .migrate) {
+                args.migrate_to = argv[i];
+                args.file = argv[i];
+            } else {
+                args.to_status = argv[i];
+            }
             continue;
         }
         if (std.mem.eql(u8, token, "--reason")) {
@@ -285,6 +328,7 @@ fn run(allocator: std.mem.Allocator, args: Args) !u8 {
         .handoff => cmdHandoff(allocator, args.file),
         .show => cmdShow(allocator, args.file, args.id.?),
         .doctor => cmdDoctor(allocator, args.file),
+        .migrate => cmdMigrate(allocator, args),
     };
 }
 
@@ -606,6 +650,147 @@ fn cmdDoctor(allocator: std.mem.Allocator, path: []const u8) !u8 {
     return if (ok) 0 else 1;
 }
 
+fn cmdMigrate(allocator: std.mem.Allocator, args: Args) !u8 {
+    const source_bytes = durable_store.readRegularFileNoSymlink(allocator, args.migrate_from, MaxStoreBytes) catch |err| {
+        try printMigrationFailure(allocator, args.migrate_from, args.migrate_to, "source_unreadable", @errorName(err));
+        return 1;
+    };
+    defer allocator.free(source_bytes);
+
+    var source_loaded = loadRecordsValidated(allocator, args.migrate_from) catch |err| {
+        try printMigrationFailure(allocator, args.migrate_from, args.migrate_to, "invalid_source_jsonl", @errorName(err));
+        return 1;
+    };
+    defer source_loaded.deinit(allocator);
+    if (!source_loaded.validation.ok()) {
+        try printMigrationFailure(allocator, args.migrate_from, args.migrate_to, "invalid_source_jsonl", source_loaded.validation.first_issue orelse "validation failed");
+        return 1;
+    }
+    const source_sha = try sha256HexAlloc(allocator, source_bytes);
+    defer allocator.free(source_sha);
+
+    if (args.dry_run) {
+        try printMigrationResult(allocator, .{
+            .status = "would_migrate",
+            .from = args.migrate_from,
+            .to = args.migrate_to,
+            .mode = migrationModeText(args.migrate_mode),
+            .records = source_loaded.records.items.len,
+            .source_sha256 = source_sha,
+            .target_sha256 = source_sha,
+            .legacy_left_in_place = true,
+        });
+        return 0;
+    }
+
+    if (durable_store.fileExists(args.migrate_to)) {
+        const target_bytes = durable_store.readRegularFileNoSymlink(allocator, args.migrate_to, MaxStoreBytes) catch |err| {
+            try printMigrationFailure(allocator, args.migrate_from, args.migrate_to, "target_unreadable", @errorName(err));
+            return 1;
+        };
+        defer allocator.free(target_bytes);
+        if (!std.mem.eql(u8, source_bytes, target_bytes)) {
+            try printMigrationFailure(allocator, args.migrate_from, args.migrate_to, "target_exists_with_different_bytes", "refusing to overwrite existing target");
+            return 1;
+        }
+        try maybeRemoveLegacy(args);
+        try printMigrationResult(allocator, .{
+            .status = "already_migrated",
+            .from = args.migrate_from,
+            .to = args.migrate_to,
+            .mode = migrationModeText(args.migrate_mode),
+            .records = source_loaded.records.items.len,
+            .source_sha256 = source_sha,
+            .target_sha256 = source_sha,
+            .legacy_left_in_place = args.migrate_mode == .copy,
+        });
+        return 0;
+    }
+
+    try durable_store.writeTextCreateNew(allocator, args.migrate_to, source_bytes, .{ .reject_symlinks = true });
+    try maybeRemoveLegacy(args);
+    try printMigrationResult(allocator, .{
+        .status = "migrated",
+        .from = args.migrate_from,
+        .to = args.migrate_to,
+        .mode = migrationModeText(args.migrate_mode),
+        .records = source_loaded.records.items.len,
+        .source_sha256 = source_sha,
+        .target_sha256 = source_sha,
+        .legacy_left_in_place = args.migrate_mode == .copy,
+    });
+    return 0;
+}
+
+const MigrationPrint = struct {
+    status: []const u8,
+    from: []const u8,
+    to: []const u8,
+    mode: []const u8,
+    records: usize,
+    source_sha256: []const u8,
+    target_sha256: []const u8,
+    legacy_left_in_place: bool,
+};
+
+fn printMigrationResult(allocator: std.mem.Allocator, result: MigrationPrint) !void {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"command\":\"migrate\",\"status\":");
+    try writeJsonString(&out.writer, result.status);
+    try out.writer.writeAll(",\"from\":");
+    try writeJsonString(&out.writer, result.from);
+    try out.writer.writeAll(",\"to\":");
+    try writeJsonString(&out.writer, result.to);
+    try out.writer.writeAll(",\"mode\":");
+    try writeJsonString(&out.writer, result.mode);
+    try out.writer.print(",\"records\":{d},\"source_sha256\":", .{result.records});
+    try writeJsonString(&out.writer, result.source_sha256);
+    try out.writer.writeAll(",\"target_sha256\":");
+    try writeJsonString(&out.writer, result.target_sha256);
+    try out.writer.print(",\"legacy_left_in_place\":{s}}}\n", .{if (result.legacy_left_in_place) "true" else "false"});
+    try writeStdoutAlloc(allocator, &out);
+}
+
+fn printMigrationFailure(allocator: std.mem.Allocator, from_path: []const u8, to_path: []const u8, reason: []const u8, detail: []const u8) !void {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"command\":\"migrate\",\"status\":\"failed\",\"reason\":");
+    try writeJsonString(&out.writer, reason);
+    try out.writer.writeAll(",\"detail\":");
+    try writeJsonString(&out.writer, detail);
+    try out.writer.writeAll(",\"from\":");
+    try writeJsonString(&out.writer, from_path);
+    try out.writer.writeAll(",\"to\":");
+    try writeJsonString(&out.writer, to_path);
+    try out.writer.writeAll("}\n");
+    try writeStdoutAlloc(allocator, &out);
+}
+
+fn migrationModeText(mode: MigrationMode) []const u8 {
+    return switch (mode) {
+        .copy => "copy",
+        .move => "move",
+    };
+}
+
+fn maybeRemoveLegacy(args: Args) !void {
+    if (args.migrate_mode != .move) return;
+    try deleteFilePath(args.migrate_from);
+}
+
+fn deleteFilePath(path: []const u8) !void {
+    const parent = std.fs.path.dirname(path) orelse ".";
+    const base = std.fs.path.basename(path);
+    if (std.fs.path.isAbsolute(path)) {
+        var dir = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), parent, .{ .follow_symlinks = false });
+        defer dir.close(std.Io.Threaded.global_single_threaded.io());
+        try dir.deleteFile(std.Io.Threaded.global_single_threaded.io(), base);
+        return;
+    }
+    try std.Io.Dir.cwd().deleteFile(std.Io.Threaded.global_single_threaded.io(), path);
+}
+
 fn loadRecords(allocator: std.mem.Allocator, path: []const u8) !std.ArrayList(Record) {
     const loaded = try loadRecordsValidated(allocator, path);
     return loaded.records;
@@ -848,6 +1033,13 @@ fn projectionFingerprintAlloc(allocator: std.mem.Allocator, record: Record) ![]u
     hasher.update(record.record_json);
     var digest: [32]u8 = undefined;
     hasher.final(&digest);
+    const encoded = std.fmt.bytesToHex(digest, .lower);
+    return allocator.dupe(u8, &encoded);
+}
+
+fn sha256HexAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     const encoded = std.fmt.bytesToHex(digest, .lower);
     return allocator.dupe(u8, &encoded);
 }
@@ -1097,6 +1289,43 @@ test "capture without witness becomes need-evidence" {
     try std.testing.expectEqual(@as(usize, 1), records.items.len);
     try std.testing.expectEqualStrings("NEG-000001", records.items[0].neg_id);
     try std.testing.expectEqualStrings("need-evidence", records.items[0].status);
+}
+
+test "default store path is namespaced under .ledger/negative-ledger" {
+    const argv = [_][]const u8{ "ledger", "query" };
+    const parsed = try parseArgs(&argv);
+    try std.testing.expectEqualStrings(".ledger/negative-ledger/events.jsonl", parsed.file);
+}
+
+test "migrate parses explicit from and to paths" {
+    const argv = [_][]const u8{ "ledger", "migrate", "--from", "old.jsonl", "--to", "new.jsonl", "--mode", "move", "--dry-run" };
+    const parsed = try parseArgs(&argv);
+    try std.testing.expectEqual(Command.migrate, parsed.command);
+    try std.testing.expectEqualStrings("old.jsonl", parsed.migrate_from);
+    try std.testing.expectEqualStrings("new.jsonl", parsed.migrate_to);
+    try std.testing.expectEqual(MigrationMode.move, parsed.migrate_mode);
+    try std.testing.expect(parsed.dry_run);
+}
+
+test "migration copy preserves legacy store bytes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const source = try std.fs.path.join(std.testing.allocator, &.{ root, "negative-ledger.jsonl" });
+    defer std.testing.allocator.free(source);
+    const target = try std.fs.path.join(std.testing.allocator, &.{ root, ".ledger", "negative-ledger", "events.jsonl" });
+    defer std.testing.allocator.free(target);
+    const bytes = "{\"v\":1,\"event\":\"capture\",\"neg_id\":\"NEG-000001\",\"status\":\"active\",\"record\":{\"hypothesis\":\"h\",\"route_id\":\"route-a\",\"source_refs\":[{\"kind\":\"test\",\"ref\":\"fixture\"}]}}\n";
+    try durable_store.writeTextAtomic(std.testing.allocator, source, bytes);
+    var source_loaded = try loadRecordsValidated(std.testing.allocator, source);
+    defer source_loaded.deinit(std.testing.allocator);
+    try std.testing.expect(source_loaded.validation.ok());
+
+    try durable_store.writeTextCreateNew(std.testing.allocator, target, bytes, .{ .reject_symlinks = true });
+    const target_bytes = try durable_store.readRegularFileNoSymlink(std.testing.allocator, target, MaxStoreBytes);
+    defer std.testing.allocator.free(target_bytes);
+    try std.testing.expectEqualStrings(bytes, target_bytes);
 }
 
 test "capture with witness can become active and map blocks exact route" {
