@@ -40,6 +40,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - `cas review_session` now forwards the native approval/runtime overrides already supported by the CAS Zig client: `--exec-approval`, `--file-approval`, `--permissions-approval`, `--request-user-input-response-json`, `--elicitation-action`, `--elicitation-content-json`, `--dynamic-tool-response-json`, and `--read-only`.
 - `cas review_session start` and `cas review_session lane review` accept `--multi-agent-mode explicit-request-only|proactive` for the fresh parent `thread/start` and bootstrap `turn/start` request flow. Reused parent threads are reported as unproven because CAS cannot prove it changed inherited parent execution context.
 - JSON review-session output now includes `resolvedCodexPath`, `resolvedCodexVersion`, `compatibilityVerdict`, `selectedTransport`, `selectionReason`, `degradedFallback`, `managedServerPid`, `managedServerListenUrl`, `orphanTtlSeconds`, `requestedMultiAgentMode`, `effectiveMultiAgentMode`, `multiAgentModeSupport`, `multiAgentModeMetricEligible`, `failureCode`, `failureHint`, plus optional `fallback*` fields when `--fallback native-review` is used.
+- `cas review_session lane smoke` starts a current persistent lane and proves that the target tuple can create a first detached review attempt. Proof-sensitive callers should use persistent lane as a canonical closeout backend only after a current passing smoke exists for the repo/codex/CAS/account/target tuple; otherwise use normalized `start --wait`.
 - `cas review_session lane review` includes a compact `reviewVerdict` object for caller control flow. The full receipt remains the audit artifact. Pass `--verdict-only` to emit only `reviewVerdict` while preserving the same exit semantics.
 - Terminal review failures are now classified more precisely: `review_interrupted`, `approval_denied`, `review_failed`, `review_output_missing`, `parent_thread_not_materialized`, and `unsafe_parent_thread_state`.
 - If a websocket-backed detached review already exists and `wait` cannot reconnect to its managed transport, `--fallback native-review` now returns an explicit degraded native-review success and persists that terminal fallback in the review-session record. It is not detached-review proof.
@@ -136,6 +137,11 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
   --cwd /path/to/workspace \
   --hooks off \
   --json
+./zig-out/bin/cas review_session lane smoke \
+  --cwd /path/to/workspace \
+  --base main \
+  --json \
+  --timeout-ms 300000
 ./zig-out/bin/cas review_session lane review \
   --lane-id lane_123 \
   --base main \
