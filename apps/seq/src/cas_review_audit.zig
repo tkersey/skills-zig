@@ -9,6 +9,8 @@ fn defaultIo() std.Io {
 
 pub const projection_fields = [_][]const u8{
     "session_id",
+    "source_path",
+    "receipt_path",
     "cwd",
     "command_surface",
     "backend_class",
@@ -19,6 +21,10 @@ pub const projection_fields = [_][]const u8{
     "failure_class",
     "retryable_same_tuple_now",
     "lane_id",
+    "managed_server_pid",
+    "managed_server_listen_url",
+    "server_exit_status",
+    "stderr_log_path",
     "review_count",
     "last_review_thread_id",
     "review_thread_id",
@@ -334,23 +340,13 @@ fn appendRowsFromCommandText(
     _ = stderr;
     var cursor: usize = 0;
     while (findJsonObject(stdout, &cursor)) |json_text| {
-        var row = classifyReceiptText(allocator, json_text, .{
+        try appendRowsFromJsonText(allocator, json_text, .{
             .session_id = call.session_id,
             .cwd = call.cwd,
             .command_surface = call.command,
             .source_path = session_path,
             .default_backend_class = backendFromCommand(call.command),
-        }) catch continue;
-        errdefer row.deinit();
-        if (!rowMatchesFilters(row, params)) {
-            row.deinit();
-            continue;
-        }
-        if (try claimDedupeKey(allocator, row, session_path, call.call_id, dedupe)) {
-            try audit.rows.append(allocator, row);
-        } else {
-            row.deinit();
-        }
+        }, session_path, call.call_id, params, audit, dedupe);
     }
 }
 
@@ -368,25 +364,15 @@ fn appendRowsFromReceiptText(
     while (findJsonObject(text, &cursor)) |json_text| {
         found = true;
         receipt_index += 1;
-        var row = classifyReceiptText(allocator, json_text, .{
+        var fallback_buf: [64]u8 = undefined;
+        const fallback = std.fmt.bufPrint(fallback_buf[0..], "receipt:{d}", .{receipt_index}) catch "receipt";
+        try appendRowsFromJsonText(allocator, json_text, .{
             .session_id = "",
             .cwd = null,
             .command_surface = "receipt",
             .source_path = path,
             .default_backend_class = "cas-receipt-normalized",
-        }) catch continue;
-        errdefer row.deinit();
-        if (!rowMatchesFilters(row, params)) {
-            row.deinit();
-            continue;
-        }
-        var fallback_buf: [64]u8 = undefined;
-        const fallback = std.fmt.bufPrint(fallback_buf[0..], "receipt:{d}", .{receipt_index}) catch "receipt";
-        if (try claimDedupeKey(allocator, row, path, fallback, dedupe)) {
-            try audit.rows.append(allocator, row);
-        } else {
-            row.deinit();
-        }
+        }, path, fallback, params, audit, dedupe);
     }
     if (!found) return;
 }
@@ -398,6 +384,155 @@ const ClassifyContext = struct {
     source_path: []const u8,
     default_backend_class: []const u8,
 };
+
+fn appendRowsFromJsonText(
+    allocator: std.mem.Allocator,
+    json_text: []const u8,
+    ctx: ClassifyContext,
+    dedupe_path: []const u8,
+    dedupe_id: []const u8,
+    params: Params,
+    audit: *Audit,
+    dedupe: *std.StringHashMap(void),
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_text, .{}) catch {
+        const row = classifyReceiptText(allocator, json_text, ctx) catch return;
+        try appendRowIfMatched(allocator, row, dedupe_path, dedupe_id, params, audit, dedupe);
+        return;
+    };
+    defer parsed.deinit();
+    const root = object(parsed.value) orelse return;
+    if (isSmokeArtifactObject(root)) {
+        try appendSmokeArtifactRows(allocator, root, ctx, dedupe_path, dedupe_id, params, audit, dedupe);
+        return;
+    }
+    if (!looksLikeReceiptObject(root)) return;
+    const row = classifyReceiptObject(allocator, root, ctx) catch return;
+    try appendRowIfMatched(allocator, row, dedupe_path, dedupe_id, params, audit, dedupe);
+}
+
+fn appendRowIfMatched(
+    allocator: std.mem.Allocator,
+    row: query.Row,
+    dedupe_path: []const u8,
+    dedupe_id: []const u8,
+    params: Params,
+    audit: *Audit,
+    dedupe: *std.StringHashMap(void),
+) !void {
+    var owned_row = row;
+    errdefer owned_row.deinit();
+    if (!rowMatchesFilters(owned_row, params)) {
+        owned_row.deinit();
+        return;
+    }
+    if (try claimDedupeKey(allocator, owned_row, dedupe_path, dedupe_id, dedupe)) {
+        try audit.rows.append(allocator, owned_row);
+    } else {
+        owned_row.deinit();
+    }
+}
+
+fn isSmokeArtifactObject(root: std.json.ObjectMap) bool {
+    return optEql(nullableString(root, "suiteVersion"), "CAS-RSS-v1") or
+        optEql(nullableString(root, "promotionVersion"), "CAS-RSP-v1");
+}
+
+fn appendSmokeArtifactRows(
+    allocator: std.mem.Allocator,
+    root: std.json.ObjectMap,
+    ctx: ClassifyContext,
+    dedupe_path: []const u8,
+    dedupe_id: []const u8,
+    params: Params,
+    audit: *Audit,
+    dedupe: *std.StringHashMap(void),
+) !void {
+    const results_value = root.get("results") orelse return;
+    const results = switch (results_value) {
+        .array => |array| array.items,
+        else => return,
+    };
+    for (results, 0..) |result_value, idx| {
+        const result = object(result_value) orelse continue;
+        const row = try classifySmokeResultObject(allocator, root, result, ctx);
+        var fallback_buf: [64]u8 = undefined;
+        const run_id = nullableString(result, "runId") orelse nullableString(result, "run_id") orelse std.fmt.bufPrint(fallback_buf[0..], "result:{d}", .{idx}) catch "result";
+        const key = try std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ dedupe_path, dedupe_id, run_id });
+        defer allocator.free(key);
+        try appendRowIfMatched(allocator, row, key, key, params, audit, dedupe);
+    }
+}
+
+fn classifySmokeResultObject(
+    allocator: std.mem.Allocator,
+    root: std.json.ObjectMap,
+    result: std.json.ObjectMap,
+    ctx: ClassifyContext,
+) !query.Row {
+    const verdict = objectField(result, "reviewVerdict");
+    const failure_code = nullableStringAny(result, &.{ "failureCode", "failure_code" });
+    const review_thread_id = nullableStringAny(result, &.{ "reviewThreadId", "review_thread_id" });
+    const review_attempt_exists = boolFieldAny(result, &.{ "reviewAttemptExists", "review_attempt_exists" }) orelse (review_thread_id != null);
+    const proof_verdict_exists = boolFieldAny(result, &.{ "proofVerdictExists", "proof_verdict_exists" }) orelse false;
+    const phase = nullableStringAny(result, &.{ "reviewAttemptPhase", "review_attempt_phase" }) orelse smokeResultPhase(review_thread_id, failure_code, proof_verdict_exists);
+    const backend_class = nullableStringAny(result, &.{ "backendClass", "backend_class" }) orelse "cas-lane";
+    const verdict_status_raw = nullableStringAny(result, &.{ "reviewVerdictStatus", "review_verdict_status" }) orelse if (verdict) |v| nullableString(v, "status") else null;
+    const verdict_status = canonicalSmokeVerdictStatus(verdict_status_raw, failure_code, review_thread_id, proof_verdict_exists);
+    const record_path = nullableStringAny(result, &.{ "recordPath", "record_path", "receiptPath", "receipt_path" });
+    const event_log_path = nullableStringAny(result, &.{ "eventLogPath", "event_log_path" });
+
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    try putStringOrNull(&row, "session_id", nonEmpty(ctx.session_id));
+    try row.putStaticKey("source_path", .{ .string = ctx.source_path });
+    try putStringOrNull(&row, "receipt_path", record_path orelse if (std.mem.eql(u8, ctx.command_surface, "receipt")) ctx.source_path else null);
+    try putStringOrNull(&row, "cwd", nullableStringAny(root, &.{ "cwd", "workdir" }) orelse ctx.cwd);
+    try row.putStaticKey("command_surface", .{ .string = if (nullableString(root, "suiteVersion") != null) "lane-smoke-suite" else "lane-smoke-until-fixed" });
+    try row.putStaticKey("backend_class", .{ .string = backend_class });
+    try row.putStaticKey("review_attempt_phase", .{ .string = phase });
+    try row.putStaticKey("review_attempt_exists", .{ .bool = review_attempt_exists });
+    try row.putStaticKey("proof_verdict_exists", .{ .bool = proof_verdict_exists });
+    try putStringOrNull(&row, "failure_code", failure_code);
+    try putStringOrNull(&row, "failure_class", nullableStringAny(result, &.{ "failureClass", "failure_class" }) orelse failureClassForCode(failure_code));
+    try putBoolOrNull(&row, "retryable_same_tuple_now", boolFieldAny(result, &.{ "retryableSameTupleNow", "retryable_same_tuple_now" }));
+    try putStringOrNull(&row, "lane_id", nullableStringAny(result, &.{ "laneId", "lane_id" }));
+    try putIntOrNull(&row, "managed_server_pid", intFieldAny(result, &.{ "managedServerPid", "managed_server_pid" }));
+    try putStringOrNull(&row, "managed_server_listen_url", nullableStringAny(result, &.{ "managedServerListenUrl", "managed_server_listen_url" }));
+    try putStringOrNull(&row, "server_exit_status", nullableStringAny(result, &.{ "serverExitStatus", "server_exit_status" }));
+    try putStringOrNull(&row, "stderr_log_path", nullableStringAny(result, &.{ "stderrLogPath", "stderr_log_path" }));
+    try row.putStaticKey("review_count", .{ .int = intFieldAny(result, &.{ "reviewCount", "review_count" }) orelse 0 });
+    try putStringOrNull(&row, "last_review_thread_id", nullableStringAny(result, &.{ "lastReviewThreadId", "last_review_thread_id" }));
+    try putStringOrNull(&row, "review_thread_id", review_thread_id);
+    try putStringOrNull(&row, "review_turn_id", nullableStringAny(result, &.{ "reviewTurnId", "review_turn_id" }));
+    try putStringOrNull(&row, "base_sha", nullableStringAny(result, &.{ "baseSha", "base_sha" }));
+    try putStringOrNull(&row, "head_sha", nullableStringAny(result, &.{ "headSha", "head_sha" }));
+    try putStringOrNull(&row, "target_fingerprint", nullableStringAny(result, &.{ "targetFingerprint", "target_fingerprint" }));
+    try putStringOrNull(&row, "review_verdict_status", verdict_status);
+    try row.putStaticKey("finding_count", .{ .int = intFieldAny(result, &.{ "findingCount", "finding_count" }) orelse 0 });
+    try row.putStaticKey("account_resource_signal", .{ .bool = accountResourceSignal(result, null) });
+    try row.putStaticKey("transport_signal", .{ .bool = transportSignal(failure_code, nullableStringAny(result, &.{ "failureClass", "failure_class" })) });
+    try putStringOrNull(&row, "record_path", record_path);
+    try putStringOrNull(&row, "event_log_path", event_log_path);
+    return row;
+}
+
+fn canonicalSmokeVerdictStatus(raw: ?[]const u8, failure_code: ?[]const u8, review_thread_id: ?[]const u8, proof_verdict_exists: bool) ?[]const u8 {
+    if (raw) |status| return canonicalVerdictStatus(status, failure_code, review_thread_id);
+    if (optEql(failure_code, "wait_timed_out")) return "timeout";
+    if (proof_verdict_exists) return "incomplete";
+    return null;
+}
+
+fn smokeResultPhase(review_thread_id: ?[]const u8, failure_code: ?[]const u8, proof_verdict_exists: bool) []const u8 {
+    if (proof_verdict_exists) return "normalized_verdict";
+    if (review_thread_id != null) {
+        if (optEql(failure_code, "wait_timed_out")) return "review_waiting";
+        return "review_started";
+    }
+    if (optEql(failure_code, "pre_review_lane_transport_lost")) return "pre_review_start";
+    return "pre_lane_start";
+}
 
 fn classifyReceiptText(allocator: std.mem.Allocator, text: []const u8, ctx: ClassifyContext) !query.Row {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
@@ -415,10 +550,11 @@ fn classifyReceiptObject(allocator: std.mem.Allocator, root: std.json.ObjectMap,
     const base_sha = nullableStringAny(root, &.{ "baseSha", "base_sha" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "baseSha", "base_sha" }) else null;
     const head_sha = nullableStringAny(root, &.{ "headSha", "head_sha" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "headSha", "head_sha" }) else null;
     const target_fingerprint = nullableStringAny(root, &.{ "targetFingerprint", "target_fingerprint" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "targetFingerprint", "target_fingerprint" }) else null;
+    const stored_terminal = storedTerminalProjection(allocator, root, base_sha, head_sha, target_fingerprint);
     const review_count = intFieldAny(root, &.{ "reviewCount", "review_count" }) orelse 0;
     const last_review_thread_id = nullableStringAny(root, &.{ "lastReviewThreadId", "last_review_thread_id" });
     const last_head_sha = nullableStringAny(root, &.{ "lastHeadSha", "last_head_sha" });
-    const verdict_status = if (verdict) |v| nullableString(v, "status") else nullableString(root, "status");
+    const verdict_status_raw = if (verdict) |v| nullableString(v, "status") else reviewVerdictStatusRoot(root) orelse stored_terminal.status;
 
     const legacy_pre_review_transport =
         optEql(failure_code_raw, "lane_transport_lost") and
@@ -429,17 +565,21 @@ fn classifyReceiptObject(allocator: std.mem.Allocator, root: std.json.ObjectMap,
         verdict == null;
 
     const failure_code = if (legacy_pre_review_transport) "pre_review_lane_transport_lost" else failure_code_raw;
-    const phase = nullableStringAny(root, &.{ "reviewAttemptPhase", "review_attempt_phase" }) orelse inferPhase(root, verdict, review_thread_id, failure_code, legacy_pre_review_transport);
+    const verdict_status = canonicalVerdictStatus(verdict_status_raw, failure_code, review_thread_id);
+    const phase = nullableStringAny(root, &.{ "reviewAttemptPhase", "review_attempt_phase" }) orelse if (stored_terminal.proof) "normalized_verdict" else inferPhase(root, verdict, review_thread_id, failure_code, legacy_pre_review_transport);
     const review_attempt_exists = boolFieldAny(root, &.{ "reviewAttemptExists", "review_attempt_exists" }) orelse (review_thread_id != null);
-    const proof_verdict_exists = boolFieldAny(root, &.{ "proofVerdictExists", "proof_verdict_exists" }) orelse tupleBoundVerdict(root, verdict, base_sha, head_sha, target_fingerprint);
-    const backend_class = (if (verdict) |v| nullableStringAny(v, &.{ "backendClass", "backend_class" }) else null) orelse nullableStringAny(root, &.{ "backendClass", "backend_class" }) orelse ctx.default_backend_class;
+    const proof_verdict_exists = boolFieldAny(root, &.{ "proofVerdictExists", "proof_verdict_exists" }) orelse (stored_terminal.proof or tupleBoundVerdict(root, verdict, base_sha, head_sha, target_fingerprint));
+    const explicit_backend_class = (if (verdict) |v| nullableStringAny(v, &.{ "backendClass", "backend_class" }) else null) orelse nullableStringAny(root, &.{ "backendClass", "backend_class" });
+    const backend_class = explicit_backend_class orelse if (optEql(failure_code, "pre_review_lane_transport_lost")) "cas-lane" else storedSessionBackendClass(root, ctx.default_backend_class);
     const record_path = nullableStringAny(root, &.{ "recordPath", "record_path" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "recordPath", "record_path" }) else null;
     const event_log_path = nullableStringAny(root, &.{ "eventLogPath", "event_log_path" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "eventLogPath", "event_log_path" }) else null;
-    const finding_count = if (verdict) |v| intFieldAny(v, &.{ "findingCount", "finding_count" }) orelse 0 else intFieldAny(root, &.{ "findingCount", "finding_count" }) orelse 0;
+    const finding_count = if (verdict) |v| intFieldAny(v, &.{ "findingCount", "finding_count" }) orelse 0 else intFieldAny(root, &.{ "findingCount", "finding_count" }) orelse stored_terminal.finding_count orelse 0;
 
     var row = query.Row.init(allocator);
     errdefer row.deinit();
     try putStringOrNull(&row, "session_id", nonEmpty(ctx.session_id));
+    try row.putStaticKey("source_path", .{ .string = ctx.source_path });
+    try putStringOrNull(&row, "receipt_path", record_path orelse if (std.mem.eql(u8, ctx.command_surface, "receipt")) ctx.source_path else null);
     try putStringOrNull(&row, "cwd", nullableStringAny(root, &.{ "cwd", "workdir" }) orelse ctx.cwd);
     try row.putStaticKey("command_surface", .{ .string = ctx.command_surface });
     try row.putStaticKey("backend_class", .{ .string = backend_class });
@@ -447,9 +587,13 @@ fn classifyReceiptObject(allocator: std.mem.Allocator, root: std.json.ObjectMap,
     try row.putStaticKey("review_attempt_exists", .{ .bool = review_attempt_exists });
     try row.putStaticKey("proof_verdict_exists", .{ .bool = proof_verdict_exists });
     try putStringOrNull(&row, "failure_code", failure_code);
-    try putStringOrNull(&row, "failure_class", nullableStringAny(root, &.{ "failureClass", "failure_class" }));
+    try putStringOrNull(&row, "failure_class", nullableStringAny(root, &.{ "failureClass", "failure_class" }) orelse failureClassForCode(failure_code));
     try putBoolOrNull(&row, "retryable_same_tuple_now", boolFieldAny(root, &.{ "retryableSameTupleNow", "retryable_same_tuple_now" }));
     try putStringOrNull(&row, "lane_id", nullableStringAny(root, &.{ "laneId", "lane_id" }));
+    try putIntOrNull(&row, "managed_server_pid", intFieldAny(root, &.{ "managedServerPid", "managed_server_pid" }));
+    try putStringOrNull(&row, "managed_server_listen_url", nullableStringAny(root, &.{ "managedServerListenUrl", "managed_server_listen_url" }));
+    try putStringOrNull(&row, "server_exit_status", nullableStringAny(root, &.{ "serverExitStatus", "server_exit_status" }));
+    try putStringOrNull(&row, "stderr_log_path", nullableStringAny(root, &.{ "stderrLogPath", "stderr_log_path", "managedServerStderrLogPath", "managed_server_stderr_log_path" }));
     try row.putStaticKey("review_count", .{ .int = review_count });
     try putStringOrNull(&row, "last_review_thread_id", last_review_thread_id);
     try putStringOrNull(&row, "review_thread_id", review_thread_id);
@@ -548,6 +692,69 @@ fn tupleBoundVerdict(root: std.json.ObjectMap, verdict: ?std.json.ObjectMap, bas
         optEql(nullableStringAny(v, &.{ "targetFingerprint", "target_fingerprint" }), fingerprint.?);
 }
 
+fn reviewVerdictStatusRoot(root: std.json.ObjectMap) ?[]const u8 {
+    const status = nullableString(root, "status") orelse return null;
+    if (isKnownReviewVerdictStatus(status)) return status;
+    return null;
+}
+
+fn isKnownReviewVerdictStatus(status: []const u8) bool {
+    return std.mem.eql(u8, status, "clean") or
+        std.mem.eql(u8, status, "findings") or
+        std.mem.eql(u8, status, "timeout") or
+        std.mem.eql(u8, status, "pre_review_transport_failure") or
+        std.mem.eql(u8, status, "review_transport_failure") or
+        std.mem.eql(u8, status, "account_resource_exhausted") or
+        std.mem.eql(u8, status, "parse_mismatch") or
+        std.mem.eql(u8, status, "review_output_missing") or
+        std.mem.eql(u8, status, "review_untrusted_source") or
+        std.mem.eql(u8, status, "incomplete") or
+        std.mem.eql(u8, status, "no_attempt") or
+        std.mem.eql(u8, status, "transport_failure");
+}
+
+const StoredTerminalProjection = struct {
+    status: ?[]const u8 = null,
+    finding_count: ?i64 = null,
+    proof: bool = false,
+};
+
+fn storedTerminalProjection(
+    allocator: std.mem.Allocator,
+    root: std.json.ObjectMap,
+    base: ?[]const u8,
+    head: ?[]const u8,
+    fingerprint: ?[]const u8,
+) StoredTerminalProjection {
+    if (!optEql(nullableString(root, "terminal_review_result_source"), "rollout_exited_review_mode")) return .{};
+    if (!terminalStatus(nullableString(root, "last_observed_status"))) return .{};
+    const result_json = nullableString(root, "terminal_review_result_json") orelse return .{};
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, result_json, .{}) catch return .{};
+    defer parsed.deinit();
+    const result = object(parsed.value) orelse return .{};
+    const finding_count: i64 = if (result.get("findings")) |value| switch (value) {
+        .array => |arr| @intCast(arr.items.len),
+        else => 0,
+    } else 0;
+
+    const tuple_bound = base != null and head != null and fingerprint != null and
+        nullableStringAny(root, &.{ "reviewThreadId", "review_thread_id" }) != null;
+    return .{
+        .status = if (finding_count > 0) "findings" else "clean",
+        .finding_count = finding_count,
+        .proof = tuple_bound,
+    };
+}
+
+fn storedSessionBackendClass(root: std.json.ObjectMap, fallback: []const u8) []const u8 {
+    if (nullableStringAny(root, &.{ "laneId", "lane_id" }) != null) return "cas-lane";
+    if (std.mem.startsWith(u8, nullableString(root, "transport_selection_reason") orelse "", "persistent_review_lane")) return "cas-lane";
+    if (optEql(nullableString(root, "terminal_fallback_transport"), "native-review")) return "cas-native-fallback";
+    if (nullableString(root, "terminal_review_result_source") != null and nullableStringAny(root, &.{ "reviewThreadId", "review_thread_id" }) != null) return "cas-start-wait";
+    return fallback;
+}
+
 fn accountResourceSignal(root: std.json.ObjectMap, verdict: ?std.json.ObjectMap) bool {
     if (optEql(nullableStringAny(root, &.{ "failureCode", "failure_code" }), "account_resource_exhausted")) return true;
     if (verdict) |v| {
@@ -575,7 +782,7 @@ fn containsAccountSignal(obj: std.json.ObjectMap) bool {
 }
 
 fn transportSignal(failure_code: ?[]const u8, failure_class: ?[]const u8) bool {
-    if (optEql(failure_class, "transport")) return true;
+    if (optEql(failure_class, "transport") or optEql(failure_class, "transport_pre_review") or optEql(failure_class, "transport_review_attempt")) return true;
     const code = failure_code orelse return false;
     return std.mem.indexOf(u8, code, "transport") != null or std.mem.indexOf(u8, code, "lane_transport") != null;
 }
@@ -648,6 +855,8 @@ fn looksLikeReceiptObject(root: std.json.ObjectMap) bool {
             optEql(status, "findings") or
             optEql(status, "timeout") or
             optEql(status, "transport_failure") or
+            optEql(status, "pre_review_transport_failure") or
+            optEql(status, "review_transport_failure") or
             optEql(status, "account_resource_exhausted") or
             optEql(status, "parse_mismatch") or
             optEql(status, "incomplete") or
@@ -795,6 +1004,33 @@ fn putBoolOrNull(row: *query.Row, key: []const u8, value: ?bool) !void {
     if (value) |v| try row.putStaticKey(key, .{ .bool = v }) else try row.putStaticKey(key, .null);
 }
 
+fn putIntOrNull(row: *query.Row, key: []const u8, value: ?i64) !void {
+    if (value) |v| try row.putStaticKey(key, .{ .int = v }) else try row.putStaticKey(key, .null);
+}
+
+fn failureClassForCode(code: ?[]const u8) ?[]const u8 {
+    const value = code orelse return null;
+    if (optEql(value, "pre_review_lane_transport_lost")) return "transport_pre_review";
+    if (optEql(value, "review_transport_lost") or optEql(value, "lane_transport_lost")) return "transport_review_attempt";
+    if (optEql(value, "account_resource_exhausted")) return "account_resource";
+    if (optEql(value, "wait_timed_out")) return "timeout";
+    if (std.mem.indexOf(u8, value, "parse") != null) return "parse";
+    if (std.mem.indexOf(u8, value, "output") != null) return "review_output";
+    return null;
+}
+
+fn canonicalVerdictStatus(status: ?[]const u8, failure_code: ?[]const u8, review_thread_id: ?[]const u8) ?[]const u8 {
+    const value = status orelse return null;
+    if (optEql(value, "no_attempt")) {
+        if (optEql(failure_code, "pre_review_lane_transport_lost")) return "pre_review_transport_failure";
+        return "incomplete";
+    }
+    if (optEql(value, "transport_failure")) {
+        return if (review_thread_id != null) "review_transport_failure" else "pre_review_transport_failure";
+    }
+    return value;
+}
+
 fn scalarString(row: query.Row, key: []const u8) ?[]const u8 {
     return switch (row.valueOrNull(key)) {
         .string => |text| text,
@@ -862,6 +1098,79 @@ test "tuple-bound review verdict proves normalized verdict" {
     try std.testing.expectEqualStrings("degraded", summary.lane_backend_status);
 }
 
+test "explicit false proof flag is preserved despite tuple fields" {
+    var row = try classifyReceiptText(std.testing.allocator,
+        \\{"reviewThreadId":"thr_started","reviewAttemptPhase":"review_started","reviewAttemptExists":true,"proofVerdictExists":false,"baseSha":"b","headSha":"h","targetFingerprint":"t"}
+    , .{
+        .session_id = "sess",
+        .cwd = "/repo",
+        .command_surface = "cas review_session lane smoke",
+        .source_path = "/tmp/no-wait-smoke.json",
+        .default_backend_class = "cas-lane",
+    });
+    defer row.deinit();
+
+    try std.testing.expectEqualStrings("review_started", scalarString(row, "review_attempt_phase").?);
+    try std.testing.expect(scalarBool(row, "review_attempt_exists"));
+    try std.testing.expect(!scalarBool(row, "proof_verdict_exists"));
+}
+
+test "lane smoke command pass status is not a review verdict" {
+    var row = try classifyReceiptText(std.testing.allocator,
+        \\{"action":"lane-smoke","status":"pass","smokeStatus":"passed","reviewThreadId":"thr_started","reviewAttemptPhase":"review_started","reviewAttemptExists":true,"proofVerdictExists":false,"baseSha":"b","headSha":"h","targetFingerprint":"t"}
+    , .{
+        .session_id = "sess",
+        .cwd = "/repo",
+        .command_surface = "cas review_session lane smoke",
+        .source_path = "/tmp/no-wait-smoke.json",
+        .default_backend_class = "cas-lane",
+    });
+    defer row.deinit();
+
+    try std.testing.expectEqualStrings("review_started", scalarString(row, "review_attempt_phase").?);
+    try std.testing.expect(scalarBool(row, "review_attempt_exists"));
+    try std.testing.expect(!scalarBool(row, "proof_verdict_exists"));
+    try std.testing.expectEqual(@as(?[]const u8, null), scalarString(row, "review_verdict_status"));
+}
+
+test "stored terminal session record projects tuple-bound clean proof" {
+    var row = try classifyReceiptText(std.testing.allocator,
+        \\{"schema_version":"CAS-RS-record-v1","last_observed_status":"completed","terminal_review_result_source":"rollout_exited_review_mode","terminal_review_result_json":"{\"findings\":[],\"overallCorrectness\":\"patch is correct\"}","review_thread_id":"thr_1","review_turn_id":"turn_1","base_sha":"b","head_sha":"h","target_fingerprint":"t","event_log_path":"/tmp/thr_1.events.ndjson"}
+    , .{
+        .session_id = "",
+        .cwd = null,
+        .command_surface = "receipt",
+        .source_path = "/tmp/thr_1.json",
+        .default_backend_class = "cas-receipt-normalized",
+    });
+    defer row.deinit();
+
+    try std.testing.expectEqualStrings("cas-start-wait", scalarString(row, "backend_class").?);
+    try std.testing.expectEqualStrings("normalized_verdict", scalarString(row, "review_attempt_phase").?);
+    try std.testing.expect(scalarBool(row, "review_attempt_exists"));
+    try std.testing.expect(scalarBool(row, "proof_verdict_exists"));
+    try std.testing.expectEqualStrings("clean", scalarString(row, "review_verdict_status").?);
+    try std.testing.expectEqual(@as(i64, 0), scalarInt(row, "finding_count"));
+}
+
+test "stored terminal lane session record preserves lane backend" {
+    var row = try classifyReceiptText(std.testing.allocator,
+        \\{"schema_version":"CAS-RS-record-v1","transport_selection_reason":"persistent_review_lane","last_observed_status":"completed","terminal_review_result_source":"rollout_exited_review_mode","terminal_review_result_json":"{\"findings\":[],\"overallCorrectness\":\"patch is correct\"}","review_thread_id":"thr_lane","review_turn_id":"turn_lane","base_sha":"b","head_sha":"h","target_fingerprint":"t","event_log_path":"/tmp/thr_lane.events.ndjson"}
+    , .{
+        .session_id = "",
+        .cwd = null,
+        .command_surface = "receipt",
+        .source_path = "/tmp/thr_lane.json",
+        .default_backend_class = "cas-receipt-normalized",
+    });
+    defer row.deinit();
+
+    try std.testing.expectEqualStrings("cas-lane", scalarString(row, "backend_class").?);
+    try std.testing.expectEqualStrings("normalized_verdict", scalarString(row, "review_attempt_phase").?);
+    try std.testing.expect(scalarBool(row, "proof_verdict_exists"));
+    try std.testing.expectEqualStrings("clean", scalarString(row, "review_verdict_status").?);
+}
+
 test "standard response item output is audited with top-level session meta" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -914,6 +1223,86 @@ test "basename receipt glob keeps handle-less receipts distinct and skips non-re
 
     try std.testing.expectEqual(@as(usize, 2), audit.rows.items.len);
     try std.testing.expectEqual(@as(i64, 2), audit.summary.pre_review_lane_transport_lost_count);
+}
+
+test "smoke suite receipt expands final-window result rows" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "suite.json", .data =
+        \\{"suiteVersion":"CAS-RSS-v1","status":"pass","cwd":"/repo","runsRequested":2,"requiredConsecutivePasses":2,"maxConsecutivePasses":2,"persistentLaneCanonical":true,"canonicalCloseoutBackend":"cas-lane","results":[
+        \\{"runId":"smoke-001","status":"pass","reviewVerdictStatus":"clean","reviewAttemptExists":true,"proofVerdictExists":true,"laneId":"lane_1","reviewThreadId":"thr_1","recordPath":"/tmp/smoke-same-tuple.json","baseSha":"b","headSha":"h","targetFingerprint":"t"},
+        \\{"runId":"smoke-002","status":"pass","reviewVerdictStatus":"clean","reviewAttemptExists":true,"proofVerdictExists":true,"laneId":"lane_2","reviewThreadId":"thr_2","recordPath":"/tmp/smoke-same-tuple.json","baseSha":"b","headSha":"h","targetFingerprint":"t"}]}
+    });
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const suite_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "suite.json" });
+    defer std.testing.allocator.free(suite_path);
+    var row_audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .receipt_paths = &.{suite_path},
+    });
+    defer row_audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), row_audit.rows.items.len);
+    try std.testing.expectEqualStrings("lane-smoke-suite", scalarString(row_audit.rows.items[0], "command_surface").?);
+    try std.testing.expectEqualStrings("cas-lane", scalarString(row_audit.rows.items[0], "backend_class").?);
+    try std.testing.expectEqualStrings("clean", scalarString(row_audit.rows.items[0], "review_verdict_status").?);
+    try std.testing.expect(scalarBool(row_audit.rows.items[0], "review_attempt_exists"));
+    try std.testing.expect(scalarBool(row_audit.rows.items[0], "proof_verdict_exists"));
+}
+
+test "smoke artifact dedupe preserves same run ids across files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const artifact =
+        \\{"suiteVersion":"CAS-RSS-v1","status":"fail","cwd":"/repo","runsRequested":1,"requiredConsecutivePasses":1,"maxConsecutivePasses":0,"persistentLaneCanonical":false,"canonicalCloseoutBackend":"cas-start-wait-normalized","results":[
+        \\{"runId":"smoke-001","status":"fail","failureCode":"pre_review_lane_transport_lost","reviewAttemptExists":false,"proofVerdictExists":false,"reviewThreadId":null}]}
+    ;
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "suite-a.json", .data = artifact });
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "suite-b.json", .data = artifact });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const suite_a_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "suite-a.json" });
+    defer std.testing.allocator.free(suite_a_path);
+    const suite_b_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "suite-b.json" });
+    defer std.testing.allocator.free(suite_b_path);
+
+    var row_audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .receipt_paths = &.{ suite_a_path, suite_b_path },
+    });
+    defer row_audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), row_audit.rows.items.len);
+    try std.testing.expectEqual(@as(i64, 2), row_audit.summary.pre_review_lane_transport_lost_count);
+}
+
+test "smoke promotion receipt projects pre-review failures" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "promotion.json", .data =
+        \\{"promotionVersion":"CAS-RSP-v1","status":"not_promoted","cwd":"/tmp/repo","roundsRun":1,"requiredConsecutivePasses":2,"observedConsecutivePasses":1,"finalBackendPolicy":{"persistentLaneCanonical":false,"canonicalCloseoutBackend":"cas-start-wait-normalized"},"results":[
+        \\{"runId":"smoke-001","status":"pass","reviewVerdictStatus":"clean","reviewAttemptExists":true,"proofVerdictExists":true,"reviewThreadId":"thr_1"},
+        \\{"runId":"smoke-002","status":"fail","failureCode":"pre_review_lane_transport_lost","reviewAttemptExists":false,"proofVerdictExists":false,"reviewThreadId":null}]}
+    });
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const promotion_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "promotion.json" });
+    defer std.testing.allocator.free(promotion_path);
+    var row_audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .receipt_paths = &.{promotion_path},
+    });
+    defer row_audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), row_audit.rows.items.len);
+    try std.testing.expectEqualStrings("lane-smoke-until-fixed", scalarString(row_audit.rows.items[1], "command_surface").?);
+    try std.testing.expectEqualStrings("/tmp/repo", scalarString(row_audit.rows.items[1], "cwd").?);
+    try std.testing.expectEqualStrings("pre_review_lane_transport_lost", scalarString(row_audit.rows.items[1], "failure_code").?);
+    try std.testing.expectEqualStrings("pre_review_start", scalarString(row_audit.rows.items[1], "review_attempt_phase").?);
+    try std.testing.expect(!scalarBool(row_audit.rows.items[1], "review_attempt_exists"));
+    try std.testing.expectEqual(@as(i64, 1), row_audit.summary.pre_review_lane_transport_lost_count);
 }
 
 test "snake-case root verdict receipts are normalized" {
