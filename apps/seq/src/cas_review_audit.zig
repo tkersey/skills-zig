@@ -561,6 +561,7 @@ fn classifyReceiptText(allocator: std.mem.Allocator, text: []const u8, ctx: Clas
 fn classifyReceiptObject(allocator: std.mem.Allocator, root: std.json.ObjectMap, ctx: ClassifyContext) !query.Row {
     const verdict = objectField(root, "reviewVerdict");
     const tuple = objectField(root, "tuple");
+    const certification = objectField(root, "certification");
     const surface = nullableString(root, "surface") orelse if (std.mem.indexOf(u8, ctx.command_surface, "receipt proof") != null) "proof" else if (std.mem.indexOf(u8, ctx.command_surface, "receipt certify") != null) "certify" else if (verdict != null) "normalize" else "runner";
     const failure_code_raw = nullableStringAny(root, &.{ "failureCode", "failure_code" });
     const review_thread_id = nullableStringAny(root, &.{ "reviewThreadId", "review_thread_id" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "reviewThreadId", "review_thread_id" }) else null;
@@ -607,11 +608,11 @@ fn classifyReceiptObject(allocator: std.mem.Allocator, root: std.json.ObjectMap,
     try row.putStaticKey("proof_verdict_exists", .{ .bool = proof_verdict_exists });
     try putBoolOrNull(&row, "certified", boolField(root, "certified"));
     try putBoolOrNull(&row, "closeout_eligible", boolField(root, "closeoutEligible"));
-    try putBoolOrNull(&row, "diagnostic_only", boolField(root, "diagnosticOnly"));
+    try putBoolOrNull(&row, "diagnostic_only", boolField(root, "diagnosticOnly") orelse if (optEql(surface, "proof")) true else null);
     try putBoolOrNull(&row, "override_used", boolField(root, "overrideUsed"));
     try putStringOrNull(&row, "override_flags", overrideFlagsSummary(root));
     try putBoolOrNull(&row, "duplicate_cached_receipt_inflation", boolField(root, "duplicateCachedReceiptInflation"));
-    try putIntOrNull(&row, "current_clean_streak", intField(root, "currentCleanStreak"));
+    try putIntOrNull(&row, "current_clean_streak", intField(root, "currentCleanStreak") orelse if (certification) |cert| intField(cert, "currentCleanStreak") else null);
     try putStringOrNull(&row, "failure_code", failure_code);
     try putStringOrNull(&row, "failure_class", nullableStringAny(root, &.{ "failureClass", "failure_class" }) orelse failureClassForCode(failure_code));
     try putBoolOrNull(&row, "retryable_same_tuple_now", boolFieldAny(root, &.{ "retryableSameTupleNow", "retryable_same_tuple_now" }));
@@ -871,7 +872,7 @@ fn looksLikeCasReviewCommand(cmd: []const u8) bool {
 
 fn looksLikeReceiptObject(root: std.json.ObjectMap) bool {
     if (nullableString(root, "surface")) |surface| {
-        if (optEql(surface, "proof") or optEql(surface, "certify") or optEql(surface, "normalize") or optEql(surface, "runner")) return true;
+        if (optEql(surface, "proof") or optEql(surface, "certify") or optEql(surface, "closeout") or optEql(surface, "normalize") or optEql(surface, "runner")) return true;
     }
     if (objectField(root, "reviewVerdict") != null) return true;
     if (nullableStringAny(root, &.{ "reviewThreadId", "review_thread_id" }) != null) return true;
@@ -1213,7 +1214,7 @@ test "stored terminal lane session record preserves lane backend" {
 
 test "diagnostic proof and certification surfaces are distinguishable" {
     var proof_row = try classifyReceiptText(std.testing.allocator,
-        \\{"schemaVersion":"cas-review-proof-v1","surface":"proof","policy":"strongest-closeout","passed":true,"closeoutEligible":false,"diagnosticOnly":true,"overrideUsed":true,"overrideFlags":["allow-reduced-principal"],"requiredCleanStreak":3,"observedCleanStreakUnderAssumptions":3,"strictCleanStreak":2,"currentCleanStreak":3,"ignoredNonProofCount":0}
+        \\{"schemaVersion":"cas-review-proof-v2","surface":"proof","passed":true,"closeoutEligible":false,"overrideUsed":true,"overrideFlags":["allow-reduced-principal"],"requiredCleanStreak":3,"observedCleanStreakUnderAssumptions":3,"strictCleanStreak":2,"currentCleanStreak":3,"ignoredNonProofCount":0}
     , .{
         .session_id = "",
         .cwd = null,
@@ -1248,6 +1249,24 @@ test "diagnostic proof and certification surfaces are distinguishable" {
     try std.testing.expect(!scalarBool(certify_row, "override_used"));
     try std.testing.expectEqual(@as(i64, 2), scalarInt(certify_row, "current_clean_streak"));
     try std.testing.expectEqualStrings("b", scalarString(certify_row, "base_sha").?);
+
+    var closeout_row = try classifyReceiptText(std.testing.allocator,
+        \\{"schemaVersion":"cas-review-closeout-v1","surface":"closeout","certified":false,"closeoutEligible":true,"dryRun":false,"tuple":{"repo":"/repo","baseSha":"b","headSha":"h","targetFingerprint":"t"},"certification":{"requiredCleanStreak":3,"currentCleanStreak":2,"strictCleanStreak":2,"attemptsConsideredCount":2},"attempts":[],"childRuns":[],"blockers":[],"nextLegalMove":"run_one_fresh_same_tuple_attempt_with_strong_principal","errors":[]}
+    , .{
+        .session_id = "",
+        .cwd = null,
+        .command_surface = "receipt",
+        .source_path = "/tmp/closeout.json",
+        .default_backend_class = "cas-receipt-normalized",
+    });
+    defer closeout_row.deinit();
+
+    try std.testing.expectEqualStrings("closeout", scalarString(closeout_row, "surface").?);
+    try std.testing.expect(!scalarBool(closeout_row, "certified"));
+    try std.testing.expect(scalarBool(closeout_row, "closeout_eligible"));
+    try std.testing.expect(!scalarBool(closeout_row, "diagnostic_only"));
+    try std.testing.expectEqual(@as(i64, 2), scalarInt(closeout_row, "current_clean_streak"));
+    try std.testing.expectEqualStrings("b", scalarString(closeout_row, "base_sha").?);
 }
 
 test "standard response item output is audited with top-level session meta" {

@@ -44,7 +44,9 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - `cas review_session lane review` includes a compact `reviewVerdict` object for caller control flow. The full receipt remains the audit artifact. Pass `--verdict-only` to emit only `reviewVerdict` while preserving the same exit semantics.
 - `cas review_session start` and `cas review_session lane review` accept `--fresh-attempt REASON` to start a new same-tuple review after a terminal or normalized receipt. This never bypasses active review locks or account/resource exhaustion locks.
 - `cas review_session receipt proof --clean-streak N` computes a diagnostic distinct-attempt clean streak from normalized receipts. Cached repeats of the same `reviewThreadId` do not increment the streak; pre-review/no-attempt transport failures are ignored. Proof output is not closeout-eligible, including when `--allow-reduced-principal REASON` is explicit.
-- `cas review_session receipt certify --policy strongest-closeout` is the non-overridable closeout surface. It requires distinct same-tuple clean attempts with strong principal proof and rejects diagnostic override flags.
+- `cas review_session closeout --cwd <repo> --base <branch>` is the canonical closeout proof surface. It discovers canonical same-tuple receipts, runs missing `start --wait --fallback none` attempts when needed, and requires three distinct strong-principal clean attempts.
+- `cas review_session closeout --dry-run` certifies existing canonical receipts without starting missing attempts.
+- `cas review_session receipt certify --cwd <repo> --base <branch>` verifies the same strongest closeout proof from canonical receipts. It does not accept caller-selected receipt paths, globs, policy selection, clean-streak weakening, or diagnostic override flags.
 - Terminal review failures are now classified more precisely: `review_interrupted`, `approval_denied`, `review_failed`, `review_output_missing`, `parent_thread_not_materialized`, and `unsafe_parent_thread_state`.
 - If a websocket-backed detached review already exists and `wait` cannot reconnect to its managed transport, `--fallback native-review` now returns an explicit degraded native-review success and persists that terminal fallback in the review-session record. It is not detached-review proof.
 - Repo-owned first-party callers should keep native fallback caller-owned: treat `start -> wait` as one detached CAS attempt, and switch to native `codex review` outside CAS after inspecting the JSON verdict when the resolved runtime is incompatible.
@@ -161,12 +163,24 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
   --fallback none \
   --json
 
-# Certify closeout from distinct tuple-bound strong-principal review attempts.
-./zig-out/bin/cas review_session receipt certify \
-  --policy strongest-closeout \
-  --glob "$HOME/.codex/cas/review_sessions/*.json" \
+# Certify closeout from canonical distinct tuple-bound strong-principal review attempts.
+./zig-out/bin/cas review_session closeout \
   --cwd /path/to/workspace \
-  --base main
+  --base main \
+  --json
+
+# Inspect the same closeout certificate without starting missing review attempts.
+./zig-out/bin/cas review_session closeout \
+  --cwd /path/to/workspace \
+  --base main \
+  --json \
+  --dry-run
+
+# Verify the same strongest closeout certificate without caller-selected receipts.
+./zig-out/bin/cas review_session receipt certify \
+  --cwd /path/to/workspace \
+  --base main \
+  --json
 
 # Auditable diagnostic escape hatch for old/reduced-principal receipts. This is not closeout.
 ./zig-out/bin/cas review_session receipt proof \
