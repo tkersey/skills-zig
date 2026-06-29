@@ -313,6 +313,8 @@ const SessionRecord = struct {
     base_sha: ?[]const u8 = null,
     head_sha: ?[]const u8 = null,
     target_fingerprint: ?[]const u8 = null,
+    accountFingerprint: ?[]const u8 = null,
+    accountFingerprintReducedProtection: bool = true,
 };
 
 const review_tuple_lock_version = "CAS-RTL-v1";
@@ -335,6 +337,15 @@ const ReviewTupleIdentity = struct {
     fn deinit(self: ReviewTupleIdentity, allocator: std.mem.Allocator) void {
         allocator.free(self.repo_realpath);
         allocator.free(self.account_fingerprint);
+    }
+};
+
+const AccountPrincipalEvidence = struct {
+    fingerprint: []const u8,
+    reduced_protection: bool,
+
+    fn deinit(self: AccountPrincipalEvidence, allocator: std.mem.Allocator) void {
+        allocator.free(self.fingerprint);
     }
 };
 
@@ -1438,6 +1449,8 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         .base_sha = identity.base_sha,
         .head_sha = identity.head_sha,
         .target_fingerprint = identity.fingerprint,
+        .accountFingerprint = review_tuple.account_fingerprint,
+        .accountFingerprintReducedProtection = review_tuple.account_fingerprint_reduced_protection,
     };
     try writeSessionRecord(allocator, record_path, record);
     updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "review_started", null, review_thread_id, review_turn_id, record_path, event_log_path);
@@ -2821,6 +2834,8 @@ fn cmdLaneSmoke(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !v
         .base_sha = identity.base_sha,
         .head_sha = identity.head_sha,
         .target_fingerprint = identity.fingerprint,
+        .accountFingerprint = review_tuple.account_fingerprint,
+        .accountFingerprintReducedProtection = review_tuple.account_fingerprint_reduced_protection,
     };
     try writeSessionRecord(allocator, record_path, record);
     updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "review_started", null, review_thread_id, review_turn_id, record_path, event_log_path);
@@ -3806,6 +3821,8 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
         .base_sha = identity.base_sha,
         .head_sha = identity.head_sha,
         .target_fingerprint = identity.fingerprint,
+        .accountFingerprint = review_tuple.account_fingerprint,
+        .accountFingerprintReducedProtection = review_tuple.account_fingerprint_reduced_protection,
     };
     try writeSessionRecord(allocator, record_path, record);
     updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "review_started", null, review_thread_id, review_turn_id, record_path, event_log_path);
@@ -5196,12 +5213,23 @@ fn repoRealpathAlloc(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 
     return allocator.dupe(u8, path_z);
 }
 
-fn accountFingerprintFromJsonAlloc(allocator: std.mem.Allocator, account_json: []const u8) ![]const u8 {
+fn hashedAccountFingerprintAlloc(allocator: std.mem.Allocator, tag: []const u8, value: []const u8) ![]const u8 {
+    const tagged = try std.fmt.allocPrint(allocator, "account.{s}:{s}", .{ tag, value });
+    defer allocator.free(tagged);
+    const digest = try sha256HexBareAlloc(allocator, tagged);
+    defer allocator.free(digest);
+    return std.fmt.allocPrint(allocator, "acct:{s}", .{digest});
+}
+
+fn accountPrincipalFromJsonAlloc(allocator: std.mem.Allocator, account_json: []const u8) !AccountPrincipalEvidence {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, account_json, .{});
     defer parsed.deinit();
     const root = switch (parsed.value) {
         .object => |obj| obj,
-        else => return allocator.dupe(u8, unknown_account_fingerprint),
+        else => return .{
+            .fingerprint = try allocator.dupe(u8, unknown_account_fingerprint),
+            .reduced_protection = true,
+        },
     };
 
     var account_obj_opt: ?std.json.ObjectMap = null;
@@ -5214,32 +5242,46 @@ fn accountFingerprintFromJsonAlloc(allocator: std.mem.Allocator, account_json: [
         for (candidates) |field| {
             if (jsonStringField(account_obj, field)) |value| {
                 if (value.len == 0) continue;
-                const tagged = try std.fmt.allocPrint(allocator, "account.{s}:{s}", .{ field, value });
-                defer allocator.free(tagged);
-                const digest = try sha256HexBareAlloc(allocator, tagged);
-                defer allocator.free(digest);
-                return std.fmt.allocPrint(allocator, "acct:{s}", .{digest});
+                return .{
+                    .fingerprint = try hashedAccountFingerprintAlloc(allocator, field, value),
+                    .reduced_protection = false,
+                };
             }
         }
         if (jsonStringField(account_obj, "type")) |account_type| {
             if (jsonStringField(account_obj, "planType")) |plan_type| {
-                const tagged = try std.fmt.allocPrint(allocator, "account.type-plan:{s}:{s}", .{ account_type, plan_type });
-                defer allocator.free(tagged);
-                const digest = try sha256HexBareAlloc(allocator, tagged);
-                defer allocator.free(digest);
-                return std.fmt.allocPrint(allocator, "acct:{s}", .{digest});
+                const combined = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ account_type, plan_type });
+                defer allocator.free(combined);
+                return .{
+                    .fingerprint = try hashedAccountFingerprintAlloc(allocator, "type-plan", combined),
+                    .reduced_protection = true,
+                };
             }
         }
     }
-    return allocator.dupe(u8, unknown_account_fingerprint);
+    return .{
+        .fingerprint = try allocator.dupe(u8, unknown_account_fingerprint),
+        .reduced_protection = true,
+    };
 }
 
-fn readAccountFingerprintAlloc(allocator: std.mem.Allocator, client: *cas.Client) ![]const u8 {
+fn accountFingerprintFromJsonAlloc(allocator: std.mem.Allocator, account_json: []const u8) ![]const u8 {
+    const principal = try accountPrincipalFromJsonAlloc(allocator, account_json);
+    return principal.fingerprint;
+}
+
+fn readAccountPrincipalAlloc(allocator: std.mem.Allocator, client: *cas.Client) !AccountPrincipalEvidence {
     const account_json = client.requestJson("account/read", "{\"refreshToken\":false}") catch {
-        return allocator.dupe(u8, unknown_account_fingerprint);
+        return .{
+            .fingerprint = try allocator.dupe(u8, unknown_account_fingerprint),
+            .reduced_protection = true,
+        };
     };
     defer allocator.free(account_json);
-    return accountFingerprintFromJsonAlloc(allocator, account_json) catch allocator.dupe(u8, unknown_account_fingerprint);
+    return accountPrincipalFromJsonAlloc(allocator, account_json) catch .{
+        .fingerprint = try allocator.dupe(u8, unknown_account_fingerprint),
+        .reduced_protection = true,
+    };
 }
 
 fn reviewTupleIdentityAlloc(
@@ -5251,7 +5293,7 @@ fn reviewTupleIdentityAlloc(
     client: *cas.Client,
 ) !ReviewTupleIdentity {
     const repo_realpath = try repoRealpathAlloc(allocator, cwd);
-    const account_fingerprint = try readAccountFingerprintAlloc(allocator, client);
+    const account_principal = try readAccountPrincipalAlloc(allocator, client);
     return .{
         .repo_realpath = repo_realpath,
         .base_sha = target_identity.base_sha,
@@ -5259,8 +5301,8 @@ fn reviewTupleIdentityAlloc(
         .target_fingerprint = target_identity.fingerprint,
         .resolved_codex_path = resolved_codex_path,
         .resolved_codex_version = resolved_codex_version,
-        .account_fingerprint = account_fingerprint,
-        .account_fingerprint_reduced_protection = std.mem.eql(u8, account_fingerprint, unknown_account_fingerprint),
+        .account_fingerprint = account_principal.fingerprint,
+        .account_fingerprint_reduced_protection = account_principal.reduced_protection,
     };
 }
 
@@ -10063,6 +10105,24 @@ test "receipt normalizer accepts strong principal metadata" {
     try std.testing.expect(normalizedReceiptCommandSucceeded(receipt));
 }
 
+test "stored session receipt with strong principal metadata satisfies strict proof" {
+    const raw =
+        \\{"schema_version":3,"cwd":"/tmp/repo","parent_thread_id":"parent","review_thread_id":"thr_stored_strong","review_turn_id":"turn_stored_strong","delivery":"detached","target":{"type":"baseBranch","branch":"main"},"event_log_path":"/tmp/events.ndjson","created_at_unix_s":1,"last_observed_status":"completed","codex_version":"0.140.0","compatibility_verdict":"compatible","transport_kind":"websocket","terminal_review_result_source":"rollout_exited_review_mode","terminal_review_result_json":"{\"findings\":[],\"overallCorrectness\":\"patch is correct\",\"overallExplanation\":\"clean\",\"overallConfidenceScore\":1}","base_sha":"base_strong","head_sha":"head_strong","target_fingerprint":"fp_strong","accountFingerprint":"acct:stable","accountFingerprintReducedProtection":false}
+    ;
+    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "stored-strong.json", raw, false, .{});
+    defer receipt.deinit(std.testing.allocator);
+    try std.testing.expect(receipt.proof_verdict_exists);
+    try std.testing.expectEqualStrings(principal_strength_strong, receipt.principal_strength);
+    try std.testing.expect(receipt.principal_proof_usable);
+    try std.testing.expect(!receipt.account_fingerprint_reduced_protection);
+
+    const receipts = [_]NormalizedReceipt{receipt};
+    const proof = try computeReceiptProof(std.testing.allocator, &receipts, 1, null);
+    try std.testing.expect(proof.satisfied);
+    try std.testing.expectEqual(@as(usize, 1), proof.attempts_considered);
+    try std.testing.expectEqual(@as(usize, 0), proof.reduced_principal_attempts);
+}
+
 test "receipt normalizer accepts compact verdict-only artifact" {
     const raw =
         \\{"status":"findings","backendClass":"cas-lane","clean":false,"findingCount":1,"failureCode":null,"failureHint":null,"reviewAttemptPhase":"normalized_verdict","baseSha":"base_2","headSha":"head_2","targetFingerprint":"fp_2","reviewThreadId":"thr_2","reviewTurnId":"turn_2","recordPath":"/tmp/record.json","eventLogPath":"/tmp/event.jsonl","findings":[{"title":"Issue","file":"/tmp/a.zig","line":12,"priority":1}]}
@@ -11491,6 +11551,25 @@ test "accountFingerprintFromJsonAlloc redacts account identifiers" {
     const unknown = try accountFingerprintFromJsonAlloc(std.testing.allocator, "{\"account\":null}");
     defer std.testing.allocator.free(unknown);
     try std.testing.expectEqualStrings(unknown_account_fingerprint, unknown);
+}
+
+test "accountPrincipalFromJsonAlloc treats type plan fallback as reduced" {
+    const stable = try accountPrincipalFromJsonAlloc(
+        std.testing.allocator,
+        "{\"account\":{\"id\":\"acct_123\",\"type\":\"chatgpt\",\"planType\":\"pro\"}}",
+    );
+    defer stable.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.startsWith(u8, stable.fingerprint, "acct:"));
+    try std.testing.expect(!stable.reduced_protection);
+
+    const fallback = try accountPrincipalFromJsonAlloc(
+        std.testing.allocator,
+        "{\"account\":{\"type\":\"chatgpt\",\"planType\":\"pro\"}}",
+    );
+    defer fallback.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.startsWith(u8, fallback.fingerprint, "acct:"));
+    try std.testing.expect(fallback.reduced_protection);
+    try std.testing.expect(!std.mem.eql(u8, stable.fingerprint, fallback.fingerprint));
 }
 
 fn testTupleIdentity(account_fingerprint: []const u8) ReviewTupleIdentity {
