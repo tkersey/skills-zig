@@ -40,15 +40,11 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - `cas review_session` now forwards the native approval/runtime overrides already supported by the CAS Zig client: `--exec-approval`, `--file-approval`, `--permissions-approval`, `--request-user-input-response-json`, `--elicitation-action`, `--elicitation-content-json`, `--dynamic-tool-response-json`, and `--read-only`.
 - `cas review_session start` and `cas review_session lane review` accept `--multi-agent-mode explicit-request-only|proactive` for the fresh parent `thread/start` and bootstrap `turn/start` request flow. Reused parent threads are reported as unproven because CAS cannot prove it changed inherited parent execution context.
 - JSON review-session output now includes `resolvedCodexPath`, `resolvedCodexVersion`, `compatibilityVerdict`, `selectedTransport`, `selectionReason`, `degradedFallback`, `managedServerPid`, `managedServerListenUrl`, `orphanTtlSeconds`, `requestedMultiAgentMode`, `effectiveMultiAgentMode`, `multiAgentModeSupport`, `multiAgentModeMetricEligible`, `failureCode`, `failureHint`, plus optional `fallback*` fields when `--fallback native-review` is used.
-- `cas review_session lane smoke` starts a current persistent lane and proves that the target tuple can create a first detached review attempt. Proof-sensitive callers should use persistent lane as a canonical closeout backend only after a current passing smoke exists for the repo/codex/CAS/account/target tuple; otherwise use normalized `start --wait`.
+- `cas review_session lane smoke` starts a current persistent lane and verifies that the target tuple can create a first detached review attempt. Callers that require multiple independent reviews must count those review attempts outside CAS.
 - `cas review_session lane review` includes a compact `reviewVerdict` object for caller control flow. The full receipt remains the audit artifact. Pass `--verdict-only` to emit only `reviewVerdict` while preserving the same exit semantics.
 - `cas review_session start` and `cas review_session lane review` accept `--fresh-attempt REASON` to start a new same-tuple review after a terminal or normalized receipt. This never bypasses active review locks or account/resource exhaustion locks.
-- `cas review_session receipt proof --clean-streak N` computes a diagnostic distinct-attempt clean streak from normalized receipts. Cached repeats of the same `reviewThreadId` do not increment the streak; pre-review/no-attempt transport failures are ignored. Proof output is not closeout-eligible, including when `--allow-reduced-principal REASON` is explicit.
-- `cas review_session closeout --cwd <repo> --base <branch>` is the canonical closeout proof surface. It discovers canonical same-tuple receipts, runs missing `start --wait --fallback none` attempts when needed, and requires three distinct strong-principal clean attempts.
-- `cas review_session closeout --dry-run` certifies existing canonical receipts without starting missing attempts.
-- `cas review_session receipt certify --cwd <repo> --base <branch>` verifies the same strongest closeout proof from canonical receipts. It does not accept caller-selected receipt paths, globs, policy selection, clean-streak weakening, or diagnostic override flags.
 - Terminal review failures are now classified more precisely: `review_interrupted`, `approval_denied`, `review_failed`, `review_output_missing`, `parent_thread_not_materialized`, and `unsafe_parent_thread_state`.
-- If a websocket-backed detached review already exists and `wait` cannot reconnect to its managed transport, `--fallback native-review` now returns an explicit degraded native-review success and persists that terminal fallback in the review-session record. It is not detached-review proof.
+- If a websocket-backed detached review already exists and `wait` cannot reconnect to its managed transport, `--fallback native-review` now returns an explicit degraded native-review success and persists that terminal fallback in the review-session record. It is not detached-review output.
 - Repo-owned first-party callers should keep native fallback caller-owned: treat `start -> wait` as one detached CAS attempt, and switch to native `codex review` outside CAS after inspecting the JSON verdict when the resolved runtime is incompatible.
 - `cas_session_inquiry` is the experimental controller for `$retrace` historical decision replay. It validates DCP-v2/RIP-v1 inputs, derives app-server compatibility from generated Codex schemas, enforces read-only/no-network/no-approval policy, persists SIR/FIR-oriented audit artifacts, and fails closed when source, permission, budget, or anchor gates are not satisfied. It never calls `thread/shellCommand`.
 - Thread-backed DCPs use `thread_fork` lineage with app-server `thread/fork` plus rollback anchoring. Rollout-backed DCPs with `source.thread_id = null` use `rollout_transcript` lineage: CAS verifies the DCP source and retained-anchor digests from `source.rollout_path`, requires `workspace_policy = transcript_only`, starts a fresh inquiry thread, and sends one bounded transcript-context `turn/start`. Rollout transcript replay is not live workspace reconstruction.
@@ -162,34 +158,6 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
   --timeout-ms 1800000 \
   --fallback none \
   --json
-
-# Certify closeout from canonical distinct tuple-bound strong-principal review attempts.
-./zig-out/bin/cas review_session closeout \
-  --cwd /path/to/workspace \
-  --base main \
-  --json
-
-# Inspect the same closeout certificate without starting missing review attempts.
-./zig-out/bin/cas review_session closeout \
-  --cwd /path/to/workspace \
-  --base main \
-  --json \
-  --dry-run
-
-# Verify the same strongest closeout certificate without caller-selected receipts.
-./zig-out/bin/cas review_session receipt certify \
-  --cwd /path/to/workspace \
-  --base main \
-  --json
-
-# Auditable diagnostic escape hatch for old/reduced-principal receipts. This is not closeout.
-./zig-out/bin/cas review_session receipt proof \
-  --glob "$HOME/.codex/cas/review_sessions/*.json" \
-  --cwd /path/to/workspace \
-  --base main \
-  --clean-streak 3 \
-  --allow-reduced-principal "operator accepted reduced account isolation"
-
 # Exploratory proactive review discovery on a fresh parent.
 ./zig-out/bin/cas review_session lane review \
   --lane-id lane_123 \

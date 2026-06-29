@@ -17,14 +17,7 @@ pub const projection_fields = [_][]const u8{
     "backend_class",
     "review_attempt_phase",
     "review_attempt_exists",
-    "proof_verdict_exists",
-    "certified",
-    "closeout_eligible",
-    "diagnostic_only",
-    "override_used",
-    "override_flags",
-    "duplicate_cached_receipt_inflation",
-    "current_clean_streak",
+    "tuple_verdict_exists",
     "failure_code",
     "failure_class",
     "retryable_same_tuple_now",
@@ -115,7 +108,7 @@ pub const Summary = struct {
     duplicate_prevented_count: i64 = 0,
     start_wait_normalized_count: i64 = 0,
     start_wait_unormalized_count: i64 = 0,
-    lane_backend_status: []const u8 = "unproven",
+    lane_backend_status: []const u8 = "unavailable",
 };
 
 const PendingCall = struct {
@@ -482,11 +475,11 @@ fn classifySmokeResultObject(
     const failure_code = nullableStringAny(result, &.{ "failureCode", "failure_code" });
     const review_thread_id = nullableStringAny(result, &.{ "reviewThreadId", "review_thread_id" });
     const review_attempt_exists = boolFieldAny(result, &.{ "reviewAttemptExists", "review_attempt_exists" }) orelse (review_thread_id != null);
-    const proof_verdict_exists = boolFieldAny(result, &.{ "proofVerdictExists", "proof_verdict_exists" }) orelse false;
-    const phase = nullableStringAny(result, &.{ "reviewAttemptPhase", "review_attempt_phase" }) orelse smokeResultPhase(review_thread_id, failure_code, proof_verdict_exists);
+    const tuple_verdict_exists = boolFieldAny(result, &.{ "tupleVerdictExists", "tuple_verdict_exists" }) orelse false;
+    const phase = nullableStringAny(result, &.{ "reviewAttemptPhase", "review_attempt_phase" }) orelse smokeResultPhase(review_thread_id, failure_code, tuple_verdict_exists);
     const backend_class = nullableStringAny(result, &.{ "backendClass", "backend_class" }) orelse "cas-lane";
     const verdict_status_raw = nullableStringAny(result, &.{ "reviewVerdictStatus", "review_verdict_status" }) orelse if (verdict) |v| nullableString(v, "status") else null;
-    const verdict_status = canonicalSmokeVerdictStatus(verdict_status_raw, failure_code, review_thread_id, proof_verdict_exists);
+    const verdict_status = canonicalSmokeVerdictStatus(verdict_status_raw, failure_code, review_thread_id, tuple_verdict_exists);
     const record_path = nullableStringAny(result, &.{ "recordPath", "record_path", "receiptPath", "receipt_path" });
     const event_log_path = nullableStringAny(result, &.{ "eventLogPath", "event_log_path" });
 
@@ -501,14 +494,7 @@ fn classifySmokeResultObject(
     try row.putStaticKey("backend_class", .{ .string = backend_class });
     try row.putStaticKey("review_attempt_phase", .{ .string = phase });
     try row.putStaticKey("review_attempt_exists", .{ .bool = review_attempt_exists });
-    try row.putStaticKey("proof_verdict_exists", .{ .bool = proof_verdict_exists });
-    try putBoolOrNull(&row, "certified", null);
-    try row.putStaticKey("closeout_eligible", .{ .bool = false });
-    try row.putStaticKey("diagnostic_only", .{ .bool = false });
-    try row.putStaticKey("override_used", .{ .bool = false });
-    try putStringOrNull(&row, "override_flags", null);
-    try row.putStaticKey("duplicate_cached_receipt_inflation", .{ .bool = false });
-    try putIntOrNull(&row, "current_clean_streak", null);
+    try row.putStaticKey("tuple_verdict_exists", .{ .bool = tuple_verdict_exists });
     try putStringOrNull(&row, "failure_code", failure_code);
     try putStringOrNull(&row, "failure_class", nullableStringAny(result, &.{ "failureClass", "failure_class" }) orelse failureClassForCode(failure_code));
     try putBoolOrNull(&row, "retryable_same_tuple_now", boolFieldAny(result, &.{ "retryableSameTupleNow", "retryable_same_tuple_now" }));
@@ -533,15 +519,15 @@ fn classifySmokeResultObject(
     return row;
 }
 
-fn canonicalSmokeVerdictStatus(raw: ?[]const u8, failure_code: ?[]const u8, review_thread_id: ?[]const u8, proof_verdict_exists: bool) ?[]const u8 {
+fn canonicalSmokeVerdictStatus(raw: ?[]const u8, failure_code: ?[]const u8, review_thread_id: ?[]const u8, tuple_verdict_exists: bool) ?[]const u8 {
     if (raw) |status| return canonicalVerdictStatus(status, failure_code, review_thread_id);
     if (optEql(failure_code, "wait_timed_out")) return "timeout";
-    if (proof_verdict_exists) return "incomplete";
+    if (tuple_verdict_exists) return "incomplete";
     return null;
 }
 
-fn smokeResultPhase(review_thread_id: ?[]const u8, failure_code: ?[]const u8, proof_verdict_exists: bool) []const u8 {
-    if (proof_verdict_exists) return "normalized_verdict";
+fn smokeResultPhase(review_thread_id: ?[]const u8, failure_code: ?[]const u8, tuple_verdict_exists: bool) []const u8 {
+    if (tuple_verdict_exists) return "normalized_verdict";
     if (review_thread_id != null) {
         if (optEql(failure_code, "wait_timed_out")) return "review_waiting";
         return "review_started";
@@ -560,15 +546,13 @@ fn classifyReceiptText(allocator: std.mem.Allocator, text: []const u8, ctx: Clas
 
 fn classifyReceiptObject(allocator: std.mem.Allocator, root: std.json.ObjectMap, ctx: ClassifyContext) !query.Row {
     const verdict = objectField(root, "reviewVerdict");
-    const tuple = objectField(root, "tuple");
-    const certification = objectField(root, "certification");
-    const surface = nullableString(root, "surface") orelse if (std.mem.indexOf(u8, ctx.command_surface, "receipt proof") != null) "proof" else if (std.mem.indexOf(u8, ctx.command_surface, "receipt certify") != null) "certify" else if (verdict != null) "normalize" else "runner";
+    const surface = nullableString(root, "surface") orelse if (verdict != null) "normalize" else "runner";
     const failure_code_raw = nullableStringAny(root, &.{ "failureCode", "failure_code" });
     const review_thread_id = nullableStringAny(root, &.{ "reviewThreadId", "review_thread_id" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "reviewThreadId", "review_thread_id" }) else null;
     const review_turn_id = nullableStringAny(root, &.{ "reviewTurnId", "review_turn_id" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "reviewTurnId", "review_turn_id" }) else null;
-    const base_sha = nullableStringAny(root, &.{ "baseSha", "base_sha" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "baseSha", "base_sha" }) else if (tuple) |t| nullableStringAny(t, &.{ "baseSha", "base_sha" }) else null;
-    const head_sha = nullableStringAny(root, &.{ "headSha", "head_sha" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "headSha", "head_sha" }) else if (tuple) |t| nullableStringAny(t, &.{ "headSha", "head_sha" }) else null;
-    const target_fingerprint = nullableStringAny(root, &.{ "targetFingerprint", "target_fingerprint" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "targetFingerprint", "target_fingerprint" }) else if (tuple) |t| nullableStringAny(t, &.{ "targetFingerprint", "target_fingerprint" }) else null;
+    const base_sha = nullableStringAny(root, &.{ "baseSha", "base_sha" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "baseSha", "base_sha" }) else null;
+    const head_sha = nullableStringAny(root, &.{ "headSha", "head_sha" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "headSha", "head_sha" }) else null;
+    const target_fingerprint = nullableStringAny(root, &.{ "targetFingerprint", "target_fingerprint" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "targetFingerprint", "target_fingerprint" }) else null;
     const stored_terminal = storedTerminalProjection(allocator, root, base_sha, head_sha, target_fingerprint);
     const review_count = intFieldAny(root, &.{ "reviewCount", "review_count" }) orelse 0;
     const last_review_thread_id = nullableStringAny(root, &.{ "lastReviewThreadId", "last_review_thread_id" });
@@ -585,9 +569,9 @@ fn classifyReceiptObject(allocator: std.mem.Allocator, root: std.json.ObjectMap,
 
     const failure_code = if (legacy_pre_review_transport) "pre_review_lane_transport_lost" else failure_code_raw;
     const verdict_status = canonicalVerdictStatus(verdict_status_raw, failure_code, review_thread_id);
-    const phase = nullableStringAny(root, &.{ "reviewAttemptPhase", "review_attempt_phase" }) orelse if (stored_terminal.proof) "normalized_verdict" else inferPhase(root, verdict, review_thread_id, failure_code, legacy_pre_review_transport);
+    const phase = nullableStringAny(root, &.{ "reviewAttemptPhase", "review_attempt_phase" }) orelse if (stored_terminal.tuple_bound) "normalized_verdict" else inferPhase(root, verdict, review_thread_id, failure_code, legacy_pre_review_transport);
     const review_attempt_exists = boolFieldAny(root, &.{ "reviewAttemptExists", "review_attempt_exists" }) orelse (review_thread_id != null);
-    const proof_verdict_exists = boolFieldAny(root, &.{ "proofVerdictExists", "proof_verdict_exists" }) orelse (stored_terminal.proof or tupleBoundVerdict(root, verdict, base_sha, head_sha, target_fingerprint));
+    const tuple_verdict_exists = boolFieldAny(root, &.{ "tupleVerdictExists", "tuple_verdict_exists" }) orelse (stored_terminal.tuple_bound or tupleBoundVerdict(root, verdict, base_sha, head_sha, target_fingerprint));
     const explicit_backend_class = (if (verdict) |v| nullableStringAny(v, &.{ "backendClass", "backend_class" }) else null) orelse nullableStringAny(root, &.{ "backendClass", "backend_class" });
     const backend_class = explicit_backend_class orelse if (optEql(failure_code, "pre_review_lane_transport_lost")) "cas-lane" else storedSessionBackendClass(root, ctx.default_backend_class);
     const record_path = nullableStringAny(root, &.{ "recordPath", "record_path" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "recordPath", "record_path" }) else null;
@@ -605,14 +589,7 @@ fn classifyReceiptObject(allocator: std.mem.Allocator, root: std.json.ObjectMap,
     try row.putStaticKey("backend_class", .{ .string = backend_class });
     try row.putStaticKey("review_attempt_phase", .{ .string = phase });
     try row.putStaticKey("review_attempt_exists", .{ .bool = review_attempt_exists });
-    try row.putStaticKey("proof_verdict_exists", .{ .bool = proof_verdict_exists });
-    try putBoolOrNull(&row, "certified", boolField(root, "certified"));
-    try putBoolOrNull(&row, "closeout_eligible", boolField(root, "closeoutEligible"));
-    try putBoolOrNull(&row, "diagnostic_only", boolField(root, "diagnosticOnly") orelse if (optEql(surface, "proof")) true else null);
-    try putBoolOrNull(&row, "override_used", boolField(root, "overrideUsed"));
-    try putStringOrNull(&row, "override_flags", overrideFlagsSummary(root));
-    try putBoolOrNull(&row, "duplicate_cached_receipt_inflation", boolField(root, "duplicateCachedReceiptInflation"));
-    try putIntOrNull(&row, "current_clean_streak", intField(root, "currentCleanStreak") orelse if (certification) |cert| intField(cert, "currentCleanStreak") else null);
+    try row.putStaticKey("tuple_verdict_exists", .{ .bool = tuple_verdict_exists });
     try putStringOrNull(&row, "failure_code", failure_code);
     try putStringOrNull(&row, "failure_class", nullableStringAny(root, &.{ "failureClass", "failure_class" }) orelse failureClassForCode(failure_code));
     try putBoolOrNull(&row, "retryable_same_tuple_now", boolFieldAny(root, &.{ "retryableSameTupleNow", "retryable_same_tuple_now" }));
@@ -639,8 +616,8 @@ fn classifyReceiptObject(allocator: std.mem.Allocator, root: std.json.ObjectMap,
 
 fn summarize(rows: []const query.Row) Summary {
     var out = Summary{ .row_count = @intCast(rows.len) };
-    var has_proof = false;
-    var has_lane_proof = false;
+    var has_tuple_verdict = false;
+    var has_lane_tuple_verdict = false;
     var has_pre_review_failure = false;
     var has_degraded = false;
 
@@ -650,7 +627,7 @@ fn summarize(rows: []const query.Row) Summary {
         const status = scalarString(row, "review_verdict_status");
         const backend = scalarString(row, "backend_class");
         const attempt_exists = scalarBool(row, "review_attempt_exists");
-        const proof_exists = scalarBool(row, "proof_verdict_exists");
+        const tuple_exists = scalarBool(row, "tuple_verdict_exists");
         const finding_count = scalarInt(row, "finding_count");
 
         if (optEql(failure_code, "pre_review_lane_transport_lost")) {
@@ -670,26 +647,26 @@ fn summarize(rows: []const query.Row) Summary {
         if ((optEql(status, "timeout") or optEql(phase, "review_waiting")) and attempt_exists) out.timeout_with_handle_count += 1;
         if (optEql(failure_code, "duplicate_prevented")) out.duplicate_prevented_count += 1;
         if (std.mem.indexOf(u8, backend orelse "", "cas-start-wait") != null or std.mem.indexOf(u8, backend orelse "", "cas-native-fallback") != null) {
-            if (proof_exists) out.start_wait_normalized_count += 1 else out.start_wait_unormalized_count += 1;
+            if (tuple_exists) out.start_wait_normalized_count += 1 else out.start_wait_unormalized_count += 1;
             has_degraded = true;
         }
-        if (proof_exists and (optEql(status, "clean") or optEql(status, "findings"))) {
-            has_proof = true;
-            if (optEql(backend, "cas-lane")) has_lane_proof = true;
+        if (tuple_exists and (optEql(status, "clean") or optEql(status, "findings"))) {
+            has_tuple_verdict = true;
+            if (optEql(backend, "cas-lane")) has_lane_tuple_verdict = true;
             if (finding_count > 0) out.completed_findings_count += 0;
         }
     }
 
-    out.lane_backend_status = if (has_degraded or (has_pre_review_failure and has_proof))
+    out.lane_backend_status = if (has_degraded or (has_pre_review_failure and has_tuple_verdict))
         "degraded"
-    else if (has_lane_proof)
-        "proven"
+    else if (has_lane_tuple_verdict)
+        "available"
     else if (has_pre_review_failure)
         "failing_pre_review"
-    else if (has_proof)
+    else if (has_tuple_verdict)
         "degraded"
     else
-        "unproven";
+        "unavailable";
     return out;
 }
 
@@ -743,7 +720,7 @@ fn isKnownReviewVerdictStatus(status: []const u8) bool {
 const StoredTerminalProjection = struct {
     status: ?[]const u8 = null,
     finding_count: ?i64 = null,
-    proof: bool = false,
+    tuple_bound: bool = false,
 };
 
 fn storedTerminalProjection(
@@ -770,7 +747,7 @@ fn storedTerminalProjection(
     return .{
         .status = if (finding_count > 0) "findings" else "clean",
         .finding_count = finding_count,
-        .proof = tuple_bound,
+        .tuple_bound = tuple_bound,
     };
 }
 
@@ -872,7 +849,7 @@ fn looksLikeCasReviewCommand(cmd: []const u8) bool {
 
 fn looksLikeReceiptObject(root: std.json.ObjectMap) bool {
     if (nullableString(root, "surface")) |surface| {
-        if (optEql(surface, "proof") or optEql(surface, "certify") or optEql(surface, "closeout") or optEql(surface, "normalize") or optEql(surface, "runner")) return true;
+        if (optEql(surface, "normalize") or optEql(surface, "runner")) return true;
     }
     if (objectField(root, "reviewVerdict") != null) return true;
     if (nullableStringAny(root, &.{ "reviewThreadId", "review_thread_id" }) != null) return true;
@@ -1118,7 +1095,7 @@ test "legacy lane transport loss is pre-review failure" {
     try std.testing.expect(!scalarBool(row, "review_attempt_exists"));
 }
 
-test "tuple-bound review verdict proves normalized verdict" {
+test "tuple-bound review verdict projects normalized verdict" {
     var row = try classifyReceiptText(std.testing.allocator,
         \\{"reviewThreadId":"thr_1","baseSha":"b","headSha":"h","targetFingerprint":"t","reviewVerdict":{"status":"clean","clean":true,"findingCount":0,"failureCode":null,"baseSha":"b","headSha":"h","targetFingerprint":"t","reviewThreadId":"thr_1","backendClass":"cas-start-wait"}}
     , .{
@@ -1132,16 +1109,16 @@ test "tuple-bound review verdict proves normalized verdict" {
 
     try std.testing.expectEqualStrings("normalized_verdict", scalarString(row, "review_attempt_phase").?);
     try std.testing.expect(scalarBool(row, "review_attempt_exists"));
-    try std.testing.expect(scalarBool(row, "proof_verdict_exists"));
+    try std.testing.expect(scalarBool(row, "tuple_verdict_exists"));
 
     const summary = summarize(&.{row});
     try std.testing.expectEqual(@as(i64, 1), summary.completed_clean_count);
     try std.testing.expectEqualStrings("degraded", summary.lane_backend_status);
 }
 
-test "explicit false proof flag is preserved despite tuple fields" {
+test "explicit false tuple verdict flag is preserved despite tuple fields" {
     var row = try classifyReceiptText(std.testing.allocator,
-        \\{"reviewThreadId":"thr_started","reviewAttemptPhase":"review_started","reviewAttemptExists":true,"proofVerdictExists":false,"baseSha":"b","headSha":"h","targetFingerprint":"t"}
+        \\{"reviewThreadId":"thr_started","reviewAttemptPhase":"review_started","reviewAttemptExists":true,"tupleVerdictExists":false,"baseSha":"b","headSha":"h","targetFingerprint":"t"}
     , .{
         .session_id = "sess",
         .cwd = "/repo",
@@ -1153,12 +1130,12 @@ test "explicit false proof flag is preserved despite tuple fields" {
 
     try std.testing.expectEqualStrings("review_started", scalarString(row, "review_attempt_phase").?);
     try std.testing.expect(scalarBool(row, "review_attempt_exists"));
-    try std.testing.expect(!scalarBool(row, "proof_verdict_exists"));
+    try std.testing.expect(!scalarBool(row, "tuple_verdict_exists"));
 }
 
 test "lane smoke command pass status is not a review verdict" {
     var row = try classifyReceiptText(std.testing.allocator,
-        \\{"action":"lane-smoke","status":"pass","smokeStatus":"passed","reviewThreadId":"thr_started","reviewAttemptPhase":"review_started","reviewAttemptExists":true,"proofVerdictExists":false,"baseSha":"b","headSha":"h","targetFingerprint":"t"}
+        \\{"action":"lane-smoke","status":"pass","smokeStatus":"passed","reviewThreadId":"thr_started","reviewAttemptPhase":"review_started","reviewAttemptExists":true,"tupleVerdictExists":false,"baseSha":"b","headSha":"h","targetFingerprint":"t"}
     , .{
         .session_id = "sess",
         .cwd = "/repo",
@@ -1170,11 +1147,11 @@ test "lane smoke command pass status is not a review verdict" {
 
     try std.testing.expectEqualStrings("review_started", scalarString(row, "review_attempt_phase").?);
     try std.testing.expect(scalarBool(row, "review_attempt_exists"));
-    try std.testing.expect(!scalarBool(row, "proof_verdict_exists"));
+    try std.testing.expect(!scalarBool(row, "tuple_verdict_exists"));
     try std.testing.expectEqual(@as(?[]const u8, null), scalarString(row, "review_verdict_status"));
 }
 
-test "stored terminal session record projects tuple-bound clean proof" {
+test "stored terminal session record projects tuple-bound clean review verdict" {
     var row = try classifyReceiptText(std.testing.allocator,
         \\{"schema_version":"CAS-RS-record-v1","last_observed_status":"completed","terminal_review_result_source":"rollout_exited_review_mode","terminal_review_result_json":"{\"findings\":[],\"overallCorrectness\":\"patch is correct\"}","review_thread_id":"thr_1","review_turn_id":"turn_1","base_sha":"b","head_sha":"h","target_fingerprint":"t","event_log_path":"/tmp/thr_1.events.ndjson"}
     , .{
@@ -1189,7 +1166,7 @@ test "stored terminal session record projects tuple-bound clean proof" {
     try std.testing.expectEqualStrings("cas-start-wait", scalarString(row, "backend_class").?);
     try std.testing.expectEqualStrings("normalized_verdict", scalarString(row, "review_attempt_phase").?);
     try std.testing.expect(scalarBool(row, "review_attempt_exists"));
-    try std.testing.expect(scalarBool(row, "proof_verdict_exists"));
+    try std.testing.expect(scalarBool(row, "tuple_verdict_exists"));
     try std.testing.expectEqualStrings("clean", scalarString(row, "review_verdict_status").?);
     try std.testing.expectEqual(@as(i64, 0), scalarInt(row, "finding_count"));
 }
@@ -1208,66 +1185,10 @@ test "stored terminal lane session record preserves lane backend" {
 
     try std.testing.expectEqualStrings("cas-lane", scalarString(row, "backend_class").?);
     try std.testing.expectEqualStrings("normalized_verdict", scalarString(row, "review_attempt_phase").?);
-    try std.testing.expect(scalarBool(row, "proof_verdict_exists"));
+    try std.testing.expect(scalarBool(row, "tuple_verdict_exists"));
     try std.testing.expectEqualStrings("clean", scalarString(row, "review_verdict_status").?);
 }
 
-test "diagnostic proof and certification surfaces are distinguishable" {
-    var proof_row = try classifyReceiptText(std.testing.allocator,
-        \\{"schemaVersion":"cas-review-proof-v2","surface":"proof","passed":true,"closeoutEligible":false,"overrideUsed":true,"overrideFlags":["allow-reduced-principal"],"requiredCleanStreak":3,"observedCleanStreakUnderAssumptions":3,"strictCleanStreak":2,"currentCleanStreak":3,"ignoredNonProofCount":0}
-    , .{
-        .session_id = "",
-        .cwd = null,
-        .command_surface = "receipt",
-        .source_path = "/tmp/proof.json",
-        .default_backend_class = "cas-receipt-normalized",
-    });
-    defer proof_row.deinit();
-
-    try std.testing.expectEqualStrings("proof", scalarString(proof_row, "surface").?);
-    try std.testing.expect(!scalarBool(proof_row, "closeout_eligible"));
-    try std.testing.expect(scalarBool(proof_row, "diagnostic_only"));
-    try std.testing.expect(scalarBool(proof_row, "override_used"));
-    try std.testing.expectEqualStrings("allow-reduced-principal", scalarString(proof_row, "override_flags").?);
-    try std.testing.expectEqual(@as(i64, 3), scalarInt(proof_row, "current_clean_streak"));
-
-    var certify_row = try classifyReceiptText(std.testing.allocator,
-        \\{"schemaVersion":"cas-review-certify-v1","surface":"certify","policy":"strongest-closeout","certified":false,"closeoutEligible":true,"overrideUsed":false,"requiredCleanStreak":3,"currentCleanStreak":2,"ignoredNonProofCount":1,"ignoredNonProofReasons":["reduced_principal"],"duplicateCachedReceiptInflation":false,"tuple":{"repo":null,"baseSha":"b","headSha":"h","targetFingerprint":"t"}}
-    , .{
-        .session_id = "",
-        .cwd = null,
-        .command_surface = "receipt",
-        .source_path = "/tmp/certify.json",
-        .default_backend_class = "cas-receipt-normalized",
-    });
-    defer certify_row.deinit();
-
-    try std.testing.expectEqualStrings("certify", scalarString(certify_row, "surface").?);
-    try std.testing.expect(!scalarBool(certify_row, "certified"));
-    try std.testing.expect(scalarBool(certify_row, "closeout_eligible"));
-    try std.testing.expect(!scalarBool(certify_row, "diagnostic_only"));
-    try std.testing.expect(!scalarBool(certify_row, "override_used"));
-    try std.testing.expectEqual(@as(i64, 2), scalarInt(certify_row, "current_clean_streak"));
-    try std.testing.expectEqualStrings("b", scalarString(certify_row, "base_sha").?);
-
-    var closeout_row = try classifyReceiptText(std.testing.allocator,
-        \\{"schemaVersion":"cas-review-closeout-v1","surface":"closeout","certified":false,"closeoutEligible":true,"dryRun":false,"tuple":{"repo":"/repo","baseSha":"b","headSha":"h","targetFingerprint":"t"},"certification":{"requiredCleanStreak":3,"currentCleanStreak":2,"strictCleanStreak":2,"attemptsConsideredCount":2},"attempts":[],"childRuns":[],"blockers":[],"nextLegalMove":"run_one_fresh_same_tuple_attempt_with_strong_principal","errors":[]}
-    , .{
-        .session_id = "",
-        .cwd = null,
-        .command_surface = "receipt",
-        .source_path = "/tmp/closeout.json",
-        .default_backend_class = "cas-receipt-normalized",
-    });
-    defer closeout_row.deinit();
-
-    try std.testing.expectEqualStrings("closeout", scalarString(closeout_row, "surface").?);
-    try std.testing.expect(!scalarBool(closeout_row, "certified"));
-    try std.testing.expect(scalarBool(closeout_row, "closeout_eligible"));
-    try std.testing.expect(!scalarBool(closeout_row, "diagnostic_only"));
-    try std.testing.expectEqual(@as(i64, 2), scalarInt(closeout_row, "current_clean_streak"));
-    try std.testing.expectEqualStrings("b", scalarString(closeout_row, "base_sha").?);
-}
 
 test "standard response item output is audited with top-level session meta" {
     var tmp = std.testing.tmpDir(.{});
@@ -1327,9 +1248,9 @@ test "smoke suite receipt expands final-window result rows" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "suite.json", .data =
-        \\{"suiteVersion":"CAS-RSS-v1","status":"pass","cwd":"/repo","runsRequested":2,"requiredConsecutivePasses":2,"maxConsecutivePasses":2,"persistentLaneCanonical":true,"canonicalCloseoutBackend":"cas-lane","results":[
-        \\{"runId":"smoke-001","status":"pass","reviewVerdictStatus":"clean","reviewAttemptExists":true,"proofVerdictExists":true,"laneId":"lane_1","reviewThreadId":"thr_1","recordPath":"/tmp/smoke-same-tuple.json","baseSha":"b","headSha":"h","targetFingerprint":"t"},
-        \\{"runId":"smoke-002","status":"pass","reviewVerdictStatus":"clean","reviewAttemptExists":true,"proofVerdictExists":true,"laneId":"lane_2","reviewThreadId":"thr_2","recordPath":"/tmp/smoke-same-tuple.json","baseSha":"b","headSha":"h","targetFingerprint":"t"}]}
+        \\{"suiteVersion":"CAS-RSS-v1","status":"pass","cwd":"/repo","runsRequested":2,"requiredConsecutivePasses":2,"maxConsecutivePasses":2,"persistentLaneCanonical":true,"canonicalReviewBackend":"cas-lane","results":[
+        \\{"runId":"smoke-001","status":"pass","reviewVerdictStatus":"clean","reviewAttemptExists":true,"tupleVerdictExists":true,"laneId":"lane_1","reviewThreadId":"thr_1","recordPath":"/tmp/smoke-same-tuple.json","baseSha":"b","headSha":"h","targetFingerprint":"t"},
+        \\{"runId":"smoke-002","status":"pass","reviewVerdictStatus":"clean","reviewAttemptExists":true,"tupleVerdictExists":true,"laneId":"lane_2","reviewThreadId":"thr_2","recordPath":"/tmp/smoke-same-tuple.json","baseSha":"b","headSha":"h","targetFingerprint":"t"}]}
     });
     const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
@@ -1346,15 +1267,15 @@ test "smoke suite receipt expands final-window result rows" {
     try std.testing.expectEqualStrings("cas-lane", scalarString(row_audit.rows.items[0], "backend_class").?);
     try std.testing.expectEqualStrings("clean", scalarString(row_audit.rows.items[0], "review_verdict_status").?);
     try std.testing.expect(scalarBool(row_audit.rows.items[0], "review_attempt_exists"));
-    try std.testing.expect(scalarBool(row_audit.rows.items[0], "proof_verdict_exists"));
+    try std.testing.expect(scalarBool(row_audit.rows.items[0], "tuple_verdict_exists"));
 }
 
 test "smoke artifact dedupe preserves same run ids across files" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const artifact =
-        \\{"suiteVersion":"CAS-RSS-v1","status":"fail","cwd":"/repo","runsRequested":1,"requiredConsecutivePasses":1,"maxConsecutivePasses":0,"persistentLaneCanonical":false,"canonicalCloseoutBackend":"cas-start-wait-normalized","results":[
-        \\{"runId":"smoke-001","status":"fail","failureCode":"pre_review_lane_transport_lost","reviewAttemptExists":false,"proofVerdictExists":false,"reviewThreadId":null}]}
+        \\{"suiteVersion":"CAS-RSS-v1","status":"fail","cwd":"/repo","runsRequested":1,"requiredConsecutivePasses":1,"maxConsecutivePasses":0,"persistentLaneCanonical":false,"canonicalReviewBackend":"cas-start-wait-normalized","results":[
+        \\{"runId":"smoke-001","status":"fail","failureCode":"pre_review_lane_transport_lost","reviewAttemptExists":false,"tupleVerdictExists":false,"reviewThreadId":null}]}
     ;
     try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "suite-a.json", .data = artifact });
     try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "suite-b.json", .data = artifact });
@@ -1380,9 +1301,9 @@ test "smoke promotion receipt projects pre-review failures" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "promotion.json", .data =
-        \\{"promotionVersion":"CAS-RSP-v1","status":"not_promoted","cwd":"/tmp/repo","roundsRun":1,"requiredConsecutivePasses":2,"observedConsecutivePasses":1,"finalBackendPolicy":{"persistentLaneCanonical":false,"canonicalCloseoutBackend":"cas-start-wait-normalized"},"results":[
-        \\{"runId":"smoke-001","status":"pass","reviewVerdictStatus":"clean","reviewAttemptExists":true,"proofVerdictExists":true,"reviewThreadId":"thr_1"},
-        \\{"runId":"smoke-002","status":"fail","failureCode":"pre_review_lane_transport_lost","reviewAttemptExists":false,"proofVerdictExists":false,"reviewThreadId":null}]}
+        \\{"promotionVersion":"CAS-RSP-v1","status":"not_promoted","cwd":"/tmp/repo","roundsRun":1,"requiredConsecutivePasses":2,"observedConsecutivePasses":1,"finalBackendPolicy":{"persistentLaneCanonical":false,"canonicalReviewBackend":"cas-start-wait-normalized"},"results":[
+        \\{"runId":"smoke-001","status":"pass","reviewVerdictStatus":"clean","reviewAttemptExists":true,"tupleVerdictExists":true,"reviewThreadId":"thr_1"},
+        \\{"runId":"smoke-002","status":"fail","failureCode":"pre_review_lane_transport_lost","reviewAttemptExists":false,"tupleVerdictExists":false,"reviewThreadId":null}]}
     });
     const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
@@ -1405,7 +1326,7 @@ test "smoke promotion receipt projects pre-review failures" {
 
 test "snake-case root verdict receipts are normalized" {
     var row = try classifyReceiptText(std.testing.allocator,
-        \\{"status":"clean","backend_class":"cas-lane","finding_count":0,"base_sha":"b","head_sha":"h","target_fingerprint":"t","review_thread_id":"thr_1","review_turn_id":"turn_1","proof_verdict_exists":true,"review_attempt_phase":"normalized_verdict"}
+        \\{"status":"clean","backend_class":"cas-lane","finding_count":0,"base_sha":"b","head_sha":"h","target_fingerprint":"t","review_thread_id":"thr_1","review_turn_id":"turn_1","tuple_verdict_exists":true,"review_attempt_phase":"normalized_verdict"}
     , .{
         .session_id = "",
         .cwd = null,
@@ -1418,11 +1339,11 @@ test "snake-case root verdict receipts are normalized" {
     try std.testing.expectEqualStrings("cas-lane", scalarString(row, "backend_class").?);
     try std.testing.expectEqualStrings("clean", scalarString(row, "review_verdict_status").?);
     try std.testing.expect(scalarBool(row, "review_attempt_exists"));
-    try std.testing.expect(scalarBool(row, "proof_verdict_exists"));
+    try std.testing.expect(scalarBool(row, "tuple_verdict_exists"));
 
     const summary = summarize(&.{row});
     try std.testing.expectEqual(@as(i64, 1), summary.completed_clean_count);
-    try std.testing.expectEqualStrings("proven", summary.lane_backend_status);
+    try std.testing.expectEqualStrings("available", summary.lane_backend_status);
 }
 
 test "repo scope matching is path-boundary safe" {
@@ -1431,7 +1352,7 @@ test "repo scope matching is path-boundary safe" {
     try std.testing.expect(!pathMatchesScope("/tmp/repo-old", "/tmp/repo"));
 }
 
-test "summary separates review transport timeout duplicate and degraded lane proof" {
+test "summary separates review transport timeout duplicate and degraded lane tuple verdict" {
     var transport_row = try classifyReceiptText(std.testing.allocator,
         \\{"reviewThreadId":"thr_transport","failureCode":"lane_transport_lost","reviewAttemptPhase":"review_terminal","baseSha":"b","headSha":"h","targetFingerprint":"t"}
     , .{
@@ -1454,7 +1375,7 @@ test "summary separates review transport timeout duplicate and degraded lane pro
     });
     defer waiting_row.deinit();
 
-    var proof_row = try classifyReceiptText(std.testing.allocator,
+    var tuple_row = try classifyReceiptText(std.testing.allocator,
         \\{"reviewThreadId":"thr_clean","baseSha":"b","headSha":"h","targetFingerprint":"t","reviewVerdict":{"status":"clean","clean":true,"findingCount":0,"failureCode":null,"baseSha":"b","headSha":"h","targetFingerprint":"t","reviewThreadId":"thr_clean","backendClass":"cas-lane"}}
     , .{
         .session_id = "sess",
@@ -1463,9 +1384,9 @@ test "summary separates review transport timeout duplicate and degraded lane pro
         .source_path = "/tmp/session.jsonl",
         .default_backend_class = "cas-lane",
     });
-    defer proof_row.deinit();
+    defer tuple_row.deinit();
 
-    const summary = summarize(&.{ transport_row, waiting_row, proof_row });
+    const summary = summarize(&.{ transport_row, waiting_row, tuple_row });
     try std.testing.expectEqual(@as(i64, 1), summary.review_attempt_transport_failure_count);
     try std.testing.expectEqual(@as(i64, 1), summary.timeout_with_handle_count);
     try std.testing.expectEqual(@as(i64, 0), summary.duplicate_prevented_count);

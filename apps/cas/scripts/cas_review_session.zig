@@ -19,7 +19,7 @@ const UsageText =
     \\Control detached Codex review sessions via the app-server.
     \\
     \\Usage:
-    \\  cas_review_session <start|status|wait|interrupt|lane|receipt|closeout> [options]
+    \\  cas_review_session <start|status|wait|interrupt|lane|receipt> [options]
     \\
     \\Actions:
     \\  start      Start a detached review session and persist its handle.
@@ -28,7 +28,6 @@ const UsageText =
     \\  interrupt  Interrupt the persisted detached review turn.
     \\  lane       Reuse one managed app-server for multiple fresh-parent reviews.
     \\  receipt    Normalize or summarize saved CAS review receipts without touching review state.
-    \\  closeout   Certify strongest closeout from canonical same-tuple CAS review receipts.
     \\
     \\Lane actions:
     \\  lane start   Start a reusable review lane.
@@ -86,13 +85,10 @@ const UsageText =
     \\Common options:
     \\  --json                           Emit machine-readable JSON.
     \\  --verdict-only                   Emit only the compact reviewVerdict JSON for lane review.
-    \\  --path FILE                      Receipt file to normalize/summarize; repeatable for receipt proof/normalize.
-    \\  --glob PATTERN                   Simple receipt glob; repeatable for receipt proof/normalize.
+    \\  --path FILE                      Receipt file to normalize/summarize; repeatable.
+    \\  --glob PATTERN                   Simple receipt glob; repeatable.
     \\  --format FORMAT                  Receipt output: table|json|jsonl (default: table).
     \\  --summary                        Include aggregate receipt counts.
-    \\  --clean-streak N                 Required consecutive clean attempts for receipt proof (default: 3).
-    \\  --allow-reduced-principal REASON Diagnostic-only receipt proof override.
-    \\  --dry-run                        For closeout, certify existing receipts without starting missing attempts.
     \\  --timeout-ms N                   Wait timeout for `wait` (default: 300000).
     \\  --poll-interval-ms N             Poll interval for `wait` (default: 250).
     \\  --help                           Show help.
@@ -112,9 +108,6 @@ const UsageText =
     \\  cas review_session lane smoke-until-fixed --cwd /path/to/repo --base main --json --cleanup
     \\  cas review_session lane review --lane-id lane_123 --base main --json
     \\  cas review_session receipt normalize --path review-1.json --format json --summary
-    \\  cas review_session receipt proof --glob 'review-*.json' --cwd /path/to/repo --base main --clean-streak 3
-    \\  cas review_session receipt certify --cwd /path/to/repo --base main --json
-    \\  cas review_session closeout --cwd /path/to/repo --base main --json
     \\  cas review_session lane stop --lane-id lane_123 --json
 ;
 
@@ -125,7 +118,6 @@ const Action = enum {
     interrupt,
     lane,
     receipt,
-    closeout,
 
     fn parse(raw: []const u8) ?Action {
         if (std.mem.eql(u8, raw, "start")) return .start;
@@ -134,7 +126,6 @@ const Action = enum {
         if (std.mem.eql(u8, raw, "interrupt")) return .interrupt;
         if (std.mem.eql(u8, raw, "lane")) return .lane;
         if (std.mem.eql(u8, raw, "receipt")) return .receipt;
-        if (std.mem.eql(u8, raw, "closeout")) return .closeout;
         return null;
     }
 };
@@ -264,12 +255,6 @@ const ParsedArgs = struct {
     receipt_globs: []const []const u8 = &.{},
     receipt_format: ReceiptFormat = .table,
     receipt_summary: bool = false,
-    receipt_proof: bool = false,
-    receipt_certify: bool = false,
-    receipt_clean_streak: u32 = 0,
-    allow_reduced_principal_reason: ?[]const u8 = null,
-    forbidden_certify_override: ?[]const u8 = null,
-    dry_run: bool = false,
     show_help: bool = false,
     show_version: bool = false,
 
@@ -346,24 +331,6 @@ const ReviewTupleIdentity = struct {
     fn deinit(self: ReviewTupleIdentity, allocator: std.mem.Allocator) void {
         allocator.free(self.repo_realpath);
         allocator.free(self.account_fingerprint);
-    }
-};
-
-const CloseoutTupleContext = struct {
-    resolved_codex_path: []const u8,
-    codex_version: []const u8,
-    managed_server: cas_websocket.ManagedServer,
-    client: cas.Client,
-    tuple: ReviewTupleIdentity,
-
-    fn deinit(self: *CloseoutTupleContext, allocator: std.mem.Allocator) void {
-        self.tuple.deinit(allocator);
-        self.client.close();
-        self.client.deinit();
-        self.managed_server.kill();
-        self.managed_server.deinit(allocator);
-        allocator.free(self.codex_version);
-        allocator.free(self.resolved_codex_path);
     }
 };
 
@@ -508,7 +475,7 @@ const LaneSmokeRunSummary = struct {
     review_verdict_status: ?[]const u8,
     finding_count: usize,
     review_attempt_exists: bool,
-    proof_verdict_exists: bool,
+    tuple_verdict_exists: bool,
     lane_id: ?[]const u8,
     review_thread_id: ?[]const u8,
     base_sha: ?[]const u8,
@@ -654,7 +621,7 @@ const TargetIdentity = struct {
     }
 };
 
-fn identityHasTupleProof(identity: TargetIdentity) bool {
+fn identityHasCompleteTuple(identity: TargetIdentity) bool {
     const base_sha = identity.base_sha orelse return false;
     if (base_sha.len == 0) return false;
     const head_sha = identity.head_sha orelse return false;
@@ -665,7 +632,7 @@ fn identityHasTupleProof(identity: TargetIdentity) bool {
 const ReviewAttemptFields = struct {
     phase: []const u8,
     review_attempt_exists: bool,
-    proof_verdict_exists: bool,
+    tuple_verdict_exists: bool,
     review_thread_id: ?[]const u8,
     review_turn_id: ?[]const u8,
     base_sha: ?[]const u8,
@@ -757,7 +724,6 @@ pub fn main(init: std.process.Init) !void {
         .interrupt => try cmdInterrupt(allocator, init.io, parsed),
         .lane => try cmdLane(allocator, init.io, parsed),
         .receipt => try cmdReceipt(allocator, init.io, parsed),
-        .closeout => try cmdCloseout(allocator, init.io, parsed),
     }
 }
 
@@ -791,16 +757,6 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
         i += 1;
     }
     if (out.action.? == .receipt and i < argv.len and std.mem.eql(u8, argv[i], "normalize")) {
-        i += 1;
-    }
-    if (out.action.? == .receipt and i < argv.len and std.mem.eql(u8, argv[i], "proof")) {
-        out.receipt_proof = true;
-        out.json = true;
-        i += 1;
-    }
-    if (out.action.? == .receipt and i < argv.len and std.mem.eql(u8, argv[i], "certify")) {
-        out.receipt_certify = true;
-        out.json = true;
         i += 1;
     }
 
@@ -845,15 +801,6 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
         }
         if (std.mem.eql(u8, arg, "--summary")) {
             out.receipt_summary = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--dry-run")) {
-            out.dry_run = true;
-            continue;
-        }
-        if (out.receipt_certify and isForbiddenCertifyOverrideFlag(arg)) {
-            out.forbidden_certify_override = arg;
-            if (certifyOverrideFlagTakesValue(arg) and i + 1 < argv.len and !std.mem.startsWith(u8, argv[i + 1], "-")) i += 1;
             continue;
         }
         if (std.mem.eql(u8, arg, "--uncommitted")) {
@@ -1002,17 +949,6 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             out.fresh_attempt_reason = value;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--clean-streak")) {
-            const parsed = try std.fmt.parseInt(i64, value, 10);
-            if (parsed <= 0) return error.InvalidCleanStreak;
-            out.receipt_clean_streak = @intCast(parsed);
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--allow-reduced-principal")) {
-            if (value.len == 0) return error.InvalidReducedPrincipalOverrideReason;
-            out.allow_reduced_principal_reason = value;
-            continue;
-        }
         if (std.mem.eql(u8, arg, "--path")) {
             try receipt_paths.append(allocator, value);
             continue;
@@ -1039,27 +975,23 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
                 .review, .smoke, .smoke_suite, .smoke_until_fixed => {},
                 .start, .status, .stop => return error.MultiAgentModeUnsupportedAction,
             },
-            .status, .wait, .interrupt, .receipt, .closeout => return error.MultiAgentModeUnsupportedAction,
+            .status, .wait, .interrupt, .receipt => return error.MultiAgentModeUnsupportedAction,
         }
     }
     if (out.review_lock_override_reason != null) {
         switch (out.action.?) {
             .start => {},
             .lane => if (out.lane_action != .review and out.lane_action != .smoke) return error.ReviewLockOverrideUnsupportedAction,
-            .status, .wait, .interrupt, .receipt, .closeout => return error.ReviewLockOverrideUnsupportedAction,
+            .status, .wait, .interrupt, .receipt => return error.ReviewLockOverrideUnsupportedAction,
         }
     }
     if (out.fresh_attempt_reason != null) {
         switch (out.action.?) {
             .start => {},
             .lane => if (out.lane_action != .review) return error.FreshAttemptUnsupportedAction,
-            .status, .wait, .interrupt, .receipt, .closeout => return error.FreshAttemptUnsupportedAction,
+            .status, .wait, .interrupt, .receipt => return error.FreshAttemptUnsupportedAction,
         }
     }
-    if (out.receipt_clean_streak != 0 and (out.action.? != .receipt or !out.receipt_proof)) return error.CleanStreakRequiresReceiptProof;
-    if (out.allow_reduced_principal_reason != null and (out.action.? != .receipt or !out.receipt_proof)) return error.ReducedPrincipalOverrideRequiresReceiptProof;
-    if (out.dry_run and out.action.? != .closeout) return error.DryRunUnsupportedAction;
-
     switch (out.action.?) {
         .start => {
             if (out.cwd == null) return error.MissingCwd;
@@ -1097,45 +1029,11 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             },
         },
         .receipt => {
-            if (out.receipt_proof and out.receipt_certify) return error.InvalidReceiptMode;
-            if (out.receipt_certify) {
-                if (out.cwd == null) return error.MissingCwd;
-                if (out.target == null) return error.MissingTarget;
-                if (out.receipt_paths.len > 0 or out.receipt_globs.len > 0) return error.ManualReceiptSelectionForbiddenForCertify;
-            } else {
-                if (out.receipt_paths.len == 0 and out.receipt_globs.len == 0) return error.MissingReceiptInput;
-            }
-            if (out.receipt_proof and out.receipt_clean_streak == 0) out.receipt_clean_streak = 3;
-        },
-        .closeout => {
-            if (out.cwd == null) return error.MissingCwd;
-            if (out.target == null) return error.MissingTarget;
-            if (out.receipt_paths.len > 0 or out.receipt_globs.len > 0) return error.ManualReceiptSelectionForbiddenForCloseout;
+            if (out.receipt_paths.len == 0 and out.receipt_globs.len == 0) return error.MissingReceiptInput;
         },
     }
 
     return out;
-}
-
-fn isForbiddenCertifyOverrideFlag(arg: []const u8) bool {
-    return std.mem.eql(u8, arg, "--allow-reduced-principal") or
-        std.mem.eql(u8, arg, "--allow-native-fallback") or
-        std.mem.eql(u8, arg, "--allow-stale-principal") or
-        std.mem.eql(u8, arg, "--allow-duplicate-cached") or
-        std.mem.eql(u8, arg, "--allow-tuple-mismatch") or
-        std.mem.eql(u8, arg, "--ignore-non-proof") or
-        std.mem.eql(u8, arg, "--assume-same-tuple") or
-        std.mem.eql(u8, arg, "--accept-cached-duplicates") or
-        std.mem.eql(u8, arg, "--show-non-proof-as-proof");
-}
-
-fn certifyOverrideFlagTakesValue(arg: []const u8) bool {
-    return std.mem.eql(u8, arg, "--allow-reduced-principal") or
-        std.mem.eql(u8, arg, "--allow-native-fallback") or
-        std.mem.eql(u8, arg, "--allow-stale-principal") or
-        std.mem.eql(u8, arg, "--allow-duplicate-cached") or
-        std.mem.eql(u8, arg, "--allow-tuple-mismatch") or
-        std.mem.eql(u8, arg, "--assume-same-tuple");
 }
 
 fn setTarget(parsed: *ParsedArgs, target: TargetConfig) void {
@@ -1683,13 +1581,13 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             std.process.exit(1);
         }
         try writeSessionRecord(allocator, record_path, record);
-        const terminal_proof_failure = terminalProofFailureForIdentity(allocator, latest, identity);
+        const terminal_binding_failure = terminalBindingFailureForIdentity(allocator, latest, identity);
         updateReviewTupleLockBestEffort(
             allocator,
             tuple_lock_bundle.path,
             tuple_lock_bundle.lock,
-            if (terminal_proof_failure == null) "normalized" else "terminal",
-            if (terminal_proof_failure) |failure| failure.code else null,
+            if (terminal_binding_failure == null) "normalized" else "terminal",
+            if (terminal_binding_failure) |failure| failure.code else null,
             review_thread_id,
             review_turn_id,
             record_path,
@@ -1711,7 +1609,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                 latest,
                 false,
                 true,
-                terminal_proof_failure,
+                terminal_binding_failure,
                 null,
             );
         } else {
@@ -1727,7 +1625,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                 event_log_path,
             });
         }
-        if (terminal_proof_failure != null) std.process.exit(1);
+        if (terminal_binding_failure != null) std.process.exit(1);
         return;
     }
 
@@ -2151,7 +2049,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
         std.process.exit(1);
     }
     try writeSessionRecord(allocator, loaded.record_path, record);
-    const terminal_lock_failure = terminalProofFailureForOptionalIdentity(allocator, latest, identity_opt);
+    const terminal_lock_failure = terminalBindingFailureForOptionalIdentity(allocator, latest, identity_opt);
     updateReviewTupleLockForRecordBestEffort(
         allocator,
         record,
@@ -2218,7 +2116,7 @@ fn cmdInterrupt(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !v
                 .action = "interrupt",
                 .reviewAttemptPhase = "review_terminal",
                 .reviewAttemptExists = true,
-                .proofVerdictExists = false,
+                .tupleVerdictExists = false,
                 .reviewThreadId = record.review_thread_id,
                 .reviewTurnId = record.review_turn_id,
                 .baseSha = if (identity_opt) |identity| identity.base_sha else null,
@@ -2261,7 +2159,7 @@ fn cmdInterrupt(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !v
                 .action = "interrupt",
                 .reviewAttemptPhase = "review_terminal",
                 .reviewAttemptExists = true,
-                .proofVerdictExists = false,
+                .tupleVerdictExists = false,
                 .reviewThreadId = record.review_thread_id,
                 .reviewTurnId = record.review_turn_id,
                 .baseSha = if (identity_opt) |identity| identity.base_sha else null,
@@ -2356,7 +2254,7 @@ fn cmdInterrupt(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !v
             .action = "interrupt",
             .reviewAttemptPhase = "review_waiting",
             .reviewAttemptExists = true,
-            .proofVerdictExists = false,
+            .tupleVerdictExists = false,
             .reviewThreadId = record.review_thread_id,
             .reviewTurnId = record.review_turn_id,
             .baseSha = if (identity_opt) |identity| identity.base_sha else null,
@@ -2386,9 +2284,8 @@ const NormalizedReceipt = struct {
     finding_count: usize,
     review_attempt_phase: []const u8,
     review_attempt_exists: bool,
-    proof_verdict_exists: bool,
+    tuple_verdict_exists: bool,
     principal_strength: []const u8 = principal_strength_reduced,
-    principal_proof_usable: bool = false,
     account_fingerprint_reduced_protection: bool = true,
     base_sha: ?[]const u8,
     head_sha: ?[]const u8,
@@ -2446,22 +2343,6 @@ const ReceiptError = struct {
     }
 };
 
-const CloseoutRunSummary = struct {
-    run_number: u32,
-    exit_code: u8,
-    fresh_attempt_reason: ?[]const u8 = null,
-    stdout_bytes: usize,
-    stderr_bytes: usize,
-    failure_stdout: ?[]const u8 = null,
-
-    fn deinit(self: CloseoutRunSummary, allocator: std.mem.Allocator) void {
-        if (self.fresh_attempt_reason) |reason| allocator.free(reason);
-        if (self.failure_stdout) |stdout| allocator.free(stdout);
-    }
-};
-
-const closeout_child_failure_stdout_limit = 64 * 1024;
-
 const ReceiptSummary = struct {
     total: usize = 0,
     clean: usize = 0,
@@ -2478,156 +2359,7 @@ const ReceiptSummary = struct {
     other_backend: usize = 0,
 };
 
-const ReceiptProof = struct {
-    required_clean_streak: u32,
-    current_clean_streak: u32 = 0,
-    strict_clean_streak: u32 = 0,
-    attempts_considered: usize = 0,
-    duplicate_attempts: usize = 0,
-    ignored_no_attempt: usize = 0,
-    ignored_non_proof: usize = 0,
-    tuple_mismatch_count: usize = 0,
-    reduced_principal_attempts: usize = 0,
-    blocker_count: usize = 0,
-    reset_count: usize = 0,
-    satisfied: bool = false,
-    reduced_principal_override_used: bool = false,
-    reduced_principal_override_reason: ?[]const u8 = null,
-    reset_by_attempt_key: ?[]const u8 = null,
-    blocker_status: ?[]const u8 = null,
-    tuple_base_sha: ?[]const u8 = null,
-    tuple_head_sha: ?[]const u8 = null,
-    tuple_target_fingerprint: ?[]const u8 = null,
-};
-
 const ReceiptEventLogRecoveryMaxInputs = 64;
-const strongest_closeout_clean_streak: u32 = 3;
-
-fn bindRequestedIdentityToProof(proof: *ReceiptProof, identity: TargetIdentity) void {
-    if (proof.tuple_base_sha == null) proof.tuple_base_sha = identity.base_sha;
-    if (proof.tuple_head_sha == null) proof.tuple_head_sha = identity.head_sha;
-    if (proof.tuple_target_fingerprint == null) proof.tuple_target_fingerprint = identity.fingerprint;
-}
-
-fn appendCanonicalReviewReceiptPaths(allocator: std.mem.Allocator, out: *std.ArrayList([]const u8)) !void {
-    const session_dir = try sessionDirAlloc(allocator);
-    defer allocator.free(session_dir);
-    var dir = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), session_dir, .{ .iterate = true });
-    defer dir.close(std.Io.Threaded.global_single_threaded.io());
-    var it = dir.iterate();
-    while (try it.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
-        if (std.mem.endsWith(u8, entry.name, ".lane.json")) continue;
-        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ session_dir, entry.name });
-        try out.append(allocator, path);
-    }
-}
-
-fn clearNormalizedReceipts(allocator: std.mem.Allocator, receipts: *std.ArrayList(NormalizedReceipt)) void {
-    for (receipts.items) |receipt| receipt.deinit(allocator);
-    receipts.clearRetainingCapacity();
-}
-
-fn clearReceiptErrors(allocator: std.mem.Allocator, errors: *std.ArrayList(ReceiptError)) void {
-    for (errors.items) |err| err.deinit(allocator);
-    errors.clearRetainingCapacity();
-}
-
-fn lessThanNormalizedReceiptCreatedAt(_: void, left: NormalizedReceipt, right: NormalizedReceipt) bool {
-    const left_created = left.attempt_created_at_unix_s orelse std.math.minInt(i64);
-    const right_created = right.attempt_created_at_unix_s orelse std.math.minInt(i64);
-    if (left_created != right_created) return left_created < right_created;
-    return lessThanString({}, left.source_path, right.source_path);
-}
-
-fn sortNormalizedReceiptsChronological(receipts: []NormalizedReceipt) void {
-    std.mem.sort(NormalizedReceipt, receipts, {}, lessThanNormalizedReceiptCreatedAt);
-}
-
-fn canonicalReceiptNormalizationErrorBlocksCloseout(err: anyerror) bool {
-    return switch (err) {
-        error.NotReviewReceipt => false,
-        else => true,
-    };
-}
-
-fn shouldRecoverReceiptEventLogs(path_count: usize, canonical_certify: bool) bool {
-    return canonical_certify or path_count <= ReceiptEventLogRecoveryMaxInputs;
-}
-
-fn emptyReceiptInputIsScanError(canonical_certify: bool) bool {
-    return !canonical_certify;
-}
-
-fn loadCanonicalReceiptsForContext(
-    allocator: std.mem.Allocator,
-    context: NormalizeContext,
-    receipts: *std.ArrayList(NormalizedReceipt),
-    errors: *std.ArrayList(ReceiptError),
-) !void {
-    clearNormalizedReceipts(allocator, receipts);
-    clearReceiptErrors(allocator, errors);
-
-    var paths: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (paths.items) |path| allocator.free(path);
-        paths.deinit(allocator);
-    }
-    try appendCanonicalReviewReceiptPaths(allocator, &paths);
-    std.mem.sort([]const u8, paths.items, {}, lessThanString);
-
-    if (paths.items.len == 0) return;
-
-    const recover_event_logs = true;
-    for (paths.items) |path| {
-        const receipt = normalizeReceiptFromPathAlloc(allocator, path, recover_event_logs, context) catch |err| {
-            if (err == error.NotReviewReceipt) continue;
-            if (!canonicalReceiptNormalizationErrorBlocksCloseout(err)) continue;
-            try errors.append(allocator, .{
-                .source_path = try allocator.dupe(u8, path),
-                .message = try allocator.dupe(u8, @errorName(err)),
-            });
-            continue;
-        };
-        try receipts.append(allocator, receipt);
-    }
-    sortNormalizedReceiptsChronological(receipts.items);
-}
-
-fn closeoutShouldRunFreshAttempt(proof: ReceiptProof, error_count: usize, child_run_count: usize) bool {
-    return !proof.satisfied and
-        error_count == 0 and
-        proof.blocker_count == 0 and
-        proof.reset_count == 0 and
-        proof.strict_clean_streak < strongest_closeout_clean_streak and
-        child_run_count < strongest_closeout_clean_streak;
-}
-
-fn appendCloseoutTuplePolicyErrors(
-    allocator: std.mem.Allocator,
-    errors: *std.ArrayList(ReceiptError),
-    identity: TargetIdentity,
-    tuple: ReviewTupleIdentity,
-) !void {
-    if (!identityHasTupleProof(identity)) {
-        try errors.append(allocator, .{
-            .source_path = try allocator.dupe(u8, "<target>"),
-            .message = try allocator.dupe(u8, "target_identity_unavailable"),
-        });
-    }
-    if (tuple.account_fingerprint_reduced_protection) {
-        try errors.append(allocator, .{
-            .source_path = try allocator.dupe(u8, "<tuple-context>"),
-            .message = try allocator.dupe(u8, "account_fingerprint_reduced_protection"),
-        });
-    }
-}
-
-fn closeoutChildNeedsFreshAttempt(proof: ReceiptProof, child_run_count: usize) bool {
-    _ = child_run_count;
-    return proof.strict_clean_streak < strongest_closeout_clean_streak;
-}
 
 fn cmdReceipt(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     var paths: std.ArrayList([]const u8) = .empty;
@@ -2636,8 +2368,11 @@ fn cmdReceipt(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !voi
         paths.deinit(allocator);
     }
 
-    if (parsed.receipt_certify) {
-        try appendCanonicalReviewReceiptPaths(allocator, &paths);
+    for (parsed.receipt_paths) |path| {
+        try paths.append(allocator, try allocator.dupe(u8, path));
+    }
+    for (parsed.receipt_globs) |pattern| {
+        try expandReceiptGlob(allocator, pattern, &paths);
     } else {
         for (parsed.receipt_paths) |path| {
             try paths.append(allocator, try allocator.dupe(u8, path));
@@ -2659,7 +2394,7 @@ fn cmdReceipt(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !voi
         errors.deinit(allocator);
     }
 
-    if (paths.items.len == 0 and emptyReceiptInputIsScanError(parsed.receipt_certify)) {
+    if (paths.items.len == 0) {
         try errors.append(allocator, .{
             .source_path = try allocator.dupe(u8, "<input>"),
             .message = try allocator.dupe(u8, "no receipt files matched"),
@@ -2671,22 +2406,18 @@ fn cmdReceipt(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !voi
     const requested_identity_required = parsed.cwd != null and parsed.target != null;
     if (requested_identity_required) {
         const target_record = targetToRecord(parsed.target.?);
-        requested_identity_opt = if (parsed.receipt_certify)
-            try computeTargetIdentityAlloc(allocator, io, parsed.cwd.?, target_record)
-        else
-            computeTargetIdentityAlloc(allocator, io, parsed.cwd.?, target_record) catch null;
+        requested_identity_opt = computeTargetIdentityAlloc(allocator, io, parsed.cwd.?, target_record) catch null;
     }
     const normalize_context = NormalizeContext{
         .requested_identity = requested_identity_opt,
         .requested_identity_required = requested_identity_required,
     };
 
-    const recover_event_logs = shouldRecoverReceiptEventLogs(paths.items.len, parsed.receipt_certify);
-    const skip_non_receipts = parsed.receipt_globs.len > 0 or parsed.receipt_certify;
+    const recover_event_logs = paths.items.len <= ReceiptEventLogRecoveryMaxInputs;
+    const skip_non_receipts = parsed.receipt_globs.len > 0;
     for (paths.items) |path| {
         const receipt = normalizeReceiptFromPathAlloc(allocator, path, recover_event_logs, normalize_context) catch |err| {
             if (skip_non_receipts and err == error.NotReviewReceipt) continue;
-            if (parsed.receipt_certify and !canonicalReceiptNormalizationErrorBlocksCloseout(err)) continue;
             try errors.append(allocator, .{
                 .source_path = try allocator.dupe(u8, path),
                 .message = try allocator.dupe(u8, @errorName(err)),
@@ -2695,141 +2426,14 @@ fn cmdReceipt(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !voi
         };
         try receipts.append(allocator, receipt);
     }
-    if (parsed.receipt_certify) sortNormalizedReceiptsChronological(receipts.items);
 
     const summary = summarizeReceipts(receipts.items);
-    if (parsed.receipt_proof) {
-        const proof = try computeReceiptProof(allocator, receipts.items, parsed.receipt_clean_streak, parsed.allow_reduced_principal_reason, null, false);
-        try printReceiptProofJson(allocator, proof, receipts.items, errors.items);
-        if (errors.items.len > 0 or !proof.satisfied) std.process.exit(1);
-        return;
-    }
-    if (parsed.receipt_certify) {
-        if (parsed.forbidden_certify_override) |flag| {
-            try printReceiptCertifyForbiddenJson(flag);
-            std.process.exit(2);
-        }
-        var tuple_context = closeoutTupleContextAlloc(allocator, io, parsed, requested_identity_opt.?) catch |err| {
-            try printReceiptTupleContextFailureJson("certify", @errorName(err));
-            std.process.exit(1);
-        };
-        defer tuple_context.deinit(allocator);
-        try appendCloseoutTuplePolicyErrors(allocator, &errors, requested_identity_opt.?, tuple_context.tuple);
-        const proof = try computeReceiptProof(allocator, receipts.items, strongest_closeout_clean_streak, null, tuple_context.tuple, true);
-        const repo_realpath = repoRealpathAlloc(allocator, parsed.cwd.?) catch null;
-        defer if (repo_realpath) |value| allocator.free(value);
-        try printReceiptCertifyJson(allocator, proof, receipts.items, errors.items, repo_realpath, tuple_context.tuple);
-        if (errors.items.len > 0 or !proof.satisfied) std.process.exit(1);
-        return;
-    }
     switch (parsed.receipt_format) {
         .table => try printReceiptTable(receipts.items, errors.items, if (parsed.receipt_summary) summary else null),
         .json => try printReceiptJson(receipts.items, errors.items, if (parsed.receipt_summary) summary else null),
         .jsonl => try printReceiptJsonl(receipts.items, errors.items, if (parsed.receipt_summary) summary else null),
     }
     if (errors.items.len > 0) std.process.exit(1);
-}
-
-fn cmdCloseout(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
-    var receipts: std.ArrayList(NormalizedReceipt) = .empty;
-    defer {
-        clearNormalizedReceipts(allocator, &receipts);
-        receipts.deinit(allocator);
-    }
-    var errors: std.ArrayList(ReceiptError) = .empty;
-    defer {
-        clearReceiptErrors(allocator, &errors);
-        errors.deinit(allocator);
-    }
-    var child_runs: std.ArrayList(CloseoutRunSummary) = .empty;
-    defer {
-        for (child_runs.items) |run| run.deinit(allocator);
-        child_runs.deinit(allocator);
-    }
-
-    const target_record = targetToRecord(parsed.target.?);
-    var requested_identity = try computeTargetIdentityAlloc(allocator, io, parsed.cwd.?, target_record);
-    defer requested_identity.deinit(allocator);
-    var tuple_context = closeoutTupleContextAlloc(allocator, io, parsed, requested_identity) catch |err| {
-        try printReceiptTupleContextFailureJson("closeout", @errorName(err));
-        std.process.exit(1);
-    };
-    defer tuple_context.deinit(allocator);
-    const normalize_context = NormalizeContext{
-        .requested_identity = requested_identity,
-        .requested_identity_required = true,
-    };
-    try loadCanonicalReceiptsForContext(allocator, normalize_context, &receipts, &errors);
-    try appendCloseoutTuplePolicyErrors(allocator, &errors, requested_identity, tuple_context.tuple);
-    var proof = try computeReceiptProof(allocator, receipts.items, strongest_closeout_clean_streak, null, tuple_context.tuple, true);
-    while (!parsed.dry_run and closeoutShouldRunFreshAttempt(proof, errors.items.len, child_runs.items.len)) {
-        const next_run_number: u32 = @intCast(child_runs.items.len + 1);
-        const needs_fresh_attempt = closeoutChildNeedsFreshAttempt(proof, child_runs.items.len);
-        const fresh_reason = if (needs_fresh_attempt)
-            try std.fmt.allocPrint(allocator, "closeout clean-run {d}", .{next_run_number})
-        else
-            null;
-        defer if (fresh_reason) |reason| allocator.free(reason);
-
-        const run = try runCloseoutStartChild(allocator, io, parsed, next_run_number, fresh_reason);
-        const child_exit_code = run.exit_code;
-        try child_runs.append(allocator, run);
-
-        try loadCanonicalReceiptsForContext(allocator, normalize_context, &receipts, &errors);
-        try appendCloseoutTuplePolicyErrors(allocator, &errors, requested_identity, tuple_context.tuple);
-        proof = try computeReceiptProof(allocator, receipts.items, strongest_closeout_clean_streak, null, tuple_context.tuple, true);
-        if (child_exit_code != 0) break;
-    }
-
-    const repo_realpath = repoRealpathAlloc(allocator, parsed.cwd.?) catch null;
-    defer if (repo_realpath) |value| allocator.free(value);
-    try printReceiptCloseoutJson(allocator, proof, receipts.items, errors.items, repo_realpath, child_runs.items, parsed.dry_run, tuple_context.tuple);
-    if (errors.items.len > 0 or !proof.satisfied) std.process.exit(1);
-}
-
-fn runCloseoutStartChild(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    parsed: ParsedArgs,
-    run_number: u32,
-    fresh_attempt_reason: ?[]const u8,
-) !CloseoutRunSummary {
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(allocator);
-    try argv.appendSlice(allocator, &.{ parsed.executable_path, "start", "--wait", "--cwd", parsed.cwd.?, "--json", "--fallback", "none", "--hooks", parsed.hook_policy.asString() });
-    try appendSmokeChildRuntimeCliArgs(allocator, &argv, parsed);
-    try appendTargetCliArgs(allocator, &argv, parsed);
-    if (fresh_attempt_reason) |reason| try argv.appendSlice(allocator, &.{ "--fresh-attempt", reason });
-    const timeout_arg = try std.fmt.allocPrint(allocator, "{d}", .{parsed.timeout_ms});
-    defer allocator.free(timeout_arg);
-    const poll_arg = try std.fmt.allocPrint(allocator, "{d}", .{parsed.poll_interval_ms});
-    defer allocator.free(poll_arg);
-    try argv.appendSlice(allocator, &.{ "--timeout-ms", timeout_arg, "--poll-interval-ms", poll_arg });
-
-    const child = try std.process.run(allocator, io, .{
-        .argv = argv.items,
-        .cwd = .inherit,
-        .stdout_limit = .limited(16 * 1024 * 1024),
-        .stderr_limit = .limited(1024 * 1024),
-    });
-    defer allocator.free(child.stderr);
-    defer allocator.free(child.stdout);
-    const exit_code: u8 = switch (child.term) {
-        .exited => |code| @intCast(@min(code, 255)),
-        .signal => |signal| @intCast(@min(@as(u32, 128) + @intFromEnum(signal), @as(u32, 255))),
-        .stopped, .unknown => 1,
-    };
-    return .{
-        .run_number = run_number,
-        .exit_code = exit_code,
-        .fresh_attempt_reason = try dupOptional(allocator, fresh_attempt_reason),
-        .stdout_bytes = child.stdout.len,
-        .stderr_bytes = child.stderr.len,
-        .failure_stdout = if (exit_code != 0 and child.stdout.len > 0)
-            try allocator.dupe(u8, child.stdout[0..@min(child.stdout.len, closeout_child_failure_stdout_limit)])
-        else
-            null,
-    };
 }
 
 fn cmdLane(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
@@ -2948,7 +2552,7 @@ fn cmdLaneStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !v
             .action = "lane-start",
             .reviewAttemptPhase = "lane_started",
             .reviewAttemptExists = false,
-            .proofVerdictExists = false,
+            .tupleVerdictExists = false,
             .reviewThreadId = @as(?[]const u8, null),
             .reviewTurnId = @as(?[]const u8, null),
             .baseSha = @as(?[]const u8, null),
@@ -3215,7 +2819,7 @@ fn cmdLaneSmoke(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !v
     var observed_status: ?[]u8 = null;
     defer if (observed_status) |status| allocator.free(status);
     var review_attempt_phase: []const u8 = "review_started";
-    var proof_verdict_exists = false;
+    var tuple_verdict_exists = false;
     var smoke_failure: ?FailureInfo = null;
     var latest_status: ?ReviewStatus = null;
     defer if (latest_status) |*status| status.deinit(allocator);
@@ -3253,7 +2857,7 @@ fn cmdLaneSmoke(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !v
                         .smokeStatus = "failed",
                         .reviewAttemptPhase = "review_started",
                         .reviewAttemptExists = true,
-                        .proofVerdictExists = false,
+                        .tupleVerdictExists = false,
                         .reviewThreadId = review_thread_id,
                         .reviewTurnId = review_turn_id,
                         .baseSha = identity.base_sha,
@@ -3283,7 +2887,7 @@ fn cmdLaneSmoke(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !v
                         updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "terminal", failure.code, review_thread_id, review_turn_id, record_path, event_log_path);
                         review_attempt_phase = "review_terminal";
                         smoke_failure = failure;
-                    } else if (!identityHasTupleProof(identity)) {
+                    } else if (!identityHasCompleteTuple(identity)) {
                         const failure = tupleIdentityUnavailableFailureInfo();
                         updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "terminal", failure.code, review_thread_id, review_turn_id, record_path, event_log_path);
                         review_attempt_phase = "review_terminal";
@@ -3291,7 +2895,7 @@ fn cmdLaneSmoke(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !v
                     } else {
                         updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "normalized", null, review_thread_id, review_turn_id, record_path, event_log_path);
                         review_attempt_phase = "normalized_verdict";
-                        proof_verdict_exists = true;
+                        tuple_verdict_exists = true;
                     }
                 } else if (status.review_result_available) {
                     updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "terminal", "review_untrusted_source", review_thread_id, review_turn_id, record_path, event_log_path);
@@ -3392,7 +2996,7 @@ fn cmdLaneSmoke(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !v
                 .smokeStatus = smoke_record_status,
                 .reviewAttemptPhase = review_attempt_phase,
                 .reviewAttemptExists = true,
-                .proofVerdictExists = proof_verdict_exists,
+                .tupleVerdictExists = tuple_verdict_exists,
                 .reviewThreadId = review_thread_id,
                 .reviewTurnId = review_turn_id,
                 .baseSha = identity.base_sha,
@@ -3432,7 +3036,7 @@ fn cmdLaneSmoke(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !v
                 .smokeStatus = smoke_record_status,
                 .reviewAttemptPhase = review_attempt_phase,
                 .reviewAttemptExists = true,
-                .proofVerdictExists = proof_verdict_exists,
+                .tupleVerdictExists = tuple_verdict_exists,
                 .reviewThreadId = review_thread_id,
                 .reviewTurnId = review_turn_id,
                 .baseSha = identity.base_sha,
@@ -3500,13 +3104,13 @@ fn tupleIdentityUnavailableFailureInfo() FailureInfo {
     };
 }
 
-fn terminalProofFailureForIdentity(allocator: std.mem.Allocator, status: ReviewStatus, identity: TargetIdentity) ?FailureInfo {
-    return terminalLockFailureForStatus(allocator, status) orelse if (!identityHasTupleProof(identity)) tupleIdentityUnavailableFailureInfo() else null;
+fn terminalBindingFailureForIdentity(allocator: std.mem.Allocator, status: ReviewStatus, identity: TargetIdentity) ?FailureInfo {
+    return terminalLockFailureForStatus(allocator, status) orelse if (!identityHasCompleteTuple(identity)) tupleIdentityUnavailableFailureInfo() else null;
 }
 
-fn terminalProofFailureForOptionalIdentity(allocator: std.mem.Allocator, status: ReviewStatus, identity_opt: ?TargetIdentity) ?FailureInfo {
+fn terminalBindingFailureForOptionalIdentity(allocator: std.mem.Allocator, status: ReviewStatus, identity_opt: ?TargetIdentity) ?FailureInfo {
     return terminalLockFailureForStatus(allocator, status) orelse if (identity_opt) |identity|
-        if (!identityHasTupleProof(identity)) tupleIdentityUnavailableFailureInfo() else null
+        if (!identityHasCompleteTuple(identity)) tupleIdentityUnavailableFailureInfo() else null
     else
         tupleIdentityUnavailableFailureInfo();
 }
@@ -3814,7 +3418,7 @@ fn smokeRunSummaryFromJsonAlloc(
             .review_verdict_status = null,
             .finding_count = 0,
             .review_attempt_exists = false,
-            .proof_verdict_exists = false,
+            .tuple_verdict_exists = false,
             .lane_id = null,
             .review_thread_id = null,
             .base_sha = null,
@@ -3849,7 +3453,7 @@ fn smokeRunSummaryFromJsonAlloc(
         .review_verdict_status = try dupOptional(allocator, verdict_status),
         .finding_count = finding_count orelse 0,
         .review_attempt_exists = jsonBoolField(obj, "reviewAttemptExists") orelse false,
-        .proof_verdict_exists = jsonBoolField(obj, "proofVerdictExists") orelse false,
+        .tuple_verdict_exists = jsonBoolField(obj, "tupleVerdictExists") orelse false,
         .lane_id = try dupOptional(allocator, core_json.stringField(obj, "laneId")),
         .review_thread_id = try dupOptional(allocator, core_json.stringField(obj, "reviewThreadId")),
         .base_sha = try dupOptional(allocator, core_json.stringField(obj, "baseSha")),
@@ -3864,7 +3468,7 @@ fn laneSmokeRunPassesSuite(result: LaneSmokeRunSummary) bool {
     if (!std.mem.eql(u8, result.status, "pass")) return false;
     if (!result.review_attempt_exists) return false;
     if (std.mem.eql(u8, result.failure_code orelse "", "pre_review_lane_transport_lost")) return false;
-    return result.proof_verdict_exists;
+    return result.tuple_verdict_exists;
 }
 
 fn maxConsecutiveSmokePasses(results: []const LaneSmokeRunSummary) u32 {
@@ -3889,7 +3493,7 @@ fn printSmokeSuiteJson(
     runs_requested: u32,
     max_consecutive_passes: u32,
     persistent_lane_canonical: bool,
-    canonical_closeout_backend: []const u8,
+    canonical_review_backend: []const u8,
     results: []const LaneSmokeRunSummary,
 ) !void {
     _ = allocator;
@@ -3905,13 +3509,13 @@ fn printSmokeSuiteJson(
     try writeJsonString(stdout, parsed.cwd.?);
     try stdout.writeAll(",\"base\":");
     if (parsed.target.?.branch) |branch| try writeJsonString(stdout, branch) else try stdout.writeAll("null");
-    try stdout.print(",\"runsRequested\":{d},\"requiredConsecutivePasses\":{d},\"maxConsecutivePasses\":{d},\"persistentLaneCanonical\":{s},\"canonicalCloseoutBackend\":", .{
+    try stdout.print(",\"runsRequested\":{d},\"requiredConsecutivePasses\":{d},\"maxConsecutivePasses\":{d},\"persistentLaneCanonical\":{s},\"canonicalReviewBackend\":", .{
         runs_requested,
         parsed.smoke_required_consecutive_passes,
         max_consecutive_passes,
         if (persistent_lane_canonical) "true" else "false",
     });
-    try writeJsonString(stdout, canonical_closeout_backend);
+    try writeJsonString(stdout, canonical_review_backend);
     try stdout.writeAll(",\"results\":[");
     for (results, 0..) |result, idx| {
         if (idx != 0) try stdout.writeByte(',');
@@ -3947,9 +3551,9 @@ fn printSmokePromotionJson(
     try writeNullableJsonString(stdout, last_failure_code);
     try stdout.writeAll(",\"finalBackendPolicy\":{\"persistentLaneCanonical\":");
     try stdout.writeAll(if (promoted) "true" else "false");
-    try stdout.writeAll(",\"canonicalCloseoutBackend\":");
+    try stdout.writeAll(",\"canonicalReviewBackend\":");
     try writeJsonString(stdout, if (promoted) "cas-lane" else "cas-start-wait-normalized");
-    try stdout.writeAll(",\"fallbackCloseoutBackend\":");
+    try stdout.writeAll(",\"fallbackReviewBackend\":");
     try writeJsonString(stdout, if (promoted) "cas-start-wait-normalized" else "cas-native-fallback-explicit-only");
     try stdout.writeAll("},\"evidenceRefs\":[");
     var wrote_ref = false;
@@ -3985,8 +3589,8 @@ fn writeSmokeRunJson(writer: *std.Io.Writer, result: LaneSmokeRunSummary) !void 
     try writeNullableJsonString(writer, result.review_attempt_phase);
     try writer.writeAll(",\"reviewAttemptExists\":");
     try writer.writeAll(if (result.review_attempt_exists) "true" else "false");
-    try writer.writeAll(",\"proofVerdictExists\":");
-    try writer.writeAll(if (result.proof_verdict_exists) "true" else "false");
+    try writer.writeAll(",\"tupleVerdictExists\":");
+    try writer.writeAll(if (result.tuple_verdict_exists) "true" else "false");
     try writer.writeAll(",\"laneId\":");
     try writeNullableJsonString(writer, result.lane_id);
     try writer.writeAll(",\"reviewThreadId\":");
@@ -4322,7 +3926,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
             .code = "review_parse_mismatch",
             .hint = "lane review structured findings disagree with the raw rendered review parse",
         }
-    else if (!identityHasTupleProof(identity))
+    else if (!identityHasCompleteTuple(identity))
         tupleIdentityUnavailableFailureInfo()
     else
         null;
@@ -4374,7 +3978,7 @@ fn cmdLaneStatus(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
             .action = "lane-status",
             .reviewAttemptPhase = laneReceiptPhase(alive, lane.last_review_thread_id),
             .reviewAttemptExists = reviewAttemptExists(lane.last_review_thread_id),
-            .proofVerdictExists = false,
+            .tupleVerdictExists = false,
             .reviewThreadId = lane.last_review_thread_id,
             .reviewTurnId = lane.last_review_turn_id,
             .baseSha = lane.last_base_sha,
@@ -4418,7 +4022,7 @@ fn cmdLaneStop(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
             .action = "lane-stop",
             .reviewAttemptPhase = laneReceiptPhase(false, lane.last_review_thread_id),
             .reviewAttemptExists = reviewAttemptExists(lane.last_review_thread_id),
-            .proofVerdictExists = false,
+            .tupleVerdictExists = false,
             .reviewThreadId = lane.last_review_thread_id,
             .reviewTurnId = lane.last_review_turn_id,
             .baseSha = lane.last_base_sha,
@@ -5677,46 +5281,6 @@ fn reviewTupleIdentityAlloc(
     };
 }
 
-fn closeoutTupleContextAlloc(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    parsed: ParsedArgs,
-    target_identity: TargetIdentity,
-) !CloseoutTupleContext {
-    const cwd = parsed.cwd.?;
-    const resolved_codex_path = try cas.resolveExecutableAlloc(allocator, "codex");
-    errdefer allocator.free(resolved_codex_path);
-    const codex_version = try readCodexVersionAlloc(allocator, io, cwd, resolved_codex_path);
-    errdefer allocator.free(codex_version);
-    var managed_server = try startManagedWebsocketServer(allocator, cwd, resolved_codex_path, parsed.hook_policy, io);
-    errdefer {
-        managed_server.kill();
-        managed_server.deinit(allocator);
-    }
-    var client = try connectReviewClient(
-        allocator,
-        cwd,
-        resolved_codex_path,
-        codex_version,
-        "websocket",
-        managed_server.listen_url,
-        io,
-        parsed,
-    );
-    errdefer {
-        client.close();
-        client.deinit();
-    }
-    const tuple = try reviewTupleIdentityAlloc(allocator, cwd, target_identity, resolved_codex_path, codex_version, &client);
-    return .{
-        .resolved_codex_path = resolved_codex_path,
-        .codex_version = codex_version,
-        .managed_server = managed_server,
-        .client = client,
-        .tuple = tuple,
-    };
-}
-
 fn canonicalReviewTuplePayloadAlloc(allocator: std.mem.Allocator, tuple: ReviewTupleIdentity) ![]const u8 {
     return std.fmt.allocPrint(
         allocator,
@@ -5978,7 +5542,7 @@ fn printReviewTupleLockExistingAndExit(
         .smokeStatus = smoke_status,
         .reviewAttemptPhase = if (lock_points_to_terminal) "review_terminal" else "review_waiting",
         .reviewAttemptExists = review_thread_id != null,
-        .proofVerdictExists = false,
+        .tupleVerdictExists = false,
         .reviewThreadId = review_thread_id,
         .reviewTurnId = review_turn_id,
         .baseSha = tuple.base_sha,
@@ -5998,7 +5562,7 @@ fn printReviewTupleLockExistingAndExit(
             .status = tupleLockFallbackVerdictStatus(lock),
             .reviewAttemptPhase = if (lock_points_to_terminal) "review_terminal" else "review_waiting",
             .reviewAttemptExists = review_thread_id != null,
-            .proofVerdictExists = false,
+            .tupleVerdictExists = false,
             .backendClass = "cas-receipt-normalized",
             .clean = false,
             .findingCount = 0,
@@ -6062,7 +5626,7 @@ fn emitReviewTupleLockBlockedAndExit(
                 .status = "incomplete",
                 .reviewAttemptPhase = "pre_review_start",
                 .reviewAttemptExists = false,
-                .proofVerdictExists = false,
+                .tupleVerdictExists = false,
                 .backendClass = "cas-receipt-normalized",
                 .clean = false,
                 .findingCount = 0,
@@ -6086,7 +5650,7 @@ fn emitReviewTupleLockBlockedAndExit(
             .smokeStatus = smoke_status,
             .reviewAttemptPhase = "pre_review_start",
             .reviewAttemptExists = false,
-            .proofVerdictExists = false,
+            .tupleVerdictExists = false,
             .reviewThreadId = @as(?[]const u8, null),
             .reviewTurnId = @as(?[]const u8, null),
             .baseSha = tuple.base_sha,
@@ -6502,7 +6066,7 @@ fn renderErrorAndExit(
             .method = method,
             .reviewAttemptPhase = errorReviewAttemptPhase(action, method),
             .reviewAttemptExists = false,
-            .proofVerdictExists = false,
+            .tupleVerdictExists = false,
             .reviewThreadId = @as(?[]const u8, null),
             .reviewTurnId = @as(?[]const u8, null),
             .baseSha = @as(?[]const u8, null),
@@ -6571,7 +6135,7 @@ fn buildPreReviewLaneTransportLostJsonAlloc(
         .method = method,
         .reviewAttemptPhase = "pre_review_start",
         .reviewAttemptExists = false,
-        .proofVerdictExists = false,
+        .tupleVerdictExists = false,
         .reviewThreadId = @as(?[]const u8, null),
         .reviewTurnId = @as(?[]const u8, null),
         .baseSha = identity.base_sha,
@@ -7263,10 +6827,10 @@ fn printStartJson(
         fallback,
     );
     defer if (review_verdict_json_opt) |value| allocator.free(value);
-    const start_proof_verdict_exists = startReceiptProofVerdictExists(allocator, review_verdict_json_opt, review_thread_id, identity, status, timed_out);
+    const start_tuple_verdict_exists = startReceiptTupleVerdictExists(allocator, review_verdict_json_opt, review_thread_id, identity, status, timed_out);
     const attempt_fields = identityReviewAttemptFields(
-        if (start_proof_verdict_exists) "normalized_verdict" else attempt_phase,
-        start_proof_verdict_exists,
+        if (start_tuple_verdict_exists) "normalized_verdict" else attempt_phase,
+        start_tuple_verdict_exists,
         review_thread_id,
         review_turn_id,
         identity,
@@ -7780,7 +7344,7 @@ fn reviewAttemptExists(review_thread_id: ?[]const u8) bool {
 
 fn identityReviewAttemptFields(
     phase: []const u8,
-    proof_verdict_exists: bool,
+    tuple_verdict_exists: bool,
     review_thread_id: ?[]const u8,
     review_turn_id: ?[]const u8,
     identity: ?TargetIdentity,
@@ -7789,7 +7353,7 @@ fn identityReviewAttemptFields(
     return .{
         .phase = phase,
         .review_attempt_exists = reviewAttemptExists(thread_id),
-        .proof_verdict_exists = proof_verdict_exists,
+        .tuple_verdict_exists = tuple_verdict_exists,
         .review_thread_id = thread_id,
         .review_turn_id = nonEmptyOptional(review_turn_id),
         .base_sha = if (identity) |value| value.base_sha else null,
@@ -7816,7 +7380,7 @@ fn startReceiptReviewAttemptPhase(status: ?ReviewStatus, timed_out: bool, failur
     return statusReviewAttemptPhase(status, timed_out);
 }
 
-fn startReceiptProofVerdictExists(
+fn startReceiptTupleVerdictExists(
     allocator: std.mem.Allocator,
     review_verdict_json_opt: ?[]const u8,
     review_thread_id: ?[]const u8,
@@ -7829,18 +7393,18 @@ fn startReceiptProofVerdictExists(
         if (!value.review_result_available) return false;
     }
     const review_verdict_json = review_verdict_json_opt orelse return false;
-    if (!reviewVerdictJsonProofVerdictExists(allocator, review_verdict_json)) return false;
-    return reviewAttemptExists(review_thread_id) and identityHasTupleProof(identity);
+    if (!reviewVerdictJsonTupleVerdictExists(allocator, review_verdict_json)) return false;
+    return reviewAttemptExists(review_thread_id) and identityHasCompleteTuple(identity);
 }
 
-fn reviewVerdictJsonProofVerdictExists(allocator: std.mem.Allocator, review_verdict_json: []const u8) bool {
+fn reviewVerdictJsonTupleVerdictExists(allocator: std.mem.Allocator, review_verdict_json: []const u8) bool {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, review_verdict_json, .{}) catch return false;
     defer parsed.deinit();
     const root = switch (parsed.value) {
         .object => |obj| obj,
         else => return false,
     };
-    return jsonBoolField(root, "proofVerdictExists") orelse false;
+    return jsonBoolField(root, "tupleVerdictExists") orelse false;
 }
 
 fn errorReviewAttemptPhase(action: []const u8, method: []const u8) []const u8 {
@@ -7860,8 +7424,8 @@ fn writeReviewAttemptFields(writer: *std.Io.Writer, fields: ReviewAttemptFields)
     try writeJsonString(writer, fields.phase);
     try writer.writeAll(",\"reviewAttemptExists\":");
     try writer.writeAll(if (fields.review_attempt_exists) "true" else "false");
-    try writer.writeAll(",\"proofVerdictExists\":");
-    try writer.writeAll(if (fields.proof_verdict_exists) "true" else "false");
+    try writer.writeAll(",\"tupleVerdictExists\":");
+    try writer.writeAll(if (fields.tuple_verdict_exists) "true" else "false");
     try writer.writeAll(",\"reviewThreadId\":");
     try writeNullableJsonString(writer, fields.review_thread_id);
     try writer.writeAll(",\"reviewTurnId\":");
@@ -7879,8 +7443,8 @@ fn writeReviewAttemptStateFields(writer: *std.Io.Writer, fields: ReviewAttemptFi
     try writeJsonString(writer, fields.phase);
     try writer.writeAll(",\"reviewAttemptExists\":");
     try writer.writeAll(if (fields.review_attempt_exists) "true" else "false");
-    try writer.writeAll(",\"proofVerdictExists\":");
-    try writer.writeAll(if (fields.proof_verdict_exists) "true" else "false");
+    try writer.writeAll(",\"tupleVerdictExists\":");
+    try writer.writeAll(if (fields.tuple_verdict_exists) "true" else "false");
 }
 
 fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]const u8 {
@@ -8006,11 +7570,6 @@ fn receiptPrincipalStrength(verdict: std.json.ObjectMap, root: std.json.ObjectMa
     return if (receiptPrincipalReduced(verdict, root)) principal_strength_reduced else principal_strength_strong;
 }
 
-fn receiptPrincipalProofUsable(verdict: std.json.ObjectMap, root: std.json.ObjectMap) bool {
-    if (optionalBoolFromVerdictOrRoot(verdict, root, "principalProofUsable")) |value| return value;
-    return !receiptPrincipalReduced(verdict, root);
-}
-
 fn optionalStringFromRootKeys(root: std.json.ObjectMap, primary: []const u8, secondary: []const u8) ?[]const u8 {
     return jsonStringField(root, primary) orelse jsonStringField(root, secondary);
 }
@@ -8060,7 +7619,7 @@ fn rootTupleMatchesIdentity(root: std.json.ObjectMap, identity: TargetIdentity) 
         optionalStringsEqual(optionalStringFromRootKey(root, "targetFingerprint"), identity.fingerprint);
 }
 
-fn rootHasTupleProof(root: std.json.ObjectMap) bool {
+fn rootHasTupleVerdictBinding(root: std.json.ObjectMap) bool {
     const base_sha = optionalStringFromRootKey(root, "baseSha") orelse return false;
     if (base_sha.len == 0) return false;
     const head_sha = optionalStringFromRootKey(root, "headSha") orelse return false;
@@ -8070,7 +7629,7 @@ fn rootHasTupleProof(root: std.json.ObjectMap) bool {
 }
 
 fn normalizedReceiptCommandSucceeded(receipt: NormalizedReceipt) bool {
-    return receipt.proof_verdict_exists and receipt.principal_proof_usable and receipt.clean;
+    return receipt.tuple_verdict_exists and receipt.clean;
 }
 
 fn verdictTupleMatchesIdentity(verdict: std.json.ObjectMap, identity: TargetIdentity) bool {
@@ -8079,7 +7638,7 @@ fn verdictTupleMatchesIdentity(verdict: std.json.ObjectMap, identity: TargetIden
         optionalStringsEqual(jsonStringField(verdict, "targetFingerprint"), identity.fingerprint);
 }
 
-fn verdictHasTupleProof(verdict: std.json.ObjectMap, root: std.json.ObjectMap, root_has_verdict: bool) bool {
+fn verdictHasTupleBinding(verdict: std.json.ObjectMap, root: std.json.ObjectMap, root_has_verdict: bool) bool {
     const base_sha = jsonStringField(verdict, "baseSha") orelse return false;
     if (base_sha.len == 0) return false;
     const head_sha = jsonStringField(verdict, "headSha") orelse return false;
@@ -8103,8 +7662,8 @@ fn terminalReceiptStatus(status: []const u8) bool {
         std.mem.eql(u8, status, "incomplete");
 }
 
-fn normalizedAttemptPhase(root: std.json.ObjectMap, status: []const u8, proof_verdict_exists: bool, review_thread_id: ?[]const u8) []const u8 {
-    if (proof_verdict_exists) return "normalized_verdict";
+fn normalizedAttemptPhase(root: std.json.ObjectMap, status: []const u8, tuple_verdict_exists: bool, review_thread_id: ?[]const u8) []const u8 {
+    if (tuple_verdict_exists) return "normalized_verdict";
     if (jsonStringField(root, "reviewAttemptPhase")) |phase| return phase;
     if (reviewAttemptExists(review_thread_id)) {
         if (std.mem.eql(u8, status, "timeout")) return "review_waiting";
@@ -8201,19 +7760,19 @@ fn normalizeReceiptFromPathAlloc(allocator: std.mem.Allocator, path: []const u8,
     return normalizeReceiptFromJsonAlloc(allocator, path, raw, recover_event_logs, context);
 }
 
-fn proofVerdictExistsForContext(verdict: std.json.ObjectMap, root: std.json.ObjectMap, root_has_verdict: bool, context: NormalizeContext) bool {
+fn tupleVerdictExistsForContext(verdict: std.json.ObjectMap, root: std.json.ObjectMap, root_has_verdict: bool, context: NormalizeContext) bool {
     if (context.requested_identity_required) {
         const requested = context.requested_identity orelse return false;
-        if (!identityHasTupleProof(requested)) return false;
+        if (!identityHasCompleteTuple(requested)) return false;
         return verdictTupleMatchesIdentity(verdict, requested) and (!root_has_verdict or rootTupleMatchesIdentity(root, requested));
     }
-    return verdictHasTupleProof(verdict, root, root_has_verdict);
+    return verdictHasTupleBinding(verdict, root, root_has_verdict);
 }
 
-fn proofBindingFailureCode(verdict: std.json.ObjectMap, root: std.json.ObjectMap, root_has_verdict: bool, context: NormalizeContext) ?[]const u8 {
+fn tupleBindingFailureCode(verdict: std.json.ObjectMap, root: std.json.ObjectMap, root_has_verdict: bool, context: NormalizeContext) ?[]const u8 {
     if (!context.requested_identity_required) return null;
     const requested = context.requested_identity orelse return "target_identity_unavailable";
-    if (!identityHasTupleProof(requested)) return "target_identity_unavailable";
+    if (!identityHasCompleteTuple(requested)) return "target_identity_unavailable";
     if (!verdictTupleMatchesIdentity(verdict, requested)) return "tuple_mismatch";
     if (root_has_verdict and !rootTupleMatchesIdentity(root, requested)) return "tuple_mismatch";
     return null;
@@ -8259,7 +7818,7 @@ fn normalizeReceiptFromJsonAlloc(allocator: std.mem.Allocator, source_path: []co
     const clean = jsonBoolField(verdict, "clean") orelse return error.MissingCleanFlag;
     const finding_count = jsonUsizeField(verdict, "findingCount") orelse return error.MissingFindingCount;
     const review_thread_id = optionalStringFromVerdictOrRoot(verdict, root, "reviewThreadId");
-    const binding_failure = proofBindingFailureCode(verdict, root, root_has_verdict, context);
+    const binding_failure = tupleBindingFailureCode(verdict, root, root_has_verdict, context);
     const account_failure = rootHasAccountResourceExhaustion(root) or
         if (optionalStringFromVerdictOrRoot(verdict, root, "failureCode")) |code| failureCodeIsAccountResourceExhausted(code) else false;
     const final_failure_code = binding_failure orelse if (account_failure) "account_resource_exhausted" else optionalStringFromVerdictOrRoot(verdict, root, "failureCode");
@@ -8271,13 +7830,13 @@ fn normalizeReceiptFromJsonAlloc(allocator: std.mem.Allocator, source_path: []co
         "account_resource_exhausted"
     else
         canonicalReceiptStatus(receipt_status, final_failure_code, review_thread_id);
-    const proof_verdict_exists = binding_failure == null and
-        reviewVerdictStatusIsProof(final_status) and
-        proofVerdictExistsForContext(verdict, root, root_has_verdict, context);
+    const tuple_verdict_exists = binding_failure == null and
+        reviewVerdictStatusIsTupleTerminal(final_status) and
+        tupleVerdictExistsForContext(verdict, root, root_has_verdict, context);
     const final_clean = if (binding_failure != null) false else clean;
     const final_failure_hint = if (binding_failure) |code|
         if (std.mem.eql(u8, code, "target_identity_unavailable"))
-            "requested target identity could not be computed for normalized receipt proof"
+            "requested target identity could not be computed for receipt normalization"
         else
             "reviewVerdict tuple did not match the requested target identity"
     else if (account_failure) account_resource_exhausted_hint else optionalStringFromVerdictOrRoot(verdict, root, "failureHint");
@@ -8286,14 +7845,13 @@ fn normalizeReceiptFromJsonAlloc(allocator: std.mem.Allocator, source_path: []co
     const review_attempt_phase = if (account_failure and reviewAttemptExists(review_thread_id))
         "review_terminal"
     else
-        normalizedAttemptPhase(root, final_status, proof_verdict_exists, review_thread_id);
+        normalizedAttemptPhase(root, final_status, tuple_verdict_exists, review_thread_id);
     const findings_json = if (verdict.get("findings")) |value|
         try stringifyJsonValueAlloc(allocator, value)
     else
         try allocator.dupe(u8, "[]");
     const account_fingerprint_reduced_protection = receiptPrincipalReduced(verdict, root);
     const principal_strength = receiptPrincipalStrength(verdict, root);
-    const principal_proof_usable = proof_verdict_exists and receiptPrincipalProofUsable(verdict, root);
 
     return .{
         .source_path = try allocator.dupe(u8, source_path),
@@ -8303,9 +7861,8 @@ fn normalizeReceiptFromJsonAlloc(allocator: std.mem.Allocator, source_path: []co
         .finding_count = finding_count,
         .review_attempt_phase = try allocator.dupe(u8, review_attempt_phase),
         .review_attempt_exists = reviewAttemptExists(review_thread_id),
-        .proof_verdict_exists = proof_verdict_exists,
+        .tuple_verdict_exists = tuple_verdict_exists,
         .principal_strength = principal_strength,
-        .principal_proof_usable = principal_proof_usable,
         .account_fingerprint_reduced_protection = account_fingerprint_reduced_protection,
         .base_sha = try dupOptional(allocator, optionalStringFromVerdictOrRoot(verdict, root, "baseSha")),
         .head_sha = try dupOptional(allocator, optionalStringFromVerdictOrRoot(verdict, root, "headSha")),
@@ -8342,21 +7899,19 @@ fn normalizeAttemptOnlyReceiptAlloc(allocator: std.mem.Allocator, source_path: [
     else
         "incomplete";
     _ = context;
-    const proof_verdict_exists = false;
+    const tuple_verdict_exists = false;
     const account_fingerprint_reduced_protection = receiptPrincipalReduced(root, root);
     const principal_strength = receiptPrincipalStrength(root, root);
-    const principal_proof_usable = proof_verdict_exists and receiptPrincipalProofUsable(root, root);
     return .{
         .source_path = try allocator.dupe(u8, source_path),
         .status = try allocator.dupe(u8, status),
         .backend_class = try allocator.dupe(u8, if (attemptOnlyReceiptIsLaneBackend(root)) "cas-lane" else "cas-receipt-normalized"),
         .clean = false,
         .finding_count = 0,
-        .review_attempt_phase = try allocator.dupe(u8, normalizedAttemptPhase(root, status, proof_verdict_exists, review_thread_id)),
+        .review_attempt_phase = try allocator.dupe(u8, normalizedAttemptPhase(root, status, tuple_verdict_exists, review_thread_id)),
         .review_attempt_exists = reviewAttemptExists(review_thread_id),
-        .proof_verdict_exists = proof_verdict_exists,
+        .tuple_verdict_exists = tuple_verdict_exists,
         .principal_strength = principal_strength,
-        .principal_proof_usable = principal_proof_usable,
         .account_fingerprint_reduced_protection = account_fingerprint_reduced_protection,
         .base_sha = try dupOptional(allocator, jsonStringField(root, "baseSha")),
         .head_sha = try dupOptional(allocator, jsonStringField(root, "headSha")),
@@ -8408,7 +7963,7 @@ fn normalizeStartReceiptAlloc(allocator: std.mem.Allocator, source_path: []const
         "incomplete";
     const binding_failure = if (context.requested_identity_required) blk: {
         const requested = context.requested_identity orelse break :blk "target_identity_unavailable";
-        if (!identityHasTupleProof(requested)) break :blk "target_identity_unavailable";
+        if (!identityHasCompleteTuple(requested)) break :blk "target_identity_unavailable";
         break :blk if (rootTupleMatchesIdentity(root, requested)) @as(?[]const u8, null) else "tuple_mismatch";
     } else null;
     const final_status = if (binding_failure != null) "incomplete" else status;
@@ -8416,33 +7971,31 @@ fn normalizeStartReceiptAlloc(allocator: std.mem.Allocator, source_path: []const
     const final_failure_code = binding_failure orelse if (account_failure) "account_resource_exhausted" else failure_code;
     const final_failure_hint = if (binding_failure) |code|
         if (std.mem.eql(u8, code, "target_identity_unavailable"))
-            "requested target identity could not be computed for normalized receipt proof"
+            "requested target identity could not be computed for receipt normalization"
         else
             "reviewVerdict tuple did not match the requested target identity"
     else if (account_failure) account_resource_exhausted_hint else jsonStringField(root, "failureHint");
     const final_failure_class = jsonStringField(root, "failureClass") orelse failureClassForCode(final_failure_code);
     const final_retryable_same_tuple_now = jsonBoolField(root, "retryableSameTupleNow") orelse retryableSameTupleNowForCode(final_failure_code);
-    const proof_verdict_exists = binding_failure == null and
-        reviewVerdictStatusIsProof(final_status) and
+    const tuple_verdict_exists = binding_failure == null and
+        reviewVerdictStatusIsTupleTerminal(final_status) and
         if (context.requested_identity_required)
             rootTupleMatchesIdentity(root, context.requested_identity.?)
         else
-            rootHasTupleProof(root);
+            rootHasTupleVerdictBinding(root);
     const findings_json = compactFindingsJsonAlloc(allocator, review_result_json) catch try allocator.dupe(u8, "[]");
     const account_fingerprint_reduced_protection = receiptPrincipalReduced(root, root);
     const principal_strength = receiptPrincipalStrength(root, root);
-    const principal_proof_usable = proof_verdict_exists and receiptPrincipalProofUsable(root, root);
     return .{
         .source_path = try allocator.dupe(u8, source_path),
         .status = try allocator.dupe(u8, final_status),
         .backend_class = try allocator.dupe(u8, if (std.mem.eql(u8, jsonStringField(root, "fallbackTransport") orelse "", "native-review")) "cas-native-fallback" else "cas-start-wait"),
         .clean = final_clean,
         .finding_count = finding_count,
-        .review_attempt_phase = try allocator.dupe(u8, normalizedAttemptPhase(root, final_status, proof_verdict_exists, review_thread_id)),
+        .review_attempt_phase = try allocator.dupe(u8, normalizedAttemptPhase(root, final_status, tuple_verdict_exists, review_thread_id)),
         .review_attempt_exists = reviewAttemptExists(review_thread_id),
-        .proof_verdict_exists = proof_verdict_exists,
+        .tuple_verdict_exists = tuple_verdict_exists,
         .principal_strength = principal_strength,
-        .principal_proof_usable = principal_proof_usable,
         .account_fingerprint_reduced_protection = account_fingerprint_reduced_protection,
         .base_sha = try dupOptional(allocator, jsonStringField(root, "baseSha")),
         .head_sha = try dupOptional(allocator, jsonStringField(root, "headSha")),
@@ -8538,7 +8091,7 @@ fn normalizeStoredSessionRecordReceiptAlloc(allocator: std.mem.Allocator, source
     const findings_json = compactFindingsJsonAlloc(allocator, review_result_json) catch try allocator.dupe(u8, "[]");
     const binding_failure = if (context.requested_identity_required) blk: {
         const requested = context.requested_identity orelse break :blk "target_identity_unavailable";
-        if (!identityHasTupleProof(requested)) break :blk "target_identity_unavailable";
+        if (!identityHasCompleteTuple(requested)) break :blk "target_identity_unavailable";
         break :blk if (rootTupleMatchesIdentity(root, requested)) @as(?[]const u8, null) else "tuple_mismatch";
     } else null;
     const final_status = if (binding_failure != null) "incomplete" else status;
@@ -8546,20 +8099,20 @@ fn normalizeStoredSessionRecordReceiptAlloc(allocator: std.mem.Allocator, source
     const final_failure_code = binding_failure orelse failure_code;
     const final_failure_hint = if (binding_failure) |code|
         if (std.mem.eql(u8, code, "target_identity_unavailable"))
-            "requested target identity could not be computed for normalized receipt proof"
+            "requested target identity could not be computed for receipt normalization"
         else
             "stored review session tuple did not match the requested target identity"
     else
         failure_hint;
     const final_failure_class = failureClassForCode(final_failure_code);
     const final_retryable_same_tuple_now = retryableSameTupleNowForCode(final_failure_code);
-    const proof_verdict_exists = binding_failure == null and
-        reviewVerdictStatusIsProof(final_status) and
+    const tuple_verdict_exists = binding_failure == null and
+        reviewVerdictStatusIsTupleTerminal(final_status) and
         if (context.requested_identity_required)
             rootTupleMatchesIdentity(root, context.requested_identity.?)
         else
-            rootHasTupleProof(root);
-    const review_attempt_phase = if (proof_verdict_exists)
+            rootHasTupleVerdictBinding(root);
+    const review_attempt_phase = if (tuple_verdict_exists)
         "normalized_verdict"
     else if (isTerminalTurnStatus(jsonStringField(root, "last_observed_status") orelse ""))
         "review_terminal"
@@ -8567,7 +8120,6 @@ fn normalizeStoredSessionRecordReceiptAlloc(allocator: std.mem.Allocator, source
         "review_waiting";
     const account_fingerprint_reduced_protection = receiptPrincipalReduced(root, root);
     const principal_strength = receiptPrincipalStrength(root, root);
-    const principal_proof_usable = proof_verdict_exists and receiptPrincipalProofUsable(root, root);
 
     return .{
         .source_path = try allocator.dupe(u8, source_path),
@@ -8577,9 +8129,8 @@ fn normalizeStoredSessionRecordReceiptAlloc(allocator: std.mem.Allocator, source
         .finding_count = finding_count,
         .review_attempt_phase = try allocator.dupe(u8, review_attempt_phase),
         .review_attempt_exists = true,
-        .proof_verdict_exists = proof_verdict_exists,
+        .tuple_verdict_exists = tuple_verdict_exists,
         .principal_strength = principal_strength,
-        .principal_proof_usable = principal_proof_usable,
         .account_fingerprint_reduced_protection = account_fingerprint_reduced_protection,
         .base_sha = try dupOptional(allocator, optionalStringFromRootKeys(root, "baseSha", "base_sha")),
         .head_sha = try dupOptional(allocator, optionalStringFromRootKeys(root, "headSha", "head_sha")),
@@ -8611,7 +8162,7 @@ fn summarizeReceipts(receipts: []const NormalizedReceipt) ReceiptSummary {
 }
 
 fn receiptAttemptKey(receipt: NormalizedReceipt) ?[]const u8 {
-    if (!receipt.review_attempt_exists or !receipt.proof_verdict_exists) return null;
+    if (!receipt.review_attempt_exists or !receipt.tuple_verdict_exists) return null;
     return nonEmptyOptional(receipt.review_thread_id);
 }
 
@@ -8619,505 +8170,6 @@ fn receiptHasCompleteTuple(receipt: NormalizedReceipt) bool {
     return nonEmptyOptional(receipt.base_sha) != null and
         nonEmptyOptional(receipt.head_sha) != null and
         nonEmptyOptional(receipt.target_fingerprint) != null;
-}
-
-fn receiptTupleMatchesProof(proof: ReceiptProof, receipt: NormalizedReceipt) bool {
-    if (proof.tuple_base_sha == null or proof.tuple_head_sha == null or proof.tuple_target_fingerprint == null) return true;
-    return std.mem.eql(u8, proof.tuple_base_sha.?, receipt.base_sha orelse "") and
-        std.mem.eql(u8, proof.tuple_head_sha.?, receipt.head_sha orelse "") and
-        std.mem.eql(u8, proof.tuple_target_fingerprint.?, receipt.target_fingerprint orelse "");
-}
-
-fn receiptMatchesRequiredReviewTuple(receipt: NormalizedReceipt, tuple: ReviewTupleIdentity) bool {
-    if (tuple.base_sha == null or tuple.head_sha == null) return false;
-    return std.mem.eql(u8, receipt.base_sha orelse "", tuple.base_sha.?) and
-        std.mem.eql(u8, receipt.head_sha orelse "", tuple.head_sha.?) and
-        std.mem.eql(u8, receipt.target_fingerprint orelse "", tuple.target_fingerprint) and
-        std.mem.eql(u8, receipt.repo_realpath orelse "", tuple.repo_realpath) and
-        std.mem.eql(u8, receipt.resolved_codex_path orelse "", tuple.resolved_codex_path) and
-        std.mem.eql(u8, receipt.resolved_codex_version orelse "", tuple.resolved_codex_version) and
-        std.mem.eql(u8, receipt.account_fingerprint orelse "", tuple.account_fingerprint);
-}
-
-fn stringSliceContains(values: []const []const u8, needle: []const u8) bool {
-    for (values) |value| {
-        if (std.mem.eql(u8, value, needle)) return true;
-    }
-    return false;
-}
-
-fn nonProofReceiptBlocksCloseout(receipt: NormalizedReceipt) bool {
-    return std.mem.eql(u8, receipt.status, "account_resource_exhausted") or
-        std.mem.eql(u8, receipt.review_attempt_phase, "review_terminal") or
-        std.mem.eql(u8, receipt.review_attempt_phase, "review_waiting");
-}
-
-fn computeReceiptProof(
-    allocator: std.mem.Allocator,
-    receipts: []const NormalizedReceipt,
-    required_clean_streak: u32,
-    allow_reduced_principal_reason: ?[]const u8,
-    required_review_tuple: ?ReviewTupleIdentity,
-    forbid_findings_resets: bool,
-) !ReceiptProof {
-    var proof = ReceiptProof{
-        .required_clean_streak = required_clean_streak,
-        .reduced_principal_override_reason = allow_reduced_principal_reason,
-    };
-    if (required_review_tuple) |tuple| {
-        proof.tuple_base_sha = tuple.base_sha;
-        proof.tuple_head_sha = tuple.head_sha;
-        proof.tuple_target_fingerprint = tuple.target_fingerprint;
-    }
-    var seen: std.ArrayList([]const u8) = .empty;
-    defer seen.deinit(allocator);
-    for (receipts) |receipt| {
-        if (!receipt.review_attempt_exists) {
-            proof.ignored_no_attempt += 1;
-            continue;
-        }
-        if (!receipt.proof_verdict_exists) {
-            proof.ignored_non_proof += 1;
-            if (required_review_tuple) |tuple| {
-                if (!receiptHasCompleteTuple(receipt) or !receiptMatchesRequiredReviewTuple(receipt, tuple)) {
-                    continue;
-                }
-            }
-            if (nonProofReceiptBlocksCloseout(receipt)) {
-                proof.blocker_count += 1;
-                proof.blocker_status = receipt.status;
-            }
-            continue;
-        }
-        const attempt_key = receiptAttemptKey(receipt) orelse {
-            proof.ignored_non_proof += 1;
-            continue;
-        };
-        if (!receiptHasCompleteTuple(receipt)) {
-            proof.ignored_non_proof += 1;
-            continue;
-        }
-        if (required_review_tuple) |tuple| {
-            if (!receiptMatchesRequiredReviewTuple(receipt, tuple)) {
-                proof.ignored_non_proof += 1;
-                proof.tuple_mismatch_count += 1;
-                continue;
-            }
-        } else if (proof.tuple_base_sha == null) {
-            proof.tuple_base_sha = receipt.base_sha;
-            proof.tuple_head_sha = receipt.head_sha;
-            proof.tuple_target_fingerprint = receipt.target_fingerprint;
-        } else if (!receiptTupleMatchesProof(proof, receipt)) {
-            proof.ignored_non_proof += 1;
-            proof.tuple_mismatch_count += 1;
-            continue;
-        }
-        if (stringSliceContains(seen.items, attempt_key)) {
-            proof.duplicate_attempts += 1;
-            continue;
-        }
-        try seen.append(allocator, attempt_key);
-        const reduced_principal = !receipt.principal_proof_usable;
-        if (reduced_principal and allow_reduced_principal_reason == null) {
-            proof.reduced_principal_attempts += 1;
-            proof.ignored_non_proof += 1;
-            continue;
-        }
-        if (reduced_principal) {
-            proof.reduced_principal_attempts += 1;
-            proof.reduced_principal_override_used = true;
-        }
-        proof.attempts_considered += 1;
-        if (std.mem.eql(u8, receipt.status, "clean") and receipt.clean and receipt.finding_count == 0) {
-            proof.current_clean_streak += 1;
-            if (!reduced_principal) proof.strict_clean_streak += 1;
-        } else if (std.mem.eql(u8, receipt.status, "findings") or receipt.finding_count > 0) {
-            proof.current_clean_streak = 0;
-            proof.strict_clean_streak = 0;
-            proof.reset_count += 1;
-            proof.reset_by_attempt_key = attempt_key;
-        } else if (std.mem.eql(u8, receipt.status, "account_resource_exhausted")) {
-            proof.current_clean_streak = 0;
-            proof.strict_clean_streak = 0;
-            proof.blocker_count += 1;
-            proof.blocker_status = receipt.status;
-        } else {
-            proof.current_clean_streak = 0;
-            proof.strict_clean_streak = 0;
-            proof.blocker_count += 1;
-            proof.blocker_status = receipt.status;
-        }
-    }
-    proof.satisfied = proof.blocker_count == 0 and
-        (!forbid_findings_resets or proof.reset_count == 0) and
-        proof.current_clean_streak >= required_clean_streak;
-    return proof;
-}
-
-fn writeReceiptProofAttemptsJson(allocator: std.mem.Allocator, writer: *std.Io.Writer, receipts: []const NormalizedReceipt, allow_reduced_principal_reason: ?[]const u8) !void {
-    var seen: std.ArrayList([]const u8) = .empty;
-    defer seen.deinit(allocator);
-    var wrote_any = false;
-    for (receipts) |receipt| {
-        const attempt_key = receiptAttemptKey(receipt) orelse continue;
-        if (stringSliceContains(seen.items, attempt_key)) continue;
-        try seen.append(allocator, attempt_key);
-        if (!receipt.principal_proof_usable and allow_reduced_principal_reason == null) continue;
-        if (wrote_any) try writer.writeByte(',');
-        wrote_any = true;
-        try writer.writeByte('{');
-        try writeJsonString(writer, "attemptKey");
-        try writer.writeByte(':');
-        try writeJsonString(writer, attempt_key);
-        try writer.writeByte(',');
-        try writeJsonString(writer, "status");
-        try writer.writeByte(':');
-        try writeJsonString(writer, receipt.status);
-        try writer.writeByte(',');
-        try writeJsonString(writer, "clean");
-        try writer.writeByte(':');
-        try writer.writeAll(if (receipt.clean) "true" else "false");
-        try writer.writeByte(',');
-        try writeJsonString(writer, "findingCount");
-        try writer.writeByte(':');
-        try writer.print("{d}", .{receipt.finding_count});
-        try writer.writeByte(',');
-        try writeJsonString(writer, "principalStrength");
-        try writer.writeByte(':');
-        try writeJsonString(writer, receipt.principal_strength);
-        try writer.writeByte(',');
-        try writeJsonString(writer, "principalProofUsable");
-        try writer.writeByte(':');
-        try writer.writeAll(if (receipt.principal_proof_usable) "true" else "false");
-        try writer.writeByte(',');
-        try writeJsonString(writer, "accountFingerprintReducedProtection");
-        try writer.writeByte(':');
-        try writer.writeAll(if (receipt.account_fingerprint_reduced_protection) "true" else "false");
-        try writer.writeByte(',');
-        try writeJsonString(writer, "sourcePath");
-        try writer.writeByte(':');
-        try writeJsonString(writer, receipt.source_path);
-        try writer.writeByte(',');
-        try writeJsonString(writer, "recordPath");
-        try writer.writeByte(':');
-        try writeNullableJsonString(writer, receipt.record_path);
-        try writer.writeByte('}');
-    }
-}
-
-fn printReceiptProofJson(allocator: std.mem.Allocator, proof: ReceiptProof, receipts: []const NormalizedReceipt, errors: []const ReceiptError) !void {
-    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-    const stdout = &stdout_writer.interface;
-    try stdout.writeAll("{\"schemaVersion\":\"cas-review-proof-v2\",\"surface\":\"proof\",\"passed\":");
-    try stdout.writeAll(if (proof.satisfied) "true" else "false");
-    try stdout.writeAll(",\"closeoutEligible\":false,\"overrideUsed\":");
-    try stdout.writeAll(if (proof.reduced_principal_override_used) "true" else "false");
-    try stdout.writeAll(",\"overrideFlags\":[");
-    if (proof.reduced_principal_override_used) try writeJsonString(stdout, "allow-reduced-principal");
-    try stdout.writeAll("],\"requiredCleanStreak\":");
-    try stdout.print("{d}", .{proof.required_clean_streak});
-    try stdout.writeAll(",\"observedCleanStreakUnderAssumptions\":");
-    try stdout.print("{d}", .{proof.current_clean_streak});
-    try stdout.writeAll(",\"strictCleanStreak\":");
-    try stdout.print("{d}", .{proof.strict_clean_streak});
-    try stdout.writeAll(",\"currentCleanStreak\":");
-    try stdout.print("{d}", .{proof.current_clean_streak});
-    try stdout.writeAll(",\"attemptsConsideredCount\":");
-    try stdout.print("{d}", .{proof.attempts_considered});
-    try stdout.writeAll(",\"duplicateAttemptCount\":");
-    try stdout.print("{d}", .{proof.duplicate_attempts});
-    try stdout.writeAll(",\"ignoredNoAttemptCount\":");
-    try stdout.print("{d}", .{proof.ignored_no_attempt});
-    try stdout.writeAll(",\"ignoredNonProofCount\":");
-    try stdout.print("{d}", .{proof.ignored_non_proof});
-    try stdout.writeAll(",\"ignoredNonProofReasons\":[");
-    try writeReceiptProofIgnoredReasons(stdout, proof);
-    try stdout.writeAll("]");
-    try stdout.writeAll(",\"tupleMismatchCount\":");
-    try stdout.print("{d}", .{proof.tuple_mismatch_count});
-    try stdout.writeAll(",\"reducedPrincipalAttemptCount\":");
-    try stdout.print("{d}", .{proof.reduced_principal_attempts});
-    try stdout.writeAll(",\"reducedPrincipalOverrideUsed\":");
-    try stdout.writeAll(if (proof.reduced_principal_override_used) "true" else "false");
-    try stdout.writeAll(",\"reducedPrincipalOverrideReason\":");
-    try writeNullableJsonString(stdout, proof.reduced_principal_override_reason);
-    try stdout.writeAll(",\"blockerCount\":");
-    try stdout.print("{d}", .{proof.blocker_count});
-    try stdout.writeAll(",\"resetCount\":");
-    try stdout.print("{d}", .{proof.reset_count});
-    try stdout.writeAll(",\"resetByAttemptKey\":");
-    try writeNullableJsonString(stdout, proof.reset_by_attempt_key);
-    try stdout.writeAll(",\"blockerStatus\":");
-    try writeNullableJsonString(stdout, proof.blocker_status);
-    try stdout.writeAll(",\"policyFailures\":[");
-    try writeReceiptProofPolicyFailures(stdout, proof);
-    try stdout.writeAll("],\"nextLegalMove\":");
-    try writeJsonString(stdout, receiptProofNextLegalMoveWithErrors(proof, errors, "run_certify_without_overrides"));
-    try stdout.writeAll(",\"attemptsConsidered\":[");
-    try writeReceiptProofAttemptsJson(allocator, stdout, receipts, proof.reduced_principal_override_reason);
-    try stdout.writeAll("],\"errors\":[");
-    for (errors, 0..) |err, i| {
-        if (i > 0) try stdout.writeByte(',');
-        try writeReceiptErrorObject(stdout, err);
-    }
-    try stdout.writeAll("]}\n");
-}
-
-fn writeReceiptProofIgnoredReasons(writer: *std.Io.Writer, proof: ReceiptProof) !void {
-    var wrote = false;
-    if (proof.reduced_principal_attempts > 0) {
-        try writeJsonString(writer, "reduced_principal");
-        wrote = true;
-    }
-    if (proof.tuple_mismatch_count > 0) {
-        if (wrote) try writer.writeByte(',');
-        try writeJsonString(writer, "tuple_mismatch");
-        wrote = true;
-    }
-    if (proof.duplicate_attempts > 0) {
-        if (wrote) try writer.writeByte(',');
-        try writeJsonString(writer, "duplicate_cached_replay");
-        wrote = true;
-    }
-    if (proof.ignored_no_attempt > 0) {
-        if (wrote) try writer.writeByte(',');
-        try writeJsonString(writer, "proof_verdict_missing");
-    }
-}
-
-fn writeReceiptProofPolicyFailures(writer: *std.Io.Writer, proof: ReceiptProof) !void {
-    var wrote = false;
-    if (proof.reset_count > 0) {
-        try writeJsonString(writer, "findings");
-        wrote = true;
-    }
-    if (proof.blocker_status) |status| {
-        if (wrote) try writer.writeByte(',');
-        try writeJsonString(writer, status);
-    }
-}
-
-fn receiptProofNextLegalMove(proof: ReceiptProof) []const u8 {
-    if (proof.blocker_count > 0) return "resolve_policy_failure_before_certify";
-    if (proof.reset_count > 0) return "resolve_policy_failure_before_certify";
-    if (proof.strict_clean_streak < proof.required_clean_streak) return "run_one_fresh_same_tuple_attempt_with_strong_principal";
-    return "run_certify_without_overrides";
-}
-
-fn receiptProofCertifiedWithoutErrors(proof: ReceiptProof, errors: []const ReceiptError) bool {
-    return proof.satisfied and errors.len == 0;
-}
-
-fn receiptProofNextLegalMoveWithErrors(proof: ReceiptProof, errors: []const ReceiptError, certified_move: []const u8) []const u8 {
-    if (errors.len > 0) return "resolve_scan_errors_before_certify";
-    if (proof.satisfied) return certified_move;
-    return receiptProofNextLegalMove(proof);
-}
-
-fn printReceiptCertifyForbiddenJson(flag: []const u8) !void {
-    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-    const stdout = &stdout_writer.interface;
-    try stdout.writeAll("{\"schemaVersion\":\"cas-review-certify-v2\",\"surface\":\"certify\",\"certified\":false,\"closeoutEligible\":false,\"overrideUsed\":true,\"failureCode\":\"forbidden_certify_override\",\"forbiddenFlags\":[");
-    try writeJsonString(stdout, flag);
-    try stdout.writeAll("]}\n");
-}
-
-fn printReceiptTupleContextFailureJson(surface: []const u8, error_name: []const u8) !void {
-    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-    const stdout = &stdout_writer.interface;
-    const schema = if (std.mem.eql(u8, surface, "closeout")) "cas-review-closeout-v1" else "cas-review-certify-v2";
-    try stdout.writeAll("{\"schemaVersion\":");
-    try writeJsonString(stdout, schema);
-    try stdout.writeAll(",\"surface\":");
-    try writeJsonString(stdout, surface);
-    try stdout.writeAll(",\"certified\":false,\"closeoutEligible\":true,\"failureCode\":\"tuple_context_unavailable\",\"failureHint\":\"CAS could not establish the current Codex tuple/account context for closeout proof\",\"errors\":[{\"sourcePath\":\"<tuple-context>\",\"error\":");
-    try writeJsonString(stdout, error_name);
-    try stdout.writeAll("}]}\n");
-}
-
-fn writeReceiptCertifyCountedReceipts(allocator: std.mem.Allocator, writer: *std.Io.Writer, proof: ReceiptProof, receipts: []const NormalizedReceipt, required_review_tuple: ?ReviewTupleIdentity) !void {
-    var seen: std.ArrayList([]const u8) = .empty;
-    defer seen.deinit(allocator);
-    var wrote_any = false;
-    for (receipts) |receipt| {
-        if (!receipt.review_attempt_exists or !receipt.proof_verdict_exists or !receiptHasCompleteTuple(receipt)) continue;
-        if (required_review_tuple) |tuple| {
-            if (!receiptMatchesRequiredReviewTuple(receipt, tuple)) continue;
-        } else if (!receiptTupleMatchesProof(proof, receipt)) continue;
-        if (!receipt.principal_proof_usable) continue;
-        if (!std.mem.eql(u8, receipt.status, "clean") or !receipt.clean or receipt.finding_count != 0) continue;
-        const attempt_key = receiptAttemptKey(receipt) orelse continue;
-        if (stringSliceContains(seen.items, attempt_key)) continue;
-        try seen.append(allocator, attempt_key);
-        if (wrote_any) try writer.writeByte(',');
-        wrote_any = true;
-        try writer.writeByte('{');
-        try writeJsonString(writer, "receiptPath");
-        try writer.writeByte(':');
-        try writeJsonString(writer, receipt.source_path);
-        try writer.writeByte(',');
-        try writeJsonString(writer, "reviewThreadId");
-        try writer.writeByte(':');
-        try writeNullableJsonString(writer, receipt.review_thread_id);
-        try writer.writeByte(',');
-        try writeJsonString(writer, "reviewTurnId");
-        try writer.writeByte(':');
-        try writeNullableJsonString(writer, receipt.review_turn_id);
-        try writer.writeByte(',');
-        try writeJsonString(writer, "attemptId");
-        try writer.writeByte(':');
-        try writeJsonString(writer, attempt_key);
-        try writer.writeByte(',');
-        try writeJsonString(writer, "backendClass");
-        try writer.writeByte(':');
-        try writeJsonString(writer, receipt.backend_class);
-        try writer.writeByte(',');
-        try writeJsonString(writer, "principalKind");
-        try writer.writeByte(':');
-        try writeJsonString(writer, receipt.principal_strength);
-        try writer.writeByte('}');
-    }
-}
-
-fn printReceiptCertifyJson(allocator: std.mem.Allocator, proof: ReceiptProof, receipts: []const NormalizedReceipt, errors: []const ReceiptError, repo_realpath: ?[]const u8, required_review_tuple: ?ReviewTupleIdentity) !void {
-    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-    const stdout = &stdout_writer.interface;
-    const certified = receiptProofCertifiedWithoutErrors(proof, errors);
-    try stdout.writeAll("{\"schemaVersion\":\"cas-review-certify-v2\",\"surface\":\"certify\",\"certified\":");
-    try stdout.writeAll(if (certified) "true" else "false");
-    try stdout.writeAll(",\"closeoutEligible\":true,\"overrideUsed\":false,\"requiredCleanStreak\":");
-    try stdout.print("{d}", .{proof.required_clean_streak});
-    try stdout.writeAll(",\"currentCleanStreak\":");
-    try stdout.print("{d}", .{proof.current_clean_streak});
-    try stdout.writeAll(",\"ignoredNonProofCount\":");
-    try stdout.print("{d}", .{proof.ignored_non_proof});
-    try stdout.writeAll(",\"ignoredNonProofReasons\":[");
-    try writeReceiptProofIgnoredReasons(stdout, proof);
-    try stdout.writeAll("],\"policyFailures\":[");
-    try writeReceiptProofPolicyFailures(stdout, proof);
-    try stdout.writeAll("],\"duplicateCachedReceiptInflation\":");
-    try stdout.writeAll(if (proof.duplicate_attempts > 0) "true" else "false");
-    try stdout.writeAll(",\"tuple\":{\"repo\":");
-    try writeNullableJsonString(stdout, repo_realpath);
-    try stdout.writeAll(",\"baseSha\":");
-    try writeNullableJsonString(stdout, proof.tuple_base_sha);
-    try stdout.writeAll(",\"headSha\":");
-    try writeNullableJsonString(stdout, proof.tuple_head_sha);
-    try stdout.writeAll(",\"targetFingerprint\":");
-    try writeNullableJsonString(stdout, proof.tuple_target_fingerprint);
-    try stdout.writeAll(",\"resolvedCodexPath\":");
-    if (required_review_tuple) |tuple| try writeJsonString(stdout, tuple.resolved_codex_path) else try stdout.writeAll("null");
-    try stdout.writeAll(",\"resolvedCodexVersion\":");
-    if (required_review_tuple) |tuple| try writeJsonString(stdout, tuple.resolved_codex_version) else try stdout.writeAll("null");
-    try stdout.writeAll(",\"accountFingerprint\":");
-    if (required_review_tuple) |tuple| try writeJsonString(stdout, tuple.account_fingerprint) else try stdout.writeAll("null");
-    try stdout.writeAll(",\"accountFingerprintReducedProtection\":");
-    if (required_review_tuple) |tuple| try stdout.writeAll(if (tuple.account_fingerprint_reduced_protection) "true" else "false") else try stdout.writeAll("null");
-    try stdout.writeAll("},\"countedReceipts\":[");
-    try writeReceiptCertifyCountedReceipts(allocator, stdout, proof, receipts, required_review_tuple);
-    try stdout.writeAll("],\"nextLegalMove\":");
-    try writeJsonString(stdout, receiptProofNextLegalMoveWithErrors(proof, errors, "none"));
-    try stdout.writeAll(",\"errors\":[");
-    for (errors, 0..) |err, i| {
-        if (i > 0) try stdout.writeByte(',');
-        try writeReceiptErrorObject(stdout, err);
-    }
-    try stdout.writeAll("]}\n");
-}
-
-fn writeCloseoutChildRunsJson(writer: *std.Io.Writer, child_runs: []const CloseoutRunSummary) !void {
-    for (child_runs, 0..) |run, i| {
-        if (i > 0) try writer.writeByte(',');
-        try writer.writeByte('{');
-        try writeJsonString(writer, "runNumber");
-        try writer.writeByte(':');
-        try writer.print("{d}", .{run.run_number});
-        try writer.writeByte(',');
-        try writeJsonString(writer, "exitCode");
-        try writer.writeByte(':');
-        try writer.print("{d}", .{run.exit_code});
-        try writer.writeByte(',');
-        try writeJsonString(writer, "freshAttemptReason");
-        try writer.writeByte(':');
-        try writeNullableJsonString(writer, run.fresh_attempt_reason);
-        try writer.writeByte(',');
-        try writeJsonString(writer, "stdoutBytes");
-        try writer.writeByte(':');
-        try writer.print("{d}", .{run.stdout_bytes});
-        try writer.writeByte(',');
-        try writeJsonString(writer, "stderrBytes");
-        try writer.writeByte(':');
-        try writer.print("{d}", .{run.stderr_bytes});
-        try writer.writeByte(',');
-        try writeJsonString(writer, "failureStdout");
-        try writer.writeByte(':');
-        try writeNullableJsonString(writer, run.failure_stdout);
-        try writer.writeByte('}');
-    }
-}
-
-fn printReceiptCloseoutJson(allocator: std.mem.Allocator, proof: ReceiptProof, receipts: []const NormalizedReceipt, errors: []const ReceiptError, repo_realpath: ?[]const u8, child_runs: []const CloseoutRunSummary, dry_run: bool, required_review_tuple: ?ReviewTupleIdentity) !void {
-    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-    const stdout = &stdout_writer.interface;
-    const certified = receiptProofCertifiedWithoutErrors(proof, errors);
-    try stdout.writeAll("{\"schemaVersion\":\"cas-review-closeout-v1\",\"surface\":\"closeout\",\"certified\":");
-    try stdout.writeAll(if (certified) "true" else "false");
-    try stdout.writeAll(",\"closeoutEligible\":true,\"dryRun\":");
-    try stdout.writeAll(if (dry_run) "true" else "false");
-    try stdout.writeAll(",\"tuple\":{\"repo\":");
-    try writeNullableJsonString(stdout, repo_realpath);
-    try stdout.writeAll(",\"baseSha\":");
-    try writeNullableJsonString(stdout, proof.tuple_base_sha);
-    try stdout.writeAll(",\"headSha\":");
-    try writeNullableJsonString(stdout, proof.tuple_head_sha);
-    try stdout.writeAll(",\"targetFingerprint\":");
-    try writeNullableJsonString(stdout, proof.tuple_target_fingerprint);
-    try stdout.writeAll(",\"resolvedCodexPath\":");
-    if (required_review_tuple) |tuple| try writeJsonString(stdout, tuple.resolved_codex_path) else try stdout.writeAll("null");
-    try stdout.writeAll(",\"resolvedCodexVersion\":");
-    if (required_review_tuple) |tuple| try writeJsonString(stdout, tuple.resolved_codex_version) else try stdout.writeAll("null");
-    try stdout.writeAll(",\"accountFingerprint\":");
-    if (required_review_tuple) |tuple| try writeJsonString(stdout, tuple.account_fingerprint) else try stdout.writeAll("null");
-    try stdout.writeAll(",\"accountFingerprintReducedProtection\":");
-    if (required_review_tuple) |tuple| try stdout.writeAll(if (tuple.account_fingerprint_reduced_protection) "true" else "false") else try stdout.writeAll("null");
-    try stdout.writeAll("},\"certification\":{\"requiredCleanStreak\":");
-    try stdout.print("{d}", .{proof.required_clean_streak});
-    try stdout.writeAll(",\"currentCleanStreak\":");
-    try stdout.print("{d}", .{proof.current_clean_streak});
-    try stdout.writeAll(",\"strictCleanStreak\":");
-    try stdout.print("{d}", .{proof.strict_clean_streak});
-    try stdout.writeAll(",\"attemptsConsideredCount\":");
-    try stdout.print("{d}", .{proof.attempts_considered});
-    try stdout.writeAll(",\"duplicateAttemptCount\":");
-    try stdout.print("{d}", .{proof.duplicate_attempts});
-    try stdout.writeAll(",\"ignoredNoAttemptCount\":");
-    try stdout.print("{d}", .{proof.ignored_no_attempt});
-    try stdout.writeAll(",\"ignoredNonProofCount\":");
-    try stdout.print("{d}", .{proof.ignored_non_proof});
-    try stdout.writeAll(",\"tupleMismatchCount\":");
-    try stdout.print("{d}", .{proof.tuple_mismatch_count});
-    try stdout.writeAll(",\"reducedPrincipalAttemptCount\":");
-    try stdout.print("{d}", .{proof.reduced_principal_attempts});
-    try stdout.writeAll(",\"blockerCount\":");
-    try stdout.print("{d}", .{proof.blocker_count});
-    try stdout.writeAll(",\"resetCount\":");
-    try stdout.print("{d}", .{proof.reset_count});
-    try stdout.writeAll(",\"policyFailures\":[");
-    try writeReceiptProofPolicyFailures(stdout, proof);
-    try stdout.writeAll("]},\"attempts\":[");
-    try writeReceiptCertifyCountedReceipts(allocator, stdout, proof, receipts, required_review_tuple);
-    try stdout.writeAll("],\"childRuns\":[");
-    try writeCloseoutChildRunsJson(stdout, child_runs);
-    try stdout.writeAll("],\"blockers\":[");
-    try writeReceiptProofIgnoredReasons(stdout, proof);
-    try stdout.writeAll("],\"nextLegalMove\":");
-    try writeJsonString(stdout, receiptProofNextLegalMoveWithErrors(proof, errors, "none"));
-    try stdout.writeAll(",\"errors\":[");
-    for (errors, 0..) |err, i| {
-        if (i > 0) try stdout.writeByte(',');
-        try writeReceiptErrorObject(stdout, err);
-    }
-    try stdout.writeAll("]}\n");
 }
 
 fn writeReceiptReviewVerdictObject(writer: *std.Io.Writer, receipt: NormalizedReceipt) !void {
@@ -9134,17 +8186,13 @@ fn writeReceiptReviewVerdictObject(writer: *std.Io.Writer, receipt: NormalizedRe
     try writer.writeByte(':');
     try writer.writeAll(if (receipt.review_attempt_exists) "true" else "false");
     try writer.writeByte(',');
-    try writeJsonString(writer, "proofVerdictExists");
+    try writeJsonString(writer, "tupleVerdictExists");
     try writer.writeByte(':');
-    try writer.writeAll(if (receipt.proof_verdict_exists) "true" else "false");
+    try writer.writeAll(if (receipt.tuple_verdict_exists) "true" else "false");
     try writer.writeByte(',');
     try writeJsonString(writer, "principalStrength");
     try writer.writeByte(':');
     try writeJsonString(writer, receipt.principal_strength);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "principalProofUsable");
-    try writer.writeByte(':');
-    try writer.writeAll(if (receipt.principal_proof_usable) "true" else "false");
     try writer.writeByte(',');
     try writeJsonString(writer, "accountFingerprintReducedProtection");
     try writer.writeByte(':');
@@ -9242,17 +8290,13 @@ fn writeReceiptObject(writer: *std.Io.Writer, receipt: NormalizedReceipt) !void 
     try writer.writeByte(':');
     try writer.writeAll(if (receipt.review_attempt_exists) "true" else "false");
     try writer.writeByte(',');
-    try writeJsonString(writer, "proofVerdictExists");
+    try writeJsonString(writer, "tupleVerdictExists");
     try writer.writeByte(':');
-    try writer.writeAll(if (receipt.proof_verdict_exists) "true" else "false");
+    try writer.writeAll(if (receipt.tuple_verdict_exists) "true" else "false");
     try writer.writeByte(',');
     try writeJsonString(writer, "principalStrength");
     try writer.writeByte(':');
     try writeJsonString(writer, receipt.principal_strength);
-    try writer.writeByte(',');
-    try writeJsonString(writer, "principalProofUsable");
-    try writer.writeByte(':');
-    try writer.writeAll(if (receipt.principal_proof_usable) "true" else "false");
     try writer.writeByte(',');
     try writeJsonString(writer, "accountFingerprintReducedProtection");
     try writer.writeByte(':');
@@ -9648,7 +8692,7 @@ fn reviewVerdictStatus(clean: ?bool, finding_count: ?usize, failure: ?FailureInf
     return "incomplete";
 }
 
-fn reviewVerdictStatusIsProof(status: []const u8) bool {
+fn reviewVerdictStatusIsTupleTerminal(status: []const u8) bool {
     return std.mem.eql(u8, status, "clean") or
         std.mem.eql(u8, status, "findings") or
         std.mem.eql(u8, status, "account_resource_exhausted");
@@ -9686,15 +8730,15 @@ fn buildReviewVerdictJsonAlloc(
     const status = reviewVerdictStatus(clean, finding_count, failure, review_thread_id);
     const normalized_clean = std.mem.eql(u8, status, "clean") and (clean orelse false);
     const normalized_finding_count = finding_count orelse 0;
-    const proof_verdict_exists = reviewVerdictStatusIsProof(status) and
+    const tuple_verdict_exists = reviewVerdictStatusIsTupleTerminal(status) and
         reviewAttemptExists(review_thread_id) and
-        identityHasTupleProof(identity);
+        identityHasCompleteTuple(identity);
     const attempt_fields = identityReviewAttemptFields(
-        if (proof_verdict_exists) "normalized_verdict" else if (reviewAttemptExists(review_thread_id))
+        if (tuple_verdict_exists) "normalized_verdict" else if (reviewAttemptExists(review_thread_id))
             if (std.mem.eql(u8, status, "timeout")) "review_waiting" else "review_terminal"
         else
             "pre_review_start",
-        proof_verdict_exists,
+        tuple_verdict_exists,
         review_thread_id,
         review_turn_id,
         identity,
@@ -9861,12 +8905,12 @@ fn printLaneReviewJson(
     const effective_multi_agent_mode_json = try optionalModeJsonAlloc(allocator, multi_agent_mode);
     const multi_agent_mode_support_json = try modeSupportJsonAlloc(allocator, if (multi_agent_mode == null) .not_requested else .proven);
     const lane_verdict_status = reviewVerdictStatus(clean, dual_parse.structured_findings, failure, review_thread_id);
-    const lane_proof_verdict_exists = status.review_result_available and
-        reviewVerdictStatusIsProof(lane_verdict_status) and
-        identityHasTupleProof(identity);
+    const lane_tuple_verdict_exists = status.review_result_available and
+        reviewVerdictStatusIsTupleTerminal(lane_verdict_status) and
+        identityHasCompleteTuple(identity);
     const attempt_fields = identityReviewAttemptFields(
-        if (lane_proof_verdict_exists) "normalized_verdict" else if (isTerminalTurnStatus(status.turn_status)) "review_terminal" else "review_waiting",
-        lane_proof_verdict_exists,
+        if (lane_tuple_verdict_exists) "normalized_verdict" else if (isTerminalTurnStatus(status.turn_status)) "review_terminal" else "review_waiting",
+        lane_tuple_verdict_exists,
         review_thread_id,
         review_turn_id,
         identity,
@@ -10411,9 +9455,9 @@ test "terminal proof failure requires tuple identity" {
         .fingerprint = "fp",
     };
 
-    const failure = terminalProofFailureForIdentity(std.testing.allocator, status, missing_base) orelse return error.ExpectedTerminalProofFailure;
+    const failure = terminalBindingFailureForIdentity(std.testing.allocator, status, missing_base) orelse return error.ExpectedTerminalProofFailure;
     try std.testing.expectEqualStrings("target_identity_unavailable", failure.code);
-    const missing_identity_failure = terminalProofFailureForOptionalIdentity(std.testing.allocator, status, null) orelse return error.ExpectedTerminalProofFailure;
+    const missing_identity_failure = terminalBindingFailureForOptionalIdentity(std.testing.allocator, status, null) orelse return error.ExpectedTerminalProofFailure;
     try std.testing.expectEqualStrings("target_identity_unavailable", missing_identity_failure.code);
 }
 
@@ -10428,7 +9472,7 @@ test "lane smoke suite does not promote no-wait review-started runs" {
         .review_verdict_status = null,
         .finding_count = 0,
         .review_attempt_exists = true,
-        .proof_verdict_exists = false,
+        .tuple_verdict_exists = false,
         .lane_id = "lane_1",
         .review_thread_id = "thr_1",
         .base_sha = "base",
@@ -10446,7 +9490,7 @@ test "lane smoke suite does not promote no-wait review-started runs" {
 
 test "smoke run summary prefers normalizable review record path" {
     const stdout_json =
-        \\{"status":"pass","reviewAttemptPhase":"normalized_verdict","reviewAttemptExists":true,"proofVerdictExists":true,"laneId":"lane_1","reviewThreadId":"thr_1","baseSha":"base","headSha":"head","targetFingerprint":"fp","recordPath":"/tmp/review-record.json","smokeRecordPath":"/tmp/smoke-summary.json","reviewVerdict":{"status":"findings","findingCount":2}}
+        \\{"status":"pass","reviewAttemptPhase":"normalized_verdict","reviewAttemptExists":true,"tupleVerdictExists":true,"laneId":"lane_1","reviewThreadId":"thr_1","baseSha":"base","headSha":"head","targetFingerprint":"fp","recordPath":"/tmp/review-record.json","smokeRecordPath":"/tmp/smoke-summary.json","reviewVerdict":{"status":"findings","findingCount":2}}
     ;
     var result = try smokeRunSummaryFromJsonAlloc(std.testing.allocator, try smokeRunIdAlloc(std.testing.allocator, 1), "off", 0, 0, stdout_json, "");
     defer result.deinit(std.testing.allocator);
@@ -10501,7 +9545,7 @@ test "smoke pass streak is computed across accumulated rounds" {
         .review_verdict_status = "clean",
         .finding_count = 0,
         .review_attempt_exists = true,
-        .proof_verdict_exists = true,
+        .tuple_verdict_exists = true,
         .lane_id = "lane_1",
         .review_thread_id = "thr_1",
         .base_sha = "base",
@@ -10514,7 +9558,7 @@ test "smoke pass streak is computed across accumulated rounds" {
     fail.run_id = "smoke-fail";
     fail.status = "fail";
     fail.failure_code = "pre_review_lane_transport_lost";
-    fail.proof_verdict_exists = false;
+    fail.tuple_verdict_exists = false;
     const results = [_]LaneSmokeRunSummary{ fail, pass, pass, pass };
     try std.testing.expectEqual(@as(u32, 3), maxConsecutiveSmokePasses(&results));
 }
@@ -10543,87 +9587,87 @@ test "targetIdentityForRecordAlloc prefers stored tuple fields" {
     try std.testing.expectEqualStrings("stored_fp", identity.fingerprint);
 }
 
-test "start receipt proof flag requires tuple-bound verdict and review thread" {
+test "start receipt tuple verdict detection requires tuple and review thread" {
     const identity = TargetIdentity{
         .base_sha = "base",
         .head_sha = "head",
         .fingerprint = "fp",
     };
-    try std.testing.expect(startReceiptProofVerdictExists(std.testing.allocator, "{\"proofVerdictExists\":true}", "thr_1", identity, null, false));
-    try std.testing.expect(!startReceiptProofVerdictExists(std.testing.allocator, "{\"proofVerdictExists\":false}", "thr_1", identity, null, false));
-    try std.testing.expect(!startReceiptProofVerdictExists(std.testing.allocator, null, "thr_1", identity, null, false));
-    try std.testing.expect(!startReceiptProofVerdictExists(std.testing.allocator, "{\"proofVerdictExists\":true}", null, identity, null, false));
-    try std.testing.expect(!startReceiptProofVerdictExists(std.testing.allocator, "{\"proofVerdictExists\":true}", "thr_1", identity, null, true));
+    try std.testing.expect(startReceiptTupleVerdictExists(std.testing.allocator, "{\"tupleVerdictExists\":true}", "thr_1", identity, null, false));
+    try std.testing.expect(!startReceiptTupleVerdictExists(std.testing.allocator, "{\"tupleVerdictExists\":false}", "thr_1", identity, null, false));
+    try std.testing.expect(!startReceiptTupleVerdictExists(std.testing.allocator, null, "thr_1", identity, null, false));
+    try std.testing.expect(!startReceiptTupleVerdictExists(std.testing.allocator, "{\"tupleVerdictExists\":true}", null, identity, null, false));
+    try std.testing.expect(!startReceiptTupleVerdictExists(std.testing.allocator, "{\"tupleVerdictExists\":true}", "thr_1", identity, null, true));
 
     const missing_base = TargetIdentity{
         .base_sha = null,
         .head_sha = "head",
         .fingerprint = "fp",
     };
-    try std.testing.expect(!startReceiptProofVerdictExists(std.testing.allocator, "{\"proofVerdictExists\":true}", "thr_1", missing_base, null, false));
+    try std.testing.expect(!startReceiptTupleVerdictExists(std.testing.allocator, "{\"tupleVerdictExists\":true}", "thr_1", missing_base, null, false));
 
     const missing_head = TargetIdentity{
         .base_sha = "base",
         .head_sha = null,
         .fingerprint = "fp",
     };
-    try std.testing.expect(!startReceiptProofVerdictExists(std.testing.allocator, "{\"proofVerdictExists\":true}", "thr_1", missing_head, null, false));
+    try std.testing.expect(!startReceiptTupleVerdictExists(std.testing.allocator, "{\"tupleVerdictExists\":true}", "thr_1", missing_head, null, false));
 
     const empty_fingerprint = TargetIdentity{
         .base_sha = "base",
         .head_sha = "head",
         .fingerprint = "",
     };
-    try std.testing.expect(!startReceiptProofVerdictExists(std.testing.allocator, "{\"proofVerdictExists\":true}", "thr_1", empty_fingerprint, null, false));
+    try std.testing.expect(!startReceiptTupleVerdictExists(std.testing.allocator, "{\"tupleVerdictExists\":true}", "thr_1", empty_fingerprint, null, false));
 }
 
 test "normalizer preserves attempt-only receipts as non-proof" {
     const raw =
-        \\{"demo":"cas-review-session","action":"lane-smoke","reviewAttemptPhase":"review_started","reviewAttemptExists":true,"proofVerdictExists":false,"reviewThreadId":"thr_started","reviewTurnId":"turn_started","baseSha":"base","headSha":"head","targetFingerprint":"fp","status":"pass","smokeStatus":"passed"}
+        \\{"demo":"cas-review-session","action":"lane-smoke","reviewAttemptPhase":"review_started","reviewAttemptExists":true,"tupleVerdictExists":false,"reviewThreadId":"thr_started","reviewTurnId":"turn_started","baseSha":"base","headSha":"head","targetFingerprint":"fp","status":"pass","smokeStatus":"passed"}
     ;
     const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "attempt-only.json", raw, true, .{});
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("cas-lane", receipt.backend_class);
     try std.testing.expectEqualStrings("review_started", receipt.review_attempt_phase);
     try std.testing.expect(receipt.review_attempt_exists);
-    try std.testing.expect(!receipt.proof_verdict_exists);
+    try std.testing.expect(!receipt.tuple_verdict_exists);
 }
 
 test "normalizer treats null reviewVerdict as absent for no-wait smoke" {
     const raw =
-        \\{"demo":"cas-review-session","action":"lane-smoke","reviewAttemptPhase":"review_started","reviewAttemptExists":true,"proofVerdictExists":false,"laneId":"lane_1","reviewThreadId":"thr_started","reviewTurnId":"turn_started","baseSha":"base","headSha":"head","targetFingerprint":"fp","recordPath":"/tmp/record.json","eventLogPath":"/tmp/events.ndjson","status":"pass","smokeStatus":"passed","reviewVerdict":null}
+        \\{"demo":"cas-review-session","action":"lane-smoke","reviewAttemptPhase":"review_started","reviewAttemptExists":true,"tupleVerdictExists":false,"laneId":"lane_1","reviewThreadId":"thr_started","reviewTurnId":"turn_started","baseSha":"base","headSha":"head","targetFingerprint":"fp","recordPath":"/tmp/record.json","eventLogPath":"/tmp/events.ndjson","status":"pass","smokeStatus":"passed","reviewVerdict":null}
     ;
     const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "no-wait-smoke.json", raw, true, .{});
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("cas-lane", receipt.backend_class);
     try std.testing.expectEqualStrings("review_started", receipt.review_attempt_phase);
     try std.testing.expect(receipt.review_attempt_exists);
-    try std.testing.expect(!receipt.proof_verdict_exists);
+    try std.testing.expect(!receipt.tuple_verdict_exists);
     try std.testing.expectEqualStrings("thr_started", receipt.review_thread_id.?);
 }
 
 test "normalizer reads object reviewResult in legacy start receipts" {
     const raw =
-        \\{"demo":"cas-review-session","action":"start","reviewAttemptPhase":"review_terminal","reviewAttemptExists":true,"proofVerdictExists":false,"reviewThreadId":"thr_findings","reviewTurnId":"turn_findings","baseSha":"base","headSha":"head","targetFingerprint":"fp","recordPath":"/tmp/record.json","eventLogPath":"/tmp/events.ndjson","reviewResult":{"findings":[{"title":"Finding","body":"Body","priority":2,"codeLocation":{"absoluteFilePath":"/tmp/file.zig","lineRange":{"start":12,"end":12}}}],"overallCorrectness":"patch is incorrect","overallExplanation":"one finding","overallConfidenceScore":0.8}}
+        \\{"demo":"cas-review-session","action":"start","reviewAttemptPhase":"review_terminal","reviewAttemptExists":true,"tupleVerdictExists":false,"reviewThreadId":"thr_findings","reviewTurnId":"turn_findings","baseSha":"base","headSha":"head","targetFingerprint":"fp","recordPath":"/tmp/record.json","eventLogPath":"/tmp/events.ndjson","reviewResult":{"findings":[{"title":"Finding","body":"Body","priority":2,"codeLocation":{"absoluteFilePath":"/tmp/file.zig","lineRange":{"start":12,"end":12}}}],"overallCorrectness":"patch is incorrect","overallExplanation":"one finding","overallConfidenceScore":0.8}}
     ;
     const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "start-object.json", raw, true, .{});
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("findings", receipt.status);
     try std.testing.expectEqual(@as(usize, 1), receipt.finding_count);
     try std.testing.expectEqualStrings("normalized_verdict", receipt.review_attempt_phase);
-    try std.testing.expect(receipt.proof_verdict_exists);
+    try std.testing.expect(receipt.tuple_verdict_exists);
 }
 
 test "normalizer treats null start reviewResult as non-proof" {
     const raw =
-        \\{"demo":"cas-review-session","action":"start","reviewAttemptPhase":"review_started","reviewAttemptExists":true,"proofVerdictExists":false,"reviewThreadId":"thr_waiting","reviewTurnId":"turn_waiting","baseSha":"base","headSha":"head","targetFingerprint":"fp","recordPath":"/tmp/record.json","eventLogPath":"/tmp/events.ndjson","reviewResult":null}
+        \\{"demo":"cas-review-session","action":"start","reviewAttemptPhase":"review_started","reviewAttemptExists":true,"tupleVerdictExists":false,"reviewThreadId":"thr_waiting","reviewTurnId":"turn_waiting","baseSha":"base","headSha":"head","targetFingerprint":"fp","recordPath":"/tmp/record.json","eventLogPath":"/tmp/events.ndjson","reviewResult":null}
     ;
     const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "start-null.json", raw, true, .{});
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("incomplete", receipt.status);
     try std.testing.expectEqualStrings("review_started", receipt.review_attempt_phase);
     try std.testing.expect(receipt.review_attempt_exists);
-    try std.testing.expect(!receipt.proof_verdict_exists);
+    try std.testing.expect(!receipt.tuple_verdict_exists);
     try std.testing.expect(!receipt.clean);
 }
 
@@ -10635,7 +9679,7 @@ test "normalizer classifies lane smoke session records as lane backend" {
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("cas-lane", receipt.backend_class);
     try std.testing.expectEqualStrings("clean", receipt.status);
-    try std.testing.expect(receipt.proof_verdict_exists);
+    try std.testing.expect(receipt.tuple_verdict_exists);
 }
 
 test "parseArgs accepts review lane smoke-until-fixed options" {
@@ -10810,7 +9854,7 @@ test "parseArgs error path does not free borrowed receipt argv values" {
     const argv = [_][]const u8{
         "cas_review_session",
         "receipt",
-        "proof",
+        "normalize",
         "--path",
         "review-1.json",
         "--format",
@@ -10846,129 +9890,16 @@ test "parseArgs accepts receipt normalize with requested tuple inputs" {
     try std.testing.expectEqual(ReceiptFormat.json, parsed.receipt_format);
 }
 
-test "parseArgs accepts receipt proof clean streak" {
-    const argv = [_][]const u8{
-        "cas_review_session",
-        "receipt",
-        "proof",
-        "--path",
-        "start-wait.json",
-        "--clean-streak",
-        "3",
-        "--allow-reduced-principal",
-        "legacy receipt audit",
-    };
+test "parseArgs rejects removed receipt authority and closure surfaces" {
+    const proof_argv = [_][]const u8{ "cas_review_session", "receipt", "proof", "--path", "start-wait.json" };
+    try std.testing.expectError(error.UnknownArg, parseArgs(std.testing.allocator, &proof_argv));
 
-    const parsed = try parseArgs(std.testing.allocator, &argv);
-    defer parsed.deinit(std.testing.allocator);
-    try std.testing.expectEqual(Action.receipt, parsed.action.?);
-    try std.testing.expect(parsed.receipt_proof);
-    try std.testing.expect(parsed.json);
-    try std.testing.expectEqual(@as(u32, 3), parsed.receipt_clean_streak);
-    try std.testing.expectEqualStrings("legacy receipt audit", parsed.allow_reduced_principal_reason.?);
-}
+    const removed_authority_action = "cert" ++ "ify";
+    const authority_argv = [_][]const u8{ "cas_review_session", "receipt", removed_authority_action, "--cwd", "/tmp/repo", "--base", "main" };
+    try std.testing.expectError(error.UnknownArg, parseArgs(std.testing.allocator, &authority_argv));
 
-test "parseArgs accepts receipt certify with requested tuple only" {
-    const argv = [_][]const u8{
-        "cas_review_session",
-        "receipt",
-        "certify",
-        "--cwd",
-        "/tmp/repo",
-        "--base",
-        "main",
-    };
-
-    const parsed = try parseArgs(std.testing.allocator, &argv);
-    defer parsed.deinit(std.testing.allocator);
-    try std.testing.expectEqual(Action.receipt, parsed.action.?);
-    try std.testing.expect(parsed.receipt_certify);
-    try std.testing.expect(parsed.json);
-    try std.testing.expectEqualStrings("/tmp/repo", parsed.cwd.?);
-    try std.testing.expectEqual(TargetKind.base_branch, parsed.target.?.kind);
-    try std.testing.expectEqualStrings("main", parsed.target.?.branch.?);
-}
-
-test "parseArgs rejects removed receipt certify knobs" {
-    const policy_argv = [_][]const u8{
-        "cas_review_session",
-        "receipt",
-        "certify",
-        "--cwd",
-        "/tmp/repo",
-        "--base",
-        "main",
-        "--policy",
-        "strongest-closeout",
-    };
-    try std.testing.expectError(error.UnknownArg, parseArgs(std.testing.allocator, &policy_argv));
-
-    const path_argv = [_][]const u8{
-        "cas_review_session",
-        "receipt",
-        "certify",
-        "--cwd",
-        "/tmp/repo",
-        "--base",
-        "main",
-        "--path",
-        "start-wait.json",
-    };
-    try std.testing.expectError(error.ManualReceiptSelectionForbiddenForCertify, parseArgs(std.testing.allocator, &path_argv));
-
-    const clean_streak_argv = [_][]const u8{
-        "cas_review_session",
-        "receipt",
-        "certify",
-        "--cwd",
-        "/tmp/repo",
-        "--base",
-        "main",
-        "--clean-streak",
-        "1",
-    };
-    try std.testing.expectError(error.CleanStreakRequiresReceiptProof, parseArgs(std.testing.allocator, &clean_streak_argv));
-}
-
-test "parseArgs accepts closeout tuple and rejects manual receipt selection" {
-    const argv = [_][]const u8{
-        "cas_review_session",
-        "closeout",
-        "--cwd",
-        "/tmp/repo",
-        "--base",
-        "main",
-        "--json",
-        "--dry-run",
-    };
-    var parsed = try parseArgs(std.testing.allocator, &argv);
-    defer parsed.deinit(std.testing.allocator);
-    try std.testing.expectEqual(Action.closeout, parsed.action.?);
-    try std.testing.expectEqualStrings("/tmp/repo", parsed.cwd.?);
-    try std.testing.expectEqual(TargetKind.base_branch, parsed.target.?.kind);
-    try std.testing.expect(parsed.dry_run);
-
-    const path_argv = [_][]const u8{
-        "cas_review_session",
-        "closeout",
-        "--cwd",
-        "/tmp/repo",
-        "--base",
-        "main",
-        "--glob",
-        "review-*.json",
-    };
-    try std.testing.expectError(error.ManualReceiptSelectionForbiddenForCloseout, parseArgs(std.testing.allocator, &path_argv));
-
-    const unsupported_argv = [_][]const u8{
-        "cas_review_session",
-        "receipt",
-        "proof",
-        "--path",
-        "review.json",
-        "--dry-run",
-    };
-    try std.testing.expectError(error.DryRunUnsupportedAction, parseArgs(std.testing.allocator, &unsupported_argv));
+    const closure_argv = [_][]const u8{ "cas_review_session", "closure", "--cwd", "/tmp/repo", "--base", "main" };
+    try std.testing.expectError(error.UnknownAction, parseArgs(std.testing.allocator, &closure_argv));
 }
 
 test "expandReceiptGlob matches current-directory patterns" {
@@ -11010,10 +9941,10 @@ test "receipt normalizer accepts full CAS receipt" {
     try std.testing.expectEqual(@as(usize, 0), receipt.finding_count);
     try std.testing.expectEqualStrings("normalized_verdict", receipt.review_attempt_phase);
     try std.testing.expect(receipt.review_attempt_exists);
-    try std.testing.expect(receipt.proof_verdict_exists);
+    try std.testing.expect(receipt.tuple_verdict_exists);
     try std.testing.expectEqualStrings(principal_strength_reduced, receipt.principal_strength);
-    try std.testing.expect(!receipt.principal_proof_usable);
     try std.testing.expect(receipt.account_fingerprint_reduced_protection);
+    try std.testing.expect(normalizedReceiptCommandSucceeded(receipt));
     try std.testing.expectEqualStrings("base_1", receipt.base_sha.?);
     try std.testing.expectEqualStrings("head_1", receipt.head_sha.?);
     try std.testing.expectEqualStrings("fp_1", receipt.target_fingerprint.?);
@@ -11026,29 +9957,10 @@ test "receipt normalizer accepts strong principal metadata" {
     ;
     const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "review-strong.json", raw, true, .{});
     defer receipt.deinit(std.testing.allocator);
-    try std.testing.expect(receipt.proof_verdict_exists);
+    try std.testing.expect(receipt.tuple_verdict_exists);
     try std.testing.expectEqualStrings(principal_strength_strong, receipt.principal_strength);
-    try std.testing.expect(receipt.principal_proof_usable);
     try std.testing.expect(!receipt.account_fingerprint_reduced_protection);
     try std.testing.expect(normalizedReceiptCommandSucceeded(receipt));
-}
-
-test "stored session receipt with strong principal metadata satisfies strict proof" {
-    const raw =
-        \\{"schema_version":3,"cwd":"/tmp/repo","parent_thread_id":"parent","review_thread_id":"thr_stored_strong","review_turn_id":"turn_stored_strong","delivery":"detached","target":{"type":"baseBranch","branch":"main"},"event_log_path":"/tmp/events.ndjson","created_at_unix_s":1,"last_observed_status":"completed","codex_version":"0.140.0","compatibility_verdict":"compatible","transport_kind":"websocket","terminal_review_result_source":"rollout_exited_review_mode","terminal_review_result_json":"{\"findings\":[],\"overallCorrectness\":\"patch is correct\",\"overallExplanation\":\"clean\",\"overallConfidenceScore\":1}","base_sha":"base_strong","head_sha":"head_strong","target_fingerprint":"fp_strong","accountFingerprint":"acct:stable","accountFingerprintReducedProtection":false}
-    ;
-    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "stored-strong.json", raw, false, .{});
-    defer receipt.deinit(std.testing.allocator);
-    try std.testing.expect(receipt.proof_verdict_exists);
-    try std.testing.expectEqualStrings(principal_strength_strong, receipt.principal_strength);
-    try std.testing.expect(receipt.principal_proof_usable);
-    try std.testing.expect(!receipt.account_fingerprint_reduced_protection);
-
-    const receipts = [_]NormalizedReceipt{receipt};
-    const proof = try computeReceiptProof(std.testing.allocator, &receipts, 1, null, null, false);
-    try std.testing.expect(proof.satisfied);
-    try std.testing.expectEqual(@as(usize, 1), proof.attempts_considered);
-    try std.testing.expectEqual(@as(usize, 0), proof.reduced_principal_attempts);
 }
 
 test "receipt normalizer accepts compact verdict-only artifact" {
@@ -11062,9 +9974,8 @@ test "receipt normalizer accepts compact verdict-only artifact" {
     try std.testing.expectEqual(@as(usize, 1), receipt.finding_count);
     try std.testing.expectEqualStrings("normalized_verdict", receipt.review_attempt_phase);
     try std.testing.expect(receipt.review_attempt_exists);
-    try std.testing.expect(receipt.proof_verdict_exists);
+    try std.testing.expect(receipt.tuple_verdict_exists);
     try std.testing.expectEqualStrings(principal_strength_reduced, receipt.principal_strength);
-    try std.testing.expect(!receipt.principal_proof_usable);
     try std.testing.expect(std.mem.indexOf(u8, receipt.findings_json, "Issue") != null);
     try std.testing.expect(!normalizedReceiptCommandSucceeded(receipt));
 }
@@ -11077,7 +9988,7 @@ test "receipt normalizer rejects target-only verdict as proof" {
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("clean", receipt.status);
     try std.testing.expect(receipt.review_attempt_exists);
-    try std.testing.expect(!receipt.proof_verdict_exists);
+    try std.testing.expect(!receipt.tuple_verdict_exists);
     try std.testing.expectEqualStrings("review_terminal", receipt.review_attempt_phase);
     try std.testing.expect(!normalizedReceiptCommandSucceeded(receipt));
 }
@@ -11090,7 +10001,7 @@ test "receipt normalizer rejects target-only start receipt as proof" {
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("clean", receipt.status);
     try std.testing.expect(receipt.review_attempt_exists);
-    try std.testing.expect(!receipt.proof_verdict_exists);
+    try std.testing.expect(!receipt.tuple_verdict_exists);
     try std.testing.expectEqualStrings("review_terminal", receipt.review_attempt_phase);
     try std.testing.expect(!normalizedReceiptCommandSucceeded(receipt));
 }
@@ -11109,7 +10020,7 @@ test "receipt normalizer rejects start receipt when requested identity is incomp
         .requested_identity_required = true,
     });
     defer receipt.deinit(std.testing.allocator);
-    try std.testing.expect(!receipt.proof_verdict_exists);
+    try std.testing.expect(!receipt.tuple_verdict_exists);
     try std.testing.expectEqualStrings("target_identity_unavailable", receipt.failure_code.?);
 }
 
@@ -11121,7 +10032,7 @@ test "receipt normalizer rejects target-only stored session as proof" {
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("clean", receipt.status);
     try std.testing.expect(receipt.review_attempt_exists);
-    try std.testing.expect(!receipt.proof_verdict_exists);
+    try std.testing.expect(!receipt.tuple_verdict_exists);
     try std.testing.expectEqualStrings("review_terminal", receipt.review_attempt_phase);
     try std.testing.expect(!normalizedReceiptCommandSucceeded(receipt));
 }
@@ -11140,420 +10051,8 @@ test "receipt normalizer rejects stored session when requested identity is incom
         .requested_identity_required = true,
     });
     defer receipt.deinit(std.testing.allocator);
-    try std.testing.expect(!receipt.proof_verdict_exists);
+    try std.testing.expect(!receipt.tuple_verdict_exists);
     try std.testing.expectEqualStrings("target_identity_unavailable", receipt.failure_code.?);
-}
-
-test "receipt command success requires clean tuple-bound proof" {
-    const clean = NormalizedReceipt{
-        .source_path = "clean.json",
-        .status = "clean",
-        .backend_class = "cas-lane",
-        .clean = true,
-        .finding_count = 0,
-        .review_attempt_phase = "normalized_verdict",
-        .review_attempt_exists = true,
-        .proof_verdict_exists = true,
-        .principal_strength = principal_strength_strong,
-        .principal_proof_usable = true,
-        .account_fingerprint_reduced_protection = false,
-        .base_sha = "base",
-        .head_sha = "head",
-        .target_fingerprint = "fp",
-        .review_thread_id = "thr",
-        .review_turn_id = "turn",
-        .record_path = null,
-        .event_log_path = null,
-        .failure_code = null,
-        .failure_hint = null,
-        .failure_class = "none",
-        .retryable_same_tuple_now = null,
-        .findings_json = "[]",
-    };
-    const findings = NormalizedReceipt{
-        .source_path = "findings.json",
-        .status = "findings",
-        .backend_class = "cas-lane",
-        .clean = false,
-        .finding_count = 1,
-        .review_attempt_phase = "normalized_verdict",
-        .review_attempt_exists = true,
-        .proof_verdict_exists = true,
-        .principal_strength = principal_strength_strong,
-        .principal_proof_usable = true,
-        .account_fingerprint_reduced_protection = false,
-        .base_sha = "base",
-        .head_sha = "head",
-        .target_fingerprint = "fp",
-        .review_thread_id = "thr",
-        .review_turn_id = "turn",
-        .record_path = null,
-        .event_log_path = null,
-        .failure_code = null,
-        .failure_hint = null,
-        .failure_class = "none",
-        .retryable_same_tuple_now = null,
-        .findings_json = "[{}]",
-    };
-    try std.testing.expect(normalizedReceiptCommandSucceeded(clean));
-    try std.testing.expect(!normalizedReceiptCommandSucceeded(findings));
-
-    const duplicate_clean = clean;
-    const no_attempt = NormalizedReceipt{
-        .source_path = "pre-review.json",
-        .status = "pre_review_transport_failure",
-        .backend_class = "cas-lane",
-        .clean = false,
-        .finding_count = 0,
-        .review_attempt_phase = "pre_review_start",
-        .review_attempt_exists = false,
-        .proof_verdict_exists = false,
-        .base_sha = "base",
-        .head_sha = "head",
-        .target_fingerprint = "fp",
-        .review_thread_id = null,
-        .review_turn_id = null,
-        .record_path = null,
-        .event_log_path = null,
-        .failure_code = "pre_review_lane_transport_lost",
-        .failure_hint = null,
-        .failure_class = "transport_pre_review",
-        .retryable_same_tuple_now = null,
-        .findings_json = "[]",
-    };
-    var clean_2 = clean;
-    clean_2.source_path = "clean-2.json";
-    clean_2.review_thread_id = "thr_2";
-    var clean_3 = clean;
-    clean_3.source_path = "clean-3.json";
-    clean_3.review_thread_id = "thr_3";
-    const receipts = [_]NormalizedReceipt{ clean, duplicate_clean, no_attempt, clean_2, clean_3 };
-    const proof = try computeReceiptProof(std.testing.allocator, &receipts, 2, null, null, false);
-    try std.testing.expect(proof.satisfied);
-    try std.testing.expectEqual(@as(u32, 3), proof.current_clean_streak);
-    try std.testing.expectEqual(@as(usize, 1), proof.duplicate_attempts);
-    try std.testing.expectEqual(@as(usize, 1), proof.ignored_no_attempt);
-    try std.testing.expectEqual(@as(usize, 0), proof.reset_count);
-
-    var reduced_clean = clean;
-    reduced_clean.source_path = "reduced-clean.json";
-    reduced_clean.review_thread_id = "thr_reduced";
-    reduced_clean.principal_strength = principal_strength_reduced;
-    reduced_clean.principal_proof_usable = false;
-    reduced_clean.account_fingerprint_reduced_protection = true;
-    const reduced_receipts = [_]NormalizedReceipt{reduced_clean};
-    const reduced_proof = try computeReceiptProof(std.testing.allocator, &reduced_receipts, 1, null, null, false);
-    try std.testing.expect(!reduced_proof.satisfied);
-    try std.testing.expectEqual(@as(usize, 1), reduced_proof.reduced_principal_attempts);
-    try std.testing.expectEqual(@as(usize, 1), reduced_proof.ignored_non_proof);
-    try std.testing.expectEqual(@as(u32, 0), reduced_proof.current_clean_streak);
-
-    const override_proof = try computeReceiptProof(std.testing.allocator, &reduced_receipts, 1, "manual audit override", null, false);
-    try std.testing.expect(override_proof.satisfied);
-    try std.testing.expect(override_proof.reduced_principal_override_used);
-    try std.testing.expectEqualStrings("manual audit override", override_proof.reduced_principal_override_reason.?);
-}
-
-fn testNormalizedReceipt(
-    source_path: []const u8,
-    status: []const u8,
-    clean: bool,
-    finding_count: usize,
-    review_thread_id: []const u8,
-    base_sha: []const u8,
-    head_sha: []const u8,
-    target_fingerprint: []const u8,
-    principal_usable: bool,
-) NormalizedReceipt {
-    return .{
-        .source_path = source_path,
-        .status = status,
-        .backend_class = "cas-lane",
-        .clean = clean,
-        .finding_count = finding_count,
-        .review_attempt_phase = "normalized_verdict",
-        .review_attempt_exists = true,
-        .proof_verdict_exists = true,
-        .principal_strength = if (principal_usable) principal_strength_strong else principal_strength_reduced,
-        .principal_proof_usable = principal_usable,
-        .account_fingerprint_reduced_protection = !principal_usable,
-        .base_sha = base_sha,
-        .head_sha = head_sha,
-        .target_fingerprint = target_fingerprint,
-        .repo_realpath = "/repo",
-        .resolved_codex_path = "/bin/codex",
-        .resolved_codex_version = "codex 0.1.0",
-        .account_fingerprint = "acct:a",
-        .review_thread_id = review_thread_id,
-        .review_turn_id = "turn",
-        .record_path = null,
-        .event_log_path = null,
-        .failure_code = null,
-        .failure_hint = null,
-        .failure_class = "none",
-        .retryable_same_tuple_now = null,
-        .findings_json = "[]",
-    };
-}
-
-test "receipt certify policy rejects reduced-principal diagnostic false closeout" {
-    const reduced = testNormalizedReceipt("reduced.json", "clean", true, 0, "thr_reduced", "base", "head", "fp", false);
-    const strong_1 = testNormalizedReceipt("strong-1.json", "clean", true, 0, "thr_strong_1", "base", "head", "fp", true);
-    const strong_2 = testNormalizedReceipt("strong-2.json", "clean", true, 0, "thr_strong_2", "base", "head", "fp", true);
-    const receipts = [_]NormalizedReceipt{ reduced, strong_1, strong_2 };
-
-    const diagnostic = try computeReceiptProof(std.testing.allocator, &receipts, 3, "diagnostic override", null, false);
-    try std.testing.expect(diagnostic.satisfied);
-    try std.testing.expect(diagnostic.reduced_principal_override_used);
-    try std.testing.expectEqual(@as(u32, 3), diagnostic.current_clean_streak);
-    try std.testing.expectEqual(@as(u32, 2), diagnostic.strict_clean_streak);
-
-    const certified = try computeReceiptProof(std.testing.allocator, &receipts, 3, null, null, true);
-    try std.testing.expect(!certified.satisfied);
-    try std.testing.expectEqual(@as(u32, 2), certified.current_clean_streak);
-    try std.testing.expectEqual(@as(u32, 2), certified.strict_clean_streak);
-    try std.testing.expectEqual(@as(usize, 1), certified.reduced_principal_attempts);
-    try std.testing.expectEqual(@as(usize, 1), certified.ignored_non_proof);
-}
-
-test "receipt certify policy accepts three distinct strong clean receipts" {
-    const one = testNormalizedReceipt("one.json", "clean", true, 0, "thr_1", "base", "head", "fp", true);
-    const two = testNormalizedReceipt("two.json", "clean", true, 0, "thr_2", "base", "head", "fp", true);
-    const three = testNormalizedReceipt("three.json", "clean", true, 0, "thr_3", "base", "head", "fp", true);
-    const receipts = [_]NormalizedReceipt{ one, two, three };
-
-    const proof = try computeReceiptProof(std.testing.allocator, &receipts, 3, null, null, true);
-    try std.testing.expect(proof.satisfied);
-    try std.testing.expectEqual(@as(u32, 3), proof.current_clean_streak);
-    try std.testing.expectEqual(@as(usize, 0), proof.duplicate_attempts);
-    try std.testing.expectEqual(@as(usize, 0), proof.ignored_non_proof);
-}
-
-test "receipt certify policy binds counted receipts to full review tuple" {
-    const tuple = testTupleIdentity("acct:a");
-    const one = testNormalizedReceipt("one.json", "clean", true, 0, "thr_1", "base", "head", "fp", true);
-    const two = testNormalizedReceipt("two.json", "clean", true, 0, "thr_2", "base", "head", "fp", true);
-    var wrong_account = testNormalizedReceipt("wrong-account.json", "clean", true, 0, "thr_3", "base", "head", "fp", true);
-    wrong_account.account_fingerprint = "acct:b";
-    var wrong_codex = testNormalizedReceipt("wrong-codex.json", "clean", true, 0, "thr_4", "base", "head", "fp", true);
-    wrong_codex.resolved_codex_version = "codex 0.2.0";
-    const receipts = [_]NormalizedReceipt{ one, two, wrong_account, wrong_codex };
-
-    const proof = try computeReceiptProof(std.testing.allocator, &receipts, 3, null, tuple, true);
-    try std.testing.expect(!proof.satisfied);
-    try std.testing.expectEqual(@as(u32, 2), proof.current_clean_streak);
-    try std.testing.expectEqual(@as(usize, 2), proof.tuple_mismatch_count);
-    try std.testing.expectEqual(@as(usize, 2), proof.ignored_non_proof);
-}
-
-test "receipt certify policy filters non-proof blockers by full review tuple" {
-    const tuple = testTupleIdentity("acct:a");
-    var unrelated_blocker = testNormalizedReceipt("unrelated-blocker.json", "account_resource_exhausted", false, 0, "thr_blocker", "base", "head", "fp", true);
-    unrelated_blocker.proof_verdict_exists = false;
-    unrelated_blocker.account_fingerprint = "acct:b";
-    var unrelated_terminal_missing = testNormalizedReceipt("unrelated-terminal-missing.json", "incomplete", false, 0, "thr_missing_other", "base", "head", "fp", true);
-    unrelated_terminal_missing.proof_verdict_exists = false;
-    unrelated_terminal_missing.review_attempt_phase = "review_terminal";
-    unrelated_terminal_missing.account_fingerprint = "acct:b";
-    var unrelated_waiting = testNormalizedReceipt("unrelated-waiting.json", "incomplete", false, 0, "thr_waiting_other", "base", "head", "fp", true);
-    unrelated_waiting.proof_verdict_exists = false;
-    unrelated_waiting.review_attempt_phase = "review_waiting";
-    unrelated_waiting.account_fingerprint = "acct:b";
-    const clean_1 = testNormalizedReceipt("clean-1.json", "clean", true, 0, "thr_1", "base", "head", "fp", true);
-    const clean_2 = testNormalizedReceipt("clean-2.json", "clean", true, 0, "thr_2", "base", "head", "fp", true);
-    const clean_3 = testNormalizedReceipt("clean-3.json", "clean", true, 0, "thr_3", "base", "head", "fp", true);
-    const unrelated_receipts = [_]NormalizedReceipt{ unrelated_blocker, unrelated_terminal_missing, unrelated_waiting, clean_1, clean_2, clean_3 };
-
-    const unrelated_proof = try computeReceiptProof(std.testing.allocator, &unrelated_receipts, 3, null, tuple, true);
-    try std.testing.expect(unrelated_proof.satisfied);
-    try std.testing.expectEqual(@as(usize, 0), unrelated_proof.blocker_count);
-    try std.testing.expectEqual(@as(usize, 0), unrelated_proof.tuple_mismatch_count);
-
-    var same_tuple_blocker = unrelated_blocker;
-    same_tuple_blocker.account_fingerprint = "acct:a";
-    const same_tuple_receipts = [_]NormalizedReceipt{ same_tuple_blocker, clean_1, clean_2, clean_3 };
-    const same_tuple_proof = try computeReceiptProof(std.testing.allocator, &same_tuple_receipts, 3, null, tuple, true);
-    try std.testing.expect(!same_tuple_proof.satisfied);
-    try std.testing.expectEqual(@as(usize, 1), same_tuple_proof.blocker_count);
-
-    var same_tuple_terminal_missing = unrelated_terminal_missing;
-    same_tuple_terminal_missing.account_fingerprint = "acct:a";
-    const terminal_missing_receipts = [_]NormalizedReceipt{ same_tuple_terminal_missing, clean_1, clean_2, clean_3 };
-    const terminal_missing_proof = try computeReceiptProof(std.testing.allocator, &terminal_missing_receipts, 3, null, tuple, true);
-    try std.testing.expect(!terminal_missing_proof.satisfied);
-    try std.testing.expectEqual(@as(usize, 1), terminal_missing_proof.blocker_count);
-    try std.testing.expectEqualStrings("incomplete", terminal_missing_proof.blocker_status.?);
-
-    var same_tuple_waiting = unrelated_waiting;
-    same_tuple_waiting.account_fingerprint = "acct:a";
-    const waiting_receipts = [_]NormalizedReceipt{ same_tuple_waiting, clean_1, clean_2, clean_3 };
-    const waiting_proof = try computeReceiptProof(std.testing.allocator, &waiting_receipts, 3, null, tuple, true);
-    try std.testing.expect(!waiting_proof.satisfied);
-    try std.testing.expectEqual(@as(usize, 1), waiting_proof.blocker_count);
-    try std.testing.expectEqualStrings("incomplete", waiting_proof.blocker_status.?);
-}
-
-test "receipt certify policy ignores duplicate cached replay and tuple mismatch" {
-    const one = testNormalizedReceipt("one.json", "clean", true, 0, "thr_1", "base", "head", "fp", true);
-    const two = testNormalizedReceipt("two.json", "clean", true, 0, "thr_2", "base", "head", "fp", true);
-    const duplicate_two = testNormalizedReceipt("two-copy.json", "clean", true, 0, "thr_2", "base", "head", "fp", true);
-    const tuple_mismatch = testNormalizedReceipt("other-tuple.json", "clean", true, 0, "thr_3", "base", "head", "other-fp", true);
-    const receipts = [_]NormalizedReceipt{ one, two, duplicate_two, tuple_mismatch };
-
-    const proof = try computeReceiptProof(std.testing.allocator, &receipts, 3, null, null, true);
-    try std.testing.expect(!proof.satisfied);
-    try std.testing.expectEqual(@as(u32, 2), proof.current_clean_streak);
-    try std.testing.expectEqual(@as(usize, 1), proof.duplicate_attempts);
-    try std.testing.expectEqual(@as(usize, 1), proof.tuple_mismatch_count);
-    try std.testing.expectEqual(@as(usize, 1), proof.ignored_non_proof);
-}
-
-test "receipt certify policy resets clean streak on findings" {
-    const clean_1 = testNormalizedReceipt("clean-1.json", "clean", true, 0, "thr_1", "base", "head", "fp", true);
-    const findings = testNormalizedReceipt("findings.json", "findings", false, 1, "thr_findings", "base", "head", "fp", true);
-    const clean_2 = testNormalizedReceipt("clean-2.json", "clean", true, 0, "thr_2", "base", "head", "fp", true);
-    const clean_3 = testNormalizedReceipt("clean-3.json", "clean", true, 0, "thr_3", "base", "head", "fp", true);
-    const receipts = [_]NormalizedReceipt{ clean_1, findings, clean_2, clean_3 };
-
-    const proof = try computeReceiptProof(std.testing.allocator, &receipts, 3, null, null, true);
-    try std.testing.expect(!proof.satisfied);
-    try std.testing.expectEqual(@as(u32, 2), proof.current_clean_streak);
-    try std.testing.expectEqual(@as(usize, 1), proof.reset_count);
-}
-
-test "receipt certify policy treats any same-tuple findings reset as fatal" {
-    const findings = testNormalizedReceipt("findings.json", "findings", false, 1, "thr_findings", "base", "head", "fp", true);
-    const clean_1 = testNormalizedReceipt("clean-1.json", "clean", true, 0, "thr_1", "base", "head", "fp", true);
-    const clean_2 = testNormalizedReceipt("clean-2.json", "clean", true, 0, "thr_2", "base", "head", "fp", true);
-    const clean_3 = testNormalizedReceipt("clean-3.json", "clean", true, 0, "thr_3", "base", "head", "fp", true);
-    const receipts = [_]NormalizedReceipt{ findings, clean_1, clean_2, clean_3 };
-
-    const diagnostic = try computeReceiptProof(std.testing.allocator, &receipts, 3, null, testTupleIdentity("acct:a"), false);
-    try std.testing.expect(diagnostic.satisfied);
-    try std.testing.expectEqual(@as(u32, 3), diagnostic.current_clean_streak);
-
-    const proof = try computeReceiptProof(std.testing.allocator, &receipts, 3, null, testTupleIdentity("acct:a"), true);
-    try std.testing.expect(!proof.satisfied);
-    try std.testing.expectEqual(@as(u32, 3), proof.current_clean_streak);
-    try std.testing.expectEqual(@as(usize, 1), proof.reset_count);
-    try std.testing.expectEqualStrings("resolve_policy_failure_before_certify", receiptProofNextLegalMove(proof));
-}
-
-test "canonical receipt proof sorts attempts chronologically" {
-    var newer_findings = testNormalizedReceipt("000-newer-findings.json", "findings", false, 1, "thr_findings", "base", "head", "fp", true);
-    newer_findings.attempt_created_at_unix_s = 30;
-    var older_clean_1 = testNormalizedReceipt("100-older-clean-1.json", "clean", true, 0, "thr_1", "base", "head", "fp", true);
-    older_clean_1.attempt_created_at_unix_s = 10;
-    var older_clean_2 = testNormalizedReceipt("200-older-clean-2.json", "clean", true, 0, "thr_2", "base", "head", "fp", true);
-    older_clean_2.attempt_created_at_unix_s = 20;
-    var receipts = [_]NormalizedReceipt{ newer_findings, older_clean_1, older_clean_2 };
-
-    sortNormalizedReceiptsChronological(&receipts);
-    const proof = try computeReceiptProof(std.testing.allocator, &receipts, 3, null, testTupleIdentity("acct:a"), true);
-    try std.testing.expect(!proof.satisfied);
-    try std.testing.expectEqual(@as(u32, 0), proof.current_clean_streak);
-    try std.testing.expectEqual(@as(usize, 1), proof.reset_count);
-    try std.testing.expectEqualStrings("thr_findings", proof.reset_by_attempt_key.?);
-}
-
-test "canonical receipt scan fails closed on malformed receipt errors" {
-    try std.testing.expect(canonicalReceiptNormalizationErrorBlocksCloseout(error.InvalidReceiptJson));
-    try std.testing.expect(canonicalReceiptNormalizationErrorBlocksCloseout(error.MissingBackendClass));
-    try std.testing.expect(canonicalReceiptNormalizationErrorBlocksCloseout(error.InvalidReviewVerdict));
-    try std.testing.expect(!canonicalReceiptNormalizationErrorBlocksCloseout(error.NotReviewReceipt));
-    try std.testing.expect(canonicalReceiptNormalizationErrorBlocksCloseout(error.AccessDenied));
-    try std.testing.expect(canonicalReceiptNormalizationErrorBlocksCloseout(error.OutOfMemory));
-}
-
-test "canonical certify recovers event logs regardless of historical receipt count" {
-    try std.testing.expect(shouldRecoverReceiptEventLogs(ReceiptEventLogRecoveryMaxInputs + 1, true));
-    try std.testing.expect(!shouldRecoverReceiptEventLogs(ReceiptEventLogRecoveryMaxInputs + 1, false));
-    try std.testing.expect(shouldRecoverReceiptEventLogs(ReceiptEventLogRecoveryMaxInputs, false));
-}
-
-test "canonical certify treats empty receipt discovery as unsatisfied proof" {
-    try std.testing.expect(!emptyReceiptInputIsScanError(true));
-    try std.testing.expect(emptyReceiptInputIsScanError(false));
-}
-
-test "closeout controller stops on findings and freshness rules mark repeated attempts" {
-    const clean_1 = ReceiptProof{
-        .required_clean_streak = strongest_closeout_clean_streak,
-        .current_clean_streak = 1,
-        .strict_clean_streak = 1,
-        .attempts_considered = 1,
-    };
-    try std.testing.expect(closeoutShouldRunFreshAttempt(clean_1, 0, 0));
-    try std.testing.expect(closeoutChildNeedsFreshAttempt(clean_1, 0));
-
-    const first_attempt = ReceiptProof{
-        .required_clean_streak = strongest_closeout_clean_streak,
-    };
-    try std.testing.expect(closeoutShouldRunFreshAttempt(first_attempt, 0, 0));
-    try std.testing.expect(closeoutChildNeedsFreshAttempt(first_attempt, 0));
-    try std.testing.expect(closeoutChildNeedsFreshAttempt(first_attempt, 1));
-
-    var terminal_non_proof = first_attempt;
-    terminal_non_proof.ignored_non_proof = 1;
-    try std.testing.expect(closeoutChildNeedsFreshAttempt(terminal_non_proof, 0));
-
-    var findings = first_attempt;
-    findings.reset_count = 1;
-    try std.testing.expect(!closeoutShouldRunFreshAttempt(findings, 0, 0));
-    try std.testing.expectEqualStrings("resolve_policy_failure_before_certify", receiptProofNextLegalMove(findings));
-
-    var blocker = first_attempt;
-    blocker.blocker_count = 1;
-    try std.testing.expect(!closeoutShouldRunFreshAttempt(blocker, 0, 0));
-
-    var satisfied = clean_1;
-    satisfied.current_clean_streak = strongest_closeout_clean_streak;
-    satisfied.strict_clean_streak = strongest_closeout_clean_streak;
-    satisfied.satisfied = true;
-    try std.testing.expect(!closeoutShouldRunFreshAttempt(satisfied, 0, 0));
-}
-
-test "closeout certification output is gated by scan errors" {
-    var proof = ReceiptProof{
-        .required_clean_streak = strongest_closeout_clean_streak,
-        .current_clean_streak = strongest_closeout_clean_streak,
-        .strict_clean_streak = strongest_closeout_clean_streak,
-        .attempts_considered = strongest_closeout_clean_streak,
-        .satisfied = true,
-    };
-    const no_errors = [_]ReceiptError{};
-    try std.testing.expect(receiptProofCertifiedWithoutErrors(proof, &no_errors));
-    try std.testing.expectEqualStrings("none", receiptProofNextLegalMoveWithErrors(proof, &no_errors, "none"));
-    try std.testing.expectEqualStrings("run_certify_without_overrides", receiptProofNextLegalMoveWithErrors(proof, &no_errors, "run_certify_without_overrides"));
-
-    const errors = [_]ReceiptError{.{
-        .source_path = "/tmp/unreadable.json",
-        .message = "AccessDenied",
-    }};
-    try std.testing.expect(!receiptProofCertifiedWithoutErrors(proof, &errors));
-    try std.testing.expectEqualStrings("resolve_scan_errors_before_certify", receiptProofNextLegalMoveWithErrors(proof, &errors, "none"));
-
-    proof.satisfied = false;
-    proof.strict_clean_streak = 0;
-    try std.testing.expectEqualStrings("resolve_scan_errors_before_certify", receiptProofNextLegalMoveWithErrors(proof, &errors, "none"));
-}
-
-test "closeout tuple policy errors block reduced principal attempts" {
-    const identity = TargetIdentity{
-        .base_sha = "base",
-        .head_sha = "head",
-        .fingerprint = "fp",
-    };
-    const tuple = testTupleIdentity(unknown_account_fingerprint);
-    var errors: std.ArrayList(ReceiptError) = .empty;
-    defer {
-        clearReceiptErrors(std.testing.allocator, &errors);
-        errors.deinit(std.testing.allocator);
-    }
-
-    try appendCloseoutTuplePolicyErrors(std.testing.allocator, &errors, identity, tuple);
-    try std.testing.expectEqual(@as(usize, 1), errors.items.len);
-    try std.testing.expectEqualStrings("account_fingerprint_reduced_protection", errors.items[0].message);
 }
 
 test "receipt normalizer flags mismatched tuple proof" {
@@ -11563,7 +10062,7 @@ test "receipt normalizer flags mismatched tuple proof" {
     const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "mismatch.json", raw, true, .{});
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expect(receipt.review_attempt_exists);
-    try std.testing.expect(!receipt.proof_verdict_exists);
+    try std.testing.expect(!receipt.tuple_verdict_exists);
     try std.testing.expectEqualStrings("review_terminal", receipt.review_attempt_phase);
 }
 
@@ -11582,7 +10081,7 @@ test "receipt normalizer rejects incomplete requested identity as proof" {
     });
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expect(receipt.review_attempt_exists);
-    try std.testing.expect(!receipt.proof_verdict_exists);
+    try std.testing.expect(!receipt.tuple_verdict_exists);
     try std.testing.expectEqualStrings("target_identity_unavailable", receipt.failure_code.?);
     try std.testing.expectEqualStrings("review_terminal", receipt.review_attempt_phase);
 }
@@ -11639,7 +10138,7 @@ test "receipt normalizer recovers findings from stored review session event log"
     try std.testing.expectEqualStrings("cas-start-wait", receipt.backend_class);
     try std.testing.expectEqualStrings("review_terminal", receipt.review_attempt_phase);
     try std.testing.expect(receipt.review_attempt_exists);
-    try std.testing.expect(!receipt.proof_verdict_exists);
+    try std.testing.expect(!receipt.tuple_verdict_exists);
     try std.testing.expectEqualStrings("thr_event", receipt.review_thread_id.?);
     try std.testing.expect(std.mem.indexOf(u8, receipt.findings_json, "Keep idempotency keys aligned") != null);
     try std.testing.expect(std.mem.indexOf(u8, receipt.findings_json, "raw finding body") != null);
@@ -11692,7 +10191,7 @@ test "receipt normalizer recovers clean stored receipt from rollout-backed event
     try std.testing.expectEqualStrings("cas-start-wait", receipt.backend_class);
     try std.testing.expectEqualStrings("review_terminal", receipt.review_attempt_phase);
     try std.testing.expect(receipt.review_attempt_exists);
-    try std.testing.expect(!receipt.proof_verdict_exists);
+    try std.testing.expect(!receipt.tuple_verdict_exists);
     try std.testing.expectEqualStrings("thr_clean", receipt.review_thread_id.?);
 }
 
@@ -11747,7 +10246,7 @@ test "receipt normalizer matches requested identity against snake-case stored tu
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("clean", receipt.status);
     try std.testing.expect(receipt.clean);
-    try std.testing.expect(receipt.proof_verdict_exists);
+    try std.testing.expect(receipt.tuple_verdict_exists);
     try std.testing.expectEqualStrings("base_snake", receipt.base_sha.?);
     try std.testing.expectEqualStrings("head_snake", receipt.head_sha.?);
     try std.testing.expectEqualStrings("fp_snake", receipt.target_fingerprint.?);
@@ -11765,7 +10264,7 @@ test "receipt normalizer bounds broad stored session recovery" {
     try std.testing.expectEqualStrings("review_output_missing", receipt.failure_code.?);
     try std.testing.expectEqualStrings("review_terminal", receipt.review_attempt_phase);
     try std.testing.expect(receipt.review_attempt_exists);
-    try std.testing.expect(!receipt.proof_verdict_exists);
+    try std.testing.expect(!receipt.tuple_verdict_exists);
 }
 
 test "receipt normalizer rejects non-receipt lane artifact" {
@@ -11788,7 +10287,7 @@ test "receipt normalizer fails closed on missing verdict fields" {
 
 test "receipt normalizer emits pre-review transport failure for pre-review lane transport loss" {
     const raw =
-        \\{"demo":"cas-review-session","action":"lane-review","reviewAttemptPhase":"pre_review_start","reviewAttemptExists":false,"proofVerdictExists":false,"reviewThreadId":null,"reviewTurnId":null,"baseSha":"base_1","headSha":"head_1","targetFingerprint":"fp_1","failureCode":"pre_review_lane_transport_lost","failureClass":"transport_pre_review","failureHint":"restart lane"}
+        \\{"demo":"cas-review-session","action":"lane-review","reviewAttemptPhase":"pre_review_start","reviewAttemptExists":false,"tupleVerdictExists":false,"reviewThreadId":null,"reviewTurnId":null,"baseSha":"base_1","headSha":"head_1","targetFingerprint":"fp_1","failureCode":"pre_review_lane_transport_lost","failureClass":"transport_pre_review","failureHint":"restart lane"}
     ;
     const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "pre-review.json", raw, true, .{});
     defer receipt.deinit(std.testing.allocator);
@@ -11816,7 +10315,7 @@ test "receipt normalizer downgrades requested tuple mismatch" {
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("incomplete", receipt.status);
     try std.testing.expect(!receipt.clean);
-    try std.testing.expect(!receipt.proof_verdict_exists);
+    try std.testing.expect(!receipt.tuple_verdict_exists);
     try std.testing.expectEqualStrings("tuple_mismatch", receipt.failure_code.?);
 }
 
@@ -11829,9 +10328,8 @@ test "receipt normalizer emits nested reviewVerdict in normalized JSON" {
         .finding_count = 0,
         .review_attempt_phase = "normalized_verdict",
         .review_attempt_exists = true,
-        .proof_verdict_exists = true,
+        .tuple_verdict_exists = true,
         .principal_strength = principal_strength_strong,
-        .principal_proof_usable = true,
         .account_fingerprint_reduced_protection = false,
         .base_sha = "base",
         .head_sha = "head",
@@ -11859,7 +10357,6 @@ test "receipt normalizer emits nested reviewVerdict in normalized JSON" {
     try std.testing.expect(verdict.get("clean").?.bool);
     try std.testing.expectEqual(@as(i64, 0), verdict.get("findingCount").?.integer);
     try std.testing.expectEqualStrings(principal_strength_strong, verdict.get("principalStrength").?.string);
-    try std.testing.expect(verdict.get("principalProofUsable").?.bool);
     try std.testing.expect(!verdict.get("accountFingerprintReducedProtection").?.bool);
     try std.testing.expectEqualStrings("base", verdict.get("baseSha").?.string);
 
@@ -11873,12 +10370,11 @@ test "receipt normalizer emits nested reviewVerdict in normalized JSON" {
     const compact = compact_parsed.value.object;
     try std.testing.expectEqualStrings("normalized_verdict", compact.get("reviewAttemptPhase").?.string);
     try std.testing.expect(compact.get("reviewAttemptExists").?.bool);
-    try std.testing.expect(compact.get("proofVerdictExists").?.bool);
+    try std.testing.expect(compact.get("tupleVerdictExists").?.bool);
     try std.testing.expectEqualStrings(principal_strength_strong, compact.get("principalStrength").?.string);
-    try std.testing.expect(compact.get("principalProofUsable").?.bool);
 }
 
-test "start wait verdict builder emits cas-start-wait clean proof" {
+test "start wait verdict builder emits cas-start-wait clean verdict" {
     const review_result =
         \\{"findings":[],"overallCorrectness":"patch is correct","overallExplanation":"No issues found.","overallConfidenceScore":0.92}
     ;
@@ -11975,7 +10471,7 @@ test "start wait verdict builder rejects notification-only proof" {
     const verdict = parsed.value.object;
     try std.testing.expectEqualStrings("review_untrusted_source", verdict.get("status").?.string);
     try std.testing.expect(!verdict.get("clean").?.bool);
-    try std.testing.expect(!verdict.get("proofVerdictExists").?.bool);
+    try std.testing.expect(!verdict.get("tupleVerdictExists").?.bool);
     try std.testing.expectEqualStrings("review_untrusted_source", verdict.get("failureCode").?.string);
 
     const lock_failure = terminalLockFailureForStatus(std.testing.allocator, status) orelse return error.ExpectedTerminalLockFailure;
@@ -11994,14 +10490,14 @@ test "review verdict status maps phase-three statuses" {
 }
 
 test "review verdict proof status excludes timeout and incomplete failures" {
-    try std.testing.expect(reviewVerdictStatusIsProof("clean"));
-    try std.testing.expect(reviewVerdictStatusIsProof("findings"));
-    try std.testing.expect(reviewVerdictStatusIsProof("account_resource_exhausted"));
-    try std.testing.expect(!reviewVerdictStatusIsProof("parse_mismatch"));
-    try std.testing.expect(!reviewVerdictStatusIsProof("timeout"));
-    try std.testing.expect(!reviewVerdictStatusIsProof("incomplete"));
-    try std.testing.expect(!reviewVerdictStatusIsProof("review_transport_failure"));
-    try std.testing.expect(!reviewVerdictStatusIsProof("review_untrusted_source"));
+    try std.testing.expect(reviewVerdictStatusIsTupleTerminal("clean"));
+    try std.testing.expect(reviewVerdictStatusIsTupleTerminal("findings"));
+    try std.testing.expect(reviewVerdictStatusIsTupleTerminal("account_resource_exhausted"));
+    try std.testing.expect(!reviewVerdictStatusIsTupleTerminal("parse_mismatch"));
+    try std.testing.expect(!reviewVerdictStatusIsTupleTerminal("timeout"));
+    try std.testing.expect(!reviewVerdictStatusIsTupleTerminal("incomplete"));
+    try std.testing.expect(!reviewVerdictStatusIsTupleTerminal("review_transport_failure"));
+    try std.testing.expect(!reviewVerdictStatusIsTupleTerminal("review_untrusted_source"));
 }
 
 test "account resource exhaustion detector accepts required signals" {
@@ -12076,7 +10572,7 @@ test "fallback stderr account limit drives no-attempt verdict" {
     try std.testing.expectEqualStrings("account_resource_exhausted", verdict.get("failureCode").?.string);
     try std.testing.expect(!verdict.get("clean").?.bool);
     try std.testing.expect(!verdict.get("reviewAttemptExists").?.bool);
-    try std.testing.expect(!verdict.get("proofVerdictExists").?.bool);
+    try std.testing.expect(!verdict.get("tupleVerdictExists").?.bool);
 }
 
 test "receipt normalizer preserves account resource retry metadata" {
@@ -12095,7 +10591,7 @@ test "receipt normalizer preserves account resource retry metadata" {
 
 test "receipt normalizer keeps pre-attempt account exhaustion attempt-free" {
     const raw =
-        \\{"demo":"cas-review-session","action":"start","reviewAttemptPhase":"pre_review_start","reviewAttemptExists":false,"proofVerdictExists":false,"reviewThreadId":null,"reviewTurnId":null,"failureCode":"account_resource_exhausted","failureClass":"account_resource","retryableSameTupleNow":false,"failureHint":"usageLimitExceeded"}
+        \\{"demo":"cas-review-session","action":"start","reviewAttemptPhase":"pre_review_start","reviewAttemptExists":false,"tupleVerdictExists":false,"reviewThreadId":null,"reviewTurnId":null,"failureCode":"account_resource_exhausted","failureClass":"account_resource","retryableSameTupleNow":false,"failureHint":"usageLimitExceeded"}
     ;
     const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "pre-account.json", raw, true, .{});
     defer receipt.deinit(std.testing.allocator);
@@ -12105,7 +10601,7 @@ test "receipt normalizer keeps pre-attempt account exhaustion attempt-free" {
     try std.testing.expectEqual(false, receipt.retryable_same_tuple_now.?);
     try std.testing.expectEqualStrings("pre_review_start", receipt.review_attempt_phase);
     try std.testing.expect(!receipt.review_attempt_exists);
-    try std.testing.expect(!receipt.proof_verdict_exists);
+    try std.testing.expect(!receipt.tuple_verdict_exists);
 }
 
 test "stored receipt event log account limit wins over missing output" {
@@ -12151,7 +10647,7 @@ test "stored account exhaustion with tuple proof normalizes phase" {
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("account_resource_exhausted", receipt.status);
     try std.testing.expectEqualStrings("account_resource_exhausted", receipt.failure_code.?);
-    try std.testing.expect(receipt.proof_verdict_exists);
+    try std.testing.expect(receipt.tuple_verdict_exists);
     try std.testing.expectEqualStrings("normalized_verdict", receipt.review_attempt_phase);
 }
 
@@ -12198,7 +10694,7 @@ test "pre-review lane transport receipt is attempt-free and tuple-bound" {
     try std.testing.expectEqualStrings("transport_pre_review", root.get("failureClass").?.string);
     try std.testing.expectEqualStrings("pre_review_start", root.get("reviewAttemptPhase").?.string);
     try std.testing.expect(!root.get("reviewAttemptExists").?.bool);
-    try std.testing.expect(!root.get("proofVerdictExists").?.bool);
+    try std.testing.expect(!root.get("tupleVerdictExists").?.bool);
     switch (root.get("reviewThreadId").?) {
         .null => {},
         else => return error.ExpectedNull,
@@ -12270,7 +10766,7 @@ test "review verdict compacts lane findings for consumers" {
     try std.testing.expectEqualStrings("findings", root.get("status").?.string);
     try std.testing.expectEqualStrings("normalized_verdict", root.get("reviewAttemptPhase").?.string);
     try std.testing.expect(root.get("reviewAttemptExists").?.bool);
-    try std.testing.expect(root.get("proofVerdictExists").?.bool);
+    try std.testing.expect(root.get("tupleVerdictExists").?.bool);
     try std.testing.expectEqualStrings("cas-lane", root.get("backendClass").?.string);
     try std.testing.expect(!root.get("clean").?.bool);
     try std.testing.expectEqual(@as(i64, 1), root.get("findingCount").?.integer);
@@ -12308,7 +10804,7 @@ test "review verdict requires tuple proof before proof flag" {
     try std.testing.expectEqualStrings("clean", root.get("status").?.string);
     try std.testing.expectEqualStrings("review_terminal", root.get("reviewAttemptPhase").?.string);
     try std.testing.expect(root.get("reviewAttemptExists").?.bool);
-    try std.testing.expect(!root.get("proofVerdictExists").?.bool);
+    try std.testing.expect(!root.get("tupleVerdictExists").?.bool);
 }
 
 test "review verdict timeout is not proof-bearing" {
@@ -12338,7 +10834,7 @@ test "review verdict timeout is not proof-bearing" {
     try std.testing.expectEqualStrings("timeout", root.get("status").?.string);
     try std.testing.expectEqualStrings("review_waiting", root.get("reviewAttemptPhase").?.string);
     try std.testing.expect(root.get("reviewAttemptExists").?.bool);
-    try std.testing.expect(!root.get("proofVerdictExists").?.bool);
+    try std.testing.expect(!root.get("tupleVerdictExists").?.bool);
 }
 
 test "dualParseVerdict fails closed on structured/raw mismatch" {
