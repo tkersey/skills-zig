@@ -43,7 +43,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - `cas review_session lane smoke` starts a current persistent lane and proves that the target tuple can create a first detached review attempt. Proof-sensitive callers should use persistent lane as a canonical closeout backend only after a current passing smoke exists for the repo/codex/CAS/account/target tuple; otherwise use normalized `start --wait`.
 - `cas review_session lane review` includes a compact `reviewVerdict` object for caller control flow. The full receipt remains the audit artifact. Pass `--verdict-only` to emit only `reviewVerdict` while preserving the same exit semantics.
 - `cas review_session start` and `cas review_session lane review` accept `--fresh-attempt REASON` to start a new same-tuple review after a terminal or normalized receipt. This never bypasses active review locks or account/resource exhaustion locks.
-- `cas review_session receipt proof --clean-streak N` computes a distinct-attempt clean streak from normalized receipts. Cached repeats of the same `reviewThreadId` do not increment the streak; pre-review/no-attempt transport failures are ignored. Attempts with reduced account-principal isolation (`principalProofUsable=false`) do not certify proof unless `--allow-reduced-principal REASON` is explicit.
+- `cas review_session receipt proof --clean-streak N` computes a distinct-attempt clean streak from normalized receipts. Cached repeats of the same `reviewThreadId` do not increment the streak; pre-review/no-attempt transport failures are ignored. Strong proof requires receipt metadata bound to a stable redacted account principal. Attempts with missing principal metadata or type/plan-only account evidence remain reduced (`principalProofUsable=false`) and do not certify proof unless `--allow-reduced-principal REASON` is explicit.
 - Terminal review failures are now classified more precisely: `review_interrupted`, `approval_denied`, `review_failed`, `review_output_missing`, `parent_thread_not_materialized`, and `unsafe_parent_thread_state`.
 - If a websocket-backed detached review already exists and `wait` cannot reconnect to its managed transport, `--fallback native-review` now returns an explicit degraded native-review success and persists that terminal fallback in the review-session record. It is not detached-review proof.
 - Repo-owned first-party callers should keep native fallback caller-owned: treat `start -> wait` as one detached CAS attempt, and switch to native `codex review` outside CAS after inspecting the JSON verdict when the resolved runtime is incompatible.
@@ -167,7 +167,8 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
   --base main \
   --clean-streak 3
 
-# Auditable compatibility escape hatch for old/reduced-principal receipts.
+# Auditable compatibility escape hatch for old/reduced-principal receipts. This is degraded proof,
+# not equivalent to strong account-principal certification.
 ./zig-out/bin/cas review_session receipt proof \
   --glob "$HOME/.codex/cas/review_sessions/*.json" \
   --cwd /path/to/workspace \
