@@ -17,6 +17,10 @@ const HelpSurface = core_cli.HelpSurface{
     .executable_name = "learnings",
     .help_text = UsageText,
 };
+const MigrateHelpSurface = core_cli.HelpSurface{
+    .executable_name = "learnings migrate",
+    .help_text = MigrateUsageText,
+};
 
 const UsageText =
     \\learnings
@@ -46,6 +50,34 @@ const UsageText =
     \\  --path PATH           Path to learnings JSONL file (relative to repo root by default)
     \\  -V, --version         Show version
     \\  version               Show version
+;
+
+const MigrateUsageText =
+    \\learnings migrate
+    \\
+    \\usage: learnings migrate [-h] [--from PATH] [--to PATH] [--mode {copy,move}] [--dry-run] [--allow-existing-target] [--remove-legacy]
+    \\
+    \\Copy or move legacy .learnings.jsonl rows into .ledger/learnings/learnings.jsonl.
+    \\
+    \\Migration states:
+    \\  legacy-only           .learnings.jsonl exists and .ledger/learnings/learnings.jsonl is missing; run --mode copy before append
+    \\  migrated              canonical .ledger/learnings/learnings.jsonl exists; append is allowed
+    \\  missing               no learnings store exists yet
+    \\
+    \\options:
+    \\  -h, --help            show this help message and exit
+    \\  --from PATH           Legacy source path relative to repo root (default: .learnings.jsonl)
+    \\  --to PATH             Canonical target path relative to repo root (default: .ledger/learnings/learnings.jsonl)
+    \\  --mode {copy,move}    Copy preserves the legacy file; move may remove it when safe (default: copy)
+    \\  --dry-run             Validate and report the migration without writing
+    \\  --allow-existing-target
+    \\                        Merge compatible target rows instead of requiring a missing target
+    \\  --remove-legacy       Remove legacy source after a successful migration when allowed
+    \\
+    \\Preflight:
+    \\  learnings doctor
+    \\  learnings migrate --dry-run --mode copy
+    \\  learnings migrate --mode copy
 ;
 
 const LearningsFields = [_][]const u8{
@@ -391,6 +423,12 @@ pub fn main(init: std.process.Init) !void {
         try core_cli.printHelpSurface(stdout, HelpSurface, Version);
         return;
     }
+    if (isSubcommandHelp(argv, "migrate")) {
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        const stdout = &stdout_writer.interface;
+        try core_cli.printHelpSurface(stdout, MigrateHelpSurface, Version);
+        return;
+    }
 
     const parsed = parseArgs(argv) catch |err| {
         printParseError(err, argv);
@@ -484,6 +522,23 @@ pub fn main(init: std.process.Init) !void {
         .doctor => try cmdDoctor(allocator, repo_root),
         .path => try cmdPath(allocator, repo_root, parsed.path, parsed.path_explicit),
     }
+}
+
+fn isSubcommandHelp(argv: []const []const u8, subcommand: []const u8) bool {
+    var i: usize = 1;
+    while (i < argv.len) : (i += 1) {
+        const arg = argv[i];
+        if (std.mem.eql(u8, arg, "--path")) {
+            i += 1;
+            continue;
+        }
+        if (!std.mem.eql(u8, arg, subcommand)) return false;
+        for (argv[i + 1 ..]) |sub_arg| {
+            if (core_cli.isHelpArg(sub_arg)) return true;
+        }
+        return false;
+    }
+    return false;
 }
 
 fn parseArgs(argv: []const []const u8) !Args {
@@ -4521,6 +4576,29 @@ test "parse args memory-digest" {
     try std.testing.expectEqualStrings("2026-03-01", parsed.since);
     try std.testing.expectEqual(@as(usize, 7), parsed.limit);
     try std.testing.expectEqualStrings("digest.md", parsed.output);
+}
+
+test "migrate subcommand help dispatches before argument parsing" {
+    const long_help = [_][]const u8{ ProgramName, "migrate", "--help" };
+    try std.testing.expect(isSubcommandHelp(&long_help, "migrate"));
+
+    const short_help = [_][]const u8{ ProgramName, "migrate", "-h" };
+    try std.testing.expect(isSubcommandHelp(&short_help, "migrate"));
+
+    const dry_run = [_][]const u8{ ProgramName, "migrate", "--dry-run" };
+    try std.testing.expect(!isSubcommandHelp(&dry_run, "migrate"));
+    const parsed = try parseArgs(&dry_run);
+    try std.testing.expect(parsed.command.? == .migrate);
+    try std.testing.expect(parsed.dry_run);
+
+    const global_path_help = [_][]const u8{ ProgramName, "--path", ".custom/learnings.jsonl", "migrate", "--help" };
+    try std.testing.expect(isSubcommandHelp(&global_path_help, "migrate"));
+
+    const late_help = [_][]const u8{ ProgramName, "migrate", "--dry-run", "--help" };
+    try std.testing.expect(isSubcommandHelp(&late_help, "migrate"));
+
+    const query_mentions_migrate = [_][]const u8{ ProgramName, "query", "--spec", "migrate", "--help" };
+    try std.testing.expect(!isSubcommandHelp(&query_mentions_migrate, "migrate"));
 }
 
 test "migrate copies legacy rows preserving byte content" {

@@ -26,3 +26,15 @@ Default store:
 Breaking/default-path change: learnings now stores records under
 `.ledger/learnings/learnings.jsonl`. Use `learnings migrate` to copy legacy
 `.learnings.jsonl` rows.
+
+Preflight before appending in a repo with possible legacy rows:
+
+```bash
+learnings doctor
+learnings migrate --dry-run --mode copy
+learnings migrate --mode copy
+```
+
+If `learnings doctor` reports `legacy-only`, migrate before `learnings append`.
+Append fails closed with `MigrationRequired` instead of splitting writes across
+legacy and canonical stores.
