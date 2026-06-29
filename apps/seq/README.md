@@ -179,7 +179,7 @@ seq review-compiler-audit --root ~/.codex/sessions --protocol legacy-cleanroom -
 
 `cas-review-audit` projects CAS review-session receipts and shell outputs into the shared review-proof plane:
 - accepts bounded session selectors (`--session-id`, `--path`, `--repo`, `--workdir`, `--since`, `--until`, `--last`) plus persisted receipts via `--receipt-path` or `--receipt-glob`
-- emits one projection row per receipt-like JSON surface with review attempt phase, attempt/proof booleans, tuple identity, backend class, failure class, and normalized verdict status
+- emits one projection row per receipt-like JSON surface with review attempt phase, attempt/proof booleans, tuple identity, backend class, failure class, normalized verdict status, and closeout authority fields such as `surface`, `certified`, `closeout_eligible`, `diagnostic_only`, and `override_used`
 - classifies legacy `lane_transport_lost` receipts with no review thread and no review count as `pre_review_lane_transport_lost`
 - reports derived counts for pre-review lane deaths, review-attempt transport failures, clean/findings verdicts, account exhaustion, timeouts with handles, duplicate prevention, and start-wait normalization
 - summarizes persistent-lane backend readiness as `proven`, `unproven`, `failing_pre_review`, or `degraded`

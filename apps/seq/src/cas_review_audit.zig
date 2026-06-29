@@ -13,10 +13,18 @@ pub const projection_fields = [_][]const u8{
     "receipt_path",
     "cwd",
     "command_surface",
+    "surface",
     "backend_class",
     "review_attempt_phase",
     "review_attempt_exists",
     "proof_verdict_exists",
+    "certified",
+    "closeout_eligible",
+    "diagnostic_only",
+    "override_used",
+    "override_flags",
+    "duplicate_cached_receipt_inflation",
+    "current_clean_streak",
     "failure_code",
     "failure_class",
     "retryable_same_tuple_now",
@@ -489,10 +497,18 @@ fn classifySmokeResultObject(
     try putStringOrNull(&row, "receipt_path", record_path orelse if (std.mem.eql(u8, ctx.command_surface, "receipt")) ctx.source_path else null);
     try putStringOrNull(&row, "cwd", nullableStringAny(root, &.{ "cwd", "workdir" }) orelse ctx.cwd);
     try row.putStaticKey("command_surface", .{ .string = if (nullableString(root, "suiteVersion") != null) "lane-smoke-suite" else "lane-smoke-until-fixed" });
+    try row.putStaticKey("surface", .{ .string = "runner" });
     try row.putStaticKey("backend_class", .{ .string = backend_class });
     try row.putStaticKey("review_attempt_phase", .{ .string = phase });
     try row.putStaticKey("review_attempt_exists", .{ .bool = review_attempt_exists });
     try row.putStaticKey("proof_verdict_exists", .{ .bool = proof_verdict_exists });
+    try putBoolOrNull(&row, "certified", null);
+    try row.putStaticKey("closeout_eligible", .{ .bool = false });
+    try row.putStaticKey("diagnostic_only", .{ .bool = false });
+    try row.putStaticKey("override_used", .{ .bool = false });
+    try putStringOrNull(&row, "override_flags", null);
+    try row.putStaticKey("duplicate_cached_receipt_inflation", .{ .bool = false });
+    try putIntOrNull(&row, "current_clean_streak", null);
     try putStringOrNull(&row, "failure_code", failure_code);
     try putStringOrNull(&row, "failure_class", nullableStringAny(result, &.{ "failureClass", "failure_class" }) orelse failureClassForCode(failure_code));
     try putBoolOrNull(&row, "retryable_same_tuple_now", boolFieldAny(result, &.{ "retryableSameTupleNow", "retryable_same_tuple_now" }));
@@ -544,12 +560,14 @@ fn classifyReceiptText(allocator: std.mem.Allocator, text: []const u8, ctx: Clas
 
 fn classifyReceiptObject(allocator: std.mem.Allocator, root: std.json.ObjectMap, ctx: ClassifyContext) !query.Row {
     const verdict = objectField(root, "reviewVerdict");
+    const tuple = objectField(root, "tuple");
+    const surface = nullableString(root, "surface") orelse if (std.mem.indexOf(u8, ctx.command_surface, "receipt proof") != null) "proof" else if (std.mem.indexOf(u8, ctx.command_surface, "receipt certify") != null) "certify" else if (verdict != null) "normalize" else "runner";
     const failure_code_raw = nullableStringAny(root, &.{ "failureCode", "failure_code" });
     const review_thread_id = nullableStringAny(root, &.{ "reviewThreadId", "review_thread_id" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "reviewThreadId", "review_thread_id" }) else null;
     const review_turn_id = nullableStringAny(root, &.{ "reviewTurnId", "review_turn_id" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "reviewTurnId", "review_turn_id" }) else null;
-    const base_sha = nullableStringAny(root, &.{ "baseSha", "base_sha" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "baseSha", "base_sha" }) else null;
-    const head_sha = nullableStringAny(root, &.{ "headSha", "head_sha" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "headSha", "head_sha" }) else null;
-    const target_fingerprint = nullableStringAny(root, &.{ "targetFingerprint", "target_fingerprint" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "targetFingerprint", "target_fingerprint" }) else null;
+    const base_sha = nullableStringAny(root, &.{ "baseSha", "base_sha" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "baseSha", "base_sha" }) else if (tuple) |t| nullableStringAny(t, &.{ "baseSha", "base_sha" }) else null;
+    const head_sha = nullableStringAny(root, &.{ "headSha", "head_sha" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "headSha", "head_sha" }) else if (tuple) |t| nullableStringAny(t, &.{ "headSha", "head_sha" }) else null;
+    const target_fingerprint = nullableStringAny(root, &.{ "targetFingerprint", "target_fingerprint" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "targetFingerprint", "target_fingerprint" }) else if (tuple) |t| nullableStringAny(t, &.{ "targetFingerprint", "target_fingerprint" }) else null;
     const stored_terminal = storedTerminalProjection(allocator, root, base_sha, head_sha, target_fingerprint);
     const review_count = intFieldAny(root, &.{ "reviewCount", "review_count" }) orelse 0;
     const last_review_thread_id = nullableStringAny(root, &.{ "lastReviewThreadId", "last_review_thread_id" });
@@ -582,10 +600,18 @@ fn classifyReceiptObject(allocator: std.mem.Allocator, root: std.json.ObjectMap,
     try putStringOrNull(&row, "receipt_path", record_path orelse if (std.mem.eql(u8, ctx.command_surface, "receipt")) ctx.source_path else null);
     try putStringOrNull(&row, "cwd", nullableStringAny(root, &.{ "cwd", "workdir" }) orelse ctx.cwd);
     try row.putStaticKey("command_surface", .{ .string = ctx.command_surface });
+    try row.putStaticKey("surface", .{ .string = surface });
     try row.putStaticKey("backend_class", .{ .string = backend_class });
     try row.putStaticKey("review_attempt_phase", .{ .string = phase });
     try row.putStaticKey("review_attempt_exists", .{ .bool = review_attempt_exists });
     try row.putStaticKey("proof_verdict_exists", .{ .bool = proof_verdict_exists });
+    try putBoolOrNull(&row, "certified", boolField(root, "certified"));
+    try putBoolOrNull(&row, "closeout_eligible", boolField(root, "closeoutEligible"));
+    try putBoolOrNull(&row, "diagnostic_only", boolField(root, "diagnosticOnly"));
+    try putBoolOrNull(&row, "override_used", boolField(root, "overrideUsed"));
+    try putStringOrNull(&row, "override_flags", overrideFlagsSummary(root));
+    try putBoolOrNull(&row, "duplicate_cached_receipt_inflation", boolField(root, "duplicateCachedReceiptInflation"));
+    try putIntOrNull(&row, "current_clean_streak", intField(root, "currentCleanStreak"));
     try putStringOrNull(&row, "failure_code", failure_code);
     try putStringOrNull(&row, "failure_class", nullableStringAny(root, &.{ "failureClass", "failure_class" }) orelse failureClassForCode(failure_code));
     try putBoolOrNull(&row, "retryable_same_tuple_now", boolFieldAny(root, &.{ "retryableSameTupleNow", "retryable_same_tuple_now" }));
@@ -844,6 +870,9 @@ fn looksLikeCasReviewCommand(cmd: []const u8) bool {
 }
 
 fn looksLikeReceiptObject(root: std.json.ObjectMap) bool {
+    if (nullableString(root, "surface")) |surface| {
+        if (optEql(surface, "proof") or optEql(surface, "certify") or optEql(surface, "normalize") or optEql(surface, "runner")) return true;
+    }
     if (objectField(root, "reviewVerdict") != null) return true;
     if (nullableStringAny(root, &.{ "reviewThreadId", "review_thread_id" }) != null) return true;
     if (nullableStringAny(root, &.{ "reviewAttemptPhase", "review_attempt_phase" }) != null) return true;
@@ -863,6 +892,17 @@ fn looksLikeReceiptObject(root: std.json.ObjectMap) bool {
             optEql(status, "no_attempt");
     }
     return false;
+}
+
+fn overrideFlagsSummary(root: std.json.ObjectMap) ?[]const u8 {
+    const value = root.get("overrideFlags") orelse return null;
+    return switch (value) {
+        .array => |array| if (array.items.len == 0) null else switch (array.items[0]) {
+            .string => |text| text,
+            else => "present",
+        },
+        else => null,
+    };
 }
 
 fn backendFromCommand(cmd: []const u8) []const u8 {
@@ -1169,6 +1209,45 @@ test "stored terminal lane session record preserves lane backend" {
     try std.testing.expectEqualStrings("normalized_verdict", scalarString(row, "review_attempt_phase").?);
     try std.testing.expect(scalarBool(row, "proof_verdict_exists"));
     try std.testing.expectEqualStrings("clean", scalarString(row, "review_verdict_status").?);
+}
+
+test "diagnostic proof and certification surfaces are distinguishable" {
+    var proof_row = try classifyReceiptText(std.testing.allocator,
+        \\{"schemaVersion":"cas-review-proof-v1","surface":"proof","policy":"strongest-closeout","passed":true,"closeoutEligible":false,"diagnosticOnly":true,"overrideUsed":true,"overrideFlags":["allow-reduced-principal"],"requiredCleanStreak":3,"observedCleanStreakUnderAssumptions":3,"strictCleanStreak":2,"currentCleanStreak":3,"ignoredNonProofCount":0}
+    , .{
+        .session_id = "",
+        .cwd = null,
+        .command_surface = "receipt",
+        .source_path = "/tmp/proof.json",
+        .default_backend_class = "cas-receipt-normalized",
+    });
+    defer proof_row.deinit();
+
+    try std.testing.expectEqualStrings("proof", scalarString(proof_row, "surface").?);
+    try std.testing.expect(!scalarBool(proof_row, "closeout_eligible"));
+    try std.testing.expect(scalarBool(proof_row, "diagnostic_only"));
+    try std.testing.expect(scalarBool(proof_row, "override_used"));
+    try std.testing.expectEqualStrings("allow-reduced-principal", scalarString(proof_row, "override_flags").?);
+    try std.testing.expectEqual(@as(i64, 3), scalarInt(proof_row, "current_clean_streak"));
+
+    var certify_row = try classifyReceiptText(std.testing.allocator,
+        \\{"schemaVersion":"cas-review-certify-v1","surface":"certify","policy":"strongest-closeout","certified":false,"closeoutEligible":true,"overrideUsed":false,"requiredCleanStreak":3,"currentCleanStreak":2,"ignoredNonProofCount":1,"ignoredNonProofReasons":["reduced_principal"],"duplicateCachedReceiptInflation":false,"tuple":{"repo":null,"baseSha":"b","headSha":"h","targetFingerprint":"t"}}
+    , .{
+        .session_id = "",
+        .cwd = null,
+        .command_surface = "receipt",
+        .source_path = "/tmp/certify.json",
+        .default_backend_class = "cas-receipt-normalized",
+    });
+    defer certify_row.deinit();
+
+    try std.testing.expectEqualStrings("certify", scalarString(certify_row, "surface").?);
+    try std.testing.expect(!scalarBool(certify_row, "certified"));
+    try std.testing.expect(scalarBool(certify_row, "closeout_eligible"));
+    try std.testing.expect(!scalarBool(certify_row, "diagnostic_only"));
+    try std.testing.expect(!scalarBool(certify_row, "override_used"));
+    try std.testing.expectEqual(@as(i64, 2), scalarInt(certify_row, "current_clean_streak"));
+    try std.testing.expectEqualStrings("b", scalarString(certify_row, "base_sha").?);
 }
 
 test "standard response item output is audited with top-level session meta" {
