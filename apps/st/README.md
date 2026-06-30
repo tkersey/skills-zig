@@ -129,7 +129,7 @@ st graph repair --workspace .ledger/st --plan default --from-last-failure --form
 `st artifact-maintenance record` emits AMR-v1 receipts for sidecar or ledger artifact maintenance where path names could otherwise look like workflow activation. AMR records classify the artifact as governed by `st`, keep `activation_signal=false`, and persist only with `--write-receipt`:
 
 ```bash
-st artifact-maintenance record --workspace .ledger/st --operation delete_sidecar --path .step/resolve-c3-st-plan.jsonl --mentioned-workflow resolve-c3 --reason "duplicate sidecar durable state" --format json
+st artifact-maintenance record --workspace .ledger/st --operation delete_sidecar --path .step/st-plan-sidecar.jsonl --mentioned-workflow review-compiler --reason "duplicate sidecar durable state" --format json
 ```
 
 Claim-bound worker output is sealed through external worktrees and CS-v1 change sets:

@@ -9,7 +9,7 @@ Source: user `$spec-pipeline`, `$plan`, and `$actuating $land` handoff for `seq 
   Source: .step/review-compiler-audit-plan.md#cli-contract
 
 - intent-rca-c3-002 | requirement | covered
-  Text: True C3 detection must require assistant/tool evidence for review_compile.py begin, .resolve-c3/state.json, minimal_review_patch_certificate, or MRPC-v1; raw `$resolve` text is candidate-only.
+  Text: True C3 detection must require assistant/tool evidence for review_compile.py begin, .ledger/resolve/c3/state.json, minimal_review_patch_certificate, or MRPC-v1; raw `$resolve` text is candidate-only.
   Source: .step/review-compiler-audit-plan.md#locked-decisions
 
 - intent-rca-c3-003 | compatibility | covered
@@ -21,7 +21,7 @@ Source: user `$spec-pipeline`, `$plan`, and `$actuating $land` handoff for `seq 
   Source: .step/review-compiler-audit-plan.md#required-c3-output
 
 - intent-rca-c3-005 | requirement | covered
-  Text: Event ordering must use .resolve-c3/events.jsonl transcript evidence when present and otherwise derive ordered evidence from assistant text and controller tool records.
+  Text: Event ordering must use .ledger/resolve/c3/events.jsonl transcript evidence when present and otherwise derive ordered evidence from assistant text and controller tool records.
   Source: .step/review-compiler-audit-plan.md#event-ordering
 
 - intent-rca-c3-006 | requirement | covered

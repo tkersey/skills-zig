@@ -6648,53 +6648,26 @@ fn appendMessageWorkflowProvenanceRows(
         return;
     }
 
-    if (!std.mem.eql(u8, workflow, "resolve-c3")) {
-        if (containsIgnoreCaseAscii(message.text, workflow)) {
-            try appendWorkflowProvenanceRow(allocator, out_rows, .{
-                .session_id = session_id,
-                .workflow_name = workflow,
-                .evidence_class = "filename_or_path_mention",
-                .source = sourceKindForRole(message.role),
-                .timestamp = message.timestamp,
-                .ref = message.text,
-                .reason = "workflow_name_text_mention",
-                .path = path,
-            });
-        }
-        return;
-    }
-
-    if (containsAuthoritativeC3EventText(message.text)) {
+    if (containsIgnoreCaseAscii(message.text, workflow) and containsArtifactRepairCue(message.text)) {
         try appendWorkflowProvenanceRow(allocator, out_rows, .{
             .session_id = session_id,
             .workflow_name = workflow,
-            .evidence_class = "controller_event",
+            .evidence_class = "artifact_under_repair",
             .source = sourceKindForRole(message.role),
             .timestamp = message.timestamp,
             .ref = message.text,
-            .reason = "resolve_c3_controller_event",
+            .reason = "artifact_repair_text",
             .path = path,
         });
-    } else if (containsDeclaredC3WorkflowEvidence(message.text)) {
+    } else if (containsIgnoreCaseAscii(message.text, workflow)) {
         try appendWorkflowProvenanceRow(allocator, out_rows, .{
             .session_id = session_id,
             .workflow_name = workflow,
-            .evidence_class = "explicit_workflow_declaration",
+            .evidence_class = "filename_or_path_mention",
             .source = sourceKindForRole(message.role),
             .timestamp = message.timestamp,
             .ref = message.text,
-            .reason = "resolve_c3_explicit_declaration",
-            .path = path,
-        });
-    } else if (containsIncidentalC3ArtifactMention(message.text)) {
-        try appendWorkflowProvenanceRow(allocator, out_rows, .{
-            .session_id = session_id,
-            .workflow_name = workflow,
-            .evidence_class = if (containsArtifactRepairCue(message.text)) "artifact_under_repair" else "filename_or_path_mention",
-            .source = sourceKindForRole(message.role),
-            .timestamp = message.timestamp,
-            .ref = message.text,
-            .reason = if (containsArtifactRepairCue(message.text)) "artifact_repair_text" else "resolve_c3_filename_or_path_mention",
+            .reason = "workflow_name_text_mention",
             .path = path,
         });
     }
@@ -6711,36 +6684,18 @@ fn appendToolWorkflowProvenanceRows(
 ) !void {
     const tool_text = reviewCompilerToolText(tool);
     const timestamp = toolTimestamp(parsed, tool);
-    if (std.mem.eql(u8, workflow, "resolve-c3")) {
-        if (reviewCompilerToolIsCompletedC3Controller(tool)) {
-            try appendWorkflowProvenanceRow(allocator, out_rows, .{
-                .session_id = session_id,
-                .workflow_name = workflow,
-                .evidence_class = "controller_invocation",
-                .source = "tool_call",
-                .timestamp = timestamp,
-                .ref = tool.command_text orelse tool_text,
-                .reason = "resolve_c3_controller_invocation",
-                .path = path,
-            });
-            return;
-        }
-        if (toolHasIncidentalC3Mention(tool)) {
-            try appendWorkflowProvenanceRow(allocator, out_rows, .{
-                .session_id = session_id,
-                .workflow_name = workflow,
-                .evidence_class = if (tool.kind == .patch_apply or containsArtifactRepairCue(tool_text)) "artifact_under_repair" else "filename_or_path_mention",
-                .source = "tool_call",
-                .timestamp = timestamp,
-                .ref = tool_text,
-                .reason = if (tool.kind == .patch_apply or containsArtifactRepairCue(tool_text)) "artifact_repair_tool" else "resolve_c3_filename_or_path_mention",
-                .path = path,
-            });
-        }
-        return;
-    }
-
-    if (toolNameMatchesWorkflow(tool, workflow)) {
+    if (std.mem.eql(u8, workflow, "review-compiler") and reviewCompilerToolIsCompletedC3Controller(tool)) {
+        try appendWorkflowProvenanceRow(allocator, out_rows, .{
+            .session_id = session_id,
+            .workflow_name = workflow,
+            .evidence_class = "controller_invocation",
+            .source = "tool_call",
+            .timestamp = timestamp,
+            .ref = tool.command_text orelse tool_text,
+            .reason = "c3_controller_invocation",
+            .path = path,
+        });
+    } else if (toolNameMatchesWorkflow(tool, workflow)) {
         try appendWorkflowProvenanceRow(allocator, out_rows, .{
             .session_id = session_id,
             .workflow_name = workflow,
@@ -6749,6 +6704,17 @@ fn appendToolWorkflowProvenanceRows(
             .timestamp = timestamp,
             .ref = tool.command_text orelse tool_text,
             .reason = "tool_name_matches_workflow",
+            .path = path,
+        });
+    } else if (containsIgnoreCaseAscii(tool_text, workflow) and containsArtifactRepairCue(tool_text)) {
+        try appendWorkflowProvenanceRow(allocator, out_rows, .{
+            .session_id = session_id,
+            .workflow_name = workflow,
+            .evidence_class = "artifact_under_repair",
+            .source = "tool_call",
+            .timestamp = timestamp,
+            .ref = tool_text,
+            .reason = "artifact_repair_tool",
             .path = path,
         });
     } else if (containsIgnoreCaseAscii(tool_text, workflow)) {
@@ -9211,7 +9177,7 @@ fn containsReviewCompilerCandidateCue(text: []const u8) bool {
             "review compiler",
             "review-compiler-audit",
             "review_compiler_audit",
-            "resolve-c3",
+            "review-compiler",
             "MBKC-v1",
             "minimum_behavioral_kernel",
             "kernel-accepted",
@@ -9248,7 +9214,7 @@ fn containsTrueMBKEvidence(text: []const u8) bool {
     return containsAnyIgnoreCaseAscii(text, &.{
         "MBKC-v1",
         "minimum_behavioral_kernel",
-        "resolve-c3 campaign begin",
+        "review-compiler campaign begin",
         "kernel-accepted",
         "terminal-closed",
     });
@@ -9266,11 +9232,11 @@ fn toolHasMBKEvidence(tool: canonical_trace.ToolLifecycleRecord) bool {
 
 fn containsDeclaredC3WorkflowEvidence(text: []const u8) bool {
     return containsAnyIgnoreCaseAscii(text, &.{
-        "using $resolve / resolve-c3",
-        "using resolve-c3",
-        "use resolve-c3",
-        "resolve-c3 for this material review",
-        "resolve-c3 workflow",
+        "using $resolve / review compiler",
+        "using review compiler",
+        "use review compiler",
+        "review compiler for this material review",
+        "review compiler workflow",
         "C3/MRPC",
         "MRPC-v1",
         "minimal_review_patch_certificate",
@@ -9291,18 +9257,18 @@ fn containsAuthoritativeC3EventText(text: []const u8) bool {
         "\"event\":\"tuple-closed\"",
         "\"event\": \"tuple-closed\"",
         "event=tuple-closed",
-        "\"controller\":\"resolve-c3\"",
-        "\"controller\": \"resolve-c3\"",
+        "\"controller\":\"review-compiler\"",
+        "\"controller\": \"review-compiler\"",
         ".ledger/c3/state.json",
     });
 }
 
 fn containsIncidentalC3ArtifactMention(text: []const u8) bool {
     return containsAnyIgnoreCaseAscii(text, &.{
-        ".step/resolve-c3-st-plan.jsonl",
-        "resolve-c3-st-plan.jsonl",
+        ".step/st-plan-sidecar.jsonl",
+        "st-plan-sidecar.jsonl",
         ".ledger/c3",
-        "resolve-c3",
+        "review-compiler",
     });
 }
 
@@ -9470,7 +9436,7 @@ fn recordReviewCompilerC3Text(
         signals.closure_provenance = "generic_delivery_closure";
     }
 
-    if (controller_source and containsAnyIgnoreCaseAscii(text, &.{ "\"event\":\"begin\" controller=resolve-c3", "event=begin", "resolve-c3 campaign begin", "\"event\":\"begin\"", "\"event\": \"begin\"", "\"event\":\"campaign-began\"", "\"event\": \"campaign-began\"", "event=campaign-began", "\nbegin\n" })) {
+    if (controller_source and containsAnyIgnoreCaseAscii(text, &.{ "\"event\":\"begin\" controller=review-compiler", "event=begin", "review-compiler campaign begin", "\"event\":\"begin\"", "\"event\": \"begin\"", "\"event\":\"campaign-began\"", "\"event\": \"campaign-began\"", "event=campaign-began", "\nbegin\n" })) {
         audit.c3.controller.begin_events += 1;
         signals.c3_begin_seen = true;
         recordReviewCompilerEvidenceRef(&signals.c3_begin_evidence, source, timestamp, text);
@@ -9488,7 +9454,7 @@ fn recordReviewCompilerC3Text(
     if (containsAnyIgnoreCaseAscii(text, &.{ "MRPC-v1", "minimal_review_patch_certificate" })) signals.c3_mrpc_seen = true;
     if (controller_source and containsAnyIgnoreCaseAscii(text, &.{ "committed", "mrpc_committed" })) audit.c3.controller.mrpc_committed += 1;
     if (controller_source and containsAnyIgnoreCaseAscii(text, &.{ "pushed", "mrpc_pushed" })) audit.c3.controller.mrpc_pushed += 1;
-    if (controller_source and containsAnyIgnoreCaseAscii(text, &.{ "resolve-c3 close", "\"event\":\"terminal-closed\"", "\"event\": \"terminal-closed\"", "event=terminal-closed", "\"event\":\"tuple-closed\"", "\"event\": \"tuple-closed\"", "event=tuple-closed", "mrpc_closed", "terminal-closed", "tuple-closed" })) {
+    if (controller_source and containsAnyIgnoreCaseAscii(text, &.{ "review-compiler close", "\"event\":\"terminal-closed\"", "\"event\": \"terminal-closed\"", "event=terminal-closed", "\"event\":\"tuple-closed\"", "\"event\": \"tuple-closed\"", "event=tuple-closed", "mrpc_closed", "terminal-closed", "tuple-closed" })) {
         audit.c3.controller.mrpc_closed += 1;
         audit.c3.delivery.closed_runs += 1;
         signals.c3_closed_seen = true;
@@ -9578,7 +9544,7 @@ fn recordReviewCompilerMBKText(
     if (containsAnyIgnoreCaseAscii(text, &.{ "isolated_conformance_session", "isolated conformance session", "isolated_conformance" })) signals.mbk_isolated_conformance_seen = true;
     if (containsAnyIgnoreCaseAscii(text, &.{ "material_kernel_required", "material kernel required" })) signals.mbk_material_kernel_required_seen = true;
 
-    if (containsAnyIgnoreCaseAscii(text, &.{ "campaign-began", "campaign_began", "resolve-c3 campaign begin" })) {
+    if (containsAnyIgnoreCaseAscii(text, &.{ "campaign-began", "campaign_began", "review-compiler campaign begin" })) {
         audit.mbk.campaigns.campaign_ids += 1;
         signals.mbk_begin_seen = true;
         recordReviewCompilerMBKTime(signals, .begin, timestamp);
@@ -9971,22 +9937,22 @@ fn reviewCompilerToolIsCompletedC3Controller(tool: canonical_trace.ToolLifecycle
     if (tool.kind != .exec_command) return false;
     if (tool.lifecycle_status != .completed) return false;
     if ((tool.exit_code orelse -1) != 0) return false;
-    return commandInvokesResolveC3Controller(tool.command_text orelse "");
+    return commandInvokesReviewCompilerController(tool.command_text orelse "");
 }
 
-fn commandInvokesResolveC3Controller(cmd: []const u8) bool {
+fn commandInvokesReviewCompilerController(cmd: []const u8) bool {
     var split = std.mem.tokenizeAny(u8, cmd, " \t\r\n'\"");
     var index: usize = 0;
     while (split.next()) |token_raw| : (index += 1) {
         const token = trimCommandPunctuation(token_raw);
         if (token.len == 0) continue;
         const base = pathBasenameSlice(token);
-        if (std.mem.eql(u8, base, "resolve-c3")) return true;
+        if (std.mem.eql(u8, base, "review-compiler")) return true;
         if ((std.mem.eql(u8, base, "seq") or std.mem.eql(u8, base, "skills-zig") or std.mem.eql(u8, base, "zig-out/bin/seq")) and index <= 2) {
             while (split.next()) |next_raw| {
                 const next = trimCommandPunctuation(next_raw);
                 if (next.len == 0 or std.mem.startsWith(u8, next, "-")) continue;
-                if (std.mem.eql(u8, pathBasenameSlice(next), "resolve-c3")) return true;
+                if (std.mem.eql(u8, pathBasenameSlice(next), "review-compiler")) return true;
                 break;
             }
             return false;
@@ -10013,7 +9979,7 @@ fn reviewCompilerToolContainsAny(tool: canonical_trace.ToolLifecycleRecord, need
 }
 
 fn commandContainsReviewCompileController(cmd: []const u8, subcommand: []const u8) bool {
-    if (!commandInvokesResolveC3Controller(cmd)) return false;
+    if (!commandInvokesReviewCompilerController(cmd)) return false;
     return containsIgnoreCaseAscii(cmd, subcommand);
 }
 
@@ -24594,7 +24560,7 @@ test "st-workspace-audit reconstructs workspace fixtures and avoids legacy menti
         "{\"receipt_version\":\"GCR-v2\",\"gcr_id\":\"gcr-1\",\"workspace_id\":\"ws-1\",\"plan_id\":\"plan-a\",\"session_id\":\"agent-a\",\"claim_id\":\"claim-a\",\"fencing_token\":\"tok-a\",\"workspace_seq\":2,\"plan_seq\":1,\"branch_epoch\":1,\"selected_tasks\":[\"plan-a:a1\"],\"execution_allowed\":true,\"denial_reasons\":[],\"current_at_mutation\":true}\n" ++
         "{\"graph_control_receipt\":{\"receipt_version\":\"GCR-v2\",\"gcr_id\":\"gcr-graph-1\",\"workspace\":{\"workspace_id\":\"ws-1\",\"workspace_sequence\":2},\"plan\":{\"plan_id\":\"plan-a\",\"plan_sequence\":1},\"branch\":{\"epoch\":1},\"claim\":{\"claim_id\":\"claim-a\",\"fencing_token\":\"tok-a\"},\"graph\":{\"ready_frontier\":[\"a1\",\"a2\"],\"selected_frontier\":[\"a1\"],\"unselected_ready\":[\"a2\"],\"critical_path\":[\"a1\"],\"parallel_width\":2},\"proof\":{\"proof_cut_kind\":\"approximation\",\"minimum_proof_cut\":[\"proof-a1\"]},\"session_projection\":{\"session_id\":\"agent-a\"},\"execution_allowed\":\"yes\",\"denial_reasons\":[]}}\n" ++
         "{\"graph_repair_receipt\":{\"receipt_version\":\"GRR-v1\",\"repair_id\":\"grr-1\",\"workspace\":{\"workspace_id\":\"ws-1\",\"workspace_sequence\":2},\"plan_id\":\"plan-a\",\"plan_sequence\":1,\"command\":\"st graph repair\",\"failure_class\":\"graph_audit_failure\",\"observed_exit_code\":2,\"blocking_debt\":[],\"current_status\":\"blocked\",\"execution_allowed\":false}}\n" ++
-        "{\"st_artifact_maintenance_receipt\":{\"receipt_version\":\"AMR-v1\",\"maintenance_id\":\"amr-1\",\"workspace\":\"ws-1\",\"operation\":\"delete_sidecar\",\"governing_workflow\":\"st\",\"artifact_paths\":[\".step/resolve-c3-st-plan.jsonl\"],\"mentioned_workflow_names\":[\"resolve-c3\"],\"activation_signal\":false,\"controller_invocation\":false,\"reason\":\"duplicate sidecar durable state\",\"evidence_refs\":[]}}\n" ++
+        "{\"st_artifact_maintenance_receipt\":{\"receipt_version\":\"AMR-v1\",\"maintenance_id\":\"amr-1\",\"workspace\":\"ws-1\",\"operation\":\"delete_sidecar\",\"governing_workflow\":\"st\",\"artifact_paths\":[\".step/st-plan-sidecar.jsonl\"],\"mentioned_workflow_names\":[\"review-compiler\"],\"activation_signal\":false,\"controller_invocation\":false,\"reason\":\"duplicate sidecar durable state\",\"evidence_refs\":[]}}\n" ++
         "{\"workspace_id\":\"ws-1\",\"change_set_id\":\"cs-1\",\"plan_id\":\"plan-a\",\"claim_id\":\"claim-a\",\"base_head\":\"abc\",\"branch_epoch\":1,\"changed_paths\":[\"apps/seq/src/lib.zig\"],\"uncovered_paths\":[],\"proof_refs\":[\"proof-1\"],\"status\":\"queued\"}\n" ++
         "{\"change_set_id\":\"cs-1\",\"queue_sequence\":1,\"target_branch\":\"main\",\"head_before\":\"abc\",\"head_after\":\"def\",\"epoch_before\":1,\"epoch_after\":2,\"proof\":{\"receipt\":\"proof-1\"},\"result\":\"accepted\",\"latency\":\"2s\"}\n" ++
         "{\"proof_ref\":\"proof-1\",\"plan_id\":\"plan-a\",\"scope\":\"focused\",\"epoch_before\":1,\"epoch_after\":2,\"foreign_change_set\":\"cs-foreign\",\"dependency_cut_intersection\":true,\"correctly_invalidated\":true}\n" ++
@@ -24665,7 +24631,7 @@ test "st-workspace-audit reconstructs workspace fixtures and avoids legacy menti
         "--format",         "json",
     }, output_path);
     defer std.testing.allocator.free(workflow_provenance);
-    try std.testing.expect(std.mem.indexOf(u8, workflow_provenance, "\"workflow_name\": \"resolve-c3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, workflow_provenance, "\"workflow_name\": \"review-compiler\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, workflow_provenance, "\"evidence_class\": \"artifact_under_repair\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, workflow_provenance, "\"activation_signal\": false") != null);
 
@@ -26162,7 +26128,7 @@ test "review-compiler-audit accepts intent closed modes and strict flag" {
         "--mode",
         "report",
         "--artifact-root",
-        "/tmp/resolve-c3",
+        "/tmp/review-compiler",
         "--strict",
     });
     try std.testing.expect(opts.review_compiler_strict);
@@ -26356,7 +26322,7 @@ test "capabilities advertises resolve intent closed audit flags" {
     }, output_path);
     defer std.testing.allocator.free(got);
 
-    try std.testing.expect(std.mem.indexOf(u8, got, "\"version\": \"0.3.22\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"version\": \"0.3.23\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_acceptance_contract_v2\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_review_batch_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_review_aperture_v1\": true") != null);
@@ -26553,36 +26519,36 @@ test "review-compiler-audit c3 protocol reports controller, tournament, holdout,
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T08:00:01Z\",\"payload\":{\"type\":\"user_message\",\"turn_id\":\"r1\",\"message\":\"Raw $resolve mention only.\"}}\n";
     const incomplete_begin =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T09:00:00Z\",\"payload\":{\"id\":\"c3-begin\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T09:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"b1\",\"message\":\"event=begin controller=resolve-c3\\ncounterexample-added raw_finding\\nbranch_liabilities:\\n  - F1\\nindependent_families:\\n  - fam1\\nbasis-set\\ncandidate-registered route_class: owner\\ncandidate-selected\\nablation-recorded\\nedit_atoms_tested\\nremoved_edit_atom\\nsurvived_edit_atom\\norphan_edit_atom\\none_minimal_pass\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n";
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T09:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"b1\",\"message\":\"event=begin controller=review-compiler\\ncounterexample-added raw_finding\\nbranch_liabilities:\\n  - F1\\nindependent_families:\\n  - fam1\\nbasis-set\\ncandidate-registered route_class: owner\\ncandidate-selected\\nablation-recorded\\nedit_atoms_tested\\nremoved_edit_atom\\nsurvived_edit_atom\\norphan_edit_atom\\none_minimal_pass\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n";
     const stages_and_controller =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T10:00:00Z\",\"payload\":{\"id\":\"c3-stages\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"s1\",\"message\":\"event=begin controller=resolve-c3\\n.ledger/c3/state.json\\nMRPC-v1 minimal_review_patch_certificate\\napply-certified\\nfinal-certified\\nbasis-set\\ncandidate-registered route_class: typed\\ncandidate-selected\\nablation-recorded edit_atoms_tested removed_edit_atom\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:02Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"s1\",\"call_id\":\"ctl-commit\",\"command\":\"resolve-c3 commit\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"committed\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:03Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"s1\",\"call_id\":\"ctl-push\",\"command\":\"resolve-c3 push\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"pushed\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:04Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"s1\",\"call_id\":\"ctl-close\",\"command\":\"resolve-c3 close --campaign C3-test\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"event=terminal-closed campaign=C3-test head=abc\"}}\n";
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"s1\",\"message\":\"event=begin controller=review-compiler\\n.ledger/c3/state.json\\nMRPC-v1 minimal_review_patch_certificate\\napply-certified\\nfinal-certified\\nbasis-set\\ncandidate-registered route_class: typed\\ncandidate-selected\\nablation-recorded edit_atoms_tested removed_edit_atom\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:02Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"s1\",\"call_id\":\"ctl-commit\",\"command\":\"review-compiler commit\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"committed\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:03Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"s1\",\"call_id\":\"ctl-push\",\"command\":\"review-compiler push\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"pushed\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T10:00:04Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"s1\",\"call_id\":\"ctl-close\",\"command\":\"review-compiler close --campaign C3-test\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"event=terminal-closed campaign=C3-test head=abc\"}}\n";
     const direct_delivery_patch =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T11:00:00Z\",\"payload\":{\"id\":\"c3-direct-patch\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T11:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"p1\",\"message\":\"event=begin controller=resolve-c3\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T11:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"p1\",\"message\":\"event=begin controller=review-compiler\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-05-12T11:00:02Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"apply_patch\",\"call_id\":\"bad-patch\",\"arguments\":\"*** Update File: apps/seq/src/lib.zig\\n+bad\\n\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T11:00:03Z\",\"payload\":{\"type\":\"patch_apply_end\",\"turn_id\":\"p1\",\"call_id\":\"bad-patch\",\"success\":true,\"cwd\":\"/repo\",\"changes\":{\"files\":1}}}\n";
     const lab_patch =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T12:00:00Z\",\"payload\":{\"id\":\"c3-lab-patch\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T12:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"l1\",\"message\":\"event=begin controller=resolve-c3\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\\ncandidate-worktree lab patch used\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T12:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"l1\",\"message\":\"event=begin controller=review-compiler\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\\ncandidate-worktree lab patch used\"}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-05-12T12:00:02Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"apply_patch\",\"call_id\":\"lab-patch\",\"arguments\":\"*** Update File: apps/seq/src/lib.zig\\n+candidate lab patch\\n\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T12:00:03Z\",\"payload\":{\"type\":\"patch_apply_end\",\"turn_id\":\"l1\",\"call_id\":\"lab-patch\",\"success\":true,\"cwd\":\"/repo/.ledger/c3/candidates/candidate-worktree\",\"changes\":{\"files\":1}}}\n";
     const raw_commit =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T13:00:00Z\",\"payload\":{\"id\":\"c3-raw-commit\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T13:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"g1\",\"message\":\"event=begin controller=resolve-c3\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T13:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"g1\",\"message\":\"event=begin controller=review-compiler\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T13:00:02Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"g1\",\"call_id\":\"raw-commit\",\"command\":\"git commit -m bad\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"ok\"}}\n";
     const holdout_recompile =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T14:00:00Z\",\"payload\":{\"id\":\"c3-recompile\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T14:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"h1\",\"message\":\"event=begin controller=resolve-c3\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T14:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"h1\",\"message\":\"event=begin controller=review-compiler\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded edit_atoms_tested\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T14:00:02Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"h1\",\"message\":\"new_counterexample from delivery holdout\\nreset after invalidation\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T14:00:03Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"h1\",\"message\":\"basis-set\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T14:00:04Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"h1\",\"message\":\"adjacent_followup captured\"}}\n";
     const waiver_and_violation =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-12T15:00:00Z\",\"payload\":{\"id\":\"c3-waiver\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T15:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"w1\",\"message\":\"event=begin controller=resolve-c3\\ntournament_waiver\\nsingle_candidate_material_violation\"}}\n";
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-12T15:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"w1\",\"message\":\"event=begin controller=review-compiler\\ntournament_waiver\\nsingle_candidate_material_violation\"}}\n";
 
     try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/12/rollout-c3-raw.jsonl", .data = raw_resolve_only });
     try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/12/rollout-c3-begin.jsonl", .data = incomplete_begin });
@@ -26658,16 +26624,16 @@ test "review-compiler-audit c3 protocol reports closure compression state" {
     try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/13");
     const clean_closed =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-13T08:00:00Z\",\"payload\":{\"id\":\"c3-clean-closed\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T08:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"c1\",\"message\":\"event=begin controller=resolve-c3\\nclean_review: true\\nevent=terminal-closed campaign=C3-test head=abc\"}}\n";
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T08:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"c1\",\"message\":\"event=begin controller=review-compiler\\nclean_review: true\\nevent=terminal-closed campaign=C3-test head=abc\"}}\n";
     const compressed_closed =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-13T09:00:00Z\",\"payload\":{\"id\":\"c3-compressed-closed\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T09:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"f1\",\"message\":\"event=begin controller=resolve-c3\\nMRPC-v1 minimal_review_patch_certificate\\napply-certified\\nfinal-certified\\nbasis-set\\ncandidate-registered route_class: typed\\ncandidate-selected\\nablation-recorded edit_atoms_tested removed_edit_atom\\nholdout-recorded delivery_holdout\\nproof-recorded\\nevent=terminal-closed campaign=C3-test head=abc\"}}\n";
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T09:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"f1\",\"message\":\"event=begin controller=review-compiler\\nMRPC-v1 minimal_review_patch_certificate\\napply-certified\\nfinal-certified\\nbasis-set\\ncandidate-registered route_class: typed\\ncandidate-selected\\nablation-recorded edit_atoms_tested removed_edit_atom\\nholdout-recorded delivery_holdout\\nproof-recorded\\nevent=terminal-closed campaign=C3-test head=abc\"}}\n";
     const uncompressed_closed =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-13T10:00:00Z\",\"payload\":{\"id\":\"c3-uncompressed-closed\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T10:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"u1\",\"message\":\"event=begin controller=resolve-c3\\nMRPC-v1 minimal_review_patch_certificate\\nevent=terminal-closed campaign=C3-test head=abc\"}}\n";
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T10:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"u1\",\"message\":\"event=begin controller=review-compiler\\nMRPC-v1 minimal_review_patch_certificate\\nevent=terminal-closed campaign=C3-test head=abc\"}}\n";
     const open_material =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-13T11:00:00Z\",\"payload\":{\"id\":\"c3-open-material\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T11:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"o1\",\"message\":\"event=begin controller=resolve-c3\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n";
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-13T11:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"o1\",\"message\":\"event=begin controller=review-compiler\\nbasis-set\\ncandidate-registered\\ncandidate-selected\\nablation-recorded\\nholdout-recorded delivery_holdout\\nproof-recorded\"}}\n";
 
     try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/13/rollout-c3-clean-closed.jsonl", .data = clean_closed });
     try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/13/rollout-c3-compressed-closed.jsonl", .data = compressed_closed });
@@ -26779,20 +26745,20 @@ test "review-compiler-audit c3 protocol attributes orphan closure counts" {
     try std.testing.expect(std.mem.indexOf(u8, got, "\"reason\": \"closed_material_c3_missing_compression_evidence\"") != null);
 }
 
-test "review-compiler-audit c3 protocol treats resolve-c3 artifact repair as incidental" {
+test "review-compiler-audit c3 protocol treats review-compiler artifact repair as incidental" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/15");
     const incidental =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-15T08:00:00Z\",\"payload\":{\"id\":\"c3-artifact-repair\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:01Z\",\"payload\":{\"type\":\"user_message\",\"turn_id\":\"r1\",\"message\":\"Canonical $st intake should replace the retired resolve-c3 staged plan.\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:02Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"r1\",\"message\":\"Retiring .step/resolve-c3-st-plan.jsonl in favor of canonical .step/st-plan.jsonl.\"}}\n" ++
-        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-15T08:00:03Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"apply_patch\",\"call_id\":\"delete-old-plan\",\"arguments\":\"*** Delete File: .step/resolve-c3-st-plan.jsonl\\n\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:01Z\",\"payload\":{\"type\":\"user_message\",\"turn_id\":\"r1\",\"message\":\"Canonical $st intake should replace the retired review-compiler staged plan.\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:02Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"r1\",\"message\":\"Retiring .step/st-plan-sidecar.jsonl in favor of canonical .step/st-plan.jsonl.\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-15T08:00:03Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"apply_patch\",\"call_id\":\"delete-old-plan\",\"arguments\":\"*** Delete File: .step/st-plan-sidecar.jsonl\\n\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:04Z\",\"payload\":{\"type\":\"patch_apply_end\",\"turn_id\":\"r1\",\"call_id\":\"delete-old-plan\",\"success\":true,\"cwd\":\"/repo\",\"changes\":{\"files\":1}}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:05Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"r1\",\"call_id\":\"jq-read\",\"command\":\"jq -c . .step/resolve-c3-st-plan.jsonl\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"{}\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:06Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"r1\",\"call_id\":\"git-diff\",\"command\":\"git diff -- .step/resolve-c3-st-plan.jsonl .step/st-plan.jsonl\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"diff\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:07Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"r1\",\"call_id\":\"git-add\",\"command\":\"git add .step/resolve-c3-st-plan.jsonl .step/st-plan.jsonl\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:05Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"r1\",\"call_id\":\"jq-read\",\"command\":\"jq -c . .step/st-plan-sidecar.jsonl\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"{}\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:06Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"r1\",\"call_id\":\"git-diff\",\"command\":\"git diff -- .step/st-plan-sidecar.jsonl .step/st-plan.jsonl\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"diff\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:07Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"r1\",\"call_id\":\"git-add\",\"command\":\"git add .step/st-plan-sidecar.jsonl .step/st-plan.jsonl\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:08Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"r1\",\"message\":\"$actuating $land complete; PR merged; goal complete; worktree clean.\"}}\n";
     try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/15/rollout-c3-artifact-repair.jsonl", .data = incidental });
 
@@ -26825,14 +26791,14 @@ test "review-compiler-audit c3 protocol treats resolve-c3 artifact repair as inc
 
     const controller =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-15T09:00:00Z\",\"payload\":{\"id\":\"c3-controller-invoked\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T09:00:01Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"c1\",\"call_id\":\"resolve-c3-begin\",\"command\":\"resolve-c3 begin --repo /repo\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"event=begin controller=resolve-c3\"}}\n";
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T09:00:01Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"c1\",\"call_id\":\"review-compiler-begin\",\"command\":\"review-compiler begin --repo /repo\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"event=begin controller=review-compiler\"}}\n";
     try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/15/rollout-c3-controller.jsonl", .data = controller });
 
     const provenance_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "workflow-provenance.json" });
     defer std.testing.allocator.free(provenance_path);
     const provenance = try runCommandWithOutput(std.testing.allocator, .workflow_audit, &.{
         "--root",     root_abs,
-        "--workflow", "resolve-c3",
+        "--workflow", "review-compiler",
         "--mode",     "provenance",
         "--since",    "2026-05-15T00:00:00Z",
         "--until",    "2026-05-16T00:00:00Z",
@@ -26840,11 +26806,11 @@ test "review-compiler-audit c3 protocol treats resolve-c3 artifact repair as inc
     }, provenance_path);
     defer std.testing.allocator.free(provenance);
 
-    try std.testing.expect(std.mem.indexOf(u8, provenance, "\"workflow_name\": \"resolve-c3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, provenance, "\"workflow_name\": \"review-compiler\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, provenance, "\"evidence_class\": \"artifact_under_repair\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, provenance, "\"evidence_class\": \"controller_invocation\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, provenance, "\"reason\": \"artifact_repair_tool\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, provenance, "\"reason\": \"resolve_c3_controller_invocation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, provenance, "\"reason\": \"artifact_repair_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, provenance, "\"reason\": \"c3_controller_invocation\"") != null);
 }
 
 test "review-compiler-audit mbk protocol audits kernel, surface, proof, closure, and bypass counters" {
@@ -26860,9 +26826,9 @@ test "review-compiler-audit mbk protocol audits kernel, surface, proof, closure,
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T09:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"l1\",\"message\":\"review-compiler-audit pasted labels only: local_surface_family wound_specific_test tuple_closed.\"}}\n";
     const true_mbk =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-14T10:00:00Z\",\"payload\":{\"id\":\"mbk-true\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T10:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"m1\",\"message\":\"MBKC-v1 minimum_behavioral_kernel\\nresolve-c3 campaign begin\\ncampaign-began\\nmaterial_kernel_required\\nfixed_base_pass\\nbase_reset_violation\\nreview_ready_baseline\\nprior_closure_head_used_as_new_base\\nrebaseline_decision\\nobservation-added raw_finding\\nbranch_liabilities:\\n  - F1\\nadditional_witness\\nlocal_surface_family\\nwound_specific_test\\nwound_specific_tests_class_mapped: true\\nkernel_law\\ndesign-registered route_class\\ndesign-selected\\nrealization_from_campaign_base\\nsurface_retired\\nbatches_total: 2\\nstrict_progress: 1\\nRAC-v1 valid mutation_allowed: yes\\nmutation_gate.status=passed\\nclosure_gate.status=passed\\nreview_ready_baseline_semantic_surface: 5\\nreview_ready_baseline_governing_laws: 1\\nreview_ready_baseline_realization_surface: 3\\nreview_ready_baseline_proof_families: 1\\nterminal_semantic_surface: 7\\nterminal_governing_laws: 2\\nterminal_realization_surface: 4\\nterminal_proof_families: 2\\ngit_files_changed: 9\\ngit_insertions: 20\\ngit_deletions: 4\\nproof_family\\nproof_run\\nstate_only_apply\\nkernel-accepted\\ntuple-closed\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T10:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"m1\",\"message\":\"MBKC-v1 minimum_behavioral_kernel\\nreview-compiler campaign begin\\ncampaign-began\\nmaterial_kernel_required\\nfixed_base_pass\\nbase_reset_violation\\nreview_ready_baseline\\nprior_closure_head_used_as_new_base\\nrebaseline_decision\\nobservation-added raw_finding\\nbranch_liabilities:\\n  - F1\\nadditional_witness\\nlocal_surface_family\\nwound_specific_test\\nwound_specific_tests_class_mapped: true\\nkernel_law\\ndesign-registered route_class\\ndesign-selected\\nrealization_from_campaign_base\\nsurface_retired\\nbatches_total: 2\\nstrict_progress: 1\\nRAC-v1 valid mutation_allowed: yes\\nmutation_gate.status=passed\\nclosure_gate.status=passed\\nreview_ready_baseline_semantic_surface: 5\\nreview_ready_baseline_governing_laws: 1\\nreview_ready_baseline_realization_surface: 3\\nreview_ready_baseline_proof_families: 1\\nterminal_semantic_surface: 7\\nterminal_governing_laws: 2\\nterminal_realization_surface: 4\\nterminal_proof_families: 2\\ngit_files_changed: 9\\ngit_insertions: 20\\ngit_deletions: 4\\nproof_family\\nproof_run\\nstate_only_apply\\nkernel-accepted\\ntuple-closed\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T10:00:01Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"m1\",\"message\":\"generated report quoted example: MBKC-v1 batches_total: 99 closure_gate.status=passed wound_specific_tests_class_mapped: false\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T10:00:02Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"m1\",\"call_id\":\"ctl-apply\",\"command\":\"resolve-c3 apply\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"applied\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T10:00:02Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"m1\",\"call_id\":\"ctl-apply\",\"command\":\"review-compiler apply\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"applied\"}}\n" ++
         "{\"type\":\"response_item\",\"timestamp\":\"2026-05-14T10:00:03Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"apply_patch\",\"call_id\":\"raw-patch\",\"arguments\":\"*** Update File: apps/seq/src/lib.zig\\n+raw\\n\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T10:00:04Z\",\"payload\":{\"type\":\"patch_apply_end\",\"turn_id\":\"m1\",\"call_id\":\"raw-patch\",\"success\":true,\"cwd\":\"/repo\",\"changes\":{\"files\":1}}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-14T10:00:05Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"m1\",\"call_id\":\"raw-commit\",\"command\":\"git commit -m bypass\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"committed\"}}\n" ++

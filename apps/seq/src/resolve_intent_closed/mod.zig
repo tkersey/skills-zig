@@ -172,7 +172,7 @@ pub fn parseArtifact(
     defer parsed.deinit();
 
     const root = object(parsed.value) orelse return invalidRow(allocator, .unknown, source_ref, authority, "root_not_object");
-    const value = if (root.get("resolve_c3_example")) |wrapped| blk: {
+    const value = if (root.get("intent_closed_example")) |wrapped| blk: {
         const wrapped_obj = object(wrapped) orelse return invalidRow(allocator, .unknown, source_ref, authority, "example_wrapper_not_object");
         break :blk wrapped_obj.get("value") orelse return invalidRow(allocator, .unknown, source_ref, authority, "example_value_missing");
     } else parsed.value;
@@ -193,7 +193,7 @@ pub fn parsePotentialMetrics(allocator: std.mem.Allocator, json_text: []const u8
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_text, .{});
     defer parsed.deinit();
     const root = object(parsed.value) orelse return error.InvalidPotential;
-    const value = if (root.get("resolve_c3_example")) |wrapped| blk: {
+    const value = if (root.get("intent_closed_example")) |wrapped| blk: {
         const wrapped_obj = object(wrapped) orelse return error.InvalidPotential;
         break :blk wrapped_obj.get("value") orelse return error.InvalidPotential;
     } else parsed.value;

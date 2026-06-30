@@ -202,6 +202,10 @@ fn handleHelpAndVersion(allocator: std.mem.Allocator, argv: []const []const u8) 
         try writeStdoutAlloc(allocator, &out);
         return true;
     }
+    if (parseCommand(first) != null and core_cli.containsHelpArg(argv[2..])) {
+        try writeHelp(allocator);
+        return true;
+    }
     return false;
 }
 

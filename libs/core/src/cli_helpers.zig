@@ -13,6 +13,13 @@ pub fn isHelpArg(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h");
 }
 
+pub fn containsHelpArg(args: []const []const u8) bool {
+    for (args) |arg| {
+        if (isHelpArg(arg)) return true;
+    }
+    return false;
+}
+
 pub fn isVersionArg(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V");
 }
@@ -106,10 +113,19 @@ test "normalizeVersion trims whitespace and newline" {
 }
 
 test "version flags and subcommand detection" {
+    try std.testing.expect(isHelpArg("--help"));
+    try std.testing.expect(isHelpArg("-h"));
+    try std.testing.expect(!isHelpArg("-help"));
     try std.testing.expect(isVersionArg("--version"));
     try std.testing.expect(isVersionArg("-V"));
     try std.testing.expect(isVersionSubcommand("version"));
     try std.testing.expect(!isVersionArg("-h"));
+}
+
+test "containsHelpArg recognizes help anywhere in an argument tail" {
+    try std.testing.expect(containsHelpArg(&.{ "--limit", "5", "--help" }));
+    try std.testing.expect(containsHelpArg(&.{"-h"}));
+    try std.testing.expect(!containsHelpArg(&.{ "--limit", "5" }));
 }
 
 test "printUsageFailureWithHelp renders token detail and versioned help" {

@@ -21,6 +21,50 @@ const MigrateHelpSurface = core_cli.HelpSurface{
     .executable_name = "learnings migrate",
     .help_text = MigrateUsageText,
 };
+const DatasetsHelpSurface = core_cli.HelpSurface{
+    .executable_name = "learnings datasets",
+    .help_text = DatasetsUsageText,
+};
+const DatasetSchemaHelpSurface = core_cli.HelpSurface{
+    .executable_name = "learnings dataset-schema",
+    .help_text = DatasetSchemaUsageText,
+};
+const QueryHelpSurface = core_cli.HelpSurface{
+    .executable_name = "learnings query",
+    .help_text = QueryUsageText,
+};
+const RecentHelpSurface = core_cli.HelpSurface{
+    .executable_name = "learnings recent",
+    .help_text = RecentUsageText,
+};
+const RecallHelpSurface = core_cli.HelpSurface{
+    .executable_name = "learnings recall",
+    .help_text = RecallUsageText,
+};
+const CodifyCandidatesHelpSurface = core_cli.HelpSurface{
+    .executable_name = "learnings codify-candidates",
+    .help_text = CodifyCandidatesUsageText,
+};
+const QualityAuditHelpSurface = core_cli.HelpSurface{
+    .executable_name = "learnings quality-audit",
+    .help_text = QualityAuditUsageText,
+};
+const ValueReportHelpSurface = core_cli.HelpSurface{
+    .executable_name = "learnings value-report",
+    .help_text = ValueReportUsageText,
+};
+const MemoryDigestHelpSurface = core_cli.HelpSurface{
+    .executable_name = "learnings memory-digest",
+    .help_text = MemoryDigestUsageText,
+};
+const DoctorHelpSurface = core_cli.HelpSurface{
+    .executable_name = "learnings doctor",
+    .help_text = DoctorUsageText,
+};
+const PathHelpSurface = core_cli.HelpSurface{
+    .executable_name = "learnings path",
+    .help_text = PathUsageText,
+};
 
 const UsageText =
     \\learnings
@@ -78,6 +122,154 @@ const MigrateUsageText =
     \\  learnings doctor
     \\  learnings migrate --dry-run --mode copy
     \\  learnings migrate --mode copy
+;
+
+const DatasetsUsageText =
+    \\learnings datasets
+    \\
+    \\usage: learnings datasets [-h]
+    \\
+    \\List queryable learnings datasets.
+    \\
+    \\options:
+    \\  -h, --help            show this help message and exit
+;
+
+const DatasetSchemaUsageText =
+    \\learnings dataset-schema
+    \\
+    \\usage: learnings dataset-schema [-h] --dataset DATASET
+    \\
+    \\Show the schema for a queryable learnings dataset.
+    \\
+    \\options:
+    \\  -h, --help            show this help message and exit
+    \\  --dataset DATASET     Dataset name, for example: learnings
+;
+
+const QueryUsageText =
+    \\learnings query
+    \\
+    \\usage: learnings query [-h] --spec SPEC
+    \\
+    \\Run a JSON query spec against the learnings dataset.
+    \\
+    \\options:
+    \\  -h, --help            show this help message and exit
+    \\  --spec SPEC           Inline JSON spec or path to a JSON spec file
+;
+
+const RecentUsageText =
+    \\learnings recent
+    \\
+    \\usage: learnings recent [-h] [--limit LIMIT]
+    \\
+    \\Show the most recent learnings.
+    \\
+    \\options:
+    \\  -h, --help            show this help message and exit
+    \\  --limit LIMIT         Maximum rows to show (default: 20)
+;
+
+const RecallUsageText =
+    \\learnings recall
+    \\
+    \\usage: learnings recall [-h] --query QUERY [--paths PATHS] [--limit LIMIT] [--format FORMAT] [--drop-superseded]
+    \\
+    \\Rank relevant learnings for a task.
+    \\
+    \\options:
+    \\  -h, --help            show this help message and exit
+    \\  --query QUERY         Focused task or failure description
+    \\  --paths PATHS         Optional path hints, comma-separated or text
+    \\  --limit LIMIT         Maximum rows to show (default: 8)
+    \\  --format FORMAT       Output format
+    \\  --drop-superseded     Hide records superseded by newer learnings
+;
+
+const CodifyCandidatesUsageText =
+    \\learnings codify-candidates
+    \\
+    \\usage: learnings codify-candidates [-h] [--min-count COUNT] [--limit LIMIT] [--format FORMAT] [--drop-superseded]
+    \\
+    \\Suggest repeated or high-impact learnings to promote into durable docs.
+    \\
+    \\options:
+    \\  -h, --help            show this help message and exit
+    \\  --min-count COUNT     Minimum repeated evidence count
+    \\  --limit LIMIT         Maximum candidates to show (default: 20)
+    \\  --format FORMAT       Output format
+    \\  --drop-superseded     Hide records superseded by newer learnings
+;
+
+const QualityAuditUsageText =
+    \\learnings quality-audit
+    \\
+    \\usage: learnings quality-audit [-h] [--since DATE] [--until DATE] [--format FORMAT] [--output PATH]
+    \\
+    \\Summarize learning capture quality and contract health.
+    \\
+    \\options:
+    \\  -h, --help            show this help message and exit
+    \\  --since DATE          Start date filter
+    \\  --until DATE          End date filter
+    \\  --format FORMAT       Output format
+    \\  --output PATH         Write report to path
+;
+
+const ValueReportUsageText =
+    \\learnings value-report
+    \\
+    \\usage: learnings value-report [-h] [--sessions-root PATH] [--since DATE] [--until DATE] [--comparator NAME] [--format FORMAT] [--output PATH]
+    \\
+    \\Compare recall-loaded sessions against a non-recall comparator.
+    \\
+    \\options:
+    \\  -h, --help            show this help message and exit
+    \\  --sessions-root PATH  Sessions root to scan
+    \\  --since DATE          Start date filter
+    \\  --until DATE          End date filter
+    \\  --comparator NAME     learnings_nonrecall, impl_nonrecall, or all_nonrecall
+    \\  --format FORMAT       Output format
+    \\  --output PATH         Write report to path
+;
+
+const MemoryDigestUsageText =
+    \\learnings memory-digest
+    \\
+    \\usage: learnings memory-digest [-h] [--scan-root PATH] [--since DATE] [--limit-candidates LIMIT] [--output PATH]
+    \\
+    \\Generate a disposable cross-repo memory consolidation digest.
+    \\
+    \\options:
+    \\  -h, --help            show this help message and exit
+    \\  --scan-root PATH      Root to scan for learnings stores
+    \\  --since DATE          Start date filter
+    \\  --limit-candidates LIMIT
+    \\                        Maximum candidate rows (default: 12)
+    \\  --output PATH         Write digest to path
+;
+
+const DoctorUsageText =
+    \\learnings doctor
+    \\
+    \\usage: learnings doctor [-h]
+    \\
+    \\Report learnings store path status.
+    \\
+    \\options:
+    \\  -h, --help            show this help message and exit
+;
+
+const PathUsageText =
+    \\learnings path
+    \\
+    \\usage: learnings path [-h]
+    \\
+    \\Print the resolved default learnings path.
+    \\
+    \\options:
+    \\  -h, --help            show this help message and exit
 ;
 
 const LearningsFields = [_][]const u8{
@@ -417,16 +609,10 @@ pub fn main(init: std.process.Init) !void {
         try core_cli.printVersion(stdout, Version);
         return;
     }
-    if (std.mem.eql(u8, argv[1], "memory-digest") and argv.len >= 3 and core_cli.isHelpArg(argv[2])) {
+    if (subcommandHelpSurface(argv)) |surface| {
         var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
-        try core_cli.printHelpSurface(stdout, HelpSurface, Version);
-        return;
-    }
-    if (isSubcommandHelp(argv, "migrate")) {
-        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-        const stdout = &stdout_writer.interface;
-        try core_cli.printHelpSurface(stdout, MigrateHelpSurface, Version);
+        try core_cli.printHelpSurface(stdout, surface, Version);
         return;
     }
 
@@ -524,7 +710,7 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-fn isSubcommandHelp(argv: []const []const u8, subcommand: []const u8) bool {
+fn subcommandHelpSurface(argv: []const []const u8) ?core_cli.HelpSurface {
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
@@ -532,13 +718,26 @@ fn isSubcommandHelp(argv: []const []const u8, subcommand: []const u8) bool {
             i += 1;
             continue;
         }
-        if (!std.mem.eql(u8, arg, subcommand)) return false;
-        for (argv[i + 1 ..]) |sub_arg| {
-            if (core_cli.isHelpArg(sub_arg)) return true;
+        if (!core_cli.containsHelpArg(argv[i + 1 ..])) return null;
+        if (std.mem.eql(u8, arg, "append")) {
+            const surface = append_learning_cli.subcommandSurface();
+            return .{ .executable_name = surface.program_name, .help_text = surface.help_text };
         }
-        return false;
+        if (std.mem.eql(u8, arg, "datasets")) return DatasetsHelpSurface;
+        if (std.mem.eql(u8, arg, "dataset-schema")) return DatasetSchemaHelpSurface;
+        if (std.mem.eql(u8, arg, "query")) return QueryHelpSurface;
+        if (std.mem.eql(u8, arg, "recent")) return RecentHelpSurface;
+        if (std.mem.eql(u8, arg, "recall")) return RecallHelpSurface;
+        if (std.mem.eql(u8, arg, "codify-candidates")) return CodifyCandidatesHelpSurface;
+        if (std.mem.eql(u8, arg, "quality-audit")) return QualityAuditHelpSurface;
+        if (std.mem.eql(u8, arg, "value-report")) return ValueReportHelpSurface;
+        if (std.mem.eql(u8, arg, "memory-digest")) return MemoryDigestHelpSurface;
+        if (std.mem.eql(u8, arg, "migrate")) return MigrateHelpSurface;
+        if (std.mem.eql(u8, arg, "doctor")) return DoctorHelpSurface;
+        if (std.mem.eql(u8, arg, "path")) return PathHelpSurface;
+        return null;
     }
-    return false;
+    return null;
 }
 
 fn parseArgs(argv: []const []const u8) !Args {
@@ -4578,27 +4777,36 @@ test "parse args memory-digest" {
     try std.testing.expectEqualStrings("digest.md", parsed.output);
 }
 
-test "migrate subcommand help dispatches before argument parsing" {
+test "subcommand help dispatches before argument parsing" {
     const long_help = [_][]const u8{ ProgramName, "migrate", "--help" };
-    try std.testing.expect(isSubcommandHelp(&long_help, "migrate"));
+    try std.testing.expectEqualStrings("learnings migrate", subcommandHelpSurface(&long_help).?.executable_name);
 
     const short_help = [_][]const u8{ ProgramName, "migrate", "-h" };
-    try std.testing.expect(isSubcommandHelp(&short_help, "migrate"));
+    try std.testing.expectEqualStrings("learnings migrate", subcommandHelpSurface(&short_help).?.executable_name);
 
     const dry_run = [_][]const u8{ ProgramName, "migrate", "--dry-run" };
-    try std.testing.expect(!isSubcommandHelp(&dry_run, "migrate"));
+    try std.testing.expect(subcommandHelpSurface(&dry_run) == null);
     const parsed = try parseArgs(&dry_run);
     try std.testing.expect(parsed.command.? == .migrate);
     try std.testing.expect(parsed.dry_run);
 
     const global_path_help = [_][]const u8{ ProgramName, "--path", ".custom/learnings.jsonl", "migrate", "--help" };
-    try std.testing.expect(isSubcommandHelp(&global_path_help, "migrate"));
+    try std.testing.expectEqualStrings("learnings migrate", subcommandHelpSurface(&global_path_help).?.executable_name);
 
     const late_help = [_][]const u8{ ProgramName, "migrate", "--dry-run", "--help" };
-    try std.testing.expect(isSubcommandHelp(&late_help, "migrate"));
+    try std.testing.expectEqualStrings("learnings migrate", subcommandHelpSurface(&late_help).?.executable_name);
 
     const query_mentions_migrate = [_][]const u8{ ProgramName, "query", "--spec", "migrate", "--help" };
-    try std.testing.expect(!isSubcommandHelp(&query_mentions_migrate, "migrate"));
+    try std.testing.expectEqualStrings("learnings query", subcommandHelpSurface(&query_mentions_migrate).?.executable_name);
+
+    const recall_help = [_][]const u8{ ProgramName, "recall", "--help" };
+    try std.testing.expectEqualStrings("learnings recall", subcommandHelpSurface(&recall_help).?.executable_name);
+
+    const query_short_help = [_][]const u8{ ProgramName, "query", "-h" };
+    try std.testing.expectEqualStrings("learnings query", subcommandHelpSurface(&query_short_help).?.executable_name);
+
+    const append_help = [_][]const u8{ ProgramName, "append", "--help" };
+    try std.testing.expectEqualStrings("learnings append", subcommandHelpSurface(&append_help).?.executable_name);
 }
 
 test "migrate copies legacy rows preserving byte content" {
