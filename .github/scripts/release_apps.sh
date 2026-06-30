@@ -16,7 +16,6 @@ apps=(
   cas
   cron
   puff
-  learnings
   ledger
   memory-note
   mesh
@@ -52,7 +51,6 @@ case "$mode" in
     }
 
     mark_durable_store_consumers() {
-      mark_app learnings
       mark_app ledger
       mark_app memory-note
       mark_app st
@@ -83,7 +81,7 @@ case "$mode" in
             ;;
         esac
         case "$raw" in
-          *".target = target,"*|*".optimize = optimize,"*|*".imports = &.{"*|*".{ .name = \"core_"*|*".link_libc = true"*)
+          *".target = target,"*|*".optimize = optimize,"*|*".imports = &.{"*|*".build_deps = &.{"*|*".test_deps = &.{"*|*".{ .name = \"core_"*|*".link_libc = true"*)
             return 0
             ;;
           *\"Build\ *|*\"Run\ *|*\"Test\ *|*"execution_policy_core/src/root.zig"*|*"test-execution-policy-core"*)
@@ -96,6 +94,12 @@ case "$mode" in
       infer_context_app() {
         local raw="$1"
         local app token
+        case "$raw" in
+          *"const learnings_"*"= b.createModule"*|*"const learnings_root = b.createModule"*|*"const append_learning_root = b.createModule"*|*"apps/learnings/"*)
+            current_app="ledger"
+            return
+            ;;
+        esac
         for app in "${apps[@]}"; do
           token="${app//-/_}"
           case "$raw" in
@@ -147,6 +151,13 @@ case "$mode" in
             esac
           fi
         done
+
+        case "$raw" in
+          *"apps/learnings/"*|*"learnings_meta"*|*"learnings_root"*|*"append_learning_root"*|*"const learnings ="*|*"const append_learning ="*|*"learnings_install"*|*"append_learning_install"*|*"run_learnings_tests"*|*"run_append_learning_tests"*|*"test-learnings"*|*"test-append-learning"*|*"build-learnings"*)
+            mark_app ledger
+            matched=1
+            ;;
+        esac
 
         if [[ "$matched" -eq 0 ]]; then
           case "$raw" in
@@ -221,9 +232,6 @@ case "$mode" in
         .github/workflows/release-puff.yml)
           mark_app puff
           ;;
-        .github/workflows/release-learnings.yml)
-          mark_app learnings
-          ;;
         .github/workflows/release-ledger.yml)
           mark_app ledger
           ;;
@@ -257,7 +265,7 @@ case "$mode" in
           mark_app puff
           ;;
         apps/learnings/*)
-          mark_app learnings
+          mark_app ledger
           ;;
         apps/ledger/*)
           mark_app ledger

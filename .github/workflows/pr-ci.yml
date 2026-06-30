@@ -38,7 +38,6 @@ jobs:
       cas: ${{ steps.filter.outputs.cas }}
       cron: ${{ steps.filter.outputs.cron }}
       puff: ${{ steps.filter.outputs.puff }}
-      learnings: ${{ steps.filter.outputs.learnings }}
       ledger: ${{ steps.filter.outputs.ledger }}
       memory_note: ${{ steps.filter.outputs.memory_note }}
       mesh: ${{ steps.filter.outputs.mesh }}
@@ -61,10 +60,9 @@ jobs:
               - "apps/cron/**"
             puff:
               - "apps/puff/**"
-            learnings:
-              - "apps/learnings/**"
             ledger:
               - "apps/ledger/**"
+              - "apps/learnings/**"
             memory_note:
               - "apps/memory-note/**"
             mesh:
@@ -266,22 +264,6 @@ jobs:
       - name: Build puff binaries
         run: zig build build-puff -Doptimize=ReleaseFast
 
-  learnings:
-    needs: changes
-    if: needs.changes.outputs.learnings == 'true' || needs.changes.outputs.core == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-      - name: Build learnings binaries
-        run: zig build build-learnings -Doptimize=ReleaseFast
-      - name: Test learnings
-        run: zig build test-learnings
-      - name: Test append_learning
-        run: zig build test-append-learning
-
   ledger:
     needs: changes
     if: needs.changes.outputs.ledger == 'true' || needs.changes.outputs.core == 'true'
@@ -294,7 +276,7 @@ jobs:
       - name: Build ledger
         run: zig build build-ledger -Doptimize=ReleaseFast
       - name: Test ledger
-        run: zig build test-ledger
+        run: zig build test-ledger test-learnings test-append-learning
 
   memory-note:
     needs: changes

@@ -80,7 +80,6 @@ pub fn build(b: *std.Build) void {
     const cas_meta = addVersionModule(b, @embedFile("apps/cas/VERSION"));
     const cron_meta = addVersionModule(b, @embedFile("apps/cron/VERSION"));
     const puff_meta = addVersionModule(b, @embedFile("apps/puff/VERSION"));
-    const learnings_meta = addVersionModule(b, @embedFile("apps/learnings/VERSION"));
     const ledger_meta = addVersionModule(b, @embedFile("apps/ledger/VERSION"));
     const memory_note_meta = addVersionModule(b, @embedFile("apps/memory-note/VERSION"));
     const mesh_meta = addVersionModule(b, @embedFile("apps/mesh/VERSION"));
@@ -306,7 +305,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_delegate", .module = core_delegate },
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "durable_store", .module = durable_store },
-            .{ .name = "app_meta", .module = learnings_meta },
+            .{ .name = "app_meta", .module = ledger_meta },
         },
     });
     const learnings_root = b.createModule(.{
@@ -318,7 +317,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_delegate", .module = core_delegate },
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "durable_store", .module = durable_store },
-            .{ .name = "app_meta", .module = learnings_meta },
+            .{ .name = "app_meta", .module = ledger_meta },
             .{ .name = "seq_bundle", .module = seq_bundle },
         },
     });
@@ -327,6 +326,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "learnings_cli", .module = learnings_root },
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "durable_store", .module = durable_store },
             .{ .name = "app_meta", .module = ledger_meta },
@@ -410,8 +410,6 @@ pub fn build(b: *std.Build) void {
     cron.root_module.linkSystemLibrary("c", .{});
     cron.root_module.linkSystemLibrary("sqlite3", .{});
     const puff = addExecutable(b, "puff", puff_root);
-    const learnings = addExecutable(b, "learnings", learnings_root);
-    const append_learning = addExecutable(b, "append_learning", append_learning_root);
     const ledger = addExecutable(b, "ledger", ledger_root);
     const memory_note = addExecutable(b, "memory-note", memory_note_root);
     const mesh = addExecutable(b, "mesh", mesh_root);
@@ -436,8 +434,6 @@ pub fn build(b: *std.Build) void {
     const cas_install = addInstallStep(b, cas);
     const cron_install = addInstallStep(b, cron);
     const puff_install = addInstallStep(b, puff);
-    const learnings_install = addInstallStep(b, learnings);
-    const append_learning_install = addInstallStep(b, append_learning);
     const ledger_install = addInstallStep(b, ledger);
     const memory_note_install = addInstallStep(b, memory_note);
     const mesh_install = addInstallStep(b, mesh);
@@ -462,8 +458,6 @@ pub fn build(b: *std.Build) void {
     install_all.dependOn(&cas_install.step);
     install_all.dependOn(&cron_install.step);
     install_all.dependOn(&puff_install.step);
-    install_all.dependOn(&learnings_install.step);
-    install_all.dependOn(&append_learning_install.step);
     install_all.dependOn(&ledger_install.step);
     install_all.dependOn(&memory_note_install.step);
     install_all.dependOn(&mesh_install.step);
@@ -699,8 +693,8 @@ pub fn build(b: *std.Build) void {
         .{
             .path = b.path("apps/learnings"),
             .build_step_name = "build-learnings",
-            .build_description = "Build learnings binaries",
-            .build_deps = &.{ &learnings_install.step, &append_learning_install.step },
+            .build_description = "Run internal ledger learnings-source tests",
+            .build_deps = &.{},
             .test_deps = &.{ &run_learnings_tests.step, &run_append_learning_tests.step },
         },
         .{

@@ -1,6 +1,7 @@
 const app_meta = @import("app_meta");
 const core_cli = @import("core_cli");
 const durable_store = @import("durable_store");
+const learnings_cli = @import("learnings_cli");
 const std = @import("std");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
@@ -12,13 +13,13 @@ const MaxInputBytes = 4 * 1024 * 1024;
 const HelpText =
     \\ledger
     \\
-    \\Durable negative-evidence ledger.
+    \\Durable source-memory ledger.
     \\
-    \\usage: ledger {init,capture,query,map,status,reopen,export,compact,handoff,show,doctor,migrate} [options]
+    \\usage: ledger {init,capture,query,map,status,reopen,export,compact,handoff,show,doctor,migrate,recent,recall,codify-candidates,quality-audit,value-report,memory-digest,path,datasets,dataset-schema} [options]
     \\
     \\commands:
     \\  init       Create the ledger store if missing
-    \\  capture    Append witness-backed negative evidence from --json FILE|-
+    \\  capture    Append witness-backed negative evidence from --json FILE|-; with --source learnings, append a learning event
     \\  query      List projected records
     \\  map        Emit negative_route_gate for a route/cluster
     \\  status     Append a lifecycle status event
@@ -28,10 +29,15 @@ const HelpText =
     \\  handoff    Emit active exclusions for handoff
     \\  show       Show one NEG record by --id
     \\  doctor     Validate JSONL store integrity
-    \\  migrate    Copy or move legacy .ledger/negative-ledger.jsonl into .ledger/negative-ledger/events.jsonl
+    \\  migrate    Copy or move legacy source stores into their events.jsonl store
+    \\  recent     With --source learnings, show recent learning events
+    \\  recall     With --source learnings, rank relevant learning events
+    \\  path       With --source learnings, print the resolved learnings event path
+    \\  datasets   With --source learnings, list learning datasets
     \\
     \\options:
     \\  --file PATH       Store path (default: .ledger/negative-ledger/events.jsonl)
+    \\  --source SOURCE   Source namespace; omit for negative-ledger, or use learnings
     \\  --json PATH|-     Capture input JSON
     \\  --id NEG-ID       Record id for show/reopen/status/export
     \\  --to VALUE        Target status for status, target path for migrate
@@ -169,6 +175,12 @@ const Date = struct {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    if (argvRequestsLearningSource(argv)) {
+        const learning_argv = try learningSourceArgvAlloc(allocator, argv);
+        defer allocator.free(learning_argv);
+        try learnings_cli.runWithArgv(allocator, learning_argv, init.environ_map.get("CODEX_HOME") orelse "");
+        return;
+    }
     if (try handleHelpAndVersion(allocator, argv)) return;
 
     const args = parseArgs(argv) catch |err| {
@@ -182,6 +194,53 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
     std.process.exit(code);
+}
+
+fn argvRequestsLearningSource(argv: []const []const u8) bool {
+    var i: usize = 1;
+    while (i < argv.len) : (i += 1) {
+        if (!std.mem.eql(u8, argv[i], "--source")) continue;
+        i += 1;
+        if (i >= argv.len) return false;
+        return std.mem.eql(u8, argv[i], "learnings");
+    }
+    return false;
+}
+
+fn learningSourceArgvAlloc(allocator: std.mem.Allocator, argv: []const []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, "ledger");
+
+    var command_seen = false;
+    var skipped_source = false;
+    var i: usize = 1;
+    while (i < argv.len) : (i += 1) {
+        const token = argv[i];
+        if (!skipped_source and std.mem.eql(u8, token, "--source")) {
+            if (i + 1 >= argv.len) return error.MissingValue;
+            if (std.mem.eql(u8, argv[i + 1], "learnings")) {
+                skipped_source = true;
+                i += 1;
+                continue;
+            }
+        }
+        if (std.mem.eql(u8, token, "--file")) {
+            try out.append(allocator, "--path");
+            continue;
+        }
+        if (!command_seen and !std.mem.startsWith(u8, token, "-")) {
+            command_seen = true;
+            if (std.mem.eql(u8, token, "capture")) {
+                try out.append(allocator, "append");
+            } else {
+                try out.append(allocator, token);
+            }
+            continue;
+        }
+        try out.append(allocator, token);
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn handleHelpAndVersion(allocator: std.mem.Allocator, argv: []const []const u8) !bool {

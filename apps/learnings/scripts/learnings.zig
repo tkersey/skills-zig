@@ -9,73 +9,74 @@ const query_output = seq_bundle.query_output;
 const query_spec = seq_bundle.query_spec;
 
 const Version = core_cli.normalizeVersion(app_meta.version);
-const ProgramName = "learnings";
+const ProgramName = "ledger --source learnings";
 const LegacyLearningsPath = append_learning_cli.LegacyLearningsPath;
+const PreviousLearningsPath = append_learning_cli.PreviousLearningsPath;
 const DefaultLearningsPath = append_learning_cli.DefaultLearningsPath;
 const MaxLearningsBytes = 64 * 1024 * 1024;
 const HelpSurface = core_cli.HelpSurface{
-    .executable_name = "learnings",
+    .executable_name = "ledger --source learnings",
     .help_text = UsageText,
 };
 const MigrateHelpSurface = core_cli.HelpSurface{
-    .executable_name = "learnings migrate",
+    .executable_name = "ledger migrate --source learnings",
     .help_text = MigrateUsageText,
 };
 const DatasetsHelpSurface = core_cli.HelpSurface{
-    .executable_name = "learnings datasets",
+    .executable_name = "ledger datasets --source learnings",
     .help_text = DatasetsUsageText,
 };
 const DatasetSchemaHelpSurface = core_cli.HelpSurface{
-    .executable_name = "learnings dataset-schema",
+    .executable_name = "ledger dataset-schema --source learnings",
     .help_text = DatasetSchemaUsageText,
 };
 const QueryHelpSurface = core_cli.HelpSurface{
-    .executable_name = "learnings query",
+    .executable_name = "ledger query --source learnings",
     .help_text = QueryUsageText,
 };
 const RecentHelpSurface = core_cli.HelpSurface{
-    .executable_name = "learnings recent",
+    .executable_name = "ledger recent --source learnings",
     .help_text = RecentUsageText,
 };
 const RecallHelpSurface = core_cli.HelpSurface{
-    .executable_name = "learnings recall",
+    .executable_name = "ledger recall --source learnings",
     .help_text = RecallUsageText,
 };
 const CodifyCandidatesHelpSurface = core_cli.HelpSurface{
-    .executable_name = "learnings codify-candidates",
+    .executable_name = "ledger codify-candidates --source learnings",
     .help_text = CodifyCandidatesUsageText,
 };
 const QualityAuditHelpSurface = core_cli.HelpSurface{
-    .executable_name = "learnings quality-audit",
+    .executable_name = "ledger quality-audit --source learnings",
     .help_text = QualityAuditUsageText,
 };
 const ValueReportHelpSurface = core_cli.HelpSurface{
-    .executable_name = "learnings value-report",
+    .executable_name = "ledger value-report --source learnings",
     .help_text = ValueReportUsageText,
 };
 const MemoryDigestHelpSurface = core_cli.HelpSurface{
-    .executable_name = "learnings memory-digest",
+    .executable_name = "ledger memory-digest --source learnings",
     .help_text = MemoryDigestUsageText,
 };
 const DoctorHelpSurface = core_cli.HelpSurface{
-    .executable_name = "learnings doctor",
+    .executable_name = "ledger doctor --source learnings",
     .help_text = DoctorUsageText,
 };
 const PathHelpSurface = core_cli.HelpSurface{
-    .executable_name = "learnings path",
+    .executable_name = "ledger path --source learnings",
     .help_text = PathUsageText,
 };
 
 const UsageText =
-    \\learnings
+    \\ledger --source learnings
     \\
-    \\usage: learnings [-h] [--path PATH] {append,datasets,dataset-schema,query,recent,recall,codify-candidates,quality-audit,value-report,memory-digest,migrate,doctor,path} ...
+    \\usage: ledger --source learnings [-h] [--path PATH] {capture,datasets,dataset-schema,query,recent,recall,codify-candidates,quality-audit,value-report,memory-digest,migrate,doctor,path} ...
     \\
-    \\Mine, recall, and promote records from repo-local .ledger/learnings/learnings.jsonl.
+    \\Mine, recall, and promote records from repo-local .ledger/learnings/events.jsonl.
     \\
     \\positional arguments:
-    \\  {append,datasets,dataset-schema,query,recent,recall,codify-candidates,quality-audit,value-report,memory-digest,migrate,doctor,path}
-    \\    append              Append a structured learning record
+    \\  {capture,datasets,dataset-schema,query,recent,recall,codify-candidates,quality-audit,value-report,memory-digest,migrate,doctor,path}
+    \\    capture             Append a structured learning event
     \\    datasets            List datasets
     \\    dataset-schema      Show dataset schema
     \\    query               Run a JSON spec query
@@ -85,7 +86,7 @@ const UsageText =
     \\    quality-audit       Summarize learning capture quality and contract health
     \\    value-report        Compare recall-loaded sessions against a non-recall comparator
     \\    memory-digest       Generate a disposable cross-repo memory consolidation digest
-    \\    migrate             Copy or move legacy .learnings.jsonl into .ledger/learnings/learnings.jsonl
+    \\    migrate             Copy or move legacy learning rows into .ledger/learnings/events.jsonl
     \\    doctor              Report learnings store path status
     \\    path                Print the resolved default learnings path
     \\
@@ -97,21 +98,21 @@ const UsageText =
 ;
 
 const MigrateUsageText =
-    \\learnings migrate
+    \\ledger migrate --source learnings
     \\
-    \\usage: learnings migrate [-h] [--from PATH] [--to PATH] [--mode {copy,move}] [--dry-run] [--allow-existing-target] [--remove-legacy]
+    \\usage: ledger migrate --source learnings [-h] [--from PATH] [--to PATH] [--mode {copy,move}] [--dry-run] [--allow-existing-target] [--remove-legacy]
     \\
-    \\Copy or move legacy .learnings.jsonl rows into .ledger/learnings/learnings.jsonl.
+    \\Copy or move legacy learning rows into .ledger/learnings/events.jsonl.
     \\
     \\Migration states:
-    \\  legacy-only           .learnings.jsonl exists and .ledger/learnings/learnings.jsonl is missing; run --mode copy before append
-    \\  migrated              canonical .ledger/learnings/learnings.jsonl exists; append is allowed
+    \\  legacy-only           old learnings store exists and .ledger/learnings/events.jsonl is missing; run --mode copy before append
+    \\  migrated              canonical .ledger/learnings/events.jsonl exists; append is allowed
     \\  missing               no learnings store exists yet
     \\
     \\options:
     \\  -h, --help            show this help message and exit
-    \\  --from PATH           Legacy source path relative to repo root (default: .learnings.jsonl)
-    \\  --to PATH             Canonical target path relative to repo root (default: .ledger/learnings/learnings.jsonl)
+    \\  --from PATH           Legacy source path relative to repo root (default: .ledger/learnings/learnings.jsonl when present, then .learnings.jsonl)
+    \\  --to PATH             Canonical target path relative to repo root (default: .ledger/learnings/events.jsonl)
     \\  --mode {copy,move}    Copy preserves the legacy file; move may remove it when safe (default: copy)
     \\  --dry-run             Validate and report the migration without writing
     \\  --allow-existing-target
@@ -119,15 +120,15 @@ const MigrateUsageText =
     \\  --remove-legacy       Remove legacy source after a successful migration when allowed
     \\
     \\Preflight:
-    \\  learnings doctor
-    \\  learnings migrate --dry-run --mode copy
-    \\  learnings migrate --mode copy
+    \\  ledger doctor --source learnings
+    \\  ledger migrate --source learnings --dry-run --mode copy
+    \\  ledger migrate --source learnings --mode copy
 ;
 
 const DatasetsUsageText =
-    \\learnings datasets
+    \\ledger datasets --source learnings
     \\
-    \\usage: learnings datasets [-h]
+    \\usage: ledger datasets --source learnings [-h]
     \\
     \\List queryable learnings datasets.
     \\
@@ -136,9 +137,9 @@ const DatasetsUsageText =
 ;
 
 const DatasetSchemaUsageText =
-    \\learnings dataset-schema
+    \\ledger dataset-schema --source learnings
     \\
-    \\usage: learnings dataset-schema [-h] --dataset DATASET
+    \\usage: ledger dataset-schema --source learnings [-h] --dataset DATASET
     \\
     \\Show the schema for a queryable learnings dataset.
     \\
@@ -148,9 +149,9 @@ const DatasetSchemaUsageText =
 ;
 
 const QueryUsageText =
-    \\learnings query
+    \\ledger query --source learnings
     \\
-    \\usage: learnings query [-h] --spec SPEC
+    \\usage: ledger query --source learnings [-h] --spec SPEC
     \\
     \\Run a JSON query spec against the learnings dataset.
     \\
@@ -160,9 +161,9 @@ const QueryUsageText =
 ;
 
 const RecentUsageText =
-    \\learnings recent
+    \\ledger recent --source learnings
     \\
-    \\usage: learnings recent [-h] [--limit LIMIT]
+    \\usage: ledger recent --source learnings [-h] [--limit LIMIT]
     \\
     \\Show the most recent learnings.
     \\
@@ -172,9 +173,9 @@ const RecentUsageText =
 ;
 
 const RecallUsageText =
-    \\learnings recall
+    \\ledger recall --source learnings
     \\
-    \\usage: learnings recall [-h] --query QUERY [--paths PATHS] [--limit LIMIT] [--format FORMAT] [--drop-superseded]
+    \\usage: ledger recall --source learnings [-h] --query QUERY [--paths PATHS] [--limit LIMIT] [--format FORMAT] [--drop-superseded]
     \\
     \\Rank relevant learnings for a task.
     \\
@@ -188,9 +189,9 @@ const RecallUsageText =
 ;
 
 const CodifyCandidatesUsageText =
-    \\learnings codify-candidates
+    \\ledger codify-candidates --source learnings
     \\
-    \\usage: learnings codify-candidates [-h] [--min-count COUNT] [--limit LIMIT] [--format FORMAT] [--drop-superseded]
+    \\usage: ledger codify-candidates --source learnings [-h] [--min-count COUNT] [--limit LIMIT] [--format FORMAT] [--drop-superseded]
     \\
     \\Suggest repeated or high-impact learnings to promote into durable docs.
     \\
@@ -203,9 +204,9 @@ const CodifyCandidatesUsageText =
 ;
 
 const QualityAuditUsageText =
-    \\learnings quality-audit
+    \\ledger quality-audit --source learnings
     \\
-    \\usage: learnings quality-audit [-h] [--since DATE] [--until DATE] [--format FORMAT] [--output PATH]
+    \\usage: ledger quality-audit --source learnings [-h] [--since DATE] [--until DATE] [--format FORMAT] [--output PATH]
     \\
     \\Summarize learning capture quality and contract health.
     \\
@@ -218,9 +219,9 @@ const QualityAuditUsageText =
 ;
 
 const ValueReportUsageText =
-    \\learnings value-report
+    \\ledger value-report --source learnings
     \\
-    \\usage: learnings value-report [-h] [--sessions-root PATH] [--since DATE] [--until DATE] [--comparator NAME] [--format FORMAT] [--output PATH]
+    \\usage: ledger value-report --source learnings [-h] [--sessions-root PATH] [--since DATE] [--until DATE] [--comparator NAME] [--format FORMAT] [--output PATH]
     \\
     \\Compare recall-loaded sessions against a non-recall comparator.
     \\
@@ -235,9 +236,9 @@ const ValueReportUsageText =
 ;
 
 const MemoryDigestUsageText =
-    \\learnings memory-digest
+    \\ledger memory-digest --source learnings
     \\
-    \\usage: learnings memory-digest [-h] [--scan-root PATH] [--since DATE] [--limit-candidates LIMIT] [--output PATH]
+    \\usage: ledger memory-digest --source learnings [-h] [--scan-root PATH] [--since DATE] [--limit-candidates LIMIT] [--output PATH]
     \\
     \\Generate a disposable cross-repo memory consolidation digest.
     \\
@@ -251,9 +252,9 @@ const MemoryDigestUsageText =
 ;
 
 const DoctorUsageText =
-    \\learnings doctor
+    \\ledger doctor --source learnings
     \\
-    \\usage: learnings doctor [-h]
+    \\usage: ledger doctor --source learnings [-h]
     \\
     \\Report learnings store path status.
     \\
@@ -262,9 +263,9 @@ const DoctorUsageText =
 ;
 
 const PathUsageText =
-    \\learnings path
+    \\ledger path --source learnings
     \\
-    \\usage: learnings path [-h]
+    \\usage: ledger path --source learnings [-h]
     \\
     \\Print the resolved default learnings path.
     \\
@@ -485,7 +486,7 @@ const Args = struct {
     min_count: usize = 3,
     scan_root: []const u8 = "",
     append_args_start: usize = 0,
-    migrate_from: []const u8 = LegacyLearningsPath,
+    migrate_from: []const u8 = "",
     migrate_to: []const u8 = DefaultLearningsPath,
     migrate_mode: MigrationMode = .copy,
     dry_run: bool = false,
@@ -589,7 +590,10 @@ const DigestGroupAccumulator = struct {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    try runWithArgv(allocator, argv, init.environ_map.get("CODEX_HOME") orelse "");
+}
 
+pub fn runWithArgv(allocator: std.mem.Allocator, argv: []const []const u8, codex_home: []const u8) !void {
     if (argv.len <= 1) {
         var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
@@ -621,7 +625,7 @@ pub fn main(init: std.process.Init) !void {
     };
 
     if ((parsed.command orelse unreachable) == .append) {
-        try cmdAppend(allocator, argv, parsed, init.environ_map.get("CODEX_HOME") orelse "");
+        try cmdAppend(allocator, argv, parsed, codex_home);
         return;
     }
 
@@ -701,7 +705,7 @@ pub fn main(init: std.process.Init) !void {
             parsed.since,
             if (parsed.limit == 0) 12 else parsed.limit,
             parsed.output,
-            init.environ_map.get("CODEX_HOME") orelse "",
+            codex_home,
             true,
         ),
         .migrate => std.process.exit(try cmdMigrate(allocator, repo_root, parsed)),
@@ -1175,7 +1179,9 @@ const JsonlStats = struct {
 };
 
 fn cmdMigrate(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !u8 {
-    const from_path = try resolveJsonlPathAlloc(allocator, repo_root, args.migrate_from);
+    const effective_from = try resolveMigrateFromPathAlloc(allocator, repo_root, args.migrate_from);
+    defer allocator.free(effective_from);
+    const from_path = try resolveJsonlPathAlloc(allocator, repo_root, effective_from);
     defer allocator.free(from_path);
     const to_path = try resolveJsonlPathAlloc(allocator, repo_root, args.migrate_to);
     defer allocator.free(to_path);
@@ -1186,11 +1192,16 @@ fn cmdMigrate(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !
     };
     defer allocator.free(source_bytes);
 
-    var source_stats = validateJsonlBytes(allocator, source_bytes) catch |err| {
+    const converted_source = try convertLearningRowsToEventsAlloc(allocator, source_bytes);
+    defer allocator.free(converted_source);
+
+    var source_stats = validateJsonlBytes(allocator, converted_source) catch |err| {
         try printMigrationFailure(allocator, from_path, to_path, "invalid_source_jsonl", @errorName(err));
         return 1;
     };
     defer source_stats.deinit(allocator);
+    const source_sha = try sha256HexAlloc(allocator, source_bytes);
+    defer allocator.free(source_sha);
 
     if (args.dry_run) {
         try printMigrationResult(allocator, .{
@@ -1200,7 +1211,7 @@ fn cmdMigrate(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !
             .mode = migrationModeText(args.migrate_mode),
             .records = source_stats.records,
             .blank_lines = source_stats.blank_lines,
-            .source_sha256 = source_stats.sha256,
+            .source_sha256 = source_sha,
             .target_sha256 = source_stats.sha256,
             .legacy_left_in_place = true,
         });
@@ -1220,7 +1231,7 @@ fn cmdMigrate(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !
         };
         defer target_stats.deinit(allocator);
 
-        if (std.mem.eql(u8, source_bytes, target_bytes)) {
+        if (std.mem.eql(u8, converted_source, target_bytes)) {
             try maybeRemoveLegacy(args, from_path);
             try printMigrationResult(allocator, .{
                 .status = "already_migrated",
@@ -1229,7 +1240,7 @@ fn cmdMigrate(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !
                 .mode = migrationModeText(args.migrate_mode),
                 .records = source_stats.records,
                 .blank_lines = source_stats.blank_lines,
-                .source_sha256 = source_stats.sha256,
+                .source_sha256 = source_sha,
                 .target_sha256 = target_stats.sha256,
                 .legacy_left_in_place = !args.remove_legacy and args.migrate_mode == .copy,
             });
@@ -1241,7 +1252,7 @@ fn cmdMigrate(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !
             return 1;
         }
 
-        const merged = mergeJsonlBytesByIdAlloc(allocator, target_bytes, &target_stats, source_bytes, &source_stats) catch |err| {
+        const merged = mergeJsonlBytesByIdAlloc(allocator, target_bytes, &target_stats, converted_source, &source_stats) catch |err| {
             try printMigrationFailure(allocator, from_path, to_path, "target_exists_with_conflicting_rows", @errorName(err));
             return 1;
         };
@@ -1258,15 +1269,15 @@ fn cmdMigrate(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !
             .mode = migrationModeText(args.migrate_mode),
             .records = source_stats.records,
             .blank_lines = source_stats.blank_lines,
-            .source_sha256 = source_stats.sha256,
+            .source_sha256 = source_sha,
             .target_sha256 = target_sha,
             .legacy_left_in_place = !args.remove_legacy and args.migrate_mode == .copy,
         });
         return 0;
     }
 
-    try durable_store.writeTextCreateNew(allocator, to_path, source_bytes, .{ .reject_symlinks = true });
-    var target_stats = validateJsonlBytes(allocator, source_bytes) catch unreachable;
+    try durable_store.writeTextCreateNew(allocator, to_path, converted_source, .{ .reject_symlinks = true });
+    var target_stats = validateJsonlBytes(allocator, converted_source) catch unreachable;
     defer target_stats.deinit(allocator);
     try maybeRemoveLegacy(args, from_path);
     try printMigrationResult(allocator, .{
@@ -1276,7 +1287,7 @@ fn cmdMigrate(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !
         .mode = migrationModeText(args.migrate_mode),
         .records = source_stats.records,
         .blank_lines = source_stats.blank_lines,
-        .source_sha256 = source_stats.sha256,
+        .source_sha256 = source_sha,
         .target_sha256 = target_stats.sha256,
         .legacy_left_in_place = !args.remove_legacy and args.migrate_mode == .copy,
     });
@@ -1286,12 +1297,15 @@ fn cmdMigrate(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !
 fn cmdDoctor(allocator: std.mem.Allocator, repo_root: []const u8) !void {
     const next_path = try resolveJsonlPathAlloc(allocator, repo_root, DefaultLearningsPath);
     defer allocator.free(next_path);
+    const previous_path = try resolveJsonlPathAlloc(allocator, repo_root, PreviousLearningsPath);
+    defer allocator.free(previous_path);
     const legacy_path = try resolveJsonlPathAlloc(allocator, repo_root, LegacyLearningsPath);
     defer allocator.free(legacy_path);
     const next_exists = durable_store.fileExists(next_path);
+    const previous_exists = durable_store.fileExists(previous_path);
     const legacy_exists = durable_store.fileExists(legacy_path);
     const status =
-        if (next_exists) "migrated" else if (legacy_exists) "legacy-only" else "missing";
+        if (next_exists) "current" else if (previous_exists or legacy_exists) "legacy-only" else "missing";
 
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
@@ -1299,8 +1313,9 @@ fn cmdDoctor(allocator: std.mem.Allocator, repo_root: []const u8) !void {
     try writeJsonString(stdout, status);
     try stdout.writeAll(",\"default_path\":");
     try writeJsonString(stdout, DefaultLearningsPath);
-    try stdout.print(",\"default_exists\":{s},\"legacy_exists\":{s}}}\n", .{
+    try stdout.print(",\"default_exists\":{s},\"previous_exists\":{s},\"legacy_exists\":{s}}}\n", .{
         if (next_exists) "true" else "false",
+        if (previous_exists) "true" else "false",
         if (legacy_exists) "true" else "false",
     });
 }
@@ -1370,6 +1385,69 @@ fn maybeRemoveLegacy(args: Args, from_path: []const u8) !void {
     try deleteFilePath(from_path);
 }
 
+fn resolveMigrateFromPathAlloc(allocator: std.mem.Allocator, repo_root: []const u8, raw_path: []const u8) ![]u8 {
+    if (raw_path.len != 0) return allocator.dupe(u8, raw_path);
+
+    const previous_path = try resolveJsonlPathAlloc(allocator, repo_root, PreviousLearningsPath);
+    defer allocator.free(previous_path);
+    if (durable_store.fileExists(previous_path)) return allocator.dupe(u8, PreviousLearningsPath);
+
+    return allocator.dupe(u8, LegacyLearningsPath);
+}
+
+fn convertLearningRowsToEventsAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r\n");
+        if (line.len == 0) continue;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return error.InvalidJsonLine;
+        defer parsed.deinit();
+        const obj = switch (parsed.value) {
+            .object => |value| value,
+            else => return error.InvalidJsonLine,
+        };
+
+        if (learningEventRecordObject(obj)) |_| {
+            try out.appendSlice(allocator, line);
+            try out.append(allocator, '\n');
+            continue;
+        }
+
+        const id = jsonObjectString(obj, "id");
+        if (id.len == 0) return error.MissingLearningId;
+        const status = jsonObjectString(obj, "status");
+
+        try out.appendSlice(allocator, "{\"v\":1,\"source\":\"learnings\",\"event\":\"learning.capture\",\"learning_id\":");
+        try appendJsonString(allocator, &out, id);
+        try out.appendSlice(allocator, ",\"status\":");
+        try appendJsonString(allocator, &out, status);
+        try out.appendSlice(allocator, ",\"record\":");
+        try out.appendSlice(allocator, line);
+        try out.appendSlice(allocator, "}\n");
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendJsonString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
+    try out.append(allocator, '"');
+    for (text) |c| {
+        switch (c) {
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            else => try out.append(allocator, c),
+        }
+    }
+    try out.append(allocator, '"');
+}
+
 fn deleteFilePath(path: []const u8) !void {
     const parent = std.fs.path.dirname(path) orelse ".";
     const base = std.fs.path.basename(path);
@@ -1403,7 +1481,7 @@ fn validateJsonlBytes(allocator: std.mem.Allocator, bytes: []const u8) !JsonlSta
             .object => |value| value,
             else => return error.InvalidJsonLine,
         };
-        const id = jsonObjectString(obj, "id");
+        const id = learningIdFromObject(obj);
         if (id.len == 0) return error.MissingLearningId;
 
         const gop = try stats.ids.getOrPut(id);
@@ -1439,7 +1517,7 @@ fn mergeJsonlBytesByIdAlloc(
             .object => |value| value,
             else => return error.InvalidJsonLine,
         };
-        const id = jsonObjectString(obj, "id");
+        const id = learningIdFromObject(obj);
         if (target_stats.ids.get(id)) |existing_line| {
             if (!std.mem.eql(u8, existing_line, source_stats.ids.get(id).?)) return error.ConflictingLearningId;
             continue;
@@ -1449,6 +1527,28 @@ fn mergeJsonlBytesByIdAlloc(
     }
 
     return out.toOwnedSlice(allocator);
+}
+
+fn learningEventRecordObject(obj: std.json.ObjectMap) ?std.json.ObjectMap {
+    if (!std.mem.eql(u8, jsonObjectString(obj, "event"), "learning.capture")) return null;
+    const record_value = obj.get("record") orelse return null;
+    return switch (record_value) {
+        .object => |record_obj| record_obj,
+        else => null,
+    };
+}
+
+fn learningRecordObject(obj: std.json.ObjectMap) std.json.ObjectMap {
+    return learningEventRecordObject(obj) orelse obj;
+}
+
+fn learningIdFromObject(obj: std.json.ObjectMap) []const u8 {
+    if (learningEventRecordObject(obj)) |record_obj| {
+        const event_id = jsonObjectString(obj, "learning_id");
+        if (event_id.len > 0) return event_id;
+        return jsonObjectString(record_obj, "id");
+    }
+    return jsonObjectString(obj, "id");
 }
 
 fn sha256HexAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
@@ -1544,7 +1644,7 @@ fn cmdDatasets(allocator: std.mem.Allocator) !void {
         rows.deinit(allocator);
     }
 
-    try appendDatasetRow(allocator, &rows, "learnings", "Learning records from .ledger/learnings/learnings.jsonl (1 row per record)");
+    try appendDatasetRow(allocator, &rows, "learnings", "Learning records from .ledger/learnings/events.jsonl (1 row per record)");
     try appendDatasetRow(allocator, &rows, "learning_paths", "Exploded context.paths (1 row per record-path)");
     try appendDatasetRow(allocator, &rows, "learning_tags", "Exploded tags (1 row per record-tag)");
 
@@ -1578,7 +1678,7 @@ fn cmdDatasetSchema(allocator: std.mem.Allocator, dataset: []const u8) !void {
 
     if (std.mem.eql(u8, dataset, "learnings")) {
         try stdout.print("Dataset: learnings\n", .{});
-        try stdout.print("Description: Learning records from .ledger/learnings/learnings.jsonl (1 row per record)\n", .{});
+        try stdout.print("Description: Learning records from .ledger/learnings/events.jsonl (1 row per record)\n", .{});
         try stdout.print("Fields:\n", .{});
         for (LearningsFields) |field| {
             try stdout.print("- {s}\n", .{field});
@@ -2628,8 +2728,8 @@ fn renderMemoryDigestAlloc(
         \\# Learnings Digest
         \\
         \\generated_at: {s}
-        \\generator: learnings memory-digest
-        \\source: .ledger/learnings/learnings.jsonl
+        \\generator: ledger memory-digest --source learnings
+        \\source: .ledger/learnings/events.jsonl
         \\source_repo: multiple
         \\source_count: {d}
         \\source_branch_policy: preserve per-entry branch; do not globalize branch-local guidance
@@ -2678,7 +2778,7 @@ fn renderMemoryDigestAlloc(
         \\## Generator recommendations
         \\
         \\- Keep the digest disposable; promote only the condensed memory guidance.
-        \\- Re-run `learnings memory-digest` after append-heavy work before memory consolidation.
+        \\- Re-run `ledger memory-digest --source learnings` after append-heavy work before memory consolidation.
         \\- Use `--scan-root` to narrow a consolidation pass when a repo family needs focused review.
         \\
     );
@@ -3000,10 +3100,11 @@ fn collectDigestRows(
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
         defer parsed.deinit();
 
-        const obj = switch (parsed.value) {
+        const parsed_obj = switch (parsed.value) {
             .object => |value| value,
             else => continue,
         };
+        const obj = learningRecordObject(parsed_obj);
 
         const status = jsonObjectString(obj, "status");
         if (!digestStatusMaybeEligible(status)) continue;
@@ -3719,10 +3820,11 @@ fn collectLearningRows(
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
         defer parsed.deinit();
 
-        const obj = switch (parsed.value) {
+        const parsed_obj = switch (parsed.value) {
             .object => |value| value,
             else => continue,
         };
+        const obj = learningRecordObject(parsed_obj);
 
         var row = query_engine.Row.init(allocator);
         errdefer row.deinit();
@@ -4583,12 +4685,24 @@ fn resolveReadJsonlPathAlloc(
     errdefer allocator.free(next_path);
     if (durable_store.fileExists(next_path)) return next_path;
 
+    const previous_path = try resolveJsonlPathAlloc(allocator, repo_root, PreviousLearningsPath);
+    if (durable_store.fileExists(previous_path)) {
+        allocator.free(next_path);
+        var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        try stderr_writer.interface.print(
+            "migration-hint: reading legacy {s}; run `ledger migrate --source learnings --mode copy` to create {s}\n",
+            .{ PreviousLearningsPath, DefaultLearningsPath },
+        );
+        return previous_path;
+    }
+    allocator.free(previous_path);
+
     const legacy_path = try resolveJsonlPathAlloc(allocator, repo_root, LegacyLearningsPath);
     if (durable_store.fileExists(legacy_path)) {
         allocator.free(next_path);
         var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         try stderr_writer.interface.print(
-            "migration-hint: reading legacy {s}; run `learnings migrate --mode copy` to create {s}\n",
+            "migration-hint: reading legacy {s}; run `ledger migrate --source learnings --mode copy` to create {s}\n",
             .{ LegacyLearningsPath, DefaultLearningsPath },
         );
         return legacy_path;
@@ -4779,10 +4893,10 @@ test "parse args memory-digest" {
 
 test "subcommand help dispatches before argument parsing" {
     const long_help = [_][]const u8{ ProgramName, "migrate", "--help" };
-    try std.testing.expectEqualStrings("learnings migrate", subcommandHelpSurface(&long_help).?.executable_name);
+    try std.testing.expectEqualStrings("ledger migrate --source learnings", subcommandHelpSurface(&long_help).?.executable_name);
 
     const short_help = [_][]const u8{ ProgramName, "migrate", "-h" };
-    try std.testing.expectEqualStrings("learnings migrate", subcommandHelpSurface(&short_help).?.executable_name);
+    try std.testing.expectEqualStrings("ledger migrate --source learnings", subcommandHelpSurface(&short_help).?.executable_name);
 
     const dry_run = [_][]const u8{ ProgramName, "migrate", "--dry-run" };
     try std.testing.expect(subcommandHelpSurface(&dry_run) == null);
@@ -4791,22 +4905,22 @@ test "subcommand help dispatches before argument parsing" {
     try std.testing.expect(parsed.dry_run);
 
     const global_path_help = [_][]const u8{ ProgramName, "--path", ".custom/learnings.jsonl", "migrate", "--help" };
-    try std.testing.expectEqualStrings("learnings migrate", subcommandHelpSurface(&global_path_help).?.executable_name);
+    try std.testing.expectEqualStrings("ledger migrate --source learnings", subcommandHelpSurface(&global_path_help).?.executable_name);
 
     const late_help = [_][]const u8{ ProgramName, "migrate", "--dry-run", "--help" };
-    try std.testing.expectEqualStrings("learnings migrate", subcommandHelpSurface(&late_help).?.executable_name);
+    try std.testing.expectEqualStrings("ledger migrate --source learnings", subcommandHelpSurface(&late_help).?.executable_name);
 
     const query_mentions_migrate = [_][]const u8{ ProgramName, "query", "--spec", "migrate", "--help" };
-    try std.testing.expectEqualStrings("learnings query", subcommandHelpSurface(&query_mentions_migrate).?.executable_name);
+    try std.testing.expectEqualStrings("ledger query --source learnings", subcommandHelpSurface(&query_mentions_migrate).?.executable_name);
 
     const recall_help = [_][]const u8{ ProgramName, "recall", "--help" };
-    try std.testing.expectEqualStrings("learnings recall", subcommandHelpSurface(&recall_help).?.executable_name);
+    try std.testing.expectEqualStrings("ledger recall --source learnings", subcommandHelpSurface(&recall_help).?.executable_name);
 
     const query_short_help = [_][]const u8{ ProgramName, "query", "-h" };
-    try std.testing.expectEqualStrings("learnings query", subcommandHelpSurface(&query_short_help).?.executable_name);
+    try std.testing.expectEqualStrings("ledger query --source learnings", subcommandHelpSurface(&query_short_help).?.executable_name);
 
     const append_help = [_][]const u8{ ProgramName, "append", "--help" };
-    try std.testing.expectEqualStrings("learnings append", subcommandHelpSurface(&append_help).?.executable_name);
+    try std.testing.expectEqualStrings("ledger capture --source learnings", subcommandHelpSurface(&append_help).?.executable_name);
 }
 
 test "migrate copies legacy rows preserving byte content" {
