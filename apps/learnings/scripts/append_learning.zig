@@ -1292,6 +1292,47 @@ test "append default writes .ledger/learnings/events.jsonl" {
     try std.testing.expectEqualStrings(expected_path, resolved);
 }
 
+test "duplicate learning detection leaves durable store unchanged" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, DefaultLearningsPath });
+    defer std.testing.allocator.free(store_path);
+
+    const evidence = [_][]const u8{"zig build test-append-learning passed"};
+    const record = Record{
+        .id = "lrn-20260630T000000Z-12345678",
+        .captured_at = "2026-06-30T00:00:00Z",
+        .status = "do_more",
+        .learning = "When duplicate learning capture is detected, prefer returning duplicate-skip because durable stores must remain unchanged.",
+        .evidence = &evidence,
+        .application = "Use duplicate detection as a no-op proof path before append.",
+        .repo = "tkersey/dotfiles",
+        .branch = "main",
+        .paths = &.{},
+        .source = "test",
+        .fingerprint = "12345678abcdef00",
+        .tags = &.{"dedupe"},
+        .related_ids = &.{},
+        .supersedes_id = null,
+    };
+    const line = try encodeLearningEventJsonAlloc(std.testing.allocator, record);
+    defer std.testing.allocator.free(line);
+    try appendJsonLine(store_path, line);
+
+    const before = try durable_store.readRegularFileNoSymlink(std.testing.allocator, store_path, 64 * 1024 * 1024);
+    defer std.testing.allocator.free(before);
+    const existing_id = try findDuplicateExistingIdAlloc(std.testing.allocator, store_path, record.fingerprint);
+    defer if (existing_id) |id| std.testing.allocator.free(id);
+    try std.testing.expect(existing_id != null);
+    try std.testing.expectEqualStrings(record.id, existing_id.?);
+    const after = try durable_store.readRegularFileNoSymlink(std.testing.allocator, store_path, 64 * 1024 * 1024);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualStrings(before, after);
+}
+
 test "legacy-only append fails with MigrationRequired" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

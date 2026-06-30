@@ -301,13 +301,15 @@ pub fn runWithArgv(allocator: std.mem.Allocator, argv: []const []const u8, codex
 
     switch (parsed.command orelse return error.MissingCommand) {
         .capture, .append => {
-            var result = try cmdCapture(allocator, repo_root, parsed);
-            defer result.deinit(allocator);
-            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-            try stdout_writer.interface.print(
-                "appended: id={s} kind={s} operation={s} path={s}\n",
-                .{ result.id, result.kind, result.operation, result.path },
-            );
+            if (try cmdCapture(allocator, repo_root, parsed)) |result_value| {
+                var result = result_value;
+                defer result.deinit(allocator);
+                var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+                try stdout_writer.interface.print(
+                    "appended: id={s} kind={s} operation={s} path={s}\n",
+                    .{ result.id, result.kind, result.operation, result.path },
+                );
+            }
         },
         .doctor => try cmdDoctor(allocator, repo_root, parsed, codex_home),
         .path => try cmdPath(allocator, repo_root, parsed),
@@ -475,7 +477,7 @@ fn parseCommand(raw: []const u8) ?Command {
     return null;
 }
 
-fn cmdCapture(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !CaptureResult {
+fn cmdCapture(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !?CaptureResult {
     const input = try readInputAlloc(allocator, args.json_path.?);
     defer allocator.free(input);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, input, .{});
@@ -503,12 +505,12 @@ fn cmdCapture(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !
     if (!args.allow_duplicate) {
         if (try findDuplicateByFingerprintAlloc(allocator, output_path, normalized.fingerprint)) |existing_id| {
             defer allocator.free(existing_id);
-            var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-            try stdout_writer.interface.print(
+            var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+            try stderr_writer.interface.print(
                 "duplicate-skip: fingerprint={s} existing_id={s} path={s}\n",
                 .{ normalized.fingerprint, existing_id, output_path },
             );
-            return error.DuplicateSynesthesiaEvent;
+            return null;
         }
     }
 
@@ -1525,6 +1527,39 @@ test "capture validates endorsement and creates SYN id" {
     const id = try buildSynIdAlloc(std.testing.allocator, "2026-06-30T12:34:56Z", normalized.fingerprint);
     defer std.testing.allocator.free(id);
     try std.testing.expect(std.mem.startsWith(u8, id, "SYN-20260630T123456Z-"));
+}
+
+test "duplicate capture is successful no-op and leaves durable store unchanged" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, DefaultSynesthesiaPath });
+    defer std.testing.allocator.free(store_path);
+    const input_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "synesthesia.json" });
+    defer std.testing.allocator.free(input_path);
+
+    const raw =
+        "{\"operation\":\"assert\",\"authority\":\"explicit-user-endorsement\",\"summary\":\"Endorse long corridor.\",\"scope\":{\"kind\":\"task-family\",\"repo\":null,\"paths\":[]},\"source_refs\":[{\"kind\":\"user\",\"ref\":\"r\",\"summary\":\"s\"}],\"related_ids\":[],\"supersedes_id\":null,\"payload\":{\"sensory_phrase\":\"long corridor\",\"engineering_translation\":\"serialized waits\",\"activation_boundary\":\"latency work\",\"non_activation_boundary\":\"syntax\",\"verification\":\"name the wait\"}}";
+    try durable_store.writeTextAtomic(std.testing.allocator, input_path, raw);
+
+    const args = Args{
+        .command = .capture,
+        .path = DefaultSynesthesiaPath,
+        .json_path = input_path,
+        .kind = "mapping-endorsement",
+    };
+    var first = (try cmdCapture(std.testing.allocator, root_abs, args)).?;
+    defer first.deinit(std.testing.allocator);
+
+    const before = try durable_store.readRegularFileNoSymlink(std.testing.allocator, store_path, MaxStoreBytes);
+    defer std.testing.allocator.free(before);
+    const duplicate = try cmdCapture(std.testing.allocator, root_abs, args);
+    try std.testing.expect(duplicate == null);
+    const after = try durable_store.readRegularFileNoSymlink(std.testing.allocator, store_path, MaxStoreBytes);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualStrings(before, after);
 }
 
 test "memory-note export omits ledger metadata" {
