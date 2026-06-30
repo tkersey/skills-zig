@@ -689,7 +689,6 @@ fn writeMemoryNoteProjection(allocator: std.mem.Allocator, writer: anytype, reco
     };
     try writer.writeByte('{');
     var first = true;
-    try writeStringField(writer, &first, "logical_kind", record.logical_kind);
     try copyField(writer, &first, obj, "operation");
     try copyField(writer, &first, obj, "authority");
     try copyField(writer, &first, obj, "summary");
@@ -1526,6 +1525,28 @@ test "capture validates endorsement and creates SYN id" {
     const id = try buildSynIdAlloc(std.testing.allocator, "2026-06-30T12:34:56Z", normalized.fingerprint);
     defer std.testing.allocator.free(id);
     try std.testing.expect(std.mem.startsWith(u8, id, "SYN-20260630T123456Z-"));
+}
+
+test "memory-note export omits ledger metadata" {
+    const raw =
+        "{\"operation\":\"assert\",\"authority\":\"explicit-user-endorsement\",\"summary\":\"Endorse long corridor.\",\"scope\":{\"kind\":\"task-family\",\"repo\":null,\"paths\":[]},\"source_refs\":[{\"kind\":\"user\",\"ref\":\"r\",\"summary\":\"s\"}],\"related_ids\":[],\"supersedes_id\":null,\"payload\":{\"sensory_phrase\":\"long corridor\",\"engineering_translation\":\"serialized waits\",\"activation_boundary\":\"latency work\",\"non_activation_boundary\":\"syntax\",\"verification\":\"name the wait\"}}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+    var normalized = try validateAndFingerprint(std.testing.allocator, "mapping-endorsement", parsed.value.object);
+    defer normalized.deinit(std.testing.allocator);
+    const record_json = try encodeRecordJsonAlloc(std.testing.allocator, "SYN-20260630T123456Z-0123456789abcdef", "2026-06-30T12:34:56Z", normalized);
+    defer std.testing.allocator.free(record_json);
+    const event_line = try encodeEventLineAlloc(std.testing.allocator, "SYN-20260630T123456Z-0123456789abcdef", "2026-06-30T12:34:56Z", normalized, record_json);
+    defer std.testing.allocator.free(event_line);
+    var record = try parseStoredRecordAlloc(std.testing.allocator, event_line);
+    defer record.deinit(std.testing.allocator);
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeMemoryNoteProjection(std.testing.allocator, &out.writer, record);
+    const projection = try out.toOwnedSlice();
+    defer std.testing.allocator.free(projection);
+    try std.testing.expect(std.mem.indexOf(u8, projection, "\"logical_kind\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, projection, "\"operation\":\"assert\"") != null);
 }
 
 test "prior operations require a relationship" {
