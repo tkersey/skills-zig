@@ -740,7 +740,7 @@ pub fn main(init: std.process.Init) !void {
     if (try core_cli.handleDefaultHelpAndVersionSurface(argv, HelpSurface, Version)) return;
 
     const parsed = parseArgs(allocator, argv) catch |err| {
-        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
+        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), usageDetailForParseError(err));
     };
     defer parsed.deinit(allocator);
 
@@ -887,6 +887,7 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             continue;
         }
         if (std.mem.eql(u8, arg, "--review-thread-id")) {
+            try validateReviewThreadIdSelector(value);
             out.review_thread_id = value;
             continue;
         }
@@ -1097,6 +1098,32 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
     }
 
     return out;
+}
+
+const ReviewThreadIdSelectorHint =
+    "pass the bare reviewThreadId; do not pass .json, .events.ndjson, .parent.events.ndjson, .lane.json, or paths. Use --latest for the newest persisted status/wait session.";
+
+fn usageDetailForParseError(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.InvalidReviewThreadId => ReviewThreadIdSelectorHint,
+        else => null,
+    };
+}
+
+fn validateReviewThreadIdSelector(value: []const u8) !void {
+    if (value.len == 0) return error.InvalidReviewThreadId;
+    if (std.mem.indexOfScalar(u8, value, '/') != null) return error.InvalidReviewThreadId;
+    if (std.mem.indexOfScalar(u8, value, '\\') != null) return error.InvalidReviewThreadId;
+
+    const artifact_suffixes = [_][]const u8{
+        ".parent.events.ndjson",
+        ".events.ndjson",
+        ".lane.json",
+        ".json",
+    };
+    for (artifact_suffixes) |suffix| {
+        if (std.mem.endsWith(u8, value, suffix)) return error.InvalidReviewThreadId;
+    }
 }
 
 fn setTarget(parsed: *ParsedArgs, target: TargetConfig) void {
@@ -9956,6 +9983,50 @@ test "parseArgs accepts latest status and wait selectors" {
     const wait = try parseArgs(std.testing.allocator, &wait_argv);
     try std.testing.expectEqual(Action.wait, wait.action.?);
     try std.testing.expect(wait.latest_review_session);
+}
+
+test "parseArgs accepts bare review thread id selectors" {
+    const argv = [_][]const u8{
+        "cas_review_session",
+        "status",
+        "--review-thread-id",
+        "019f198b-722f-7b81-a6a9-f6dbbcec5ed8",
+        "--json",
+    };
+
+    var parsed = try parseArgs(std.testing.allocator, &argv);
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Action.status, parsed.action.?);
+    try std.testing.expectEqualStrings("019f198b-722f-7b81-a6a9-f6dbbcec5ed8", parsed.review_thread_id.?);
+    try std.testing.expect(parsed.json);
+}
+
+test "parseArgs rejects artifact-like review thread id selectors" {
+    const invalid_values = [_][]const u8{
+        "",
+        "019f198b-722f-7b81-a6a9-f6dbbcec5ed8.json",
+        "019f198b-722f-7b81-a6a9-f6dbbcec5ed8.events.ndjson",
+        "019f198b-722f-7b81-a6a9-f6dbbcec5ed8.parent.events.ndjson",
+        "lane_1.lane.json",
+        "review_sessions/019f198b-722f-7b81-a6a9-f6dbbcec5ed8",
+        "review_sessions\\019f198b-722f-7b81-a6a9-f6dbbcec5ed8",
+    };
+
+    for (invalid_values) |value| {
+        const argv = [_][]const u8{
+            "cas_review_session",
+            "status",
+            "--review-thread-id",
+            value,
+        };
+        try std.testing.expectError(error.InvalidReviewThreadId, parseArgs(std.testing.allocator, &argv));
+    }
+}
+
+test "usage detail explains invalid review thread id selectors" {
+    const detail = usageDetailForParseError(error.InvalidReviewThreadId) orelse return error.TestExpectedEqual;
+    try std.testing.expect(std.mem.indexOf(u8, detail, "bare reviewThreadId") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "--latest") != null);
 }
 
 test "parseArgs rejects ambiguous and unsafe latest selectors" {
