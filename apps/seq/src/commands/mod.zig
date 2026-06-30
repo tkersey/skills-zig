@@ -26322,7 +26322,9 @@ test "capabilities advertises resolve intent closed audit flags" {
     }, output_path);
     defer std.testing.allocator.free(got);
 
-    try std.testing.expect(std.mem.indexOf(u8, got, "\"version\": \"0.3.23\"") != null);
+    const expected_version = try std.fmt.allocPrint(std.testing.allocator, "\"version\": \"{s}\"", .{app_meta.version});
+    defer std.testing.allocator.free(expected_version);
+    try std.testing.expect(std.mem.indexOf(u8, got, expected_version) != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_acceptance_contract_v2\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_review_batch_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_review_aperture_v1\": true") != null);
