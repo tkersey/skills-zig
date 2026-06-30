@@ -8,12 +8,9 @@ Monorepo for Zig CLIs with shared internal libraries and independent release str
 - `lift` (`bench_stats`, `perf_report`)
 - `cas` (`cas_smoke_check`, `cas_instance_runner`, `cas_review_session`)
 - `cron` (`cron`)
-- `puff` (`puff`)
-- `ledger` (`ledger`, including `ledger --source learnings`)
+- `ledger` (`ledger`, including `ledger --source learnings` and `ledger --source synesthesia`)
 - `memory-note` (`memory-note`)
-- `mesh` (`mesh`)
 - `st` (`st`)
-- `parse-arch` (`parse-arch`)
 
 No unified umbrella CLI is introduced. Binaries remain separate.
 
@@ -23,13 +20,11 @@ No unified umbrella CLI is introduced. Binaries remain separate.
 - `apps/lift`
 - `apps/cas`
 - `apps/cron`
-- `apps/puff`
 - `apps/learnings` (ledger-owned internal learning source)
+- `apps/synesthesia` (ledger-owned internal Synesthesia source)
 - `apps/ledger`
 - `apps/memory-note`
-- `apps/mesh`
 - `apps/st`
-- `apps/parse-arch`
 - `libs/core`
 - `libs/durable_store`
 - `.github/workflows`
@@ -52,12 +47,9 @@ zig build build-seq -Doptimize=ReleaseFast
 zig build build-lift -Doptimize=ReleaseFast
 zig build build-cas -Doptimize=ReleaseFast
 zig build build-cron -Doptimize=ReleaseFast
-zig build build-puff -Doptimize=ReleaseFast
 zig build build-ledger -Doptimize=ReleaseFast
 zig build build-memory-note -Doptimize=ReleaseFast
-zig build build-mesh -Doptimize=ReleaseFast
 zig build build-st -Doptimize=ReleaseFast
-zig build build-parse-arch -Doptimize=ReleaseFast
 ```
 
 Run helpers:
@@ -85,7 +77,7 @@ zig build perf-accept-local
 
 # Optional filter by binary or case id substring.
 zig build perf-capture-local -- --target seq
-zig build perf-compare-local -- --target parse-arch
+zig build perf-compare-local -- --target st
 ```
 
 Authoritative baselines live under `.perf-local/<machine-id>/baselines/` and are ignored by git.
@@ -101,15 +93,12 @@ Per-app VERSION files are the source of truth:
 - `apps/lift/VERSION`
 - `apps/cas/VERSION`
 - `apps/cron/VERSION`
-- `apps/puff/VERSION`
 - `apps/ledger/VERSION`
 - `apps/memory-note/VERSION`
-- `apps/mesh/VERSION`
 - `apps/st/VERSION`
-- `apps/parse-arch/VERSION`
 
 PRs that touch release-relevant CLI surfaces must bump the corresponding `VERSION` file.
-The check is conservative: app-local changes count for that app, `apps/learnings/**` counts for `ledger`, broad shared shipped surfaces such as `build.zig`, `build.zig.zon`, and `libs/core/**` count for every shipped CLI, and `libs/durable_store/**` counts for its shipped consumers. Durable-store concurrency changes are release-relevant for `st` when they affect workspace mutation, transaction recovery, fencing, CAS, or command exit behavior.
+The check is conservative: app-local changes count for that app, `apps/learnings/**` and `apps/synesthesia/**` count for `ledger`, broad shared shipped surfaces such as `build.zig`, `build.zig.zon`, and `libs/core/**` count for every shipped CLI, and `libs/durable_store/**` counts for its shipped consumers. Durable-store concurrency changes are release-relevant for `st` when they affect workspace mutation, transaction recovery, fencing, CAS, or command exit behavior.
 Do not close release-relevant CLI work with a local `./zig-out/bin` binary alone.
 Release closure means the changed CLI has a tagged GitHub release, the tap formula has been updated, Homebrew audit/test have passed, and the installed Homebrew binary reports the expected version.
 
@@ -119,12 +108,9 @@ Independent tags trigger independent workflows, and each tag must match its app 
 - `lift-v*` -> `.github/workflows/release-lift.yml`
 - `cas-v*` -> `.github/workflows/release-cas.yml`
 - `cron-v*` -> `.github/workflows/release-cron.yml`
-- `puff-v*` -> `.github/workflows/release-puff.yml`
 - `ledger-v*` -> `.github/workflows/release-ledger.yml`
 - `memory-note-v*` -> `.github/workflows/release-memory-note.yml`
-- `mesh-v*` -> `.github/workflows/release-mesh.yml`
 - `st-v*` -> `.github/workflows/release-st.yml`
-- `parse-arch-v*` -> `.github/workflows/release-parse-arch.yml`
 
 Pushes to `main` auto-create any missing release tags for changed `VERSION` files and dispatch the matching release workflow.
 Manual tag pushes still work, but they are no longer the only path.
@@ -135,12 +121,9 @@ Required tag forms:
 - `lift-v<version>` where `<version>` equals `apps/lift/VERSION`
 - `cas-v<version>` where `<version>` equals `apps/cas/VERSION`
 - `cron-v<version>` where `<version>` equals `apps/cron/VERSION`
-- `puff-v<version>` where `<version>` equals `apps/puff/VERSION`
 - `ledger-v<version>` where `<version>` equals `apps/ledger/VERSION`
 - `memory-note-v<version>` where `<version>` equals `apps/memory-note/VERSION`
-- `mesh-v<version>` where `<version>` equals `apps/mesh/VERSION`
 - `st-v<version>` where `<version>` equals `apps/st/VERSION`
-- `parse-arch-v<version>` where `<version>` equals `apps/parse-arch/VERSION`
 
 Artifacts are published as:
 

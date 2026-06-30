@@ -15,12 +15,9 @@ apps=(
   lift
   cas
   cron
-  puff
   ledger
   memory-note
-  mesh
   st
-  parse-arch
 )
 
 resolve_ref() {
@@ -99,6 +96,10 @@ case "$mode" in
             current_app="ledger"
             return
             ;;
+          *"const synesthesia_"*"= b.createModule"*|*"const synesthesia_root = b.createModule"*|*"apps/synesthesia/"*)
+            current_app="ledger"
+            return
+            ;;
         esac
         for app in "${apps[@]}"; do
           token="${app//-/_}"
@@ -154,6 +155,10 @@ case "$mode" in
 
         case "$raw" in
           *"apps/learnings/"*|*"learnings_meta"*|*"learnings_root"*|*"append_learning_root"*|*"const learnings ="*|*"const append_learning ="*|*"learnings_install"*|*"append_learning_install"*|*"run_learnings_tests"*|*"run_append_learning_tests"*|*"test-learnings"*|*"test-append-learning"*|*"build-learnings"*)
+            mark_app ledger
+            matched=1
+            ;;
+          *"apps/synesthesia/"*|*"synesthesia_root"*|*"synesthesia_cli"*|*"run_synesthesia_tests"*|*"test-synesthesia"*|*"build-synesthesia"*)
             mark_app ledger
             matched=1
             ;;
@@ -229,25 +234,16 @@ case "$mode" in
         .github/workflows/release-cron.yml)
           mark_app cron
           ;;
-        .github/workflows/release-puff.yml)
-          mark_app puff
-          ;;
         .github/workflows/release-ledger.yml)
           mark_app ledger
           ;;
         .github/workflows/release-memory-note.yml)
           mark_app memory-note
           ;;
-        .github/workflows/release-mesh.yml)
-          mark_app mesh
-          ;;
         .github/workflows/release-st.yml)
           mark_app st
           ;;
-        .github/workflows/release-parse-arch.yml)
-          mark_app parse-arch
-          ;;
-        apps/seq/README.md|apps/lift/README.md|apps/cas/README.md|apps/cron/README.md|apps/puff/README.md|apps/learnings/README.md|apps/ledger/README.md|apps/memory-note/README.md|apps/mesh/README.md|apps/st/README.md|apps/parse-arch/README.md)
+        apps/seq/README.md|apps/lift/README.md|apps/cas/README.md|apps/cron/README.md|apps/learnings/README.md|apps/ledger/README.md|apps/memory-note/README.md|apps/st/README.md)
           ;;
         apps/seq/*)
           mark_app seq
@@ -261,10 +257,10 @@ case "$mode" in
         apps/cron/*)
           mark_app cron
           ;;
-        apps/puff/*)
-          mark_app puff
-          ;;
         apps/learnings/*)
+          mark_app ledger
+          ;;
+        apps/synesthesia/*)
           mark_app ledger
           ;;
         apps/ledger/*)
@@ -273,14 +269,8 @@ case "$mode" in
         apps/memory-note/*)
           mark_app memory-note
           ;;
-        apps/mesh/*)
-          mark_app mesh
-          ;;
         apps/st/*)
           mark_app st
-          ;;
-        apps/parse-arch/*)
-          mark_app parse-arch
           ;;
       esac
     done < <(git diff --name-only "$base" "$head")

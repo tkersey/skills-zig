@@ -10,13 +10,11 @@ on:
       - "apps/lift/**"
       - "apps/cas/**"
       - "apps/cron/**"
-      - "apps/puff/**"
       - "apps/learnings/**"
+      - "apps/synesthesia/**"
       - "apps/ledger/**"
       - "apps/memory-note/**"
-      - "apps/mesh/**"
       - "apps/st/**"
-      - "apps/parse-arch/**"
       - "libs/core/**"
       - "libs/durable_store/**"
       - ".github/scripts/**"
@@ -37,12 +35,9 @@ jobs:
       lift: ${{ steps.filter.outputs.lift }}
       cas: ${{ steps.filter.outputs.cas }}
       cron: ${{ steps.filter.outputs.cron }}
-      puff: ${{ steps.filter.outputs.puff }}
       ledger: ${{ steps.filter.outputs.ledger }}
       memory_note: ${{ steps.filter.outputs.memory_note }}
-      mesh: ${{ steps.filter.outputs.mesh }}
       st: ${{ steps.filter.outputs.st }}
-      parse_arch: ${{ steps.filter.outputs.parse_arch }}
       core: ${{ steps.filter.outputs.core }}
     steps:
       - uses: actions/checkout@v4
@@ -58,19 +53,14 @@ jobs:
               - "apps/cas/**"
             cron:
               - "apps/cron/**"
-            puff:
-              - "apps/puff/**"
             ledger:
               - "apps/ledger/**"
               - "apps/learnings/**"
+              - "apps/synesthesia/**"
             memory_note:
               - "apps/memory-note/**"
-            mesh:
-              - "apps/mesh/**"
             st:
               - "apps/st/**"
-            parse_arch:
-              - "apps/parse-arch/**"
             core:
               - "build.zig"
               - "build.zig.zon"
@@ -252,18 +242,6 @@ jobs:
       - name: Test cron
         run: zig build test-cron
 
-  puff:
-    needs: changes
-    if: needs.changes.outputs.puff == 'true' || needs.changes.outputs.core == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-      - name: Build puff binaries
-        run: zig build build-puff -Doptimize=ReleaseFast
-
   ledger:
     needs: changes
     if: needs.changes.outputs.ledger == 'true' || needs.changes.outputs.core == 'true'
@@ -276,7 +254,7 @@ jobs:
       - name: Build ledger
         run: zig build build-ledger -Doptimize=ReleaseFast
       - name: Test ledger
-        run: zig build test-ledger test-learnings test-append-learning
+        run: zig build test-ledger test-learnings test-append-learning test-synesthesia
 
   memory-note:
     needs: changes
@@ -305,31 +283,3 @@ jobs:
         run: zig build build-st -Doptimize=ReleaseFast
       - name: Test st
         run: zig build test-st
-
-  mesh:
-    needs: changes
-    if: needs.changes.outputs.mesh == 'true' || needs.changes.outputs.core == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-      - name: Build mesh
-        run: zig build build-mesh -Doptimize=ReleaseFast
-      - name: Test mesh
-        run: zig build test-mesh
-
-  parse-arch:
-    needs: changes
-    if: needs.changes.outputs.parse_arch == 'true' || needs.changes.outputs.core == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-      - name: Build parse-arch
-        run: zig build build-parse-arch -Doptimize=ReleaseFast
-      - name: Test parse-arch
-        run: zig build test-parse-arch

@@ -17,11 +17,8 @@
         "apps/lift/scripts",
         "apps/cas/scripts",
         "apps/cron/scripts",
-        "apps/puff/scripts",
         "apps/learnings/scripts",
-        "apps/parse-arch/scripts",
-        "apps/parse-arch/src",
-        "apps/parse-arch/references",
+        "apps/synesthesia/scripts",
         "libs/core/src",
     },
 }

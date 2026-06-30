@@ -6,11 +6,9 @@ This monorepo uses independent GitHub Actions release workflows per CLI:
 - `lift`: `.github/workflows/release-lift.yml` on tag `lift-v*`
 - `cas`: `.github/workflows/release-cas.yml` on tag `cas-v*`
 - `cron`: `.github/workflows/release-cron.yml` on tag `cron-v*`
-- `puff`: `.github/workflows/release-puff.yml` on tag `puff-v*`
 - `ledger`: `.github/workflows/release-ledger.yml` on tag `ledger-v*`
-- `mesh`: `.github/workflows/release-mesh.yml` on tag `mesh-v*`
+- `memory-note`: `.github/workflows/release-memory-note.yml` on tag `memory-note-v*`
 - `st`: `.github/workflows/release-st.yml` on tag `st-v*`
-- `parse-arch`: `.github/workflows/release-parse-arch.yml` on tag `parse-arch-v*`
 
 Per-app VERSION files:
 
@@ -18,11 +16,9 @@ Per-app VERSION files:
 - `apps/lift/VERSION`
 - `apps/cas/VERSION`
 - `apps/cron/VERSION`
-- `apps/puff/VERSION`
 - `apps/ledger/VERSION`
-- `apps/mesh/VERSION`
+- `apps/memory-note/VERSION`
 - `apps/st/VERSION`
-- `apps/parse-arch/VERSION`
 
 Release contract:
 
@@ -30,7 +26,7 @@ Release contract:
 2. Release-relevant surfaces are conservative:
    - `apps/<cli>/**` except the per-app `README.md` counts for that CLI.
    - broad shared shipped surfaces (`build.zig`, `build.zig.zon`, `libs/core/**`) count for every shipped CLI.
-   - `apps/learnings/**` counts for `ledger`; it is an internal source module, not a shipped CLI.
+   - `apps/learnings/**` and `apps/synesthesia/**` count for `ledger`; they are internal source modules, not shipped CLIs.
    - `libs/durable_store/**` counts for its shipped consumers: `ledger` and `st`.
    - `.github/workflows/release-<cli>.yml` counts for that CLI's packaged artifact contract.
    Durable-store changes that alter lease locks, fencing counters, CAS writes, transaction recovery, or semantic concurrency errors must be treated as release-relevant for every shipped consumer whose command behavior depends on those paths. For `st`, that includes workspace mutation and exit code `2` conflict/recovery states.
@@ -43,11 +39,9 @@ Release tags must match file versions:
 - `lift-v<version>` where `<version>` equals `apps/lift/VERSION`
 - `cas-v<version>` where `<version>` equals `apps/cas/VERSION`
 - `cron-v<version>` where `<version>` equals `apps/cron/VERSION`
-- `puff-v<version>` where `<version>` equals `apps/puff/VERSION`
 - `ledger-v<version>` where `<version>` equals `apps/ledger/VERSION`
-- `mesh-v<version>` where `<version>` equals `apps/mesh/VERSION`
+- `memory-note-v<version>` where `<version>` equals `apps/memory-note/VERSION`
 - `st-v<version>` where `<version>` equals `apps/st/VERSION`
-- `parse-arch-v<version>` where `<version>` equals `apps/parse-arch/VERSION`
 
 Each workflow builds only binaries from its own CLI path and publishes two release archives:
 
@@ -64,16 +58,12 @@ Examples:
 - `cas-v1.2.3-darwin-arm64.tar.gz`
 - `cron-v1.2.3-linux-x86_64.tar.gz`
 - `cron-v1.2.3-darwin-arm64.tar.gz`
-- `puff-v1.2.3-linux-x86_64.tar.gz`
-- `puff-v1.2.3-darwin-arm64.tar.gz`
 - `ledger-v1.2.3-linux-x86_64.tar.gz`
 - `ledger-v1.2.3-darwin-arm64.tar.gz`
-- `mesh-v1.2.3-linux-x86_64.tar.gz`
-- `mesh-v1.2.3-darwin-arm64.tar.gz`
+- `memory-note-v1.2.3-linux-x86_64.tar.gz`
+- `memory-note-v1.2.3-darwin-arm64.tar.gz`
 - `st-v1.2.3-linux-x86_64.tar.gz`
 - `st-v1.2.3-darwin-arm64.tar.gz`
-- `parse-arch-v1.2.3-linux-x86_64.tar.gz`
-- `parse-arch-v1.2.3-darwin-arm64.tar.gz`
 
 ## Homebrew Tap Handoff
 

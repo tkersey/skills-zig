@@ -37,12 +37,14 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - By default, permissions requests are denied, request-user-input questions are answered with the first option label when present, MCP elicitations are declined, and dynamic tool calls return `success: false` with an explanatory text item.
 - `cas_review_session` now starts detached `review/start` turns over a CAS-managed loopback websocket app-server, persists the detached `reviewThreadId` as the recoverable handle, appends raw request/response artifacts to an NDJSON log, and stores websocket session metadata beside the review-session record so fresh-process `status`, `wait`, and `interrupt` can reconnect to the same detached review transport.
 - `cas review_session start` supports `--parent-mode auto|fresh|reuse`. `reuse` rejects unsafe parent threads. On Codex `0.118.x`, `auto` pre-materializes a fresh parent thread before detached `review/start`; `fresh` still forces the literal fresh-parent attempt and only retries after bootstrap materialization if the runtime rejects it.
+- `cas review_session status --latest --json` and `cas review_session wait --latest --json` select the newest persisted review-session record, so callers can inspect tuple binding and current status without manually listing `~/.codex/cas/review_sessions/*.json`.
 - `cas review_session` now forwards the native approval/runtime overrides already supported by the CAS Zig client: `--exec-approval`, `--file-approval`, `--permissions-approval`, `--request-user-input-response-json`, `--elicitation-action`, `--elicitation-content-json`, `--dynamic-tool-response-json`, and `--read-only`.
 - `cas review_session start` and `cas review_session lane review` accept `--multi-agent-mode explicit-request-only|proactive` for the fresh parent `thread/start` and bootstrap `turn/start` request flow. Reused parent threads are reported as unproven because CAS cannot prove it changed inherited parent execution context.
 - JSON review-session output now includes `resolvedCodexPath`, `resolvedCodexVersion`, `compatibilityVerdict`, `selectedTransport`, `selectionReason`, `degradedFallback`, `managedServerPid`, `managedServerListenUrl`, `orphanTtlSeconds`, `requestedMultiAgentMode`, `effectiveMultiAgentMode`, `multiAgentModeSupport`, `multiAgentModeMetricEligible`, `failureCode`, `failureHint`, plus optional `fallback*` fields when `--fallback native-review` is used.
 - `cas review_session lane smoke` starts a current persistent lane and verifies that the target tuple can create a first detached review attempt. Callers that require multiple independent reviews must count those review attempts outside CAS.
 - `cas review_session lane review` includes a compact `reviewVerdict` object for caller control flow. The full receipt remains the audit artifact. Pass `--verdict-only` to emit only `reviewVerdict` while preserving the same exit semantics.
 - `cas review_session start` and `cas review_session lane review` accept `--fresh-attempt REASON` to start a new same-tuple review after a terminal or normalized receipt. This never bypasses active review locks or account/resource exhaustion locks.
+- `cas review_session receipt classify`, `cas review_session receipt gate`, and `cas review_session lock gate` provide the native Zig validator/classifier helpers for `$cas` skill fixtures and review receipts. These replace the old skill-local Python helper scripts.
 - Terminal review failures are now classified more precisely: `review_interrupted`, `approval_denied`, `review_failed`, `review_output_missing`, `parent_thread_not_materialized`, and `unsafe_parent_thread_state`.
 - If a websocket-backed detached review already exists and `wait` cannot reconnect to its managed transport, `--fallback native-review` now returns an explicit degraded native-review success and persists that terminal fallback in the review-session record. It is not detached-review output.
 - Repo-owned first-party callers should keep native fallback caller-owned: treat `start -> wait` as one detached CAS attempt, and switch to native `codex review` outside CAS after inspecting the JSON verdict when the resolved runtime is incompatible.
@@ -125,6 +127,22 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 ./zig-out/bin/cas review_session wait \
   --review-thread-id thr_123 \
   --json
+
+# Inspect the newest persisted review session and tuple binding.
+./zig-out/bin/cas review_session status \
+  --latest \
+  --json
+
+# Classify and validate saved CAS review artifacts with native helpers.
+./zig-out/bin/cas review_session receipt classify \
+  --path receipts.jsonl \
+  --format jsonl
+./zig-out/bin/cas review_session receipt gate \
+  --path review.json \
+  --format json
+./zig-out/bin/cas review_session lock gate \
+  --path tuple-lock.json \
+  --format json
 
 # Detached review with explicit degraded native-review fallback if websocket reconnect is lost.
 ./zig-out/bin/cas review_session start \

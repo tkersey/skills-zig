@@ -3,6 +3,7 @@ const core_cli = @import("core_cli");
 const durable_store = @import("durable_store");
 const learnings_cli = @import("learnings_cli");
 const std = @import("std");
+const synesthesia_cli = @import("synesthesia_cli");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
 const LegacyStorePath = ".ledger/negative-ledger.jsonl";
@@ -19,7 +20,7 @@ const HelpText =
     \\
     \\commands:
     \\  init       Create the ledger store if missing
-    \\  capture    Append witness-backed negative evidence from --json FILE|-; with --source learnings, append a learning event
+    \\  capture    Append witness-backed negative evidence from --json FILE|-; with --source learnings or synesthesia, append a source event
     \\  query      List projected records
     \\  map        Emit negative_route_gate for a route/cluster
     \\  status     Append a lifecycle status event
@@ -30,14 +31,14 @@ const HelpText =
     \\  show       Show one NEG record by --id
     \\  doctor     Validate JSONL store integrity
     \\  migrate    Copy or move legacy source stores into their events.jsonl store
-    \\  recent     With --source learnings, show recent learning events
-    \\  recall     With --source learnings, rank relevant learning events
-    \\  path       With --source learnings, print the resolved learnings event path
+    \\  recent     With --source learnings or synesthesia, show recent source events
+    \\  recall     With --source learnings or synesthesia, rank relevant source events
+    \\  path       With --source learnings or synesthesia, print the resolved event path
     \\  datasets   With --source learnings, list learning datasets
     \\
     \\options:
     \\  --file PATH       Store path (default: .ledger/negative-ledger/events.jsonl)
-    \\  --source SOURCE   Source namespace; omit for negative-ledger, or use learnings
+    \\  --source SOURCE   Source namespace; omit for negative-ledger, or use learnings or synesthesia
     \\  --json PATH|-     Capture input JSON
     \\  --id NEG-ID       Record id for show/reopen/status/export
     \\  --to VALUE        Target status for status, target path for migrate
@@ -175,10 +176,18 @@ const Date = struct {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
-    if (argvRequestsLearningSource(argv)) {
-        const learning_argv = try learningSourceArgvAlloc(allocator, argv);
-        defer allocator.free(learning_argv);
-        try learnings_cli.runWithArgv(allocator, learning_argv, init.environ_map.get("CODEX_HOME") orelse "");
+    if (argvSource(argv)) |source| {
+        const source_argv = try sourceArgvAlloc(allocator, argv, source);
+        defer allocator.free(source_argv);
+        if (std.mem.eql(u8, source, "learnings")) {
+            try learnings_cli.runWithArgv(allocator, source_argv, init.environ_map.get("CODEX_HOME") orelse "");
+            return;
+        }
+        if (std.mem.eql(u8, source, "synesthesia")) {
+            try synesthesia_cli.runWithArgv(allocator, source_argv, init.environ_map.get("CODEX_HOME") orelse "");
+            return;
+        }
+        core_cli.exitUsageFailure(HelpSurface, Version, "UnknownSource", source);
         return;
     }
     if (try handleHelpAndVersion(allocator, argv)) return;
@@ -196,18 +205,18 @@ pub fn main(init: std.process.Init) !void {
     std.process.exit(code);
 }
 
-fn argvRequestsLearningSource(argv: []const []const u8) bool {
+fn argvSource(argv: []const []const u8) ?[]const u8 {
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         if (!std.mem.eql(u8, argv[i], "--source")) continue;
         i += 1;
-        if (i >= argv.len) return false;
-        return std.mem.eql(u8, argv[i], "learnings");
+        if (i >= argv.len) return null;
+        return argv[i];
     }
-    return false;
+    return null;
 }
 
-fn learningSourceArgvAlloc(allocator: std.mem.Allocator, argv: []const []const u8) ![]const []const u8 {
+fn sourceArgvAlloc(allocator: std.mem.Allocator, argv: []const []const u8, source: []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     errdefer out.deinit(allocator);
     try out.append(allocator, "ledger");
@@ -219,7 +228,7 @@ fn learningSourceArgvAlloc(allocator: std.mem.Allocator, argv: []const []const u
         const token = argv[i];
         if (!skipped_source and std.mem.eql(u8, token, "--source")) {
             if (i + 1 >= argv.len) return error.MissingValue;
-            if (std.mem.eql(u8, argv[i + 1], "learnings")) {
+            if (std.mem.eql(u8, argv[i + 1], source)) {
                 skipped_source = true;
                 i += 1;
                 continue;
@@ -231,7 +240,7 @@ fn learningSourceArgvAlloc(allocator: std.mem.Allocator, argv: []const []const u
         }
         if (!command_seen and !std.mem.startsWith(u8, token, "-")) {
             command_seen = true;
-            if (std.mem.eql(u8, token, "capture")) {
+            if (std.mem.eql(u8, source, "learnings") and std.mem.eql(u8, token, "capture")) {
                 try out.append(allocator, "append");
             } else {
                 try out.append(allocator, token);

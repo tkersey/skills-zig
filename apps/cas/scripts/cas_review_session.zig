@@ -19,7 +19,7 @@ const UsageText =
     \\Control detached Codex review sessions via the app-server.
     \\
     \\Usage:
-    \\  cas_review_session <start|status|wait|interrupt|lane|receipt> [options]
+    \\  cas_review_session <start|status|wait|interrupt|lane|receipt|lock> [options]
     \\
     \\Actions:
     \\  start      Start a detached review session and persist its handle.
@@ -28,6 +28,7 @@ const UsageText =
     \\  interrupt  Interrupt the persisted detached review turn.
     \\  lane       Reuse one managed app-server for multiple fresh-parent reviews.
     \\  receipt    Normalize or summarize saved CAS review receipts without touching review state.
+    \\  lock       Validate saved CAS review tuple-lock records.
     \\
     \\Lane actions:
     \\  lane start   Start a reusable review lane.
@@ -39,6 +40,14 @@ const UsageText =
     \\               Run smoke-suite rounds until persistent lane can be promoted.
     \\  lane status  Report whether the lane app-server process is still alive.
     \\  lane stop    Stop the lane app-server process.
+    \\
+    \\Receipt actions:
+    \\  receipt normalize  Normalize saved receipts into the reviewVerdict surface.
+    \\  receipt classify   Classify saved receipt records into transport facts.
+    \\  receipt gate       Validate saved receipts against the review transport boundary.
+    \\
+    \\Lock actions:
+    \\  lock gate          Validate saved CAS-RTL-v1 tuple-lock records.
     \\
     \\Start options:
     \\  --cwd DIR                        Workspace for the app-server.
@@ -70,6 +79,7 @@ const UsageText =
     \\
     \\Status/wait/interrupt options:
     \\  --review-thread-id THREAD_ID     Detached review thread id handle.
+    \\  --latest                         Use the newest persisted review-session record for status/wait.
     \\
     \\Lane options:
     \\  --lane-id LANE_ID                Lane handle for lane review/status/stop.
@@ -85,9 +95,9 @@ const UsageText =
     \\Common options:
     \\  --json                           Emit machine-readable JSON.
     \\  --verdict-only                   Emit only the compact reviewVerdict JSON for lane review.
-    \\  --path FILE                      Receipt file to normalize/summarize; repeatable.
+    \\  --path FILE                      Receipt or lock file to process; repeatable.
     \\  --glob PATTERN                   Simple receipt glob; repeatable.
-    \\  --format FORMAT                  Receipt output: table|json|jsonl (default: table).
+    \\  --format FORMAT                  Helper output: table|json|jsonl (default: table).
     \\  --summary                        Include aggregate receipt counts.
     \\  --timeout-ms N                   Wait timeout for `wait` (default: 300000).
     \\  --poll-interval-ms N             Poll interval for `wait` (default: 250).
@@ -100,6 +110,7 @@ const UsageText =
     \\  cas review_session start --cwd /path/to/repo --base main --json
     \\  cas review_session start --wait --cwd /path/to/repo --base main --json
     \\  cas review_session status --review-thread-id thr_123 --json
+    \\  cas review_session status --latest --json
     \\  cas review_session wait --review-thread-id thr_123 --timeout-ms 300000 --json
     \\  cas review_session interrupt --review-thread-id thr_123 --json
     \\  cas review_session lane start --cwd /path/to/repo --json
@@ -108,6 +119,9 @@ const UsageText =
     \\  cas review_session lane smoke-until-fixed --cwd /path/to/repo --base main --json --cleanup
     \\  cas review_session lane review --lane-id lane_123 --base main --json
     \\  cas review_session receipt normalize --path review-1.json --format json --summary
+    \\  cas review_session receipt classify --path receipts.jsonl --format jsonl
+    \\  cas review_session receipt gate --path review-1.json --format json
+    \\  cas review_session lock gate --path tuple-lock.json --format json
     \\  cas review_session lane stop --lane-id lane_123 --json
 ;
 
@@ -118,6 +132,7 @@ const Action = enum {
     interrupt,
     lane,
     receipt,
+    lock,
 
     fn parse(raw: []const u8) ?Action {
         if (std.mem.eql(u8, raw, "start")) return .start;
@@ -126,6 +141,7 @@ const Action = enum {
         if (std.mem.eql(u8, raw, "interrupt")) return .interrupt;
         if (std.mem.eql(u8, raw, "lane")) return .lane;
         if (std.mem.eql(u8, raw, "receipt")) return .receipt;
+        if (std.mem.eql(u8, raw, "lock")) return .lock;
         return null;
     }
 };
@@ -147,6 +163,28 @@ const LaneAction = enum {
         if (std.mem.eql(u8, raw, "smoke-until-fixed")) return .smoke_until_fixed;
         if (std.mem.eql(u8, raw, "status")) return .status;
         if (std.mem.eql(u8, raw, "stop")) return .stop;
+        return null;
+    }
+};
+
+const ReceiptAction = enum {
+    normalize,
+    classify,
+    gate,
+
+    fn parse(raw: []const u8) ?ReceiptAction {
+        if (std.mem.eql(u8, raw, "normalize")) return .normalize;
+        if (std.mem.eql(u8, raw, "classify")) return .classify;
+        if (std.mem.eql(u8, raw, "gate")) return .gate;
+        return null;
+    }
+};
+
+const LockAction = enum {
+    gate,
+
+    fn parse(raw: []const u8) ?LockAction {
+        if (std.mem.eql(u8, raw, "gate")) return .gate;
         return null;
     }
 };
@@ -217,12 +255,15 @@ const ParsedArgs = struct {
     executable_path: []const u8 = "cas_review_session",
     action: ?Action = null,
     lane_action: ?LaneAction = null,
+    receipt_action: ReceiptAction = .normalize,
+    lock_action: ?LockAction = null,
     cwd: ?[]const u8 = null,
     lane_id: ?[]const u8 = null,
     parent_thread_id: ?[]const u8 = null,
     parent_mode: ParentMode = .auto,
     multi_agent_mode: ?cas.MultiAgentMode = null,
     review_thread_id: ?[]const u8 = null,
+    latest_review_session: bool = false,
     target: ?TargetConfig = null,
     custom_instructions_arg: ?[]const u8 = null,
     wait_after_start: bool = false,
@@ -724,6 +765,7 @@ pub fn main(init: std.process.Init) !void {
         .interrupt => try cmdInterrupt(allocator, init.io, parsed),
         .lane => try cmdLane(allocator, init.io, parsed),
         .receipt => try cmdReceipt(allocator, init.io, parsed),
+        .lock => try cmdLock(allocator, parsed),
     }
 }
 
@@ -756,7 +798,15 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
         out.lane_action = LaneAction.parse(argv[i]) orelse return error.UnknownLaneAction;
         i += 1;
     }
-    if (out.action.? == .receipt and i < argv.len and std.mem.eql(u8, argv[i], "normalize")) {
+    if (out.action.? == .receipt and i < argv.len) {
+        if (ReceiptAction.parse(argv[i])) |receipt_action| {
+            out.receipt_action = receipt_action;
+            i += 1;
+        }
+    }
+    if (out.action.? == .lock) {
+        if (i >= argv.len) return error.MissingLockAction;
+        out.lock_action = LockAction.parse(argv[i]) orelse return error.UnknownLockAction;
         i += 1;
     }
 
@@ -781,6 +831,10 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
         }
         if (std.mem.eql(u8, arg, "--read-only")) {
             out.read_only = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--latest")) {
+            out.latest_review_session = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "--wait")) {
@@ -975,21 +1029,21 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
                 .review, .smoke, .smoke_suite, .smoke_until_fixed => {},
                 .start, .status, .stop => return error.MultiAgentModeUnsupportedAction,
             },
-            .status, .wait, .interrupt, .receipt => return error.MultiAgentModeUnsupportedAction,
+            .status, .wait, .interrupt, .receipt, .lock => return error.MultiAgentModeUnsupportedAction,
         }
     }
     if (out.review_lock_override_reason != null) {
         switch (out.action.?) {
             .start => {},
             .lane => if (out.lane_action != .review and out.lane_action != .smoke) return error.ReviewLockOverrideUnsupportedAction,
-            .status, .wait, .interrupt, .receipt => return error.ReviewLockOverrideUnsupportedAction,
+            .status, .wait, .interrupt, .receipt, .lock => return error.ReviewLockOverrideUnsupportedAction,
         }
     }
     if (out.fresh_attempt_reason != null) {
         switch (out.action.?) {
             .start => {},
             .lane => if (out.lane_action != .review) return error.FreshAttemptUnsupportedAction,
-            .status, .wait, .interrupt, .receipt => return error.FreshAttemptUnsupportedAction,
+            .status, .wait, .interrupt, .receipt, .lock => return error.FreshAttemptUnsupportedAction,
         }
     }
     switch (out.action.?) {
@@ -999,7 +1053,12 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             if (out.parent_mode == .fresh and out.parent_thread_id != null) return error.FreshParentModeDisallowsParentThreadId;
             if (out.parent_mode == .reuse and out.parent_thread_id == null) return error.ReuseParentModeRequiresParentThreadId;
         },
-        .status, .wait, .interrupt => {
+        .status, .wait => {
+            if (out.review_thread_id != null and out.latest_review_session) return error.AmbiguousReviewSessionSelector;
+            if (out.review_thread_id == null and !out.latest_review_session) return error.MissingReviewThreadId;
+        },
+        .interrupt => {
+            if (out.latest_review_session) return error.LatestReviewSessionUnsupportedAction;
             if (out.review_thread_id == null) return error.MissingReviewThreadId;
         },
         .lane => switch (out.lane_action orelse return error.MissingLaneAction) {
@@ -1030,6 +1089,10 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
         },
         .receipt => {
             if (out.receipt_paths.len == 0 and out.receipt_globs.len == 0) return error.MissingReceiptInput;
+        },
+        .lock => {
+            _ = out.lock_action orelse return error.MissingLockAction;
+            if (out.receipt_paths.len == 0 and out.receipt_globs.len == 0) return error.MissingLockInput;
         },
     }
 
@@ -1662,7 +1725,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
 }
 
 fn cmdStatus(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
-    var loaded = try loadSessionRecord(allocator, parsed.review_thread_id.?);
+    var loaded = try loadSelectedSessionRecord(allocator, parsed);
     defer loaded.deinit(allocator);
     const record = loaded.record;
     const identity_opt: ?TargetIdentity = targetIdentityForRecordAlloc(allocator, io, record) catch null;
@@ -1797,7 +1860,7 @@ fn cmdStatus(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void
 }
 
 fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
-    var loaded = try loadSessionRecord(allocator, parsed.review_thread_id.?);
+    var loaded = try loadSelectedSessionRecord(allocator, parsed);
     defer loaded.deinit(allocator);
     var record = loaded.record;
     const identity_opt: ?TargetIdentity = targetIdentityForRecordAlloc(allocator, io, record) catch null;
@@ -2362,26 +2425,35 @@ const ReceiptSummary = struct {
 const ReceiptEventLogRecoveryMaxInputs = 64;
 
 fn cmdReceipt(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
+    switch (parsed.receipt_action) {
+        .normalize => try cmdReceiptNormalize(allocator, io, parsed),
+        .classify => try cmdReceiptClassify(allocator, parsed),
+        .gate => try cmdReceiptGate(allocator, parsed),
+    }
+}
+
+fn collectInputPathsAlloc(allocator: std.mem.Allocator, paths_raw: []const []const u8, globs: []const []const u8) !std.ArrayList([]const u8) {
     var paths: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit(allocator);
+    }
+    for (paths_raw) |path| {
+        try paths.append(allocator, try allocator.dupe(u8, path));
+    }
+    for (globs) |pattern| {
+        try expandReceiptGlob(allocator, pattern, &paths);
+    }
+    std.mem.sort([]const u8, paths.items, {}, lessThanString);
+    return paths;
+}
+
+fn cmdReceiptNormalize(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
+    var paths = try collectInputPathsAlloc(allocator, parsed.receipt_paths, parsed.receipt_globs);
     defer {
         for (paths.items) |path| allocator.free(path);
         paths.deinit(allocator);
     }
-
-    for (parsed.receipt_paths) |path| {
-        try paths.append(allocator, try allocator.dupe(u8, path));
-    }
-    for (parsed.receipt_globs) |pattern| {
-        try expandReceiptGlob(allocator, pattern, &paths);
-    } else {
-        for (parsed.receipt_paths) |path| {
-            try paths.append(allocator, try allocator.dupe(u8, path));
-        }
-        for (parsed.receipt_globs) |pattern| {
-            try expandReceiptGlob(allocator, pattern, &paths);
-        }
-    }
-    std.mem.sort([]const u8, paths.items, {}, lessThanString);
 
     var receipts: std.ArrayList(NormalizedReceipt) = .empty;
     defer {
@@ -2434,6 +2506,500 @@ fn cmdReceipt(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !voi
         .jsonl => try printReceiptJsonl(receipts.items, errors.items, if (parsed.receipt_summary) summary else null),
     }
     if (errors.items.len > 0) std.process.exit(1);
+}
+
+const ReceiptClassification = struct {
+    classification: []const u8,
+    failure_class: []const u8,
+    failure_code: ?[]const u8,
+    review_attempt_phase: []const u8,
+    review_attempt_exists: bool,
+    tuple_verdict_exists: bool,
+    review_thread_id: ?[]const u8,
+    retryable_same_tuple_now: bool,
+
+    fn deinit(self: ReceiptClassification, allocator: std.mem.Allocator) void {
+        allocator.free(self.classification);
+    }
+};
+
+const GateResult = struct {
+    path: []const u8,
+    errors: []const []const u8,
+
+    fn ok(self: GateResult) bool {
+        return self.errors.len == 0;
+    }
+
+    fn deinit(self: GateResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        for (self.errors) |err| allocator.free(err);
+        allocator.free(self.errors);
+    }
+};
+
+fn cmdReceiptClassify(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
+    var paths = try collectInputPathsAlloc(allocator, parsed.receipt_paths, parsed.receipt_globs);
+    defer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit(allocator);
+    }
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    var source_index: usize = 0;
+    var emitted: usize = 0;
+    if (parsed.receipt_format == .json) try stdout.writeByte('[');
+    if (parsed.receipt_format == .table) {
+        try stdout.writeAll("sourceIndex\tclassification\tfailureClass\tfailureCode\treviewAttemptPhase\treviewAttemptExists\ttupleVerdictExists\treviewThreadId\tretryableSameTupleNow\n");
+    }
+    for (paths.items) |path| {
+        try classifyReceiptFile(allocator, path, parsed.receipt_format, stdout, &source_index, &emitted);
+    }
+    if (parsed.receipt_format == .json) try stdout.writeAll("]\n");
+}
+
+fn classifyReceiptFile(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    format: ReceiptFormat,
+    writer: *std.Io.Writer,
+    source_index: *usize,
+    emitted: *usize,
+) !void {
+    const raw = try readFileAlloc(allocator, path, 8 * 1024 * 1024);
+    defer allocator.free(raw);
+    const stripped = std.mem.trim(u8, raw, " \t\r\n");
+    if (stripped.len == 0) return;
+
+    if (std.mem.startsWith(u8, stripped, "[")) {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, stripped, .{});
+        defer parsed.deinit();
+        const arr = switch (parsed.value) {
+            .array => |value| value,
+            else => return,
+        };
+        for (arr.items) |item| {
+            const obj = switch (item) {
+                .object => |value| value,
+                else => continue,
+            };
+            try emitClassificationForObject(allocator, obj, format, writer, source_index, emitted);
+        }
+        return;
+    }
+
+    if (std.mem.startsWith(u8, stripped, "{") and std.mem.indexOfScalar(u8, stripped, '\n') == null) {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, stripped, .{});
+        defer parsed.deinit();
+        const obj = switch (parsed.value) {
+            .object => |value| value,
+            else => return,
+        };
+        try emitClassificationForObject(allocator, obj, format, writer, source_index, emitted);
+        return;
+    }
+
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0) continue;
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
+        defer parsed.deinit();
+        const obj = switch (parsed.value) {
+            .object => |value| value,
+            else => continue,
+        };
+        try emitClassificationForObject(allocator, obj, format, writer, source_index, emitted);
+    }
+}
+
+fn emitClassificationForObject(
+    allocator: std.mem.Allocator,
+    obj: std.json.ObjectMap,
+    format: ReceiptFormat,
+    writer: *std.Io.Writer,
+    source_index: *usize,
+    emitted: *usize,
+) !void {
+    const row = try classifyReceiptRecordAlloc(allocator, obj);
+    defer row.deinit(allocator);
+    switch (format) {
+        .json => {
+            if (emitted.* > 0) try writer.writeByte(',');
+            try writeReceiptClassificationObject(writer, source_index.*, row);
+        },
+        .jsonl => {
+            try writeReceiptClassificationObject(writer, source_index.*, row);
+            try writer.writeByte('\n');
+        },
+        .table => {
+            try writer.print("{d}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n", .{
+                source_index.*,
+                row.classification,
+                row.failure_class,
+                row.failure_code orelse "",
+                row.review_attempt_phase,
+                if (row.review_attempt_exists) "true" else "false",
+                if (row.tuple_verdict_exists) "true" else "false",
+                row.review_thread_id orelse "",
+                if (row.retryable_same_tuple_now) "true" else "false",
+            });
+        },
+    }
+    source_index.* += 1;
+    emitted.* += 1;
+}
+
+fn classifyReceiptRecordAlloc(allocator: std.mem.Allocator, receipt: std.json.ObjectMap) !ReceiptClassification {
+    const verdict = objectField(receipt, "reviewVerdict");
+    const failure_code = stringFieldAny(receipt, &.{ "failureCode", "failure_code" }) orelse
+        if (verdict) |value| jsonStringField(value, "failureCode") else null;
+    const review_thread_id = stringFieldAny(receipt, &.{ "reviewThreadId", "review_thread_id" }) orelse
+        if (verdict) |value| jsonStringField(value, "reviewThreadId") else null;
+    const review_count = intFieldAny(receipt, &.{ "reviewCount", "review_count" });
+    const last_review_thread = stringFieldAny(receipt, &.{ "lastReviewThreadId", "last_review_thread_id" });
+    const last_head = stringFieldAny(receipt, &.{ "lastHeadSha", "last_head_sha" });
+
+    if (try receiptContainsUsageLimit(allocator, receipt) or std.mem.eql(u8, failure_code orelse "", "account_resource_exhausted")) {
+        return .{
+            .classification = try allocator.dupe(u8, "account_resource_exhausted"),
+            .failure_class = "account_resource",
+            .failure_code = "account_resource_exhausted",
+            .review_attempt_phase = if (reviewAttemptExists(review_thread_id)) "review_terminal" else "pre_review_start",
+            .review_attempt_exists = reviewAttemptExists(review_thread_id),
+            .tuple_verdict_exists = false,
+            .review_thread_id = review_thread_id,
+            .retryable_same_tuple_now = false,
+        };
+    }
+
+    if ((std.mem.eql(u8, failure_code orelse "", "pre_review_lane_transport_lost") or
+        std.mem.eql(u8, failure_code orelse "", "lane_transport_lost")) and
+        (review_count == null or review_count.? == 0) and
+        !reviewAttemptExists(review_thread_id) and
+        !reviewAttemptExists(last_review_thread) and
+        nonEmptyOptional(last_head) == null)
+    {
+        return .{
+            .classification = try allocator.dupe(u8, "pre_review_lane_transport_lost"),
+            .failure_class = "transport_pre_review",
+            .failure_code = "pre_review_lane_transport_lost",
+            .review_attempt_phase = "pre_review_start",
+            .review_attempt_exists = false,
+            .tuple_verdict_exists = false,
+            .review_thread_id = null,
+            .retryable_same_tuple_now = true,
+        };
+    }
+
+    if (verdict) |value| {
+        const status = jsonStringField(value, "status") orelse "";
+        return .{
+            .classification = try std.fmt.allocPrint(allocator, "review_verdict_{s}", .{status}),
+            .failure_class = "review_verdict",
+            .failure_code = jsonStringField(value, "failureCode"),
+            .review_attempt_phase = "normalized_verdict",
+            .review_attempt_exists = reviewAttemptExists(jsonStringField(value, "reviewThreadId") orelse review_thread_id),
+            .tuple_verdict_exists = reviewVerdictStatusIsTupleTerminal(status),
+            .review_thread_id = jsonStringField(value, "reviewThreadId") orelse review_thread_id,
+            .retryable_same_tuple_now = !std.mem.eql(u8, status, "timeout") and !std.mem.eql(u8, status, "account_resource_exhausted"),
+        };
+    }
+
+    if (reviewAttemptExists(review_thread_id)) {
+        return .{
+            .classification = try allocator.dupe(u8, "review_attempt_unnormalized"),
+            .failure_class = "review_attempt",
+            .failure_code = failure_code,
+            .review_attempt_phase = "review_started",
+            .review_attempt_exists = true,
+            .tuple_verdict_exists = false,
+            .review_thread_id = review_thread_id,
+            .retryable_same_tuple_now = false,
+        };
+    }
+
+    return .{
+        .classification = try allocator.dupe(u8, "unknown_no_attempt"),
+        .failure_class = "unknown",
+        .failure_code = failure_code,
+        .review_attempt_phase = stringFieldAny(receipt, &.{ "reviewAttemptPhase", "phase" }) orelse "pre_lane_start",
+        .review_attempt_exists = false,
+        .tuple_verdict_exists = false,
+        .review_thread_id = null,
+        .retryable_same_tuple_now = true,
+    };
+}
+
+fn writeReceiptClassificationObject(writer: *std.Io.Writer, source_index: usize, row: ReceiptClassification) !void {
+    try writer.writeByte('{');
+    try writeJsonString(writer, "classification");
+    try writer.writeByte(':');
+    try writeJsonString(writer, row.classification);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "failureClass");
+    try writer.writeByte(':');
+    try writeJsonString(writer, row.failure_class);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "failureCode");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, row.failure_code);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "retryableSameTupleNow");
+    try writer.writeByte(':');
+    try writer.writeAll(if (row.retryable_same_tuple_now) "true" else "false");
+    try writer.writeByte(',');
+    try writeJsonString(writer, "reviewAttemptExists");
+    try writer.writeByte(':');
+    try writer.writeAll(if (row.review_attempt_exists) "true" else "false");
+    try writer.writeByte(',');
+    try writeJsonString(writer, "reviewAttemptPhase");
+    try writer.writeByte(':');
+    try writeJsonString(writer, row.review_attempt_phase);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "reviewThreadId");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, row.review_thread_id);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "sourceIndex");
+    try writer.writeByte(':');
+    try writer.print("{d}", .{source_index});
+    try writer.writeByte(',');
+    try writeJsonString(writer, "tupleVerdictExists");
+    try writer.writeByte(':');
+    try writer.writeAll(if (row.tuple_verdict_exists) "true" else "false");
+    try writer.writeByte('}');
+}
+
+fn cmdReceiptGate(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
+    var paths = try collectInputPathsAlloc(allocator, parsed.receipt_paths, parsed.receipt_globs);
+    defer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit(allocator);
+    }
+    try runGateCommand(allocator, paths.items, parsed.receipt_format, validateReceiptGatePathAlloc);
+}
+
+fn cmdLock(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
+    switch (parsed.lock_action.?) {
+        .gate => {},
+    }
+    var paths = try collectInputPathsAlloc(allocator, parsed.receipt_paths, parsed.receipt_globs);
+    defer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit(allocator);
+    }
+    try runGateCommand(allocator, paths.items, parsed.receipt_format, validateTupleLockGatePathAlloc);
+}
+
+fn runGateCommand(
+    allocator: std.mem.Allocator,
+    paths: []const []const u8,
+    format: ReceiptFormat,
+    comptime validatePath: fn (std.mem.Allocator, []const u8) anyerror!GateResult,
+) !void {
+    var results: std.ArrayList(GateResult) = .empty;
+    defer {
+        for (results.items) |result| result.deinit(allocator);
+        results.deinit(allocator);
+    }
+    if (paths.len == 0) {
+        try results.append(allocator, try gateResultFromSingleErrorAlloc(allocator, "<input>", "no files matched"));
+    }
+    for (paths) |path| {
+        try results.append(allocator, try validatePath(allocator, path));
+    }
+
+    var any_failed = false;
+    for (results.items) |result| {
+        if (!result.ok()) any_failed = true;
+    }
+
+    switch (format) {
+        .json => try printGateResultsJson(results.items),
+        .jsonl => try printGateResultsJsonl(results.items),
+        .table => try printGateResultsText(results.items),
+    }
+    if (any_failed) std.process.exit(1);
+}
+
+fn validateReceiptGatePathAlloc(allocator: std.mem.Allocator, path: []const u8) !GateResult {
+    const raw = readFileAlloc(allocator, path, 8 * 1024 * 1024) catch |err| {
+        return gateResultFromSingleErrorAlloc(allocator, path, @errorName(err));
+    };
+    defer allocator.free(raw);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err| {
+        return gateResultFromSingleErrorAlloc(allocator, path, @errorName(err));
+    };
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |value| value,
+        else => return gateResultFromSingleErrorAlloc(allocator, path, "top-level JSON must be an object"),
+    };
+    return validateReceiptGateObjectAlloc(allocator, path, obj);
+}
+
+fn validateReceiptGateObjectAlloc(allocator: std.mem.Allocator, path: []const u8, data: std.json.ObjectMap) !GateResult {
+    var errors: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (errors.items) |err| allocator.free(err);
+        errors.deinit(allocator);
+    }
+
+    const phase = stringFieldAny(data, &.{ "reviewAttemptPhase", "phase" });
+    const failure_code = stringFieldAny(data, &.{ "failureCode", "failure_code" });
+    const review_thread_id = stringFieldAny(data, &.{ "reviewThreadId", "review_thread_id" });
+    const review_thread_id_present = fieldAnyPresentNonNull(data, &.{ "reviewThreadId", "review_thread_id" });
+    const review_attempt_exists = boolFieldAny(data, &.{ "reviewAttemptExists", "review_attempt_exists" });
+    const tuple_verdict_exists = jsonBoolField(data, "tupleVerdictExists");
+    const verdict = try objectFieldOrGateError(allocator, data, "reviewVerdict", &errors);
+
+    if (phase) |value| {
+        if (!reviewPhaseAllowed(value)) try appendGateError(allocator, &errors, "invalid reviewAttemptPhase: {s}", .{value});
+    } else {
+        try appendGateError(allocator, &errors, "missing reviewAttemptPhase", .{});
+    }
+
+    const expected_attempt = review_thread_id_present;
+    if (review_attempt_exists) |value| {
+        if (value != expected_attempt) try appendGateError(allocator, &errors, "reviewAttemptExists must equal reviewThreadId != null", .{});
+    }
+
+    if (std.mem.eql(u8, phase orelse "", "pre_review_start")) {
+        if (review_thread_id_present) try appendGateError(allocator, &errors, "pre_review_start must not have reviewThreadId", .{});
+        if (review_attempt_exists != null and review_attempt_exists.? != false) {
+            try appendGateError(allocator, &errors, "pre_review_start must have reviewAttemptExists=false", .{});
+        }
+    }
+
+    if (std.mem.eql(u8, failure_code orelse "", "pre_review_lane_transport_lost")) {
+        if (!std.mem.eql(u8, phase orelse "", "pre_review_start")) {
+            try appendGateError(allocator, &errors, "pre_review_lane_transport_lost requires reviewAttemptPhase=pre_review_start", .{});
+        }
+        if (review_thread_id_present) try appendGateError(allocator, &errors, "pre_review_lane_transport_lost must not have reviewThreadId", .{});
+        const failure_class = stringFieldAny(data, &.{ "failureClass", "failure_class" });
+        if (failure_class != null and !std.mem.eql(u8, failure_class.?, "transport_pre_review")) {
+            try appendGateError(allocator, &errors, "pre_review_lane_transport_lost requires failureClass=transport_pre_review", .{});
+        }
+        const required = [_][]const u8{ "laneId", "managedServerPid", "reviewCount" };
+        for (required) |name| {
+            if (data.get(name) == null) try appendGateError(allocator, &errors, "pre_review_lane_transport_lost missing {s}", .{name});
+        }
+    }
+
+    if (std.mem.eql(u8, failure_code orelse "", "account_resource_exhausted")) {
+        if (boolFieldAny(data, &.{ "retryableSameTupleNow", "retryable_same_tuple_now" }) != false) {
+            try appendGateError(allocator, &errors, "account_resource_exhausted requires retryableSameTupleNow=false", .{});
+        }
+    }
+
+    if (verdict) |value| {
+        const status = jsonStringField(value, "status");
+        const backend = jsonStringField(value, "backendClass");
+        if (status == null or !reviewStatusAllowed(status.?)) {
+            try appendGateError(allocator, &errors, "invalid reviewVerdict.status: {s}", .{status orelse "null"});
+        }
+        if (backend == null or !backendClassAllowed(backend.?)) {
+            try appendGateError(allocator, &errors, "invalid reviewVerdict.backendClass: {s}", .{backend orelse "null"});
+        }
+        if (std.mem.eql(u8, status orelse "", "clean") or std.mem.eql(u8, status orelse "", "findings")) {
+            const required = [_][]const u8{ "baseSha", "headSha", "targetFingerprint", "reviewThreadId", "reviewTurnId" };
+            for (required) |name| {
+                if (nonEmptyOptional(jsonStringField(value, name)) == null) {
+                    try appendGateError(allocator, &errors, "reviewVerdict.status={s} missing {s}", .{ status.?, name });
+                }
+            }
+            if (std.mem.eql(u8, status.?, "clean") and (jsonUsizeField(value, "findingCount") orelse 0) != 0) {
+                try appendGateError(allocator, &errors, "clean reviewVerdict must have findingCount=0", .{});
+            }
+            if (std.mem.eql(u8, status.?, "clean") and fieldPresentNonNull(value, "failureCode")) {
+                try appendGateError(allocator, &errors, "clean reviewVerdict must not have failureCode", .{});
+            }
+        }
+        if (std.mem.eql(u8, status orelse "", "pre_review_transport_failure") and fieldPresentNonNull(value, "reviewThreadId")) {
+            try appendGateError(allocator, &errors, "pre_review_transport_failure reviewVerdict must not have reviewThreadId", .{});
+        }
+        if (std.mem.eql(u8, status orelse "", "review_transport_failure") and
+            !reviewAttemptExists(jsonStringField(value, "reviewThreadId") orelse review_thread_id))
+        {
+            try appendGateError(allocator, &errors, "review_transport_failure reviewVerdict requires reviewThreadId", .{});
+        }
+        if (tuple_verdict_exists == true and !reviewVerdictStatusIsTupleTerminal(status orelse "")) {
+            try appendGateError(allocator, &errors, "tupleVerdictExists=true is inconsistent with reviewVerdict.status", .{});
+        }
+    }
+
+    return .{
+        .path = try allocator.dupe(u8, path),
+        .errors = try errors.toOwnedSlice(allocator),
+    };
+}
+
+fn validateTupleLockGatePathAlloc(allocator: std.mem.Allocator, path: []const u8) !GateResult {
+    const raw = readFileAlloc(allocator, path, 8 * 1024 * 1024) catch |err| {
+        return gateResultFromSingleErrorAlloc(allocator, path, @errorName(err));
+    };
+    defer allocator.free(raw);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err| {
+        return gateResultFromSingleErrorAlloc(allocator, path, @errorName(err));
+    };
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |value| value,
+        else => return gateResultFromSingleErrorAlloc(allocator, path, "top-level lock must be an object"),
+    };
+    return validateTupleLockGateObjectAlloc(allocator, path, obj);
+}
+
+fn validateTupleLockGateObjectAlloc(allocator: std.mem.Allocator, path: []const u8, lock: std.json.ObjectMap) !GateResult {
+    var errors: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (errors.items) |err| allocator.free(err);
+        errors.deinit(allocator);
+    }
+
+    if (!std.mem.eql(u8, jsonStringField(lock, "lockVersion") orelse "", review_tuple_lock_version)) {
+        try appendGateError(allocator, &errors, "lockVersion must be {s}", .{review_tuple_lock_version});
+    }
+    const required = [_][]const u8{
+        "tupleHash",
+        "repoRealpath",
+        "baseSha",
+        "headSha",
+        "targetFingerprint",
+        "resolvedCodexPath",
+        "resolvedCodexVersion",
+        "accountFingerprint",
+        "state",
+    };
+    for (required) |name| {
+        if (!jsonValueTruthy(lock.get(name))) try appendGateError(allocator, &errors, "missing {s}", .{name});
+    }
+    const state = jsonStringField(lock, "state");
+    if (state == null or !reviewTupleLockStateAllowed(state.?)) {
+        try appendGateError(allocator, &errors, "invalid state: {s}", .{state orelse "null"});
+    }
+    if (state != null and reviewTupleLockStateActive(state.?) and nonEmptyOptional(jsonStringField(lock, "reviewThreadId")) == null) {
+        try appendGateError(allocator, &errors, "{s} requires reviewThreadId", .{state.?});
+    }
+    if (std.mem.eql(u8, state orelse "", "pre_review_start_failed") and fieldPresentNonNull(lock, "reviewThreadId")) {
+        try appendGateError(allocator, &errors, "pre_review_start_failed must not have reviewThreadId", .{});
+    }
+    if (std.mem.eql(u8, state orelse "", "account_resource_exhausted") and
+        !std.mem.eql(u8, jsonStringField(lock, "lastFailureCode") orelse "", "account_resource_exhausted"))
+    {
+        try appendGateError(allocator, &errors, "account_resource_exhausted state requires lastFailureCode=account_resource_exhausted", .{});
+    }
+    const expires_at = jsonI64Field(lock, "expiresAtUnixS") orelse 0;
+    const updated_at = jsonI64Field(lock, "updatedAtUnixS") orelse 0;
+    if (expires_at != 0 and updated_at != 0 and expires_at < updated_at) {
+        try appendGateError(allocator, &errors, "expiresAtUnixS must be >= updatedAtUnixS", .{});
+    }
+    return .{
+        .path = try allocator.dupe(u8, path),
+        .errors = try errors.toOwnedSlice(allocator),
+    };
 }
 
 fn cmdLane(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
@@ -5133,6 +5699,24 @@ fn loadSessionRecord(allocator: std.mem.Allocator, review_thread_id: []const u8)
     const session_dir = try sessionDirAlloc(allocator);
     defer allocator.free(session_dir);
     const record_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ session_dir, review_thread_id });
+    return loadOwnedSessionRecordPath(allocator, record_path) catch |err| {
+        allocator.free(record_path);
+        return err;
+    };
+}
+
+fn loadSelectedSessionRecord(allocator: std.mem.Allocator, parsed: ParsedArgs) !LoadedSessionRecord {
+    if (parsed.latest_review_session) {
+        const record_path = try latestSessionRecordPathAlloc(allocator);
+        return loadOwnedSessionRecordPath(allocator, record_path) catch |err| {
+            allocator.free(record_path);
+            return err;
+        };
+    }
+    return loadSessionRecord(allocator, parsed.review_thread_id.?);
+}
+
+fn loadOwnedSessionRecordPath(allocator: std.mem.Allocator, record_path: []const u8) !LoadedSessionRecord {
     errdefer allocator.free(record_path);
     const file = try std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), record_path, .{});
     defer file.close(std.Io.Threaded.global_single_threaded.io());
@@ -5146,6 +5730,47 @@ fn loadSessionRecord(allocator: std.mem.Allocator, review_thread_id: []const u8)
         .parsed = parsed,
         .record = parsed.value,
     };
+}
+
+fn latestSessionRecordPathAlloc(allocator: std.mem.Allocator) ![]const u8 {
+    const session_dir = try sessionDirAlloc(allocator);
+    defer allocator.free(session_dir);
+    return latestSessionRecordPathInDirAlloc(allocator, session_dir);
+}
+
+fn latestSessionRecordPathInDirAlloc(allocator: std.mem.Allocator, session_dir: []const u8) ![]const u8 {
+    var dir = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), session_dir, .{ .iterate = true });
+    defer dir.close(std.Io.Threaded.global_single_threaded.io());
+
+    var best_name: ?[]u8 = null;
+    errdefer if (best_name) |name| allocator.free(name);
+    var best_mtime: ?std.Io.Timestamp = null;
+    var it = dir.iterate();
+    while (try it.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
+        if (!isReviewSessionRecordName(entry.name, entry.kind)) continue;
+        const stat = dir.statFile(std.Io.Threaded.global_single_threaded.io(), entry.name, .{ .follow_symlinks = false }) catch continue;
+        if (stat.kind != .file) continue;
+        const replace = if (best_mtime) |mtime|
+            stat.mtime.nanoseconds > mtime.nanoseconds or
+                (stat.mtime.nanoseconds == mtime.nanoseconds and std.mem.order(u8, entry.name, best_name.?) == .gt)
+        else
+            true;
+        if (!replace) continue;
+        if (best_name) |name| allocator.free(name);
+        best_name = try allocator.dupe(u8, entry.name);
+        best_mtime = stat.mtime;
+    }
+
+    const name = best_name orelse return error.NoReviewSessionRecords;
+    defer allocator.free(name);
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ session_dir, name });
+}
+
+fn isReviewSessionRecordName(name: []const u8, kind: std.Io.File.Kind) bool {
+    if (kind != .file) return false;
+    if (!std.mem.endsWith(u8, name, ".json")) return false;
+    if (std.mem.endsWith(u8, name, ".lane.json")) return false;
+    return true;
 }
 
 fn writeSessionRecord(allocator: std.mem.Allocator, path: []const u8, record: SessionRecord) !void {
@@ -7507,6 +8132,67 @@ fn jsonStringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     };
 }
 
+fn objectField(obj: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .object => |child| child,
+        else => null,
+    };
+}
+
+fn objectFieldOrGateError(
+    allocator: std.mem.Allocator,
+    obj: std.json.ObjectMap,
+    key: []const u8,
+    errors: *std.ArrayList([]const u8),
+) !?std.json.ObjectMap {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .object => |child| child,
+        .null => null,
+        else => {
+            try appendGateError(allocator, errors, "{s} must be an object", .{key});
+            return null;
+        },
+    };
+}
+
+fn stringFieldAny(obj: std.json.ObjectMap, keys: []const []const u8) ?[]const u8 {
+    for (keys) |key| {
+        if (jsonStringField(obj, key)) |value| return value;
+    }
+    return null;
+}
+
+fn boolFieldAny(obj: std.json.ObjectMap, keys: []const []const u8) ?bool {
+    for (keys) |key| {
+        if (jsonBoolField(obj, key)) |value| return value;
+    }
+    return null;
+}
+
+fn fieldPresentNonNull(obj: std.json.ObjectMap, key: []const u8) bool {
+    const value = obj.get(key) orelse return false;
+    return switch (value) {
+        .null => false,
+        else => true,
+    };
+}
+
+fn fieldAnyPresentNonNull(obj: std.json.ObjectMap, keys: []const []const u8) bool {
+    for (keys) |key| {
+        if (fieldPresentNonNull(obj, key)) return true;
+    }
+    return false;
+}
+
+fn intFieldAny(obj: std.json.ObjectMap, keys: []const []const u8) ?i64 {
+    for (keys) |key| {
+        if (jsonI64Field(obj, key)) |value| return value;
+    }
+    return null;
+}
+
 fn jsonFieldAsJsonAlloc(allocator: std.mem.Allocator, obj: std.json.ObjectMap, key: []const u8) !?[]u8 {
     const value = obj.get(key) orelse return null;
     return switch (value) {
@@ -7542,6 +8228,20 @@ fn jsonUsizeField(obj: std.json.ObjectMap, key: []const u8) ?usize {
     return switch (value) {
         .integer => |number| if (number >= 0) @intCast(number) else null,
         else => null,
+    };
+}
+
+fn jsonValueTruthy(value: ?std.json.Value) bool {
+    const actual = value orelse return false;
+    return switch (actual) {
+        .null => false,
+        .bool => |flag| flag,
+        .integer => |number| number != 0,
+        .float => |number| number != 0,
+        .string => |text| text.len != 0,
+        .array => |arr| arr.items.len != 0,
+        .object => |obj| obj.count() != 0,
+        else => true,
     };
 }
 
@@ -8618,6 +9318,140 @@ fn detectAccountResourceExhaustion(text: []const u8) bool {
         containsIgnoreCase(text, "resource exhausted");
 }
 
+fn receiptContainsUsageLimit(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !bool {
+    const text = try stringifyJsonValueAlloc(allocator, std.json.Value{ .object = obj });
+    defer allocator.free(text);
+    return std.mem.indexOf(u8, text, "usageLimitExceeded") != null or
+        std.mem.indexOf(u8, text, "quota exceeded") != null or
+        std.mem.indexOf(u8, text, "rate limit exceeded") != null;
+}
+
+fn appendGateError(
+    allocator: std.mem.Allocator,
+    errors: *std.ArrayList([]const u8),
+    comptime fmt: []const u8,
+    args: anytype,
+) !void {
+    try errors.append(allocator, try std.fmt.allocPrint(allocator, fmt, args));
+}
+
+fn gateResultFromSingleErrorAlloc(allocator: std.mem.Allocator, path: []const u8, message: []const u8) !GateResult {
+    const errors = try allocator.alloc([]const u8, 1);
+    errdefer allocator.free(errors);
+    errors[0] = try allocator.dupe(u8, message);
+    return .{
+        .path = try allocator.dupe(u8, path),
+        .errors = errors,
+    };
+}
+
+fn reviewPhaseAllowed(value: []const u8) bool {
+    return std.mem.eql(u8, value, "pre_lane_start") or
+        std.mem.eql(u8, value, "lane_started") or
+        std.mem.eql(u8, value, "pre_review_start") or
+        std.mem.eql(u8, value, "review_started") or
+        std.mem.eql(u8, value, "review_waiting") or
+        std.mem.eql(u8, value, "review_terminal") or
+        std.mem.eql(u8, value, "normalized_verdict");
+}
+
+fn reviewStatusAllowed(value: []const u8) bool {
+    return std.mem.eql(u8, value, "clean") or
+        std.mem.eql(u8, value, "findings") or
+        std.mem.eql(u8, value, "timeout") or
+        std.mem.eql(u8, value, "pre_review_transport_failure") or
+        std.mem.eql(u8, value, "review_transport_failure") or
+        std.mem.eql(u8, value, "account_resource_exhausted") or
+        std.mem.eql(u8, value, "parse_mismatch") or
+        std.mem.eql(u8, value, "review_untrusted_source") or
+        std.mem.eql(u8, value, "incomplete");
+}
+
+fn backendClassAllowed(value: []const u8) bool {
+    return std.mem.eql(u8, value, "cas-lane") or
+        std.mem.eql(u8, value, "cas-start-wait") or
+        std.mem.eql(u8, value, "cas-native-fallback") or
+        std.mem.eql(u8, value, "cas-receipt-normalized");
+}
+
+fn reviewTupleLockStateAllowed(value: []const u8) bool {
+    return std.mem.eql(u8, value, "starting_lane") or
+        std.mem.eql(u8, value, "pre_review_start_failed") or
+        std.mem.eql(u8, value, "review_started") or
+        std.mem.eql(u8, value, "waiting") or
+        std.mem.eql(u8, value, "terminal") or
+        std.mem.eql(u8, value, "normalized") or
+        std.mem.eql(u8, value, "account_resource_exhausted") or
+        std.mem.eql(u8, value, "stale");
+}
+
+fn reviewTupleLockStateActive(value: []const u8) bool {
+    return std.mem.eql(u8, value, "review_started") or std.mem.eql(u8, value, "waiting");
+}
+
+fn writeGateResultJson(writer: *std.Io.Writer, result: GateResult) !void {
+    try writer.writeByte('{');
+    try writeJsonString(writer, "errors");
+    try writer.writeByte(':');
+    try writer.writeByte('[');
+    for (result.errors, 0..) |err, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writeJsonString(writer, err);
+    }
+    try writer.writeByte(']');
+    try writer.writeByte(',');
+    try writeJsonString(writer, "ok");
+    try writer.writeByte(':');
+    try writer.writeAll(if (result.ok()) "true" else "false");
+    try writer.writeByte(',');
+    try writeJsonString(writer, "path");
+    try writer.writeByte(':');
+    try writeJsonString(writer, result.path);
+    try writer.writeByte('}');
+}
+
+fn printGateResultsJson(results: []const GateResult) !void {
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    if (results.len == 1) {
+        try writeGateResultJson(stdout, results[0]);
+        try stdout.writeByte('\n');
+        return;
+    }
+    try stdout.writeByte('[');
+    for (results, 0..) |result, i| {
+        if (i > 0) try stdout.writeByte(',');
+        try writeGateResultJson(stdout, result);
+    }
+    try stdout.writeAll("]\n");
+}
+
+fn printGateResultsJsonl(results: []const GateResult) !void {
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    for (results) |result| {
+        try writeGateResultJson(stdout, result);
+        try stdout.writeByte('\n');
+    }
+}
+
+fn printGateResultsText(results: []const GateResult) !void {
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stderr = &stderr_writer.interface;
+    for (results) |result| {
+        if (result.ok()) {
+            try stdout.print("ok: {s}\n", .{result.path});
+        } else {
+            try stderr.print("failed: {s}\n", .{result.path});
+            for (result.errors) |err| {
+                try stderr.print("- {s}\n", .{err});
+            }
+        }
+    }
+}
+
 fn rootHasAccountResourceExhaustion(root: std.json.ObjectMap) bool {
     const keys = [_][]const u8{
         "failureCode",
@@ -9100,6 +9934,67 @@ test "parseArgs captures start --wait" {
     try std.testing.expect(parsed.wait_after_start);
     try std.testing.expectEqual(Action.start, parsed.action.?);
     try std.testing.expectEqual(TargetKind.base_branch, parsed.target.?.kind);
+}
+
+test "parseArgs accepts latest status and wait selectors" {
+    const status_argv = [_][]const u8{
+        "cas_review_session",
+        "status",
+        "--latest",
+        "--json",
+    };
+    const status = try parseArgs(std.testing.allocator, &status_argv);
+    try std.testing.expectEqual(Action.status, status.action.?);
+    try std.testing.expect(status.latest_review_session);
+    try std.testing.expect(status.json);
+
+    const wait_argv = [_][]const u8{
+        "cas_review_session",
+        "wait",
+        "--latest",
+    };
+    const wait = try parseArgs(std.testing.allocator, &wait_argv);
+    try std.testing.expectEqual(Action.wait, wait.action.?);
+    try std.testing.expect(wait.latest_review_session);
+}
+
+test "parseArgs rejects ambiguous and unsafe latest selectors" {
+    const ambiguous_argv = [_][]const u8{
+        "cas_review_session",
+        "status",
+        "--latest",
+        "--review-thread-id",
+        "thr_1",
+    };
+    try std.testing.expectError(error.AmbiguousReviewSessionSelector, parseArgs(std.testing.allocator, &ambiguous_argv));
+
+    const interrupt_argv = [_][]const u8{
+        "cas_review_session",
+        "interrupt",
+        "--latest",
+    };
+    try std.testing.expectError(error.LatestReviewSessionUnsupportedAction, parseArgs(std.testing.allocator, &interrupt_argv));
+}
+
+test "latestSessionRecordPathInDirAlloc selects newest top-level session record" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "old.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "new.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "lane_1.lane.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "events.ndjson", .data = "" });
+    try tmp.dir.setTimestamps(io, "old.json", .{ .modify_timestamp = .{ .new = .{ .nanoseconds = 1 } } });
+    try tmp.dir.setTimestamps(io, "new.json", .{ .modify_timestamp = .{ .new = .{ .nanoseconds = 2 } } });
+    try tmp.dir.setTimestamps(io, "lane_1.lane.json", .{ .modify_timestamp = .{ .new = .{ .nanoseconds = 3 } } });
+
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(tmp_path);
+    const latest = try latestSessionRecordPathInDirAlloc(std.testing.allocator, tmp_path);
+    defer std.testing.allocator.free(latest);
+    const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}/new.json", .{tmp_path});
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, latest);
 }
 
 test "parseArgs accepts multi-agent mode for start and lane review" {
@@ -9888,6 +10783,151 @@ test "parseArgs accepts receipt normalize with requested tuple inputs" {
     try std.testing.expectEqual(TargetKind.base_branch, parsed.target.?.kind);
     try std.testing.expectEqualStrings("main", parsed.target.?.branch.?);
     try std.testing.expectEqual(ReceiptFormat.json, parsed.receipt_format);
+}
+
+test "parseArgs accepts native receipt classify gate and lock gate actions" {
+    const classify_argv = [_][]const u8{
+        "cas_review_session",
+        "receipt",
+        "classify",
+        "--path",
+        "receipts.jsonl",
+        "--format",
+        "jsonl",
+    };
+    const classify = try parseArgs(std.testing.allocator, &classify_argv);
+    defer std.testing.allocator.free(classify.receipt_paths);
+    defer std.testing.allocator.free(classify.receipt_globs);
+    try std.testing.expectEqual(Action.receipt, classify.action.?);
+    try std.testing.expectEqual(ReceiptAction.classify, classify.receipt_action);
+    try std.testing.expectEqual(ReceiptFormat.jsonl, classify.receipt_format);
+
+    const receipt_gate_argv = [_][]const u8{
+        "cas_review_session",
+        "receipt",
+        "gate",
+        "--path",
+        "review.json",
+        "--format",
+        "json",
+    };
+    const receipt_gate = try parseArgs(std.testing.allocator, &receipt_gate_argv);
+    defer std.testing.allocator.free(receipt_gate.receipt_paths);
+    defer std.testing.allocator.free(receipt_gate.receipt_globs);
+    try std.testing.expectEqual(ReceiptAction.gate, receipt_gate.receipt_action);
+
+    const lock_gate_argv = [_][]const u8{
+        "cas_review_session",
+        "lock",
+        "gate",
+        "--path",
+        "tuple-lock.json",
+        "--format",
+        "json",
+    };
+    const lock_gate = try parseArgs(std.testing.allocator, &lock_gate_argv);
+    defer std.testing.allocator.free(lock_gate.receipt_paths);
+    defer std.testing.allocator.free(lock_gate.receipt_globs);
+    try std.testing.expectEqual(Action.lock, lock_gate.action.?);
+    try std.testing.expectEqual(LockAction.gate, lock_gate.lock_action.?);
+}
+
+test "native receipt classifier preserves Python helper contract" {
+    var pre_review = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"failureCode\":\"lane_transport_lost\",\"lastHeadSha\":null,\"lastReviewThreadId\":null,\"reviewCount\":0,\"reviewThreadId\":null}",
+        .{},
+    );
+    defer pre_review.deinit();
+    const pre_review_row = try classifyReceiptRecordAlloc(std.testing.allocator, pre_review.value.object);
+    defer pre_review_row.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("pre_review_lane_transport_lost", pre_review_row.classification);
+    try std.testing.expectEqualStrings("transport_pre_review", pre_review_row.failure_class);
+    try std.testing.expectEqualStrings("pre_review_lane_transport_lost", pre_review_row.failure_code.?);
+    try std.testing.expect(!pre_review_row.review_attempt_exists);
+    try std.testing.expect(!pre_review_row.tuple_verdict_exists);
+    try std.testing.expect(pre_review_row.retryable_same_tuple_now);
+
+    var findings = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"reviewVerdict\":{\"backendClass\":\"cas-lane\",\"findingCount\":2,\"reviewThreadId\":\"thr1\",\"status\":\"findings\"}}",
+        .{},
+    );
+    defer findings.deinit();
+    const findings_row = try classifyReceiptRecordAlloc(std.testing.allocator, findings.value.object);
+    defer findings_row.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("review_verdict_findings", findings_row.classification);
+    try std.testing.expectEqualStrings("review_verdict", findings_row.failure_class);
+    try std.testing.expect(findings_row.review_attempt_exists);
+    try std.testing.expect(findings_row.tuple_verdict_exists);
+    try std.testing.expectEqualStrings("thr1", findings_row.review_thread_id.?);
+
+    var exhausted = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"failureCode\":\"review_failed\",\"rawErrorText\":\"usageLimitExceeded: Reviewer failed to output a response.\",\"reviewThreadId\":\"thr2\"}",
+        .{},
+    );
+    defer exhausted.deinit();
+    const exhausted_row = try classifyReceiptRecordAlloc(std.testing.allocator, exhausted.value.object);
+    defer exhausted_row.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("account_resource_exhausted", exhausted_row.classification);
+    try std.testing.expectEqualStrings("account_resource", exhausted_row.failure_class);
+    try std.testing.expectEqualStrings("account_resource_exhausted", exhausted_row.failure_code.?);
+    try std.testing.expectEqualStrings("review_terminal", exhausted_row.review_attempt_phase);
+    try std.testing.expect(!exhausted_row.retryable_same_tuple_now);
+}
+
+test "native receipt gate validates pre-review and tuple verdict invariants" {
+    var valid = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"action\":\"lane-review\",\"baseSha\":\"base\",\"failureClass\":\"transport_pre_review\",\"failureCode\":\"pre_review_lane_transport_lost\",\"headSha\":\"head\",\"laneId\":\"lane_1\",\"lastReviewThreadId\":null,\"managedServerPid\":123,\"reviewAttemptExists\":false,\"reviewAttemptPhase\":\"pre_review_start\",\"reviewCount\":0,\"reviewThreadId\":null,\"reviewTurnId\":null,\"targetFingerprint\":\"fp\",\"tupleVerdictExists\":false}",
+        .{},
+    );
+    defer valid.deinit();
+    const valid_result = try validateReceiptGateObjectAlloc(std.testing.allocator, "valid.json", valid.value.object);
+    defer valid_result.deinit(std.testing.allocator);
+    try std.testing.expect(valid_result.ok());
+
+    var invalid = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"reviewAttemptPhase\":\"review_waiting\",\"reviewThreadId\":\"thr\",\"reviewAttemptExists\":true,\"tupleVerdictExists\":true,\"reviewVerdict\":{\"status\":\"timeout\",\"backendClass\":\"cas-lane\",\"reviewThreadId\":\"thr\"}}",
+        .{},
+    );
+    defer invalid.deinit();
+    const invalid_result = try validateReceiptGateObjectAlloc(std.testing.allocator, "invalid.json", invalid.value.object);
+    defer invalid_result.deinit(std.testing.allocator);
+    try std.testing.expect(!invalid_result.ok());
+    try std.testing.expectEqualStrings("tupleVerdictExists=true is inconsistent with reviewVerdict.status", invalid_result.errors[0]);
+}
+
+test "native tuple lock gate validates CAS-RTL-v1 lock records" {
+    var valid = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"accountFingerprint\":\"acct:a\",\"baseSha\":\"base\",\"createdAtUnixS\":1,\"expiresAtUnixS\":30,\"headSha\":\"head\",\"lockVersion\":\"CAS-RTL-v1\",\"ownerPid\":4,\"repoRealpath\":\"/repo\",\"resolvedCodexPath\":\"/bin/codex\",\"resolvedCodexVersion\":\"codex 0.1.0\",\"reviewThreadId\":\"thr_1\",\"state\":\"waiting\",\"targetFingerprint\":\"fp\",\"tupleHash\":\"sha256:tuple\",\"updatedAtUnixS\":2}",
+        .{},
+    );
+    defer valid.deinit();
+    const valid_result = try validateTupleLockGateObjectAlloc(std.testing.allocator, "lock.json", valid.value.object);
+    defer valid_result.deinit(std.testing.allocator);
+    try std.testing.expect(valid_result.ok());
+
+    var invalid = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"accountFingerprint\":\"acct:a\",\"baseSha\":\"base\",\"expiresAtUnixS\":1,\"headSha\":\"head\",\"lockVersion\":\"CRTL-v1\",\"repoRealpath\":\"/repo\",\"resolvedCodexPath\":\"/bin/codex\",\"resolvedCodexVersion\":\"codex 0.1.0\",\"state\":\"waiting\",\"targetFingerprint\":\"fp\",\"tupleHash\":\"sha256:tuple\",\"updatedAtUnixS\":2}",
+        .{},
+    );
+    defer invalid.deinit();
+    const invalid_result = try validateTupleLockGateObjectAlloc(std.testing.allocator, "bad-lock.json", invalid.value.object);
+    defer invalid_result.deinit(std.testing.allocator);
+    try std.testing.expect(!invalid_result.ok());
+    try std.testing.expect(std.mem.indexOf(u8, invalid_result.errors[0], "lockVersion") != null);
 }
 
 test "parseArgs rejects removed receipt authority and closure surfaces" {

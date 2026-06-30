@@ -69,8 +69,6 @@ const CompatSetup = enum {
     cas_budget_governor_driver,
     cron_help,
     cron_list,
-    puff_help,
-    puff_wrapper,
     learnings_help,
     learnings_recent,
     learnings_recall,
@@ -79,18 +77,9 @@ const CompatSetup = enum {
     learnings_quality,
     append_learning_help,
     append_learning_append,
-    mesh_help,
-    mesh_budget,
-    mesh_plan_sync,
-    mesh_slice,
-    mesh_wave,
     st_help,
     st_add_show,
     st_emit_export,
-    parse_arch_help,
-    parse_arch_collect,
-    parse_arch_eval,
-    parse_arch_doctor,
 };
 
 const CompatCase = struct {
@@ -278,8 +267,6 @@ const MiscCases = [_]perf_contract.CaseDescriptor{
     .{ .case_id = "cas-review-session-help", .binary = "cas_review_session", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
     .{ .case_id = "cas-review-session-version", .binary = "cas_review_session", .family = "version", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
     .{ .case_id = "cas-budget-governor-driver", .binary = "cas", .family = "driver", .case_kind = .driver, .measurement_mode = .latency_alloc, .compat_case = true },
-    .{ .case_id = "puff-help", .binary = "puff", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "puff-wrapper", .binary = "puff", .family = "wrapper", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
     .{ .case_id = "learnings-help", .binary = "learnings", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
     .{ .case_id = "learnings-recent", .binary = "learnings", .family = "recent", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
     .{ .case_id = "learnings-recall", .binary = "learnings", .family = "recall", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
@@ -288,15 +275,6 @@ const MiscCases = [_]perf_contract.CaseDescriptor{
     .{ .case_id = "learnings-quality", .binary = "learnings", .family = "quality-audit", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
     .{ .case_id = "append-learning-help", .binary = "append_learning", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
     .{ .case_id = "append-learning-append", .binary = "append_learning", .family = "append", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "mesh-help", .binary = "mesh", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "mesh-budget", .binary = "mesh", .family = "budget", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "mesh-plan-sync", .binary = "mesh", .family = "plan_sync", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "mesh-slice", .binary = "mesh", .family = "slice", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "mesh-wave", .binary = "mesh", .family = "wave", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "parse-arch-help", .binary = "parse-arch", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "parse-arch-collect", .binary = "parse-arch", .family = "collect", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "parse-arch-eval", .binary = "parse-arch", .family = "eval", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "parse-arch-doctor", .binary = "parse-arch", .family = "doctor", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
 };
 
 const MiscCoverages = [_]perf_contract.CommandCoverage{
@@ -319,28 +297,17 @@ const CompatCases = [_]CompatCase{
     .{ .descriptor = MiscCases[10], .builder = .root, .build_step = "build-cas", .binary_path = "zig-out/bin/cas-perf-budget-governor", .setup = .cas_budget_governor_driver, .tolerance_pct = 45.0 },
     .{ .descriptor = CronCases[0], .builder = .root, .build_step = "build-cron", .binary_path = "zig-out/bin/cron", .setup = .cron_help, .tolerance_pct = 25.0 },
     .{ .descriptor = CronCases[1], .builder = .root, .build_step = "build-cron", .binary_path = "zig-out/bin/cron", .setup = .cron_list, .tolerance_pct = 35.0 },
-    .{ .descriptor = MiscCases[11], .builder = .root, .build_step = "build-puff", .binary_path = "zig-out/bin/puff", .setup = .puff_help, .tolerance_pct = 25.0 },
-    .{ .descriptor = MiscCases[12], .builder = .root, .build_step = "build-puff", .binary_path = "zig-out/bin/puff", .setup = .puff_wrapper, .tolerance_pct = 35.0 },
-    .{ .descriptor = MiscCases[13], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_help, .tolerance_pct = 150.0 },
-    .{ .descriptor = MiscCases[14], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_recent, .tolerance_pct = 120.0 },
-    .{ .descriptor = MiscCases[15], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_recall, .tolerance_pct = 20.0 },
-    .{ .descriptor = MiscCases[16], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_query, .tolerance_pct = 25.0 },
-    .{ .descriptor = MiscCases[17], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_codify, .tolerance_pct = 25.0 },
-    .{ .descriptor = MiscCases[18], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_quality, .tolerance_pct = 25.0 },
-    .{ .descriptor = MiscCases[19], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/append_learning", .setup = .append_learning_help },
-    .{ .descriptor = MiscCases[20], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/append_learning", .setup = .append_learning_append, .tolerance_pct = 100.0 },
-    .{ .descriptor = MiscCases[21], .builder = .root, .build_step = "build-mesh", .binary_path = "zig-out/bin/mesh", .setup = .mesh_help, .tolerance_pct = 200.0 },
-    .{ .descriptor = MiscCases[22], .builder = .root, .build_step = "build-mesh", .binary_path = "zig-out/bin/mesh", .setup = .mesh_budget, .tolerance_pct = 200.0 },
-    .{ .descriptor = MiscCases[23], .builder = .root, .build_step = "build-mesh", .binary_path = "zig-out/bin/mesh", .setup = .mesh_plan_sync, .tolerance_pct = 200.0 },
-    .{ .descriptor = MiscCases[24], .builder = .root, .build_step = "build-mesh", .binary_path = "zig-out/bin/mesh", .setup = .mesh_slice, .tolerance_pct = 200.0 },
-    .{ .descriptor = MiscCases[25], .builder = .root, .build_step = "build-mesh", .binary_path = "zig-out/bin/mesh", .setup = .mesh_wave, .tolerance_pct = 200.0 },
+    .{ .descriptor = MiscCases[11], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_help, .tolerance_pct = 150.0 },
+    .{ .descriptor = MiscCases[12], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_recent, .tolerance_pct = 120.0 },
+    .{ .descriptor = MiscCases[13], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_recall, .tolerance_pct = 20.0 },
+    .{ .descriptor = MiscCases[14], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_query, .tolerance_pct = 25.0 },
+    .{ .descriptor = MiscCases[15], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_codify, .tolerance_pct = 25.0 },
+    .{ .descriptor = MiscCases[16], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_quality, .tolerance_pct = 25.0 },
+    .{ .descriptor = MiscCases[17], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/append_learning", .setup = .append_learning_help },
+    .{ .descriptor = MiscCases[18], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/append_learning", .setup = .append_learning_append, .tolerance_pct = 100.0 },
     .{ .descriptor = StCases[0], .builder = .root, .build_step = "build-st", .binary_path = "zig-out/bin/st", .setup = .st_help, .tolerance_pct = 25.0 },
     .{ .descriptor = StCases[1], .builder = .root, .build_step = "build-st", .binary_path = "zig-out/bin/st", .setup = .st_add_show, .tolerance_pct = 20.0 },
     .{ .descriptor = StCases[2], .builder = .root, .build_step = "build-st", .binary_path = "zig-out/bin/st", .setup = .st_emit_export, .tolerance_pct = 300.0 },
-    .{ .descriptor = MiscCases[26], .builder = .root, .build_step = "build-parse-arch", .binary_path = "zig-out/bin/parse-arch", .setup = .parse_arch_help, .tolerance_pct = 200.0 },
-    .{ .descriptor = MiscCases[27], .builder = .root, .build_step = "build-parse-arch", .binary_path = "zig-out/bin/parse-arch", .setup = .parse_arch_collect, .tolerance_pct = 200.0 },
-    .{ .descriptor = MiscCases[28], .builder = .root, .build_step = "build-parse-arch", .binary_path = "zig-out/bin/parse-arch", .setup = .parse_arch_eval, .tolerance_pct = 800.0 },
-    .{ .descriptor = MiscCases[29], .builder = .root, .build_step = "build-parse-arch", .binary_path = "zig-out/bin/parse-arch", .setup = .parse_arch_doctor, .tolerance_pct = 200.0 },
 };
 
 const DeepCases = [_]DeepCase{
@@ -1318,7 +1285,7 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
 
     switch (case_cfg.setup) {
         .seq_help => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
-        .bench_stats_help, .perf_report_help, .cas_smoke_check_help, .cas_instance_runner_help, .cas_review_session_help, .cron_help, .puff_help, .learnings_help, .mesh_help, .st_help, .parse_arch_help => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
+        .bench_stats_help, .perf_report_help, .cas_smoke_check_help, .cas_instance_runner_help, .cas_review_session_help, .cron_help, .learnings_help, .st_help => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
         .cas_review_session_version => try args.appendSlice(allocator, &.{ binary_path, "--version" }),
         .bench_stats_parse => {
             const input_path = try std.fs.path.join(allocator, &.{ ".", "apps/lift/perf/fixtures/bench_stats_input.txt" });
@@ -1347,15 +1314,6 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
             try seedCronDb(allocator, db_path);
             try args.appendSlice(allocator, &.{ binary_path, "--db", db_path, "list" });
         },
-        .puff_wrapper => {
-            const codex_home = try std.fs.path.join(allocator, &.{ temp_root, ".codex" });
-            const script_dir = try std.fs.path.join(allocator, &.{ codex_home, "skills", "puff", "scripts" });
-            try makeRepoAwarePath(allocator, script_dir);
-            const script_path = try std.fs.path.join(allocator, &.{ script_dir, "puff.sh" });
-            try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = script_path, .data = "#!/usr/bin/env bash\nexit 0\n" });
-            try makeExecutable(script_path);
-            try args.appendSlice(allocator, &.{ "/usr/bin/env", try std.fmt.allocPrint(allocator, "CODEX_HOME={s}", .{codex_home}), binary_path, "status" });
-        },
         .learnings_recent => try args.appendSlice(allocator, &.{ binary_path, "--path", "apps/learnings/perf/fixtures/learnings.jsonl", "recent", "--limit", "3" }),
         .learnings_recall => try args.appendSlice(allocator, &.{ binary_path, "--path", "apps/learnings/perf/fixtures/learnings.jsonl", "recall", "--query", "benchmark regression", "--limit", "3", "--format", "json", "--drop-superseded" }),
         .learnings_query => try args.appendSlice(allocator, &.{ binary_path, "--path", "apps/learnings/perf/fixtures/learnings.jsonl", "query", "--spec", "@apps/learnings/perf/fixtures/query_spec.json" }),
@@ -1366,26 +1324,6 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
             const fixture_path = try std.fs.path.join(allocator, &.{ temp_root, "learnings.jsonl" });
             try std.Io.Dir.copyFileAbsolute("apps/learnings/perf/fixtures/learnings.jsonl", fixture_path, std.Io.Threaded.global_single_threaded.io(), .{});
             try args.appendSlice(allocator, &.{ binary_path, "--path", fixture_path, "--status", "do_more", "--learning", "When running local perf comparisons, prefer machine-scoped baselines to avoid cross-host noise.", "--evidence", "Local compare uses one machine and one baseline directory.", "--application", "Use .perf-local baselines before refactors to avoid cross-host drift.", "--tag", "perf" });
-        },
-        .mesh_budget => try args.appendSlice(allocator, &.{ binary_path, "budget", "--remaining-five-hour", "42", "--remaining-weekly", "38", "--max-threads", "12", "--previous-triplet-width", "3", "--prior-wave-instability", "false", "--consecutive-unstable-waves", "0", "--consecutive-clean-waves", "1" }),
-        .mesh_plan_sync => try args.appendSlice(allocator, &.{ binary_path, "plan_sync", "--input-json", "apps/mesh/perf/fixtures/plan.json" }),
-        .mesh_slice => {
-            const output_path = try std.fs.path.join(allocator, &.{ temp_root, "units.json" });
-            try args.appendSlice(allocator, &.{ binary_path, "slice", "--input-json", "apps/mesh/perf/fixtures/plan.json", "--output-json", output_path, "--max-slices", "2" });
-        },
-        .mesh_wave => {
-            const units_path = try std.fs.path.join(allocator, &.{ temp_root, "units.json" });
-            {
-                var prep = std.ArrayList([]const u8).empty;
-                defer prep.deinit(allocator);
-                try prep.appendSlice(allocator, &.{ binary_path, "slice", "--input-json", "apps/mesh/perf/fixtures/plan.json", "--output-json", units_path, "--max-slices", "2" });
-                const prep_result = try runChildCapture(allocator, ".", prep.items);
-                defer allocator.free(prep_result.stdout);
-                defer allocator.free(prep_result.stderr);
-                if (prep_result.exit_code != 0) return error.CaseFailed;
-            }
-            const csv_path = try std.fs.path.join(allocator, &.{ temp_root, "wave.csv" });
-            try args.appendSlice(allocator, &.{ binary_path, "wave", "--units-json", units_path, "--csv-path", csv_path, "--max-active", "2", "--lane", "coder", "--triplet-width", "2" });
         },
         .st_add_show => {
             const plan_path = try std.fs.path.join(allocator, &.{ temp_root, "st-plan.jsonl" });
@@ -1414,9 +1352,6 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
             }
             try args.appendSlice(allocator, &.{ binary_path, "export", "--file", plan_path, "--output", export_path });
         },
-        .parse_arch_collect => try args.appendSlice(allocator, &.{ binary_path, "collect", "apps/parse-arch/references/eval/fixtures/layered-api" }),
-        .parse_arch_eval => try args.appendSlice(allocator, &.{ binary_path, "eval", "--suite", "apps/parse-arch/references/eval/suite.yaml" }),
-        .parse_arch_doctor => try args.appendSlice(allocator, &.{ binary_path, "doctor", "--suite", "apps/parse-arch/references/eval/suite.yaml", "--repo-path", "apps/parse-arch/references/eval/fixtures/layered-api" }),
         else => return error.InvalidCommand,
     }
     return .{ .cwd = cwd, .argv = try args.toOwnedSlice(allocator) };
@@ -1776,9 +1711,6 @@ fn inferBinary(case_id: []const u8) []const u8 {
     if (std.mem.startsWith(u8, case_id, "seq-")) return "seq";
     if (std.mem.startsWith(u8, case_id, "cron-")) return "cron";
     if (std.mem.startsWith(u8, case_id, "st-")) return "st";
-    if (std.mem.startsWith(u8, case_id, "mesh-")) return "mesh";
-    if (std.mem.startsWith(u8, case_id, "puff-")) return "puff";
-    if (std.mem.startsWith(u8, case_id, "parse-arch-")) return "parse-arch";
     if (std.mem.startsWith(u8, case_id, "learnings-")) return "learnings";
     if (std.mem.startsWith(u8, case_id, "append-learning-")) return "append_learning";
     if (std.mem.startsWith(u8, case_id, "bench-stats")) return "bench_stats";

@@ -79,25 +79,9 @@ pub fn build(b: *std.Build) void {
     const lift_meta = addVersionModule(b, @embedFile("apps/lift/VERSION"));
     const cas_meta = addVersionModule(b, @embedFile("apps/cas/VERSION"));
     const cron_meta = addVersionModule(b, @embedFile("apps/cron/VERSION"));
-    const puff_meta = addVersionModule(b, @embedFile("apps/puff/VERSION"));
     const ledger_meta = addVersionModule(b, @embedFile("apps/ledger/VERSION"));
     const memory_note_meta = addVersionModule(b, @embedFile("apps/memory-note/VERSION"));
-    const mesh_meta = addVersionModule(b, @embedFile("apps/mesh/VERSION"));
     const st_meta = addVersionModule(b, @embedFile("apps/st/VERSION"));
-    const parse_arch_meta = addVersionModule(b, @embedFile("apps/parse-arch/VERSION"));
-    const parse_arch_collector = b.createModule(.{
-        .root_source_file = b.path("apps/parse-arch/src/collector.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const parse_arch_eval_suite = b.createModule(.{
-        .root_source_file = b.path("apps/parse-arch/src/eval_suite.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "parse_arch_collector", .module = parse_arch_collector },
-        },
-    });
 
     const seq_root = b.createModule(.{
         .root_source_file = b.path("apps/seq/src/main.zig"),
@@ -287,16 +271,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = cron_meta },
         },
     });
-    const puff_root = b.createModule(.{
-        .root_source_file = b.path("apps/puff/scripts/puff.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "core_delegate", .module = core_delegate },
-            .{ .name = "core_cli", .module = core_cli },
-            .{ .name = "app_meta", .module = puff_meta },
-        },
-    });
     const append_learning_root = b.createModule(.{
         .root_source_file = b.path("apps/learnings/scripts/append_learning.zig"),
         .target = target,
@@ -321,12 +295,23 @@ pub fn build(b: *std.Build) void {
             .{ .name = "seq_bundle", .module = seq_bundle },
         },
     });
+    const synesthesia_root = b.createModule(.{
+        .root_source_file = b.path("apps/synesthesia/scripts/synesthesia.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "durable_store", .module = durable_store },
+            .{ .name = "app_meta", .module = ledger_meta },
+        },
+    });
     const ledger_root = b.createModule(.{
         .root_source_file = b.path("apps/ledger/scripts/ledger.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "learnings_cli", .module = learnings_root },
+            .{ .name = "synesthesia_cli", .module = synesthesia_root },
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "durable_store", .module = durable_store },
             .{ .name = "app_meta", .module = ledger_meta },
@@ -342,15 +327,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = memory_note_meta },
         },
     });
-    const mesh_root = b.createModule(.{
-        .root_source_file = b.path("apps/mesh/scripts/mesh.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "core_cli", .module = core_cli },
-            .{ .name = "app_meta", .module = mesh_meta },
-        },
-    });
     const st_root = b.createModule(.{
         .root_source_file = b.path("apps/st/scripts/st.zig"),
         .target = target,
@@ -360,17 +336,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "durable_store", .module = durable_store },
             .{ .name = "execution_policy_core", .module = execution_policy_core },
             .{ .name = "app_meta", .module = st_meta },
-        },
-    });
-    const parse_arch_root = b.createModule(.{
-        .root_source_file = b.path("apps/parse-arch/scripts/parse_arch.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "core_cli", .module = core_cli },
-            .{ .name = "app_meta", .module = parse_arch_meta },
-            .{ .name = "parse_arch_collector", .module = parse_arch_collector },
-            .{ .name = "parse_arch_eval_suite", .module = parse_arch_eval_suite },
         },
     });
     const perf_hub_root = b.createModule(.{
@@ -409,13 +374,9 @@ pub fn build(b: *std.Build) void {
     const cron = addExecutable(b, "cron", cron_root);
     cron.root_module.linkSystemLibrary("c", .{});
     cron.root_module.linkSystemLibrary("sqlite3", .{});
-    const puff = addExecutable(b, "puff", puff_root);
     const ledger = addExecutable(b, "ledger", ledger_root);
     const memory_note = addExecutable(b, "memory-note", memory_note_root);
-    const mesh = addExecutable(b, "mesh", mesh_root);
-    mesh.root_module.linkSystemLibrary("c", .{}); // build-mesh
     const st = addExecutable(b, "st", st_root);
-    const parse_arch = addExecutable(b, "parse-arch", parse_arch_root);
     const perf_hub = addExecutable(b, "perf_hub", perf_hub_root);
 
     const seq_install = addInstallStep(b, seq);
@@ -433,12 +394,9 @@ pub fn build(b: *std.Build) void {
     const cas_budget_perf_install = addInstallStep(b, cas_budget_perf);
     const cas_install = addInstallStep(b, cas);
     const cron_install = addInstallStep(b, cron);
-    const puff_install = addInstallStep(b, puff);
     const ledger_install = addInstallStep(b, ledger);
     const memory_note_install = addInstallStep(b, memory_note);
-    const mesh_install = addInstallStep(b, mesh);
     const st_install = addInstallStep(b, st);
-    const parse_arch_install = addInstallStep(b, parse_arch);
     const perf_hub_install = addInstallStep(b, perf_hub);
 
     const install_all = b.getInstallStep();
@@ -457,12 +415,9 @@ pub fn build(b: *std.Build) void {
     install_all.dependOn(&cas_budget_perf_install.step);
     install_all.dependOn(&cas_install.step);
     install_all.dependOn(&cron_install.step);
-    install_all.dependOn(&puff_install.step);
     install_all.dependOn(&ledger_install.step);
     install_all.dependOn(&memory_note_install.step);
-    install_all.dependOn(&mesh_install.step);
     install_all.dependOn(&st_install.step);
-    install_all.dependOn(&parse_arch_install.step);
     install_all.dependOn(&perf_hub_install.step);
 
     const run_seq_tests = addTestStepWithOptions(
@@ -605,6 +560,12 @@ pub fn build(b: *std.Build) void {
         "test-append-learning",
         "Run append_learning tests",
     );
+    const run_synesthesia_tests = addTestStep(
+        b,
+        synesthesia_root,
+        "test-synesthesia",
+        "Run internal ledger synesthesia-source tests",
+    );
     const run_ledger_tests = addTestStep(
         b,
         ledger_root,
@@ -617,23 +578,11 @@ pub fn build(b: *std.Build) void {
         "test-memory-note",
         "Run memory-note tests",
     );
-    const run_mesh_tests = addTestStep(
-        b,
-        mesh_root,
-        "test-mesh",
-        "Run mesh tests",
-    );
     const run_st_tests = addTestStep(
         b,
         st_root,
         "test-st",
         "Run st tests",
-    );
-    const run_parse_arch_tests = addTestStep(
-        b,
-        parse_arch_root,
-        "test-parse-arch",
-        "Run parse-arch tests",
     );
     const run_perf_hub_tests = addTestStep(
         b,
@@ -684,13 +633,6 @@ pub fn build(b: *std.Build) void {
             .test_deps = &.{&run_cron_tests.step},
         },
         .{
-            .path = b.path("apps/puff"),
-            .build_step_name = "build-puff",
-            .build_description = "Build puff binaries",
-            .build_deps = &.{&puff_install.step},
-            .test_deps = &.{},
-        },
-        .{
             .path = b.path("apps/learnings"),
             .build_step_name = "build-learnings",
             .build_description = "Run internal ledger learnings-source tests",
@@ -698,11 +640,18 @@ pub fn build(b: *std.Build) void {
             .test_deps = &.{ &run_learnings_tests.step, &run_append_learning_tests.step },
         },
         .{
+            .path = b.path("apps/synesthesia"),
+            .build_step_name = "build-synesthesia",
+            .build_description = "Run internal ledger synesthesia-source tests",
+            .build_deps = &.{},
+            .test_deps = &.{&run_synesthesia_tests.step},
+        },
+        .{
             .path = b.path("apps/ledger"),
             .build_step_name = "build-ledger",
             .build_description = "Build ledger binary",
             .build_deps = &.{&ledger_install.step},
-            .test_deps = &.{&run_ledger_tests.step},
+            .test_deps = &.{ &run_ledger_tests.step, &run_synesthesia_tests.step },
         },
         .{
             .path = b.path("apps/memory-note"),
@@ -712,25 +661,11 @@ pub fn build(b: *std.Build) void {
             .test_deps = &.{&run_memory_note_tests.step},
         },
         .{
-            .path = b.path("apps/mesh"),
-            .build_step_name = "build-mesh",
-            .build_description = "Build mesh binary",
-            .build_deps = &.{&mesh_install.step},
-            .test_deps = &.{&run_mesh_tests.step},
-        },
-        .{
             .path = b.path("apps/st"),
             .build_step_name = "build-st",
             .build_description = "Build st binary",
             .build_deps = &.{&st_install.step},
             .test_deps = &.{&run_st_tests.step},
-        },
-        .{
-            .path = b.path("apps/parse-arch"),
-            .build_step_name = "build-parse-arch",
-            .build_description = "Build parse-arch binary",
-            .build_deps = &.{&parse_arch_install.step},
-            .test_deps = &.{&run_parse_arch_tests.step},
         },
     };
 
@@ -767,8 +702,6 @@ pub fn build(b: *std.Build) void {
     addRunStep(b, ledger, "run-ledger", "Run ledger", &.{"--help"});
     addRunStep(b, memory_note, "run-memory-note", "Run memory-note", &.{"--help"});
     addRunStep(b, st, "run-st", "Run st", &.{"--help"});
-    addRunStep(b, mesh, "run-mesh", "Run mesh", &.{"--help"});
-    addRunStep(b, parse_arch, "run-parse-arch", "Run parse-arch", &.{"--help"});
     addRunStep(b, bench_stats, "run-bench-stats", "Run bench_stats", &.{"--help"});
     addRunStep(b, cas_smoke_check, "run-cas-smoke-check", "Run cas_smoke_check", &.{"--help"});
     addRunStep(b, cas_conformance_suite, "run-cas-conformance-suite", "Run cas_conformance_suite", &.{"--help"});

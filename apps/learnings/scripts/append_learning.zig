@@ -1249,7 +1249,7 @@ test "condition-action and counterfactual detectors" {
 
 test "evidence anchors detect run ids, paths, and status language" {
     try std.testing.expect(hasEvidenceAnchor("release run 22525295017 passed"));
-    try std.testing.expect(hasEvidenceAnchor("see apps/mesh/scripts/mesh.zig"));
+    try std.testing.expect(hasEvidenceAnchor("see apps/cas/scripts/cas.zig"));
     try std.testing.expect(hasEvidenceAnchor("commit a1b2c3d4e5f6"));
     try std.testing.expect(!hasEvidenceAnchor("follow up later maybe"));
 }
