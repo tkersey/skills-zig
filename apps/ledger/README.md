@@ -1,13 +1,20 @@
 # ledger
 
-Repo-local durable negative evidence ledger.
+Repo-local durable source-memory ledger.
 
 `ledger` stores disconfirmed hypotheses, failed routes, reopening criteria, and route-exclusion evidence in an append-only JSONL file that future runs can query directly.
+It also owns learning capture under `--source learnings`.
 
 Default store:
 
 ```bash
 .ledger/negative-ledger/events.jsonl
+```
+
+Learning source store:
+
+```bash
+.ledger/learnings/events.jsonl
 ```
 
 ## Commands
@@ -26,9 +33,14 @@ ledger handoff
 ledger compact
 ledger doctor
 ledger migrate --mode copy
+ledger capture --source learnings --learning "When X, prefer Y because Z." --evidence "command/result" --application "Do Y next time."
+ledger recall --source learnings --query "focused task" --limit 5 --drop-superseded
+ledger migrate --source learnings --mode copy
+ledger doctor --source learnings
 ```
 
 Use `--file PATH` to point at a non-default store.
+For `--source learnings`, `--file PATH` is accepted as an alias for the learning event path.
 
 Path migration:
 
@@ -37,6 +49,18 @@ ledger migrate \
   --from .ledger/negative-ledger.jsonl \
   --to .ledger/negative-ledger/events.jsonl \
   --mode copy
+```
+
+Learning path migration:
+
+```bash
+ledger migrate --source learnings --mode copy
+```
+
+This converts legacy rows from `.ledger/learnings/learnings.jsonl` or `.learnings.jsonl` into event envelopes:
+
+```json
+{"v":1,"source":"learnings","event":"learning.capture","learning_id":"lrn-...","status":"do_more","record":{ "...": "old learning row fields" }}
 ```
 
 ## Capture
@@ -56,6 +80,19 @@ ledger migrate \
 ```
 
 Records get monotonic `NEG-*` ids. A capture that requests `active` without witness evidence is stored as `need-evidence`, not as an active exclusion.
+
+For learning capture, use `--source learnings` with the learning flags:
+
+```bash
+ledger capture --source learnings \
+  --status do_more \
+  --learning "When a documented CLI form has already propagated, keep a tested compatibility alias because agents copy command forms." \
+  --evidence "zig build test-ledger passed after adding parser coverage" \
+  --application "Add compatibility before only updating docs." \
+  --tag cli
+```
+
+Use `--record-source SOURCE` to override the source marker stored inside the learning row.
 
 Active exclusions are route-scoped by default. Same-cluster recurrence is reusable memory, not an automatic ban.
 

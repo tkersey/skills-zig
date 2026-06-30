@@ -5,7 +5,8 @@ const std = @import("std");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
 pub const LegacyLearningsPath = ".learnings.jsonl";
-pub const DefaultLearningsPath = ".ledger/learnings/learnings.jsonl";
+pub const PreviousLearningsPath = ".ledger/learnings/learnings.jsonl";
+pub const DefaultLearningsPath = ".ledger/learnings/events.jsonl";
 
 pub const Surface = struct {
     program_name: []const u8,
@@ -15,13 +16,13 @@ pub const Surface = struct {
 
 const StandaloneSurface = Surface{
     .program_name = "append_learning",
-    .usage_line = "usage: append_learning [-h] [--status STATUS] --learning LEARNING [--evidence EVIDENCE] [--application APPLICATION] [--tag TAG] [--related-id RELATED_ID] [--supersedes-id SUPERSEDES_ID] [--repo REPO] [--path PATH] [--source SOURCE] [--allow-duplicate] [--quality-mode {strict,best_effort}] [--allow-temp-path]",
+    .usage_line = "usage: append_learning [-h] [--status STATUS] --learning LEARNING [--evidence EVIDENCE] [--application APPLICATION] [--tag TAG] [--related-id RELATED_ID] [--supersedes-id SUPERSEDES_ID] [--repo REPO] [--path PATH] [--record-source SOURCE] [--allow-duplicate] [--quality-mode {strict,best_effort}] [--allow-temp-path]",
     .help_text =
     \\append_learning
     \\
-    \\usage: append_learning [-h] [--status STATUS] --learning LEARNING [--evidence EVIDENCE] [--application APPLICATION] [--tag TAG] [--related-id RELATED_ID] [--supersedes-id SUPERSEDES_ID] [--repo REPO] [--path PATH] [--source SOURCE] [--allow-duplicate] [--quality-mode {strict,best_effort}] [--allow-temp-path]
+    \\usage: append_learning [-h] [--status STATUS] --learning LEARNING [--evidence EVIDENCE] [--application APPLICATION] [--tag TAG] [--related-id RELATED_ID] [--supersedes-id SUPERSEDES_ID] [--repo REPO] [--path PATH] [--record-source SOURCE] [--allow-duplicate] [--quality-mode {strict,best_effort}] [--allow-temp-path]
     \\
-    \\Append a structured learning record to repo-local .ledger/learnings/learnings.jsonl.
+    \\Append a structured learning event to repo-local .ledger/learnings/events.jsonl.
     \\
     \\options:
     \\  -h, --help            show this help message and exit
@@ -37,7 +38,8 @@ const StandaloneSurface = Surface{
     \\                        If this learning supersedes an older record id
     \\  --repo REPO           Repo identifier override (defaults to remote origin slug or repo dir name)
     \\  --path PATH           Path to JSONL file, relative to repo root by default
-    \\  --source SOURCE       Source marker for the record
+    \\  --record-source SOURCE
+    \\                        Source marker for the record
     \\  --allow-duplicate     Append even if an existing record has the same fingerprint
     \\  --quality-mode {strict,best_effort}
     \\                        Record quality gate mode; strict rejects weak records, best_effort keeps legacy placeholder behavior.
@@ -48,14 +50,14 @@ const StandaloneSurface = Surface{
 };
 
 const SubcommandSurface = Surface{
-    .program_name = "learnings append",
-    .usage_line = "usage: learnings append [-h] [--status STATUS] --learning LEARNING [--evidence EVIDENCE] [--application APPLICATION] [--tag TAG] [--related-id RELATED_ID] [--supersedes-id SUPERSEDES_ID] [--repo REPO] [--path PATH] [--source SOURCE] [--allow-duplicate] [--quality-mode {strict,best_effort}] [--allow-temp-path]",
+    .program_name = "ledger capture --source learnings",
+    .usage_line = "usage: ledger capture --source learnings [-h] [--status STATUS] --learning LEARNING [--evidence EVIDENCE] [--application APPLICATION] [--tag TAG] [--related-id RELATED_ID] [--supersedes-id SUPERSEDES_ID] [--repo REPO] [--path PATH] [--record-source SOURCE] [--allow-duplicate] [--quality-mode {strict,best_effort}] [--allow-temp-path]",
     .help_text =
-    \\learnings append
+    \\ledger capture --source learnings
     \\
-    \\usage: learnings append [-h] [--status STATUS] --learning LEARNING [--evidence EVIDENCE] [--application APPLICATION] [--tag TAG] [--related-id RELATED_ID] [--supersedes-id SUPERSEDES_ID] [--repo REPO] [--path PATH] [--source SOURCE] [--allow-duplicate] [--quality-mode {strict,best_effort}] [--allow-temp-path]
+    \\usage: ledger capture --source learnings [-h] [--status STATUS] --learning LEARNING [--evidence EVIDENCE] [--application APPLICATION] [--tag TAG] [--related-id RELATED_ID] [--supersedes-id SUPERSEDES_ID] [--repo REPO] [--path PATH] [--record-source SOURCE] [--allow-duplicate] [--quality-mode {strict,best_effort}] [--allow-temp-path]
     \\
-    \\Append a structured learning record to repo-local .ledger/learnings/learnings.jsonl.
+    \\Append a structured learning event to repo-local .ledger/learnings/events.jsonl.
     \\
     \\options:
     \\  -h, --help            show this help message and exit
@@ -71,7 +73,8 @@ const SubcommandSurface = Surface{
     \\                        If this learning supersedes an older record id
     \\  --repo REPO           Repo identifier override (defaults to remote origin slug or repo dir name)
     \\  --path PATH           Path to JSONL file, relative to repo root by default
-    \\  --source SOURCE       Source marker for the record
+    \\  --record-source SOURCE
+    \\                        Source marker for the record
     \\  --allow-duplicate     Append even if an existing record has the same fingerprint
     \\  --quality-mode {strict,best_effort}
     \\                        Record quality gate mode; strict rejects weak records, best_effort keeps legacy placeholder behavior.
@@ -138,7 +141,7 @@ const Options = struct {
     repo: []const u8 = "",
     path: []const u8 = DefaultLearningsPath,
     path_explicit: bool = false,
-    source: []const u8 = "skill:learnings",
+    source: []const u8 = "ledger:learnings",
     allow_duplicate: bool = false,
     quality_mode: QualityMode = .strict,
     allow_temp_path: bool = false,
@@ -288,7 +291,7 @@ pub fn runWithAllocator(
             opts.path_explicit = true;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--source")) {
+        if (std.mem.eql(u8, arg, "--record-source") or std.mem.eql(u8, arg, "--source")) {
             i += 1;
             if (i >= args.len) exitParseError(surface, "argument --source: expected one argument", .{});
             opts.source = args[i];
@@ -448,7 +451,7 @@ pub fn runWithAllocator(
         .supersedes_id = supersedes_id,
     };
 
-    const line = try encodeRecordJsonAlloc(allocator, record);
+    const line = try encodeLearningEventJsonAlloc(allocator, record);
     defer allocator.free(line);
 
     try appendJsonLine(output_path, line);
@@ -993,6 +996,10 @@ fn resolveWritePathAlloc(
     errdefer allocator.free(next_path);
     if (durable_store.fileExists(next_path)) return next_path;
 
+    const previous_path = try resolveOutputPathAlloc(allocator, repo_root, PreviousLearningsPath);
+    defer allocator.free(previous_path);
+    if (durable_store.fileExists(previous_path)) return error.MigrationRequired;
+
     const legacy_path = try resolveOutputPathAlloc(allocator, repo_root, LegacyLearningsPath);
     defer allocator.free(legacy_path);
     if (durable_store.fileExists(legacy_path)) return error.MigrationRequired;
@@ -1028,7 +1035,8 @@ fn findDuplicateExistingIdAlloc(allocator: std.mem.Allocator, path: []const u8, 
             else => continue,
         };
 
-        const fp_value = obj.get("fingerprint") orelse continue;
+        const record_obj = learningRecordObject(obj) orelse continue;
+        const fp_value = record_obj.get("fingerprint") orelse continue;
         const fp_text = switch (fp_value) {
             .string => |value| value,
             else => continue,
@@ -1036,7 +1044,7 @@ fn findDuplicateExistingIdAlloc(allocator: std.mem.Allocator, path: []const u8, 
 
         if (!std.mem.eql(u8, fp_text, fingerprint)) continue;
 
-        if (obj.get("id")) |id_value| {
+        if (record_obj.get("id")) |id_value| {
             const id_text = switch (id_value) {
                 .string => |value| value,
                 else => "unknown",
@@ -1048,6 +1056,23 @@ fn findDuplicateExistingIdAlloc(allocator: std.mem.Allocator, path: []const u8, 
     }
 
     return null;
+}
+
+fn learningRecordObject(obj: std.json.ObjectMap) ?std.json.ObjectMap {
+    if (obj.get("record")) |record_value| {
+        if (record_value == .object and std.mem.eql(u8, jsonObjectStringField(obj, "event"), "learning.capture")) {
+            return record_value.object;
+        }
+    }
+    return obj;
+}
+
+fn jsonObjectStringField(obj: std.json.ObjectMap, key: []const u8) []const u8 {
+    const value = obj.get(key) orelse return "";
+    return switch (value) {
+        .string => |text| text,
+        else => "",
+    };
 }
 
 fn encodeRecordJsonAlloc(allocator: std.mem.Allocator, record: Record) ![]u8 {
@@ -1087,6 +1112,25 @@ fn encodeRecordJsonAlloc(allocator: std.mem.Allocator, record: Record) ![]u8 {
         try writeFieldString(writer, &first, "supersedes_id", value);
     }
 
+    try writer.writeByte('}');
+    return writer_alloc.toOwnedSlice();
+}
+
+fn encodeLearningEventJsonAlloc(allocator: std.mem.Allocator, record: Record) ![]u8 {
+    const row = try encodeRecordJsonAlloc(allocator, record);
+    defer allocator.free(row);
+
+    var out: std.ArrayList(u8) = .empty;
+    var writer_alloc: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+
+    try writer.writeAll("{\"v\":1,\"source\":\"learnings\",\"event\":\"learning.capture\",\"learning_id\":");
+    try writeJsonStringAscii(writer, record.id);
+    try writer.writeAll(",\"status\":");
+    try writeJsonStringAscii(writer, record.status);
+    try writer.writeAll(",\"record\":");
+    try writer.writeAll(row);
     try writer.writeByte('}');
     return writer_alloc.toOwnedSlice();
 }
@@ -1234,7 +1278,7 @@ test "discoverRepoRootAlloc walks to git ancestor" {
     try std.testing.expectEqualStrings(root_abs, resolved_nested);
 }
 
-test "append default writes .ledger/learnings/learnings.jsonl" {
+test "append default writes .ledger/learnings/events.jsonl" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 

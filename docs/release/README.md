@@ -7,7 +7,6 @@ This monorepo uses independent GitHub Actions release workflows per CLI:
 - `cas`: `.github/workflows/release-cas.yml` on tag `cas-v*`
 - `cron`: `.github/workflows/release-cron.yml` on tag `cron-v*`
 - `puff`: `.github/workflows/release-puff.yml` on tag `puff-v*`
-- `learnings`: `.github/workflows/release-learnings.yml` on tag `learnings-v*`
 - `ledger`: `.github/workflows/release-ledger.yml` on tag `ledger-v*`
 - `mesh`: `.github/workflows/release-mesh.yml` on tag `mesh-v*`
 - `st`: `.github/workflows/release-st.yml` on tag `st-v*`
@@ -20,7 +19,6 @@ Per-app VERSION files:
 - `apps/cas/VERSION`
 - `apps/cron/VERSION`
 - `apps/puff/VERSION`
-- `apps/learnings/VERSION`
 - `apps/ledger/VERSION`
 - `apps/mesh/VERSION`
 - `apps/st/VERSION`
@@ -32,7 +30,8 @@ Release contract:
 2. Release-relevant surfaces are conservative:
    - `apps/<cli>/**` except the per-app `README.md` counts for that CLI.
    - broad shared shipped surfaces (`build.zig`, `build.zig.zon`, `libs/core/**`) count for every shipped CLI.
-   - `libs/durable_store/**` counts for its shipped consumers: `learnings`, `ledger`, and `st`.
+   - `apps/learnings/**` counts for `ledger`; it is an internal source module, not a shipped CLI.
+   - `libs/durable_store/**` counts for its shipped consumers: `ledger` and `st`.
    - `.github/workflows/release-<cli>.yml` counts for that CLI's packaged artifact contract.
    Durable-store changes that alter lease locks, fencing counters, CAS writes, transaction recovery, or semantic concurrency errors must be treated as release-relevant for every shipped consumer whose command behavior depends on those paths. For `st`, that includes workspace mutation and exit code `2` conflict/recovery states.
 3. When those `VERSION` bumps land on `main`, `.github/workflows/auto-release.yml` creates any missing tags and dispatches the matching release workflows automatically.
@@ -45,7 +44,6 @@ Release tags must match file versions:
 - `cas-v<version>` where `<version>` equals `apps/cas/VERSION`
 - `cron-v<version>` where `<version>` equals `apps/cron/VERSION`
 - `puff-v<version>` where `<version>` equals `apps/puff/VERSION`
-- `learnings-v<version>` where `<version>` equals `apps/learnings/VERSION`
 - `ledger-v<version>` where `<version>` equals `apps/ledger/VERSION`
 - `mesh-v<version>` where `<version>` equals `apps/mesh/VERSION`
 - `st-v<version>` where `<version>` equals `apps/st/VERSION`
@@ -68,8 +66,6 @@ Examples:
 - `cron-v1.2.3-darwin-arm64.tar.gz`
 - `puff-v1.2.3-linux-x86_64.tar.gz`
 - `puff-v1.2.3-darwin-arm64.tar.gz`
-- `learnings-v1.2.3-linux-x86_64.tar.gz`
-- `learnings-v1.2.3-darwin-arm64.tar.gz`
 - `ledger-v1.2.3-linux-x86_64.tar.gz`
 - `ledger-v1.2.3-darwin-arm64.tar.gz`
 - `mesh-v1.2.3-linux-x86_64.tar.gz`
@@ -101,7 +97,7 @@ Use explicit queue checks first:
 
 ```bash
 gh run list --workflow release-seq.yml --status queued --limit 20
-gh run list --workflow release-learnings.yml --status queued --limit 20
+gh run list --workflow release-ledger.yml --status queued --limit 20
 gh run view <run-id> --json status,jobs,headBranch,createdAt
 ```
 

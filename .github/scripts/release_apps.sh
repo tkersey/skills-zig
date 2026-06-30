@@ -16,7 +16,6 @@ apps=(
   cas
   cron
   puff
-  learnings
   ledger
   memory-note
   mesh
@@ -52,7 +51,6 @@ case "$mode" in
     }
 
     mark_durable_store_consumers() {
-      mark_app learnings
       mark_app ledger
       mark_app memory-note
       mark_app st
@@ -221,9 +219,6 @@ case "$mode" in
         .github/workflows/release-puff.yml)
           mark_app puff
           ;;
-        .github/workflows/release-learnings.yml)
-          mark_app learnings
-          ;;
         .github/workflows/release-ledger.yml)
           mark_app ledger
           ;;
@@ -257,7 +252,7 @@ case "$mode" in
           mark_app puff
           ;;
         apps/learnings/*)
-          mark_app learnings
+          mark_app ledger
           ;;
         apps/ledger/*)
           mark_app ledger
