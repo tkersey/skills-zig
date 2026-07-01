@@ -39,6 +39,8 @@ pub const projection_fields = [_][]const u8{
     "transport_signal",
     "record_path",
     "event_log_path",
+    "review_broker_action",
+    "review_broker_reason",
 };
 
 pub const summary_fields = [_][]const u8{
@@ -52,6 +54,11 @@ pub const summary_fields = [_][]const u8{
     "duplicate_prevented_count",
     "start_wait_normalized_count",
     "start_wait_unormalized_count",
+    "broker_run_count",
+    "broker_auto_replaced_dead_transport_count",
+    "broker_attached_existing_count",
+    "broker_blocked_live_count",
+    "manual_recovery_command_count",
     "lane_backend_status",
 };
 
@@ -108,6 +115,11 @@ pub const Summary = struct {
     duplicate_prevented_count: i64 = 0,
     start_wait_normalized_count: i64 = 0,
     start_wait_unormalized_count: i64 = 0,
+    broker_run_count: i64 = 0,
+    broker_auto_replaced_dead_transport_count: i64 = 0,
+    broker_attached_existing_count: i64 = 0,
+    broker_blocked_live_count: i64 = 0,
+    manual_recovery_command_count: i64 = 0,
     lane_backend_status: []const u8 = "unavailable",
 };
 
@@ -170,6 +182,11 @@ pub fn summaryRow(allocator: std.mem.Allocator, summary: Summary) !query.Row {
     try row.putStaticKey("duplicate_prevented_count", .{ .int = summary.duplicate_prevented_count });
     try row.putStaticKey("start_wait_normalized_count", .{ .int = summary.start_wait_normalized_count });
     try row.putStaticKey("start_wait_unormalized_count", .{ .int = summary.start_wait_unormalized_count });
+    try row.putStaticKey("broker_run_count", .{ .int = summary.broker_run_count });
+    try row.putStaticKey("broker_auto_replaced_dead_transport_count", .{ .int = summary.broker_auto_replaced_dead_transport_count });
+    try row.putStaticKey("broker_attached_existing_count", .{ .int = summary.broker_attached_existing_count });
+    try row.putStaticKey("broker_blocked_live_count", .{ .int = summary.broker_blocked_live_count });
+    try row.putStaticKey("manual_recovery_command_count", .{ .int = summary.manual_recovery_command_count });
     try row.putStaticKey("lane_backend_status", .{ .string = summary.lane_backend_status });
     return row;
 }
@@ -187,6 +204,11 @@ pub fn writeReport(writer: anytype, summary: Summary) !void {
     try writer.print("- duplicate_prevented_count: {d}\n", .{summary.duplicate_prevented_count});
     try writer.print("- start_wait_normalized_count: {d}\n", .{summary.start_wait_normalized_count});
     try writer.print("- start_wait_unormalized_count: {d}\n", .{summary.start_wait_unormalized_count});
+    try writer.print("- broker_run_count: {d}\n", .{summary.broker_run_count});
+    try writer.print("- broker_auto_replaced_dead_transport_count: {d}\n", .{summary.broker_auto_replaced_dead_transport_count});
+    try writer.print("- broker_attached_existing_count: {d}\n", .{summary.broker_attached_existing_count});
+    try writer.print("- broker_blocked_live_count: {d}\n", .{summary.broker_blocked_live_count});
+    try writer.print("- manual_recovery_command_count: {d}\n", .{summary.manual_recovery_command_count});
     try writer.writeAll("\nCompleted findings are review outcomes, not CAS backend failures.\n");
 }
 
@@ -269,13 +291,17 @@ fn scanSessionPath(
             const cmd = stringField(args_obj, "cmd") orelse continue;
             if (!looksLikeCasReviewCommand(cmd)) continue;
             const ts = stringField(root, "timestamp") orelse "";
-            try pending.put(call_id, .{
+            const call = PendingCall{
                 .call_id = call_id,
                 .session_id = session_id,
                 .timestamp = ts,
                 .command = cmd,
                 .cwd = nullableString(args_obj, "workdir") orelse nullableString(args_obj, "cwd"),
-            });
+            };
+            if (manualRecoveryCommand(cmd)) {
+                try appendManualRecoveryCommandRow(allocator, call, path, params, audit, dedupe);
+            }
+            try pending.put(call_id, call);
             continue;
         }
 
@@ -288,6 +314,55 @@ fn scanSessionPath(
             try appendRowsFromCommandText(allocator, stdout, stderr, call, path, params, audit, dedupe);
         }
     }
+}
+
+fn appendManualRecoveryCommandRow(
+    allocator: std.mem.Allocator,
+    call: PendingCall,
+    session_path: []const u8,
+    params: Params,
+    audit: *Audit,
+    dedupe: *std.StringHashMap(void),
+) !void {
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    try putStringOrNull(&row, "session_id", nonEmpty(call.session_id));
+    try row.putStaticKey("source_path", .{ .string = session_path });
+    try putStringOrNull(&row, "receipt_path", null);
+    try putStringOrNull(&row, "cwd", call.cwd);
+    try row.putStaticKey("command_surface", .{ .string = call.command });
+    try row.putStaticKey("surface", .{ .string = "manual_recovery_command" });
+    try putStringOrNull(&row, "backend_class", null);
+    try putStringOrNull(&row, "review_attempt_phase", null);
+    try row.putStaticKey("review_attempt_exists", .{ .bool = false });
+    try row.putStaticKey("tuple_verdict_exists", .{ .bool = false });
+    try putStringOrNull(&row, "failure_code", null);
+    try putStringOrNull(&row, "failure_class", null);
+    try putBoolOrNull(&row, "retryable_same_tuple_now", null);
+    try putStringOrNull(&row, "lane_id", null);
+    try putIntOrNull(&row, "managed_server_pid", null);
+    try putStringOrNull(&row, "managed_server_listen_url", null);
+    try putStringOrNull(&row, "server_exit_status", null);
+    try putStringOrNull(&row, "stderr_log_path", null);
+    try row.putStaticKey("review_count", .{ .int = 0 });
+    try putStringOrNull(&row, "last_review_thread_id", null);
+    try putStringOrNull(&row, "review_thread_id", null);
+    try putStringOrNull(&row, "review_turn_id", null);
+    try putStringOrNull(&row, "base_sha", null);
+    try putStringOrNull(&row, "head_sha", null);
+    try putStringOrNull(&row, "target_fingerprint", null);
+    try putStringOrNull(&row, "review_verdict_status", null);
+    try row.putStaticKey("finding_count", .{ .int = 0 });
+    try row.putStaticKey("account_resource_signal", .{ .bool = false });
+    try row.putStaticKey("transport_signal", .{ .bool = false });
+    try putStringOrNull(&row, "record_path", null);
+    try putStringOrNull(&row, "event_log_path", null);
+    try putStringOrNull(&row, "review_broker_action", null);
+    try putStringOrNull(&row, "review_broker_reason", null);
+
+    const fallback = try std.fmt.allocPrint(allocator, "{s}:manual-recovery", .{call.call_id});
+    defer allocator.free(fallback);
+    try appendRowIfMatched(allocator, row, session_path, fallback, params, audit, dedupe);
 }
 
 fn scanReceiptPath(
@@ -516,6 +591,8 @@ fn classifySmokeResultObject(
     try row.putStaticKey("transport_signal", .{ .bool = transportSignal(failure_code, nullableStringAny(result, &.{ "failureClass", "failure_class" })) });
     try putStringOrNull(&row, "record_path", record_path);
     try putStringOrNull(&row, "event_log_path", event_log_path);
+    try putStringOrNull(&row, "review_broker_action", null);
+    try putStringOrNull(&row, "review_broker_reason", null);
     return row;
 }
 
@@ -546,6 +623,9 @@ fn classifyReceiptText(allocator: std.mem.Allocator, text: []const u8, ctx: Clas
 
 fn classifyReceiptObject(allocator: std.mem.Allocator, root: std.json.ObjectMap, ctx: ClassifyContext) !query.Row {
     const verdict = objectField(root, "reviewVerdict");
+    const broker = objectField(root, "reviewBrokerDecision");
+    const broker_action = if (broker) |value| nullableString(value, "action") else null;
+    const broker_reason = if (broker) |value| nullableString(value, "reason") else null;
     const surface = nullableString(root, "surface") orelse if (verdict != null) "normalize" else "runner";
     const failure_code_raw = nullableStringAny(root, &.{ "failureCode", "failure_code" });
     const review_thread_id = nullableStringAny(root, &.{ "reviewThreadId", "review_thread_id" }) orelse if (verdict) |v| nullableStringAny(v, &.{ "reviewThreadId", "review_thread_id" }) else null;
@@ -611,6 +691,8 @@ fn classifyReceiptObject(allocator: std.mem.Allocator, root: std.json.ObjectMap,
     try row.putStaticKey("transport_signal", .{ .bool = transportSignal(failure_code, nullableStringAny(root, &.{ "failureClass", "failure_class" })) });
     try putStringOrNull(&row, "record_path", record_path);
     try putStringOrNull(&row, "event_log_path", event_log_path);
+    try putStringOrNull(&row, "review_broker_action", broker_action);
+    try putStringOrNull(&row, "review_broker_reason", broker_reason);
     return row;
 }
 
@@ -626,9 +708,17 @@ fn summarize(rows: []const query.Row) Summary {
         const phase = scalarString(row, "review_attempt_phase");
         const status = scalarString(row, "review_verdict_status");
         const backend = scalarString(row, "backend_class");
+        const command_surface = scalarString(row, "command_surface") orelse "";
+        const broker_action = scalarString(row, "review_broker_action");
         const attempt_exists = scalarBool(row, "review_attempt_exists");
         const tuple_exists = scalarBool(row, "tuple_verdict_exists");
         const finding_count = scalarInt(row, "finding_count");
+
+        if (broker_action != null or std.mem.indexOf(u8, command_surface, "review_session run") != null) out.broker_run_count += 1;
+        if (optEql(broker_action, "auto_replaced_dead_transport")) out.broker_auto_replaced_dead_transport_count += 1;
+        if (optEql(broker_action, "attached_existing")) out.broker_attached_existing_count += 1;
+        if (optEql(broker_action, "blocked_live_attempt")) out.broker_blocked_live_count += 1;
+        if (manualRecoveryCommand(command_surface)) out.manual_recovery_command_count += 1;
 
         if (optEql(failure_code, "pre_review_lane_transport_lost")) {
             out.pre_review_lane_transport_lost_count += 1;
@@ -668,6 +758,14 @@ fn summarize(rows: []const query.Row) Summary {
     else
         "unavailable";
     return out;
+}
+
+fn manualRecoveryCommand(command_surface: []const u8) bool {
+    return std.mem.indexOf(u8, command_surface, "review_session lock") != null or
+        std.mem.indexOf(u8, command_surface, "review_session receipt") != null or
+        std.mem.indexOf(u8, command_surface, "receipt normalize") != null or
+        std.mem.indexOf(u8, command_surface, "lock gate") != null or
+        std.mem.indexOf(u8, command_surface, "--review-lock-override") != null;
 }
 
 fn inferPhase(
@@ -852,6 +950,7 @@ fn looksLikeReceiptObject(root: std.json.ObjectMap) bool {
         if (optEql(surface, "normalize") or optEql(surface, "runner")) return true;
     }
     if (objectField(root, "reviewVerdict") != null) return true;
+    if (objectField(root, "reviewBrokerDecision") != null) return true;
     if (nullableStringAny(root, &.{ "reviewThreadId", "review_thread_id" }) != null) return true;
     if (nullableStringAny(root, &.{ "reviewAttemptPhase", "review_attempt_phase" }) != null) return true;
     if (nullableStringAny(root, &.{ "failureCode", "failure_code" }) != null) return true;
@@ -1189,7 +1288,6 @@ test "stored terminal lane session record preserves lane backend" {
     try std.testing.expectEqualStrings("clean", scalarString(row, "review_verdict_status").?);
 }
 
-
 test "standard response item output is audited with top-level session meta" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1218,6 +1316,65 @@ test "standard response item output is audited with top-level session meta" {
     try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_clean_count);
     try std.testing.expectEqual(@as(i64, 1), audit.summary.start_wait_normalized_count);
     try std.testing.expectEqualStrings("sess-standard", scalarString(audit.rows.items[0], "session_id").?);
+}
+
+test "brokered run output contributes broker summary counters" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "session.jsonl", .data =
+        \\{"type":"session_meta","timestamp":"2026-06-27T01:00:00Z","payload":{"id":"sess-broker"}}
+        \\{"type":"response_item","timestamp":"2026-06-27T01:00:01Z","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"cas review_session run --cwd /repo --base main --json\",\"cwd\":\"/repo\"}"}}
+        \\{"type":"response_item","timestamp":"2026-06-27T01:00:02Z","payload":{"type":"function_call_output","call_id":"call-1","output":"{\"demo\":\"cas-review-session\",\"action\":\"run\",\"reviewBrokerDecision\":{\"version\":\"CAS-RBD-v1\",\"action\":\"auto_replaced_dead_transport\",\"reason\":\"dead\",\"reviewThreadId\":\"thr_1\",\"recordPath\":\"/tmp/review.json\",\"eventLogPath\":\"/tmp/review.events.ndjson\"},\"reviewThreadId\":\"thr_2\",\"baseSha\":\"b\",\"headSha\":\"h\",\"targetFingerprint\":\"t\",\"reviewVerdict\":{\"status\":\"clean\",\"clean\":true,\"findingCount\":0,\"failureCode\":null,\"baseSha\":\"b\",\"headSha\":\"h\",\"targetFingerprint\":\"t\",\"reviewThreadId\":\"thr_2\",\"backendClass\":\"cas-start-wait\"}}\n"}}
+        \\
+    });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "session.jsonl" });
+    defer std.testing.allocator.free(path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .path = path,
+        .session_id = "sess-broker",
+        .repo = "/repo",
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), audit.rows.items.len);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.broker_run_count);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.broker_auto_replaced_dead_transport_count);
+    try std.testing.expectEqualStrings("auto_replaced_dead_transport", scalarString(audit.rows.items[0], "review_broker_action").?);
+}
+
+test "manual recovery command is counted without receipt-shaped output" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "session.jsonl", .data =
+        \\{"type":"session_meta","timestamp":"2026-06-27T01:00:00Z","payload":{"id":"sess-manual"}}
+        \\{"type":"response_item","timestamp":"2026-06-27T01:00:01Z","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"cas review_session lock gate --path tuple-lock.json --format json\",\"cwd\":\"/repo\"}"}}
+        \\{"type":"response_item","timestamp":"2026-06-27T01:00:02Z","payload":{"type":"function_call_output","call_id":"call-1","output":"not json\n"}}
+        \\
+    });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "session.jsonl" });
+    defer std.testing.allocator.free(path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .path = path,
+        .session_id = "sess-manual",
+        .repo = "/repo",
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), audit.rows.items.len);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.manual_recovery_command_count);
+    try std.testing.expectEqualStrings("manual_recovery_command", scalarString(audit.rows.items[0], "surface").?);
 }
 
 test "basename receipt glob keeps handle-less receipts distinct and skips non-receipts" {

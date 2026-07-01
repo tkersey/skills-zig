@@ -19,9 +19,10 @@ const UsageText =
     \\Control detached Codex review sessions via the app-server.
     \\
     \\Usage:
-    \\  cas_review_session <start|status|wait|interrupt|lane|receipt|lock> [options]
+    \\  cas_review_session <run|start|status|wait|interrupt|lane|receipt|lock> [options]
     \\
     \\Actions:
+    \\  run        Broker one tuple-bound review verdict; waits and hides lock recovery.
     \\  start      Start a detached review session and persist its handle.
     \\  status     Read the persisted session and report current review status.
     \\  wait       Poll the persisted session until the review turn reaches a terminal status.
@@ -49,7 +50,7 @@ const UsageText =
     \\Lock actions:
     \\  lock gate          Validate saved CAS-RTL-v1 tuple-lock records.
     \\
-    \\Start options:
+    \\Run/start options:
     \\  --cwd DIR                        Workspace for the app-server.
     \\  --parent-thread-id THREAD_ID     Optional parent thread id to reuse.
     \\  --parent-mode MODE               Parent strategy: auto|fresh|reuse (default: auto).
@@ -106,6 +107,7 @@ const UsageText =
     \\  version                          Show version.
     \\
     \\Examples:
+    \\  cas review_session run --cwd /path/to/repo --base main --json
     \\  cas review_session start --cwd /path/to/repo --uncommitted --json
     \\  cas review_session start --cwd /path/to/repo --base main --json
     \\  cas review_session start --wait --cwd /path/to/repo --base main --json
@@ -126,6 +128,7 @@ const UsageText =
 ;
 
 const Action = enum {
+    run,
     start,
     status,
     wait,
@@ -135,6 +138,7 @@ const Action = enum {
     lock,
 
     fn parse(raw: []const u8) ?Action {
+        if (std.mem.eql(u8, raw, "run")) return .run;
         if (std.mem.eql(u8, raw, "start")) return .start;
         if (std.mem.eql(u8, raw, "status")) return .status;
         if (std.mem.eql(u8, raw, "wait")) return .wait;
@@ -427,6 +431,7 @@ const ReviewTupleLockAction = enum {
     normalize_existing,
     fresh_after_terminal,
     retry_after_pre_review_failure,
+    auto_replace_dead_transport,
     takeover_with_override,
     block_active,
     block_stale,
@@ -440,6 +445,7 @@ const ReviewTupleLockAction = enum {
             .normalize_existing => "normalize_existing",
             .fresh_after_terminal => "fresh_after_terminal",
             .retry_after_pre_review_failure => "retry_after_pre_review_failure",
+            .auto_replace_dead_transport => "auto_replace_dead_transport",
             .takeover_with_override => "takeover_with_override",
             .block_active => "block_active",
             .block_stale => "block_stale",
@@ -542,6 +548,7 @@ const LaneSmokeRunSummary = struct {
 };
 
 const OutputReceipt = struct {
+    surface_action: []const u8 = "start",
     resolved_codex_path: ?[]const u8 = null,
     resolved_codex_version: ?[]const u8 = null,
     compatibility_verdict: []const u8 = "not_checked",
@@ -558,6 +565,16 @@ const OutputReceipt = struct {
     effective_multi_agent_mode: ?cas.MultiAgentMode = null,
     multi_agent_mode_support: cas.MultiAgentModeSupport = .not_requested,
     multi_agent_mode_metric_eligible: bool = false,
+    review_broker_decision: ?ReviewBrokerDecision = null,
+};
+
+const ReviewBrokerDecision = struct {
+    version: []const u8 = "CAS-RBD-v1",
+    action: []const u8,
+    reason: []const u8,
+    reviewThreadId: ?[]const u8 = null,
+    recordPath: ?[]const u8 = null,
+    eventLogPath: ?[]const u8 = null,
 };
 
 const FailureInfo = struct {
@@ -759,6 +776,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     switch (parsed.action.?) {
+        .run => try cmdRun(allocator, init.io, parsed),
         .start => try cmdStart(allocator, init.io, parsed),
         .status => try cmdStatus(allocator, init.io, parsed),
         .wait => try cmdWait(allocator, init.io, parsed),
@@ -1025,6 +1043,7 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
 
     if (out.multi_agent_mode != null) {
         switch (out.action.?) {
+            .run => {},
             .start => {},
             .lane => switch (out.lane_action orelse return error.MissingLaneAction) {
                 .review, .smoke, .smoke_suite, .smoke_until_fixed => {},
@@ -1035,6 +1054,7 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
     }
     if (out.review_lock_override_reason != null) {
         switch (out.action.?) {
+            .run => {},
             .start => {},
             .lane => if (out.lane_action != .review and out.lane_action != .smoke) return error.ReviewLockOverrideUnsupportedAction,
             .status, .wait, .interrupt, .receipt, .lock => return error.ReviewLockOverrideUnsupportedAction,
@@ -1042,13 +1062,14 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
     }
     if (out.fresh_attempt_reason != null) {
         switch (out.action.?) {
+            .run => {},
             .start => {},
             .lane => if (out.lane_action != .review) return error.FreshAttemptUnsupportedAction,
             .status, .wait, .interrupt, .receipt, .lock => return error.FreshAttemptUnsupportedAction,
         }
     }
     switch (out.action.?) {
-        .start => {
+        .run, .start => {
             if (out.cwd == null) return error.MissingCwd;
             if (out.target == null) return error.MissingTarget;
             if (out.parent_mode == .fresh and out.parent_thread_id != null) return error.FreshParentModeDisallowsParentThreadId;
@@ -1167,7 +1188,15 @@ fn validateSmokeHookPolicies(raw: []const u8) !void {
     if (count == 0) return error.InvalidHooksPolicy;
 }
 
+fn cmdRun(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
+    var broker_parsed = parsed;
+    broker_parsed.wait_after_start = true;
+    broker_parsed.json = true;
+    try cmdStart(allocator, io, broker_parsed);
+}
+
 fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
+    const action_name = if (parsed.action != null and parsed.action.? == .run) "run" else "start";
     const cwd = try repoRealpathAlloc(allocator, parsed.cwd.?);
     defer allocator.free(cwd);
     const resolved_codex_path = cas.resolveExecutableAlloc(allocator, "codex") catch {
@@ -1203,6 +1232,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
     };
     defer allocator.free(codex_version);
     var output_receipt = OutputReceipt{
+        .surface_action = action_name,
         .resolved_codex_path = resolved_codex_path,
         .resolved_codex_version = codex_version,
         .compatibility_verdict = "compatible",
@@ -1281,7 +1311,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
     const tuple_lock_bundle = try acquireReviewTupleStartLockOrExit(
         allocator,
         parsed.json,
-        "start",
+        action_name,
         identity,
         review_tuple,
         parsed.review_lock_override_reason,
@@ -1523,6 +1553,19 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         .accountFingerprint = review_tuple.account_fingerprint,
         .accountFingerprintReducedProtection = review_tuple.account_fingerprint_reduced_protection,
     };
+    if (std.mem.eql(u8, action_name, "run")) {
+        const auto_replaced = std.mem.eql(u8, tuple_lock_bundle.lock.overrideReason orelse "", "auto-replaced-dead-transport");
+        output_receipt.review_broker_decision = .{
+            .action = if (auto_replaced) "auto_replaced_dead_transport" else "created_new",
+            .reason = if (auto_replaced)
+                "existing same-tuple review transport was marked lost and both recorded owner and managed server were dead"
+            else
+                "no reusable terminal receipt or provably live active attempt satisfied the requested tuple before starting a new review",
+            .reviewThreadId = review_thread_id,
+            .recordPath = record_path,
+            .eventLogPath = event_log_path,
+        };
+    }
     try writeSessionRecord(allocator, record_path, record);
     updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "review_started", null, review_thread_id, review_turn_id, record_path, event_log_path);
 
@@ -6118,6 +6161,10 @@ fn isSmokeSuiteOverride(override_reason: ?[]const u8) bool {
 }
 
 fn reviewTupleLockAction(action_name: []const u8, existing: ?ReviewTupleLock, now_s: i64, override_reason: ?[]const u8, fresh_attempt_reason: ?[]const u8) ReviewTupleLockAction {
+    return reviewTupleLockActionWithProbe(action_name, existing, now_s, override_reason, fresh_attempt_reason, false);
+}
+
+fn reviewTupleLockActionWithProbe(action_name: []const u8, existing: ?ReviewTupleLock, now_s: i64, override_reason: ?[]const u8, fresh_attempt_reason: ?[]const u8, dead_transport_proven: bool) ReviewTupleLockAction {
     const lock = existing orelse return .create;
     if (!std.mem.eql(u8, lock.lockVersion, review_tuple_lock_version)) return .block_invalid;
     if (std.mem.eql(u8, lock.state, "account_resource_exhausted")) {
@@ -6126,7 +6173,7 @@ fn reviewTupleLockAction(action_name: []const u8, existing: ?ReviewTupleLock, no
     }
     if (std.mem.eql(u8, lock.state, "terminal") or std.mem.eql(u8, lock.state, "normalized")) {
         if (std.mem.eql(u8, action_name, "lane-smoke") and isSmokeSuiteOverride(override_reason)) return .takeover_with_override;
-        if ((std.mem.eql(u8, action_name, "start") or std.mem.eql(u8, action_name, "lane-review")) and fresh_attempt_reason != null) return .fresh_after_terminal;
+        if ((std.mem.eql(u8, action_name, "run") or std.mem.eql(u8, action_name, "start") or std.mem.eql(u8, action_name, "lane-review")) and fresh_attempt_reason != null) return .fresh_after_terminal;
         return .normalize_existing;
     }
     const expired = lock.expiresAtUnixS <= now_s;
@@ -6134,6 +6181,7 @@ fn reviewTupleLockAction(action_name: []const u8, existing: ?ReviewTupleLock, no
         return if (override_reason != null) .takeover_with_override else .block_stale;
     }
     if (std.mem.eql(u8, lock.state, "review_started") or std.mem.eql(u8, lock.state, "waiting")) {
+        if (std.mem.eql(u8, action_name, "run") and dead_transport_proven) return .auto_replace_dead_transport;
         if (std.mem.eql(u8, action_name, "lane-smoke") and
             isSmokeSuiteOverride(override_reason) and
             (isSmokeSuiteOverride(lock.overrideReason) or std.mem.eql(u8, lock.lastFailureCode orelse "", "wait_timed_out")))
@@ -6145,6 +6193,32 @@ fn reviewTupleLockAction(action_name: []const u8, existing: ?ReviewTupleLock, no
     if (std.mem.eql(u8, lock.state, "pre_review_start_failed")) return .retry_after_pre_review_failure;
     if (std.mem.eql(u8, lock.state, "starting_lane")) return .block_active;
     return .block_invalid;
+}
+
+fn reviewTupleLockDeadTransportProven(allocator: std.mem.Allocator, lock: ReviewTupleLock) bool {
+    if (!std.mem.eql(u8, lock.lastFailureCode orelse "", "review_transport_lost")) return false;
+    if (cas_websocket.processAlive(lock.ownerPid)) return false;
+    const record_path = lock.recordPath orelse return false;
+    const owned_record_path = allocator.dupe(u8, record_path) catch return false;
+    var loaded = loadOwnedSessionRecordPath(allocator, owned_record_path) catch {
+        allocator.free(owned_record_path);
+        return false;
+    };
+    defer loaded.deinit(allocator);
+    const managed_server_pid = loaded.record.managed_server_pid orelse return false;
+    return !cas_websocket.processAlive(managed_server_pid);
+}
+
+fn reviewTupleLockActionForAcquire(
+    allocator: std.mem.Allocator,
+    action_name: []const u8,
+    existing: ?ReviewTupleLock,
+    now_s: i64,
+    override_reason: ?[]const u8,
+    fresh_attempt_reason: ?[]const u8,
+) ReviewTupleLockAction {
+    const dead_transport_proven = if (existing) |lock| reviewTupleLockDeadTransportProven(allocator, lock) else false;
+    return reviewTupleLockActionWithProbe(action_name, existing, now_s, override_reason, fresh_attempt_reason, dead_transport_proven);
 }
 
 fn printReviewTupleLockExistingAndExit(
@@ -6175,6 +6249,9 @@ fn printReviewTupleLockExistingAndExit(
                 if (verdict_only) {
                     try writeReceiptReviewVerdictObject(stdout, normalized);
                     try stdout.writeAll("\n");
+                } else if (std.mem.eql(u8, action_name, "run")) {
+                    try writeRunNormalizedReceiptObject(allocator, stdout, normalized, lock);
+                    try stdout.writeAll("\n");
                 } else {
                     try writeReceiptObject(stdout, normalized);
                     try stdout.writeAll("\n");
@@ -6188,9 +6265,20 @@ fn printReviewTupleLockExistingAndExit(
     const review_turn_id = lock.reviewTurnId;
     const smoke_status = if (std.mem.eql(u8, action_name, "lane-smoke")) @as(?[]const u8, "failed") else null;
     const lock_points_to_terminal = std.mem.eql(u8, lock.state, "terminal") or std.mem.eql(u8, lock.state, "normalized");
+    const broker_decision: ?ReviewBrokerDecision = if (std.mem.eql(u8, action_name, "run")) .{
+        .action = if (decision == .normalize_existing) "normalized_existing" else "blocked_live_attempt",
+        .reason = if (decision == .normalize_existing)
+            "tuple lock points to an existing terminal receipt, but the receipt could not be normalized into a terminal verdict"
+        else
+            "tuple lock points to an existing active review attempt whose liveness was not disproven",
+        .reviewThreadId = review_thread_id,
+        .recordPath = lock.recordPath,
+        .eventLogPath = lock.eventLogPath,
+    } else null;
     const payload = .{
         .demo = "cas-review-session",
         .action = action_name,
+        .reviewBrokerDecision = broker_decision,
         .smokeStatus = smoke_status,
         .reviewAttemptPhase = if (lock_points_to_terminal) "review_terminal" else "review_waiting",
         .reviewAttemptExists = review_thread_id != null,
@@ -6241,6 +6329,34 @@ fn printReviewTupleLockExistingAndExit(
         try stdout.writeAll("\n");
     }
     std.process.exit(1);
+}
+
+fn writeRunNormalizedReceiptObject(allocator: std.mem.Allocator, writer: *std.Io.Writer, receipt: NormalizedReceipt, lock: ReviewTupleLock) !void {
+    const broker_json = try stringifyAnyAlloc(allocator, ReviewBrokerDecision{
+        .action = "normalized_existing",
+        .reason = "tuple lock points to an existing terminal receipt normalized for the requested tuple",
+        .reviewThreadId = lock.reviewThreadId,
+        .recordPath = lock.recordPath,
+        .eventLogPath = lock.eventLogPath,
+    });
+    defer allocator.free(broker_json);
+    var receipt_out = std.Io.Writer.Allocating.init(allocator);
+    defer receipt_out.deinit();
+    try writeReceiptObject(&receipt_out.writer, receipt);
+    const receipt_json = try receipt_out.toOwnedSlice();
+    defer allocator.free(receipt_json);
+
+    try writer.print("{{\"demo\":\"cas-review-session\",\"action\":\"run\",\"reviewBrokerDecision\":{s},\"reviewVerdict\":", .{broker_json});
+    try writeReceiptReviewVerdictObject(writer, receipt);
+    try writer.print(",\"normalizedReceipt\":{s}}}", .{receipt_json});
+}
+
+fn reviewBrokerActionForBlockedLock(decision: ReviewTupleLockAction) []const u8 {
+    return switch (decision) {
+        .block_account_resource => "blocked_account_resource",
+        .block_invalid => "blocked_invalid_lock",
+        else => "blocked_live_attempt",
+    };
 }
 
 fn tupleLockFallbackVerdictStatus(lock: ReviewTupleLock) []const u8 {
@@ -6296,9 +6412,17 @@ fn emitReviewTupleLockBlockedAndExit(
             std.process.exit(1);
         }
         const smoke_status = if (std.mem.eql(u8, action_name, "lane-smoke")) @as(?[]const u8, "failed") else null;
+        const broker_decision: ?ReviewBrokerDecision = if (std.mem.eql(u8, action_name, "run")) .{
+            .action = reviewBrokerActionForBlockedLock(decision),
+            .reason = hint,
+            .reviewThreadId = if (lock) |value| value.reviewThreadId else null,
+            .recordPath = if (lock) |value| value.recordPath else null,
+            .eventLogPath = if (lock) |value| value.eventLogPath else null,
+        } else null;
         const payload = .{
             .demo = "cas-review-session",
             .action = action_name,
+            .reviewBrokerDecision = broker_decision,
             .smokeStatus = smoke_status,
             .reviewAttemptPhase = "pre_review_start",
             .reviewAttemptExists = false,
@@ -6378,7 +6502,7 @@ fn acquireReviewTupleStartLockOrExit(
     };
     defer if (loaded_opt) |*loaded| loaded.deinit(allocator);
     const now_s = unixSeconds();
-    const decision = reviewTupleLockAction(action_name, if (loaded_opt) |loaded| loaded.record else null, now_s, override_reason, fresh_attempt_reason);
+    const decision = reviewTupleLockActionForAcquire(allocator, action_name, if (loaded_opt) |loaded| loaded.record else null, now_s, override_reason, fresh_attempt_reason);
     switch (decision) {
         .create => {
             const lock = makeReviewTupleLock(tuple_hash, tuple, "starting_lane", now_s, override_reason, fresh_attempt_reason);
@@ -6399,7 +6523,7 @@ fn acquireReviewTupleStartLockOrExit(
                         );
                     }) orelse return err;
                     defer raced.deinit(allocator);
-                    const raced_decision = reviewTupleLockAction(action_name, raced.record, now_s, override_reason, fresh_attempt_reason);
+                    const raced_decision = reviewTupleLockActionForAcquire(allocator, action_name, raced.record, now_s, override_reason, fresh_attempt_reason);
                     switch (raced_decision) {
                         .return_existing, .normalize_existing => {
                             killManagedServerBeforeTupleLockExit(managed_server_to_kill_on_exit);
@@ -6419,14 +6543,14 @@ fn acquireReviewTupleStartLockOrExit(
                                 verdict_only,
                             );
                         },
-                        .create, .retry_after_pre_review_failure, .takeover_with_override, .fresh_after_terminal => return err,
+                        .create, .retry_after_pre_review_failure, .auto_replace_dead_transport, .takeover_with_override, .fresh_after_terminal => return err,
                     }
                 },
                 else => return err,
             };
             return .{ .path = lock_path, .lock = lock };
         },
-        .retry_after_pre_review_failure, .takeover_with_override, .fresh_after_terminal => {
+        .retry_after_pre_review_failure, .auto_replace_dead_transport, .takeover_with_override, .fresh_after_terminal => {
             const claim_path = claimReviewTupleLockRewriteExclusive(allocator, lock_path) catch |err| switch (err) {
                 error.PathAlreadyExists => {
                     killManagedServerBeforeTupleLockExit(managed_server_to_kill_on_exit);
@@ -6475,9 +6599,9 @@ fn acquireReviewTupleStartLockOrExit(
                 );
             };
             defer latest.deinit(allocator);
-            const latest_decision = reviewTupleLockAction(action_name, latest.record, unixSeconds(), override_reason, fresh_attempt_reason);
+            const latest_decision = reviewTupleLockActionForAcquire(allocator, action_name, latest.record, unixSeconds(), override_reason, fresh_attempt_reason);
             switch (latest_decision) {
-                .retry_after_pre_review_failure, .takeover_with_override, .fresh_after_terminal => {},
+                .retry_after_pre_review_failure, .auto_replace_dead_transport, .takeover_with_override, .fresh_after_terminal => {},
                 .return_existing, .normalize_existing => {
                     killManagedServerBeforeTupleLockExit(managed_server_to_kill_on_exit);
                     try printReviewTupleLockExistingAndExit(allocator, action_name, target_identity, tuple, lock_path, latest.record, latest_decision, verdict_only);
@@ -6511,7 +6635,8 @@ fn acquireReviewTupleStartLockOrExit(
                     );
                 },
             }
-            const lock = makeReviewTupleLock(tuple_hash, tuple, "starting_lane", now_s, override_reason, fresh_attempt_reason);
+            const replacement_override_reason = if (latest_decision == .auto_replace_dead_transport) "auto-replaced-dead-transport" else override_reason;
+            const lock = makeReviewTupleLock(tuple_hash, tuple, "starting_lane", now_s, replacement_override_reason, fresh_attempt_reason);
             try writeReviewTupleLock(allocator, lock_path, lock);
             return .{ .path = lock_path, .lock = lock };
         },
@@ -7463,6 +7588,9 @@ fn printStartJson(
         if (value.stderr_text) |text| try quoteJsonStringAlloc(allocator, text) else "null"
     else
         "null";
+    const surface_action_json = try quoteJsonStringAlloc(allocator, receipt.surface_action);
+    const broker_decision_json = if (receipt.review_broker_decision) |value| try stringifyAnyAlloc(allocator, value) else try allocator.dupe(u8, "null");
+    defer allocator.free(broker_decision_json);
     const hook_summary = try hookSummaryFromEventLog(allocator, receipt.hook_policy, receipt.hook_log_path orelse event_log_path);
     const hook_summary_json = try stringifyAnyAlloc(allocator, hook_summary);
     const review_verdict_json_opt = try startWaitReviewVerdictJsonAlloc(
@@ -7494,8 +7622,10 @@ fn printStartJson(
     defer allocator.free(review_verdict_suffix);
 
     try stdout.print(
-        "{{\"demo\":\"cas-review-session\",\"action\":\"start\",\"cwd\":{s},\"parentThreadId\":{s}",
+        "{{\"demo\":\"cas-review-session\",\"action\":{s},\"reviewBrokerDecision\":{s},\"cwd\":{s},\"parentThreadId\":{s}",
         .{
+            surface_action_json,
+            broker_decision_json,
             try quoteJsonStringAlloc(allocator, cwd),
             try quoteJsonStringAlloc(allocator, parent_thread_id),
         },
@@ -9963,6 +10093,28 @@ test "parseArgs captures start --wait" {
     try std.testing.expectEqual(TargetKind.base_branch, parsed.target.?.kind);
 }
 
+test "parseArgs accepts brokered run target" {
+    const argv = [_][]const u8{
+        "cas_review_session",
+        "run",
+        "--cwd",
+        "/tmp/repo",
+        "--base",
+        "main",
+        "--json",
+        "--fresh-attempt",
+        "run 2",
+    };
+
+    const parsed = try parseArgs(std.testing.allocator, &argv);
+    try std.testing.expectEqual(Action.run, parsed.action.?);
+    try std.testing.expectEqualStrings("/tmp/repo", parsed.cwd.?);
+    try std.testing.expect(parsed.json);
+    try std.testing.expectEqual(TargetKind.base_branch, parsed.target.?.kind);
+    try std.testing.expectEqualStrings("main", parsed.target.?.branch.?);
+    try std.testing.expectEqualStrings("run 2", parsed.fresh_attempt_reason.?);
+}
+
 test "parseArgs accepts latest status and wait selectors" {
     const status_argv = [_][]const u8{
         "cas_review_session",
@@ -12289,6 +12441,20 @@ test "parseArgs accepts review lock override only for review starters" {
     defer start.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("human takeover", start.review_lock_override_reason.?);
 
+    const run_argv = [_][]const u8{
+        "cas_review_session",
+        "run",
+        "--cwd",
+        "/repo",
+        "--base",
+        "main",
+        "--review-lock-override",
+        "human takeover",
+    };
+    var run = try parseArgs(std.testing.allocator, &run_argv);
+    defer run.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("human takeover", run.review_lock_override_reason.?);
+
     const lane_argv = [_][]const u8{
         "cas_review_session",
         "lane",
@@ -12344,6 +12510,20 @@ test "parseArgs accepts fresh attempt only for review starters" {
     var start = try parseArgs(std.testing.allocator, &start_argv);
     defer start.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("run 2", start.fresh_attempt_reason.?);
+
+    const run_argv = [_][]const u8{
+        "cas_review_session",
+        "run",
+        "--cwd",
+        "/repo",
+        "--base",
+        "main",
+        "--fresh-attempt",
+        "run 2",
+    };
+    var run = try parseArgs(std.testing.allocator, &run_argv);
+    defer run.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("run 2", run.fresh_attempt_reason.?);
 
     const lane_argv = [_][]const u8{
         "cas_review_session",
@@ -12455,6 +12635,8 @@ test "review tuple lock action classifies active terminal exhausted and stale st
         .ownerPid = 1,
     };
     try std.testing.expectEqual(ReviewTupleLockAction.return_existing, reviewTupleLockAction("lane-review", active, now_s, null, null));
+    try std.testing.expectEqual(ReviewTupleLockAction.return_existing, reviewTupleLockAction("run", active, now_s, null, null));
+    try std.testing.expectEqual(ReviewTupleLockAction.auto_replace_dead_transport, reviewTupleLockActionWithProbe("run", active, now_s, null, null, true));
 
     var timed_out_smoke = active;
     timed_out_smoke.lastFailureCode = "wait_timed_out";
@@ -12472,7 +12654,9 @@ test "review tuple lock action classifies active terminal exhausted and stale st
     var terminal = active;
     terminal.state = "terminal";
     try std.testing.expectEqual(ReviewTupleLockAction.normalize_existing, reviewTupleLockAction("lane-review", terminal, now_s, null, null));
+    try std.testing.expectEqual(ReviewTupleLockAction.normalize_existing, reviewTupleLockAction("run", terminal, now_s, null, null));
     try std.testing.expectEqual(ReviewTupleLockAction.fresh_after_terminal, reviewTupleLockAction("lane-review", terminal, now_s, null, "run 2"));
+    try std.testing.expectEqual(ReviewTupleLockAction.fresh_after_terminal, reviewTupleLockAction("run", terminal, now_s, null, "run 2"));
     try std.testing.expectEqual(ReviewTupleLockAction.fresh_after_terminal, reviewTupleLockAction("start", terminal, now_s, null, "run 2"));
     try std.testing.expectEqual(ReviewTupleLockAction.normalize_existing, reviewTupleLockAction("lane-review", terminal, now_s, "cas-smoke-suite:1", null));
     try std.testing.expectEqual(ReviewTupleLockAction.takeover_with_override, reviewTupleLockAction("lane-smoke", terminal, now_s, "cas-smoke-suite:1", "run 2"));
