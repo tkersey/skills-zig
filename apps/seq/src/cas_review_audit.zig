@@ -709,6 +709,7 @@ fn summarize(rows: []const query.Row) Summary {
         const status = scalarString(row, "review_verdict_status");
         const backend = scalarString(row, "backend_class");
         const command_surface = scalarString(row, "command_surface") orelse "";
+        const surface = scalarString(row, "surface");
         const broker_action = scalarString(row, "review_broker_action");
         const attempt_exists = scalarBool(row, "review_attempt_exists");
         const tuple_exists = scalarBool(row, "tuple_verdict_exists");
@@ -718,7 +719,7 @@ fn summarize(rows: []const query.Row) Summary {
         if (optEql(broker_action, "auto_replaced_dead_transport")) out.broker_auto_replaced_dead_transport_count += 1;
         if (optEql(broker_action, "attached_existing")) out.broker_attached_existing_count += 1;
         if (optEql(broker_action, "blocked_live_attempt")) out.broker_blocked_live_count += 1;
-        if (manualRecoveryCommand(command_surface)) out.manual_recovery_command_count += 1;
+        if (optEql(surface, "manual_recovery_command")) out.manual_recovery_command_count += 1;
 
         if (optEql(failure_code, "pre_review_lane_transport_lost")) {
             out.pre_review_lane_transport_lost_count += 1;
@@ -1348,14 +1349,14 @@ test "brokered run output contributes broker summary counters" {
     try std.testing.expectEqualStrings("auto_replaced_dead_transport", scalarString(audit.rows.items[0], "review_broker_action").?);
 }
 
-test "manual recovery command is counted without receipt-shaped output" {
+test "manual recovery command is counted once when output is receipt-shaped" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "session.jsonl", .data =
         \\{"type":"session_meta","timestamp":"2026-06-27T01:00:00Z","payload":{"id":"sess-manual"}}
         \\{"type":"response_item","timestamp":"2026-06-27T01:00:01Z","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"cas review_session lock gate --path tuple-lock.json --format json\",\"cwd\":\"/repo\"}"}}
-        \\{"type":"response_item","timestamp":"2026-06-27T01:00:02Z","payload":{"type":"function_call_output","call_id":"call-1","output":"not json\n"}}
+        \\{"type":"response_item","timestamp":"2026-06-27T01:00:02Z","payload":{"type":"function_call_output","call_id":"call-1","output":"{\"reviewThreadId\":\"thr_1\",\"baseSha\":\"b\",\"headSha\":\"h\",\"targetFingerprint\":\"t\",\"reviewVerdict\":{\"status\":\"clean\",\"clean\":true,\"findingCount\":0,\"failureCode\":null,\"baseSha\":\"b\",\"headSha\":\"h\",\"targetFingerprint\":\"t\",\"reviewThreadId\":\"thr_1\",\"backendClass\":\"cas-receipt-normalized\"}}\n"}}
         \\
     });
 
@@ -1372,7 +1373,7 @@ test "manual recovery command is counted without receipt-shaped output" {
     });
     defer audit.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), audit.rows.items.len);
+    try std.testing.expectEqual(@as(usize, 2), audit.rows.items.len);
     try std.testing.expectEqual(@as(i64, 1), audit.summary.manual_recovery_command_count);
     try std.testing.expectEqualStrings("manual_recovery_command", scalarString(audit.rows.items[0], "surface").?);
 }

@@ -6354,6 +6354,7 @@ fn writeRunNormalizedReceiptObject(allocator: std.mem.Allocator, writer: *std.Io
 fn reviewBrokerActionForBlockedLock(decision: ReviewTupleLockAction) []const u8 {
     return switch (decision) {
         .block_account_resource => "blocked_account_resource",
+        .block_stale => "blocked_stale_lock",
         .block_invalid => "blocked_invalid_lock",
         else => "blocked_live_attempt",
     };
@@ -12676,6 +12677,7 @@ test "review tuple lock action classifies active terminal exhausted and stale st
     stale.expiresAtUnixS = now_s - 1;
     try std.testing.expectEqual(ReviewTupleLockAction.block_stale, reviewTupleLockAction("lane-review", stale, now_s, null, null));
     try std.testing.expectEqual(ReviewTupleLockAction.takeover_with_override, reviewTupleLockAction("lane-review", stale, now_s, "stale owner", null));
+    try std.testing.expectEqualStrings("blocked_stale_lock", reviewBrokerActionForBlockedLock(.block_stale));
 
     var smoke_suite_lock = active;
     smoke_suite_lock.overrideReason = "cas-smoke-suite:1";
