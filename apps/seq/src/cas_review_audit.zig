@@ -298,9 +298,6 @@ fn scanSessionPath(
                 .command = cmd,
                 .cwd = nullableString(args_obj, "workdir") orelse nullableString(args_obj, "cwd"),
             };
-            if (manualRecoveryCommand(cmd)) {
-                try appendManualRecoveryCommandRow(allocator, call, path, params, audit, dedupe);
-            }
             try pending.put(call_id, call);
             continue;
         }
@@ -309,9 +306,20 @@ fn scanSessionPath(
             const call_id = stringField(payload, "call_id") orelse continue;
             var call = pending.get(call_id) orelse continue;
             if (call.cwd == null) call.cwd = nullableString(payload, "cwd");
+            if (manualRecoveryCommand(call.command)) {
+                try appendManualRecoveryCommandRow(allocator, call, path, params, audit, dedupe);
+            }
             const stdout = stringField(payload, "stdout") orelse stringField(payload, "output") orelse "";
             const stderr = stringField(payload, "stderr") orelse "";
             try appendRowsFromCommandText(allocator, stdout, stderr, call, path, params, audit, dedupe);
+            _ = pending.remove(call_id);
+        }
+    }
+
+    var leftovers = pending.valueIterator();
+    while (leftovers.next()) |call| {
+        if (manualRecoveryCommand(call.command)) {
+            try appendManualRecoveryCommandRow(allocator, call.*, path, params, audit, dedupe);
         }
     }
 }
@@ -1349,14 +1357,14 @@ test "brokered run output contributes broker summary counters" {
     try std.testing.expectEqualStrings("auto_replaced_dead_transport", scalarString(audit.rows.items[0], "review_broker_action").?);
 }
 
-test "manual recovery command is counted once when output is receipt-shaped" {
+test "manual recovery command uses output cwd and is counted once when output is receipt-shaped" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "session.jsonl", .data =
         \\{"type":"session_meta","timestamp":"2026-06-27T01:00:00Z","payload":{"id":"sess-manual"}}
-        \\{"type":"response_item","timestamp":"2026-06-27T01:00:01Z","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"cas review_session lock gate --path tuple-lock.json --format json\",\"cwd\":\"/repo\"}"}}
-        \\{"type":"response_item","timestamp":"2026-06-27T01:00:02Z","payload":{"type":"function_call_output","call_id":"call-1","output":"{\"reviewThreadId\":\"thr_1\",\"baseSha\":\"b\",\"headSha\":\"h\",\"targetFingerprint\":\"t\",\"reviewVerdict\":{\"status\":\"clean\",\"clean\":true,\"findingCount\":0,\"failureCode\":null,\"baseSha\":\"b\",\"headSha\":\"h\",\"targetFingerprint\":\"t\",\"reviewThreadId\":\"thr_1\",\"backendClass\":\"cas-receipt-normalized\"}}\n"}}
+        \\{"type":"response_item","timestamp":"2026-06-27T01:00:01Z","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"cas review_session lock gate --path tuple-lock.json --format json\"}"}}
+        \\{"type":"response_item","timestamp":"2026-06-27T01:00:02Z","payload":{"type":"function_call_output","call_id":"call-1","cwd":"/repo","output":"{\"reviewThreadId\":\"thr_1\",\"baseSha\":\"b\",\"headSha\":\"h\",\"targetFingerprint\":\"t\",\"reviewVerdict\":{\"status\":\"clean\",\"clean\":true,\"findingCount\":0,\"failureCode\":null,\"baseSha\":\"b\",\"headSha\":\"h\",\"targetFingerprint\":\"t\",\"reviewThreadId\":\"thr_1\",\"backendClass\":\"cas-receipt-normalized\"}}\n"}}
         \\
     });
 
@@ -1376,6 +1384,7 @@ test "manual recovery command is counted once when output is receipt-shaped" {
     try std.testing.expectEqual(@as(usize, 2), audit.rows.items.len);
     try std.testing.expectEqual(@as(i64, 1), audit.summary.manual_recovery_command_count);
     try std.testing.expectEqualStrings("manual_recovery_command", scalarString(audit.rows.items[0], "surface").?);
+    try std.testing.expectEqualStrings("/repo", scalarString(audit.rows.items[0], "cwd").?);
 }
 
 test "basename receipt glob keeps handle-less receipts distinct and skips non-receipts" {
