@@ -306,13 +306,13 @@ fn scanSessionPath(
             const call_id = stringField(payload, "call_id") orelse continue;
             var call = pending.get(call_id) orelse continue;
             if (call.cwd == null) call.cwd = nullableString(payload, "cwd");
+            try pending.put(call_id, call);
             if (manualRecoveryCommand(call.command)) {
                 try appendManualRecoveryCommandRow(allocator, call, path, params, audit, dedupe);
             }
-            const stdout = stringField(payload, "stdout") orelse stringField(payload, "output") orelse "";
+            const stdout = nullableStringAny(payload, &.{ "stdout", "output", "aggregated_output" }) orelse "";
             const stderr = stringField(payload, "stderr") orelse "";
             try appendRowsFromCommandText(allocator, stdout, stderr, call, path, params, audit, dedupe);
-            _ = pending.remove(call_id);
         }
     }
 
@@ -1364,7 +1364,8 @@ test "manual recovery command uses output cwd and is counted once when output is
     try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "session.jsonl", .data =
         \\{"type":"session_meta","timestamp":"2026-06-27T01:00:00Z","payload":{"id":"sess-manual"}}
         \\{"type":"response_item","timestamp":"2026-06-27T01:00:01Z","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"cas review_session lock gate --path tuple-lock.json --format json\"}"}}
-        \\{"type":"response_item","timestamp":"2026-06-27T01:00:02Z","payload":{"type":"function_call_output","call_id":"call-1","cwd":"/repo","output":"{\"reviewThreadId\":\"thr_1\",\"baseSha\":\"b\",\"headSha\":\"h\",\"targetFingerprint\":\"t\",\"reviewVerdict\":{\"status\":\"clean\",\"clean\":true,\"findingCount\":0,\"failureCode\":null,\"baseSha\":\"b\",\"headSha\":\"h\",\"targetFingerprint\":\"t\",\"reviewThreadId\":\"thr_1\",\"backendClass\":\"cas-receipt-normalized\"}}\n"}}
+        \\{"type":"event_msg","timestamp":"2026-06-27T01:00:02Z","payload":{"type":"exec_command_end","call_id":"call-1","cwd":"/repo","stdout":"","output":""}}
+        \\{"type":"response_item","timestamp":"2026-06-27T01:00:03Z","payload":{"type":"function_call_output","call_id":"call-1","output":"{\"reviewThreadId\":\"thr_1\",\"baseSha\":\"b\",\"headSha\":\"h\",\"targetFingerprint\":\"t\",\"reviewVerdict\":{\"status\":\"clean\",\"clean\":true,\"findingCount\":0,\"failureCode\":null,\"baseSha\":\"b\",\"headSha\":\"h\",\"targetFingerprint\":\"t\",\"reviewThreadId\":\"thr_1\",\"backendClass\":\"cas-receipt-normalized\"}}\n"}}
         \\
     });
 
@@ -1385,6 +1386,7 @@ test "manual recovery command uses output cwd and is counted once when output is
     try std.testing.expectEqual(@as(i64, 1), audit.summary.manual_recovery_command_count);
     try std.testing.expectEqualStrings("manual_recovery_command", scalarString(audit.rows.items[0], "surface").?);
     try std.testing.expectEqualStrings("/repo", scalarString(audit.rows.items[0], "cwd").?);
+    try std.testing.expectEqualStrings("/repo", scalarString(audit.rows.items[1], "cwd").?);
 }
 
 test "basename receipt glob keeps handle-less receipts distinct and skips non-receipts" {
