@@ -2774,6 +2774,15 @@ fn cmdReviewImport(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs)
     const import_repo_realpath = if (parsed.cwd) |cwd| try repoRealpathAlloc(allocator, cwd) else null;
     defer if (import_repo_realpath) |value| allocator.free(value);
 
+    if (paths.items.len == 0) {
+        try errors.append(allocator, .{
+            .source_path = try allocator.dupe(u8, "<input>"),
+            .message = try allocator.dupe(u8, "no files matched"),
+        });
+        try printReviewImportResults(imported.items, errors.items, if (parsed.json) .json else parsed.receipt_format);
+        std.process.exit(1);
+    }
+
     const recover_event_logs = paths.items.len <= ReceiptEventLogRecoveryMaxInputs;
     for (paths.items) |path| {
         const receipt = normalizeReceiptFromPathAlloc(allocator, path, recover_event_logs, normalize_context) catch |err| {
@@ -2785,8 +2794,12 @@ fn cmdReviewImport(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs)
         };
         defer receipt.deinit(allocator);
 
+        const import_timestamp = try casRerTimestampAlloc(allocator);
+        defer allocator.free(import_timestamp);
         const record_json = casRerJsonFromReceiptAlloc(allocator, receipt, .{
             .repo_realpath_override = import_repo_realpath,
+            .created_at = import_timestamp,
+            .updated_at = import_timestamp,
         }) catch |err| {
             try errors.append(allocator, .{
                 .source_path = try allocator.dupe(u8, path),
@@ -6137,8 +6150,10 @@ const CasRerLedgerRecord = struct {
     record_id: []const u8,
     created_at: []const u8,
     status: []const u8,
+    phase: []const u8,
     tuple_verdict_exists: bool,
     attempt_exists: bool,
+    failure_code: ?[]const u8,
     review_thread_id: ?[]const u8,
     base_sha: ?[]const u8,
     head_sha: ?[]const u8,
@@ -6151,6 +6166,8 @@ const CasRerLedgerRecord = struct {
         allocator.free(self.record_id);
         allocator.free(self.created_at);
         allocator.free(self.status);
+        allocator.free(self.phase);
+        if (self.failure_code) |value| allocator.free(value);
         if (self.review_thread_id) |value| allocator.free(value);
         if (self.base_sha) |value| allocator.free(value);
         if (self.head_sha) |value| allocator.free(value);
@@ -6178,6 +6195,7 @@ fn casRerLedgerRecordFromJsonAlloc(allocator: std.mem.Allocator, path: []const u
     const tuple = objectField(root, "tuple");
     const attempt = objectField(root, "attempt");
     const verdict = objectField(root, "verdict");
+    const failure = objectField(root, "failure");
     const principal = objectField(root, "principal");
     return .{
         .path = try allocator.dupe(u8, path),
@@ -6185,8 +6203,10 @@ fn casRerLedgerRecordFromJsonAlloc(allocator: std.mem.Allocator, path: []const u
         .record_id = try allocator.dupe(u8, jsonStringField(root, "recordId") orelse ""),
         .created_at = try allocator.dupe(u8, jsonStringField(root, "createdAt") orelse ""),
         .status = try allocator.dupe(u8, if (verdict) |value| jsonStringField(value, "status") orelse "incomplete" else "incomplete"),
+        .phase = try allocator.dupe(u8, if (attempt) |value| jsonStringField(value, "phase") orelse "" else ""),
         .tuple_verdict_exists = if (verdict) |value| jsonBoolField(value, "tupleVerdictExists") orelse false else false,
         .attempt_exists = if (attempt) |value| jsonBoolField(value, "exists") orelse false else false,
+        .failure_code = if (failure) |value| try dupOptional(allocator, jsonStringField(value, "failureCode")) else null,
         .review_thread_id = if (attempt) |value| try dupOptional(allocator, jsonStringField(value, "reviewThreadId")) else null,
         .base_sha = if (tuple) |value| try dupOptional(allocator, jsonStringField(value, "baseSha")) else null,
         .head_sha = if (tuple) |value| try dupOptional(allocator, jsonStringField(value, "headSha")) else null,
@@ -6258,7 +6278,10 @@ fn actionRequiredForCasRerRecord(record: CasRerLedgerRecord) []const u8 {
     }
     if (std.mem.eql(u8, record.status, "timeout")) return "inspect";
     if (std.mem.eql(u8, record.status, "transport_failure")) return "run_new_attempt";
-    if (record.attempt_exists and !record.tuple_verdict_exists) return "wait";
+    if (record.attempt_exists and !record.tuple_verdict_exists) {
+        if (std.mem.eql(u8, record.phase, "review_waiting") or std.mem.eql(u8, record.phase, "review_started")) return "wait";
+        if (record.phase.len == 0 and record.failure_code == null) return "wait";
+    }
     if (std.mem.eql(u8, record.status, "incomplete")) return "inspect";
     return "workflow_policy";
 }
@@ -12761,6 +12784,15 @@ test "CAS-RER ledger record projection matches tuple identity" {
     try std.testing.expect(active_record.attempt_exists);
     try std.testing.expect(!active_record.tuple_verdict_exists);
     try std.testing.expectEqualStrings("wait", actionRequiredForCasRerRecord(active_record));
+
+    const terminal_incomplete_raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_terminal_incomplete","createdAt":"2026-07-02T00:00:04Z","updatedAt":"2026-07-02T00:00:04Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:e","phase":"review_terminal","reviewThreadId":"thr_terminal","reviewTurnId":"turn_terminal"},"verdict":{"tupleVerdictExists":false,"status":"incomplete","clean":false,"findingCount":1,"findings":[{"title":"tuple mismatch"}]},"failure":{"failureCode":"tuple_mismatch","failureClass":"caller_error","retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-start-wait"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
+    ;
+    const terminal_incomplete_record = try casRerLedgerRecordFromJsonAlloc(std.testing.allocator, "/tmp/rer_terminal_incomplete.json", terminal_incomplete_raw);
+    defer terminal_incomplete_record.deinit(std.testing.allocator);
+    try std.testing.expect(terminal_incomplete_record.attempt_exists);
+    try std.testing.expect(!terminal_incomplete_record.tuple_verdict_exists);
+    try std.testing.expectEqualStrings("inspect", actionRequiredForCasRerRecord(terminal_incomplete_record));
 }
 
 test "CAS-RER writer projects pre-review lane transport as non-attempt" {

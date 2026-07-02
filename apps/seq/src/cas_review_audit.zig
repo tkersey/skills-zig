@@ -19,6 +19,10 @@ pub const projection_fields = [_][]const u8{
     "command_surface",
     "surface",
     "backend_class",
+    "principal_kind",
+    "principal_proof_usable",
+    "principal_reduced",
+    "principal_fallback_used",
     "review_attempt_phase",
     "review_attempt_exists",
     "tuple_verdict_exists",
@@ -790,10 +794,11 @@ fn classifyCasRerObject(allocator: std.mem.Allocator, root: std.json.ObjectMap, 
     const attempt = objectField(root, "attempt");
     const verdict = objectField(root, "verdict");
     const failure = objectField(root, "failure");
+    const principal = objectField(root, "principal");
     const attachments = objectField(root, "attachments");
 
     const record_id = nullableString(root, "recordId");
-    const status = if (verdict) |value| nullableString(value, "status") else null;
+    const raw_status = if (verdict) |value| nullableString(value, "status") else null;
     const backend_class =
         (if (command) |cmd| nullableString(cmd, "sourceBackendClass") else null) orelse
         (if (command) |cmd| nullableString(cmd, "backendSelected") else null) orelse
@@ -809,8 +814,16 @@ fn classifyCasRerObject(allocator: std.mem.Allocator, root: std.json.ObjectMap, 
     const review_turn_id = if (attempt) |value| nullableString(value, "reviewTurnId") else null;
     const phase = if (attempt) |value| nullableString(value, "phase") else null;
     const attempt_exists = if (attempt) |value| boolField(value, "exists") orelse (review_thread_id != null) else false;
-    const tuple_verdict_exists = if (verdict) |value| boolField(value, "tupleVerdictExists") orelse false else false;
+    const raw_tuple_verdict_exists = if (verdict) |value| boolField(value, "tupleVerdictExists") orelse false else false;
     const finding_count = if (verdict) |value| intField(value, "findingCount") orelse 0 else 0;
+    const principal_kind = if (principal) |value| nullableString(value, "kind") else null;
+    const principal_proof_usable = if (principal) |value| boolField(value, "proofUsable") orelse false else false;
+    const principal_reduced = if (principal) |value| boolField(value, "reduced") orelse optEql(principal_kind, "reduced") else false;
+    const principal_fallback_used = if (principal) |value| boolField(value, "fallbackUsed") orelse false else false;
+    const terminal_status = optEql(raw_status, "clean") or optEql(raw_status, "findings");
+    const principal_unusable_terminal = raw_tuple_verdict_exists and terminal_status and !principal_proof_usable;
+    const tuple_verdict_exists = raw_tuple_verdict_exists and !principal_unusable_terminal;
+    const status = if (principal_unusable_terminal) "review_untrusted_source" else raw_status;
     const record_path = if (attempt) |value| nullableString(value, "recordPath") else null;
     const event_log_path =
         (if (attempt) |value| nullableString(value, "eventLogPath") else null) orelse
@@ -829,6 +842,10 @@ fn classifyCasRerObject(allocator: std.mem.Allocator, root: std.json.ObjectMap, 
     try row.putStaticKey("command_surface", .{ .string = command_surface });
     try row.putStaticKey("surface", .{ .string = "cas_review_evidence_record" });
     try row.putStaticKey("backend_class", .{ .string = backend_class });
+    try putStringOrNull(&row, "principal_kind", principal_kind);
+    try row.putStaticKey("principal_proof_usable", .{ .bool = principal_proof_usable });
+    try row.putStaticKey("principal_reduced", .{ .bool = principal_reduced });
+    try row.putStaticKey("principal_fallback_used", .{ .bool = principal_fallback_used });
     try row.putStaticKey("review_attempt_phase", .{ .string = phase orelse "pre_lane_start" });
     try row.putStaticKey("review_attempt_exists", .{ .bool = attempt_exists });
     try row.putStaticKey("tuple_verdict_exists", .{ .bool = tuple_verdict_exists });
@@ -1695,6 +1712,29 @@ test "CAS-RER findings record is canonical ledger evidence" {
     const summary = summarize(&.{row});
     try std.testing.expectEqual(@as(i64, 1), summary.completed_findings_count);
     try std.testing.expectEqual(@as(i64, 0), summary.timeout_with_handle_count);
+}
+
+test "CAS-RER unusable principal is not counted as completed evidence" {
+    var row = try classifyReceiptText(std.testing.allocator,
+        \\{"schema":"CAS-RER-v1","recordId":"rer_reduced","createdAt":"2026-07-02T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_reduced","reviewTurnId":"turn_reduced"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"reduced","proofUsable":false,"reduced":true,"fallbackUsed":false}}
+    , .{
+        .session_id = "",
+        .cwd = null,
+        .command_surface = "receipt",
+        .source_path = "/tmp/rer-reduced.json",
+        .default_backend_class = "cas-receipt-normalized",
+    });
+    defer row.deinit();
+
+    try std.testing.expectEqualStrings("review_untrusted_source", scalarString(row, "canonical_status").?);
+    try std.testing.expectEqualStrings("review_untrusted_source", scalarString(row, "review_verdict_status").?);
+    try std.testing.expect(!scalarBool(row, "tuple_verdict_exists"));
+    try std.testing.expect(!scalarBool(row, "principal_proof_usable"));
+    try std.testing.expect(scalarBool(row, "principal_reduced"));
+
+    const summary = summarize(&.{row});
+    try std.testing.expectEqual(@as(i64, 0), summary.completed_clean_count);
+    try std.testing.expectEqual(@as(i64, 0), summary.completed_findings_count);
 }
 
 test "CAS-RER findings are not reduced to timeout-only audit evidence" {
