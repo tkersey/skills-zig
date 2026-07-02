@@ -3516,6 +3516,16 @@ fn validateCasRerRecordObjectAlloc(allocator: std.mem.Allocator, path: []const u
         if (status == null or !casRerStatusAllowed(status.?)) {
             try appendGateError(allocator, &errors, "invalid verdict.status: {s}", .{status orelse "null"});
         }
+        const clean = jsonBoolField(verdict_obj, "clean");
+        if (clean == null) {
+            try appendGateError(allocator, &errors, "verdict.clean must be boolean", .{});
+        } else if (std.mem.eql(u8, status orelse "", "clean")) {
+            if (clean.? != true) {
+                try appendGateError(allocator, &errors, "verdict.status=clean requires verdict.clean=true", .{});
+            }
+        } else if (clean.? != false) {
+            try appendGateError(allocator, &errors, "verdict.status!=clean requires verdict.clean=false", .{});
+        }
         const finding_count = jsonUsizeField(verdict_obj, "findingCount");
         if (finding_count == null) {
             try appendGateError(allocator, &errors, "verdict.findingCount must be a non-negative integer", .{});
@@ -12858,6 +12868,30 @@ test "CAS-RER validator rejects findings without finding count" {
     try std.testing.expect(!gate.ok());
     try std.testing.expectEqual(@as(usize, 1), gate.errors.len);
     try std.testing.expect(std.mem.indexOf(u8, gate.errors[0], "findingCount > 0") != null);
+}
+
+test "CAS-RER validator rejects verdict clean/status disagreement" {
+    const clean_false_raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_clean_false","tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
+    ;
+    var clean_false = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, clean_false_raw, .{});
+    defer clean_false.deinit();
+    const clean_false_gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "clean-false-rer.json", clean_false.value.object);
+    defer clean_false_gate.deinit(std.testing.allocator);
+    try std.testing.expect(!clean_false_gate.ok());
+    try std.testing.expect(clean_false_gate.errors.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, clean_false_gate.errors[0], "verdict.clean=true") != null);
+
+    const findings_true_raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_findings_true","tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":true,"findingCount":1,"findings":[{"title":"issue"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
+    ;
+    var findings_true = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, findings_true_raw, .{});
+    defer findings_true.deinit();
+    const findings_true_gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "findings-true-rer.json", findings_true.value.object);
+    defer findings_true_gate.deinit(std.testing.allocator);
+    try std.testing.expect(!findings_true_gate.ok());
+    try std.testing.expect(findings_true_gate.errors.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, findings_true_gate.errors[0], "verdict.clean=false") != null);
 }
 
 test "CAS-RER validator rejects null required sections" {
