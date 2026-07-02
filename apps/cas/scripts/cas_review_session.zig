@@ -9548,18 +9548,21 @@ fn normalizeReceiptFromJsonAlloc(allocator: std.mem.Allocator, source_path: []co
     const clean = jsonBoolField(verdict, "clean") orelse return error.MissingCleanFlag;
     const finding_count = jsonUsizeField(verdict, "findingCount") orelse return error.MissingFindingCount;
     const review_thread_id = optionalStringFromVerdictOrRoot(verdict, root, "reviewThreadId");
-    const binding_failure = tupleBindingFailureCode(verdict, root, root_has_verdict, context);
     const account_failure = rootHasAccountResourceExhaustion(root) or
         if (optionalStringFromVerdictOrRoot(verdict, root, "failureCode")) |code| failureCodeIsAccountResourceExhausted(code) else false;
-    const final_failure_code = binding_failure orelse if (account_failure) "account_resource_exhausted" else optionalStringFromVerdictOrRoot(verdict, root, "failureCode");
-    const final_status = if (binding_failure != null)
-        "incomplete"
-    else if (account_failure and !reviewAttemptExists(review_thread_id))
+    const raw_failure_code = optionalStringFromVerdictOrRoot(verdict, root, "failureCode");
+    const status_without_binding = if (account_failure and !reviewAttemptExists(review_thread_id))
         "incomplete"
     else if (account_failure)
         "account_resource_exhausted"
     else
-        canonicalReceiptStatus(receipt_status, final_failure_code, review_thread_id);
+        canonicalReceiptStatus(receipt_status, raw_failure_code, review_thread_id);
+    const binding_failure = if (reviewVerdictStatusIsTupleTerminal(status_without_binding))
+        tupleBindingFailureCode(verdict, root, root_has_verdict, context)
+    else
+        null;
+    const final_failure_code = binding_failure orelse if (account_failure) "account_resource_exhausted" else raw_failure_code;
+    const final_status = if (binding_failure != null) "incomplete" else status_without_binding;
     const tuple_verdict_exists = binding_failure == null and
         reviewVerdictStatusIsTupleTerminal(final_status) and
         tupleVerdictExistsForContext(verdict, root, root_has_verdict, context);
@@ -13068,6 +13071,26 @@ test "receipt normalizer downgrades requested tuple mismatch" {
     try std.testing.expect(!receipt.clean);
     try std.testing.expect(!receipt.tuple_verdict_exists);
     try std.testing.expectEqualStrings("tuple_mismatch", receipt.failure_code.?);
+}
+
+test "receipt normalizer preserves transport failure over requested tuple binding" {
+    const raw =
+        \\{"demo":"cas-review-session","action":"start","reviewThreadId":"thr_transport","reviewTurnId":"turn_transport","recordPath":"/tmp/record.json","eventLogPath":"/tmp/events.jsonl","baseSha":"base_a","headSha":"head_a","targetFingerprint":"fp_a","reviewVerdict":{"status":"review_transport_failure","backendClass":"cas-start-wait","clean":false,"findingCount":0,"failureCode":"review_transport_lost","failureHint":"transport lost","baseSha":"base_a","headSha":"head_a","targetFingerprint":"fp_a","reviewThreadId":"thr_transport","reviewTurnId":"turn_transport","recordPath":"/tmp/record.json","eventLogPath":"/tmp/events.jsonl","findings":[]}}
+    ;
+    const requested = TargetIdentity{
+        .base_sha = "base_b",
+        .head_sha = "head_a",
+        .fingerprint = "fp_a",
+    };
+    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "transport.json", raw, true, .{
+        .requested_identity = requested,
+        .requested_identity_required = true,
+    });
+    defer receipt.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("review_transport_failure", receipt.status);
+    try std.testing.expect(!receipt.clean);
+    try std.testing.expect(!receipt.tuple_verdict_exists);
+    try std.testing.expectEqualStrings("review_transport_lost", receipt.failure_code.?);
 }
 
 test "receipt normalizer emits nested reviewVerdict in normalized JSON" {
