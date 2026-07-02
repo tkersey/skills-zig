@@ -1321,6 +1321,41 @@ fn writeCasRerRecordsArray(writer: *std.Io.Writer, records: []const CasRerLedger
     try writer.writeByte(']');
 }
 
+fn writeCasRerRecordRefsArray(writer: *std.Io.Writer, records: []const CasRerLedgerRecord) !void {
+    try writer.writeByte('[');
+    for (records, 0..) |record, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.writeAll("{\"recordId\":");
+        try writeJsonString(writer, record.record_id);
+        try writer.writeAll(",\"recordPath\":");
+        try writeJsonString(writer, record.path);
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
+}
+
+fn writeCasReviewCurrentEnvelope(writer: *std.Io.Writer, records: []const CasRerLedgerRecord) !void {
+    try writer.writeAll("{\"schema\":\"CAS-CURRENT-v1\",\"recordPath\":");
+    if (latestCasRerLedgerRecordIndex(records)) |idx| {
+        try writeJsonString(writer, records[idx].path);
+        try writer.writeAll(",\"record\":");
+        try writer.writeAll(records[idx].raw_json);
+        try writer.writeAll(",\"tupleCurrent\":true,\"actionRequired\":");
+        try writeJsonString(writer, actionRequiredForCasRerRecord(records[idx]));
+    } else {
+        try writer.writeAll("null,\"record\":null,\"tupleCurrent\":false,\"actionRequired\":\"run_new_attempt\"");
+    }
+    try writer.writeByte('}');
+}
+
+fn writeCasReviewListEnvelope(writer: *std.Io.Writer, records: []const CasRerLedgerRecord) !void {
+    try writer.writeAll("{\"schema\":\"CAS-LIST-v1\",\"records\":");
+    try writeCasRerRecordsArray(writer, records);
+    try writer.writeAll(",\"recordRefs\":");
+    try writeCasRerRecordRefsArray(writer, records);
+    try writer.writeByte('}');
+}
+
 fn cmdReviewCurrent(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     var resolved = try reviewCurrentIdentityAlloc(allocator, io, parsed);
     defer allocator.free(resolved.cwd);
@@ -1339,15 +1374,8 @@ fn cmdReviewCurrent(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs
 
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
-    try stdout.writeAll("{\"schema\":\"CAS-CURRENT-v1\",\"record\":");
-    if (latestCasRerLedgerRecordIndex(records.items)) |idx| {
-        try stdout.writeAll(records.items[idx].raw_json);
-        try stdout.writeAll(",\"tupleCurrent\":true,\"actionRequired\":");
-        try writeJsonString(stdout, actionRequiredForCasRerRecord(records.items[idx]));
-    } else {
-        try stdout.writeAll("null,\"tupleCurrent\":false,\"actionRequired\":\"run_new_attempt\"");
-    }
-    try stdout.writeAll("}\n");
+    try writeCasReviewCurrentEnvelope(stdout, records.items);
+    try stdout.writeByte('\n');
 }
 
 fn cmdReviewList(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
@@ -1368,9 +1396,8 @@ fn cmdReviewList(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
 
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
-    try stdout.writeAll("{\"schema\":\"CAS-LIST-v1\",\"records\":");
-    try writeCasRerRecordsArray(stdout, records.items);
-    try stdout.writeAll("}\n");
+    try writeCasReviewListEnvelope(stdout, records.items);
+    try stdout.writeByte('\n');
 }
 
 fn cmdReviewInspect(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
@@ -8927,6 +8954,7 @@ fn printStartJson(
             };
             try writeCasRunEnvelopeFromReceipt(allocator, stdout, normalized, broker, receipt.fresh_attempt_required);
             try stdout.writeByte('\n');
+            if (!casRunEvidenceAllowsSuccess(normalized)) return error.UntrustedReviewEvidence;
             return;
         }
     } else if (std.mem.eql(u8, receipt.surface_action, "start") and waited) {
@@ -10519,6 +10547,10 @@ fn casRerPrincipalProofUsable(receipt: NormalizedReceipt) bool {
         !receipt.account_fingerprint_reduced_protection and
         !casRerFallbackUsed(receipt) and
         casRerPrincipalFingerprintUsable(receipt.account_fingerprint);
+}
+
+fn casRunEvidenceAllowsSuccess(receipt: NormalizedReceipt) bool {
+    return casRerPrincipalProofUsable(receipt);
 }
 
 fn casRerAttemptIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt) !?[]const u8 {
@@ -13260,6 +13292,87 @@ test "CAS-RER ledger record projection matches tuple identity" {
     try std.testing.expect(terminal_incomplete_record.attempt_exists);
     try std.testing.expect(!terminal_incomplete_record.tuple_verdict_exists);
     try std.testing.expectEqualStrings("inspect", actionRequiredForCasRerRecord(terminal_incomplete_record));
+}
+
+test "CAS current and list envelopes include ledger record paths" {
+    const raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_path","createdAt":"2026-07-02T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:a","phase":"review_terminal","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":1,"findings":[{"title":"issue"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-start-wait"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
+    ;
+    const record = try casRerLedgerRecordFromJsonAlloc(std.testing.allocator, "/tmp/rer_path.json", raw);
+    defer record.deinit(std.testing.allocator);
+    const records = [_]CasRerLedgerRecord{record};
+
+    var current_out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer current_out.deinit();
+    try writeCasReviewCurrentEnvelope(&current_out.writer, &records);
+    const current_json = try current_out.toOwnedSlice();
+    defer std.testing.allocator.free(current_json);
+    var current_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, current_json, .{});
+    defer current_parsed.deinit();
+    const current = current_parsed.value.object;
+    try std.testing.expectEqualStrings("CAS-CURRENT-v1", current.get("schema").?.string);
+    try std.testing.expectEqualStrings("/tmp/rer_path.json", current.get("recordPath").?.string);
+    try std.testing.expectEqualStrings("none", current.get("actionRequired").?.string);
+    try std.testing.expectEqualStrings("rer_path", current.get("record").?.object.get("recordId").?.string);
+
+    var list_out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer list_out.deinit();
+    try writeCasReviewListEnvelope(&list_out.writer, &records);
+    const list_json = try list_out.toOwnedSlice();
+    defer std.testing.allocator.free(list_json);
+    var list_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, list_json, .{});
+    defer list_parsed.deinit();
+    const list = list_parsed.value.object;
+    try std.testing.expectEqualStrings("CAS-LIST-v1", list.get("schema").?.string);
+    try std.testing.expectEqual(@as(usize, 1), list.get("records").?.array.items.len);
+    try std.testing.expectEqualStrings("rer_path", list.get("records").?.array.items[0].object.get("recordId").?.string);
+    const ref = list.get("recordRefs").?.array.items[0].object;
+    try std.testing.expectEqualStrings("rer_path", ref.get("recordId").?.string);
+    try std.testing.expectEqualStrings("/tmp/rer_path.json", ref.get("recordPath").?.string);
+}
+
+test "CAS run shell success requires proof usable principal" {
+    const strong = NormalizedReceipt{
+        .source_path = "/tmp/receipt.json",
+        .status = "findings",
+        .backend_class = "cas-start-wait",
+        .clean = false,
+        .finding_count = 1,
+        .review_attempt_phase = "normalized_verdict",
+        .review_attempt_exists = true,
+        .tuple_verdict_exists = true,
+        .principal_strength = principal_strength_strong,
+        .account_fingerprint_reduced_protection = false,
+        .base_sha = "base",
+        .head_sha = "head",
+        .target_fingerprint = "fp",
+        .repo_realpath = "/tmp/repo",
+        .resolved_codex_path = "/bin/codex",
+        .resolved_codex_version = "codex 0.1.0",
+        .account_fingerprint = "acct:test",
+        .review_thread_id = "thr",
+        .review_turn_id = "turn",
+        .record_path = "/tmp/record.json",
+        .event_log_path = "/tmp/events.ndjson",
+        .failure_code = null,
+        .failure_hint = null,
+        .failure_class = null,
+        .retryable_same_tuple_now = null,
+        .findings_json = "[]",
+    };
+    try std.testing.expect(casRunEvidenceAllowsSuccess(strong));
+
+    var reduced = strong;
+    reduced.principal_strength = principal_strength_reduced;
+    try std.testing.expect(!casRunEvidenceAllowsSuccess(reduced));
+
+    var fallback = strong;
+    fallback.backend_class = "cas-native-fallback";
+    try std.testing.expect(!casRunEvidenceAllowsSuccess(fallback));
+
+    var unknown_account = strong;
+    unknown_account.account_fingerprint = unknown_account_fingerprint;
+    try std.testing.expect(!casRunEvidenceAllowsSuccess(unknown_account));
 }
 
 test "start shadow payload carries Codex identity into CAS-RER tuple" {
