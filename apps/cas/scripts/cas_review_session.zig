@@ -2800,6 +2800,7 @@ fn cmdReviewImport(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs)
         defer allocator.free(import_timestamp);
         const record_json = casRerJsonFromReceiptAlloc(allocator, receipt, .{
             .repo_realpath_override = import_repo_realpath,
+            .tuple_current_at_record_time = if (requested_identity_opt) |identity| receiptTupleMatchesIdentity(receipt, identity) else false,
             .created_at = import_timestamp,
             .updated_at = import_timestamp,
         }) catch |err| {
@@ -7162,6 +7163,7 @@ fn printReviewTupleLockExistingAndExit(
                 .broker_action = "blocked_live",
                 .broker_reason = broker_decision.?.reason,
                 .imported_from_receipt = false,
+                .tuple_current_at_record_time = true,
                 .created_at = timestamp,
                 .updated_at = timestamp,
             });
@@ -7308,6 +7310,7 @@ fn emitReviewTupleLockBlockedAndExit(
                 .broker_action = publicReviewBrokerAction(reviewBrokerActionForBlockedLock(decision)),
                 .broker_reason = hint,
                 .imported_from_receipt = false,
+                .tuple_current_at_record_time = true,
                 .created_at = timestamp,
                 .updated_at = timestamp,
             });
@@ -7848,6 +7851,7 @@ fn emitPreReviewLaneTransportLostAndExit(
             .broker_action = "created_new",
             .broker_reason = "pre-review lane transport loss shadowed into CAS-RER-v1",
             .imported_from_receipt = false,
+            .tuple_current_at_record_time = true,
             .created_at = timestamp,
             .updated_at = timestamp,
         });
@@ -8230,6 +8234,7 @@ fn printStatusJson(
                     .broker_action = "created_new",
                     .broker_reason = "low-level wait output shadowed into CAS-RER-v1",
                     .imported_from_receipt = false,
+                    .tuple_current_at_record_time = true,
                     .created_at = timestamp,
                     .updated_at = timestamp,
                 });
@@ -8659,6 +8664,7 @@ fn printStartJson(
             .broker_action = "created_new",
             .broker_reason = "low-level start output shadowed into CAS-RER-v1",
             .imported_from_receipt = false,
+            .tuple_current_at_record_time = true,
             .created_at = timestamp,
             .updated_at = timestamp,
         });
@@ -8724,6 +8730,7 @@ fn printStartJson(
                 .broker_action = "created_new",
                 .broker_reason = "low-level start --wait output shadowed into CAS-RER-v1",
                 .imported_from_receipt = false,
+                .tuple_current_at_record_time = true,
                 .created_at = timestamp,
                 .updated_at = timestamp,
             });
@@ -10142,6 +10149,13 @@ fn receiptHasCompleteTuple(receipt: NormalizedReceipt) bool {
         nonEmptyOptional(receipt.target_fingerprint) != null;
 }
 
+fn receiptTupleMatchesIdentity(receipt: NormalizedReceipt, identity: TargetIdentity) bool {
+    if (!identityHasCompleteTuple(identity)) return false;
+    return optionalStringsEqual(receipt.base_sha, identity.base_sha) and
+        optionalStringsEqual(receipt.head_sha, identity.head_sha) and
+        optionalStringsEqual(receipt.target_fingerprint, identity.fingerprint);
+}
+
 const CasRerProjectionOptions = struct {
     command_surface: []const u8 = "import",
     backend_selected: []const u8 = "imported-legacy",
@@ -10149,7 +10163,7 @@ const CasRerProjectionOptions = struct {
     broker_reason: []const u8 = "legacy review artifact normalized into CAS-RER-v1",
     repo_realpath_override: ?[]const u8 = null,
     fresh_attempt_required: bool = false,
-    tuple_current_at_record_time: bool = true,
+    tuple_current_at_record_time: bool = false,
     imported_from_receipt: bool = true,
     created_at: []const u8 = "1970-01-01T00:00:00Z",
     updated_at: []const u8 = "1970-01-01T00:00:00Z",
@@ -10192,6 +10206,7 @@ fn writeCasRunEnvelopeFromReceipt(allocator: std.mem.Allocator, writer: *std.Io.
         .broker_reason = broker.reason,
         .fresh_attempt_required = fresh_attempt_required,
         .imported_from_receipt = false,
+        .tuple_current_at_record_time = true,
         .created_at = timestamp,
         .updated_at = timestamp,
     });
@@ -13127,6 +13142,22 @@ test "CAS-RER projection fills missing repo realpath from import cwd" {
     defer parsed.deinit();
     const tuple = parsed.value.object.get("tuple").?.object;
     try std.testing.expectEqualStrings("/tmp/repo", tuple.get("repoRealpath").?.string);
+    try std.testing.expect(!tuple.get("tupleCurrentAtRecordTime").?.bool);
+
+    const identity = TargetIdentity{
+        .base_sha = "base",
+        .head_sha = "head",
+        .fingerprint = "fp",
+    };
+    try std.testing.expect(receiptTupleMatchesIdentity(receipt, identity));
+    const matched_json = try casRerJsonFromReceiptAlloc(std.testing.allocator, receipt, .{
+        .repo_realpath_override = "/tmp/repo",
+        .tuple_current_at_record_time = receiptTupleMatchesIdentity(receipt, identity),
+    });
+    defer std.testing.allocator.free(matched_json);
+    var matched = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, matched_json, .{});
+    defer matched.deinit();
+    try std.testing.expect(matched.value.object.get("tuple").?.object.get("tupleCurrentAtRecordTime").?.bool);
 }
 
 test "CAS inspect record object keeps malformed JSON output parseable" {
