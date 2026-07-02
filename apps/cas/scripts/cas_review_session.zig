@@ -10955,11 +10955,14 @@ fn casRerRecordIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt,
     const effective_resolved_codex_path = opts.resolved_codex_path_override orelse receipt.resolved_codex_path orelse "";
     const effective_resolved_codex_version = opts.resolved_codex_version_override orelse receipt.resolved_codex_version orelse "";
     const effective_account_fingerprint = opts.account_fingerprint_override orelse receipt.account_fingerprint orelse "";
-    const material = try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{d}\x1f{s}\x1f{s}", .{
+    const material = try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{d}\x1f{s}\x1f{s}", .{
         effective_repo_realpath,
         effective_resolved_codex_path,
         effective_resolved_codex_version,
         effective_account_fingerprint,
+        receipt.backend_class,
+        receipt.principal_strength,
+        if (receipt.account_fingerprint_reduced_protection) "reduced-protection" else "full-protection",
         opts.command_surface,
         opts.backend_selected,
         opts.broker_action,
@@ -14284,6 +14287,28 @@ test "CAS-RER record id includes stable projection identity" {
     });
     defer std.testing.allocator.free(run);
     try std.testing.expect(!std.mem.eql(u8, start_wait, run));
+
+    var reduced = receipt;
+    reduced.account_fingerprint_reduced_protection = true;
+    const reduced_id = try casRerRecordIdAlloc(std.testing.allocator, reduced, .{
+        .command_surface = "start_wait",
+        .backend_selected = "cas-start-wait",
+        .broker_action = "created_new",
+        .broker_reason = "test",
+    });
+    defer std.testing.allocator.free(reduced_id);
+    try std.testing.expect(!std.mem.eql(u8, start_wait, reduced_id));
+
+    var fallback = receipt;
+    fallback.backend_class = "cas-native-fallback";
+    const fallback_id = try casRerRecordIdAlloc(std.testing.allocator, fallback, .{
+        .command_surface = "start_wait",
+        .backend_selected = "cas-start-wait",
+        .broker_action = "created_new",
+        .broker_reason = "test",
+    });
+    defer std.testing.allocator.free(fallback_id);
+    try std.testing.expect(!std.mem.eql(u8, start_wait, fallback_id));
 }
 
 test "CAS-RER projection lets requested import cwd override receipt repo" {
