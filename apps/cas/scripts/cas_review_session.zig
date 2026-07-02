@@ -2816,7 +2816,10 @@ fn collectNestedCasRerRecordsAlloc(allocator: std.mem.Allocator, out: *std.Array
                     .object => |value| value,
                     else => continue,
                 };
-                const record = objectField(item_obj, "record") orelse continue;
+                const record = if (isCasRerObject(item_obj))
+                    item_obj
+                else
+                    objectField(item_obj, "record") orelse continue;
                 if (!isCasRerObject(record)) continue;
                 try out.append(allocator, try stringifyJsonValueAlloc(allocator, .{ .object = record }));
                 found = true;
@@ -13615,13 +13618,13 @@ test "review import extracts nested CAS-RER records from envelopes" {
     try std.testing.expectEqualStrings("acct:test", nested.value.object.get("principal").?.object.get("accountFingerprint").?.string);
 
     const import_envelope = try std.fmt.allocPrint(std.testing.allocator,
-        \\{{"schema":"CAS-IMPORT-v1","records":[{{"sourcePath":"/tmp/receipt.json","record":{s}}}],"errors":[]}}
-    , .{record_json});
+        \\{{"schema":"CAS-IMPORT-v1","records":[{{"sourcePath":"/tmp/receipt.json","record":{s}}},{s}],"errors":[]}}
+    , .{ record_json, record_json });
     defer std.testing.allocator.free(import_envelope);
     var import_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, import_envelope, .{});
     defer import_parsed.deinit();
     try std.testing.expect(try collectNestedCasRerRecordsAlloc(std.testing.allocator, &records, import_parsed.value.object));
-    try std.testing.expectEqual(@as(usize, 2), records.items.len);
+    try std.testing.expectEqual(@as(usize, 3), records.items.len);
 }
 
 test "CAS inspect record object keeps malformed JSON output parseable" {
