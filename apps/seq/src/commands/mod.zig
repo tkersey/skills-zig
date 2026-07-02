@@ -25,6 +25,7 @@ const actuation_proof = @import("../actuation/proof.zig");
 const actuation_compaction = @import("../actuation/compaction.zig");
 const actuation_workers = @import("../actuation/workers.zig");
 const actuation_surface = @import("../actuation/surface.zig");
+const actuation_hylo = @import("../actuation/hylo.zig");
 const cas_review_audit = @import("../cas_review_audit.zig");
 const execution_policy_audit = @import("../execution_policy/mod.zig");
 const st_workspace_audit = @import("../st_workspace_audit.zig");
@@ -272,6 +273,11 @@ pub const dataset_meta = [_]DatasetMeta{
         .name = "actuation_workers",
         .description = "Actuation linked worker and packet-yield rows",
         .fields = &.{ "run_id", "session_id", "spawned", "linked", "valid_artifacts", "artifact_yield" },
+    },
+    .{
+        .name = "actuation_hylo_runs",
+        .description = "ALSR/HYL/HSR governance coverage for true actuation runs",
+        .fields = &.{ "run_id", "session_id", "true_run", "hylo_required", "alsr_present", "hyl_present", "hsr_step_count", "mutations", "mutations_with_unfold", "actions_without_fold", "continues_without_next_state", "terminal_folds", "atcg_after_terminal_fold", "graph_bypass", "quality_state", "failure_classes" },
     },
     .{
         .name = "execution_policy_runs",
@@ -1177,7 +1183,7 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\  --format markdown           Only valid with --mode report
         ,
         .actuation_audit =>
-        \\usage: seq actuation-audit --root <path> [--session-id <id>|--path <rollout.jsonl>|(--repo <path>|--workdir <path>) (--since <iso>|--until <iso>|--last <duration>)] [--include-workers] [--mode summary|runs|slices|proof|compactions|decisions|report] [--strict] [--include-excerpts] [--format table|json|jsonl|csv|markdown]
+        \\usage: seq actuation-audit --root <path> [--session-id <id>|--path <rollout.jsonl>|(--repo <path>|--workdir <path>) (--since <iso>|--until <iso>|--last <duration>)] [--include-workers] [--mode summary|runs|slices|proof|compactions|decisions|hylo|report] [--strict] [--include-excerpts] [--format table|json|jsonl|csv|markdown]
         \\extra options:
         \\  --exclude-current          Exclude the current CODEX_THREAD_ID session from corpus selectors
         \\  --strict                   Exit 2 when a true run has a defined actuation control failure
@@ -2191,6 +2197,7 @@ fn isValidActuationAuditMode(text: []const u8) bool {
         std.mem.eql(u8, text, "proof") or
         std.mem.eql(u8, text, "compactions") or
         std.mem.eql(u8, text, "decisions") or
+        std.mem.eql(u8, text, "hylo") or
         std.mem.eql(u8, text, "report");
 }
 
@@ -3378,6 +3385,7 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
             \\      "source_governance_projection_v1": true,
             \\      "c3_structured_closure_v1": true,
             \\      "actuation_audit_v1": true,
+            \\      "actuation_hylo_audit_v1": true,
             \\      "execution_policy_audit_v1": true,
             \\      "st_workspace_audit_v1": true,
             \\      "st_graph_control_receipt_v1": true,
@@ -3448,6 +3456,7 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
         .{ .name = "source_governance_projection_v1", .enabled = true },
         .{ .name = "c3_structured_closure_v1", .enabled = true },
         .{ .name = "actuation_audit_v1", .enabled = true },
+        .{ .name = "actuation_hylo_audit_v1", .enabled = true },
         .{ .name = "execution_policy_audit_v1", .enabled = true },
         .{ .name = "st_workspace_audit_v1", .enabled = true },
         .{ .name = "st_graph_control_receipt_v1", .enabled = true },
@@ -3507,6 +3516,13 @@ fn cmdActuationAudit(allocator: std.mem.Allocator, sessions_root: []const u8, op
     try collectActuationDatasetRows(allocator, dataset_name, sessions_root, params.items, &rows);
 
     if (opts.actuation_strict and try hasStrictActuationFailureForParams(allocator, sessions_root, params.items, dataset_name, rows.items)) std.process.exit(2);
+
+    if (std.mem.eql(u8, mode, "hylo") and opts.format == .json) {
+        const rendered = try renderActuationHyloSummaryJson(allocator, rows.items);
+        defer allocator.free(rendered);
+        try writeTextOutput(rendered, opts.out_path);
+        return;
+    }
 
     const cols = actuationColumnsForMode(mode);
     try output.writeOutput(allocator, opts.format, rows.items, cols, opts.out_path);
@@ -3978,6 +3994,7 @@ fn actuationDatasetForMode(mode: []const u8) []const u8 {
     if (std.mem.eql(u8, mode, "decisions")) return "actuation_decisions";
     if (std.mem.eql(u8, mode, "proof")) return "actuation_proofs";
     if (std.mem.eql(u8, mode, "compactions")) return "actuation_compactions";
+    if (std.mem.eql(u8, mode, "hylo")) return "actuation_hylo_runs";
     return "actuation_runs";
 }
 
@@ -3988,7 +4005,84 @@ fn actuationColumnsForMode(mode: []const u8) []const []const u8 {
     if (std.mem.eql(u8, mode, "decisions")) return findDatasetMeta("actuation_decisions").?.fields;
     if (std.mem.eql(u8, mode, "proof")) return findDatasetMeta("actuation_proofs").?.fields;
     if (std.mem.eql(u8, mode, "compactions")) return findDatasetMeta("actuation_compactions").?.fields;
+    if (std.mem.eql(u8, mode, "hylo")) return findDatasetMeta("actuation_hylo_runs").?.fields;
     return findDatasetMeta("actuation_runs").?.fields;
+}
+
+fn renderActuationHyloSummaryJson(allocator: std.mem.Allocator, rows: []const query.Row) ![]u8 {
+    var true_runs: i64 = 0;
+    var hylo_required: i64 = 0;
+    var alsr_present: i64 = 0;
+    var hyl_present: i64 = 0;
+    var hsr_step_count: i64 = 0;
+    var mutations: i64 = 0;
+    var mutations_with_unfold: i64 = 0;
+    var actions_without_fold: i64 = 0;
+    var continues_without_next_state: i64 = 0;
+    var terminal_folds: i64 = 0;
+    var atcg_after_terminal_fold: i64 = 0;
+    var graph_bypass: i64 = 0;
+    var quality_counts: [actuation_hylo.quality_state_count]usize = .{0} ** actuation_hylo.quality_state_count;
+    var failure_counts: [actuation_hylo.failure_class_count]usize = .{0} ** actuation_hylo.failure_class_count;
+
+    for (rows) |row| {
+        if (scalarBool(row.valueOrNull("true_run"))) true_runs += 1;
+        if (!scalarBool(row.valueOrNull("hylo_required"))) continue;
+        hylo_required += 1;
+        if (scalarBool(row.valueOrNull("alsr_present"))) alsr_present += 1;
+        if (scalarBool(row.valueOrNull("hyl_present"))) hyl_present += 1;
+        hsr_step_count += scalarIntOrZero(row.valueOrNull("hsr_step_count"));
+        mutations += scalarIntOrZero(row.valueOrNull("mutations"));
+        mutations_with_unfold += scalarIntOrZero(row.valueOrNull("mutations_with_unfold"));
+        actions_without_fold += scalarIntOrZero(row.valueOrNull("actions_without_fold"));
+        continues_without_next_state += scalarIntOrZero(row.valueOrNull("continues_without_next_state"));
+        terminal_folds += scalarIntOrZero(row.valueOrNull("terminal_folds"));
+        atcg_after_terminal_fold += scalarIntOrZero(row.valueOrNull("atcg_after_terminal_fold"));
+        if (scalarBool(row.valueOrNull("graph_bypass"))) graph_bypass += 1;
+
+        const quality = scalarString(row.valueOrNull("quality_state")) orelse "absent";
+        for (actuation_hylo.quality_state_names, 0..) |name, idx| {
+            if (std.mem.eql(u8, quality, name)) {
+                quality_counts[idx] += 1;
+                break;
+            }
+        }
+        const failures = scalarString(row.valueOrNull("failure_classes")) orelse "";
+        for (actuation_hylo.failure_class_names, 0..) |name, idx| {
+            if (std.mem.indexOf(u8, failures, name) != null) failure_counts[idx] += 1;
+        }
+    }
+
+    const failures_json = try actuation_hylo.failureClassesJson(allocator, failure_counts);
+    defer allocator.free(failures_json);
+
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+    try writer.writeAll("{\n");
+    try writer.print("  \"true_runs\": {d},\n", .{true_runs});
+    try writer.print("  \"hylo_required\": {d},\n", .{hylo_required});
+    try writer.print("  \"alsr_present\": {d},\n", .{alsr_present});
+    try writer.print("  \"hyl_present\": {d},\n", .{hyl_present});
+    try writer.print("  \"hsr_step_count\": {d},\n", .{hsr_step_count});
+    try writer.print("  \"mutations\": {d},\n", .{mutations});
+    try writer.print("  \"mutations_with_unfold\": {d},\n", .{mutations_with_unfold});
+    try writer.print("  \"actions_without_fold\": {d},\n", .{actions_without_fold});
+    try writer.print("  \"continues_without_next_state\": {d},\n", .{continues_without_next_state});
+    try writer.print("  \"terminal_folds\": {d},\n", .{terminal_folds});
+    try writer.print("  \"atcg_after_terminal_fold\": {d},\n", .{atcg_after_terminal_fold});
+    try writer.print("  \"graph_bypass\": {d},\n", .{graph_bypass});
+    try writer.writeAll("  \"quality_states\": {");
+    for (actuation_hylo.quality_state_names, 0..) |name, idx| {
+        if (idx > 0) try writer.writeAll(", ");
+        try output.writeJsonString(writer, name);
+        try writer.print(": {d}", .{quality_counts[idx]});
+    }
+    try writer.writeAll("},\n");
+    try writer.writeAll("  \"failure_classes\": ");
+    try writer.writeAll(failures_json);
+    try writer.writeAll("\n}\n");
+    return writer_alloc.toOwnedSlice();
 }
 
 fn hasStrictActuationFailure(rows: []const query.Row) bool {
@@ -21010,6 +21104,8 @@ fn collectActuationDatasetRows(
             try appendActuationCompactionRow(allocator, out_rows, ledger, trace);
         } else if (std.mem.eql(u8, dataset_name, "actuation_workers")) {
             try appendActuationWorkerRow(allocator, out_rows, ledger, trace);
+        } else if (std.mem.eql(u8, dataset_name, "actuation_hylo_runs")) {
+            try appendActuationHyloRow(allocator, out_rows, ledger, graph, trace);
         } else {
             return error.UnknownDataset;
         }
@@ -21200,6 +21296,37 @@ fn appendActuationWorkerRow(allocator: std.mem.Allocator, rows: *std.ArrayList(q
     try row.putStaticKey("linked", .{ .int = @intCast(summary.linked) });
     try row.putStaticKey("valid_artifacts", .{ .int = @intCast(summary.valid_artifacts) });
     try row.putStaticKey("artifact_yield", .{ .float = summary.artifactYield() });
+    try rows.append(allocator, row);
+}
+
+fn appendActuationHyloRow(
+    allocator: std.mem.Allocator,
+    rows: *std.ArrayList(query.Row),
+    ledger: actuation_audit.RunLedger,
+    graph: actuation_gcr.Analysis,
+    trace: canonical_trace.CanonicalSessionTrace,
+) !void {
+    const summary = actuation_hylo.analyzeTrace(trace, ledger.classification.true_run, graph);
+    const failures_json = try actuation_hylo.failureClassListJson(allocator, summary.failure_counts);
+    defer allocator.free(failures_json);
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    try row.putStaticKey("run_id", .{ .string = ledger.identity.run_id });
+    try row.putStaticKey("session_id", .{ .string = ledger.identity.session_id });
+    try row.putStaticKey("true_run", .{ .bool = summary.true_run });
+    try row.putStaticKey("hylo_required", .{ .bool = summary.hylo_required });
+    try row.putStaticKey("alsr_present", .{ .bool = summary.alsr_present });
+    try row.putStaticKey("hyl_present", .{ .bool = summary.hyl_present });
+    try row.putStaticKey("hsr_step_count", .{ .int = @intCast(summary.hsr_step_count) });
+    try row.putStaticKey("mutations", .{ .int = @intCast(summary.mutations) });
+    try row.putStaticKey("mutations_with_unfold", .{ .int = @intCast(summary.mutations_with_unfold) });
+    try row.putStaticKey("actions_without_fold", .{ .int = @intCast(summary.actions_without_fold) });
+    try row.putStaticKey("continues_without_next_state", .{ .int = @intCast(summary.continues_without_next_state) });
+    try row.putStaticKey("terminal_folds", .{ .int = @intCast(summary.terminal_folds) });
+    try row.putStaticKey("atcg_after_terminal_fold", .{ .int = @intCast(summary.atcg_after_terminal_fold) });
+    try row.putStaticKey("graph_bypass", .{ .bool = summary.graph_bypass });
+    try row.putStaticKey("quality_state", .{ .string = summary.quality_state });
+    try row.putStaticKey("failure_classes", .{ .string = failures_json });
     try rows.append(allocator, row);
 }
 

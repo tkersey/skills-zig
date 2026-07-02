@@ -48,6 +48,27 @@ fn writePastedSkillFixture(path: []const u8) !void {
     try out.flush();
 }
 
+fn writeHyloFixture(path: []const u8) !void {
+    if (std.fs.path.dirname(path)) |dir| {
+        if (dir.len > 0) try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), dir);
+    }
+    var file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), path, .{ .truncate = true });
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    var file_writer = file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const out = &file_writer.interface;
+    try out.writeAll(
+        \\{"type":"session_meta","timestamp":"2026-07-02T10:00:00Z","payload":{"id":"actuation-hylo-governed","cwd":"/repo/seq-audit","model":"gpt-5","git":{"branch":"feature/hylo","commit_hash":"base"}}}
+        \\{"type":"event_msg","timestamp":"2026-07-02T10:00:01Z","payload":{"type":"task_started","turn_id":"t1"}}
+        \\{"type":"event_msg","timestamp":"2026-07-02T10:00:02Z","payload":{"type":"user_message","turn_id":"t1","message":"$actuating implement governed feature. Detection markers: receipt_version: ALSR-v1 machine_version: HYL-v1 receipt_version: HSR-v1"}}
+        \\{"type":"event_msg","timestamp":"2026-07-02T10:00:03Z","payload":{"type":"agent_message","turn_id":"t1","message":"agent_loop_scheme_receipt:\n  receipt_version: ALSR-v1\nactuation_hylomorphism:\n  machine_version: HYL-v1\nhylo_step_receipt:\n  receipt_version: HSR-v1\n  unfold:\n    produced: work_node\n  action:\n    effect: edit\n  fold:\n    verdict: complete\n    current_artifact_bound: yes\n  stop_rule:\n    success: done\nATCG-v1:\n  can_mark_goal_complete: yes"}}
+        \\{"type":"response_item","timestamp":"2026-07-02T10:00:04Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-1","arguments":"*** Begin Patch\n*** Update File: a\n+ok\n*** End Patch"}}
+        \\{"type":"response_item","timestamp":"2026-07-02T10:00:05Z","payload":{"type":"function_call_output","call_id":"patch-1","output":"Success. Updated the following files:\nM a\n"}}
+        \\{"type":"event_msg","timestamp":"2026-07-02T10:00:06Z","payload":{"type":"task_complete","turn_id":"t1","duration_ms":5000}}
+        \\
+    );
+    try out.flush();
+}
+
 test "actuation audit regression fixture exposes projection inversion signals" {
     const fixture = "testdata/actuation/long-run-regression.jsonl";
 
@@ -109,6 +130,30 @@ test "actuation audit datasets expose lineage proof compaction and query rows" {
     const filtered = try runAndReadOutput(std.testing.allocator, .query, filtered_query_args[0..], ".zig-cache/actuation-query-filtered.json");
     defer std.testing.allocator.free(filtered);
     try std.testing.expectEqualStrings("[\n]\n", filtered);
+}
+
+test "actuation audit hylo mode emits object-shaped governance summary" {
+    const fixture = ".zig-cache/actuation-hylo-governed.jsonl";
+    try writeHyloFixture(fixture);
+
+    const args = [_][]const u8{ "--path", fixture, "--mode", "hylo", "--format", "json" };
+    const got = try runAndReadOutput(std.testing.allocator, .actuation_audit, args[0..], ".zig-cache/actuation-hylo.json");
+    defer std.testing.allocator.free(got);
+
+    try expectContains(got, "\"true_runs\": 1");
+    try expectContains(got, "\"hylo_required\": 1");
+    try expectContains(got, "\"alsr_present\": 1");
+    try expectContains(got, "\"hyl_present\": 1");
+    try expectContains(got, "\"hsr_step_count\": 1");
+    try expectContains(got, "\"mutations\": 1");
+    try expectContains(got, "\"mutations_with_unfold\": 1");
+    try expectContains(got, "\"actions_without_fold\": 0");
+    try expectContains(got, "\"continues_without_next_state\": 0");
+    try expectContains(got, "\"terminal_folds\": 1");
+    try expectContains(got, "\"atcg_after_terminal_fold\": 1");
+    try expectContains(got, "\"graph_bypass\": 0");
+    try expectContains(got, "\"present_and_closed\": 1");
+    try expectContains(got, "\"failure_classes\": {}");
 }
 
 test "actuation audit excludes pasted skill blocks as true runs" {
