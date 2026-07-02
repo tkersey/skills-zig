@@ -10878,10 +10878,9 @@ fn casRerPrincipalProofUsable(receipt: NormalizedReceipt) bool {
 
 fn casRerAttemptIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt) !?[]const u8 {
     const review_thread_id = nonEmptyOptional(receipt.review_thread_id) orelse return null;
-    const material = try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}", .{
+    const material = try std.fmt.allocPrint(allocator, "{s}\x1f{s}", .{
         review_thread_id,
         receipt.review_turn_id orelse "",
-        receipt.source_path,
     });
     defer allocator.free(material);
     return try sha256HexAlloc(allocator, material);
@@ -13557,6 +13556,11 @@ test "CAS-RER writer projects terminal findings receipt" {
     try std.testing.expect(attempt.get("exists").?.bool);
     try std.testing.expect(std.mem.startsWith(u8, attempt.get("attemptId").?.string, "sha256:"));
     try std.testing.expectEqualStrings("thr_rer", attempt.get("reviewThreadId").?.string);
+    var copied_receipt = receipt;
+    copied_receipt.source_path = "/tmp/copied-findings-receipt.json";
+    const copied_attempt_id = (try casRerAttemptIdAlloc(std.testing.allocator, copied_receipt)).?;
+    defer std.testing.allocator.free(copied_attempt_id);
+    try std.testing.expectEqualStrings(attempt.get("attemptId").?.string, copied_attempt_id);
     const verdict = root.get("verdict").?.object;
     try std.testing.expect(verdict.get("tupleVerdictExists").?.bool);
     try std.testing.expectEqualStrings("findings", verdict.get("status").?.string);

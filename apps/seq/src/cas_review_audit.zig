@@ -1082,10 +1082,12 @@ fn manualRecoveryCommand(command_surface: []const u8) bool {
     return std.mem.indexOf(u8, command_surface, "review_session lock") != null or
         std.mem.indexOf(u8, command_surface, "review_session receipt") != null or
         std.mem.indexOf(u8, command_surface, "review_session validate-record") != null or
+        std.mem.indexOf(u8, command_surface, "review_session validate_record") != null or
         std.mem.indexOf(u8, command_surface, "review_session inspect") != null or
         std.mem.indexOf(u8, command_surface, "receipt normalize") != null or
         std.mem.indexOf(u8, command_surface, "lock gate") != null or
         std.mem.indexOf(u8, command_surface, "cas review validate-record") != null or
+        std.mem.indexOf(u8, command_surface, "cas review validate_record") != null or
         std.mem.indexOf(u8, command_surface, "cas review inspect") != null or
         std.mem.indexOf(u8, command_surface, "--review-lock-override") != null;
 }
@@ -2332,8 +2334,11 @@ test "summary separates review transport timeout duplicate and degraded lane tup
 
 test "public review diagnostics count as manual recovery commands" {
     try std.testing.expect(manualRecoveryCommand("cas review validate-record --record rer_1 --json"));
+    try std.testing.expect(manualRecoveryCommand("cas review validate_record --record rer_1 --json"));
     try std.testing.expect(manualRecoveryCommand("cas review inspect --record rer_1 --json"));
     try std.testing.expect(manualRecoveryCommand("cas review_session validate-record --record rer_1 --json"));
+    try std.testing.expect(manualRecoveryCommand("cas review_session validate_record --record rer_1 --json"));
+    try std.testing.expect(manualRecoveryCommand("cas_review_session validate_record --record rer_1 --json"));
     try std.testing.expect(manualRecoveryCommand("cas_review_session inspect --record rer_1 --json"));
     try std.testing.expect(!manualRecoveryCommand("cas review current --cwd /repo --base main --json"));
 }
