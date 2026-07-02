@@ -2835,6 +2835,13 @@ fn importRecordEnvelopeValidationOk(obj: std.json.ObjectMap) bool {
     return false;
 }
 
+fn nestedCasRerObjectImportable(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !bool {
+    if (!isCasRerObject(obj)) return false;
+    var validation = try validateCasRerRecordObjectAlloc(allocator, "<nested CAS-RER>", obj);
+    defer validation.deinit(allocator);
+    return validation.ok();
+}
+
 fn collectNestedCasRerRecordsAlloc(allocator: std.mem.Allocator, out: *std.ArrayList([]u8), root: std.json.ObjectMap) !bool {
     if (isCasRerObject(root)) {
         try out.append(allocator, try stringifyJsonValueAlloc(allocator, .{ .object = root }));
@@ -2843,7 +2850,7 @@ fn collectNestedCasRerRecordsAlloc(allocator: std.mem.Allocator, out: *std.Array
 
     var found = false;
     if (objectField(root, "record")) |record| {
-        if (isCasRerObject(record)) {
+        if (try nestedCasRerObjectImportable(allocator, record)) {
             try out.append(allocator, try stringifyJsonValueAlloc(allocator, .{ .object = record }));
             found = true;
         }
@@ -2856,11 +2863,11 @@ fn collectNestedCasRerRecordsAlloc(allocator: std.mem.Allocator, out: *std.Array
                     else => continue,
                 };
                 if (!importRecordEnvelopeValidationOk(item_obj)) continue;
-                const record = if (isCasRerObject(item_obj))
+                const record = if (try nestedCasRerObjectImportable(allocator, item_obj))
                     item_obj
                 else
                     objectField(item_obj, "record") orelse continue;
-                if (!isCasRerObject(record)) continue;
+                if (!(try nestedCasRerObjectImportable(allocator, record))) continue;
                 try out.append(allocator, try stringifyJsonValueAlloc(allocator, .{ .object = record }));
                 found = true;
             }
@@ -7351,6 +7358,29 @@ fn reviewTupleLockActionWithProbe(action_name: []const u8, existing: ?ReviewTupl
     return .block_invalid;
 }
 
+fn normalizedReceiptReusableTerminal(receipt: NormalizedReceipt) bool {
+    if (!receipt.tuple_verdict_exists) return false;
+    if (!(std.mem.eql(u8, receipt.status, "clean") or std.mem.eql(u8, receipt.status, "findings"))) return false;
+    return casRerPrincipalProofUsable(receipt);
+}
+
+fn terminalLockNeedsFreshAttempt(
+    allocator: std.mem.Allocator,
+    action_name: []const u8,
+    lock: ReviewTupleLock,
+    target_identity: TargetIdentity,
+) bool {
+    if (!(std.mem.eql(u8, action_name, "run") or std.mem.eql(u8, action_name, "start") or std.mem.eql(u8, action_name, "lane-review"))) return false;
+    if (!(std.mem.eql(u8, lock.state, "terminal") or std.mem.eql(u8, lock.state, "normalized"))) return false;
+    const record_path = lock.recordPath orelse return true;
+    const normalized = normalizeReceiptFromPathAlloc(allocator, record_path, true, .{
+        .requested_identity = target_identity,
+        .requested_identity_required = true,
+    }) catch return true;
+    defer normalized.deinit(allocator);
+    return !normalizedReceiptReusableTerminal(normalized);
+}
+
 fn reviewTupleLockDeadTransportProven(allocator: std.mem.Allocator, lock: ReviewTupleLock) bool {
     if (!std.mem.eql(u8, lock.lastFailureCode orelse "", "review_transport_lost")) return false;
     if (cas_websocket.processAlive(lock.ownerPid)) return false;
@@ -7372,9 +7402,16 @@ fn reviewTupleLockActionForAcquire(
     now_s: i64,
     override_reason: ?[]const u8,
     fresh_attempt_reason: ?[]const u8,
+    target_identity: TargetIdentity,
 ) ReviewTupleLockAction {
     const dead_transport_proven = if (existing) |lock| reviewTupleLockDeadTransportProven(allocator, lock) else false;
-    return reviewTupleLockActionWithProbe(action_name, existing, now_s, override_reason, fresh_attempt_reason, dead_transport_proven);
+    const action = reviewTupleLockActionWithProbe(action_name, existing, now_s, override_reason, fresh_attempt_reason, dead_transport_proven);
+    if (action == .normalize_existing and fresh_attempt_reason == null) {
+        if (existing) |lock| {
+            if (terminalLockNeedsFreshAttempt(allocator, action_name, lock, target_identity)) return .fresh_after_terminal;
+        }
+    }
+    return action;
 }
 
 fn printReviewTupleLockExistingAndExit(
@@ -7697,7 +7734,7 @@ fn acquireReviewTupleStartLockOrExit(
     };
     defer if (loaded_opt) |*loaded| loaded.deinit(allocator);
     const now_s = unixSeconds();
-    const decision = reviewTupleLockActionForAcquire(allocator, action_name, if (loaded_opt) |loaded| loaded.record else null, now_s, override_reason, fresh_attempt_reason);
+    const decision = reviewTupleLockActionForAcquire(allocator, action_name, if (loaded_opt) |loaded| loaded.record else null, now_s, override_reason, fresh_attempt_reason, target_identity);
     switch (decision) {
         .create => {
             const lock = makeReviewTupleLock(tuple_hash, tuple, "starting_lane", now_s, override_reason, fresh_attempt_reason);
@@ -7718,7 +7755,7 @@ fn acquireReviewTupleStartLockOrExit(
                         );
                     }) orelse return err;
                     defer raced.deinit(allocator);
-                    const raced_decision = reviewTupleLockActionForAcquire(allocator, action_name, raced.record, now_s, override_reason, fresh_attempt_reason);
+                    const raced_decision = reviewTupleLockActionForAcquire(allocator, action_name, raced.record, now_s, override_reason, fresh_attempt_reason, target_identity);
                     switch (raced_decision) {
                         .return_existing, .normalize_existing => {
                             killManagedServerBeforeTupleLockExit(managed_server_to_kill_on_exit);
@@ -7794,7 +7831,7 @@ fn acquireReviewTupleStartLockOrExit(
                 );
             };
             defer latest.deinit(allocator);
-            const latest_decision = reviewTupleLockActionForAcquire(allocator, action_name, latest.record, unixSeconds(), override_reason, fresh_attempt_reason);
+            const latest_decision = reviewTupleLockActionForAcquire(allocator, action_name, latest.record, unixSeconds(), override_reason, fresh_attempt_reason, target_identity);
             switch (latest_decision) {
                 .retry_after_pre_review_failure, .auto_replace_dead_transport, .takeover_with_override, .fresh_after_terminal => {},
                 .return_existing, .normalize_existing => {
@@ -13932,6 +13969,18 @@ test "review import extracts nested CAS-RER records from envelopes" {
     }
     try std.testing.expect(try collectNestedCasRerRecordsFromJsonLinesAlloc(std.testing.allocator, &jsonl_records, jsonl_envelope));
     try std.testing.expectEqual(@as(usize, 1), jsonl_records.items.len);
+
+    const placeholder_run =
+        \\{"schema":"CAS-RUN-v1","record":{"schema":"CAS-RER-v1"},"reviewVerdict":{"status":"clean","backendClass":"cas-start-wait","clean":true,"findingCount":0,"baseSha":"base","headSha":"head","targetFingerprint":"fp","reviewThreadId":"thr","reviewTurnId":"turn","findings":[]}}
+    ;
+    var placeholder_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, placeholder_run, .{});
+    defer placeholder_parsed.deinit();
+    var placeholder_records: std.ArrayList([]u8) = .empty;
+    defer {
+        for (placeholder_records.items) |record| std.testing.allocator.free(record);
+        placeholder_records.deinit(std.testing.allocator);
+    }
+    try std.testing.expect(!try collectNestedCasRerRecordsAlloc(std.testing.allocator, &placeholder_records, placeholder_parsed.value.object));
 }
 
 test "CAS inspect record object keeps malformed JSON output parseable" {
@@ -15564,6 +15613,55 @@ test "review tuple lock action classifies active terminal exhausted and stale st
     smoke_suite_lock.lastFailureCode = null;
     smoke_suite_lock.state = "account_resource_exhausted";
     try std.testing.expect(!smokeChildTupleLockReleasable(smoke_suite_lock, "thr_1"));
+}
+
+test "review tuple acquire does not reuse diagnostic terminal receipts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const reusable_receipt =
+        \\{"reviewVerdict":{"status":"findings","backendClass":"cas-start-wait","clean":false,"findingCount":1,"baseSha":"base","headSha":"head","targetFingerprint":"fp","reviewThreadId":"thr","reviewTurnId":"turn","accountFingerprint":"acct:a","accountFingerprintReducedProtection":false,"principalStrength":"strong","findings":[{"title":"issue"}]}}
+    ;
+    const diagnostic_receipt =
+        \\{"reviewVerdict":{"status":"clean","backendClass":"cas-native-fallback","clean":true,"findingCount":0,"baseSha":"base","headSha":"head","targetFingerprint":"fp","reviewThreadId":"thr","reviewTurnId":"turn","accountFingerprint":"acct:a","accountFingerprintReducedProtection":true,"principalStrength":"reduced","findings":[]}}
+    ;
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "reusable.json", .data = reusable_receipt });
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "diagnostic.json", .data = diagnostic_receipt });
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const reusable_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "reusable.json" });
+    defer std.testing.allocator.free(reusable_path);
+    const diagnostic_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "diagnostic.json" });
+    defer std.testing.allocator.free(diagnostic_path);
+    const target_identity = TargetIdentity{
+        .base_sha = "base",
+        .head_sha = "head",
+        .fingerprint = "fp",
+    };
+    const now_s: i64 = 1000;
+    var lock = ReviewTupleLock{
+        .tupleHash = "sha256:terminal",
+        .repoRealpath = "/repo",
+        .baseSha = "base",
+        .headSha = "head",
+        .targetFingerprint = "fp",
+        .resolvedCodexPath = "/bin/codex",
+        .resolvedCodexVersion = "codex 0.1.0",
+        .accountFingerprint = "acct:a",
+        .state = "terminal",
+        .reviewThreadId = "thr",
+        .reviewTurnId = "turn",
+        .recordPath = reusable_path,
+        .createdAtUnixS = now_s,
+        .updatedAtUnixS = now_s,
+        .expiresAtUnixS = now_s + 60,
+        .ownerPid = 1,
+    };
+    try std.testing.expectEqual(ReviewTupleLockAction.normalize_existing, reviewTupleLockActionForAcquire(std.testing.allocator, "run", lock, now_s, null, null, target_identity));
+
+    lock.recordPath = diagnostic_path;
+    try std.testing.expectEqual(ReviewTupleLockAction.fresh_after_terminal, reviewTupleLockActionForAcquire(std.testing.allocator, "run", lock, now_s, null, null, target_identity));
+    try std.testing.expectEqual(ReviewTupleLockAction.fresh_after_terminal, reviewTupleLockActionForAcquire(std.testing.allocator, "lane-review", lock, now_s, null, null, target_identity));
+    try std.testing.expectEqual(ReviewTupleLockAction.normalize_existing, reviewTupleLockActionForAcquire(std.testing.allocator, "lane-smoke", lock, now_s, null, null, target_identity));
 }
 
 test "review tuple lock write and load roundtrip" {
