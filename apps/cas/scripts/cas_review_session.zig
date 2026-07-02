@@ -1660,6 +1660,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
                     "",
                     parent_event_log_path,
                     .{
+                        .surface_action = action_name,
                         .resolved_codex_path = resolved_codex_path,
                         .resolved_codex_version = codex_version,
                         .compatibility_verdict = if (retry_failure != null) "incompatible" else "not_checked",
@@ -1704,6 +1705,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
             "",
             parent_event_log_path,
             .{
+                .surface_action = action_name,
                 .resolved_codex_path = resolved_codex_path,
                 .resolved_codex_version = codex_version,
                 .compatibility_verdict = if (failure != null) "incompatible" else "not_checked",
@@ -2793,7 +2795,14 @@ fn cmdReviewImport(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs)
     const requested_identity_required = parsed.cwd != null and parsed.target != null;
     if (requested_identity_required) {
         const target_record = targetToRecord(parsed.target.?);
-        requested_identity_opt = computeTargetIdentityAlloc(allocator, io, parsed.cwd.?, target_record) catch null;
+        requested_identity_opt = computeTargetIdentityAlloc(allocator, io, parsed.cwd.?, target_record) catch |err| {
+            try errors.append(allocator, .{
+                .source_path = try allocator.dupe(u8, parsed.cwd.?),
+                .message = try std.fmt.allocPrint(allocator, "target identity unavailable: {s}", .{@errorName(err)}),
+            });
+            try printReviewImportResults(imported.items, errors.items, if (parsed.json) .json else parsed.receipt_format);
+            std.process.exit(1);
+        };
     }
     const normalize_context = NormalizeContext{
         .requested_identity = requested_identity_opt,
@@ -7276,11 +7285,15 @@ fn emitReviewTupleLockBlockedAndExit(
         else => "an active review attempt already owns this repo/base/head/account tuple",
     };
     if (json_mode) {
+        const blocked_review_thread_id = if (lock) |value| value.reviewThreadId else null;
+        const blocked_review_turn_id = if (lock) |value| value.reviewTurnId else null;
+        const blocked_attempt_exists = blocked_review_thread_id != null;
+        const blocked_phase: []const u8 = if (blocked_attempt_exists) "review_waiting" else "pre_review_start";
         if (verdict_only) {
             try printJson(.{
                 .status = "incomplete",
-                .reviewAttemptPhase = "pre_review_start",
-                .reviewAttemptExists = false,
+                .reviewAttemptPhase = blocked_phase,
+                .reviewAttemptExists = blocked_attempt_exists,
                 .tupleVerdictExists = false,
                 .backendClass = "cas-receipt-normalized",
                 .clean = false,
@@ -7290,8 +7303,8 @@ fn emitReviewTupleLockBlockedAndExit(
                 .baseSha = tuple.base_sha,
                 .headSha = tuple.head_sha,
                 .targetFingerprint = tuple.target_fingerprint,
-                .reviewThreadId = @as(?[]const u8, null),
-                .reviewTurnId = @as(?[]const u8, null),
+                .reviewThreadId = blocked_review_thread_id,
+                .reviewTurnId = blocked_review_turn_id,
                 .recordPath = if (lock) |value| value.recordPath else null,
                 .eventLogPath = if (lock) |value| value.eventLogPath else null,
                 .findings = [_]u8{},
@@ -7312,11 +7325,11 @@ fn emitReviewTupleLockBlockedAndExit(
             .reviewBrokerDecision = broker_decision,
             .cwd = tuple.repo_realpath,
             .smokeStatus = smoke_status,
-            .reviewAttemptPhase = "pre_review_start",
-            .reviewAttemptExists = false,
+            .reviewAttemptPhase = blocked_phase,
+            .reviewAttemptExists = blocked_attempt_exists,
             .tupleVerdictExists = false,
-            .reviewThreadId = @as(?[]const u8, null),
-            .reviewTurnId = @as(?[]const u8, null),
+            .reviewThreadId = blocked_review_thread_id,
+            .reviewTurnId = blocked_review_turn_id,
             .baseSha = tuple.base_sha,
             .headSha = tuple.head_sha,
             .targetFingerprint = tuple.target_fingerprint,
@@ -7345,8 +7358,8 @@ fn emitReviewTupleLockBlockedAndExit(
                 .baseSha = tuple.base_sha,
                 .headSha = tuple.head_sha,
                 .targetFingerprint = tuple.target_fingerprint,
-                .reviewThreadId = @as(?[]const u8, null),
-                .reviewTurnId = @as(?[]const u8, null),
+                .reviewThreadId = blocked_review_thread_id,
+                .reviewTurnId = blocked_review_turn_id,
                 .recordPath = if (lock) |value| value.recordPath else null,
                 .eventLogPath = if (lock) |value| value.eventLogPath else null,
                 .findings = [_]u8{},
@@ -8708,7 +8721,7 @@ fn printStartJson(
         defer allocator.free(payload_json);
         const timestamp = try casRerTimestampAlloc(allocator);
         defer allocator.free(timestamp);
-        const shadow_record_path = try writeCasRerShadowRecordFromJsonAlloc(allocator, record_path, payload_json, .{
+        const shadow_record_path = writeCasRerShadowRecordFromJsonAlloc(allocator, record_path, payload_json, .{
             .requested_identity = identity,
             .requested_identity_required = true,
         }, .{
@@ -8720,8 +8733,8 @@ fn printStartJson(
             .tuple_current_at_record_time = true,
             .created_at = timestamp,
             .updated_at = timestamp,
-        });
-        defer allocator.free(shadow_record_path);
+        }) catch null;
+        defer if (shadow_record_path) |path| allocator.free(path);
     }
 
     if (std.mem.eql(u8, receipt.surface_action, "run")) {
@@ -9646,6 +9659,12 @@ fn rootTupleMatchesIdentity(root: std.json.ObjectMap, identity: TargetIdentity) 
         optionalStringsEqual(optionalStringFromRootKey(root, "targetFingerprint"), identity.fingerprint);
 }
 
+fn rootTupleFieldsMatchIdentityIfPresent(root: std.json.ObjectMap, identity: TargetIdentity) bool {
+    return rootFieldMatchesIfPresent(root, "baseSha", identity.base_sha) and
+        rootFieldMatchesIfPresent(root, "headSha", identity.head_sha) and
+        rootFieldMatchesIfPresent(root, "targetFingerprint", identity.fingerprint);
+}
+
 fn rootHasTupleVerdictBinding(root: std.json.ObjectMap) bool {
     const base_sha = optionalStringFromRootKey(root, "baseSha") orelse return false;
     if (base_sha.len == 0) return false;
@@ -9656,7 +9675,7 @@ fn rootHasTupleVerdictBinding(root: std.json.ObjectMap) bool {
 }
 
 fn normalizedReceiptCommandSucceeded(receipt: NormalizedReceipt) bool {
-    return receipt.tuple_verdict_exists and receipt.clean;
+    return receipt.tuple_verdict_exists and receipt.clean and casRerPrincipalProofUsable(receipt);
 }
 
 fn verdictTupleMatchesIdentity(verdict: std.json.ObjectMap, identity: TargetIdentity) bool {
@@ -9791,7 +9810,7 @@ fn tupleVerdictExistsForContext(verdict: std.json.ObjectMap, root: std.json.Obje
     if (context.requested_identity_required) {
         const requested = context.requested_identity orelse return false;
         if (!identityHasCompleteTuple(requested)) return false;
-        return verdictTupleMatchesIdentity(verdict, requested) and (!root_has_verdict or rootTupleMatchesIdentity(root, requested));
+        return verdictTupleMatchesIdentity(verdict, requested) and (!root_has_verdict or rootTupleFieldsMatchIdentityIfPresent(root, requested));
     }
     return verdictHasTupleBinding(verdict, root, root_has_verdict);
 }
@@ -9801,7 +9820,7 @@ fn tupleBindingFailureCode(verdict: std.json.ObjectMap, root: std.json.ObjectMap
     const requested = context.requested_identity orelse return "target_identity_unavailable";
     if (!identityHasCompleteTuple(requested)) return "target_identity_unavailable";
     if (!verdictTupleMatchesIdentity(verdict, requested)) return "tuple_mismatch";
-    if (root_has_verdict and !rootTupleMatchesIdentity(root, requested)) return "tuple_mismatch";
+    if (root_has_verdict and !rootTupleFieldsMatchIdentityIfPresent(root, requested)) return "tuple_mismatch";
     return null;
 }
 
@@ -10345,8 +10364,10 @@ fn casRerAttemptIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt
 }
 
 fn casRerRecordIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt, opts: CasRerProjectionOptions) ![]const u8 {
-    const material = try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}", .{
+    const effective_repo_realpath = opts.repo_realpath_override orelse receipt.repo_realpath orelse "";
+    const material = try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}", .{
         receipt.source_path,
+        effective_repo_realpath,
         receipt.status,
         receipt.review_thread_id orelse "",
         receipt.review_turn_id orelse "",
@@ -10395,7 +10416,7 @@ fn writeCasRerCommandObject(writer: *std.Io.Writer, receipt: NormalizedReceipt, 
 }
 
 fn writeCasRerTupleObject(writer: *std.Io.Writer, receipt: NormalizedReceipt, opts: CasRerProjectionOptions) !void {
-    const repo_realpath = receipt.repo_realpath orelse opts.repo_realpath_override;
+    const repo_realpath = opts.repo_realpath_override orelse receipt.repo_realpath;
     try writer.writeByte('{');
     try writeJsonString(writer, "repoRealpath");
     try writer.writeByte(':');
@@ -12906,7 +12927,7 @@ test "receipt normalizer accepts full CAS receipt" {
     try std.testing.expect(receipt.tuple_verdict_exists);
     try std.testing.expectEqualStrings(principal_strength_reduced, receipt.principal_strength);
     try std.testing.expect(receipt.account_fingerprint_reduced_protection);
-    try std.testing.expect(normalizedReceiptCommandSucceeded(receipt));
+    try std.testing.expect(!normalizedReceiptCommandSucceeded(receipt));
     try std.testing.expectEqualStrings("base_1", receipt.base_sha.?);
     try std.testing.expectEqualStrings("head_1", receipt.head_sha.?);
     try std.testing.expectEqualStrings("fp_1", receipt.target_fingerprint.?);
@@ -13250,6 +13271,70 @@ test "CAS-RER projection fills missing repo realpath from import cwd" {
     var matched = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, matched_json, .{});
     defer matched.deinit();
     try std.testing.expect(matched.value.object.get("tuple").?.object.get("tupleCurrentAtRecordTime").?.bool);
+}
+
+test "CAS-RER projection lets requested import cwd override receipt repo" {
+    const receipt = NormalizedReceipt{
+        .source_path = "source.json",
+        .status = "clean",
+        .backend_class = "cas-start-wait",
+        .clean = true,
+        .finding_count = 0,
+        .review_attempt_phase = "normalized_verdict",
+        .review_attempt_exists = true,
+        .tuple_verdict_exists = true,
+        .principal_strength = principal_strength_strong,
+        .account_fingerprint_reduced_protection = false,
+        .base_sha = "base",
+        .head_sha = "head",
+        .target_fingerprint = "fp",
+        .repo_realpath = "/tmp/old-repo",
+        .account_fingerprint = "acct:test",
+        .review_thread_id = "thr",
+        .review_turn_id = "turn",
+        .record_path = "/tmp/record.json",
+        .event_log_path = "/tmp/events.ndjson",
+        .failure_code = null,
+        .failure_hint = null,
+        .failure_class = null,
+        .retryable_same_tuple_now = null,
+        .findings_json = "[]",
+    };
+    const old_json = try casRerJsonFromReceiptAlloc(std.testing.allocator, receipt, .{});
+    defer std.testing.allocator.free(old_json);
+    var old_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, old_json, .{});
+    defer old_parsed.deinit();
+
+    const override_json = try casRerJsonFromReceiptAlloc(std.testing.allocator, receipt, .{
+        .repo_realpath_override = "/tmp/new-repo",
+    });
+    defer std.testing.allocator.free(override_json);
+    var override_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, override_json, .{});
+    defer override_parsed.deinit();
+
+    try std.testing.expectEqualStrings("/tmp/new-repo", override_parsed.value.object.get("tuple").?.object.get("repoRealpath").?.string);
+    try std.testing.expect(!std.mem.eql(u8, old_parsed.value.object.get("recordId").?.string, override_parsed.value.object.get("recordId").?.string));
+}
+
+test "CAS-RUN envelope verdict imports through wrapper without tuple mismatch" {
+    const raw =
+        \\{"schema":"CAS-RUN-v1","record":{"schema":"CAS-RER-v1"},"reviewVerdict":{"status":"clean","reviewAttemptPhase":"normalized_verdict","reviewAttemptExists":true,"tupleVerdictExists":true,"principalStrength":"strong","accountFingerprint":"acct:test","accountFingerprintReducedProtection":false,"backendClass":"cas-start-wait","clean":true,"findingCount":0,"failureCode":null,"failureHint":null,"baseSha":"base","headSha":"head","targetFingerprint":"fp","reviewThreadId":"thr","reviewTurnId":"turn","findings":[]}}
+    ;
+    const requested = TargetIdentity{
+        .base_sha = "base",
+        .head_sha = "head",
+        .fingerprint = "fp",
+    };
+    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "run-envelope.json", raw, true, .{
+        .requested_identity = requested,
+        .requested_identity_required = true,
+    });
+    defer receipt.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("clean", receipt.status);
+    try std.testing.expect(receipt.tuple_verdict_exists);
+    try std.testing.expectEqualStrings("base", receipt.base_sha.?);
+    try std.testing.expectEqualStrings("head", receipt.head_sha.?);
+    try std.testing.expectEqualStrings("fp", receipt.target_fingerprint.?);
 }
 
 test "CAS inspect record object keeps malformed JSON output parseable" {

@@ -503,6 +503,14 @@ fn appendRowsFromJsonText(
         try appendRowsFromCasRunEnvelope(allocator, root, ctx, dedupe_path, dedupe_id, params, audit, dedupe);
         return;
     }
+    if (isCasCurrentEnvelope(root)) {
+        try appendRowsFromCasCurrentEnvelope(allocator, root, ctx, dedupe_path, dedupe_id, params, audit, dedupe);
+        return;
+    }
+    if (isCasListEnvelope(root)) {
+        try appendRowsFromCasListEnvelope(allocator, root, ctx, dedupe_path, dedupe_id, params, audit, dedupe);
+        return;
+    }
     if (isCasImportEnvelope(root)) {
         try appendRowsFromCasImportEnvelope(allocator, root, ctx, dedupe_path, dedupe_id, params, audit, dedupe);
         return;
@@ -566,6 +574,14 @@ fn isCasRunEnvelope(root: std.json.ObjectMap) bool {
     return optEql(nullableString(root, "schema"), "CAS-RUN-v1");
 }
 
+fn isCasCurrentEnvelope(root: std.json.ObjectMap) bool {
+    return optEql(nullableString(root, "schema"), "CAS-CURRENT-v1");
+}
+
+fn isCasListEnvelope(root: std.json.ObjectMap) bool {
+    return optEql(nullableString(root, "schema"), "CAS-LIST-v1");
+}
+
 fn appendRowsFromCasRunEnvelope(
     allocator: std.mem.Allocator,
     root: std.json.ObjectMap,
@@ -583,6 +599,52 @@ fn appendRowsFromCasRunEnvelope(
     const key = try std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ dedupe_path, dedupe_id, record_id });
     defer allocator.free(key);
     try appendRowIfMatched(allocator, row, key, key, params, audit, dedupe);
+}
+
+fn appendRowsFromCasCurrentEnvelope(
+    allocator: std.mem.Allocator,
+    root: std.json.ObjectMap,
+    ctx: ClassifyContext,
+    dedupe_path: []const u8,
+    dedupe_id: []const u8,
+    params: Params,
+    audit: *Audit,
+    dedupe: *std.StringHashMap(void),
+) !void {
+    const record = objectField(root, "record") orelse return;
+    if (!isCasReviewEvidenceRecord(record)) return;
+    const row = try classifyCasRerObject(allocator, record, ctx);
+    const record_id = nullableString(record, "recordId") orelse "cas-current-rer";
+    const key = try std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ dedupe_path, dedupe_id, record_id });
+    defer allocator.free(key);
+    try appendRowIfMatched(allocator, row, key, key, params, audit, dedupe);
+}
+
+fn appendRowsFromCasListEnvelope(
+    allocator: std.mem.Allocator,
+    root: std.json.ObjectMap,
+    ctx: ClassifyContext,
+    dedupe_path: []const u8,
+    dedupe_id: []const u8,
+    params: Params,
+    audit: *Audit,
+    dedupe: *std.StringHashMap(void),
+) !void {
+    const records_value = root.get("records") orelse return;
+    const records = switch (records_value) {
+        .array => |array| array.items,
+        else => return,
+    };
+    for (records, 0..) |record_value, idx| {
+        const record = object(record_value) orelse continue;
+        if (!isCasReviewEvidenceRecord(record)) continue;
+        const row = try classifyCasRerObject(allocator, record, ctx);
+        var fallback_buf: [64]u8 = undefined;
+        const record_id = nullableString(record, "recordId") orelse std.fmt.bufPrint(fallback_buf[0..], "cas-list-rer:{d}", .{idx}) catch "cas-list-rer";
+        const key = try std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ dedupe_path, dedupe_id, record_id });
+        defer allocator.free(key);
+        try appendRowIfMatched(allocator, row, key, key, params, audit, dedupe);
+    }
 }
 
 fn appendRowsFromCasImportEnvelope(
@@ -830,8 +892,8 @@ fn classifyCasRerObject(allocator: std.mem.Allocator, root: std.json.ObjectMap, 
     const record_id = nullableString(root, "recordId");
     const raw_status = if (verdict) |value| nullableString(value, "status") else null;
     const backend_class =
-        (if (command) |cmd| nullableString(cmd, "sourceBackendClass") else null) orelse
         (if (command) |cmd| nullableString(cmd, "backendSelected") else null) orelse
+        (if (command) |cmd| nullableString(cmd, "sourceBackendClass") else null) orelse
         ctx.default_backend_class;
     const command_surface = if (command) |cmd| nullableString(cmd, "surface") orelse ctx.command_surface else ctx.command_surface;
     const raw_broker_action = if (broker) |value| nullableString(value, "action") else null;
@@ -915,7 +977,6 @@ fn summarize(rows: []const query.Row) Summary {
 
     for (rows) |row| {
         const failure_code = scalarString(row, "failure_code");
-        const phase = scalarString(row, "review_attempt_phase");
         const status = scalarString(row, "review_verdict_status");
         const backend = scalarString(row, "backend_class");
         const command_surface = scalarString(row, "command_surface") orelse "";
@@ -927,7 +988,7 @@ fn summarize(rows: []const query.Row) Summary {
 
         if (broker_action != null or std.mem.indexOf(u8, command_surface, "review_session run") != null) out.broker_run_count += 1;
         if (optEql(broker_action, "auto_replaced_dead_transport") or optEql(broker_action, "replaced_dead_transport")) out.broker_auto_replaced_dead_transport_count += 1;
-        if (optEql(broker_action, "attached_existing")) out.broker_attached_existing_count += 1;
+        if (optEql(broker_action, "attached_existing") or optEql(broker_action, "returned_terminal")) out.broker_attached_existing_count += 1;
         if (optEql(broker_action, "blocked_live_attempt") or optEql(broker_action, "blocked_live")) out.broker_blocked_live_count += 1;
         if (optEql(surface, "manual_recovery_command")) out.manual_recovery_command_count += 1;
 
@@ -945,7 +1006,7 @@ fn summarize(rows: []const query.Row) Summary {
             out.account_resource_exhausted_count += 1;
             has_degraded = true;
         }
-        if ((optEql(status, "timeout") or optEql(phase, "review_waiting")) and attempt_exists) out.timeout_with_handle_count += 1;
+        if (optEql(status, "timeout") and attempt_exists) out.timeout_with_handle_count += 1;
         if (optEql(failure_code, "duplicate_prevented")) out.duplicate_prevented_count += 1;
         if (std.mem.indexOf(u8, backend orelse "", "cas-start-wait") != null or std.mem.indexOf(u8, backend orelse "", "cas-native-fallback") != null) {
             if (tuple_exists) out.start_wait_normalized_count += 1 else out.start_wait_unormalized_count += 1;
@@ -976,6 +1037,8 @@ fn manualRecoveryCommand(command_surface: []const u8) bool {
         std.mem.indexOf(u8, command_surface, "review_session receipt") != null or
         std.mem.indexOf(u8, command_surface, "receipt normalize") != null or
         std.mem.indexOf(u8, command_surface, "lock gate") != null or
+        std.mem.indexOf(u8, command_surface, "cas review validate-record") != null or
+        std.mem.indexOf(u8, command_surface, "cas review inspect") != null or
         std.mem.indexOf(u8, command_surface, "--review-lock-override") != null;
 }
 
@@ -1839,7 +1902,7 @@ test "CAS-RER unbound terminal status is not counted as completed evidence" {
 
 test "CAS-RER findings are not reduced to timeout-only audit evidence" {
     var timeout_row = try classifyReceiptText(std.testing.allocator,
-        \\{"reviewThreadId":"thr_same","reviewAttemptPhase":"review_waiting","timedOut":true,"baseSha":"base","headSha":"head","targetFingerprint":"fp"}
+        \\{"status":"timeout","reviewThreadId":"thr_same","reviewAttemptPhase":"review_waiting","timedOut":true,"baseSha":"base","headSha":"head","targetFingerprint":"fp"}
     , .{
         .session_id = "sess",
         .cwd = "/repo",
@@ -1915,7 +1978,7 @@ test "CAS run envelope expands nested CAS-RER record" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "run.json", .data =
-        \\{"schema":"CAS-RUN-v1","recordPath":"/tmp/rer-run.json","record":{"schema":"CAS-RER-v1","recordId":"rer_run","command":{"surface":"run","backendSelected":"cas-run","sourceBackendClass":"cas-start-wait","brokerDecision":{"action":"replaced_dead_transport","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_run","reviewTurnId":"turn_run"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}},"reviewBrokerDecision":{"action":"replaced_dead_transport","reason":"test","freshAttemptRequired":false}}
+        \\{"schema":"CAS-RUN-v1","recordPath":"/tmp/rer-run.json","record":{"schema":"CAS-RER-v1","recordId":"rer_run","command":{"surface":"run","backendSelected":"cas-run","sourceBackendClass":"cas-start-wait","brokerDecision":{"action":"returned_terminal","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_run","reviewTurnId":"turn_run"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}},"reviewBrokerDecision":{"action":"returned_terminal","reason":"test","freshAttemptRequired":false}}
     });
     const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
@@ -1931,8 +1994,39 @@ test "CAS run envelope expands nested CAS-RER record" {
     try std.testing.expectEqual(@as(usize, 1), audit.rows.items.len);
     try std.testing.expectEqualStrings("rer_run", scalarString(audit.rows.items[0], "record_id").?);
     try std.testing.expectEqualStrings("cas_review_evidence_ledger", scalarString(audit.rows.items[0], "canonical_source").?);
+    try std.testing.expectEqualStrings("cas-run", scalarString(audit.rows.items[0], "backend_class").?);
     try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_clean_count);
     try std.testing.expectEqual(@as(i64, 1), audit.summary.broker_run_count);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.broker_attached_existing_count);
+    try std.testing.expectEqual(@as(i64, 0), audit.summary.start_wait_normalized_count);
+}
+
+test "CAS current and list envelopes expand nested ledger records" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "current.json", .data =
+        \\{"schema":"CAS-CURRENT-v1","record":{"schema":"CAS-RER-v1","recordId":"rer_current","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"blocked_live","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"review_waiting","reviewThreadId":"thr_current","reviewTurnId":"turn_current"},"verdict":{"tupleVerdictExists":false,"status":"incomplete","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":true},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}},"tupleCurrent":true,"actionRequired":"wait"}
+    });
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "list.json", .data =
+        \\{"schema":"CAS-LIST-v1","records":[{"schema":"CAS-RER-v1","recordId":"rer_list","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"replaced_dead_transport","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_list","reviewTurnId":"turn_list"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":1,"findings":[{"title":"issue"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}]}
+    });
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const current_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "current.json" });
+    defer std.testing.allocator.free(current_path);
+    const list_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "list.json" });
+    defer std.testing.allocator.free(list_path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .receipt_paths = &.{ current_path, list_path },
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), audit.rows.items.len);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_findings_count);
+    try std.testing.expectEqual(@as(i64, 0), audit.summary.timeout_with_handle_count);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.broker_blocked_live_count);
     try std.testing.expectEqual(@as(i64, 1), audit.summary.broker_auto_replaced_dead_transport_count);
 }
 
@@ -1955,7 +2049,7 @@ test "summary separates review transport timeout duplicate and degraded lane tup
     defer transport_row.deinit();
 
     var waiting_row = try classifyReceiptText(std.testing.allocator,
-        \\{"reviewThreadId":"thr_waiting","reviewAttemptPhase":"review_waiting","timedOut":true,"baseSha":"b","headSha":"h","targetFingerprint":"t"}
+        \\{"status":"timeout","reviewThreadId":"thr_waiting","reviewAttemptPhase":"review_waiting","timedOut":true,"baseSha":"b","headSha":"h","targetFingerprint":"t"}
     , .{
         .session_id = "sess",
         .cwd = "/repo",
@@ -1981,4 +2075,10 @@ test "summary separates review transport timeout duplicate and degraded lane tup
     try std.testing.expectEqual(@as(i64, 1), summary.timeout_with_handle_count);
     try std.testing.expectEqual(@as(i64, 0), summary.duplicate_prevented_count);
     try std.testing.expectEqualStrings("degraded", summary.lane_backend_status);
+}
+
+test "public review diagnostics count as manual recovery commands" {
+    try std.testing.expect(manualRecoveryCommand("cas review validate-record --record rer_1 --json"));
+    try std.testing.expect(manualRecoveryCommand("cas review inspect --record rer_1 --json"));
+    try std.testing.expect(!manualRecoveryCommand("cas review current --cwd /repo --base main --json"));
 }
