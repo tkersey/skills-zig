@@ -7223,6 +7223,8 @@ fn printReviewTupleLockExistingAndExit(
         .baseSha = tuple.base_sha,
         .headSha = tuple.head_sha,
         .targetFingerprint = tuple.target_fingerprint,
+        .resolvedCodexPath = tuple.resolved_codex_path,
+        .resolvedCodexVersion = tuple.resolved_codex_version,
         .reviewTupleLockVersion = review_tuple_lock_version,
         .reviewTupleHash = lock.tupleHash,
         .reviewTupleLockPath = lock_path,
@@ -7382,6 +7384,8 @@ fn emitReviewTupleLockBlockedAndExit(
             .baseSha = tuple.base_sha,
             .headSha = tuple.head_sha,
             .targetFingerprint = tuple.target_fingerprint,
+            .resolvedCodexPath = tuple.resolved_codex_path,
+            .resolvedCodexVersion = tuple.resolved_codex_version,
             .failureCode = failure_code,
             .failureClass = "coordination",
             .retryableSameTupleNow = false,
@@ -14229,6 +14233,8 @@ test "blocked account-resource run payload projects valid CAS-RER" {
         .baseSha = tuple.base_sha,
         .headSha = tuple.head_sha,
         .targetFingerprint = tuple.target_fingerprint,
+        .resolvedCodexPath = tuple.resolved_codex_path,
+        .resolvedCodexVersion = tuple.resolved_codex_version,
         .failureCode = "review_tuple_lock_account_resource_exhausted",
         .failureClass = "coordination",
         .retryableSameTupleNow = false,
@@ -14267,6 +14273,8 @@ test "blocked account-resource run payload projects valid CAS-RER" {
     try std.testing.expectEqualStrings("account_resource_exhausted", receipt.status);
     try std.testing.expectEqualStrings("account_resource_exhausted", receipt.failure_code.?);
     try std.testing.expectEqual(false, receipt.retryable_same_tuple_now.?);
+    try std.testing.expectEqualStrings("/bin/codex", receipt.resolved_codex_path.?);
+    try std.testing.expectEqualStrings("codex 0.1.0", receipt.resolved_codex_version.?);
     try std.testing.expect(!receipt.tuple_verdict_exists);
     try std.testing.expect(receipt.review_attempt_exists);
 
@@ -14290,6 +14298,9 @@ test "blocked account-resource run payload projects valid CAS-RER" {
     const verdict = parsed.value.object.get("verdict").?.object;
     try std.testing.expectEqualStrings("account_resource_exhausted", verdict.get("status").?.string);
     try std.testing.expect(!verdict.get("tupleVerdictExists").?.bool);
+    const tuple_obj = parsed.value.object.get("tuple").?.object;
+    try std.testing.expectEqualStrings("/bin/codex", tuple_obj.get("resolvedCodexPath").?.string);
+    try std.testing.expectEqualStrings("codex 0.1.0", tuple_obj.get("resolvedCodexVersion").?.string);
 }
 
 test "receipt normalizer keeps pre-attempt account exhaustion attempt-free" {
