@@ -10144,7 +10144,7 @@ fn normalizeStoredSessionRecordReceiptAlloc(allocator: std.mem.Allocator, source
             rootHasTupleVerdictBinding(root);
     const review_attempt_phase = if (tuple_verdict_exists)
         "normalized_verdict"
-    else if (isTerminalTurnStatus(jsonStringField(root, "last_observed_status") orelse ""))
+    else if (std.mem.eql(u8, final_status, "account_resource_exhausted") or isTerminalTurnStatus(jsonStringField(root, "last_observed_status") orelse ""))
         "review_terminal"
     else
         "review_waiting";
@@ -11288,8 +11288,7 @@ fn reviewVerdictStatus(clean: ?bool, finding_count: ?usize, failure: ?FailureInf
 
 fn reviewVerdictStatusIsTupleTerminal(status: []const u8) bool {
     return std.mem.eql(u8, status, "clean") or
-        std.mem.eql(u8, status, "findings") or
-        std.mem.eql(u8, status, "account_resource_exhausted");
+        std.mem.eql(u8, status, "findings");
 }
 
 fn canonicalReceiptStatus(status: []const u8, failure_code: ?[]const u8, review_thread_id: ?[]const u8) []const u8 {
@@ -13845,10 +13844,10 @@ test "review verdict status maps phase-three statuses" {
     try std.testing.expectEqualStrings("findings", reviewVerdictStatus(false, 2, null, "thr"));
 }
 
-test "review verdict proof status excludes timeout and incomplete failures" {
+test "review verdict tuple terminal status is clean or findings only" {
     try std.testing.expect(reviewVerdictStatusIsTupleTerminal("clean"));
     try std.testing.expect(reviewVerdictStatusIsTupleTerminal("findings"));
-    try std.testing.expect(reviewVerdictStatusIsTupleTerminal("account_resource_exhausted"));
+    try std.testing.expect(!reviewVerdictStatusIsTupleTerminal("account_resource_exhausted"));
     try std.testing.expect(!reviewVerdictStatusIsTupleTerminal("parse_mismatch"));
     try std.testing.expect(!reviewVerdictStatusIsTupleTerminal("timeout"));
     try std.testing.expect(!reviewVerdictStatusIsTupleTerminal("incomplete"));
@@ -13984,7 +13983,7 @@ test "stored receipt event log account limit wins over missing output" {
     try std.testing.expectEqualStrings("review_terminal", receipt.review_attempt_phase);
 }
 
-test "stored account exhaustion with tuple proof normalizes phase" {
+test "stored account exhaustion with tuple fields is not a tuple verdict" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "events.ndjson", .data = "{\"payload\":\"quota exceeded\"}\n" });
@@ -14003,8 +14002,8 @@ test "stored account exhaustion with tuple proof normalizes phase" {
     defer receipt.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("account_resource_exhausted", receipt.status);
     try std.testing.expectEqualStrings("account_resource_exhausted", receipt.failure_code.?);
-    try std.testing.expect(receipt.tuple_verdict_exists);
-    try std.testing.expectEqualStrings("normalized_verdict", receipt.review_attempt_phase);
+    try std.testing.expect(!receipt.tuple_verdict_exists);
+    try std.testing.expectEqualStrings("review_terminal", receipt.review_attempt_phase);
 }
 
 test "pre-review lane transport receipt is attempt-free and tuple-bound" {
