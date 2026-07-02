@@ -634,6 +634,8 @@ fn withRecordMultiAgentMode(receipt: OutputReceipt, record: SessionRecord) Outpu
     out.effective_multi_agent_mode = modeFromStoredConfigValue(record.effective_multi_agent_mode);
     out.multi_agent_mode_support = supportFromStoredValue(record.multi_agent_mode_support);
     out.multi_agent_mode_metric_eligible = record.multi_agent_mode_metric_eligible;
+    out.account_fingerprint = record.accountFingerprint;
+    out.account_fingerprint_reduced_protection = record.accountFingerprintReducedProtection;
     return out;
 }
 
@@ -2246,8 +2248,8 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                 try printStatusJson(
                     allocator,
                     .wait,
-                    null,
-                    null,
+                    record.cwd,
+                    record.parent_thread_id,
                     record.review_thread_id,
                     record.review_turn_id,
                     timeout_status,
@@ -2357,8 +2359,8 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
             try printStatusJson(
                 allocator,
                 .wait,
-                null,
-                null,
+                record.cwd,
+                record.parent_thread_id,
                 record.review_thread_id,
                 record.review_turn_id,
                 latest,
@@ -2407,8 +2409,8 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
         try printStatusJson(
             allocator,
             .wait,
-            null,
-            null,
+            record.cwd,
+            record.parent_thread_id,
             record.review_thread_id,
             record.review_turn_id,
             latest,
@@ -3554,6 +3556,19 @@ fn validateCasRerRecordObjectAlloc(allocator: std.mem.Allocator, path: []const u
                     }
                     if (nonEmptyOptional(jsonStringField(tuple_obj, "targetFingerprint")) == null) {
                         try appendGateError(allocator, &errors, "verdict.tupleVerdictExists requires tuple.targetFingerprint", .{});
+                    }
+                }
+                if (std.mem.eql(u8, status orelse "", "clean") or std.mem.eql(u8, status orelse "", "findings")) {
+                    if (attempt_exists_value != true) {
+                        try appendGateError(allocator, &errors, "terminal tuple verdict requires attempt.exists=true", .{});
+                    }
+                    if (attempt) |attempt_obj| {
+                        if (nonEmptyOptional(jsonStringField(attempt_obj, "reviewThreadId")) == null) {
+                            try appendGateError(allocator, &errors, "terminal tuple verdict requires attempt.reviewThreadId", .{});
+                        }
+                        if (nonEmptyOptional(jsonStringField(attempt_obj, "reviewTurnId")) == null) {
+                            try appendGateError(allocator, &errors, "terminal tuple verdict requires attempt.reviewTurnId", .{});
+                        }
                     }
                 }
             }
@@ -12989,6 +13004,19 @@ test "CAS-RER validator rejects verdict clean/status disagreement" {
     try std.testing.expect(!findings_true_gate.ok());
     try std.testing.expect(findings_true_gate.errors.len >= 1);
     try std.testing.expect(std.mem.indexOf(u8, findings_true_gate.errors[0], "verdict.clean=false") != null);
+}
+
+test "CAS-RER validator rejects terminal verdict without attempt" {
+    const raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_no_attempt","tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":false,"phase":"normalized_verdict","reviewThreadId":null,"reviewTurnId":null},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "no-attempt-rer.json", parsed.value.object);
+    defer gate.deinit(std.testing.allocator);
+    try std.testing.expect(!gate.ok());
+    try std.testing.expect(gate.errors.len >= 3);
+    try std.testing.expect(std.mem.indexOf(u8, gate.errors[0], "attempt.exists=true") != null);
 }
 
 test "CAS-RER validator rejects null required sections" {
