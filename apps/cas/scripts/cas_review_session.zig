@@ -2977,6 +2977,10 @@ fn appendCollectedNestedCasRerRecordsAlloc(
     }
 }
 
+fn reviewImportShouldSkipNormalizeError(from_glob: bool, err: anyerror) bool {
+    return from_glob and err == error.NotReviewReceipt;
+}
+
 fn cmdReviewImport(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     var paths = try collectInputPathsAlloc(allocator, parsed.receipt_paths, parsed.receipt_globs);
     defer {
@@ -3026,6 +3030,7 @@ fn cmdReviewImport(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs)
     }
 
     const recover_event_logs = paths.items.len <= ReceiptEventLogRecoveryMaxInputs;
+    const skip_non_receipts = parsed.receipt_globs.len > 0;
     for (paths.items) |path| {
         const raw = readFileAlloc(allocator, path, 8 * 1024 * 1024) catch |err| {
             try errors.append(allocator, .{
@@ -3083,6 +3088,7 @@ fn cmdReviewImport(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs)
         }
 
         const receipt = normalizeReceiptFromJsonAlloc(allocator, path, raw, recover_event_logs, normalize_context) catch |err| {
+            if (reviewImportShouldSkipNormalizeError(skip_non_receipts, err)) continue;
             try errors.append(allocator, .{
                 .source_path = try allocator.dupe(u8, path),
                 .message = try allocator.dupe(u8, @errorName(err)),
@@ -14502,6 +14508,12 @@ test "review import extracts nested CAS-RER records from envelopes" {
         placeholder_records.deinit(std.testing.allocator);
     }
     try std.testing.expect(!try collectNestedCasRerRecordsAlloc(std.testing.allocator, &placeholder_records, placeholder_parsed.value.object));
+}
+
+test "review import glob skips non-review receipts" {
+    try std.testing.expect(reviewImportShouldSkipNormalizeError(true, error.NotReviewReceipt));
+    try std.testing.expect(!reviewImportShouldSkipNormalizeError(false, error.NotReviewReceipt));
+    try std.testing.expect(!reviewImportShouldSkipNormalizeError(true, error.InvalidReceiptJson));
 }
 
 test "CAS inspect record object keeps malformed JSON output parseable" {
