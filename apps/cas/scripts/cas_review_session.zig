@@ -6883,6 +6883,21 @@ fn reviewTupleHashAlloc(allocator: std.mem.Allocator, tuple: ReviewTupleIdentity
     return sha256HexAlloc(allocator, canonical);
 }
 
+fn targetIdentityFromReviewTuple(tuple: ReviewTupleIdentity) TargetIdentity {
+    return .{
+        .head_sha = tuple.head_sha,
+        .base_sha = tuple.base_sha,
+        .fingerprint = tuple.target_fingerprint,
+    };
+}
+
+fn normalizeContextFromReviewTuple(tuple: ReviewTupleIdentity) NormalizeContext {
+    return .{
+        .requested_identity = targetIdentityFromReviewTuple(tuple),
+        .requested_identity_required = true,
+    };
+}
+
 fn reviewTupleLocksDirAlloc(allocator: std.mem.Allocator) ![]const u8 {
     const session_dir = try sessionDirAlloc(allocator);
     defer allocator.free(session_dir);
@@ -7201,7 +7216,7 @@ fn printReviewTupleLockExistingAndExit(
             .reviewTurnId = review_turn_id,
             .recordPath = lock.recordPath,
             .eventLogPath = lock.eventLogPath,
-            .findings = [_]u8{},
+            .findings = [_]std.json.Value{},
         },
     };
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
@@ -7307,7 +7322,7 @@ fn emitReviewTupleLockBlockedAndExit(
                 .reviewTurnId = blocked_review_turn_id,
                 .recordPath = if (lock) |value| value.recordPath else null,
                 .eventLogPath = if (lock) |value| value.eventLogPath else null,
-                .findings = [_]u8{},
+                .findings = [_]std.json.Value{},
             });
             std.process.exit(1);
         }
@@ -7362,7 +7377,7 @@ fn emitReviewTupleLockBlockedAndExit(
                 .reviewTurnId = blocked_review_turn_id,
                 .recordPath = if (lock) |value| value.recordPath else null,
                 .eventLogPath = if (lock) |value| value.eventLogPath else null,
-                .findings = [_]u8{},
+                .findings = [_]std.json.Value{},
             },
         };
         const payload_json = try stringifyAnyAlloc(allocator, payload);
@@ -7370,7 +7385,7 @@ fn emitReviewTupleLockBlockedAndExit(
         if (std.mem.eql(u8, action_name, "run")) {
             const timestamp = try casRerTimestampAlloc(allocator);
             defer allocator.free(timestamp);
-            const shadow_record_path = try writeCasRerShadowRecordFromJsonAlloc(allocator, if (lock) |value| value.recordPath orelse lock_path else lock_path, payload_json, .{}, .{
+            const shadow_record_path = try writeCasRerShadowRecordFromJsonAlloc(allocator, if (lock) |value| value.recordPath orelse lock_path else lock_path, payload_json, normalizeContextFromReviewTuple(tuple), .{
                 .command_surface = "run",
                 .backend_selected = "cas-run",
                 .broker_action = publicReviewBrokerAction(reviewBrokerActionForBlockedLock(decision)),
@@ -7796,7 +7811,7 @@ fn renderErrorAndExit(
                 .reviewTurnId = @as(?[]const u8, null),
                 .recordPath = @as(?[]const u8, null),
                 .eventLogPath = @as(?[]const u8, null),
-                .findings = [_]u8{},
+                .findings = [_]std.json.Value{},
             },
         };
         try printJson(payload);
@@ -7871,7 +7886,7 @@ fn buildPreReviewLaneTransportLostJsonAlloc(
             .reviewTurnId = @as(?[]const u8, null),
             .recordPath = @as(?[]const u8, null),
             .eventLogPath = @as(?[]const u8, null),
-            .findings = [_]u8{},
+            .findings = [_]std.json.Value{},
         },
         .@"error" = message,
     });
@@ -10308,7 +10323,15 @@ fn writeCasRerShadowRecordFromReceipt(allocator: std.mem.Allocator, receipt: Nor
     defer parsed_record.deinit();
     const validation = try validateCasRerRecordObjectAlloc(allocator, receipt.source_path, parsed_record.value.object);
     defer validation.deinit(allocator);
-    if (!validation.ok()) return error.InvalidCasRerRecord;
+    if (!validation.ok()) {
+        var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        const stderr = &stderr_writer.interface;
+        try stderr.print("CAS-RER shadow validation failed for {s}\n", .{receipt.source_path});
+        for (validation.errors) |err| {
+            try stderr.print("- {s}\n", .{err});
+        }
+        return error.InvalidCasRerRecord;
+    }
     return writeCasRerRecordJsonToLedgerAlloc(allocator, record_json);
 }
 
@@ -14027,6 +14050,97 @@ test "receipt normalizer preserves account resource retry metadata" {
     try std.testing.expectEqual(false, receipt.retryable_same_tuple_now.?);
     try std.testing.expectEqualStrings("review_terminal", receipt.review_attempt_phase);
     try std.testing.expect(receipt.review_attempt_exists);
+}
+
+test "blocked account-resource run payload projects valid CAS-RER" {
+    const tuple = ReviewTupleIdentity{
+        .repo_realpath = "/repo",
+        .base_sha = "base_a",
+        .head_sha = "head_a",
+        .target_fingerprint = "fp_a",
+        .resolved_codex_path = "/bin/codex",
+        .resolved_codex_version = "codex 0.1.0",
+        .account_fingerprint = "acct:test",
+        .account_fingerprint_reduced_protection = false,
+    };
+    const raw = try stringifyAnyAlloc(std.testing.allocator, .{
+        .demo = "cas-review-session",
+        .action = "run",
+        .reviewBrokerDecision = .{
+            .action = "blocked_account_resource",
+            .reason = "same-account review retry is blocked",
+            .freshAttemptRequired = false,
+        },
+        .cwd = "/repo",
+        .reviewAttemptPhase = "review_waiting",
+        .reviewAttemptExists = true,
+        .tupleVerdictExists = false,
+        .reviewThreadId = "thr_account",
+        .reviewTurnId = "turn_account",
+        .baseSha = tuple.base_sha,
+        .headSha = tuple.head_sha,
+        .targetFingerprint = tuple.target_fingerprint,
+        .failureCode = "review_tuple_lock_account_resource_exhausted",
+        .failureClass = "coordination",
+        .retryableSameTupleNow = false,
+        .failureHint = "same-account review retry is blocked",
+        .reviewTupleLockVersion = review_tuple_lock_version,
+        .reviewTupleHash = "sha256:tuple",
+        .reviewTupleLockPath = "/locks/tuple.json",
+        .reviewTupleLockState = "account_resource_exhausted",
+        .reviewTupleLockAction = "block_account_resource",
+        .accountFingerprint = tuple.account_fingerprint,
+        .accountFingerprintReducedProtection = tuple.account_fingerprint_reduced_protection,
+        .recordPath = "/tmp/record.json",
+        .eventLogPath = "/tmp/events.jsonl",
+        .lastFailureCode = "account_resource_exhausted",
+        .reviewVerdict = .{
+            .status = "incomplete",
+            .backendClass = "cas-receipt-normalized",
+            .clean = false,
+            .findingCount = 0,
+            .failureCode = "review_tuple_lock_account_resource_exhausted",
+            .failureHint = "same-account review retry is blocked",
+            .baseSha = tuple.base_sha,
+            .headSha = tuple.head_sha,
+            .targetFingerprint = tuple.target_fingerprint,
+            .reviewThreadId = "thr_account",
+            .reviewTurnId = "turn_account",
+            .recordPath = "/tmp/record.json",
+            .eventLogPath = "/tmp/events.jsonl",
+            .findings = [_]std.json.Value{},
+        },
+    });
+    defer std.testing.allocator.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"findings\":[]") != null);
+    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "/tmp/record.json", raw, true, normalizeContextFromReviewTuple(tuple));
+    defer receipt.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("account_resource_exhausted", receipt.status);
+    try std.testing.expectEqualStrings("account_resource_exhausted", receipt.failure_code.?);
+    try std.testing.expectEqual(false, receipt.retryable_same_tuple_now.?);
+    try std.testing.expect(!receipt.tuple_verdict_exists);
+    try std.testing.expect(receipt.review_attempt_exists);
+
+    const rer_json = try casRerJsonFromReceiptAlloc(std.testing.allocator, receipt, .{
+        .command_surface = "run",
+        .backend_selected = "cas-run",
+        .broker_action = publicReviewBrokerAction(reviewBrokerActionForBlockedLock(.block_account_resource)),
+        .broker_reason = "same-account review retry is blocked",
+        .imported_from_receipt = false,
+        .tuple_current_at_record_time = true,
+        .created_at = "unix-ns:1",
+        .updated_at = "unix-ns:1",
+    });
+    defer std.testing.allocator.free(rer_json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, rer_json, .{});
+    defer parsed.deinit();
+
+    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "blocked-account-rer.json", parsed.value.object);
+    defer gate.deinit(std.testing.allocator);
+    try std.testing.expect(gate.ok());
+    const verdict = parsed.value.object.get("verdict").?.object;
+    try std.testing.expectEqualStrings("account_resource_exhausted", verdict.get("status").?.string);
+    try std.testing.expect(!verdict.get("tupleVerdictExists").?.bool);
 }
 
 test "receipt normalizer keeps pre-attempt account exhaustion attempt-free" {
