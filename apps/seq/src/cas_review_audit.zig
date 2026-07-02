@@ -1210,8 +1210,12 @@ fn claimDedupeKey(
     fallback: []const u8,
     dedupe: *std.StringHashMap(void),
 ) !bool {
-    const key_value = scalarString(row, "record_path") orelse scalarString(row, "event_log_path") orelse scalarString(row, "review_thread_id") orelse fallback;
-    const key = try std.fmt.allocPrint(allocator, "{s}|{s}", .{ source_path, key_value });
+    const key = if (scalarString(row, "record_id")) |record_id|
+        try std.fmt.allocPrint(allocator, "recordId|{s}", .{record_id})
+    else blk: {
+        const key_value = scalarString(row, "record_path") orelse scalarString(row, "event_log_path") orelse scalarString(row, "review_thread_id") orelse fallback;
+        break :blk try std.fmt.allocPrint(allocator, "{s}|{s}", .{ source_path, key_value });
+    };
     errdefer allocator.free(key);
     if (dedupe.contains(key)) {
         allocator.free(key);
@@ -2056,6 +2060,62 @@ test "CAS current and list envelopes expand nested ledger records" {
     try std.testing.expectEqual(@as(i64, 0), audit.summary.timeout_with_handle_count);
     try std.testing.expectEqual(@as(i64, 1), audit.summary.broker_blocked_live_count);
     try std.testing.expectEqual(@as(i64, 1), audit.summary.broker_auto_replaced_dead_transport_count);
+}
+
+test "CAS-RER envelope dedupe uses stable record identity" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const record =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_same_record","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"returned_terminal","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_same","reviewTurnId":"turn_same"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+    ;
+    const run_envelope = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"schema":"CAS-RUN-v1","record":{s},"reviewBrokerDecision":{{"action":"returned_terminal","reason":"test","freshAttemptRequired":false}}}}
+    , .{record});
+    defer std.testing.allocator.free(run_envelope);
+    const current_envelope = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"schema":"CAS-CURRENT-v1","record":{s},"tupleCurrent":true,"actionRequired":"none"}}
+    , .{record});
+    defer std.testing.allocator.free(current_envelope);
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "run.json", .data = run_envelope });
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "current.json", .data = current_envelope });
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const run_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "run.json" });
+    defer std.testing.allocator.free(run_path);
+    const current_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "current.json" });
+    defer std.testing.allocator.free(current_path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .receipt_paths = &.{ run_path, current_path },
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), audit.rows.items.len);
+    try std.testing.expectEqualStrings("rer_same_record", scalarString(audit.rows.items[0], "record_id").?);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_clean_count);
+}
+
+test "bare CAS-RER JSONL preserves distinct record identities" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "records.jsonl", .data =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_jsonl_one","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_one","reviewTurnId":"turn_one"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_jsonl_two","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_two","reviewTurnId":"turn_two"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+    });
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "records.jsonl" });
+    defer std.testing.allocator.free(path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .receipt_paths = &.{path},
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), audit.rows.items.len);
+    try std.testing.expectEqual(@as(i64, 2), audit.summary.completed_clean_count);
 }
 
 test "repo scope matching is path-boundary safe" {

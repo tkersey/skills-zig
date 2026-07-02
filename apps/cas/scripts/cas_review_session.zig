@@ -1286,13 +1286,23 @@ fn currentAccountFingerprintAlloc(allocator: std.mem.Allocator, io: std.Io, pars
     return principal.fingerprint;
 }
 
-fn reviewCurrentIdentityAlloc(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !struct {
+const ReviewCurrentIdentity = struct {
     cwd: []const u8,
     identity: TargetIdentity,
     resolved_codex_path: []const u8,
     resolved_codex_version: []const u8,
     account_fingerprint: []const u8,
-} {
+
+    fn deinit(self: ReviewCurrentIdentity, allocator: std.mem.Allocator) void {
+        allocator.free(self.cwd);
+        self.identity.deinit(allocator);
+        allocator.free(self.resolved_codex_path);
+        allocator.free(self.resolved_codex_version);
+        allocator.free(self.account_fingerprint);
+    }
+};
+
+fn reviewCurrentIdentityAlloc(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !ReviewCurrentIdentity {
     const cwd = try repoRealpathAlloc(allocator, parsed.cwd.?);
     errdefer allocator.free(cwd);
     const identity = try computeTargetIdentityAlloc(allocator, io, cwd, targetToRecord(parsed.target.?));
@@ -1358,11 +1368,7 @@ fn writeCasReviewListEnvelope(writer: *std.Io.Writer, records: []const CasRerLed
 
 fn cmdReviewCurrent(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     var resolved = try reviewCurrentIdentityAlloc(allocator, io, parsed);
-    defer allocator.free(resolved.cwd);
-    defer resolved.identity.deinit(allocator);
-    defer allocator.free(resolved.resolved_codex_path);
-    defer allocator.free(resolved.resolved_codex_version);
-    defer allocator.free(resolved.account_fingerprint);
+    defer resolved.deinit(allocator);
 
     var records: std.ArrayList(CasRerLedgerRecord) = .empty;
     defer {
@@ -1380,11 +1386,7 @@ fn cmdReviewCurrent(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs
 
 fn cmdReviewList(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     var resolved = try reviewCurrentIdentityAlloc(allocator, io, parsed);
-    defer allocator.free(resolved.cwd);
-    defer resolved.identity.deinit(allocator);
-    defer allocator.free(resolved.resolved_codex_path);
-    defer allocator.free(resolved.resolved_codex_version);
-    defer allocator.free(resolved.account_fingerprint);
+    defer resolved.deinit(allocator);
 
     var records: std.ArrayList(CasRerLedgerRecord) = .empty;
     defer {
@@ -2823,6 +2825,16 @@ fn isCasRerObject(obj: std.json.ObjectMap) bool {
     return std.mem.eql(u8, jsonStringField(obj, "schema") orelse "", cas_review_evidence_schema);
 }
 
+fn importRecordEnvelopeValidationOk(obj: std.json.ObjectMap) bool {
+    const validation = objectField(obj, "validation") orelse return true;
+    if (jsonBoolField(validation, "ok")) |ok| return ok;
+    if (validation.get("errors")) |errors| switch (errors) {
+        .array => |array| return array.items.len == 0,
+        else => return false,
+    };
+    return false;
+}
+
 fn collectNestedCasRerRecordsAlloc(allocator: std.mem.Allocator, out: *std.ArrayList([]u8), root: std.json.ObjectMap) !bool {
     if (isCasRerObject(root)) {
         try out.append(allocator, try stringifyJsonValueAlloc(allocator, .{ .object = root }));
@@ -2843,6 +2855,7 @@ fn collectNestedCasRerRecordsAlloc(allocator: std.mem.Allocator, out: *std.Array
                     .object => |value| value,
                     else => continue,
                 };
+                if (!importRecordEnvelopeValidationOk(item_obj)) continue;
                 const record = if (isCasRerObject(item_obj))
                     item_obj
                 else
@@ -2857,11 +2870,29 @@ fn collectNestedCasRerRecordsAlloc(allocator: std.mem.Allocator, out: *std.Array
     return found;
 }
 
+fn collectNestedCasRerRecordsFromJsonLinesAlloc(allocator: std.mem.Allocator, out: *std.ArrayList([]u8), raw: []const u8) !bool {
+    var found = false;
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len == 0) continue;
+        var parsed_line = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+        defer parsed_line.deinit();
+        const root = switch (parsed_line.value) {
+            .object => |value| value,
+            else => continue,
+        };
+        if (try collectNestedCasRerRecordsAlloc(allocator, out, root)) found = true;
+    }
+    return found;
+}
+
 fn appendImportedCasRerRecordJsonAlloc(
     allocator: std.mem.Allocator,
     imported: *std.ArrayList(ImportedCasRerRecord),
     source_path_raw: []const u8,
     record_json: []u8,
+    requested_identity: ?ReviewCurrentIdentity,
 ) !void {
     errdefer allocator.free(record_json);
     var parsed_record = try std.json.parseFromSlice(std.json.Value, allocator, record_json, .{});
@@ -2874,6 +2905,25 @@ fn appendImportedCasRerRecordJsonAlloc(
 
     var validation = try validateCasRerRecordObjectAlloc(allocator, source_path_raw, record_obj);
     errdefer validation.deinit(allocator);
+    if (validation.ok()) {
+        if (requested_identity) |identity| {
+            if (!casRerObjectMatchesIdentity(
+                record_obj,
+                identity.cwd,
+                identity.identity,
+                identity.resolved_codex_path,
+                identity.resolved_codex_version,
+                identity.account_fingerprint,
+            )) {
+                validation.deinit(allocator);
+                validation = try gateResultFromSingleErrorAlloc(
+                    allocator,
+                    source_path_raw,
+                    "CAS-RER record does not match requested import identity",
+                );
+            }
+        }
+    }
     const record_path = if (validation.ok())
         try writeCasRerRecordJsonToLedgerAlloc(allocator, record_json)
     else
@@ -2887,6 +2937,26 @@ fn appendImportedCasRerRecordJsonAlloc(
         .record_json = record_json,
         .validation = validation,
     });
+}
+
+fn appendCollectedNestedCasRerRecordsAlloc(
+    allocator: std.mem.Allocator,
+    imported: *std.ArrayList(ImportedCasRerRecord),
+    errors: *std.ArrayList(ReceiptError),
+    source_path: []const u8,
+    nested_records: *std.ArrayList([]u8),
+    requested_identity: ?ReviewCurrentIdentity,
+) !void {
+    for (nested_records.items) |*record_json_ref| {
+        const record_json = record_json_ref.*;
+        record_json_ref.* = "";
+        appendImportedCasRerRecordJsonAlloc(allocator, imported, source_path, record_json, requested_identity) catch |err| {
+            try errors.append(allocator, .{
+                .source_path = try allocator.dupe(u8, source_path),
+                .message = try allocator.dupe(u8, @errorName(err)),
+            });
+        };
+    }
 }
 
 fn cmdReviewImport(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
@@ -2907,12 +2977,11 @@ fn cmdReviewImport(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs)
         errors.deinit(allocator);
     }
 
-    var requested_identity_opt: ?TargetIdentity = null;
-    defer if (requested_identity_opt) |identity| identity.deinit(allocator);
+    var requested_current_opt: ?ReviewCurrentIdentity = null;
+    defer if (requested_current_opt) |identity| identity.deinit(allocator);
     const requested_identity_required = parsed.cwd != null and parsed.target != null;
     if (requested_identity_required) {
-        const target_record = targetToRecord(parsed.target.?);
-        requested_identity_opt = computeTargetIdentityAlloc(allocator, io, parsed.cwd.?, target_record) catch |err| {
+        requested_current_opt = reviewCurrentIdentityAlloc(allocator, io, parsed) catch |err| {
             try errors.append(allocator, .{
                 .source_path = try allocator.dupe(u8, parsed.cwd.?),
                 .message = try std.fmt.allocPrint(allocator, "target identity unavailable: {s}", .{@errorName(err)}),
@@ -2922,11 +2991,12 @@ fn cmdReviewImport(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs)
         };
     }
     const normalize_context = NormalizeContext{
-        .requested_identity = requested_identity_opt,
+        .requested_identity = if (requested_current_opt) |identity| identity.identity else null,
         .requested_identity_required = requested_identity_required,
     };
-    const import_repo_realpath = if (parsed.cwd) |cwd| try repoRealpathAlloc(allocator, cwd) else null;
-    defer if (import_repo_realpath) |value| allocator.free(value);
+    const standalone_import_repo_realpath = if (requested_current_opt == null and parsed.cwd != null) try repoRealpathAlloc(allocator, parsed.cwd.?) else null;
+    defer if (standalone_import_repo_realpath) |value| allocator.free(value);
+    const import_repo_realpath = if (requested_current_opt) |identity| identity.cwd else standalone_import_repo_realpath;
 
     if (paths.items.len == 0) {
         try errors.append(allocator, .{
@@ -2967,18 +3037,30 @@ fn cmdReviewImport(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs)
                     continue;
                 };
                 if (found_nested) {
-                    for (nested_records.items) |*record_json_ref| {
-                        const record_json = record_json_ref.*;
-                        record_json_ref.* = "";
-                        appendImportedCasRerRecordJsonAlloc(allocator, &imported, path, record_json) catch |err| {
-                            try errors.append(allocator, .{
-                                .source_path = try allocator.dupe(u8, path),
-                                .message = try allocator.dupe(u8, @errorName(err)),
-                            });
-                        };
-                    }
+                    try appendCollectedNestedCasRerRecordsAlloc(allocator, &imported, &errors, path, &nested_records, requested_current_opt);
                     continue;
                 }
+            }
+        }
+
+        {
+            var nested_records: std.ArrayList([]u8) = .empty;
+            defer {
+                for (nested_records.items) |record_json| {
+                    if (record_json.len != 0) allocator.free(record_json);
+                }
+                nested_records.deinit(allocator);
+            }
+            const found_nested = collectNestedCasRerRecordsFromJsonLinesAlloc(allocator, &nested_records, raw) catch |err| {
+                try errors.append(allocator, .{
+                    .source_path = try allocator.dupe(u8, path),
+                    .message = try allocator.dupe(u8, @errorName(err)),
+                });
+                continue;
+            };
+            if (found_nested) {
+                try appendCollectedNestedCasRerRecordsAlloc(allocator, &imported, &errors, path, &nested_records, requested_current_opt);
+                continue;
             }
         }
 
@@ -2995,7 +3077,10 @@ fn cmdReviewImport(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs)
         defer allocator.free(import_timestamp);
         const record_json = casRerJsonFromReceiptAlloc(allocator, receipt, .{
             .repo_realpath_override = import_repo_realpath,
-            .tuple_current_at_record_time = if (requested_identity_opt) |identity| receiptTupleMatchesIdentity(receipt, identity) else false,
+            .resolved_codex_path_override = if (requested_current_opt) |identity| identity.resolved_codex_path else null,
+            .resolved_codex_version_override = if (requested_current_opt) |identity| identity.resolved_codex_version else null,
+            .account_fingerprint_override = if (requested_current_opt) |identity| identity.account_fingerprint else null,
+            .tuple_current_at_record_time = if (requested_current_opt) |identity| receiptTupleMatchesIdentity(receipt, identity.identity) else false,
             .created_at = import_timestamp,
             .updated_at = import_timestamp,
         }) catch |err| {
@@ -3006,7 +3091,7 @@ fn cmdReviewImport(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs)
             continue;
         };
 
-        appendImportedCasRerRecordJsonAlloc(allocator, &imported, path, record_json) catch |err| {
+        appendImportedCasRerRecordJsonAlloc(allocator, &imported, path, record_json, requested_current_opt) catch |err| {
             try errors.append(allocator, .{
                 .source_path = try allocator.dupe(u8, path),
                 .message = try allocator.dupe(u8, @errorName(err)),
@@ -3721,9 +3806,17 @@ fn validateCasRerRecordObjectAlloc(allocator: std.mem.Allocator, path: []const u
             if ((findings_len orelse 1) != 0) {
                 try appendGateError(allocator, &errors, "verdict.status=clean requires findings length = 0", .{});
             }
+        }
+        if (std.mem.eql(u8, status orelse "", "clean") or std.mem.eql(u8, status orelse "", "findings")) {
             if (failure) |failure_obj| {
                 if (fieldPresentNonNull(failure_obj, "failureCode")) {
-                    try appendGateError(allocator, &errors, "verdict.status=clean requires failure.failureCode=null", .{});
+                    try appendGateError(allocator, &errors, "terminal tuple verdict requires failure.failureCode=null", .{});
+                }
+                if (fieldPresentNonNull(failure_obj, "failureClass")) {
+                    try appendGateError(allocator, &errors, "terminal tuple verdict requires failure.failureClass=null", .{});
+                }
+                if (fieldPresentNonNull(failure_obj, "retryableSameTupleNow")) {
+                    try appendGateError(allocator, &errors, "terminal tuple verdict requires failure.retryableSameTupleNow=null", .{});
                 }
             }
         }
@@ -6343,10 +6436,14 @@ fn sessionDirAlloc(allocator: std.mem.Allocator) ![]const u8 {
 }
 
 fn reviewLedgerRecordsDirAlloc(allocator: std.mem.Allocator) ![]const u8 {
-    const base = try core_path.expandHomePath(allocator, "~/.codex/cas/review_ledger/records");
+    const base = try reviewLedgerRecordsDirPathAlloc(allocator);
     try ensureParentPath(base);
     try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), base);
     return base;
+}
+
+fn reviewLedgerRecordsDirPathAlloc(allocator: std.mem.Allocator) ![]const u8 {
+    return core_path.expandHomePath(allocator, "~/.codex/cas/review_ledger/records");
 }
 
 fn casRerRecordIdFromJsonAlloc(allocator: std.mem.Allocator, record_json: []const u8) ![]const u8 {
@@ -6487,10 +6584,7 @@ fn appendCasRerLedgerRecordsAlloc(
     resolved_codex_version: ?[]const u8,
     account_fingerprint: ?[]const u8,
 ) !void {
-    const records_dir = reviewLedgerRecordsDirAlloc(allocator) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
+    const records_dir = try reviewLedgerRecordsDirPathAlloc(allocator);
     defer allocator.free(records_dir);
     var dir = std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), records_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
@@ -6514,7 +6608,21 @@ fn appendCasRerLedgerRecordsAlloc(
                 else => continue,
             };
             if (!std.mem.eql(u8, jsonStringField(root, "schema") orelse "", cas_review_evidence_schema)) continue;
+            var validation = validateCasRerRecordObjectAlloc(allocator, path, root) catch continue;
+            defer validation.deinit(allocator);
+            if (!validation.ok()) continue;
             if (!casRerObjectMatchesIdentity(root, repo_realpath.?, identity.?, resolved_codex_path.?, resolved_codex_version.?, account_fingerprint.?)) continue;
+        } else {
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch continue;
+            defer parsed.deinit();
+            const root = switch (parsed.value) {
+                .object => |obj| obj,
+                else => continue,
+            };
+            if (!std.mem.eql(u8, jsonStringField(root, "schema") orelse "", cas_review_evidence_schema)) continue;
+            var validation = validateCasRerRecordObjectAlloc(allocator, path, root) catch continue;
+            defer validation.deinit(allocator);
+            if (!validation.ok()) continue;
         }
         const record = casRerLedgerRecordFromJsonAlloc(allocator, path, raw) catch continue;
         errdefer record.deinit(allocator);
@@ -6542,8 +6650,15 @@ fn actionRequiredForCasRerRecord(record: CasRerLedgerRecord) []const u8 {
         if (!record.principal_proof_usable) return "run_new_attempt";
         return "none";
     }
+    if (record.failure_code) |code| {
+        if (std.mem.eql(u8, code, "review_tuple_lock_stale") or std.mem.eql(u8, code, "review_tuple_lock_invalid")) return "inspect";
+    }
     if (std.mem.eql(u8, record.status, "timeout")) return "inspect";
-    if (std.mem.eql(u8, record.status, "transport_failure")) return if (record.attempt_exists) "wait" else "run_new_attempt";
+    if (std.mem.eql(u8, record.status, "transport_failure")) {
+        if (!record.attempt_exists) return "run_new_attempt";
+        if (std.mem.eql(u8, record.phase, "review_terminal") or std.mem.eql(u8, record.phase, "normalized_verdict")) return "inspect";
+        return "wait";
+    }
     if (record.attempt_exists and !record.tuple_verdict_exists) {
         if (std.mem.eql(u8, record.phase, "review_waiting") or std.mem.eql(u8, record.phase, "review_started")) return "wait";
         if (record.phase.len == 0 and record.failure_code == null) return "wait";
@@ -7374,7 +7489,7 @@ fn printReviewTupleLockExistingAndExit(
         if (std.mem.eql(u8, action_name, "run")) {
             const timestamp = try casRerTimestampAlloc(allocator);
             defer allocator.free(timestamp);
-            const shadow_record_path = try writeCasRerShadowRecordFromJsonAlloc(allocator, lock.recordPath orelse lock_path, payload_json, .{
+            const shadow_record_path = writeCasRerShadowRecordFromJsonAlloc(allocator, lock.recordPath orelse lock_path, payload_json, .{
                 .requested_identity = target_identity,
                 .requested_identity_required = true,
             }, .{
@@ -7386,8 +7501,8 @@ fn printReviewTupleLockExistingAndExit(
                 .tuple_current_at_record_time = true,
                 .created_at = timestamp,
                 .updated_at = timestamp,
-            });
-            defer allocator.free(shadow_record_path);
+            }) catch null;
+            defer if (shadow_record_path) |path| allocator.free(path);
         }
         try stdout.print("{s}\n", .{payload_json});
     }
@@ -8454,7 +8569,7 @@ fn printStatusJson(
                 defer normalized.deinit(allocator);
                 const timestamp = try casRerTimestampAlloc(allocator);
                 defer allocator.free(timestamp);
-                const shadow_record_path = try writeCasRerShadowRecordFromReceipt(allocator, normalized, .{
+                const shadow_record_path = writeCasRerShadowRecordFromReceipt(allocator, normalized, .{
                     .command_surface = "start_wait",
                     .backend_selected = "cas-start-wait",
                     .broker_action = "created_new",
@@ -8463,8 +8578,8 @@ fn printStatusJson(
                     .tuple_current_at_record_time = true,
                     .created_at = timestamp,
                     .updated_at = timestamp,
-                });
-                defer allocator.free(shadow_record_path);
+                }) catch null;
+                defer if (shadow_record_path) |path| allocator.free(path);
             }
         }
     }
@@ -8913,8 +9028,8 @@ fn printStartJson(
             .requested_identity = identity,
             .requested_identity_required = true,
         }, .{
-            .command_surface = "start_wait",
-            .backend_selected = "cas-start-wait",
+            .command_surface = "start",
+            .backend_selected = "cas-start",
             .broker_action = "created_new",
             .broker_reason = "low-level start output shadowed into CAS-RER-v1",
             .imported_from_receipt = false,
@@ -8954,7 +9069,7 @@ fn printStartJson(
             };
             try writeCasRunEnvelopeFromReceipt(allocator, stdout, normalized, broker, receipt.fresh_attempt_required);
             try stdout.writeByte('\n');
-            if (!casRunEvidenceAllowsSuccess(normalized)) return error.UntrustedReviewEvidence;
+            if (!normalizedReceiptCommandSucceeded(normalized)) return error.ReviewNotClean;
             return;
         }
     } else if (std.mem.eql(u8, receipt.surface_action, "start") and waited) {
@@ -10423,6 +10538,9 @@ const CasRerProjectionOptions = struct {
     broker_action: []const u8 = "imported_legacy",
     broker_reason: []const u8 = "legacy review artifact normalized into CAS-RER-v1",
     repo_realpath_override: ?[]const u8 = null,
+    resolved_codex_path_override: ?[]const u8 = null,
+    resolved_codex_version_override: ?[]const u8 = null,
+    account_fingerprint_override: ?[]const u8 = null,
     fresh_attempt_required: bool = false,
     tuple_current_at_record_time: bool = false,
     imported_from_receipt: bool = true,
@@ -10549,10 +10667,6 @@ fn casRerPrincipalProofUsable(receipt: NormalizedReceipt) bool {
         casRerPrincipalFingerprintUsable(receipt.account_fingerprint);
 }
 
-fn casRunEvidenceAllowsSuccess(receipt: NormalizedReceipt) bool {
-    return casRerPrincipalProofUsable(receipt);
-}
-
 fn casRerAttemptIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt) !?[]const u8 {
     const review_thread_id = nonEmptyOptional(receipt.review_thread_id) orelse return null;
     const material = try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}", .{
@@ -10618,6 +10732,8 @@ fn writeCasRerCommandObject(writer: *std.Io.Writer, receipt: NormalizedReceipt, 
 
 fn writeCasRerTupleObject(writer: *std.Io.Writer, receipt: NormalizedReceipt, opts: CasRerProjectionOptions) !void {
     const repo_realpath = opts.repo_realpath_override orelse receipt.repo_realpath;
+    const resolved_codex_path = opts.resolved_codex_path_override orelse receipt.resolved_codex_path;
+    const resolved_codex_version = opts.resolved_codex_version_override orelse receipt.resolved_codex_version;
     try writer.writeByte('{');
     try writeJsonString(writer, "repoRealpath");
     try writer.writeByte(':');
@@ -10639,11 +10755,11 @@ fn writeCasRerTupleObject(writer: *std.Io.Writer, receipt: NormalizedReceipt, op
     try writer.writeByte(',');
     try writeJsonString(writer, "resolvedCodexPath");
     try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.resolved_codex_path);
+    try writeNullableJsonString(writer, resolved_codex_path);
     try writer.writeByte(',');
     try writeJsonString(writer, "resolvedCodexVersion");
     try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.resolved_codex_version);
+    try writeNullableJsonString(writer, resolved_codex_version);
     try writer.writeByte(',');
     try writeJsonString(writer, "diffScope");
     try writer.writeAll(":\"entire_pr\",");
@@ -10725,7 +10841,15 @@ fn writeCasRerFailureObject(writer: *std.Io.Writer, receipt: NormalizedReceipt) 
     try writer.writeByte('}');
 }
 
-fn writeCasRerPrincipalObject(writer: *std.Io.Writer, receipt: NormalizedReceipt) !void {
+fn casRerPrincipalProofUsableWithFingerprint(receipt: NormalizedReceipt, account_fingerprint: ?[]const u8) bool {
+    return std.mem.eql(u8, casRerPrincipalKind(receipt), "strong") and
+        !receipt.account_fingerprint_reduced_protection and
+        !casRerFallbackUsed(receipt) and
+        casRerPrincipalFingerprintUsable(account_fingerprint);
+}
+
+fn writeCasRerPrincipalObject(writer: *std.Io.Writer, receipt: NormalizedReceipt, opts: CasRerProjectionOptions) !void {
+    const account_fingerprint = opts.account_fingerprint_override orelse receipt.account_fingerprint;
     try writer.writeByte('{');
     try writeJsonString(writer, "kind");
     try writer.writeByte(':');
@@ -10733,11 +10857,11 @@ fn writeCasRerPrincipalObject(writer: *std.Io.Writer, receipt: NormalizedReceipt
     try writer.writeByte(',');
     try writeJsonString(writer, "accountFingerprint");
     try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.account_fingerprint);
+    try writeNullableJsonString(writer, account_fingerprint);
     try writer.writeByte(',');
     try writeJsonString(writer, "proofUsable");
     try writer.writeByte(':');
-    try writer.writeAll(if (casRerPrincipalProofUsable(receipt)) "true" else "false");
+    try writer.writeAll(if (casRerPrincipalProofUsableWithFingerprint(receipt, account_fingerprint)) "true" else "false");
     try writer.writeByte(',');
     try writeJsonString(writer, "reduced");
     try writer.writeByte(':');
@@ -10838,7 +10962,7 @@ fn writeCasRerRecordObject(
     try writer.writeByte(',');
     try writeJsonString(writer, "principal");
     try writer.writeByte(':');
-    try writeCasRerPrincipalObject(writer, receipt);
+    try writeCasRerPrincipalObject(writer, receipt, opts);
     try writer.writeByte(',');
     try writeJsonString(writer, "attachments");
     try writer.writeByte(':');
@@ -10883,6 +11007,10 @@ fn writeReceiptReviewVerdictObject(writer: *std.Io.Writer, receipt: NormalizedRe
     try writeJsonString(writer, "principalStrength");
     try writer.writeByte(':');
     try writeJsonString(writer, receipt.principal_strength);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "accountFingerprint");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.account_fingerprint);
     try writer.writeByte(',');
     try writeJsonString(writer, "accountFingerprintReducedProtection");
     try writer.writeByte(':');
@@ -13276,6 +13404,13 @@ test "CAS-RER ledger record projection matches tuple identity" {
     try std.testing.expect(!active_record.tuple_verdict_exists);
     try std.testing.expectEqualStrings("wait", actionRequiredForCasRerRecord(active_record));
 
+    const stale_lock_raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_stale_lock","createdAt":"2026-07-02T00:00:03Z","updatedAt":"2026-07-02T00:00:03Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"blocked_live","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:d","phase":"review_waiting","reviewThreadId":"thr_stale","reviewTurnId":"turn_stale"},"verdict":{"tupleVerdictExists":false,"status":"incomplete","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":"review_tuple_lock_stale","failureClass":"coordination","retryableSameTupleNow":false},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-run"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
+    ;
+    const stale_lock_record = try casRerLedgerRecordFromJsonAlloc(std.testing.allocator, "/tmp/rer_stale_lock.json", stale_lock_raw);
+    defer stale_lock_record.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("inspect", actionRequiredForCasRerRecord(stale_lock_record));
+
     const active_transport_raw =
         \\{"schema":"CAS-RER-v1","recordId":"rer_active_transport","createdAt":"2026-07-02T00:00:04Z","updatedAt":"2026-07-02T00:00:04Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:e","phase":"review_waiting","reviewThreadId":"thr_transport","reviewTurnId":"turn_transport"},"verdict":{"tupleVerdictExists":false,"status":"transport_failure","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":"review_transport_lost","failureClass":"transport","retryableSameTupleNow":true},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-start-wait"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
     ;
@@ -13331,8 +13466,8 @@ test "CAS current and list envelopes include ledger record paths" {
     try std.testing.expectEqualStrings("/tmp/rer_path.json", ref.get("recordPath").?.string);
 }
 
-test "CAS run shell success requires proof usable principal" {
-    const strong = NormalizedReceipt{
+test "CAS run shell success requires clean proof usable principal" {
+    const strong_findings = NormalizedReceipt{
         .source_path = "/tmp/receipt.json",
         .status = "findings",
         .backend_class = "cas-start-wait",
@@ -13360,19 +13495,26 @@ test "CAS run shell success requires proof usable principal" {
         .retryable_same_tuple_now = null,
         .findings_json = "[]",
     };
-    try std.testing.expect(casRunEvidenceAllowsSuccess(strong));
+    try std.testing.expect(casRerPrincipalProofUsable(strong_findings));
+    try std.testing.expect(!normalizedReceiptCommandSucceeded(strong_findings));
 
-    var reduced = strong;
+    var strong_clean = strong_findings;
+    strong_clean.status = "clean";
+    strong_clean.clean = true;
+    strong_clean.finding_count = 0;
+    try std.testing.expect(normalizedReceiptCommandSucceeded(strong_clean));
+
+    var reduced = strong_clean;
     reduced.principal_strength = principal_strength_reduced;
-    try std.testing.expect(!casRunEvidenceAllowsSuccess(reduced));
+    try std.testing.expect(!normalizedReceiptCommandSucceeded(reduced));
 
-    var fallback = strong;
+    var fallback = strong_clean;
     fallback.backend_class = "cas-native-fallback";
-    try std.testing.expect(!casRunEvidenceAllowsSuccess(fallback));
+    try std.testing.expect(!normalizedReceiptCommandSucceeded(fallback));
 
-    var unknown_account = strong;
+    var unknown_account = strong_clean;
     unknown_account.account_fingerprint = unknown_account_fingerprint;
-    try std.testing.expect(!casRunEvidenceAllowsSuccess(unknown_account));
+    try std.testing.expect(!normalizedReceiptCommandSucceeded(unknown_account));
 }
 
 test "start shadow payload carries Codex identity into CAS-RER tuple" {
@@ -13522,6 +13664,30 @@ test "CAS-RER validator rejects verdict clean/status disagreement" {
     try std.testing.expect(std.mem.indexOf(u8, findings_true_gate.errors[0], "verdict.clean=false") != null);
 }
 
+test "CAS-RER validator rejects terminal verdict failure metadata" {
+    const clean_failure_class_raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_clean_failure_class","tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":"transport","retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
+    ;
+    var clean_failure_class = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, clean_failure_class_raw, .{});
+    defer clean_failure_class.deinit();
+    const clean_gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "clean-failure-class-rer.json", clean_failure_class.value.object);
+    defer clean_gate.deinit(std.testing.allocator);
+    try std.testing.expect(!clean_gate.ok());
+    try std.testing.expect(clean_gate.errors.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, clean_gate.errors[0], "failure.failureClass=null") != null);
+
+    const findings_failure_raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_findings_failure","tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":1,"findings":[{"title":"issue"}]},"failure":{"failureCode":"review_parse_mismatch","failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
+    ;
+    var findings_failure = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, findings_failure_raw, .{});
+    defer findings_failure.deinit();
+    const findings_gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "findings-failure-rer.json", findings_failure.value.object);
+    defer findings_gate.deinit(std.testing.allocator);
+    try std.testing.expect(!findings_gate.ok());
+    try std.testing.expect(findings_gate.errors.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, findings_gate.errors[0], "failure.failureCode=null") != null);
+}
+
 test "CAS-RER validator rejects terminal verdict without attempt" {
     const raw =
         \\{"schema":"CAS-RER-v1","recordId":"rer_no_attempt","tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":false,"phase":"normalized_verdict","reviewThreadId":null,"reviewTurnId":null},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
@@ -13634,12 +13800,19 @@ test "CAS-RER projection fills missing repo realpath from import cwd" {
     try std.testing.expect(receiptTupleMatchesIdentity(receipt, identity));
     const matched_json = try casRerJsonFromReceiptAlloc(std.testing.allocator, receipt, .{
         .repo_realpath_override = "/tmp/repo",
+        .resolved_codex_path_override = "/opt/codex",
+        .resolved_codex_version_override = "codex 9.9.9",
+        .account_fingerprint_override = "acct:import",
         .tuple_current_at_record_time = receiptTupleMatchesIdentity(receipt, identity),
     });
     defer std.testing.allocator.free(matched_json);
     var matched = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, matched_json, .{});
     defer matched.deinit();
-    try std.testing.expect(matched.value.object.get("tuple").?.object.get("tupleCurrentAtRecordTime").?.bool);
+    const matched_tuple = matched.value.object.get("tuple").?.object;
+    try std.testing.expect(matched_tuple.get("tupleCurrentAtRecordTime").?.bool);
+    try std.testing.expectEqualStrings("/opt/codex", matched_tuple.get("resolvedCodexPath").?.string);
+    try std.testing.expectEqualStrings("codex 9.9.9", matched_tuple.get("resolvedCodexVersion").?.string);
+    try std.testing.expectEqualStrings("acct:import", matched.value.object.get("principal").?.object.get("accountFingerprint").?.string);
 }
 
 test "CAS-RER projection lets requested import cwd override receipt repo" {
@@ -13729,15 +13902,36 @@ test "review import extracts nested CAS-RER records from envelopes" {
     try std.testing.expectEqualStrings("rer_nested", nested.value.object.get("recordId").?.string);
     try std.testing.expectEqualStrings("/bin/codex", nested.value.object.get("tuple").?.object.get("resolvedCodexPath").?.string);
     try std.testing.expectEqualStrings("acct:test", nested.value.object.get("principal").?.object.get("accountFingerprint").?.string);
+    const requested_identity = TargetIdentity{
+        .base_sha = "base",
+        .head_sha = "head",
+        .fingerprint = "fp",
+    };
+    try std.testing.expect(casRerObjectMatchesIdentity(nested.value.object, "/tmp/repo", requested_identity, "/bin/codex", "codex 0.1.0", "acct:test"));
+    try std.testing.expect(!casRerObjectMatchesIdentity(nested.value.object, "/tmp/repo", requested_identity, "/bin/codex", "codex 0.1.0", "acct:other"));
 
     const import_envelope = try std.fmt.allocPrint(std.testing.allocator,
-        \\{{"schema":"CAS-IMPORT-v1","records":[{{"sourcePath":"/tmp/receipt.json","record":{s}}},{s}],"errors":[]}}
-    , .{ record_json, record_json });
+        \\{{"schema":"CAS-IMPORT-v1","records":[{{"sourcePath":"/tmp/receipt.json","validation":{{"ok":false,"errors":["bad"],"path":"/tmp/receipt.json"}},"record":{s}}},{{"sourcePath":"/tmp/receipt.json","validation":{{"ok":true,"errors":[],"path":"/tmp/receipt.json"}},"record":{s}}},{s}],"errors":[]}}
+    , .{ record_json, record_json, record_json });
     defer std.testing.allocator.free(import_envelope);
     var import_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, import_envelope, .{});
     defer import_parsed.deinit();
     try std.testing.expect(try collectNestedCasRerRecordsAlloc(std.testing.allocator, &records, import_parsed.value.object));
     try std.testing.expectEqual(@as(usize, 3), records.items.len);
+
+    const jsonl_envelope = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"schema":"CAS-IMPORT-v1","records":[{{"sourcePath":"/tmp/receipt.json","validation":{{"ok":false,"errors":["bad"],"path":"/tmp/receipt.json"}},"record":{s}}}],"errors":[]}}
+        \\
+        \\{s}
+    , .{ record_json, record_json });
+    defer std.testing.allocator.free(jsonl_envelope);
+    var jsonl_records: std.ArrayList([]u8) = .empty;
+    defer {
+        for (jsonl_records.items) |record| std.testing.allocator.free(record);
+        jsonl_records.deinit(std.testing.allocator);
+    }
+    try std.testing.expect(try collectNestedCasRerRecordsFromJsonLinesAlloc(std.testing.allocator, &jsonl_records, jsonl_envelope));
+    try std.testing.expectEqual(@as(usize, 1), jsonl_records.items.len);
 }
 
 test "CAS inspect record object keeps malformed JSON output parseable" {
