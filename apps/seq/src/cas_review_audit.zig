@@ -992,7 +992,7 @@ fn summarize(rows: []const query.Row) Summary {
         const tuple_exists = scalarBool(row, "tuple_verdict_exists");
         const finding_count = scalarInt(row, "finding_count");
 
-        if (broker_action != null or std.mem.indexOf(u8, command_surface, "review_session run") != null) out.broker_run_count += 1;
+        if (broker_action != null or brokerRunCommandSurface(command_surface)) out.broker_run_count += 1;
         if (optEql(broker_action, "auto_replaced_dead_transport") or optEql(broker_action, "replaced_dead_transport")) out.broker_auto_replaced_dead_transport_count += 1;
         if (optEql(broker_action, "attached_existing") or optEql(broker_action, "returned_terminal")) out.broker_attached_existing_count += 1;
         if (optEql(broker_action, "blocked_live_attempt") or optEql(broker_action, "blocked_live")) out.broker_blocked_live_count += 1;
@@ -1048,6 +1048,13 @@ fn manualRecoveryCommand(command_surface: []const u8) bool {
         std.mem.indexOf(u8, command_surface, "cas review validate-record") != null or
         std.mem.indexOf(u8, command_surface, "cas review inspect") != null or
         std.mem.indexOf(u8, command_surface, "--review-lock-override") != null;
+}
+
+fn brokerRunCommandSurface(command_surface: []const u8) bool {
+    return std.mem.indexOf(u8, command_surface, "cas review run") != null or
+        std.mem.indexOf(u8, command_surface, "cas review_session run") != null or
+        std.mem.indexOf(u8, command_surface, "cas_review_session run") != null or
+        std.mem.indexOf(u8, command_surface, "review_session run") != null;
 }
 
 fn inferPhase(
@@ -1664,6 +1671,35 @@ test "brokered run output contributes broker summary counters" {
     try std.testing.expectEqual(@as(i64, 1), audit.summary.broker_run_count);
     try std.testing.expectEqual(@as(i64, 1), audit.summary.broker_auto_replaced_dead_transport_count);
     try std.testing.expectEqualStrings("auto_replaced_dead_transport", scalarString(audit.rows.items[0], "review_broker_action").?);
+}
+
+test "public cas review run command counts as broker run without broker action" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "session.jsonl", .data =
+        \\{"type":"session_meta","timestamp":"2026-06-27T01:00:00Z","payload":{"id":"sess-public-run"}}
+        \\{"type":"response_item","timestamp":"2026-06-27T01:00:01Z","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"cas review run --cwd /repo --base main --json\",\"cwd\":\"/repo\"}"}}
+        \\{"type":"response_item","timestamp":"2026-06-27T01:00:02Z","payload":{"type":"function_call_output","call_id":"call-1","output":"{\"demo\":\"cas-review-session\",\"action\":\"run\",\"reviewAttemptPhase\":\"pre_review_start\",\"reviewAttemptExists\":false,\"tupleVerdictExists\":false,\"reviewVerdict\":{\"status\":\"incomplete\",\"backendClass\":\"cas-run\",\"clean\":false,\"findingCount\":0,\"failureCode\":\"missing_codex_binary\",\"baseSha\":\"b\",\"headSha\":\"h\",\"targetFingerprint\":\"t\",\"findings\":[]}}\n"}}
+        \\
+    });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "session.jsonl" });
+    defer std.testing.allocator.free(path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .path = path,
+        .session_id = "sess-public-run",
+        .repo = "/repo",
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), audit.rows.items.len);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.broker_run_count);
+    try std.testing.expect(scalarString(audit.rows.items[0], "review_broker_action") == null);
 }
 
 test "manual recovery command uses output cwd and is counted once when output is receipt-shaped" {
