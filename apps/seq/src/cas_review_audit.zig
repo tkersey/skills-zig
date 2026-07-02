@@ -820,7 +820,9 @@ fn classifyReceiptObject(allocator: std.mem.Allocator, root: std.json.ObjectMap,
     const review_count = intFieldAny(root, &.{ "reviewCount", "review_count" }) orelse 0;
     const last_review_thread_id = nullableStringAny(root, &.{ "lastReviewThreadId", "last_review_thread_id" });
     const last_head_sha = nullableStringAny(root, &.{ "lastHeadSha", "last_head_sha" });
-    const verdict_status_raw = if (verdict) |v| nullableString(v, "status") else reviewVerdictStatusRoot(root) orelse stored_terminal.status;
+    const legacy_timed_out = boolFieldAny(root, &.{ "timedOut", "timed_out" }) orelse false;
+    const legacy_timeout_status: ?[]const u8 = if (legacy_timed_out and review_thread_id != null) "timeout" else null;
+    const verdict_status_raw = if (verdict) |v| nullableString(v, "status") else reviewVerdictStatusRoot(root) orelse stored_terminal.status orelse legacy_timeout_status;
 
     const legacy_pre_review_transport =
         optEql(failure_code_raw, "lane_transport_lost") and
@@ -1541,6 +1543,25 @@ test "lane smoke command pass status is not a review verdict" {
     try std.testing.expect(scalarBool(row, "review_attempt_exists"));
     try std.testing.expect(!scalarBool(row, "tuple_verdict_exists"));
     try std.testing.expectEqual(@as(?[]const u8, null), scalarString(row, "review_verdict_status"));
+}
+
+test "legacy timedOut receipt derives timeout verdict status" {
+    var row = try classifyReceiptText(std.testing.allocator,
+        \\{"reviewThreadId":"thr_waiting","reviewAttemptPhase":"review_waiting","timedOut":true,"baseSha":"b","headSha":"h","targetFingerprint":"t"}
+    , .{
+        .session_id = "sess",
+        .cwd = "/repo",
+        .command_surface = "cas review_session start --wait",
+        .source_path = "/tmp/timeout.json",
+        .default_backend_class = "cas-start-wait",
+    });
+    defer row.deinit();
+
+    try std.testing.expectEqualStrings("timeout", scalarString(row, "review_verdict_status").?);
+    try std.testing.expect(scalarBool(row, "review_attempt_exists"));
+
+    const summary = summarize(&.{row});
+    try std.testing.expectEqual(@as(i64, 1), summary.timeout_with_handle_count);
 }
 
 test "stored terminal session record projects tuple-bound clean review verdict" {
