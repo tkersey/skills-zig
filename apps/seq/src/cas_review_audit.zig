@@ -495,6 +495,7 @@ fn appendRowsFromJsonText(
     defer parsed.deinit();
     const root = object(parsed.value) orelse return;
     if (isCasReviewEvidenceRecord(root)) {
+        if (!isTrustedCasReviewEvidenceRecord(root)) return;
         const row = classifyCasRerObject(allocator, root, ctx) catch return;
         try appendRowIfMatched(allocator, row, dedupe_path, dedupe_id, params, audit, dedupe);
         return;
@@ -582,6 +583,50 @@ fn isAuditableCasReviewEvidenceRecord(root: std.json.ObjectMap) bool {
         nonEmpty(surface) != null and
         nonEmpty(backend_selected) != null and
         nonEmpty(status) != null;
+}
+
+fn fieldPresentNonNull(obj: std.json.ObjectMap, key: []const u8) bool {
+    const value = obj.get(key) orelse return false;
+    return value != .null;
+}
+
+fn terminalCasRerStatus(status: []const u8) bool {
+    return std.mem.eql(u8, status, "clean") or std.mem.eql(u8, status, "findings");
+}
+
+fn terminalCasRerPhase(phase: []const u8) bool {
+    return std.mem.eql(u8, phase, "review_terminal") or std.mem.eql(u8, phase, "normalized_verdict");
+}
+
+fn isTrustedCasReviewEvidenceRecord(root: std.json.ObjectMap) bool {
+    if (!isAuditableCasReviewEvidenceRecord(root)) return false;
+    const tuple = objectField(root, "tuple") orelse return false;
+    const attempt = objectField(root, "attempt") orelse return false;
+    const verdict = objectField(root, "verdict") orelse return false;
+    const failure = objectField(root, "failure") orelse return false;
+    const principal = objectField(root, "principal") orelse return false;
+    if (boolField(principal, "proofUsable") == true and !casRerPrincipalProofUsable(principal)) return false;
+    const status = nullableString(verdict, "status") orelse return false;
+    if (boolField(verdict, "tupleVerdictExists") == true and terminalCasRerStatus(status)) {
+        if (boolField(attempt, "exists") != true) return false;
+        const phase = nullableString(attempt, "phase") orelse return false;
+        if (!terminalCasRerPhase(phase)) return false;
+        const review_thread_id = nullableString(attempt, "reviewThreadId") orelse return false;
+        const review_turn_id = nullableString(attempt, "reviewTurnId") orelse return false;
+        if (nonEmpty(review_thread_id) == null or nonEmpty(review_turn_id) == null) return false;
+        const repo = nullableString(tuple, "repoRealpath") orelse return false;
+        const base = nullableString(tuple, "baseSha") orelse return false;
+        const head = nullableString(tuple, "headSha") orelse return false;
+        const target = nullableString(tuple, "targetFingerprint") orelse return false;
+        if (nonEmpty(repo) == null or nonEmpty(base) == null or nonEmpty(head) == null or nonEmpty(target) == null) return false;
+        if (fieldPresentNonNull(failure, "failureCode") or
+            fieldPresentNonNull(failure, "failureClass") or
+            fieldPresentNonNull(failure, "retryableSameTupleNow"))
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 fn isCasImportEnvelope(root: std.json.ObjectMap) bool {
@@ -696,6 +741,7 @@ fn appendRowsFromCasImportEnvelope(
     for (records, 0..) |record_value, idx| {
         const item = object(record_value) orelse continue;
         if (isCasReviewEvidenceRecord(item)) {
+            if (!isTrustedCasReviewEvidenceRecord(item)) continue;
             const row = try classifyCasRerObject(allocator, item, ctx);
             var fallback_buf: [64]u8 = undefined;
             const record_id = nullableString(item, "recordId") orelse std.fmt.bufPrint(fallback_buf[0..], "cas-rer:{d}", .{idx}) catch "cas-rer";
@@ -2283,6 +2329,28 @@ test "bare CAS-RER JSONL preserves distinct record identities" {
 
     try std.testing.expectEqual(@as(usize, 2), audit.rows.items.len);
     try std.testing.expectEqual(@as(i64, 2), audit.summary.completed_clean_count);
+}
+
+test "bare CAS-RER JSONL rejects invalid terminal evidence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "records.jsonl", .data =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_waiting_clean","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"review_waiting","reviewThreadId":"thr_waiting","reviewTurnId":"turn_waiting"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_failed_clean","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_failed","reviewTurnId":"turn_failed"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":"review_failed","failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+    });
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "records.jsonl" });
+    defer std.testing.allocator.free(path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .receipt_paths = &.{path},
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), audit.rows.items.len);
+    try std.testing.expectEqual(@as(i64, 0), audit.summary.completed_clean_count);
 }
 
 test "repo scope matching is path-boundary safe" {

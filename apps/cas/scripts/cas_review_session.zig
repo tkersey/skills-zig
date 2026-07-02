@@ -1265,8 +1265,11 @@ fn cmdRun(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     try cmdStart(allocator, io, broker_parsed);
 }
 
-fn currentAccountFingerprintAlloc(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs, cwd: []const u8) ![]const u8 {
-    const resolved_codex_path = cas.resolveExecutableAlloc(allocator, "codex") catch return allocator.dupe(u8, unknown_account_fingerprint);
+fn currentAccountPrincipalAlloc(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs, cwd: []const u8) !AccountPrincipalEvidence {
+    const resolved_codex_path = cas.resolveExecutableAlloc(allocator, "codex") catch return .{
+        .fingerprint = try allocator.dupe(u8, unknown_account_fingerprint),
+        .reduced_protection = true,
+    };
     defer allocator.free(resolved_codex_path);
     var client = cas.Client.start(allocator, .{
         .cwd = cwd,
@@ -1277,13 +1280,18 @@ fn currentAccountFingerprintAlloc(allocator: std.mem.Allocator, io: std.Io, pars
         .client_version = Version,
         .read_only = true,
         .hook_policy = parsed.hook_policy,
-    }) catch return allocator.dupe(u8, unknown_account_fingerprint);
+    }) catch return .{
+        .fingerprint = try allocator.dupe(u8, unknown_account_fingerprint),
+        .reduced_protection = true,
+    };
     defer {
         client.close();
         client.deinit();
     }
-    const principal = readAccountPrincipalAlloc(allocator, &client) catch return allocator.dupe(u8, unknown_account_fingerprint);
-    return principal.fingerprint;
+    return readAccountPrincipalAlloc(allocator, &client) catch .{
+        .fingerprint = try allocator.dupe(u8, unknown_account_fingerprint),
+        .reduced_protection = true,
+    };
 }
 
 const ReviewCurrentIdentity = struct {
@@ -1292,6 +1300,7 @@ const ReviewCurrentIdentity = struct {
     resolved_codex_path: []const u8,
     resolved_codex_version: []const u8,
     account_fingerprint: []const u8,
+    account_fingerprint_reduced_protection: bool,
 
     fn deinit(self: ReviewCurrentIdentity, allocator: std.mem.Allocator) void {
         allocator.free(self.cwd);
@@ -1311,14 +1320,15 @@ fn reviewCurrentIdentityAlloc(allocator: std.mem.Allocator, io: std.Io, parsed: 
     errdefer allocator.free(resolved_codex_path);
     const resolved_codex_version = readCodexVersionAlloc(allocator, io, cwd, resolved_codex_path) catch try allocator.dupe(u8, "unknown");
     errdefer allocator.free(resolved_codex_version);
-    const account_fingerprint = try currentAccountFingerprintAlloc(allocator, io, parsed, cwd);
-    errdefer allocator.free(account_fingerprint);
+    const account_principal = try currentAccountPrincipalAlloc(allocator, io, parsed, cwd);
+    errdefer account_principal.deinit(allocator);
     return .{
         .cwd = cwd,
         .identity = identity,
         .resolved_codex_path = resolved_codex_path,
         .resolved_codex_version = resolved_codex_version,
-        .account_fingerprint = account_fingerprint,
+        .account_fingerprint = account_principal.fingerprint,
+        .account_fingerprint_reduced_protection = account_principal.reduced_protection,
     };
 }
 
@@ -1375,7 +1385,7 @@ fn cmdReviewCurrent(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs
         for (records.items) |record| record.deinit(allocator);
         records.deinit(allocator);
     }
-    try appendCasRerLedgerRecordsAlloc(allocator, &records, resolved.cwd, resolved.identity, resolved.resolved_codex_path, resolved.resolved_codex_version, resolved.account_fingerprint);
+    try appendCasRerLedgerRecordsAlloc(allocator, &records, resolved.cwd, resolved.identity, resolved.resolved_codex_path, resolved.resolved_codex_version, resolved.account_fingerprint, resolved.account_fingerprint_reduced_protection);
     std.mem.sort(CasRerLedgerRecord, records.items, {}, casRerRecordLessThan);
 
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
@@ -1393,7 +1403,7 @@ fn cmdReviewList(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
         for (records.items) |record| record.deinit(allocator);
         records.deinit(allocator);
     }
-    try appendCasRerLedgerRecordsAlloc(allocator, &records, resolved.cwd, resolved.identity, resolved.resolved_codex_path, resolved.resolved_codex_version, resolved.account_fingerprint);
+    try appendCasRerLedgerRecordsAlloc(allocator, &records, resolved.cwd, resolved.identity, resolved.resolved_codex_path, resolved.resolved_codex_version, resolved.account_fingerprint, resolved.account_fingerprint_reduced_protection);
     std.mem.sort(CasRerLedgerRecord, records.items, {}, casRerRecordLessThan);
 
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
@@ -2921,6 +2931,7 @@ fn appendImportedCasRerRecordJsonAlloc(
                 identity.resolved_codex_path,
                 identity.resolved_codex_version,
                 identity.account_fingerprint,
+                identity.account_fingerprint_reduced_protection,
             )) {
                 validation.deinit(allocator);
                 validation = try gateResultFromSingleErrorAlloc(
@@ -3769,6 +3780,15 @@ fn validateCasRerRecordObjectAlloc(allocator: std.mem.Allocator, path: []const u
         } else {
             try appendGateError(allocator, &errors, "missing command.brokerDecision", .{});
         }
+    }
+
+    const created_at = jsonStringField(data, "createdAt");
+    if (created_at == null or parseCasRerCreatedAtNs(created_at.?) == null) {
+        try appendGateError(allocator, &errors, "createdAt must be a parseable CAS-RER timestamp", .{});
+    }
+    const updated_at = jsonStringField(data, "updatedAt");
+    if (updated_at == null or parseCasRerCreatedAtNs(updated_at.?) == null) {
+        try appendGateError(allocator, &errors, "updatedAt must be a parseable CAS-RER timestamp", .{});
     }
 
     var attempt_exists_value: ?bool = null;
@@ -6643,6 +6663,7 @@ const CasRerLedgerRecord = struct {
     head_sha: ?[]const u8,
     target_fingerprint: ?[]const u8,
     principal_proof_usable: bool,
+    fresh_attempt_required: bool,
 
     fn deinit(self: CasRerLedgerRecord, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
@@ -6666,7 +6687,9 @@ fn casRerObjectMatchesIdentity(
     resolved_codex_path: []const u8,
     resolved_codex_version: []const u8,
     account_fingerprint: []const u8,
+    account_fingerprint_reduced_protection: bool,
 ) bool {
+    if (account_fingerprint_reduced_protection) return false;
     const tuple = objectField(root, "tuple") orelse return false;
     const record_repo = jsonStringField(tuple, "repoRealpath") orelse return false;
     if (!std.mem.eql(u8, record_repo, repo_realpath)) return false;
@@ -6704,6 +6727,8 @@ fn casRerLedgerRecordFromJsonAlloc(allocator: std.mem.Allocator, path: []const u
     const verdict = objectField(root, "verdict");
     const failure = objectField(root, "failure");
     const principal = objectField(root, "principal");
+    const command = objectField(root, "command");
+    const broker = if (command) |value| objectField(value, "brokerDecision") else null;
     return .{
         .path = try allocator.dupe(u8, path),
         .raw_json = try allocator.dupe(u8, raw),
@@ -6719,6 +6744,7 @@ fn casRerLedgerRecordFromJsonAlloc(allocator: std.mem.Allocator, path: []const u
         .head_sha = if (tuple) |value| try dupOptional(allocator, jsonStringField(value, "headSha")) else null,
         .target_fingerprint = if (tuple) |value| try dupOptional(allocator, jsonStringField(value, "targetFingerprint")) else null,
         .principal_proof_usable = casRerPrincipalProofUsableObject(principal),
+        .fresh_attempt_required = if (broker) |value| jsonBoolField(value, "freshAttemptRequired") orelse false else false,
     };
 }
 
@@ -6730,6 +6756,7 @@ fn appendCasRerLedgerRecordsAlloc(
     resolved_codex_path: ?[]const u8,
     resolved_codex_version: ?[]const u8,
     account_fingerprint: ?[]const u8,
+    account_fingerprint_reduced_protection: ?bool,
 ) !void {
     const records_dir = try reviewLedgerRecordsDirPathAlloc(allocator);
     defer allocator.free(records_dir);
@@ -6747,7 +6774,7 @@ fn appendCasRerLedgerRecordsAlloc(
         defer allocator.free(path);
         const raw = readFileAlloc(allocator, path, 8 * 1024 * 1024) catch continue;
         defer allocator.free(raw);
-        if (repo_realpath != null and identity != null and resolved_codex_path != null and resolved_codex_version != null and account_fingerprint != null) {
+        if (repo_realpath != null and identity != null and resolved_codex_path != null and resolved_codex_version != null and account_fingerprint != null and account_fingerprint_reduced_protection != null) {
             var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch continue;
             defer parsed.deinit();
             const root = switch (parsed.value) {
@@ -6758,7 +6785,7 @@ fn appendCasRerLedgerRecordsAlloc(
             var validation = validateCasRerRecordObjectAlloc(allocator, path, root) catch continue;
             defer validation.deinit(allocator);
             if (!validation.ok()) continue;
-            if (!casRerObjectMatchesIdentity(root, repo_realpath.?, identity.?, resolved_codex_path.?, resolved_codex_version.?, account_fingerprint.?)) continue;
+            if (!casRerObjectMatchesIdentity(root, repo_realpath.?, identity.?, resolved_codex_path.?, resolved_codex_version.?, account_fingerprint.?, account_fingerprint_reduced_protection.?)) continue;
         } else {
             var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch continue;
             defer parsed.deinit();
@@ -6784,6 +6811,10 @@ fn casRerTerminalUsableRank(record: CasRerLedgerRecord) u8 {
         return 1;
     }
     return 0;
+}
+
+fn casRerFreshNonterminal(record: CasRerLedgerRecord) bool {
+    return record.fresh_attempt_required and record.attempt_exists and !record.tuple_verdict_exists;
 }
 
 fn daysFromCivil(year_raw: i64, month_raw: i64, day_raw: i64) i64 {
@@ -6868,11 +6899,12 @@ fn parseCasRerCreatedAtNs(text: []const u8) ?i128 {
 }
 
 fn casRerRecordLessThan(_: void, left: CasRerLedgerRecord, right: CasRerLedgerRecord) bool {
+    const left_ns = parseCasRerCreatedAtNs(left.created_at);
+    const right_ns = parseCasRerCreatedAtNs(right.created_at);
+    if ((casRerFreshNonterminal(left) or casRerFreshNonterminal(right)) and left_ns != null and right_ns != null and left_ns.? != right_ns.?) return left_ns.? < right_ns.?;
     const left_rank = casRerTerminalUsableRank(left);
     const right_rank = casRerTerminalUsableRank(right);
     if (left_rank != right_rank) return left_rank < right_rank;
-    const left_ns = parseCasRerCreatedAtNs(left.created_at);
-    const right_ns = parseCasRerCreatedAtNs(right.created_at);
     if (left_ns != null and right_ns != null and left_ns.? != right_ns.?) return left_ns.? < right_ns.?;
     const created_order = std.mem.order(u8, left.created_at, right.created_at);
     if (created_order != .eq) return created_order == .lt;
@@ -13654,16 +13686,17 @@ test "CAS-RER ledger record projection matches tuple identity" {
         .head_sha = "head",
         .fingerprint = "fp",
     };
-    try std.testing.expect(casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/bin/codex", "codex 0.1.0", "acct:test"));
-    try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/usr/local/bin/codex", "codex 0.1.0", "acct:test"));
-    try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/bin/codex", "codex 0.2.0", "acct:test"));
-    try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/bin/codex", "codex 0.1.0", "acct:other"));
+    try std.testing.expect(casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/bin/codex", "codex 0.1.0", "acct:test", false));
+    try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/bin/codex", "codex 0.1.0", "acct:test", true));
+    try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/usr/local/bin/codex", "codex 0.1.0", "acct:test", false));
+    try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/bin/codex", "codex 0.2.0", "acct:test", false));
+    try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/bin/codex", "codex 0.1.0", "acct:other", false));
     const wrong_identity = TargetIdentity{
         .base_sha = "base",
         .head_sha = "other",
         .fingerprint = "fp",
     };
-    try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", wrong_identity, "/bin/codex", "codex 0.1.0", "acct:test"));
+    try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", wrong_identity, "/bin/codex", "codex 0.1.0", "acct:test", false));
 
     const record = try casRerLedgerRecordFromJsonAlloc(std.testing.allocator, "/tmp/rer_match.json", raw);
     defer record.deinit(std.testing.allocator);
@@ -13698,6 +13731,15 @@ test "CAS-RER ledger record projection matches tuple identity" {
     try std.testing.expectEqual(@as(?i128, 900_000_000), parseCasRerCreatedAtNs("1970-01-01T00:00:00.900Z"));
     try std.testing.expectEqual(@as(?i128, 0), parseCasRerCreatedAtNs("1970-01-01T01:00:00+01:00"));
     try std.testing.expectEqual(@as(?i128, 1_500_000_000), parseCasRerCreatedAtNs("1970-01-01T00:00:01.500+00:00"));
+
+    const fresh_waiting_raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_fresh_waiting","createdAt":"2026-07-02T00:00:10Z","updatedAt":"2026-07-02T00:00:10Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"fresh retry","freshAttemptRequired":true}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:fresh","phase":"review_waiting","reviewThreadId":"thr_fresh","reviewTurnId":"turn_fresh"},"verdict":{"tupleVerdictExists":false,"status":"incomplete","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":true},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-run"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
+    ;
+    const fresh_waiting_record = try casRerLedgerRecordFromJsonAlloc(std.testing.allocator, "/tmp/rer_fresh_waiting.json", fresh_waiting_raw);
+    defer fresh_waiting_record.deinit(std.testing.allocator);
+    const fresh_records = [_]CasRerLedgerRecord{ record, fresh_waiting_record };
+    try std.testing.expectEqual(@as(?usize, 1), latestCasRerLedgerRecordIndex(&fresh_records));
+    try std.testing.expectEqualStrings("wait", actionRequiredForCasRerRecord(fresh_waiting_record));
 
     const timeout_raw =
         \\{"schema":"CAS-RER-v1","recordId":"rer_timeout","createdAt":"2026-07-02T00:00:02Z","updatedAt":"2026-07-02T00:00:02Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:c","phase":"review_waiting","reviewThreadId":"thr_timeout","reviewTurnId":"turn_timeout"},"verdict":{"tupleVerdictExists":false,"status":"timeout","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":"wait_timed_out","failureClass":"timeout","retryableSameTupleNow":true},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-start-wait"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
@@ -13964,6 +14006,18 @@ test "CAS-RER validator rejects terminal tuple verdict with waiting phase" {
     try std.testing.expect(!gate.ok());
     try std.testing.expect(gate.errors.len >= 1);
     try std.testing.expect(gateErrorsContain(gate, "terminal attempt.phase"));
+}
+
+test "CAS-RER validator rejects unparseable timestamps" {
+    const raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_bad_timestamp","createdAt":"zzzz","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"import","backendSelected":"imported-legacy","brokerDecision":{"action":"imported_legacy","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "bad-timestamp-rer.json", parsed.value.object);
+    defer gate.deinit(std.testing.allocator);
+    try std.testing.expect(!gate.ok());
+    try std.testing.expect(gateErrorsContain(gate, "createdAt"));
 }
 
 test "CAS-RER validator rejects verdict clean/status disagreement" {
@@ -14403,8 +14457,8 @@ test "review import extracts nested CAS-RER records from envelopes" {
         .head_sha = "head",
         .fingerprint = "fp",
     };
-    try std.testing.expect(casRerObjectMatchesIdentity(nested.value.object, "/tmp/repo", requested_identity, "/bin/codex", "codex 0.1.0", "acct:test"));
-    try std.testing.expect(!casRerObjectMatchesIdentity(nested.value.object, "/tmp/repo", requested_identity, "/bin/codex", "codex 0.1.0", "acct:other"));
+    try std.testing.expect(casRerObjectMatchesIdentity(nested.value.object, "/tmp/repo", requested_identity, "/bin/codex", "codex 0.1.0", "acct:test", false));
+    try std.testing.expect(!casRerObjectMatchesIdentity(nested.value.object, "/tmp/repo", requested_identity, "/bin/codex", "codex 0.1.0", "acct:other", false));
 
     const import_envelope = try std.fmt.allocPrint(std.testing.allocator,
         \\{{"schema":"CAS-IMPORT-v1","records":[{{"sourcePath":"/tmp/receipt.json","validation":{{"ok":false,"errors":["bad"],"path":"/tmp/receipt.json"}},"record":{s}}},{{"sourcePath":"/tmp/receipt.json","validation":{{"ok":true,"errors":[],"path":"/tmp/receipt.json"}},"record":{s}}},{s}],"errors":[]}}
