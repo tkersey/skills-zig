@@ -6287,7 +6287,7 @@ fn actionRequiredForCasRerRecord(record: CasRerLedgerRecord) []const u8 {
         return "none";
     }
     if (std.mem.eql(u8, record.status, "timeout")) return "inspect";
-    if (std.mem.eql(u8, record.status, "transport_failure")) return "run_new_attempt";
+    if (std.mem.eql(u8, record.status, "transport_failure")) return if (record.attempt_exists) "wait" else "run_new_attempt";
     if (record.attempt_exists and !record.tuple_verdict_exists) {
         if (std.mem.eql(u8, record.phase, "review_waiting") or std.mem.eql(u8, record.phase, "review_started")) return "wait";
         if (record.phase.len == 0 and record.failure_code == null) return "wait";
@@ -12812,8 +12812,16 @@ test "CAS-RER ledger record projection matches tuple identity" {
     try std.testing.expect(!active_record.tuple_verdict_exists);
     try std.testing.expectEqualStrings("wait", actionRequiredForCasRerRecord(active_record));
 
+    const active_transport_raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_active_transport","createdAt":"2026-07-02T00:00:04Z","updatedAt":"2026-07-02T00:00:04Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:e","phase":"review_waiting","reviewThreadId":"thr_transport","reviewTurnId":"turn_transport"},"verdict":{"tupleVerdictExists":false,"status":"transport_failure","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":"review_transport_lost","failureClass":"transport","retryableSameTupleNow":true},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-start-wait"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
+    ;
+    const active_transport_record = try casRerLedgerRecordFromJsonAlloc(std.testing.allocator, "/tmp/rer_active_transport.json", active_transport_raw);
+    defer active_transport_record.deinit(std.testing.allocator);
+    try std.testing.expect(active_transport_record.attempt_exists);
+    try std.testing.expectEqualStrings("wait", actionRequiredForCasRerRecord(active_transport_record));
+
     const terminal_incomplete_raw =
-        \\{"schema":"CAS-RER-v1","recordId":"rer_terminal_incomplete","createdAt":"2026-07-02T00:00:04Z","updatedAt":"2026-07-02T00:00:04Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:e","phase":"review_terminal","reviewThreadId":"thr_terminal","reviewTurnId":"turn_terminal"},"verdict":{"tupleVerdictExists":false,"status":"incomplete","clean":false,"findingCount":1,"findings":[{"title":"tuple mismatch"}]},"failure":{"failureCode":"tuple_mismatch","failureClass":"caller_error","retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-start-wait"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_terminal_incomplete","createdAt":"2026-07-02T00:00:05Z","updatedAt":"2026-07-02T00:00:05Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:f","phase":"review_terminal","reviewThreadId":"thr_terminal","reviewTurnId":"turn_terminal"},"verdict":{"tupleVerdictExists":false,"status":"incomplete","clean":false,"findingCount":1,"findings":[{"title":"tuple mismatch"}]},"failure":{"failureCode":"tuple_mismatch","failureClass":"caller_error","retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-start-wait"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
     ;
     const terminal_incomplete_record = try casRerLedgerRecordFromJsonAlloc(std.testing.allocator, "/tmp/rer_terminal_incomplete.json", terminal_incomplete_raw);
     defer terminal_incomplete_record.deinit(std.testing.allocator);

@@ -822,8 +822,9 @@ fn classifyCasRerObject(allocator: std.mem.Allocator, root: std.json.ObjectMap, 
     const principal_fallback_used = if (principal) |value| boolField(value, "fallbackUsed") orelse false else false;
     const terminal_status = optEql(raw_status, "clean") or optEql(raw_status, "findings");
     const principal_unusable_terminal = raw_tuple_verdict_exists and terminal_status and !principal_proof_usable;
+    const unbound_terminal_status = !raw_tuple_verdict_exists and terminal_status;
     const tuple_verdict_exists = raw_tuple_verdict_exists and !principal_unusable_terminal;
-    const status = if (principal_unusable_terminal) "review_untrusted_source" else raw_status;
+    const status = if (principal_unusable_terminal) "review_untrusted_source" else if (unbound_terminal_status) "incomplete" else raw_status;
     const record_path = if (attempt) |value| nullableString(value, "recordPath") else null;
     const event_log_path =
         (if (attempt) |value| nullableString(value, "eventLogPath") else null) orelse
@@ -1731,6 +1732,28 @@ test "CAS-RER unusable principal is not counted as completed evidence" {
     try std.testing.expect(!scalarBool(row, "tuple_verdict_exists"));
     try std.testing.expect(!scalarBool(row, "principal_proof_usable"));
     try std.testing.expect(scalarBool(row, "principal_reduced"));
+
+    const summary = summarize(&.{row});
+    try std.testing.expectEqual(@as(i64, 0), summary.completed_clean_count);
+    try std.testing.expectEqual(@as(i64, 0), summary.completed_findings_count);
+}
+
+test "CAS-RER unbound terminal status is not counted as completed evidence" {
+    var row = try classifyReceiptText(std.testing.allocator,
+        \\{"schema":"CAS-RER-v1","recordId":"rer_unbound_findings","createdAt":"2026-07-02T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":null,"targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_unbound","reviewTurnId":"turn_unbound"},"verdict":{"tupleVerdictExists":false,"status":"findings","clean":false,"findingCount":1,"findings":[{"title":"unbound"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+    , .{
+        .session_id = "",
+        .cwd = null,
+        .command_surface = "receipt",
+        .source_path = "/tmp/rer-unbound.json",
+        .default_backend_class = "cas-receipt-normalized",
+    });
+    defer row.deinit();
+
+    try std.testing.expectEqualStrings("incomplete", scalarString(row, "canonical_status").?);
+    try std.testing.expectEqualStrings("incomplete", scalarString(row, "review_verdict_status").?);
+    try std.testing.expect(!scalarBool(row, "tuple_verdict_exists"));
+    try std.testing.expectEqual(@as(i64, 1), scalarInt(row, "finding_count"));
 
     const summary = summarize(&.{row});
     try std.testing.expectEqual(@as(i64, 0), summary.completed_clean_count);
