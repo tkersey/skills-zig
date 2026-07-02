@@ -6532,7 +6532,9 @@ fn casRerVolatileTimestampField(key: []const u8) bool {
 
 fn casRerStableCompareIgnoredField(key: []const u8) bool {
     return casRerVolatileTimestampField(key) or
+        std.mem.eql(u8, key, "recordPath") or
         std.mem.eql(u8, key, "sourcePath") or
+        std.mem.eql(u8, key, "rawSessionRecord") or
         std.mem.eql(u8, key, "rawReceipt");
 }
 
@@ -6619,10 +6621,18 @@ fn casRerStableContentMatchesAlloc(allocator: std.mem.Allocator, raw: []const u8
 
 fn writeRawJsonFileExclusiveOrIdenticalAlloc(allocator: std.mem.Allocator, path: []const u8, json: []const u8) !void {
     try ensureParentPath(path);
-    var file = std.Io.Dir.createFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{
-        .truncate = false,
-        .exclusive = true,
-    }) catch |err| switch (err) {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const parent = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    const basename = std.fs.path.basename(path);
+    var dir = try std.Io.Dir.openDirAbsolute(io, parent, .{});
+    defer dir.close(io);
+    var atomic_file = try dir.createFileAtomic(io, basename, .{ .replace = false });
+    defer atomic_file.deinit(io);
+    var writer = atomic_file.file.writer(io, &.{});
+    try writer.interface.writeAll(json);
+    try writer.interface.writeAll("\n");
+    try writer.interface.flush();
+    atomic_file.link(io) catch |err| switch (err) {
         error.PathAlreadyExists => {
             const existing = try readFileAlloc(allocator, path, 8 * 1024 * 1024);
             defer allocator.free(existing);
@@ -6632,9 +6642,6 @@ fn writeRawJsonFileExclusiveOrIdenticalAlloc(allocator: std.mem.Allocator, path:
         },
         else => return err,
     };
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
-    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), json);
-    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), "\n");
 }
 
 fn writeCasRerRecordJsonToLedgerAlloc(allocator: std.mem.Allocator, record_json: []const u8) ![]const u8 {
@@ -14243,8 +14250,8 @@ test "CAS-RER ledger write accepts stable content with regenerated timestamps" {
     const path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "rer_same.json" });
     defer std.testing.allocator.free(path);
 
-    try writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"schema\":\"CAS-RER-v1\",\"recordId\":\"rer_same\",\"createdAt\":\"2026-07-02T00:00:00Z\",\"updatedAt\":\"2026-07-02T00:00:00Z\",\"attachments\":{\"rawReceipt\":\"/tmp/original.json\"},\"legacy\":{\"sourcePath\":\"/tmp/original.json\"},\"value\":1}");
-    try writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"schema\":\"CAS-RER-v1\",\"recordId\":\"rer_same\",\"createdAt\":\"2026-07-02T00:00:01Z\",\"updatedAt\":\"2026-07-02T00:00:01Z\",\"attachments\":{\"rawReceipt\":\"/tmp/copy.json\"},\"legacy\":{\"sourcePath\":\"/tmp/copy.json\"},\"value\":1}");
+    try writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"schema\":\"CAS-RER-v1\",\"recordId\":\"rer_same\",\"createdAt\":\"2026-07-02T00:00:00Z\",\"updatedAt\":\"2026-07-02T00:00:00Z\",\"attempt\":{\"recordPath\":\"/tmp/original-session.json\"},\"attachments\":{\"rawSessionRecord\":\"/tmp/original-session.json\",\"rawReceipt\":\"/tmp/original.json\"},\"legacy\":{\"sourcePath\":\"/tmp/original.json\"},\"value\":1}");
+    try writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"schema\":\"CAS-RER-v1\",\"recordId\":\"rer_same\",\"createdAt\":\"2026-07-02T00:00:01Z\",\"updatedAt\":\"2026-07-02T00:00:01Z\",\"attempt\":{\"recordPath\":\"/tmp/archive/copy-session.json\"},\"attachments\":{\"rawSessionRecord\":\"/tmp/archive/copy-session.json\",\"rawReceipt\":\"/tmp/copy.json\"},\"legacy\":{\"sourcePath\":\"/tmp/copy.json\"},\"value\":1}");
     try std.testing.expectError(error.CasRerRecordIdCollision, writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"schema\":\"CAS-RER-v1\",\"recordId\":\"rer_same\",\"createdAt\":\"2026-07-02T00:00:02Z\",\"updatedAt\":\"2026-07-02T00:00:02Z\",\"value\":2}"));
 }
 
