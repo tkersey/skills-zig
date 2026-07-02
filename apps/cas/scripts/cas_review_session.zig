@@ -2176,6 +2176,13 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
             );
         }
         if (isTransportLossError(err) and parsed.json) {
+            updateReviewTupleLockByReviewThreadIdBestEffort(
+                allocator,
+                record,
+                loaded.record_path,
+                "waiting",
+                "review_transport_lost",
+            );
             try printDisconnectedReviewTransportJson(
                 allocator,
                 .wait,
@@ -2273,6 +2280,15 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
                 );
             }
             if (isTransportLossError(err) and parsed.json) {
+                updateReviewTupleLockForRecordBestEffort(
+                    allocator,
+                    record,
+                    loaded.record_path,
+                    identity_opt,
+                    &client,
+                    "waiting",
+                    "review_transport_lost",
+                );
                 try printDisconnectedReviewTransportJson(
                     allocator,
                     .wait,
