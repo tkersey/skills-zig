@@ -11,10 +11,18 @@ pub const projection_fields = [_][]const u8{
     "session_id",
     "source_path",
     "receipt_path",
+    "record_id",
+    "canonical_source",
+    "canonical_status",
+    "parent_visible_status",
     "cwd",
     "command_surface",
     "surface",
     "backend_class",
+    "principal_kind",
+    "principal_proof_usable",
+    "principal_reduced",
+    "principal_fallback_used",
     "review_attempt_phase",
     "review_attempt_exists",
     "tuple_verdict_exists",
@@ -486,6 +494,32 @@ fn appendRowsFromJsonText(
     };
     defer parsed.deinit();
     const root = object(parsed.value) orelse return;
+    if (isCasReviewEvidenceRecord(root)) {
+        if (!isTrustedCasReviewEvidenceRecord(root)) return;
+        const row = classifyCasRerObject(allocator, root, ctx) catch return;
+        try appendRowIfMatched(allocator, row, dedupe_path, dedupe_id, params, audit, dedupe);
+        return;
+    }
+    if (isCasRunEnvelope(root)) {
+        try appendRowsFromCasRunEnvelope(allocator, root, ctx, dedupe_path, dedupe_id, params, audit, dedupe);
+        return;
+    }
+    if (isCasCurrentEnvelope(root)) {
+        try appendRowsFromCasCurrentEnvelope(allocator, root, ctx, dedupe_path, dedupe_id, params, audit, dedupe);
+        return;
+    }
+    if (isCasListEnvelope(root)) {
+        try appendRowsFromCasListEnvelope(allocator, root, ctx, dedupe_path, dedupe_id, params, audit, dedupe);
+        return;
+    }
+    if (isCasImportEnvelope(root)) {
+        try appendRowsFromCasImportEnvelope(allocator, root, ctx, dedupe_path, dedupe_id, params, audit, dedupe);
+        return;
+    }
+    if (isCasImportRecordWrapper(root)) {
+        try appendRowFromCasImportRecordWrapper(allocator, root, ctx, dedupe_path, dedupe_id, params, audit, dedupe);
+        return;
+    }
     if (isSmokeArtifactObject(root)) {
         try appendSmokeArtifactRows(allocator, root, ctx, dedupe_path, dedupe_id, params, audit, dedupe);
         return;
@@ -520,6 +554,245 @@ fn appendRowIfMatched(
 fn isSmokeArtifactObject(root: std.json.ObjectMap) bool {
     return optEql(nullableString(root, "suiteVersion"), "CAS-RSS-v1") or
         optEql(nullableString(root, "promotionVersion"), "CAS-RSP-v1");
+}
+
+fn isCasReviewEvidenceRecord(root: std.json.ObjectMap) bool {
+    return optEql(nullableString(root, "schema"), "CAS-RER-v1");
+}
+
+fn isCompleteCasReviewEvidenceRecord(root: std.json.ObjectMap) bool {
+    return isCasReviewEvidenceRecord(root) and
+        nullableString(root, "recordId") != null and
+        objectField(root, "command") != null and
+        objectField(root, "tuple") != null and
+        objectField(root, "attempt") != null and
+        objectField(root, "verdict") != null and
+        objectField(root, "failure") != null and
+        objectField(root, "principal") != null;
+}
+
+fn isAuditableCasReviewEvidenceRecord(root: std.json.ObjectMap) bool {
+    if (!isCompleteCasReviewEvidenceRecord(root)) return false;
+    const command = objectField(root, "command") orelse return false;
+    const verdict = objectField(root, "verdict") orelse return false;
+    const record_id = nullableString(root, "recordId") orelse return false;
+    const surface = nullableString(command, "surface") orelse return false;
+    const backend_selected = nullableString(command, "backendSelected") orelse return false;
+    const status = nullableString(verdict, "status") orelse return false;
+    return nonEmpty(record_id) != null and
+        nonEmpty(surface) != null and
+        nonEmpty(backend_selected) != null and
+        nonEmpty(status) != null;
+}
+
+fn fieldPresentNonNull(obj: std.json.ObjectMap, key: []const u8) bool {
+    const value = obj.get(key) orelse return false;
+    return value != .null;
+}
+
+fn terminalCasRerStatus(status: []const u8) bool {
+    return std.mem.eql(u8, status, "clean") or std.mem.eql(u8, status, "findings");
+}
+
+fn terminalCasRerPhase(phase: []const u8) bool {
+    return std.mem.eql(u8, phase, "review_terminal") or std.mem.eql(u8, phase, "normalized_verdict");
+}
+
+fn terminalCasRerVerdictConsistent(verdict: std.json.ObjectMap, status: []const u8) bool {
+    const clean = boolField(verdict, "clean") orelse return false;
+    const finding_count = intField(verdict, "findingCount") orelse return false;
+    const findings_len = switch (verdict.get("findings") orelse return false) {
+        .array => |array| array.items.len,
+        else => return false,
+    };
+    if (std.mem.eql(u8, status, "clean")) return clean and finding_count == 0 and findings_len == 0;
+    if (std.mem.eql(u8, status, "findings")) return !clean and finding_count > 0 and findings_len == @as(usize, @intCast(finding_count));
+    return true;
+}
+
+fn isTrustedCasReviewEvidenceRecord(root: std.json.ObjectMap) bool {
+    if (!isAuditableCasReviewEvidenceRecord(root)) return false;
+    const tuple = objectField(root, "tuple") orelse return false;
+    const attempt = objectField(root, "attempt") orelse return false;
+    const verdict = objectField(root, "verdict") orelse return false;
+    const failure = objectField(root, "failure") orelse return false;
+    const principal = objectField(root, "principal") orelse return false;
+    if (boolField(principal, "proofUsable") == true and !casRerPrincipalProofUsable(principal)) return false;
+    const status = nullableString(verdict, "status") orelse return false;
+    if (boolField(verdict, "tupleVerdictExists") == true and terminalCasRerStatus(status)) {
+        if (!terminalCasRerVerdictConsistent(verdict, status)) return false;
+        if (boolField(attempt, "exists") != true) return false;
+        const phase = nullableString(attempt, "phase") orelse return false;
+        if (!terminalCasRerPhase(phase)) return false;
+        const review_thread_id = nullableString(attempt, "reviewThreadId") orelse return false;
+        const review_turn_id = nullableString(attempt, "reviewTurnId") orelse return false;
+        if (nonEmpty(review_thread_id) == null or nonEmpty(review_turn_id) == null) return false;
+        const repo = nullableString(tuple, "repoRealpath") orelse return false;
+        const base = nullableString(tuple, "baseSha") orelse return false;
+        const head = nullableString(tuple, "headSha") orelse return false;
+        const target = nullableString(tuple, "targetFingerprint") orelse return false;
+        if (nonEmpty(repo) == null or nonEmpty(base) == null or nonEmpty(head) == null or nonEmpty(target) == null) return false;
+        if (fieldPresentNonNull(failure, "failureCode") or
+            fieldPresentNonNull(failure, "failureClass") or
+            fieldPresentNonNull(failure, "retryableSameTupleNow"))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn isCasImportEnvelope(root: std.json.ObjectMap) bool {
+    return optEql(nullableString(root, "schema"), "CAS-IMPORT-v1");
+}
+
+fn isCasImportRecordWrapper(root: std.json.ObjectMap) bool {
+    const validation = objectField(root, "validation") orelse return false;
+    if (boolField(validation, "ok") != true) return false;
+    const record = objectField(root, "record") orelse return false;
+    return isTrustedCasReviewEvidenceRecord(record);
+}
+
+fn isCasRunEnvelope(root: std.json.ObjectMap) bool {
+    return optEql(nullableString(root, "schema"), "CAS-RUN-v1");
+}
+
+fn isCasCurrentEnvelope(root: std.json.ObjectMap) bool {
+    return optEql(nullableString(root, "schema"), "CAS-CURRENT-v1");
+}
+
+fn isCasListEnvelope(root: std.json.ObjectMap) bool {
+    return optEql(nullableString(root, "schema"), "CAS-LIST-v1");
+}
+
+fn appendRowsFromCasRunEnvelope(
+    allocator: std.mem.Allocator,
+    root: std.json.ObjectMap,
+    ctx: ClassifyContext,
+    dedupe_path: []const u8,
+    dedupe_id: []const u8,
+    params: Params,
+    audit: *Audit,
+    dedupe: *std.StringHashMap(void),
+) !void {
+    if (objectField(root, "record")) |record| {
+        if (isTrustedCasReviewEvidenceRecord(record)) {
+            const row = try classifyCasRerObject(allocator, record, ctx);
+            const record_id = nullableString(record, "recordId") orelse "cas-run-rer";
+            const key = try std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ dedupe_path, dedupe_id, record_id });
+            defer allocator.free(key);
+            try appendRowIfMatched(allocator, row, key, key, params, audit, dedupe);
+            return;
+        }
+    }
+    if (!looksLikeReceiptObject(root)) return;
+    const row = classifyReceiptObject(allocator, root, ctx) catch return;
+    try appendRowIfMatched(allocator, row, dedupe_path, dedupe_id, params, audit, dedupe);
+}
+
+fn appendRowsFromCasCurrentEnvelope(
+    allocator: std.mem.Allocator,
+    root: std.json.ObjectMap,
+    ctx: ClassifyContext,
+    dedupe_path: []const u8,
+    dedupe_id: []const u8,
+    params: Params,
+    audit: *Audit,
+    dedupe: *std.StringHashMap(void),
+) !void {
+    const record = objectField(root, "record") orelse return;
+    if (!isTrustedCasReviewEvidenceRecord(record)) return;
+    const row = try classifyCasRerObject(allocator, record, ctx);
+    const record_id = nullableString(record, "recordId") orelse "cas-current-rer";
+    const key = try std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ dedupe_path, dedupe_id, record_id });
+    defer allocator.free(key);
+    try appendRowIfMatched(allocator, row, key, key, params, audit, dedupe);
+}
+
+fn appendRowsFromCasListEnvelope(
+    allocator: std.mem.Allocator,
+    root: std.json.ObjectMap,
+    ctx: ClassifyContext,
+    dedupe_path: []const u8,
+    dedupe_id: []const u8,
+    params: Params,
+    audit: *Audit,
+    dedupe: *std.StringHashMap(void),
+) !void {
+    const records_value = root.get("records") orelse return;
+    const records = switch (records_value) {
+        .array => |array| array.items,
+        else => return,
+    };
+    for (records, 0..) |record_value, idx| {
+        const record = object(record_value) orelse continue;
+        if (!isTrustedCasReviewEvidenceRecord(record)) continue;
+        const row = try classifyCasRerObject(allocator, record, ctx);
+        var fallback_buf: [64]u8 = undefined;
+        const record_id = nullableString(record, "recordId") orelse std.fmt.bufPrint(fallback_buf[0..], "cas-list-rer:{d}", .{idx}) catch "cas-list-rer";
+        const key = try std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ dedupe_path, dedupe_id, record_id });
+        defer allocator.free(key);
+        try appendRowIfMatched(allocator, row, key, key, params, audit, dedupe);
+    }
+}
+
+fn appendRowsFromCasImportEnvelope(
+    allocator: std.mem.Allocator,
+    root: std.json.ObjectMap,
+    ctx: ClassifyContext,
+    dedupe_path: []const u8,
+    dedupe_id: []const u8,
+    params: Params,
+    audit: *Audit,
+    dedupe: *std.StringHashMap(void),
+) !void {
+    const records_value = root.get("records") orelse return;
+    const records = switch (records_value) {
+        .array => |array| array.items,
+        else => return,
+    };
+    for (records, 0..) |record_value, idx| {
+        const item = object(record_value) orelse continue;
+        if (isCasReviewEvidenceRecord(item)) {
+            if (!isTrustedCasReviewEvidenceRecord(item)) continue;
+            const row = try classifyCasRerObject(allocator, item, ctx);
+            var fallback_buf: [64]u8 = undefined;
+            const record_id = nullableString(item, "recordId") orelse std.fmt.bufPrint(fallback_buf[0..], "cas-rer:{d}", .{idx}) catch "cas-rer";
+            const key = try std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ dedupe_path, dedupe_id, record_id });
+            defer allocator.free(key);
+            try appendRowIfMatched(allocator, row, key, key, params, audit, dedupe);
+            continue;
+        }
+        const validation = objectField(item, "validation") orelse continue;
+        if (boolField(validation, "ok") != true) continue;
+        const record = objectField(item, "record") orelse continue;
+        if (!isTrustedCasReviewEvidenceRecord(record)) continue;
+        const row = try classifyCasRerObject(allocator, record, ctx);
+        var fallback_buf: [64]u8 = undefined;
+        const record_id = nullableString(record, "recordId") orelse std.fmt.bufPrint(fallback_buf[0..], "cas-rer:{d}", .{idx}) catch "cas-rer";
+        const key = try std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ dedupe_path, dedupe_id, record_id });
+        defer allocator.free(key);
+        try appendRowIfMatched(allocator, row, key, key, params, audit, dedupe);
+    }
+}
+
+fn appendRowFromCasImportRecordWrapper(
+    allocator: std.mem.Allocator,
+    root: std.json.ObjectMap,
+    ctx: ClassifyContext,
+    dedupe_path: []const u8,
+    dedupe_id: []const u8,
+    params: Params,
+    audit: *Audit,
+    dedupe: *std.StringHashMap(void),
+) !void {
+    const record = objectField(root, "record") orelse return;
+    if (!isTrustedCasReviewEvidenceRecord(record)) return;
+    const row = try classifyCasRerObject(allocator, record, ctx);
+    const record_id = nullableString(record, "recordId") orelse "cas-rer-wrapper";
+    const key = try std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ dedupe_path, dedupe_id, record_id });
+    defer allocator.free(key);
+    try appendRowIfMatched(allocator, row, key, key, params, audit, dedupe);
 }
 
 fn appendSmokeArtifactRows(
@@ -625,6 +898,7 @@ fn classifyReceiptText(allocator: std.mem.Allocator, text: []const u8, ctx: Clas
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
     defer parsed.deinit();
     const root = object(parsed.value) orelse return error.InvalidReceipt;
+    if (isCasReviewEvidenceRecord(root)) return classifyCasRerObject(allocator, root, ctx);
     if (!looksLikeReceiptObject(root)) return error.InvalidReceipt;
     return classifyReceiptObject(allocator, root, ctx);
 }
@@ -645,7 +919,9 @@ fn classifyReceiptObject(allocator: std.mem.Allocator, root: std.json.ObjectMap,
     const review_count = intFieldAny(root, &.{ "reviewCount", "review_count" }) orelse 0;
     const last_review_thread_id = nullableStringAny(root, &.{ "lastReviewThreadId", "last_review_thread_id" });
     const last_head_sha = nullableStringAny(root, &.{ "lastHeadSha", "last_head_sha" });
-    const verdict_status_raw = if (verdict) |v| nullableString(v, "status") else reviewVerdictStatusRoot(root) orelse stored_terminal.status;
+    const legacy_timed_out = boolFieldAny(root, &.{ "timedOut", "timed_out" }) orelse false;
+    const legacy_timeout_status: ?[]const u8 = if (legacy_timed_out and review_thread_id != null) "timeout" else null;
+    const verdict_status_raw = if (verdict) |v| nullableString(v, "status") else reviewVerdictStatusRoot(root) orelse stored_terminal.status orelse legacy_timeout_status;
 
     const legacy_pre_review_transport =
         optEql(failure_code_raw, "lane_transport_lost") and
@@ -704,6 +980,99 @@ fn classifyReceiptObject(allocator: std.mem.Allocator, root: std.json.ObjectMap,
     return row;
 }
 
+fn classifyCasRerObject(allocator: std.mem.Allocator, root: std.json.ObjectMap, ctx: ClassifyContext) !query.Row {
+    const command = objectField(root, "command");
+    const broker = if (command) |cmd| objectField(cmd, "brokerDecision") else null;
+    const tuple = objectField(root, "tuple");
+    const attempt = objectField(root, "attempt");
+    const verdict = objectField(root, "verdict");
+    const failure = objectField(root, "failure");
+    const principal = objectField(root, "principal");
+    const attachments = objectField(root, "attachments");
+
+    const record_id = nullableString(root, "recordId");
+    const raw_status = if (verdict) |value| nullableString(value, "status") else null;
+    const backend_class = casRerBackendClass(command, ctx.default_backend_class);
+    const command_surface = if (command) |cmd| nullableString(cmd, "surface") orelse ctx.command_surface else ctx.command_surface;
+    const raw_broker_action = if (broker) |value| nullableString(value, "action") else null;
+    const raw_broker_reason = if (broker) |value| nullableString(value, "reason") else null;
+    const broker_action = if (optEql(command_surface, "run")) raw_broker_action else null;
+    const broker_reason = if (broker_action != null) raw_broker_reason else null;
+    const failure_code = if (failure) |value| nullableString(value, "failureCode") else null;
+    const failure_class = (if (failure) |value| nullableString(value, "failureClass") else null) orelse failureClassForCode(failure_code);
+    const review_thread_id = if (attempt) |value| nullableString(value, "reviewThreadId") else null;
+    const review_turn_id = if (attempt) |value| nullableString(value, "reviewTurnId") else null;
+    const phase = if (attempt) |value| nullableString(value, "phase") else null;
+    const attempt_exists = if (attempt) |value| boolField(value, "exists") orelse (review_thread_id != null) else false;
+    const raw_tuple_verdict_exists = if (verdict) |value| boolField(value, "tupleVerdictExists") orelse false else false;
+    const finding_count = if (verdict) |value| intField(value, "findingCount") orelse 0 else 0;
+    const principal_kind = if (principal) |value| nullableString(value, "kind") else null;
+    const principal_proof_usable = casRerPrincipalProofUsable(principal);
+    const principal_reduced = if (principal) |value| boolField(value, "reduced") orelse optEql(principal_kind, "reduced") else false;
+    const principal_fallback_used = if (principal) |value| boolField(value, "fallbackUsed") orelse false else false;
+    const terminal_status = optEql(raw_status, "clean") or optEql(raw_status, "findings");
+    const principal_unusable_terminal = raw_tuple_verdict_exists and terminal_status and !principal_proof_usable;
+    const unbound_terminal_status = !raw_tuple_verdict_exists and terminal_status;
+    const tuple_verdict_exists = raw_tuple_verdict_exists and !principal_unusable_terminal;
+    const status = if (principal_unusable_terminal) "review_untrusted_source" else if (unbound_terminal_status) "incomplete" else raw_status;
+    const record_path = if (attempt) |value| nullableString(value, "recordPath") else null;
+    const event_log_path =
+        (if (attempt) |value| nullableString(value, "eventLogPath") else null) orelse
+        (if (attachments) |value| nullableString(value, "eventLog") else null);
+
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    try putStringOrNull(&row, "session_id", nonEmpty(ctx.session_id));
+    try row.putStaticKey("source_path", .{ .string = ctx.source_path });
+    try putStringOrNull(&row, "receipt_path", ctx.source_path);
+    try putStringOrNull(&row, "record_id", record_id);
+    try row.putStaticKey("canonical_source", .{ .string = "cas_review_evidence_ledger" });
+    try putStringOrNull(&row, "canonical_status", status);
+    try putStringOrNull(&row, "parent_visible_status", null);
+    try putStringOrNull(&row, "cwd", if (tuple) |value| nullableString(value, "repoRealpath") else ctx.cwd);
+    try row.putStaticKey("command_surface", .{ .string = command_surface });
+    try row.putStaticKey("surface", .{ .string = "cas_review_evidence_record" });
+    try row.putStaticKey("backend_class", .{ .string = backend_class });
+    try putStringOrNull(&row, "principal_kind", principal_kind);
+    try row.putStaticKey("principal_proof_usable", .{ .bool = principal_proof_usable });
+    try row.putStaticKey("principal_reduced", .{ .bool = principal_reduced });
+    try row.putStaticKey("principal_fallback_used", .{ .bool = principal_fallback_used });
+    try row.putStaticKey("review_attempt_phase", .{ .string = phase orelse "pre_lane_start" });
+    try row.putStaticKey("review_attempt_exists", .{ .bool = attempt_exists });
+    try row.putStaticKey("tuple_verdict_exists", .{ .bool = tuple_verdict_exists });
+    try putStringOrNull(&row, "failure_code", failure_code);
+    try putStringOrNull(&row, "failure_class", failure_class);
+    try putBoolOrNull(&row, "retryable_same_tuple_now", if (failure) |value| boolField(value, "retryableSameTupleNow") else null);
+    try putStringOrNull(&row, "lane_id", null);
+    try putIntOrNull(&row, "managed_server_pid", null);
+    try putStringOrNull(&row, "managed_server_listen_url", null);
+    try putStringOrNull(&row, "server_exit_status", null);
+    try putStringOrNull(&row, "stderr_log_path", if (attachments) |value| nullableString(value, "stderr") else null);
+    try row.putStaticKey("review_count", .{ .int = 0 });
+    try putStringOrNull(&row, "last_review_thread_id", null);
+    try putStringOrNull(&row, "review_thread_id", review_thread_id);
+    try putStringOrNull(&row, "review_turn_id", review_turn_id);
+    try putStringOrNull(&row, "base_sha", if (tuple) |value| nullableString(value, "baseSha") else null);
+    try putStringOrNull(&row, "head_sha", if (tuple) |value| nullableString(value, "headSha") else null);
+    try putStringOrNull(&row, "target_fingerprint", if (tuple) |value| nullableString(value, "targetFingerprint") else null);
+    try putStringOrNull(&row, "review_verdict_status", status);
+    try row.putStaticKey("finding_count", .{ .int = finding_count });
+    try row.putStaticKey("account_resource_signal", .{ .bool = optEql(status, "account_resource_exhausted") or optEql(failure_code, "account_resource_exhausted") });
+    try row.putStaticKey("transport_signal", .{ .bool = optEql(status, "transport_failure") or transportSignal(failure_code, failure_class) });
+    try putStringOrNull(&row, "record_path", record_path orelse ctx.source_path);
+    try putStringOrNull(&row, "event_log_path", event_log_path);
+    try putStringOrNull(&row, "review_broker_action", broker_action);
+    try putStringOrNull(&row, "review_broker_reason", broker_reason);
+    return row;
+}
+
+fn casRerBackendClass(command: ?std.json.ObjectMap, default_backend_class: []const u8) []const u8 {
+    const selected = if (command) |cmd| nullableString(cmd, "backendSelected") else null;
+    const source = if (command) |cmd| nullableString(cmd, "sourceBackendClass") else null;
+    if (optEql(selected, "imported-legacy")) return source orelse selected.?;
+    return selected orelse source orelse default_backend_class;
+}
+
 fn summarize(rows: []const query.Row) Summary {
     var out = Summary{ .row_count = @intCast(rows.len) };
     var has_tuple_verdict = false;
@@ -713,7 +1082,6 @@ fn summarize(rows: []const query.Row) Summary {
 
     for (rows) |row| {
         const failure_code = scalarString(row, "failure_code");
-        const phase = scalarString(row, "review_attempt_phase");
         const status = scalarString(row, "review_verdict_status");
         const backend = scalarString(row, "backend_class");
         const command_surface = scalarString(row, "command_surface") orelse "";
@@ -723,10 +1091,10 @@ fn summarize(rows: []const query.Row) Summary {
         const tuple_exists = scalarBool(row, "tuple_verdict_exists");
         const finding_count = scalarInt(row, "finding_count");
 
-        if (broker_action != null or std.mem.indexOf(u8, command_surface, "review_session run") != null) out.broker_run_count += 1;
-        if (optEql(broker_action, "auto_replaced_dead_transport")) out.broker_auto_replaced_dead_transport_count += 1;
-        if (optEql(broker_action, "attached_existing")) out.broker_attached_existing_count += 1;
-        if (optEql(broker_action, "blocked_live_attempt")) out.broker_blocked_live_count += 1;
+        if (broker_action != null or brokerRunCommandSurface(command_surface)) out.broker_run_count += 1;
+        if (optEql(broker_action, "auto_replaced_dead_transport") or optEql(broker_action, "replaced_dead_transport")) out.broker_auto_replaced_dead_transport_count += 1;
+        if (optEql(broker_action, "attached_existing") or optEql(broker_action, "returned_terminal")) out.broker_attached_existing_count += 1;
+        if (optEql(broker_action, "blocked_live_attempt") or optEql(broker_action, "blocked_live")) out.broker_blocked_live_count += 1;
         if (optEql(surface, "manual_recovery_command")) out.manual_recovery_command_count += 1;
 
         if (optEql(failure_code, "pre_review_lane_transport_lost")) {
@@ -743,7 +1111,7 @@ fn summarize(rows: []const query.Row) Summary {
             out.account_resource_exhausted_count += 1;
             has_degraded = true;
         }
-        if ((optEql(status, "timeout") or optEql(phase, "review_waiting")) and attempt_exists) out.timeout_with_handle_count += 1;
+        if (optEql(status, "timeout") and attempt_exists) out.timeout_with_handle_count += 1;
         if (optEql(failure_code, "duplicate_prevented")) out.duplicate_prevented_count += 1;
         if (std.mem.indexOf(u8, backend orelse "", "cas-start-wait") != null or std.mem.indexOf(u8, backend orelse "", "cas-native-fallback") != null) {
             if (tuple_exists) out.start_wait_normalized_count += 1 else out.start_wait_unormalized_count += 1;
@@ -772,9 +1140,22 @@ fn summarize(rows: []const query.Row) Summary {
 fn manualRecoveryCommand(command_surface: []const u8) bool {
     return std.mem.indexOf(u8, command_surface, "review_session lock") != null or
         std.mem.indexOf(u8, command_surface, "review_session receipt") != null or
+        std.mem.indexOf(u8, command_surface, "review_session validate-record") != null or
+        std.mem.indexOf(u8, command_surface, "review_session validate_record") != null or
+        std.mem.indexOf(u8, command_surface, "review_session inspect") != null or
         std.mem.indexOf(u8, command_surface, "receipt normalize") != null or
         std.mem.indexOf(u8, command_surface, "lock gate") != null or
+        std.mem.indexOf(u8, command_surface, "cas review validate-record") != null or
+        std.mem.indexOf(u8, command_surface, "cas review validate_record") != null or
+        std.mem.indexOf(u8, command_surface, "cas review inspect") != null or
         std.mem.indexOf(u8, command_surface, "--review-lock-override") != null;
+}
+
+fn brokerRunCommandSurface(command_surface: []const u8) bool {
+    return std.mem.indexOf(u8, command_surface, "cas review run") != null or
+        std.mem.indexOf(u8, command_surface, "cas review_session run") != null or
+        std.mem.indexOf(u8, command_surface, "cas_review_session run") != null or
+        std.mem.indexOf(u8, command_surface, "review_session run") != null;
 }
 
 fn inferPhase(
@@ -937,8 +1318,29 @@ fn claimDedupeKey(
     fallback: []const u8,
     dedupe: *std.StringHashMap(void),
 ) !bool {
-    const key_value = scalarString(row, "record_path") orelse scalarString(row, "event_log_path") orelse scalarString(row, "review_thread_id") orelse fallback;
-    const key = try std.fmt.allocPrint(allocator, "{s}|{s}", .{ source_path, key_value });
+    const key = if (scalarString(row, "record_id")) |record_id| blk: {
+        const cwd = scalarString(row, "cwd") orelse "";
+        const base_sha = scalarString(row, "base_sha") orelse "";
+        const head_sha = scalarString(row, "head_sha") orelse "";
+        const target_fingerprint = scalarString(row, "target_fingerprint") orelse "";
+        const review_thread_id = scalarString(row, "review_thread_id") orelse "";
+        const status = scalarString(row, "canonical_status") orelse scalarString(row, "review_verdict_status") orelse "";
+        const source_scope = if (cwd.len == 0 and base_sha.len == 0 and head_sha.len == 0 and target_fingerprint.len == 0 and review_thread_id.len == 0 and status.len == 0) source_path else "";
+        break :blk try std.fmt.allocPrint(allocator, "recordId|{s}|cwd={s}|base={s}|head={s}|target={s}|thread={s}|status={s}|findings={d}|source={s}", .{
+            record_id,
+            cwd,
+            base_sha,
+            head_sha,
+            target_fingerprint,
+            review_thread_id,
+            status,
+            scalarInt(row, "finding_count"),
+            source_scope,
+        });
+    } else blk: {
+        const key_value = scalarString(row, "record_path") orelse scalarString(row, "event_log_path") orelse scalarString(row, "review_thread_id") orelse fallback;
+        break :blk try std.fmt.allocPrint(allocator, "{s}|{s}", .{ source_path, key_value });
+    };
     errdefer allocator.free(key);
     if (dedupe.contains(key)) {
         allocator.free(key);
@@ -949,7 +1351,8 @@ fn claimDedupeKey(
 }
 
 fn looksLikeCasReviewCommand(cmd: []const u8) bool {
-    return std.mem.indexOf(u8, cmd, "cas review_session") != null or
+    return std.mem.indexOf(u8, cmd, "cas review ") != null or
+        std.mem.indexOf(u8, cmd, "cas review_session") != null or
         std.mem.indexOf(u8, cmd, "cas_review_session") != null or
         std.mem.indexOf(u8, cmd, "review_session") != null;
 }
@@ -1066,6 +1469,18 @@ fn object(value: std.json.Value) ?std.json.ObjectMap {
 fn objectField(obj: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
     const value = obj.get(key) orelse return null;
     return object(value);
+}
+
+fn casRerPrincipalProofUsable(principal: ?std.json.ObjectMap) bool {
+    const principal_obj = principal orelse return false;
+    if (boolField(principal_obj, "proofUsable") != true) return false;
+    if (!optEql(nullableString(principal_obj, "kind"), "strong")) return false;
+    if (boolField(principal_obj, "reduced") != false) return false;
+    if (boolField(principal_obj, "fallbackUsed") != false) return false;
+    if (optEql(nullableString(principal_obj, "source"), "cas-native-fallback")) return false;
+    const fingerprint = nullableString(principal_obj, "accountFingerprint") orelse return false;
+    if (fingerprint.len == 0) return false;
+    return !std.mem.eql(u8, fingerprint, "unknown-account");
 }
 
 fn stringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -1259,6 +1674,25 @@ test "lane smoke command pass status is not a review verdict" {
     try std.testing.expectEqual(@as(?[]const u8, null), scalarString(row, "review_verdict_status"));
 }
 
+test "legacy timedOut receipt derives timeout verdict status" {
+    var row = try classifyReceiptText(std.testing.allocator,
+        \\{"reviewThreadId":"thr_waiting","reviewAttemptPhase":"review_waiting","timedOut":true,"baseSha":"b","headSha":"h","targetFingerprint":"t"}
+    , .{
+        .session_id = "sess",
+        .cwd = "/repo",
+        .command_surface = "cas review_session start --wait",
+        .source_path = "/tmp/timeout.json",
+        .default_backend_class = "cas-start-wait",
+    });
+    defer row.deinit();
+
+    try std.testing.expectEqualStrings("timeout", scalarString(row, "review_verdict_status").?);
+    try std.testing.expect(scalarBool(row, "review_attempt_exists"));
+
+    const summary = summarize(&.{row});
+    try std.testing.expectEqual(@as(i64, 1), summary.timeout_with_handle_count);
+}
+
 test "stored terminal session record projects tuple-bound clean review verdict" {
     var row = try classifyReceiptText(std.testing.allocator,
         \\{"schema_version":"CAS-RS-record-v1","last_observed_status":"completed","terminal_review_result_source":"rollout_exited_review_mode","terminal_review_result_json":"{\"findings\":[],\"overallCorrectness\":\"patch is correct\"}","review_thread_id":"thr_1","review_turn_id":"turn_1","base_sha":"b","head_sha":"h","target_fingerprint":"t","event_log_path":"/tmp/thr_1.events.ndjson"}
@@ -1355,6 +1789,35 @@ test "brokered run output contributes broker summary counters" {
     try std.testing.expectEqual(@as(i64, 1), audit.summary.broker_run_count);
     try std.testing.expectEqual(@as(i64, 1), audit.summary.broker_auto_replaced_dead_transport_count);
     try std.testing.expectEqualStrings("auto_replaced_dead_transport", scalarString(audit.rows.items[0], "review_broker_action").?);
+}
+
+test "public cas review run command counts as broker run without broker action" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "session.jsonl", .data =
+        \\{"type":"session_meta","timestamp":"2026-06-27T01:00:00Z","payload":{"id":"sess-public-run"}}
+        \\{"type":"response_item","timestamp":"2026-06-27T01:00:01Z","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"cas review run --cwd /repo --base main --json\",\"cwd\":\"/repo\"}"}}
+        \\{"type":"response_item","timestamp":"2026-06-27T01:00:02Z","payload":{"type":"function_call_output","call_id":"call-1","output":"{\"demo\":\"cas-review-session\",\"action\":\"run\",\"reviewAttemptPhase\":\"pre_review_start\",\"reviewAttemptExists\":false,\"tupleVerdictExists\":false,\"reviewVerdict\":{\"status\":\"incomplete\",\"backendClass\":\"cas-run\",\"clean\":false,\"findingCount\":0,\"failureCode\":\"missing_codex_binary\",\"baseSha\":\"b\",\"headSha\":\"h\",\"targetFingerprint\":\"t\",\"findings\":[]}}\n"}}
+        \\
+    });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "session.jsonl" });
+    defer std.testing.allocator.free(path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .path = path,
+        .session_id = "sess-public-run",
+        .repo = "/repo",
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), audit.rows.items.len);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.broker_run_count);
+    try std.testing.expect(scalarString(audit.rows.items[0], "review_broker_action") == null);
 }
 
 test "manual recovery command uses output cwd and is counted once when output is receipt-shaped" {
@@ -1515,6 +1978,453 @@ test "snake-case root verdict receipts are normalized" {
     try std.testing.expectEqualStrings("available", summary.lane_backend_status);
 }
 
+test "CAS-RER findings record is canonical ledger evidence" {
+    var row = try classifyReceiptText(std.testing.allocator,
+        \\{"schema":"CAS-RER-v1","recordId":"rer_findings","createdAt":"2026-07-02T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane","brokerDecision":{"action":"imported_legacy","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:attempt","phase":"normalized_verdict","reviewThreadId":"thr_findings","reviewTurnId":"turn_findings","recordPath":"/tmp/session.json","eventLogPath":"/tmp/events.ndjson"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":2,"findings":[{"title":"one"},{"title":"two"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"},"attachments":{"eventLog":"/tmp/events.ndjson","rawSessionRecord":"/tmp/session.json","rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":true,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
+    , .{
+        .session_id = "",
+        .cwd = null,
+        .command_surface = "receipt",
+        .source_path = "/tmp/rer.json",
+        .default_backend_class = "cas-receipt-normalized",
+    });
+    defer row.deinit();
+
+    try std.testing.expectEqualStrings("cas_review_evidence_ledger", scalarString(row, "canonical_source").?);
+    try std.testing.expectEqualStrings("findings", scalarString(row, "canonical_status").?);
+    try std.testing.expectEqualStrings("cas-lane", scalarString(row, "backend_class").?);
+    try std.testing.expectEqualStrings("rer_findings", scalarString(row, "record_id").?);
+    try std.testing.expectEqualStrings("findings", scalarString(row, "review_verdict_status").?);
+    try std.testing.expectEqualStrings("thr_findings", scalarString(row, "review_thread_id").?);
+    try std.testing.expectEqualStrings("base", scalarString(row, "base_sha").?);
+    try std.testing.expectEqualStrings("head", scalarString(row, "head_sha").?);
+    try std.testing.expectEqualStrings("fp", scalarString(row, "target_fingerprint").?);
+    try std.testing.expectEqual(@as(i64, 2), scalarInt(row, "finding_count"));
+
+    const summary = summarize(&.{row});
+    try std.testing.expectEqual(@as(i64, 1), summary.completed_findings_count);
+    try std.testing.expectEqual(@as(i64, 0), summary.timeout_with_handle_count);
+}
+
+test "CAS-RER unusable principal is not counted as completed evidence" {
+    var row = try classifyReceiptText(std.testing.allocator,
+        \\{"schema":"CAS-RER-v1","recordId":"rer_reduced","createdAt":"2026-07-02T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_reduced","reviewTurnId":"turn_reduced"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"reduced","proofUsable":false,"reduced":true,"fallbackUsed":false}}
+    , .{
+        .session_id = "",
+        .cwd = null,
+        .command_surface = "receipt",
+        .source_path = "/tmp/rer-reduced.json",
+        .default_backend_class = "cas-receipt-normalized",
+    });
+    defer row.deinit();
+
+    try std.testing.expectEqualStrings("review_untrusted_source", scalarString(row, "canonical_status").?);
+    try std.testing.expectEqualStrings("review_untrusted_source", scalarString(row, "review_verdict_status").?);
+    try std.testing.expect(!scalarBool(row, "tuple_verdict_exists"));
+    try std.testing.expect(!scalarBool(row, "principal_proof_usable"));
+    try std.testing.expect(scalarBool(row, "principal_reduced"));
+
+    const summary = summarize(&.{row});
+    try std.testing.expectEqual(@as(i64, 0), summary.completed_clean_count);
+    try std.testing.expectEqual(@as(i64, 0), summary.completed_findings_count);
+}
+
+test "CAS-RER proof usable principal requires account fingerprint" {
+    var row = try classifyReceiptText(std.testing.allocator,
+        \\{"schema":"CAS-RER-v1","recordId":"rer_missing_principal_fingerprint","createdAt":"2026-07-02T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_missing_fingerprint","reviewTurnId":"turn_missing_fingerprint"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+    , .{
+        .session_id = "",
+        .cwd = null,
+        .command_surface = "receipt",
+        .source_path = "/tmp/rer-missing-principal-fingerprint.json",
+        .default_backend_class = "cas-receipt-normalized",
+    });
+    defer row.deinit();
+
+    try std.testing.expectEqualStrings("review_untrusted_source", scalarString(row, "canonical_status").?);
+    try std.testing.expect(!scalarBool(row, "tuple_verdict_exists"));
+    try std.testing.expect(!scalarBool(row, "principal_proof_usable"));
+
+    const summary = summarize(&.{row});
+    try std.testing.expectEqual(@as(i64, 0), summary.completed_clean_count);
+
+    var empty_row = try classifyReceiptText(std.testing.allocator,
+        \\{"schema":"CAS-RER-v1","recordId":"rer_empty_principal_fingerprint","createdAt":"2026-07-02T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_empty_fingerprint","reviewTurnId":"turn_empty_fingerprint"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+    , .{
+        .session_id = "",
+        .cwd = null,
+        .command_surface = "receipt",
+        .source_path = "/tmp/rer-empty-principal-fingerprint.json",
+        .default_backend_class = "cas-receipt-normalized",
+    });
+    defer empty_row.deinit();
+
+    try std.testing.expectEqualStrings("review_untrusted_source", scalarString(empty_row, "canonical_status").?);
+    try std.testing.expect(!scalarBool(empty_row, "tuple_verdict_exists"));
+    try std.testing.expect(!scalarBool(empty_row, "principal_proof_usable"));
+}
+
+test "CAS-RER unbound terminal status is not counted as completed evidence" {
+    var row = try classifyReceiptText(std.testing.allocator,
+        \\{"schema":"CAS-RER-v1","recordId":"rer_unbound_findings","createdAt":"2026-07-02T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":null,"targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_unbound","reviewTurnId":"turn_unbound"},"verdict":{"tupleVerdictExists":false,"status":"findings","clean":false,"findingCount":1,"findings":[{"title":"unbound"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+    , .{
+        .session_id = "",
+        .cwd = null,
+        .command_surface = "receipt",
+        .source_path = "/tmp/rer-unbound.json",
+        .default_backend_class = "cas-receipt-normalized",
+    });
+    defer row.deinit();
+
+    try std.testing.expectEqualStrings("incomplete", scalarString(row, "canonical_status").?);
+    try std.testing.expectEqualStrings("incomplete", scalarString(row, "review_verdict_status").?);
+    try std.testing.expect(!scalarBool(row, "tuple_verdict_exists"));
+    try std.testing.expectEqual(@as(i64, 1), scalarInt(row, "finding_count"));
+
+    const summary = summarize(&.{row});
+    try std.testing.expectEqual(@as(i64, 0), summary.completed_clean_count);
+    try std.testing.expectEqual(@as(i64, 0), summary.completed_findings_count);
+}
+
+test "CAS-RER findings are not reduced to timeout-only audit evidence" {
+    var timeout_row = try classifyReceiptText(std.testing.allocator,
+        \\{"status":"timeout","reviewThreadId":"thr_same","reviewAttemptPhase":"review_waiting","timedOut":true,"baseSha":"base","headSha":"head","targetFingerprint":"fp"}
+    , .{
+        .session_id = "sess",
+        .cwd = "/repo",
+        .command_surface = "cas review_session lane review",
+        .source_path = "/tmp/session.jsonl",
+        .default_backend_class = "cas-lane",
+    });
+    defer timeout_row.deinit();
+
+    var findings_row = try classifyReceiptText(std.testing.allocator,
+        \\{"schema":"CAS-RER-v1","recordId":"rer_same","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_same","reviewTurnId":"turn_same"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":1,"findings":[{"title":"issue"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+    , .{
+        .session_id = "sess",
+        .cwd = "/repo",
+        .command_surface = "receipt",
+        .source_path = "/tmp/rer.json",
+        .default_backend_class = "cas-receipt-normalized",
+    });
+    defer findings_row.deinit();
+
+    const summary = summarize(&.{ timeout_row, findings_row });
+    try std.testing.expectEqual(@as(i64, 1), summary.completed_findings_count);
+    try std.testing.expectEqual(@as(i64, 1), summary.timeout_with_handle_count);
+    try std.testing.expectEqualStrings("cas_review_evidence_ledger", scalarString(findings_row, "canonical_source").?);
+}
+
+test "CAS import envelope expands nested CAS-RER records" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "import.json", .data =
+        \\{"schema":"CAS-IMPORT-v1","records":[{"sourcePath":"/tmp/receipt.json","recordPath":"/tmp/rer.json","validation":{"ok":true,"errors":[],"path":"/tmp/receipt.json"},"record":{"schema":"CAS-RER-v1","recordId":"rer_envelope","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_env","reviewTurnId":"turn_env"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}},{"sourcePath":"/tmp/bad.json","recordPath":"","validation":{"ok":false,"errors":["bad"],"path":"/tmp/bad.json"},"record":{"schema":"CAS-RER-v1","recordId":"rer_rejected","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_bad","reviewTurnId":"turn_bad"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":1,"findings":[{"title":"bad"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}}],"errors":[]}
+    });
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const import_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "import.json" });
+    defer std.testing.allocator.free(import_path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .receipt_paths = &.{import_path},
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), audit.rows.items.len);
+    try std.testing.expectEqualStrings("rer_envelope", scalarString(audit.rows.items[0], "record_id").?);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_clean_count);
+    try std.testing.expectEqual(@as(i64, 0), audit.summary.broker_run_count);
+}
+
+test "CAS import envelope expands bare CAS-RER records" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "import.json", .data =
+        \\{"schema":"CAS-IMPORT-v1","records":[{"schema":"CAS-RER-v1","recordId":"rer_bare_import","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_bare","reviewTurnId":"turn_bare"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}],"errors":[]}
+    });
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const import_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "import.json" });
+    defer std.testing.allocator.free(import_path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .receipt_paths = &.{import_path},
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), audit.rows.items.len);
+    try std.testing.expectEqualStrings("rer_bare_import", scalarString(audit.rows.items[0], "record_id").?);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_clean_count);
+}
+
+test "CAS import JSONL wrapper expands nested CAS-RER record" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "import.jsonl", .data =
+        \\{"sourcePath":"/tmp/receipt.json","recordPath":"/tmp/rer.json","validation":{"ok":true,"errors":[],"path":"/tmp/receipt.json"},"record":{"schema":"CAS-RER-v1","recordId":"rer_jsonl_wrapper","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_jsonl","reviewTurnId":"turn_jsonl"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}}
+    });
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const import_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "import.jsonl" });
+    defer std.testing.allocator.free(import_path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .receipt_paths = &.{import_path},
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), audit.rows.items.len);
+    try std.testing.expectEqualStrings("rer_jsonl_wrapper", scalarString(audit.rows.items[0], "record_id").?);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_clean_count);
+}
+
+test "CAS run envelope expands nested CAS-RER record" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "run.json", .data =
+        \\{"schema":"CAS-RUN-v1","recordPath":"/tmp/rer-run.json","record":{"schema":"CAS-RER-v1","recordId":"rer_run","command":{"surface":"run","backendSelected":"cas-run","sourceBackendClass":"cas-start-wait","brokerDecision":{"action":"returned_terminal","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_run","reviewTurnId":"turn_run"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}},"reviewBrokerDecision":{"action":"returned_terminal","reason":"test","freshAttemptRequired":false}}
+    });
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const run_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "run.json" });
+    defer std.testing.allocator.free(run_path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .receipt_paths = &.{run_path},
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), audit.rows.items.len);
+    try std.testing.expectEqualStrings("rer_run", scalarString(audit.rows.items[0], "record_id").?);
+    try std.testing.expectEqualStrings("cas_review_evidence_ledger", scalarString(audit.rows.items[0], "canonical_source").?);
+    try std.testing.expectEqualStrings("cas-run", scalarString(audit.rows.items[0], "backend_class").?);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_clean_count);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.broker_run_count);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.broker_attached_existing_count);
+    try std.testing.expectEqual(@as(i64, 0), audit.summary.start_wait_normalized_count);
+}
+
+test "CAS run envelope falls back to verdict when nested CAS-RER is incomplete" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "run.json", .data =
+        \\{"schema":"CAS-RUN-v1","record":{"schema":"CAS-RER-v1","recordId":"rer_placeholder","command":{"surface":"","backendSelected":""},"tuple":{},"attempt":{},"verdict":{"tupleVerdictExists":false},"failure":{},"principal":{}},"reviewVerdict":{"status":"clean","backendClass":"cas-start-wait","clean":true,"findingCount":0,"failureCode":null,"baseSha":"base","headSha":"head","targetFingerprint":"fp","reviewThreadId":"thr_fallback","reviewTurnId":"turn_fallback","findings":[]},"reviewBrokerDecision":{"action":"returned_terminal","reason":"test","freshAttemptRequired":false}}
+    });
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const run_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "run.json" });
+    defer std.testing.allocator.free(run_path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .receipt_paths = &.{run_path},
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), audit.rows.items.len);
+    try std.testing.expectEqualStrings("thr_fallback", scalarString(audit.rows.items[0], "review_thread_id").?);
+    try std.testing.expectEqualStrings("clean", scalarString(audit.rows.items[0], "review_verdict_status").?);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_clean_count);
+}
+
+test "CAS current and list envelopes expand nested ledger records" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "current.json", .data =
+        \\{"schema":"CAS-CURRENT-v1","record":{"schema":"CAS-RER-v1","recordId":"rer_current","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"blocked_live","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"review_waiting","reviewThreadId":"thr_current","reviewTurnId":"turn_current"},"verdict":{"tupleVerdictExists":false,"status":"incomplete","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":true},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}},"tupleCurrent":true,"actionRequired":"wait"}
+    });
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "list.json", .data =
+        \\{"schema":"CAS-LIST-v1","records":[{"schema":"CAS-RER-v1","recordId":"rer_list","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"replaced_dead_transport","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_list","reviewTurnId":"turn_list"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":1,"findings":[{"title":"issue"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}]}
+    });
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const current_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "current.json" });
+    defer std.testing.allocator.free(current_path);
+    const list_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "list.json" });
+    defer std.testing.allocator.free(list_path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .receipt_paths = &.{ current_path, list_path },
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), audit.rows.items.len);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_findings_count);
+    try std.testing.expectEqual(@as(i64, 0), audit.summary.timeout_with_handle_count);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.broker_blocked_live_count);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.broker_auto_replaced_dead_transport_count);
+}
+
+test "CAS-RER envelope dedupe uses stable record identity" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const record =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_same_record","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"returned_terminal","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_same","reviewTurnId":"turn_same"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+    ;
+    const run_envelope = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"schema":"CAS-RUN-v1","record":{s},"reviewBrokerDecision":{{"action":"returned_terminal","reason":"test","freshAttemptRequired":false}}}}
+    , .{record});
+    defer std.testing.allocator.free(run_envelope);
+    const current_envelope = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"schema":"CAS-CURRENT-v1","record":{s},"tupleCurrent":true,"actionRequired":"none"}}
+    , .{record});
+    defer std.testing.allocator.free(current_envelope);
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "run.json", .data = run_envelope });
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "current.json", .data = current_envelope });
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const run_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "run.json" });
+    defer std.testing.allocator.free(run_path);
+    const current_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "current.json" });
+    defer std.testing.allocator.free(current_path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .receipt_paths = &.{ run_path, current_path },
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), audit.rows.items.len);
+    try std.testing.expectEqualStrings("rer_same_record", scalarString(audit.rows.items[0], "record_id").?);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_clean_count);
+}
+
+test "CAS-RER dedupe preserves colliding record ids across distinct tuples" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "one.json", .data =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_collision","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo-one","baseSha":"base","headSha":"head-one","targetFingerprint":"fp-one"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_one","reviewTurnId":"turn_one"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+    });
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "two.json", .data =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_collision","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo-two","baseSha":"base","headSha":"head-two","targetFingerprint":"fp-two"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_two","reviewTurnId":"turn_two"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":1,"findings":[{"title":"issue"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+    });
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const one_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "one.json" });
+    defer std.testing.allocator.free(one_path);
+    const two_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "two.json" });
+    defer std.testing.allocator.free(two_path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .receipt_paths = &.{ one_path, two_path },
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), audit.rows.items.len);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_clean_count);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_findings_count);
+}
+
+test "bare CAS-RER JSONL preserves distinct record identities" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "records.jsonl", .data =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_jsonl_one","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_one","reviewTurnId":"turn_one"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_jsonl_two","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_two","reviewTurnId":"turn_two"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+    });
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "records.jsonl" });
+    defer std.testing.allocator.free(path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .receipt_paths = &.{path},
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), audit.rows.items.len);
+    try std.testing.expectEqual(@as(i64, 2), audit.summary.completed_clean_count);
+}
+
+test "bare CAS-RER JSONL rejects invalid terminal evidence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "records.jsonl", .data =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_waiting_clean","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"review_waiting","reviewThreadId":"thr_waiting","reviewTurnId":"turn_waiting"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_failed_clean","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_failed","reviewTurnId":"turn_failed"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":"review_failed","failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_clean_false","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_clean_false","reviewTurnId":"turn_clean_false"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_clean_with_findings","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_clean_with_findings","reviewTurnId":"turn_clean_with_findings"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":1,"findings":[{"title":"issue"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_findings_without_count","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_findings_without_count","reviewTurnId":"turn_findings_without_count"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_findings_without_entries","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_findings_without_entries","reviewTurnId":"turn_findings_without_entries"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":1,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_clean_with_entries","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_clean_with_entries","reviewTurnId":"turn_clean_with_entries"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[{"title":"issue"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+    });
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "records.jsonl" });
+    defer std.testing.allocator.free(path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .receipt_paths = &.{path},
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), audit.rows.items.len);
+    try std.testing.expectEqual(@as(i64, 0), audit.summary.completed_clean_count);
+}
+
+test "CAS-RER envelopes reject untrusted nested terminal evidence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const invalid_record =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_invalid_nested","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"returned_terminal","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"review_waiting","reviewThreadId":"thr_invalid","reviewTurnId":"turn_invalid"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+    ;
+    const run_envelope = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"schema":"CAS-RUN-v1","record":{s},"reviewBrokerDecision":{{"action":"returned_terminal","reason":"test","freshAttemptRequired":false}}}}
+    , .{invalid_record});
+    defer std.testing.allocator.free(run_envelope);
+    const current_envelope = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"schema":"CAS-CURRENT-v1","record":{s},"tupleCurrent":true,"actionRequired":"none"}}
+    , .{invalid_record});
+    defer std.testing.allocator.free(current_envelope);
+    const list_envelope = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"schema":"CAS-LIST-v1","records":[{s}]}}
+    , .{invalid_record});
+    defer std.testing.allocator.free(list_envelope);
+    const import_envelope = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"schema":"CAS-IMPORT-v1","records":[{{"sourcePath":"/tmp/receipt.json","recordPath":"/tmp/rer.json","validation":{{"ok":true,"errors":[],"path":"/tmp/receipt.json"}},"record":{s}}}],"errors":[]}}
+    , .{invalid_record});
+    defer std.testing.allocator.free(import_envelope);
+    const import_wrapper = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"sourcePath":"/tmp/receipt.json","recordPath":"/tmp/rer.json","validation":{{"ok":true,"errors":[],"path":"/tmp/receipt.json"}},"record":{s}}}
+    , .{invalid_record});
+    defer std.testing.allocator.free(import_wrapper);
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "run.json", .data = run_envelope });
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "current.json", .data = current_envelope });
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "list.json", .data = list_envelope });
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "import.json", .data = import_envelope });
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "wrapper.jsonl", .data = import_wrapper });
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const run_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "run.json" });
+    defer std.testing.allocator.free(run_path);
+    const current_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "current.json" });
+    defer std.testing.allocator.free(current_path);
+    const list_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "list.json" });
+    defer std.testing.allocator.free(list_path);
+    const import_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "import.json" });
+    defer std.testing.allocator.free(import_path);
+    const wrapper_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "wrapper.jsonl" });
+    defer std.testing.allocator.free(wrapper_path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .receipt_paths = &.{ run_path, current_path, list_path, import_path, wrapper_path },
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(i64, 0), audit.summary.completed_clean_count);
+    try std.testing.expectEqual(@as(i64, 0), audit.summary.completed_findings_count);
+}
+
 test "repo scope matching is path-boundary safe" {
     try std.testing.expect(pathMatchesScope("/tmp/repo", "/tmp/repo"));
     try std.testing.expect(pathMatchesScope("/tmp/repo/sub", "/tmp/repo"));
@@ -1534,7 +2444,7 @@ test "summary separates review transport timeout duplicate and degraded lane tup
     defer transport_row.deinit();
 
     var waiting_row = try classifyReceiptText(std.testing.allocator,
-        \\{"reviewThreadId":"thr_waiting","reviewAttemptPhase":"review_waiting","timedOut":true,"baseSha":"b","headSha":"h","targetFingerprint":"t"}
+        \\{"status":"timeout","reviewThreadId":"thr_waiting","reviewAttemptPhase":"review_waiting","timedOut":true,"baseSha":"b","headSha":"h","targetFingerprint":"t"}
     , .{
         .session_id = "sess",
         .cwd = "/repo",
@@ -1560,4 +2470,15 @@ test "summary separates review transport timeout duplicate and degraded lane tup
     try std.testing.expectEqual(@as(i64, 1), summary.timeout_with_handle_count);
     try std.testing.expectEqual(@as(i64, 0), summary.duplicate_prevented_count);
     try std.testing.expectEqualStrings("degraded", summary.lane_backend_status);
+}
+
+test "public review diagnostics count as manual recovery commands" {
+    try std.testing.expect(manualRecoveryCommand("cas review validate-record --record rer_1 --json"));
+    try std.testing.expect(manualRecoveryCommand("cas review validate_record --record rer_1 --json"));
+    try std.testing.expect(manualRecoveryCommand("cas review inspect --record rer_1 --json"));
+    try std.testing.expect(manualRecoveryCommand("cas review_session validate-record --record rer_1 --json"));
+    try std.testing.expect(manualRecoveryCommand("cas review_session validate_record --record rer_1 --json"));
+    try std.testing.expect(manualRecoveryCommand("cas_review_session validate_record --record rer_1 --json"));
+    try std.testing.expect(manualRecoveryCommand("cas_review_session inspect --record rer_1 --json"));
+    try std.testing.expect(!manualRecoveryCommand("cas review current --cwd /repo --base main --json"));
 }
