@@ -6102,6 +6102,7 @@ const CasRerLedgerRecord = struct {
     base_sha: ?[]const u8,
     head_sha: ?[]const u8,
     target_fingerprint: ?[]const u8,
+    principal_proof_usable: bool,
 
     fn deinit(self: CasRerLedgerRecord, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
@@ -6136,6 +6137,7 @@ fn casRerLedgerRecordFromJsonAlloc(allocator: std.mem.Allocator, path: []const u
     const tuple = objectField(root, "tuple");
     const attempt = objectField(root, "attempt");
     const verdict = objectField(root, "verdict");
+    const principal = objectField(root, "principal");
     return .{
         .path = try allocator.dupe(u8, path),
         .raw_json = try allocator.dupe(u8, raw),
@@ -6148,6 +6150,7 @@ fn casRerLedgerRecordFromJsonAlloc(allocator: std.mem.Allocator, path: []const u
         .base_sha = if (tuple) |value| try dupOptional(allocator, jsonStringField(value, "baseSha")) else null,
         .head_sha = if (tuple) |value| try dupOptional(allocator, jsonStringField(value, "headSha")) else null,
         .target_fingerprint = if (tuple) |value| try dupOptional(allocator, jsonStringField(value, "targetFingerprint")) else null,
+        .principal_proof_usable = if (principal) |value| jsonBoolField(value, "proofUsable") orelse false else false,
     };
 }
 
@@ -6208,7 +6211,10 @@ fn latestCasRerLedgerRecordIndex(records: []const CasRerLedgerRecord) ?usize {
 }
 
 fn actionRequiredForCasRerRecord(record: CasRerLedgerRecord) []const u8 {
-    if (record.tuple_verdict_exists and (std.mem.eql(u8, record.status, "clean") or std.mem.eql(u8, record.status, "findings"))) return "none";
+    if (record.tuple_verdict_exists and (std.mem.eql(u8, record.status, "clean") or std.mem.eql(u8, record.status, "findings"))) {
+        if (!record.principal_proof_usable) return "run_new_attempt";
+        return "none";
+    }
     if (record.attempt_exists and !record.tuple_verdict_exists) return "wait";
     if (std.mem.eql(u8, record.status, "timeout") or std.mem.eql(u8, record.status, "incomplete")) return "inspect";
     if (std.mem.eql(u8, record.status, "transport_failure")) return "run_new_attempt";
@@ -12684,6 +12690,15 @@ test "CAS-RER ledger record projection matches tuple identity" {
     try std.testing.expectEqualStrings("clean", record.status);
     try std.testing.expect(record.tuple_verdict_exists);
     try std.testing.expectEqualStrings("none", actionRequiredForCasRerRecord(record));
+
+    const reduced_raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_reduced","createdAt":"2026-07-02T00:00:01Z","updatedAt":"2026-07-02T00:00:01Z","command":{"surface":"import","backendSelected":"imported-legacy","brokerDecision":{"action":"imported_legacy","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:b","phase":"normalized_verdict","reviewThreadId":"thr_reduced","reviewTurnId":"turn_reduced"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"reduced","proofUsable":false,"reduced":true,"fallbackUsed":false,"source":"cas-lane"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":true,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
+    ;
+    const reduced_record = try casRerLedgerRecordFromJsonAlloc(std.testing.allocator, "/tmp/rer_reduced.json", reduced_raw);
+    defer reduced_record.deinit(std.testing.allocator);
+    try std.testing.expect(reduced_record.tuple_verdict_exists);
+    try std.testing.expect(!reduced_record.principal_proof_usable);
+    try std.testing.expectEqualStrings("run_new_attempt", actionRequiredForCasRerRecord(reduced_record));
 }
 
 test "CAS-RER writer projects pre-review lane transport as non-attempt" {
