@@ -1,0 +1,7 @@
+{"type":"session_meta","timestamp":"2026-07-02T12:30:00Z","payload":{"id":"stale_hylo_after_diff_change","cwd":"/repo/seq-audit","model":"gpt-5","git":{"branch":"feature/hylo","commit_hash":"head-stale"}}}
+{"type":"event_msg","timestamp":"2026-07-02T12:30:01Z","payload":{"type":"task_started","turn_id":"t1"}}
+{"type":"event_msg","timestamp":"2026-07-02T12:30:02Z","payload":{"type":"user_message","turn_id":"t1","message":"$actuating stale Hylo fixture."}}
+{"type":"event_msg","timestamp":"2026-07-02T12:30:03Z","payload":{"type":"agent_message","turn_id":"t1","message":"blocked-loop-contract-stale\nstale_hylo_after_diff_change\nagent_loop_scheme_receipt:\n  receipt_version: ALSR-v1\nactuation_hylomorphism:\n  machine_version: HYL-v1\nhylo_step_receipt:\n  receipt_version: HSR-v1\n  unfold:\n    produced: work_node\n  action:\n    effect: edit\n  fold:\n    verdict: complete\n    current_artifact_bound: yes\n  stop_rule:\n    success: done\nATCG-v1:\n  can_mark_goal_complete: yes"}}
+{"type":"response_item","timestamp":"2026-07-02T12:30:04Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-1","arguments":"*** Begin Patch\n*** Update File: stale.txt\n+bad\n*** End Patch"}}
+{"type":"response_item","timestamp":"2026-07-02T12:30:05Z","payload":{"type":"function_call_output","call_id":"patch-1","output":"Success. Updated the following files:\nM stale.txt\n"}}
+{"type":"event_msg","timestamp":"2026-07-02T12:30:06Z","payload":{"type":"task_complete","turn_id":"t1","duration_ms":5000}}

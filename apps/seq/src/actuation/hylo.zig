@@ -5,7 +5,7 @@ const gcr = @import("gcr.zig");
 const output = @import("../output/mod.zig");
 
 pub const quality_state_count = 7;
-pub const failure_class_count = 14;
+pub const failure_class_count = 16;
 
 pub const quality_state_names = [_][]const u8{
     "absent",
@@ -32,6 +32,8 @@ pub const failure_class_names = [_][]const u8{
     "stale_hylo_after_diff_change",
     "review_fix_without_review_fold",
     "raw_review_to_patch",
+    "cached_cas_counted_as_fresh",
+    "ship_without_terminal_publication_boundary",
 };
 
 const QualityState = enum(u8) {
@@ -59,6 +61,8 @@ const FailureClass = enum(u8) {
     stale_hylo_after_diff_change = 11,
     review_fix_without_review_fold = 12,
     raw_review_to_patch = 13,
+    cached_cas_counted_as_fresh = 14,
+    ship_without_terminal_publication_boundary = 15,
 };
 
 const TextStats = struct {
@@ -83,9 +87,25 @@ const TextStats = struct {
     review_marker_count: usize = 0,
     review_fold_count: usize = 0,
     raw_review_patch_count: usize = 0,
+    direct_action_fused_count: usize = 0,
+    st_governed_count: usize = 0,
+    cached_cas_counted_fresh_count: usize = 0,
+    ship_effect_count: usize = 0,
+    publication_boundary_count: usize = 0,
 
     fn anyGovernance(self: TextStats) bool {
-        return self.alsr_count > 0 or self.hyl_count > 0 or self.hsr_step_count > 0 or self.resume_packet_count > 0;
+        return self.alsr_count > 0 or self.hyl_count > 0 or self.hsr_step_count > 0 or self.resume_packet_count > 0 or self.directActionFused() or self.stGoverned();
+    }
+
+    fn directActionFused(self: TextStats) bool {
+        return self.direct_action_fused_count > 0 and
+            self.review_marker_count == 0 and
+            self.parallel_frontier_count == 0 and
+            self.ship_effect_count == 0;
+    }
+
+    fn stGoverned(self: TextStats) bool {
+        return self.st_governed_count > 0;
     }
 };
 
@@ -122,6 +142,7 @@ pub fn analyzeTrace(trace: canonical_trace.CanonicalSessionTrace, true_run: bool
 
     const unfold_capacity = @max(stats.unfold_count, stats.hsr_step_count);
     summary.mutations_with_unfold = @min(summary.mutations, unfold_capacity);
+    if (stats.directActionFused() or stats.stGoverned()) summary.mutations_with_unfold = summary.mutations;
     summary.actions_without_fold = stats.action_count -| stats.fold_count;
     summary.continues_without_next_state = stats.continue_count -| stats.next_state_count;
     summary.atcg_after_terminal_fold = if (stats.terminal_fold_count > 0) @min(stats.terminal_fold_count, stats.atcg_count) else 0;
@@ -210,7 +231,7 @@ fn scanActiveText(text: []const u8, stats: *TextStats) void {
     if (hsr_markers > 0) {
         stats.unfold_count += if (containsAny(text, &.{ "unfold:", "\"unfold\"" })) hsr_markers else 0;
         stats.action_count += if (containsAny(text, &.{ "action:", "\"action\"" })) hsr_markers else 0;
-        stats.fold_count += if (containsAny(text, &.{ "fold:", "\"fold\"" })) hsr_markers else 0;
+        stats.fold_count += if (containsAny(text, &.{ "\n  fold:", "\nfold:", "\"fold\"" })) hsr_markers else 0;
     }
 
     stats.continue_count += countAny(text, &.{ "verdict: continue", "\"verdict\":\"continue\"", "\"verdict\": \"continue\"" });
@@ -235,6 +256,11 @@ fn scanActiveText(text: []const u8, stats: *TextStats) void {
     stats.review_marker_count += countAny(text, &.{ "$cas review", "review finding", "requested changes" });
     stats.review_fold_count += countAny(text, &.{ "$review-fold", "review-fold", "review_fold" });
     stats.raw_review_patch_count += countAny(text, &.{ "raw_review_to_patch", "Finding -> Patch" });
+    stats.direct_action_fused_count += countAny(text, &.{ "direct_action_fused: yes", "direct_action fused exemption" });
+    stats.st_governed_count += countAny(text, &.{ "st_governed_handoff: yes", "$st owns the work", "st-owned" });
+    stats.cached_cas_counted_fresh_count += countAny(text, &.{ "cached_cas_counted_as_fresh", "cas_receipt_cache_hit: yes\ncounted_as_fresh: yes" });
+    stats.ship_effect_count += countAny(text, &.{ "ship_handoff:", "$ship", "gh pr create", "gh pr edit", "gh pr ready", "gh pr merge" });
+    stats.publication_boundary_count += countAny(text, &.{ "publication_boundary: yes", "ship_result:", "ADD-v1" });
 }
 
 fn toolOutputLooksLikeSkillRead(tool: canonical_trace.ToolLifecycleRecord) bool {
@@ -249,15 +275,18 @@ fn passiveSpecDiscussion(text: []const u8) bool {
         contains(text, "Quality states") or
         contains(text, "Anti-contamination") or
         contains(text, "# 01 - `seq actuation-audit") or
+        contains(text, "# 02 - Regression Fixtures for Hylo Audits") or
+        contains(text, "expected_detection:") or
         contains(text, "schema:") and contains(text, "receipt_version: HSR-v1");
 }
 
 fn applyFailures(summary: *RunSummary, stats: TextStats) void {
-    if (!summary.alsr_present) addFailure(summary, .missing_alsr);
-    if (!summary.hyl_present) addFailure(summary, .missing_hyl);
-    if (summary.hsr_step_count == 0 or stats.unfold_count == 0) addFailure(summary, .missing_unfold);
+    const governance_exempt = stats.directActionFused() or stats.stGoverned();
+    if (!governance_exempt and !summary.alsr_present) addFailure(summary, .missing_alsr);
+    if (!governance_exempt and !summary.hyl_present) addFailure(summary, .missing_hyl);
+    if (!governance_exempt and (summary.hsr_step_count == 0 or stats.unfold_count == 0)) addFailure(summary, .missing_unfold);
     if (stats.stale_count > 0) addFailure(summary, .stale_hylo_after_diff_change);
-    if (summary.mutations > summary.mutations_with_unfold) addFailure(summary, .mutation_without_unfold);
+    if (!governance_exempt and summary.mutations > stats.unfold_count) addFailure(summary, .mutation_without_unfold);
     if (summary.actions_without_fold > 0) addFailure(summary, .action_without_fold);
     if (stats.current_artifact_no_count > 0) addFailure(summary, .fold_without_current_artifact);
     if (stats.stale_count > 0 or containsFailure(summary.*, .stale_hylo_after_diff_change)) addFailure(summary, .unfold_not_current);
@@ -267,11 +296,14 @@ fn applyFailures(summary: *RunSummary, stats: TextStats) void {
     if (stats.parallel_frontier_count > 0 and stats.fanin_count == 0) addFailure(summary, .parallel_fanout_without_fanin);
     if (stats.review_marker_count > 0 and summary.mutations > 0 and stats.review_fold_count == 0) addFailure(summary, .review_fix_without_review_fold);
     if (stats.raw_review_patch_count > 0) addFailure(summary, .raw_review_to_patch);
+    if (stats.cached_cas_counted_fresh_count > 0) addFailure(summary, .cached_cas_counted_as_fresh);
+    if (stats.ship_effect_count > 0 and stats.publication_boundary_count == 0) addFailure(summary, .ship_without_terminal_publication_boundary);
 }
 
 fn qualityState(summary: RunSummary, stats: TextStats) []const u8 {
     if (stats.contradictory_count > 0) return quality_state_names[@intFromEnum(QualityState.contradictory)];
     if (stats.stale_count > 0) return quality_state_names[@intFromEnum(QualityState.stale)];
+    if ((stats.directActionFused() or stats.stGoverned()) and summary.terminal_folds > 0 and summary.atcg_after_terminal_fold > 0) return quality_state_names[@intFromEnum(QualityState.present_and_closed)];
     if (!summary.alsr_present and !summary.hyl_present and summary.hsr_step_count == 0) return quality_state_names[@intFromEnum(QualityState.absent)];
     if (!summary.alsr_present or !summary.hyl_present or summary.hsr_step_count == 0) return quality_state_names[@intFromEnum(QualityState.partial)];
     if (summary.terminal_folds > 0 and summary.atcg_after_terminal_fold > 0 and !containsFailure(summary, .terminal_without_atcg)) return quality_state_names[@intFromEnum(QualityState.present_and_closed)];
