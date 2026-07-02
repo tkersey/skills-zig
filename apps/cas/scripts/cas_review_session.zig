@@ -3596,8 +3596,35 @@ fn validateCasRerRecordObjectAlloc(allocator: std.mem.Allocator, path: []const u
         if (proof_usable == null) {
             try appendGateError(allocator, &errors, "principal.proofUsable must be boolean", .{});
         }
-        if (std.mem.eql(u8, kind orelse "", "reduced") and proof_usable != false) {
-            try appendGateError(allocator, &errors, "principal.kind=reduced requires principal.proofUsable=false", .{});
+        const reduced = jsonBoolField(principal_obj, "reduced");
+        if (reduced == null) {
+            try appendGateError(allocator, &errors, "principal.reduced must be boolean", .{});
+        }
+        const fallback_used = jsonBoolField(principal_obj, "fallbackUsed");
+        if (fallback_used == null) {
+            try appendGateError(allocator, &errors, "principal.fallbackUsed must be boolean", .{});
+        }
+        if (std.mem.eql(u8, kind orelse "", "reduced")) {
+            if (proof_usable != false) {
+                try appendGateError(allocator, &errors, "principal.kind=reduced requires principal.proofUsable=false", .{});
+            }
+            if (reduced != true) {
+                try appendGateError(allocator, &errors, "principal.kind=reduced requires principal.reduced=true", .{});
+            }
+        }
+        if (proof_usable == true) {
+            if (!std.mem.eql(u8, kind orelse "", "strong")) {
+                try appendGateError(allocator, &errors, "principal.proofUsable=true requires principal.kind=strong", .{});
+            }
+            if (reduced != false) {
+                try appendGateError(allocator, &errors, "principal.proofUsable=true requires principal.reduced=false", .{});
+            }
+            if (fallback_used != false or std.mem.eql(u8, jsonStringField(principal_obj, "source") orelse "", "cas-native-fallback")) {
+                try appendGateError(allocator, &errors, "principal.proofUsable=true requires no fallback", .{});
+            }
+            if (!casRerPrincipalFingerprintUsable(jsonStringField(principal_obj, "accountFingerprint"))) {
+                try appendGateError(allocator, &errors, "principal.proofUsable=true requires principal.accountFingerprint", .{});
+            }
         }
     }
 
@@ -6209,6 +6236,16 @@ fn casRerObjectMatchesIdentity(root: std.json.ObjectMap, repo_realpath: []const 
     return optionalStringsEqual(jsonStringField(tuple, "targetFingerprint"), identity.fingerprint);
 }
 
+fn casRerPrincipalProofUsableObject(principal: ?std.json.ObjectMap) bool {
+    const principal_obj = principal orelse return false;
+    if (jsonBoolField(principal_obj, "proofUsable") != true) return false;
+    if (!std.mem.eql(u8, jsonStringField(principal_obj, "kind") orelse "", "strong")) return false;
+    if (jsonBoolField(principal_obj, "reduced") != false) return false;
+    if (jsonBoolField(principal_obj, "fallbackUsed") != false) return false;
+    if (std.mem.eql(u8, jsonStringField(principal_obj, "source") orelse "", "cas-native-fallback")) return false;
+    return casRerPrincipalFingerprintUsable(jsonStringField(principal_obj, "accountFingerprint"));
+}
+
 fn casRerLedgerRecordFromJsonAlloc(allocator: std.mem.Allocator, path: []const u8, raw: []const u8) !CasRerLedgerRecord {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
@@ -6236,7 +6273,7 @@ fn casRerLedgerRecordFromJsonAlloc(allocator: std.mem.Allocator, path: []const u
         .base_sha = if (tuple) |value| try dupOptional(allocator, jsonStringField(value, "baseSha")) else null,
         .head_sha = if (tuple) |value| try dupOptional(allocator, jsonStringField(value, "headSha")) else null,
         .target_fingerprint = if (tuple) |value| try dupOptional(allocator, jsonStringField(value, "targetFingerprint")) else null,
-        .principal_proof_usable = if (principal) |value| jsonBoolField(value, "proofUsable") orelse false else false,
+        .principal_proof_usable = casRerPrincipalProofUsableObject(principal),
     };
 }
 
@@ -10216,8 +10253,16 @@ fn casRerFallbackUsed(receipt: NormalizedReceipt) bool {
     return std.mem.eql(u8, receipt.backend_class, "cas-native-fallback");
 }
 
+fn casRerPrincipalFingerprintUsable(fingerprint: ?[]const u8) bool {
+    const value = nonEmptyOptional(fingerprint) orelse return false;
+    return !std.mem.eql(u8, value, unknown_account_fingerprint);
+}
+
 fn casRerPrincipalProofUsable(receipt: NormalizedReceipt) bool {
-    return std.mem.eql(u8, casRerPrincipalKind(receipt), "strong") and !receipt.account_fingerprint_reduced_protection and !casRerFallbackUsed(receipt);
+    return std.mem.eql(u8, casRerPrincipalKind(receipt), "strong") and
+        !receipt.account_fingerprint_reduced_protection and
+        !casRerFallbackUsed(receipt) and
+        casRerPrincipalFingerprintUsable(receipt.account_fingerprint);
 }
 
 fn casRerAttemptIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt) !?[]const u8 {
@@ -10387,6 +10432,10 @@ fn writeCasRerPrincipalObject(writer: *std.Io.Writer, receipt: NormalizedReceipt
     try writeJsonString(writer, "kind");
     try writer.writeByte(':');
     try writeJsonString(writer, casRerPrincipalKind(receipt));
+    try writer.writeByte(',');
+    try writeJsonString(writer, "accountFingerprint");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.account_fingerprint);
     try writer.writeByte(',');
     try writeJsonString(writer, "proofUsable");
     try writer.writeByte(':');
@@ -12865,7 +12914,7 @@ test "CAS-RER writer projects terminal findings receipt" {
 
 test "CAS-RER ledger record projection matches tuple identity" {
     const raw =
-        \\{"schema":"CAS-RER-v1","recordId":"rer_match","createdAt":"2026-07-02T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"import","backendSelected":"imported-legacy","brokerDecision":{"action":"imported_legacy","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:a","phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":true,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_match","createdAt":"2026-07-02T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"import","backendSelected":"imported-legacy","brokerDecision":{"action":"imported_legacy","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:a","phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":true,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
     ;
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
     defer parsed.deinit();
@@ -12899,7 +12948,7 @@ test "CAS-RER ledger record projection matches tuple identity" {
     try std.testing.expectEqualStrings("run_new_attempt", actionRequiredForCasRerRecord(reduced_record));
 
     const timeout_raw =
-        \\{"schema":"CAS-RER-v1","recordId":"rer_timeout","createdAt":"2026-07-02T00:00:02Z","updatedAt":"2026-07-02T00:00:02Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:c","phase":"review_waiting","reviewThreadId":"thr_timeout","reviewTurnId":"turn_timeout"},"verdict":{"tupleVerdictExists":false,"status":"timeout","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":"wait_timed_out","failureClass":"timeout","retryableSameTupleNow":true},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-start-wait"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_timeout","createdAt":"2026-07-02T00:00:02Z","updatedAt":"2026-07-02T00:00:02Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:c","phase":"review_waiting","reviewThreadId":"thr_timeout","reviewTurnId":"turn_timeout"},"verdict":{"tupleVerdictExists":false,"status":"timeout","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":"wait_timed_out","failureClass":"timeout","retryableSameTupleNow":true},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-start-wait"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
     ;
     const timeout_record = try casRerLedgerRecordFromJsonAlloc(std.testing.allocator, "/tmp/rer_timeout.json", timeout_raw);
     defer timeout_record.deinit(std.testing.allocator);
@@ -12908,7 +12957,7 @@ test "CAS-RER ledger record projection matches tuple identity" {
     try std.testing.expectEqualStrings("inspect", actionRequiredForCasRerRecord(timeout_record));
 
     const active_incomplete_raw =
-        \\{"schema":"CAS-RER-v1","recordId":"rer_active","createdAt":"2026-07-02T00:00:03Z","updatedAt":"2026-07-02T00:00:03Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"blocked_live","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:d","phase":"review_waiting","reviewThreadId":"thr_active","reviewTurnId":"turn_active"},"verdict":{"tupleVerdictExists":false,"status":"incomplete","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":true},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-run"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_active","createdAt":"2026-07-02T00:00:03Z","updatedAt":"2026-07-02T00:00:03Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"blocked_live","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:d","phase":"review_waiting","reviewThreadId":"thr_active","reviewTurnId":"turn_active"},"verdict":{"tupleVerdictExists":false,"status":"incomplete","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":true},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-run"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
     ;
     const active_record = try casRerLedgerRecordFromJsonAlloc(std.testing.allocator, "/tmp/rer_active.json", active_incomplete_raw);
     defer active_record.deinit(std.testing.allocator);
@@ -12917,7 +12966,7 @@ test "CAS-RER ledger record projection matches tuple identity" {
     try std.testing.expectEqualStrings("wait", actionRequiredForCasRerRecord(active_record));
 
     const active_transport_raw =
-        \\{"schema":"CAS-RER-v1","recordId":"rer_active_transport","createdAt":"2026-07-02T00:00:04Z","updatedAt":"2026-07-02T00:00:04Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:e","phase":"review_waiting","reviewThreadId":"thr_transport","reviewTurnId":"turn_transport"},"verdict":{"tupleVerdictExists":false,"status":"transport_failure","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":"review_transport_lost","failureClass":"transport","retryableSameTupleNow":true},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-start-wait"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_active_transport","createdAt":"2026-07-02T00:00:04Z","updatedAt":"2026-07-02T00:00:04Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:e","phase":"review_waiting","reviewThreadId":"thr_transport","reviewTurnId":"turn_transport"},"verdict":{"tupleVerdictExists":false,"status":"transport_failure","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":"review_transport_lost","failureClass":"transport","retryableSameTupleNow":true},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-start-wait"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
     ;
     const active_transport_record = try casRerLedgerRecordFromJsonAlloc(std.testing.allocator, "/tmp/rer_active_transport.json", active_transport_raw);
     defer active_transport_record.deinit(std.testing.allocator);
@@ -12925,7 +12974,7 @@ test "CAS-RER ledger record projection matches tuple identity" {
     try std.testing.expectEqualStrings("wait", actionRequiredForCasRerRecord(active_transport_record));
 
     const terminal_incomplete_raw =
-        \\{"schema":"CAS-RER-v1","recordId":"rer_terminal_incomplete","createdAt":"2026-07-02T00:00:05Z","updatedAt":"2026-07-02T00:00:05Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:f","phase":"review_terminal","reviewThreadId":"thr_terminal","reviewTurnId":"turn_terminal"},"verdict":{"tupleVerdictExists":false,"status":"incomplete","clean":false,"findingCount":1,"findings":[{"title":"tuple mismatch"}]},"failure":{"failureCode":"tuple_mismatch","failureClass":"caller_error","retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-start-wait"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_terminal_incomplete","createdAt":"2026-07-02T00:00:05Z","updatedAt":"2026-07-02T00:00:05Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:f","phase":"review_terminal","reviewThreadId":"thr_terminal","reviewTurnId":"turn_terminal"},"verdict":{"tupleVerdictExists":false,"status":"incomplete","clean":false,"findingCount":1,"findings":[{"title":"tuple mismatch"}]},"failure":{"failureCode":"tuple_mismatch","failureClass":"caller_error","retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-start-wait"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
     ;
     const terminal_incomplete_record = try casRerLedgerRecordFromJsonAlloc(std.testing.allocator, "/tmp/rer_terminal_incomplete.json", terminal_incomplete_raw);
     defer terminal_incomplete_record.deinit(std.testing.allocator);
@@ -12971,7 +13020,7 @@ test "CAS-RER writer projects pre-review lane transport as non-attempt" {
 
 test "CAS-RER validator rejects findings without finding count" {
     const raw =
-        \\{"schema":"CAS-RER-v1","recordId":"rer_bad","tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_bad","tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
     ;
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
     defer parsed.deinit();
@@ -12984,7 +13033,7 @@ test "CAS-RER validator rejects findings without finding count" {
 
 test "CAS-RER validator rejects verdict clean/status disagreement" {
     const clean_false_raw =
-        \\{"schema":"CAS-RER-v1","recordId":"rer_clean_false","tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_clean_false","tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
     ;
     var clean_false = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, clean_false_raw, .{});
     defer clean_false.deinit();
@@ -12995,7 +13044,7 @@ test "CAS-RER validator rejects verdict clean/status disagreement" {
     try std.testing.expect(std.mem.indexOf(u8, clean_false_gate.errors[0], "verdict.clean=true") != null);
 
     const findings_true_raw =
-        \\{"schema":"CAS-RER-v1","recordId":"rer_findings_true","tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":true,"findingCount":1,"findings":[{"title":"issue"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_findings_true","tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":true,"findingCount":1,"findings":[{"title":"issue"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
     ;
     var findings_true = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, findings_true_raw, .{});
     defer findings_true.deinit();
@@ -13008,7 +13057,7 @@ test "CAS-RER validator rejects verdict clean/status disagreement" {
 
 test "CAS-RER validator rejects terminal verdict without attempt" {
     const raw =
-        \\{"schema":"CAS-RER-v1","recordId":"rer_no_attempt","tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":false,"phase":"normalized_verdict","reviewThreadId":null,"reviewTurnId":null},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_no_attempt","tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":false,"phase":"normalized_verdict","reviewThreadId":null,"reviewTurnId":null},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
     ;
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
     defer parsed.deinit();
@@ -13017,6 +13066,19 @@ test "CAS-RER validator rejects terminal verdict without attempt" {
     try std.testing.expect(!gate.ok());
     try std.testing.expect(gate.errors.len >= 3);
     try std.testing.expect(std.mem.indexOf(u8, gate.errors[0], "attempt.exists=true") != null);
+}
+
+test "CAS-RER validator rejects proof usable principal without account fingerprint" {
+    const raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_unbound_principal","tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "unbound-principal-rer.json", parsed.value.object);
+    defer gate.deinit(std.testing.allocator);
+    try std.testing.expect(!gate.ok());
+    try std.testing.expectEqual(@as(usize, 1), gate.errors.len);
+    try std.testing.expect(std.mem.indexOf(u8, gate.errors[0], "accountFingerprint") != null);
 }
 
 test "CAS-RER validator rejects null required sections" {

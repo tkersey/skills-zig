@@ -847,7 +847,7 @@ fn classifyCasRerObject(allocator: std.mem.Allocator, root: std.json.ObjectMap, 
     const raw_tuple_verdict_exists = if (verdict) |value| boolField(value, "tupleVerdictExists") orelse false else false;
     const finding_count = if (verdict) |value| intField(value, "findingCount") orelse 0 else 0;
     const principal_kind = if (principal) |value| nullableString(value, "kind") else null;
-    const principal_proof_usable = if (principal) |value| boolField(value, "proofUsable") orelse false else false;
+    const principal_proof_usable = casRerPrincipalProofUsable(principal);
     const principal_reduced = if (principal) |value| boolField(value, "reduced") orelse optEql(principal_kind, "reduced") else false;
     const principal_fallback_used = if (principal) |value| boolField(value, "fallbackUsed") orelse false else false;
     const terminal_status = optEql(raw_status, "clean") or optEql(raw_status, "findings");
@@ -1269,6 +1269,17 @@ fn object(value: std.json.Value) ?std.json.ObjectMap {
 fn objectField(obj: std.json.ObjectMap, key: []const u8) ?std.json.ObjectMap {
     const value = obj.get(key) orelse return null;
     return object(value);
+}
+
+fn casRerPrincipalProofUsable(principal: ?std.json.ObjectMap) bool {
+    const principal_obj = principal orelse return false;
+    if (boolField(principal_obj, "proofUsable") != true) return false;
+    if (!optEql(nullableString(principal_obj, "kind"), "strong")) return false;
+    if (boolField(principal_obj, "reduced") != false) return false;
+    if (boolField(principal_obj, "fallbackUsed") != false) return false;
+    if (optEql(nullableString(principal_obj, "source"), "cas-native-fallback")) return false;
+    const fingerprint = nullableString(principal_obj, "accountFingerprint") orelse return false;
+    return !std.mem.eql(u8, fingerprint, "unknown-account");
 }
 
 fn stringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -1720,7 +1731,7 @@ test "snake-case root verdict receipts are normalized" {
 
 test "CAS-RER findings record is canonical ledger evidence" {
     var row = try classifyReceiptText(std.testing.allocator,
-        \\{"schema":"CAS-RER-v1","recordId":"rer_findings","createdAt":"2026-07-02T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane","brokerDecision":{"action":"imported_legacy","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:attempt","phase":"normalized_verdict","reviewThreadId":"thr_findings","reviewTurnId":"turn_findings","recordPath":"/tmp/session.json","eventLogPath":"/tmp/events.ndjson"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":2,"findings":[{"title":"one"},{"title":"two"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"},"attachments":{"eventLog":"/tmp/events.ndjson","rawSessionRecord":"/tmp/session.json","rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":true,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_findings","createdAt":"2026-07-02T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane","brokerDecision":{"action":"imported_legacy","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:attempt","phase":"normalized_verdict","reviewThreadId":"thr_findings","reviewTurnId":"turn_findings","recordPath":"/tmp/session.json","eventLogPath":"/tmp/events.ndjson"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":2,"findings":[{"title":"one"},{"title":"two"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"},"attachments":{"eventLog":"/tmp/events.ndjson","rawSessionRecord":"/tmp/session.json","rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":true,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
     , .{
         .session_id = "",
         .cwd = null,
@@ -1768,9 +1779,29 @@ test "CAS-RER unusable principal is not counted as completed evidence" {
     try std.testing.expectEqual(@as(i64, 0), summary.completed_findings_count);
 }
 
+test "CAS-RER proof usable principal requires account fingerprint" {
+    var row = try classifyReceiptText(std.testing.allocator,
+        \\{"schema":"CAS-RER-v1","recordId":"rer_missing_principal_fingerprint","createdAt":"2026-07-02T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_missing_fingerprint","reviewTurnId":"turn_missing_fingerprint"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+    , .{
+        .session_id = "",
+        .cwd = null,
+        .command_surface = "receipt",
+        .source_path = "/tmp/rer-missing-principal-fingerprint.json",
+        .default_backend_class = "cas-receipt-normalized",
+    });
+    defer row.deinit();
+
+    try std.testing.expectEqualStrings("review_untrusted_source", scalarString(row, "canonical_status").?);
+    try std.testing.expect(!scalarBool(row, "tuple_verdict_exists"));
+    try std.testing.expect(!scalarBool(row, "principal_proof_usable"));
+
+    const summary = summarize(&.{row});
+    try std.testing.expectEqual(@as(i64, 0), summary.completed_clean_count);
+}
+
 test "CAS-RER unbound terminal status is not counted as completed evidence" {
     var row = try classifyReceiptText(std.testing.allocator,
-        \\{"schema":"CAS-RER-v1","recordId":"rer_unbound_findings","createdAt":"2026-07-02T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":null,"targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_unbound","reviewTurnId":"turn_unbound"},"verdict":{"tupleVerdictExists":false,"status":"findings","clean":false,"findingCount":1,"findings":[{"title":"unbound"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_unbound_findings","createdAt":"2026-07-02T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":null,"targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_unbound","reviewTurnId":"turn_unbound"},"verdict":{"tupleVerdictExists":false,"status":"findings","clean":false,"findingCount":1,"findings":[{"title":"unbound"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
     , .{
         .session_id = "",
         .cwd = null,
@@ -1803,7 +1834,7 @@ test "CAS-RER findings are not reduced to timeout-only audit evidence" {
     defer timeout_row.deinit();
 
     var findings_row = try classifyReceiptText(std.testing.allocator,
-        \\{"schema":"CAS-RER-v1","recordId":"rer_same","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_same","reviewTurnId":"turn_same"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":1,"findings":[{"title":"issue"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_same","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_same","reviewTurnId":"turn_same"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":1,"findings":[{"title":"issue"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
     , .{
         .session_id = "sess",
         .cwd = "/repo",
@@ -1823,7 +1854,7 @@ test "CAS import envelope expands nested CAS-RER records" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "import.json", .data =
-        \\{"schema":"CAS-IMPORT-v1","records":[{"sourcePath":"/tmp/receipt.json","recordPath":"/tmp/rer.json","validation":{"ok":true,"errors":[],"path":"/tmp/receipt.json"},"record":{"schema":"CAS-RER-v1","recordId":"rer_envelope","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_env","reviewTurnId":"turn_env"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true}}},{"sourcePath":"/tmp/bad.json","recordPath":"","validation":{"ok":false,"errors":["bad"],"path":"/tmp/bad.json"},"record":{"schema":"CAS-RER-v1","recordId":"rer_rejected","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_bad","reviewTurnId":"turn_bad"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":1,"findings":[{"title":"bad"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true}}}],"errors":[]}
+        \\{"schema":"CAS-IMPORT-v1","records":[{"sourcePath":"/tmp/receipt.json","recordPath":"/tmp/rer.json","validation":{"ok":true,"errors":[],"path":"/tmp/receipt.json"},"record":{"schema":"CAS-RER-v1","recordId":"rer_envelope","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_env","reviewTurnId":"turn_env"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}},{"sourcePath":"/tmp/bad.json","recordPath":"","validation":{"ok":false,"errors":["bad"],"path":"/tmp/bad.json"},"record":{"schema":"CAS-RER-v1","recordId":"rer_rejected","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_bad","reviewTurnId":"turn_bad"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":1,"findings":[{"title":"bad"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}}],"errors":[]}
     });
     const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
@@ -1846,7 +1877,7 @@ test "CAS import JSONL wrapper expands nested CAS-RER record" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "import.jsonl", .data =
-        \\{"sourcePath":"/tmp/receipt.json","recordPath":"/tmp/rer.json","validation":{"ok":true,"errors":[],"path":"/tmp/receipt.json"},"record":{"schema":"CAS-RER-v1","recordId":"rer_jsonl_wrapper","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_jsonl","reviewTurnId":"turn_jsonl"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true}}}
+        \\{"sourcePath":"/tmp/receipt.json","recordPath":"/tmp/rer.json","validation":{"ok":true,"errors":[],"path":"/tmp/receipt.json"},"record":{"schema":"CAS-RER-v1","recordId":"rer_jsonl_wrapper","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_jsonl","reviewTurnId":"turn_jsonl"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}}
     });
     const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
@@ -1868,7 +1899,7 @@ test "CAS run envelope expands nested CAS-RER record" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "run.json", .data =
-        \\{"schema":"CAS-RUN-v1","recordPath":"/tmp/rer-run.json","record":{"schema":"CAS-RER-v1","recordId":"rer_run","command":{"surface":"run","backendSelected":"cas-run","sourceBackendClass":"cas-start-wait","brokerDecision":{"action":"replaced_dead_transport","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_run","reviewTurnId":"turn_run"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true}},"reviewBrokerDecision":{"action":"replaced_dead_transport","reason":"test","freshAttemptRequired":false}}
+        \\{"schema":"CAS-RUN-v1","recordPath":"/tmp/rer-run.json","record":{"schema":"CAS-RER-v1","recordId":"rer_run","command":{"surface":"run","backendSelected":"cas-run","sourceBackendClass":"cas-start-wait","brokerDecision":{"action":"replaced_dead_transport","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_run","reviewTurnId":"turn_run"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}},"reviewBrokerDecision":{"action":"replaced_dead_transport","reason":"test","freshAttemptRequired":false}}
     });
     const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
@@ -1935,3 +1966,4 @@ test "summary separates review transport timeout duplicate and degraded lane tup
     try std.testing.expectEqual(@as(i64, 0), summary.duplicate_prevented_count);
     try std.testing.expectEqualStrings("degraded", summary.lane_backend_status);
 }
+{"v":1,"source":"learnings","event":"learning.capture","learning_id":"lrn-20260702T062827Z-c7ffe737","status":"do_more","record":{"id":"lrn-20260702T062827Z-c7ffe737","captured_at":"2026-07-02T06:28:27Z","status":"do_more","learning":"When CAS-RER principal.proofUsable is true, prefer deriving trust from strong kind, reduced=false, fallbackUsed=false, and a non-unknown accountFingerprint because trusting the boolean alone can admit unbound fallback evidence.","evidence":["CAS review on PR #56 found that imported or validated CAS-RER records could mark kind=strong and proofUsable=true while using native fallback or omitting account fingerprint binding.","Fix emits principal.accountFingerprint, requires it in CAS-RER validation when proofUsable=true, and makes cas review current plus seq recompute proof usability before treating terminal evidence as usable."],"application":"For CAS ledger and audit consumers, keep principal proof usability derived from all binding facts before current-state decisions or completed-evidence counters.","context":{"repo":"skills-zig","branch":"unknown","paths":[]},"source":"codex","fingerprint":"c7ffe73751dbec39","tags":["cas","review_ledger","principal","seq"]}}
