@@ -1279,6 +1279,7 @@ fn casRerPrincipalProofUsable(principal: ?std.json.ObjectMap) bool {
     if (boolField(principal_obj, "fallbackUsed") != false) return false;
     if (optEql(nullableString(principal_obj, "source"), "cas-native-fallback")) return false;
     const fingerprint = nullableString(principal_obj, "accountFingerprint") orelse return false;
+    if (fingerprint.len == 0) return false;
     return !std.mem.eql(u8, fingerprint, "unknown-account");
 }
 
@@ -1797,6 +1798,21 @@ test "CAS-RER proof usable principal requires account fingerprint" {
 
     const summary = summarize(&.{row});
     try std.testing.expectEqual(@as(i64, 0), summary.completed_clean_count);
+
+    var empty_row = try classifyReceiptText(std.testing.allocator,
+        \\{"schema":"CAS-RER-v1","recordId":"rer_empty_principal_fingerprint","createdAt":"2026-07-02T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_empty_fingerprint","reviewTurnId":"turn_empty_fingerprint"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+    , .{
+        .session_id = "",
+        .cwd = null,
+        .command_surface = "receipt",
+        .source_path = "/tmp/rer-empty-principal-fingerprint.json",
+        .default_backend_class = "cas-receipt-normalized",
+    });
+    defer empty_row.deinit();
+
+    try std.testing.expectEqualStrings("review_untrusted_source", scalarString(empty_row, "canonical_status").?);
+    try std.testing.expect(!scalarBool(empty_row, "tuple_verdict_exists"));
+    try std.testing.expect(!scalarBool(empty_row, "principal_proof_usable"));
 }
 
 test "CAS-RER unbound terminal status is not counted as completed evidence" {

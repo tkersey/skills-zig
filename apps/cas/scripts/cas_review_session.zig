@@ -3501,10 +3501,10 @@ fn validateCasRerRecordObjectAlloc(allocator: std.mem.Allocator, path: []const u
         if (attempt_exists == null) {
             try appendGateError(allocator, &errors, "attempt.exists must be boolean", .{});
         }
-        const review_thread_id_present = fieldPresentNonNull(attempt_obj, "reviewThreadId");
+        const review_thread_id_present = nonEmptyOptional(jsonStringField(attempt_obj, "reviewThreadId")) != null;
         if (attempt_exists) |value| {
             if (value != review_thread_id_present) {
-                try appendGateError(allocator, &errors, "attempt.exists must equal attempt.reviewThreadId != null", .{});
+                try appendGateError(allocator, &errors, "attempt.exists must equal attempt.reviewThreadId non-empty", .{});
             }
         }
         if (jsonStringField(attempt_obj, "phase")) |phase| {
@@ -13081,6 +13081,19 @@ test "CAS-RER validator rejects terminal verdict without attempt" {
     try std.testing.expect(!gate.ok());
     try std.testing.expect(gate.errors.len >= 3);
     try std.testing.expect(std.mem.indexOf(u8, gate.errors[0], "attempt.exists=true") != null);
+}
+
+test "CAS-RER validator rejects attempt exists with empty review thread id" {
+    const raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_empty_thread","tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"phase":"review_waiting","reviewThreadId":"","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":false,"status":"incomplete","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":true},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "empty-thread-rer.json", parsed.value.object);
+    defer gate.deinit(std.testing.allocator);
+    try std.testing.expect(!gate.ok());
+    try std.testing.expect(gate.errors.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, gate.errors[0], "reviewThreadId non-empty") != null);
 }
 
 test "CAS-RER validator rejects proof usable principal without account fingerprint" {
