@@ -3742,12 +3742,34 @@ fn validateCasRerRecordObjectAlloc(allocator: std.mem.Allocator, path: []const u
         }
     }
 
-    _ = try requiredCasRerObjectField(allocator, data, "command", &errors);
+    const command = try requiredCasRerObjectField(allocator, data, "command", &errors);
     const tuple = try requiredCasRerObjectField(allocator, data, "tuple", &errors);
     const attempt = try requiredCasRerObjectField(allocator, data, "attempt", &errors);
     const verdict = try requiredCasRerObjectField(allocator, data, "verdict", &errors);
     const failure = try requiredCasRerObjectField(allocator, data, "failure", &errors);
     const principal = try requiredCasRerObjectField(allocator, data, "principal", &errors);
+
+    if (command) |command_obj| {
+        if (nonEmptyOptional(jsonStringField(command_obj, "surface")) == null) {
+            try appendGateError(allocator, &errors, "command.surface must be non-empty", .{});
+        }
+        if (nonEmptyOptional(jsonStringField(command_obj, "backendSelected")) == null) {
+            try appendGateError(allocator, &errors, "command.backendSelected must be non-empty", .{});
+        }
+        if (objectField(command_obj, "brokerDecision")) |broker| {
+            if (nonEmptyOptional(jsonStringField(broker, "action")) == null) {
+                try appendGateError(allocator, &errors, "command.brokerDecision.action must be non-empty", .{});
+            }
+            if (nonEmptyOptional(jsonStringField(broker, "reason")) == null) {
+                try appendGateError(allocator, &errors, "command.brokerDecision.reason must be non-empty", .{});
+            }
+            if (jsonBoolField(broker, "freshAttemptRequired") == null) {
+                try appendGateError(allocator, &errors, "command.brokerDecision.freshAttemptRequired must be boolean", .{});
+            }
+        } else {
+            try appendGateError(allocator, &errors, "missing command.brokerDecision", .{});
+        }
+    }
 
     var attempt_exists_value: ?bool = null;
     if (attempt) |attempt_obj| {
@@ -3857,6 +3879,10 @@ fn validateCasRerRecordObjectAlloc(allocator: std.mem.Allocator, path: []const u
                         }
                         if (nonEmptyOptional(jsonStringField(attempt_obj, "reviewTurnId")) == null) {
                             try appendGateError(allocator, &errors, "terminal tuple verdict requires attempt.reviewTurnId", .{});
+                        }
+                        const phase = jsonStringField(attempt_obj, "phase") orelse "";
+                        if (!(std.mem.eql(u8, phase, "review_terminal") or std.mem.eql(u8, phase, "normalized_verdict"))) {
+                            try appendGateError(allocator, &errors, "terminal tuple verdict requires terminal attempt.phase", .{});
                         }
                     }
                 }
@@ -6782,7 +6808,7 @@ fn parseTwoDigits(text: []const u8) ?i64 {
 }
 
 fn parseIsoTimestampNs(text: []const u8) ?i128 {
-    if (text.len < 20) return null;
+    if (text.len < 19) return null;
     if (text[4] != '-' or text[7] != '-' or text[10] != 'T' or text[13] != ':' or text[16] != ':') return null;
     const year = std.fmt.parseInt(i64, text[0..4], 10) catch return null;
     const month = parseTwoDigits(text[5..7]) orelse return null;
@@ -6793,7 +6819,45 @@ fn parseIsoTimestampNs(text: []const u8) ?i128 {
     if (month < 1 or month > 12 or day < 1 or day > 31 or hour > 23 or minute > 59 or second > 60) return null;
     const days = daysFromCivil(year, month, day);
     const seconds = days * 86_400 + hour * 3_600 + minute * 60 + second;
-    return @as(i128, seconds) * 1_000_000_000;
+
+    var idx: usize = 19;
+    var fraction_ns: i128 = 0;
+    if (idx < text.len and text[idx] == '.') {
+        idx += 1;
+        var stored_digits: usize = 0;
+        var saw_digit = false;
+        while (idx < text.len and std.ascii.isDigit(text[idx])) : (idx += 1) {
+            saw_digit = true;
+            if (stored_digits < 9) {
+                fraction_ns = fraction_ns * 10 + @as(i128, text[idx] - '0');
+                stored_digits += 1;
+            }
+        }
+        if (!saw_digit) return null;
+        while (stored_digits < 9) : (stored_digits += 1) {
+            fraction_ns *= 10;
+        }
+    }
+
+    var offset_seconds: i64 = 0;
+    if (idx < text.len) {
+        if (text[idx] == 'Z') {
+            idx += 1;
+            if (idx != text.len) return null;
+        } else if (text[idx] == '+' or text[idx] == '-') {
+            const sign: i64 = if (text[idx] == '+') 1 else -1;
+            idx += 1;
+            if (idx + 5 != text.len or text[idx + 2] != ':') return null;
+            const offset_hour = parseTwoDigits(text[idx .. idx + 2]) orelse return null;
+            const offset_minute = parseTwoDigits(text[idx + 3 .. idx + 5]) orelse return null;
+            if (offset_hour > 23 or offset_minute > 59) return null;
+            offset_seconds = sign * (offset_hour * 3_600 + offset_minute * 60);
+        } else {
+            return null;
+        }
+    }
+
+    return @as(i128, seconds - offset_seconds) * 1_000_000_000 + fraction_ns;
 }
 
 fn parseCasRerCreatedAtNs(text: []const u8) ?i128 {
@@ -8395,7 +8459,7 @@ fn emitPreReviewLaneTransportLostAndExit(
         defer normalized.deinit(allocator);
         const timestamp = try casRerTimestampAlloc(allocator);
         defer allocator.free(timestamp);
-        const shadow_record_path = try writeCasRerShadowRecordFromReceipt(allocator, normalized, .{
+        const shadow_record_path = writeCasRerShadowRecordFromReceipt(allocator, normalized, .{
             .command_surface = "lane_review",
             .backend_selected = "cas-lane",
             .broker_action = "created_new",
@@ -8404,8 +8468,8 @@ fn emitPreReviewLaneTransportLostAndExit(
             .tuple_current_at_record_time = true,
             .created_at = timestamp,
             .updated_at = timestamp,
-        });
-        defer allocator.free(shadow_record_path);
+        }) catch null;
+        defer if (shadow_record_path) |path| allocator.free(path);
         var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try stdout.print("{s}\n", .{payload});
@@ -13617,17 +13681,20 @@ test "CAS-RER ledger record projection matches tuple identity" {
     try std.testing.expectEqual(@as(?usize, 1), latestCasRerLedgerRecordIndex(&ranked_records));
 
     const unix_timestamp_raw =
-        \\{"schema":"CAS-RER-v1","recordId":"rer_unix_ts","createdAt":"unix-ns:2000000000","updatedAt":"unix-ns:2000000000","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:unix","phase":"normalized_verdict","reviewThreadId":"thr_unix","reviewTurnId":"turn_unix"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-run"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_unix_ts","createdAt":"unix-ns:500000000","updatedAt":"unix-ns:500000000","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:unix","phase":"normalized_verdict","reviewThreadId":"thr_unix","reviewTurnId":"turn_unix"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-run"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
     ;
     const unix_timestamp_record = try casRerLedgerRecordFromJsonAlloc(std.testing.allocator, "/tmp/rer_unix_ts.json", unix_timestamp_raw);
     defer unix_timestamp_record.deinit(std.testing.allocator);
     const iso_timestamp_raw =
-        \\{"schema":"CAS-RER-v1","recordId":"rer_iso_ts","createdAt":"1970-01-01T00:00:03Z","updatedAt":"1970-01-01T00:00:03Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:iso","phase":"normalized_verdict","reviewThreadId":"thr_iso","reviewTurnId":"turn_iso"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-run"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_iso_ts","createdAt":"1970-01-01T00:00:00.900Z","updatedAt":"1970-01-01T00:00:00.900Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:iso","phase":"normalized_verdict","reviewThreadId":"thr_iso","reviewTurnId":"turn_iso"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-run"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
     ;
     const iso_timestamp_record = try casRerLedgerRecordFromJsonAlloc(std.testing.allocator, "/tmp/rer_iso_ts.json", iso_timestamp_raw);
     defer iso_timestamp_record.deinit(std.testing.allocator);
     const timestamp_records = [_]CasRerLedgerRecord{ unix_timestamp_record, iso_timestamp_record };
     try std.testing.expectEqual(@as(?usize, 1), latestCasRerLedgerRecordIndex(&timestamp_records));
+    try std.testing.expectEqual(@as(?i128, 900_000_000), parseCasRerCreatedAtNs("1970-01-01T00:00:00.900Z"));
+    try std.testing.expectEqual(@as(?i128, 0), parseCasRerCreatedAtNs("1970-01-01T01:00:00+01:00"));
+    try std.testing.expectEqual(@as(?i128, 1_500_000_000), parseCasRerCreatedAtNs("1970-01-01T00:00:01.500+00:00"));
 
     const timeout_raw =
         \\{"schema":"CAS-RER-v1","recordId":"rer_timeout","createdAt":"2026-07-02T00:00:02Z","updatedAt":"2026-07-02T00:00:02Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:c","phase":"review_waiting","reviewThreadId":"thr_timeout","reviewTurnId":"turn_timeout"},"verdict":{"tupleVerdictExists":false,"status":"timeout","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":"wait_timed_out","failureClass":"timeout","retryableSameTupleNow":true},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-start-wait"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
@@ -13883,6 +13950,19 @@ test "CAS-RER validator rejects non-terminal tuple verdicts" {
     try std.testing.expect(gateErrorsContain(gate, "terminal clean or findings"));
 }
 
+test "CAS-RER validator rejects terminal tuple verdict with waiting phase" {
+    const raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_waiting_clean","command":{"surface":"import","backendSelected":"imported-legacy","brokerDecision":{"action":"imported_legacy","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"phase":"review_waiting","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "waiting-clean-rer.json", parsed.value.object);
+    defer gate.deinit(std.testing.allocator);
+    try std.testing.expect(!gate.ok());
+    try std.testing.expect(gate.errors.len >= 1);
+    try std.testing.expect(gateErrorsContain(gate, "terminal attempt.phase"));
+}
+
 test "CAS-RER validator rejects verdict clean/status disagreement" {
     const clean_false_raw =
         \\{"schema":"CAS-RER-v1","recordId":"rer_clean_false","tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
@@ -13994,6 +14074,20 @@ test "CAS-RER validator rejects missing command section" {
     try std.testing.expect(!gate.ok());
     try std.testing.expect(gate.errors.len >= 1);
     try std.testing.expect(std.mem.indexOf(u8, gate.errors[0], "missing command") != null);
+}
+
+test "CAS-RER validator rejects incomplete command metadata" {
+    const raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_empty_command","command":{},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "empty-command-rer.json", parsed.value.object);
+    defer gate.deinit(std.testing.allocator);
+    try std.testing.expect(!gate.ok());
+    try std.testing.expect(gateErrorsContain(gate, "command.surface"));
+    try std.testing.expect(gateErrorsContain(gate, "command.backendSelected"));
+    try std.testing.expect(gateErrorsContain(gate, "command.brokerDecision"));
 }
 
 test "CAS-RER validator rejects null required sections" {
