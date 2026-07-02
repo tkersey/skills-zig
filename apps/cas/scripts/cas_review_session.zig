@@ -8315,6 +8315,7 @@ fn reviewVerdictJsonForStatusAlloc(
 fn casRunSyntheticReceiptJsonAlloc(
     allocator: std.mem.Allocator,
     cwd: []const u8,
+    identity: TargetIdentity,
     parent_thread_id: []const u8,
     review_thread_id: ?[]const u8,
     review_turn_id: ?[]const u8,
@@ -8334,6 +8335,18 @@ fn casRunSyntheticReceiptJsonAlloc(
     try writeJsonString(writer, "cwd");
     try writer.writeByte(':');
     try writeJsonString(writer, cwd);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "baseSha");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, identity.base_sha);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "headSha");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, identity.head_sha);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "targetFingerprint");
+    try writer.writeByte(':');
+    try writeJsonString(writer, identity.fingerprint);
     try writer.writeByte(',');
     try writeJsonString(writer, "parentThreadId");
     try writer.writeByte(':');
@@ -8506,6 +8519,7 @@ fn printStartJson(
             const synthetic_receipt_json = try casRunSyntheticReceiptJsonAlloc(
                 allocator,
                 cwd,
+                identity,
                 parent_thread_id,
                 review_thread_id,
                 review_turn_id,
@@ -8536,6 +8550,7 @@ fn printStartJson(
             const synthetic_receipt_json = try casRunSyntheticReceiptJsonAlloc(
                 allocator,
                 cwd,
+                identity,
                 parent_thread_id,
                 review_thread_id,
                 review_turn_id,
@@ -10041,6 +10056,8 @@ fn writeCasRunEnvelopeFromReceipt(allocator: std.mem.Allocator, writer: *std.Io.
     try writeJsonString(writer, ledger_record_path);
     try writer.writeAll(",\"record\":");
     try writer.writeAll(record_json);
+    try writer.writeAll(",\"reviewVerdict\":");
+    try writeReceiptReviewVerdictObject(writer, receipt);
     try writer.writeAll(",\"reviewBrokerDecision\":");
     try writePublicReviewBrokerDecisionObject(writer, broker, fresh_attempt_required);
     try writer.writeByte('}');
@@ -13327,6 +13344,45 @@ test "receipt normalizer emits nested reviewVerdict in normalized JSON" {
     try std.testing.expect(compact.get("reviewAttemptExists").?.bool);
     try std.testing.expect(compact.get("tupleVerdictExists").?.bool);
     try std.testing.expectEqualStrings(principal_strength_strong, compact.get("principalStrength").?.string);
+}
+
+test "synthetic run receipt preserves root tuple binding" {
+    const identity = TargetIdentity{
+        .base_sha = "base",
+        .head_sha = "head",
+        .fingerprint = "fp",
+    };
+    const review_verdict_json =
+        \\{"status":"clean","backendClass":"cas-start-wait","clean":true,"findingCount":0,"failureCode":null,"failureHint":null,"baseSha":"base","headSha":"head","targetFingerprint":"fp","reviewThreadId":"thr","reviewTurnId":"turn","recordPath":"/tmp/record.json","eventLogPath":"/tmp/events.jsonl","findings":[]}
+    ;
+    const synthetic = try casRunSyntheticReceiptJsonAlloc(
+        std.testing.allocator,
+        "/tmp/repo",
+        identity,
+        "parent",
+        "thr",
+        "turn",
+        "/tmp/record.json",
+        "/tmp/events.jsonl",
+        .{
+            .surface_action = "run",
+            .account_fingerprint_reduced_protection = false,
+        },
+        review_verdict_json,
+    );
+    defer std.testing.allocator.free(synthetic);
+
+    const normalized = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "/tmp/record.json", synthetic, true, .{
+        .requested_identity = identity,
+        .requested_identity_required = true,
+    });
+    defer normalized.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("clean", normalized.status);
+    try std.testing.expect(normalized.tuple_verdict_exists);
+    try std.testing.expectEqualStrings("base", normalized.base_sha.?);
+    try std.testing.expectEqualStrings("head", normalized.head_sha.?);
+    try std.testing.expectEqualStrings("fp", normalized.target_fingerprint.?);
 }
 
 test "start wait verdict builder emits cas-start-wait clean verdict" {
