@@ -8632,6 +8632,41 @@ fn casRunSyntheticReceiptJsonAlloc(
     return out.toOwnedSlice();
 }
 
+fn startShadowReceiptPayloadJsonAlloc(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    parent_thread_id: []const u8,
+    review_thread_id: ?[]const u8,
+    review_turn_id: ?[]const u8,
+    record_path: []const u8,
+    event_log_path: []const u8,
+    identity: TargetIdentity,
+    receipt: OutputReceipt,
+    attempt_phase: []const u8,
+) ![]u8 {
+    const payload = .{
+        .demo = "cas-review-session",
+        .action = "start",
+        .cwd = cwd,
+        .parentThreadId = parent_thread_id,
+        .reviewAttemptPhase = attempt_phase,
+        .reviewAttemptExists = true,
+        .tupleVerdictExists = false,
+        .reviewThreadId = review_thread_id,
+        .reviewTurnId = review_turn_id,
+        .baseSha = identity.base_sha,
+        .headSha = identity.head_sha,
+        .targetFingerprint = identity.fingerprint,
+        .resolvedCodexPath = receipt.resolved_codex_path,
+        .resolvedCodexVersion = receipt.resolved_codex_version,
+        .recordPath = record_path,
+        .eventLogPath = event_log_path,
+        .accountFingerprint = receipt.account_fingerprint,
+        .accountFingerprintReducedProtection = receipt.account_fingerprint_reduced_protection,
+    };
+    return stringifyAnyAlloc(allocator, payload);
+}
+
 fn printStartJson(
     backing_allocator: std.mem.Allocator,
     cwd: []const u8,
@@ -8748,25 +8783,18 @@ fn printStartJson(
     defer allocator.free(review_verdict_suffix);
 
     if (std.mem.eql(u8, receipt.surface_action, "start") and !waited and review_thread_id != null) {
-        const payload = .{
-            .demo = "cas-review-session",
-            .action = "start",
-            .cwd = cwd,
-            .parentThreadId = parent_thread_id,
-            .reviewAttemptPhase = attempt_phase,
-            .reviewAttemptExists = true,
-            .tupleVerdictExists = false,
-            .reviewThreadId = review_thread_id,
-            .reviewTurnId = review_turn_id,
-            .baseSha = identity.base_sha,
-            .headSha = identity.head_sha,
-            .targetFingerprint = identity.fingerprint,
-            .recordPath = record_path,
-            .eventLogPath = event_log_path,
-            .accountFingerprint = receipt.account_fingerprint,
-            .accountFingerprintReducedProtection = receipt.account_fingerprint_reduced_protection,
-        };
-        const payload_json = try stringifyAnyAlloc(allocator, payload);
+        const payload_json = try startShadowReceiptPayloadJsonAlloc(
+            allocator,
+            cwd,
+            parent_thread_id,
+            review_thread_id,
+            review_turn_id,
+            record_path,
+            event_log_path,
+            identity,
+            receipt,
+            attempt_phase,
+        );
         defer allocator.free(payload_json);
         const timestamp = try casRerTimestampAlloc(allocator);
         defer allocator.free(timestamp);
@@ -13148,6 +13176,55 @@ test "CAS-RER ledger record projection matches tuple identity" {
     try std.testing.expect(terminal_incomplete_record.attempt_exists);
     try std.testing.expect(!terminal_incomplete_record.tuple_verdict_exists);
     try std.testing.expectEqualStrings("inspect", actionRequiredForCasRerRecord(terminal_incomplete_record));
+}
+
+test "start shadow payload carries Codex identity into CAS-RER tuple" {
+    const identity = TargetIdentity{
+        .base_sha = "base",
+        .head_sha = "head",
+        .fingerprint = "fp",
+    };
+    const receipt = OutputReceipt{
+        .surface_action = "start",
+        .resolved_codex_path = "/bin/codex",
+        .resolved_codex_version = "codex 0.1.0",
+        .account_fingerprint = "acct:test",
+        .account_fingerprint_reduced_protection = false,
+    };
+    const payload_json = try startShadowReceiptPayloadJsonAlloc(
+        std.testing.allocator,
+        "/tmp/repo",
+        "parent",
+        "thr",
+        "turn",
+        "/tmp/record.json",
+        "/tmp/events.ndjson",
+        identity,
+        receipt,
+        "review_started",
+    );
+    defer std.testing.allocator.free(payload_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, payload_json, "\"resolvedCodexPath\":\"/bin/codex\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload_json, "\"resolvedCodexVersion\":\"codex 0.1.0\"") != null);
+
+    const normalized = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "/tmp/record.json", payload_json, true, .{
+        .requested_identity = identity,
+        .requested_identity_required = true,
+    });
+    defer normalized.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("/bin/codex", normalized.resolved_codex_path.?);
+    try std.testing.expectEqualStrings("codex 0.1.0", normalized.resolved_codex_version.?);
+
+    const rer_json = try casRerJsonFromReceiptAlloc(std.testing.allocator, normalized, .{
+        .repo_realpath_override = "/tmp/repo",
+    });
+    defer std.testing.allocator.free(rer_json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, rer_json, .{});
+    defer parsed.deinit();
+    const tuple = parsed.value.object.get("tuple").?.object;
+    try std.testing.expectEqualStrings("/bin/codex", tuple.get("resolvedCodexPath").?.string);
+    try std.testing.expectEqualStrings("codex 0.1.0", tuple.get("resolvedCodexVersion").?.string);
 }
 
 test "CAS-RER writer projects pre-review lane transport as non-attempt" {
