@@ -3742,6 +3742,7 @@ fn validateCasRerRecordObjectAlloc(allocator: std.mem.Allocator, path: []const u
         }
     }
 
+    _ = try requiredCasRerObjectField(allocator, data, "command", &errors);
     const tuple = try requiredCasRerObjectField(allocator, data, "tuple", &errors);
     const attempt = try requiredCasRerObjectField(allocator, data, "attempt", &errors);
     const verdict = try requiredCasRerObjectField(allocator, data, "verdict", &errors);
@@ -3920,6 +3921,13 @@ fn validateCasRerRecordObjectAlloc(allocator: std.mem.Allocator, path: []const u
         .path = try allocator.dupe(u8, path),
         .errors = try errors.toOwnedSlice(allocator),
     };
+}
+
+fn gateErrorsContain(gate: GateResult, needle: []const u8) bool {
+    for (gate.errors) |err| {
+        if (std.mem.indexOf(u8, err, needle) != null) return true;
+    }
+    return false;
 }
 
 fn validateTupleLockGatePathAlloc(allocator: std.mem.Allocator, path: []const u8) !GateResult {
@@ -13750,8 +13758,8 @@ test "CAS-RER validator rejects findings without finding count" {
     const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "bad-rer.json", parsed.value.object);
     defer gate.deinit(std.testing.allocator);
     try std.testing.expect(!gate.ok());
-    try std.testing.expectEqual(@as(usize, 1), gate.errors.len);
-    try std.testing.expect(std.mem.indexOf(u8, gate.errors[0], "findingCount > 0") != null);
+    try std.testing.expect(gate.errors.len >= 1);
+    try std.testing.expect(gateErrorsContain(gate, "findingCount > 0"));
 }
 
 test "CAS-RER validator rejects findings count without findings entries" {
@@ -13764,7 +13772,7 @@ test "CAS-RER validator rejects findings count without findings entries" {
     defer gate.deinit(std.testing.allocator);
     try std.testing.expect(!gate.ok());
     try std.testing.expect(gate.errors.len >= 1);
-    try std.testing.expect(std.mem.indexOf(u8, gate.errors[0], "findings length") != null);
+    try std.testing.expect(gateErrorsContain(gate, "findings length"));
 }
 
 test "CAS-RER validator rejects non-terminal tuple verdicts" {
@@ -13777,7 +13785,7 @@ test "CAS-RER validator rejects non-terminal tuple verdicts" {
     defer gate.deinit(std.testing.allocator);
     try std.testing.expect(!gate.ok());
     try std.testing.expect(gate.errors.len >= 1);
-    try std.testing.expect(std.mem.indexOf(u8, gate.errors[0], "terminal clean or findings") != null);
+    try std.testing.expect(gateErrorsContain(gate, "terminal clean or findings"));
 }
 
 test "CAS-RER validator rejects verdict clean/status disagreement" {
@@ -13790,7 +13798,7 @@ test "CAS-RER validator rejects verdict clean/status disagreement" {
     defer clean_false_gate.deinit(std.testing.allocator);
     try std.testing.expect(!clean_false_gate.ok());
     try std.testing.expect(clean_false_gate.errors.len >= 1);
-    try std.testing.expect(std.mem.indexOf(u8, clean_false_gate.errors[0], "verdict.clean=true") != null);
+    try std.testing.expect(gateErrorsContain(clean_false_gate, "verdict.clean=true"));
 
     const findings_true_raw =
         \\{"schema":"CAS-RER-v1","recordId":"rer_findings_true","tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":true,"findingCount":1,"findings":[{"title":"issue"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
@@ -13801,7 +13809,7 @@ test "CAS-RER validator rejects verdict clean/status disagreement" {
     defer findings_true_gate.deinit(std.testing.allocator);
     try std.testing.expect(!findings_true_gate.ok());
     try std.testing.expect(findings_true_gate.errors.len >= 1);
-    try std.testing.expect(std.mem.indexOf(u8, findings_true_gate.errors[0], "verdict.clean=false") != null);
+    try std.testing.expect(gateErrorsContain(findings_true_gate, "verdict.clean=false"));
 }
 
 test "CAS-RER validator rejects terminal verdict failure metadata" {
@@ -13814,7 +13822,7 @@ test "CAS-RER validator rejects terminal verdict failure metadata" {
     defer clean_gate.deinit(std.testing.allocator);
     try std.testing.expect(!clean_gate.ok());
     try std.testing.expect(clean_gate.errors.len >= 1);
-    try std.testing.expect(std.mem.indexOf(u8, clean_gate.errors[0], "failure.failureClass=null") != null);
+    try std.testing.expect(gateErrorsContain(clean_gate, "failure.failureClass=null"));
 
     const findings_failure_raw =
         \\{"schema":"CAS-RER-v1","recordId":"rer_findings_failure","tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":1,"findings":[{"title":"issue"}]},"failure":{"failureCode":"review_parse_mismatch","failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
@@ -13825,7 +13833,7 @@ test "CAS-RER validator rejects terminal verdict failure metadata" {
     defer findings_gate.deinit(std.testing.allocator);
     try std.testing.expect(!findings_gate.ok());
     try std.testing.expect(findings_gate.errors.len >= 1);
-    try std.testing.expect(std.mem.indexOf(u8, findings_gate.errors[0], "failure.failureCode=null") != null);
+    try std.testing.expect(gateErrorsContain(findings_gate, "failure.failureCode=null"));
 }
 
 test "CAS-RER validator rejects terminal verdict without attempt" {
@@ -13838,7 +13846,7 @@ test "CAS-RER validator rejects terminal verdict without attempt" {
     defer gate.deinit(std.testing.allocator);
     try std.testing.expect(!gate.ok());
     try std.testing.expect(gate.errors.len >= 3);
-    try std.testing.expect(std.mem.indexOf(u8, gate.errors[0], "attempt.exists=true") != null);
+    try std.testing.expect(gateErrorsContain(gate, "attempt.exists=true"));
 }
 
 test "CAS-RER validator rejects terminal tuple verdict without repo binding" {
@@ -13851,7 +13859,7 @@ test "CAS-RER validator rejects terminal tuple verdict without repo binding" {
     defer gate.deinit(std.testing.allocator);
     try std.testing.expect(!gate.ok());
     try std.testing.expect(gate.errors.len >= 1);
-    try std.testing.expect(std.mem.indexOf(u8, gate.errors[0], "repoRealpath") != null);
+    try std.testing.expect(gateErrorsContain(gate, "repoRealpath"));
 }
 
 test "CAS-RER validator rejects attempt exists with empty review thread id" {
@@ -13864,7 +13872,7 @@ test "CAS-RER validator rejects attempt exists with empty review thread id" {
     defer gate.deinit(std.testing.allocator);
     try std.testing.expect(!gate.ok());
     try std.testing.expect(gate.errors.len >= 1);
-    try std.testing.expect(std.mem.indexOf(u8, gate.errors[0], "reviewThreadId non-empty") != null);
+    try std.testing.expect(gateErrorsContain(gate, "reviewThreadId non-empty"));
 }
 
 test "CAS-RER validator rejects proof usable principal without account fingerprint" {
@@ -13876,8 +13884,21 @@ test "CAS-RER validator rejects proof usable principal without account fingerpri
     const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "unbound-principal-rer.json", parsed.value.object);
     defer gate.deinit(std.testing.allocator);
     try std.testing.expect(!gate.ok());
-    try std.testing.expectEqual(@as(usize, 1), gate.errors.len);
-    try std.testing.expect(std.mem.indexOf(u8, gate.errors[0], "accountFingerprint") != null);
+    try std.testing.expect(gate.errors.len >= 1);
+    try std.testing.expect(gateErrorsContain(gate, "accountFingerprint"));
+}
+
+test "CAS-RER validator rejects missing command section" {
+    const raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_missing_command","tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "missing-command-rer.json", parsed.value.object);
+    defer gate.deinit(std.testing.allocator);
+    try std.testing.expect(!gate.ok());
+    try std.testing.expect(gate.errors.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, gate.errors[0], "missing command") != null);
 }
 
 test "CAS-RER validator rejects null required sections" {

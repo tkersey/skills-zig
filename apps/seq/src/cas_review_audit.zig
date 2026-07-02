@@ -1234,9 +1234,26 @@ fn claimDedupeKey(
     fallback: []const u8,
     dedupe: *std.StringHashMap(void),
 ) !bool {
-    const key = if (scalarString(row, "record_id")) |record_id|
-        try std.fmt.allocPrint(allocator, "recordId|{s}", .{record_id})
-    else blk: {
+    const key = if (scalarString(row, "record_id")) |record_id| blk: {
+        const cwd = scalarString(row, "cwd") orelse "";
+        const base_sha = scalarString(row, "base_sha") orelse "";
+        const head_sha = scalarString(row, "head_sha") orelse "";
+        const target_fingerprint = scalarString(row, "target_fingerprint") orelse "";
+        const review_thread_id = scalarString(row, "review_thread_id") orelse "";
+        const status = scalarString(row, "canonical_status") orelse scalarString(row, "review_verdict_status") orelse "";
+        const source_scope = if (cwd.len == 0 and base_sha.len == 0 and head_sha.len == 0 and target_fingerprint.len == 0 and review_thread_id.len == 0 and status.len == 0) source_path else "";
+        break :blk try std.fmt.allocPrint(allocator, "recordId|{s}|cwd={s}|base={s}|head={s}|target={s}|thread={s}|status={s}|findings={d}|source={s}", .{
+            record_id,
+            cwd,
+            base_sha,
+            head_sha,
+            target_fingerprint,
+            review_thread_id,
+            status,
+            scalarInt(row, "finding_count"),
+            source_scope,
+        });
+    } else blk: {
         const key_value = scalarString(row, "record_path") orelse scalarString(row, "event_log_path") orelse scalarString(row, "review_thread_id") orelse fallback;
         break :blk try std.fmt.allocPrint(allocator, "{s}|{s}", .{ source_path, key_value });
     };
@@ -2170,6 +2187,33 @@ test "CAS-RER envelope dedupe uses stable record identity" {
     try std.testing.expectEqual(@as(usize, 1), audit.rows.items.len);
     try std.testing.expectEqualStrings("rer_same_record", scalarString(audit.rows.items[0], "record_id").?);
     try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_clean_count);
+}
+
+test "CAS-RER dedupe preserves colliding record ids across distinct tuples" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "one.json", .data =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_collision","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo-one","baseSha":"base","headSha":"head-one","targetFingerprint":"fp-one"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_one","reviewTurnId":"turn_one"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+    });
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "two.json", .data =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_collision","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo-two","baseSha":"base","headSha":"head-two","targetFingerprint":"fp-two"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_two","reviewTurnId":"turn_two"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":1,"findings":[{"title":"issue"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+    });
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const one_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "one.json" });
+    defer std.testing.allocator.free(one_path);
+    const two_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "two.json" });
+    defer std.testing.allocator.free(two_path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .receipt_paths = &.{ one_path, two_path },
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), audit.rows.items.len);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_clean_count);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_findings_count);
 }
 
 test "bare CAS-RER JSONL preserves distinct record identities" {
