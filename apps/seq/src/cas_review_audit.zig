@@ -598,6 +598,14 @@ fn terminalCasRerPhase(phase: []const u8) bool {
     return std.mem.eql(u8, phase, "review_terminal") or std.mem.eql(u8, phase, "normalized_verdict");
 }
 
+fn terminalCasRerVerdictConsistent(verdict: std.json.ObjectMap, status: []const u8) bool {
+    const clean = boolField(verdict, "clean") orelse return false;
+    const finding_count = intField(verdict, "findingCount") orelse return false;
+    if (std.mem.eql(u8, status, "clean")) return clean and finding_count == 0;
+    if (std.mem.eql(u8, status, "findings")) return !clean and finding_count > 0;
+    return true;
+}
+
 fn isTrustedCasReviewEvidenceRecord(root: std.json.ObjectMap) bool {
     if (!isAuditableCasReviewEvidenceRecord(root)) return false;
     const tuple = objectField(root, "tuple") orelse return false;
@@ -608,6 +616,7 @@ fn isTrustedCasReviewEvidenceRecord(root: std.json.ObjectMap) bool {
     if (boolField(principal, "proofUsable") == true and !casRerPrincipalProofUsable(principal)) return false;
     const status = nullableString(verdict, "status") orelse return false;
     if (boolField(verdict, "tupleVerdictExists") == true and terminalCasRerStatus(status)) {
+        if (!terminalCasRerVerdictConsistent(verdict, status)) return false;
         if (boolField(attempt, "exists") != true) return false;
         const phase = nullableString(attempt, "phase") orelse return false;
         if (!terminalCasRerPhase(phase)) return false;
@@ -637,7 +646,7 @@ fn isCasImportRecordWrapper(root: std.json.ObjectMap) bool {
     const validation = objectField(root, "validation") orelse return false;
     if (boolField(validation, "ok") != true) return false;
     const record = objectField(root, "record") orelse return false;
-    return isCasReviewEvidenceRecord(record);
+    return isTrustedCasReviewEvidenceRecord(record);
 }
 
 fn isCasRunEnvelope(root: std.json.ObjectMap) bool {
@@ -663,7 +672,7 @@ fn appendRowsFromCasRunEnvelope(
     dedupe: *std.StringHashMap(void),
 ) !void {
     if (objectField(root, "record")) |record| {
-        if (isAuditableCasReviewEvidenceRecord(record)) {
+        if (isTrustedCasReviewEvidenceRecord(record)) {
             const row = try classifyCasRerObject(allocator, record, ctx);
             const record_id = nullableString(record, "recordId") orelse "cas-run-rer";
             const key = try std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ dedupe_path, dedupe_id, record_id });
@@ -688,7 +697,7 @@ fn appendRowsFromCasCurrentEnvelope(
     dedupe: *std.StringHashMap(void),
 ) !void {
     const record = objectField(root, "record") orelse return;
-    if (!isCasReviewEvidenceRecord(record)) return;
+    if (!isTrustedCasReviewEvidenceRecord(record)) return;
     const row = try classifyCasRerObject(allocator, record, ctx);
     const record_id = nullableString(record, "recordId") orelse "cas-current-rer";
     const key = try std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ dedupe_path, dedupe_id, record_id });
@@ -713,7 +722,7 @@ fn appendRowsFromCasListEnvelope(
     };
     for (records, 0..) |record_value, idx| {
         const record = object(record_value) orelse continue;
-        if (!isCasReviewEvidenceRecord(record)) continue;
+        if (!isTrustedCasReviewEvidenceRecord(record)) continue;
         const row = try classifyCasRerObject(allocator, record, ctx);
         var fallback_buf: [64]u8 = undefined;
         const record_id = nullableString(record, "recordId") orelse std.fmt.bufPrint(fallback_buf[0..], "cas-list-rer:{d}", .{idx}) catch "cas-list-rer";
@@ -753,7 +762,7 @@ fn appendRowsFromCasImportEnvelope(
         const validation = objectField(item, "validation") orelse continue;
         if (boolField(validation, "ok") != true) continue;
         const record = objectField(item, "record") orelse continue;
-        if (!isCasReviewEvidenceRecord(record)) continue;
+        if (!isTrustedCasReviewEvidenceRecord(record)) continue;
         const row = try classifyCasRerObject(allocator, record, ctx);
         var fallback_buf: [64]u8 = undefined;
         const record_id = nullableString(record, "recordId") orelse std.fmt.bufPrint(fallback_buf[0..], "cas-rer:{d}", .{idx}) catch "cas-rer";
@@ -774,7 +783,7 @@ fn appendRowFromCasImportRecordWrapper(
     dedupe: *std.StringHashMap(void),
 ) !void {
     const record = objectField(root, "record") orelse return;
-    if (!isCasReviewEvidenceRecord(record)) return;
+    if (!isTrustedCasReviewEvidenceRecord(record)) return;
     const row = try classifyCasRerObject(allocator, record, ctx);
     const record_id = nullableString(record, "recordId") orelse "cas-rer-wrapper";
     const key = try std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ dedupe_path, dedupe_id, record_id });
@@ -2337,6 +2346,9 @@ test "bare CAS-RER JSONL rejects invalid terminal evidence" {
     try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "records.jsonl", .data =
         \\{"schema":"CAS-RER-v1","recordId":"rer_waiting_clean","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"review_waiting","reviewThreadId":"thr_waiting","reviewTurnId":"turn_waiting"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
         \\{"schema":"CAS-RER-v1","recordId":"rer_failed_clean","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_failed","reviewTurnId":"turn_failed"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":"review_failed","failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_clean_false","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_clean_false","reviewTurnId":"turn_clean_false"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_clean_with_findings","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_clean_with_findings","reviewTurnId":"turn_clean_with_findings"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":1,"findings":[{"title":"issue"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_findings_without_count","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_findings_without_count","reviewTurnId":"turn_findings_without_count"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
     });
     const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
@@ -2351,6 +2363,60 @@ test "bare CAS-RER JSONL rejects invalid terminal evidence" {
 
     try std.testing.expectEqual(@as(usize, 0), audit.rows.items.len);
     try std.testing.expectEqual(@as(i64, 0), audit.summary.completed_clean_count);
+}
+
+test "CAS-RER envelopes reject untrusted nested terminal evidence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const invalid_record =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_invalid_nested","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"returned_terminal","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"review_waiting","reviewThreadId":"thr_invalid","reviewTurnId":"turn_invalid"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+    ;
+    const run_envelope = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"schema":"CAS-RUN-v1","record":{s},"reviewBrokerDecision":{{"action":"returned_terminal","reason":"test","freshAttemptRequired":false}}}}
+    , .{invalid_record});
+    defer std.testing.allocator.free(run_envelope);
+    const current_envelope = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"schema":"CAS-CURRENT-v1","record":{s},"tupleCurrent":true,"actionRequired":"none"}}
+    , .{invalid_record});
+    defer std.testing.allocator.free(current_envelope);
+    const list_envelope = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"schema":"CAS-LIST-v1","records":[{s}]}}
+    , .{invalid_record});
+    defer std.testing.allocator.free(list_envelope);
+    const import_envelope = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"schema":"CAS-IMPORT-v1","records":[{{"sourcePath":"/tmp/receipt.json","recordPath":"/tmp/rer.json","validation":{{"ok":true,"errors":[],"path":"/tmp/receipt.json"}},"record":{s}}}],"errors":[]}}
+    , .{invalid_record});
+    defer std.testing.allocator.free(import_envelope);
+    const import_wrapper = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"sourcePath":"/tmp/receipt.json","recordPath":"/tmp/rer.json","validation":{{"ok":true,"errors":[],"path":"/tmp/receipt.json"}},"record":{s}}}
+    , .{invalid_record});
+    defer std.testing.allocator.free(import_wrapper);
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "run.json", .data = run_envelope });
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "current.json", .data = current_envelope });
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "list.json", .data = list_envelope });
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "import.json", .data = import_envelope });
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "wrapper.jsonl", .data = import_wrapper });
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const run_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "run.json" });
+    defer std.testing.allocator.free(run_path);
+    const current_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "current.json" });
+    defer std.testing.allocator.free(current_path);
+    const list_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "list.json" });
+    defer std.testing.allocator.free(list_path);
+    const import_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "import.json" });
+    defer std.testing.allocator.free(import_path);
+    const wrapper_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "wrapper.jsonl" });
+    defer std.testing.allocator.free(wrapper_path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .receipt_paths = &.{ run_path, current_path, list_path, import_path, wrapper_path },
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(i64, 0), audit.summary.completed_clean_count);
+    try std.testing.expectEqual(@as(i64, 0), audit.summary.completed_findings_count);
 }
 
 test "repo scope matching is path-boundary safe" {
