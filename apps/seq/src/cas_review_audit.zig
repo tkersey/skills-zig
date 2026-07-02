@@ -507,6 +507,10 @@ fn appendRowsFromJsonText(
         try appendRowsFromCasImportEnvelope(allocator, root, ctx, dedupe_path, dedupe_id, params, audit, dedupe);
         return;
     }
+    if (isCasImportRecordWrapper(root)) {
+        try appendRowFromCasImportRecordWrapper(allocator, root, ctx, dedupe_path, dedupe_id, params, audit, dedupe);
+        return;
+    }
     if (isSmokeArtifactObject(root)) {
         try appendSmokeArtifactRows(allocator, root, ctx, dedupe_path, dedupe_id, params, audit, dedupe);
         return;
@@ -549,6 +553,13 @@ fn isCasReviewEvidenceRecord(root: std.json.ObjectMap) bool {
 
 fn isCasImportEnvelope(root: std.json.ObjectMap) bool {
     return optEql(nullableString(root, "schema"), "CAS-IMPORT-v1");
+}
+
+fn isCasImportRecordWrapper(root: std.json.ObjectMap) bool {
+    const validation = objectField(root, "validation") orelse return false;
+    if (boolField(validation, "ok") != true) return false;
+    const record = objectField(root, "record") orelse return false;
+    return isCasReviewEvidenceRecord(record);
 }
 
 fn isCasRunEnvelope(root: std.json.ObjectMap) bool {
@@ -602,6 +613,25 @@ fn appendRowsFromCasImportEnvelope(
         defer allocator.free(key);
         try appendRowIfMatched(allocator, row, key, key, params, audit, dedupe);
     }
+}
+
+fn appendRowFromCasImportRecordWrapper(
+    allocator: std.mem.Allocator,
+    root: std.json.ObjectMap,
+    ctx: ClassifyContext,
+    dedupe_path: []const u8,
+    dedupe_id: []const u8,
+    params: Params,
+    audit: *Audit,
+    dedupe: *std.StringHashMap(void),
+) !void {
+    const record = objectField(root, "record") orelse return;
+    if (!isCasReviewEvidenceRecord(record)) return;
+    const row = try classifyCasRerObject(allocator, record, ctx);
+    const record_id = nullableString(record, "recordId") orelse "cas-rer-wrapper";
+    const key = try std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ dedupe_path, dedupe_id, record_id });
+    defer allocator.free(key);
+    try appendRowIfMatched(allocator, row, key, key, params, audit, dedupe);
 }
 
 fn appendSmokeArtifactRows(
@@ -1810,6 +1840,28 @@ test "CAS import envelope expands nested CAS-RER records" {
     try std.testing.expectEqualStrings("rer_envelope", scalarString(audit.rows.items[0], "record_id").?);
     try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_clean_count);
     try std.testing.expectEqual(@as(i64, 0), audit.summary.broker_run_count);
+}
+
+test "CAS import JSONL wrapper expands nested CAS-RER record" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "import.jsonl", .data =
+        \\{"sourcePath":"/tmp/receipt.json","recordPath":"/tmp/rer.json","validation":{"ok":true,"errors":[],"path":"/tmp/receipt.json"},"record":{"schema":"CAS-RER-v1","recordId":"rer_jsonl_wrapper","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_jsonl","reviewTurnId":"turn_jsonl"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true}}}
+    });
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const import_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "import.jsonl" });
+    defer std.testing.allocator.free(import_path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .receipt_paths = &.{import_path},
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), audit.rows.items.len);
+    try std.testing.expectEqualStrings("rer_jsonl_wrapper", scalarString(audit.rows.items[0], "record_id").?);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_clean_count);
 }
 
 test "CAS run envelope expands nested CAS-RER record" {

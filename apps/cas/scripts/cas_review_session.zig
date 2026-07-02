@@ -8135,6 +8135,57 @@ fn printStatusJson(
     else
         "null";
 
+    if (action == .wait) {
+        if (identity) |target_identity| {
+            const review_verdict_json_opt = try startWaitReviewVerdictJsonAlloc(
+                allocator,
+                target_identity,
+                review_thread_id,
+                review_turn_id,
+                record_path orelse "",
+                event_log_path,
+                status,
+                timed_out orelse false,
+                true,
+                effective_failure,
+                fallback,
+            );
+            defer if (review_verdict_json_opt) |value| allocator.free(value);
+            if (review_verdict_json_opt) |review_verdict_json| {
+                const synthetic_receipt_json = try casRunSyntheticReceiptJsonAlloc(
+                    allocator,
+                    cwd orelse "",
+                    target_identity,
+                    parent_thread_id orelse "",
+                    review_thread_id,
+                    review_turn_id,
+                    record_path orelse "",
+                    event_log_path,
+                    receipt,
+                    review_verdict_json,
+                );
+                defer allocator.free(synthetic_receipt_json);
+                const normalized = try normalizeReceiptFromJsonAlloc(allocator, record_path orelse event_log_path, synthetic_receipt_json, true, .{
+                    .requested_identity = target_identity,
+                    .requested_identity_required = true,
+                });
+                defer normalized.deinit(allocator);
+                const timestamp = try casRerTimestampAlloc(allocator);
+                defer allocator.free(timestamp);
+                const shadow_record_path = try writeCasRerShadowRecordFromReceipt(allocator, normalized, .{
+                    .command_surface = "start_wait",
+                    .backend_selected = "cas-start-wait",
+                    .broker_action = "created_new",
+                    .broker_reason = "low-level wait output shadowed into CAS-RER-v1",
+                    .imported_from_receipt = false,
+                    .created_at = timestamp,
+                    .updated_at = timestamp,
+                });
+                defer allocator.free(shadow_record_path);
+            }
+        }
+    }
+
     try stdout.print(
         "{{\"demo\":\"cas-review-session\",\"action\":\"{s}\"",
         .{@tagName(action)},
@@ -8523,6 +8574,44 @@ fn printStartJson(
     else
         try allocator.dupe(u8, "");
     defer allocator.free(review_verdict_suffix);
+
+    if (std.mem.eql(u8, receipt.surface_action, "start") and !waited and review_thread_id != null) {
+        const payload = .{
+            .demo = "cas-review-session",
+            .action = "start",
+            .cwd = cwd,
+            .parentThreadId = parent_thread_id,
+            .reviewAttemptPhase = attempt_phase,
+            .reviewAttemptExists = true,
+            .tupleVerdictExists = false,
+            .reviewThreadId = review_thread_id,
+            .reviewTurnId = review_turn_id,
+            .baseSha = identity.base_sha,
+            .headSha = identity.head_sha,
+            .targetFingerprint = identity.fingerprint,
+            .recordPath = record_path,
+            .eventLogPath = event_log_path,
+            .accountFingerprint = receipt.account_fingerprint,
+            .accountFingerprintReducedProtection = receipt.account_fingerprint_reduced_protection,
+        };
+        const payload_json = try stringifyAnyAlloc(allocator, payload);
+        defer allocator.free(payload_json);
+        const timestamp = try casRerTimestampAlloc(allocator);
+        defer allocator.free(timestamp);
+        const shadow_record_path = try writeCasRerShadowRecordFromJsonAlloc(allocator, record_path, payload_json, .{
+            .requested_identity = identity,
+            .requested_identity_required = true,
+        }, .{
+            .command_surface = "start_wait",
+            .backend_selected = "cas-start-wait",
+            .broker_action = "created_new",
+            .broker_reason = "low-level start output shadowed into CAS-RER-v1",
+            .imported_from_receipt = false,
+            .created_at = timestamp,
+            .updated_at = timestamp,
+        });
+        defer allocator.free(shadow_record_path);
+    }
 
     if (std.mem.eql(u8, receipt.surface_action, "run")) {
         if (review_verdict_json_opt) |review_verdict_json| {
