@@ -1,0 +1,226 @@
+{
+  "fixtures": [
+    {
+      "fixture": {
+        "name": "valid_direct_action_fused",
+        "expected_quality": "present_and_closed",
+        "expected_failure_class": null,
+        "transcript_excerpt": "direct_action_fused: yes",
+        "artifact_state": { "branch": "feature/hylo", "head": "head-direct", "diff_digest": "direct" },
+        "expected_detection": { "alsr_present": false, "hyl_present": false, "hsr_step_count": 0, "terminal_atcg": true }
+      }
+    },
+    {
+      "fixture": {
+        "name": "valid_goal_grind_with_alsr_hyl_hsr",
+        "expected_quality": "present_and_closed",
+        "expected_failure_class": null,
+        "transcript_excerpt": "receipt_version: ALSR-v1",
+        "artifact_state": { "branch": "feature/hylo", "head": "head-goal", "diff_digest": "goal" },
+        "expected_detection": { "alsr_present": true, "hyl_present": true, "hsr_step_count": 1, "terminal_atcg": true }
+      }
+    },
+    {
+      "fixture": {
+        "name": "valid_review_fix_three_clean_cas",
+        "expected_quality": "present_and_closed",
+        "expected_failure_class": null,
+        "transcript_excerpt": "CAS-RER-v1 clean_run: 3 fresh_attempt: yes",
+        "artifact_state": { "branch": "feature/hylo", "head": "head-review", "diff_digest": "review" },
+        "expected_detection": { "alsr_present": true, "hyl_present": true, "hsr_step_count": 1, "terminal_atcg": true }
+      }
+    },
+    {
+      "fixture": {
+        "name": "valid_st_governed_handoff",
+        "expected_quality": "present_and_closed",
+        "expected_failure_class": null,
+        "transcript_excerpt": "st_governed_handoff: yes",
+        "artifact_state": { "branch": "feature/hylo", "head": "head-st", "diff_digest": "st" },
+        "expected_detection": { "alsr_present": false, "hyl_present": false, "hsr_step_count": 0, "terminal_atcg": true }
+      }
+    },
+    {
+      "fixture": {
+        "name": "valid_parallel_review_class_fanout",
+        "expected_quality": "present_and_closed",
+        "expected_failure_class": null,
+        "transcript_excerpt": "parallel_frontier with fan_in",
+        "artifact_state": { "branch": "feature/hylo", "head": "head-parallel", "diff_digest": "parallel" },
+        "expected_detection": { "alsr_present": true, "hyl_present": true, "hsr_step_count": 1, "terminal_atcg": true }
+      }
+    },
+    {
+      "fixture": {
+        "name": "valid_branch_race_common_verifier",
+        "expected_quality": "present_and_closed",
+        "expected_failure_class": null,
+        "transcript_excerpt": "branch_race with common_verifier",
+        "artifact_state": { "branch": "feature/hylo", "head": "head-branch-race", "diff_digest": "branch-race" },
+        "expected_detection": { "alsr_present": true, "hyl_present": true, "hsr_step_count": 1, "terminal_atcg": true }
+      }
+    },
+    {
+      "fixture": {
+        "name": "missing_alsr",
+        "expected_quality": "partial",
+        "expected_failure_class": "missing_alsr",
+        "transcript_excerpt": "machine_version: HYL-v1 without ALSR-v1",
+        "artifact_state": { "branch": "feature/hylo", "head": "head-missing-alsr", "diff_digest": "missing-alsr" },
+        "expected_detection": { "alsr_present": false, "hyl_present": true, "hsr_step_count": 2, "terminal_atcg": true }
+      }
+    },
+    {
+      "fixture": {
+        "name": "missing_hyl",
+        "expected_quality": "partial",
+        "expected_failure_class": "missing_hyl",
+        "transcript_excerpt": "receipt_version: ALSR-v1 without HYL-v1",
+        "artifact_state": { "branch": "feature/hylo", "head": "head-missing-hyl", "diff_digest": "missing-hyl" },
+        "expected_detection": { "alsr_present": true, "hyl_present": false, "hsr_step_count": 2, "terminal_atcg": true }
+      }
+    },
+    {
+      "fixture": {
+        "name": "missing_unfold",
+        "expected_quality": "present_unverified",
+        "expected_failure_class": "missing_unfold",
+        "transcript_excerpt": "HSR-v1 action/fold without unfold",
+        "artifact_state": { "branch": "feature/hylo", "head": "head-missing-unfold", "diff_digest": "missing-unfold" },
+        "expected_detection": { "alsr_present": true, "hyl_present": true, "hsr_step_count": 1, "terminal_atcg": false }
+      }
+    },
+    {
+      "fixture": {
+        "name": "mutation_without_unfold",
+        "expected_quality": "present_and_closed",
+        "expected_failure_class": "mutation_without_unfold",
+        "expected_failure_classes": ["missing_unfold"],
+        "transcript_excerpt": "patch with HSR-v1 but no unfold",
+        "artifact_state": { "branch": "feature/hylo", "head": "head-mutation-no-unfold", "diff_digest": "mutation-no-unfold" },
+        "expected_detection": { "alsr_present": true, "hyl_present": true, "hsr_step_count": 1, "terminal_atcg": true }
+      }
+    },
+    {
+      "fixture": {
+        "name": "action_without_fold",
+        "expected_quality": "present_unverified",
+        "expected_failure_class": "action_without_fold",
+        "transcript_excerpt": "HSR-v1 unfold/action without fold",
+        "artifact_state": { "branch": "feature/hylo", "head": "head-action-no-fold", "diff_digest": "action-no-fold" },
+        "expected_detection": { "alsr_present": true, "hyl_present": true, "hsr_step_count": 1, "terminal_atcg": false }
+      }
+    },
+    {
+      "fixture": {
+        "name": "fold_without_current_artifact",
+        "expected_quality": "contradictory",
+        "expected_failure_class": "fold_without_current_artifact",
+        "transcript_excerpt": "current_artifact_bound: no",
+        "artifact_state": { "branch": "feature/hylo", "head": "head-fold-not-current", "diff_digest": "fold-not-current" },
+        "expected_detection": { "alsr_present": true, "hyl_present": true, "hsr_step_count": 1, "terminal_atcg": false }
+      }
+    },
+    {
+      "fixture": {
+        "name": "continue_without_next_seed",
+        "expected_quality": "present_verified",
+        "expected_failure_class": "continue_without_next_seed",
+        "transcript_excerpt": "verdict: continue without next_state_ref",
+        "artifact_state": { "branch": "feature/hylo", "head": "head-continue-no-seed", "diff_digest": "continue-no-seed" },
+        "expected_detection": { "alsr_present": true, "hyl_present": true, "hsr_step_count": 1, "terminal_atcg": false }
+      }
+    },
+    {
+      "fixture": {
+        "name": "terminal_without_stop_rule",
+        "expected_quality": "present_and_closed",
+        "expected_failure_class": "terminal_without_stop_rule",
+        "transcript_excerpt": "verdict: complete without stop_rule",
+        "artifact_state": { "branch": "feature/hylo", "head": "head-terminal-no-stop", "diff_digest": "terminal-no-stop" },
+        "expected_detection": { "alsr_present": true, "hyl_present": true, "hsr_step_count": 1, "terminal_atcg": true }
+      }
+    },
+    {
+      "fixture": {
+        "name": "terminal_without_atcg",
+        "expected_quality": "present_verified",
+        "expected_failure_class": "terminal_without_atcg",
+        "transcript_excerpt": "verdict: complete without ATCG-v1",
+        "artifact_state": { "branch": "feature/hylo", "head": "head-terminal-no-atcg", "diff_digest": "terminal-no-atcg" },
+        "expected_detection": { "alsr_present": true, "hyl_present": true, "hsr_step_count": 1, "terminal_atcg": false }
+      }
+    },
+    {
+      "fixture": {
+        "name": "stale_hylo_after_diff_change",
+        "expected_quality": "stale",
+        "expected_failure_class": "stale_hylo_after_diff_change",
+        "expected_failure_classes": ["unfold_not_current"],
+        "transcript_excerpt": "blocked-loop-contract-stale",
+        "artifact_state": { "branch": "feature/hylo", "head": "head-stale", "diff_digest": "stale" },
+        "expected_detection": { "alsr_present": true, "hyl_present": true, "hsr_step_count": 1, "terminal_atcg": true }
+      }
+    },
+    {
+      "fixture": {
+        "name": "parallel_fanout_without_fanin",
+        "expected_quality": "present_verified",
+        "expected_failure_class": "parallel_fanout_without_fanin",
+        "transcript_excerpt": "parallel_frontier without fan_in",
+        "artifact_state": { "branch": "feature/hylo", "head": "head-parallel-no-fanin", "diff_digest": "parallel-no-fanin" },
+        "expected_detection": { "alsr_present": true, "hyl_present": true, "hsr_step_count": 1, "terminal_atcg": false }
+      }
+    },
+    {
+      "fixture": {
+        "name": "raw_review_to_patch",
+        "expected_quality": "present_and_closed",
+        "expected_failure_class": "raw_review_to_patch",
+        "transcript_excerpt": "Finding -> Patch",
+        "artifact_state": { "branch": "feature/hylo", "head": "head-raw-review", "diff_digest": "raw-review" },
+        "expected_detection": { "alsr_present": true, "hyl_present": true, "hsr_step_count": 1, "terminal_atcg": true }
+      }
+    },
+    {
+      "fixture": {
+        "name": "cached_cas_counted_as_fresh",
+        "expected_quality": "present_verified",
+        "expected_failure_class": "cached_cas_counted_as_fresh",
+        "transcript_excerpt": "cas_receipt_cache_hit: yes counted_as_fresh: yes",
+        "artifact_state": { "branch": "feature/hylo", "head": "head-cached-cas", "diff_digest": "cached-cas" },
+        "expected_detection": { "alsr_present": true, "hyl_present": true, "hsr_step_count": 1, "terminal_atcg": false }
+      }
+    },
+    {
+      "fixture": {
+        "name": "review_fix_without_review_fold",
+        "expected_quality": "present_and_closed",
+        "expected_failure_class": "review_fix_without_review_fold",
+        "transcript_excerpt": "$cas review without $review-fold",
+        "artifact_state": { "branch": "feature/hylo", "head": "head-review-no-fold", "diff_digest": "review-no-fold" },
+        "expected_detection": { "alsr_present": true, "hyl_present": true, "hsr_step_count": 1, "terminal_atcg": true }
+      }
+    },
+    {
+      "fixture": {
+        "name": "ship_without_terminal_publication_boundary",
+        "expected_quality": "present_and_closed",
+        "expected_failure_class": "ship_without_terminal_publication_boundary",
+        "transcript_excerpt": "ship_handoff without publication_boundary",
+        "artifact_state": { "branch": "feature/hylo", "head": "head-ship-no-boundary", "diff_digest": "ship-no-boundary" },
+        "expected_detection": { "alsr_present": true, "hyl_present": true, "hsr_step_count": 1, "terminal_atcg": true }
+      }
+    },
+    {
+      "fixture": {
+        "name": "prompt_contamination_control",
+        "expected_quality": "absent",
+        "expected_failure_class": null,
+        "transcript_excerpt": "# 02 - Regression Fixtures for Hylo Audits",
+        "artifact_state": { "branch": "feature/hylo", "head": "head-contamination", "diff_digest": "contamination" },
+        "expected_detection": { "alsr_present": false, "hyl_present": false, "hsr_step_count": 0, "terminal_atcg": false }
+      }
+    }
+  ]
+}

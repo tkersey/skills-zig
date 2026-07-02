@@ -1,0 +1,7 @@
+{"type":"session_meta","timestamp":"2026-07-02T11:00:00Z","payload":{"id":"missing_alsr","cwd":"/repo/seq-audit","model":"gpt-5","git":{"branch":"feature/hylo","commit_hash":"head-missing-alsr"}}}
+{"type":"event_msg","timestamp":"2026-07-02T11:00:01Z","payload":{"type":"task_started","turn_id":"t1"}}
+{"type":"event_msg","timestamp":"2026-07-02T11:00:02Z","payload":{"type":"user_message","turn_id":"t1","message":"$actuating missing ALSR fixture."}}
+{"type":"event_msg","timestamp":"2026-07-02T11:00:03Z","payload":{"type":"agent_message","turn_id":"t1","message":"actuation_hylomorphism:\n  machine_version: HYL-v1\nhylo_step_receipt:\n  receipt_version: HSR-v1\n  unfold:\n    produced: work_node\n  action:\n    effect: edit\n  fold:\n    verdict: complete\n    current_artifact_bound: yes\n  stop_rule:\n    success: done\nATCG-v1:\n  can_mark_goal_complete: yes"}}
+{"type":"response_item","timestamp":"2026-07-02T11:00:04Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-1","arguments":"*** Begin Patch\n*** Update File: missing_alsr.txt\n+ok\n*** End Patch"}}
+{"type":"response_item","timestamp":"2026-07-02T11:00:05Z","payload":{"type":"function_call_output","call_id":"patch-1","output":"Success. Updated the following files:\nM missing_alsr.txt\n"}}
+{"type":"event_msg","timestamp":"2026-07-02T11:00:06Z","payload":{"type":"task_complete","turn_id":"t1","duration_ms":5000}}

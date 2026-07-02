@@ -1,0 +1,5 @@
+{"type":"session_meta","timestamp":"2026-07-02T12:40:00Z","payload":{"id":"parallel_fanout_without_fanin","cwd":"/repo/seq-audit","model":"gpt-5","git":{"branch":"feature/hylo","commit_hash":"head-parallel-no-fanin"}}}
+{"type":"event_msg","timestamp":"2026-07-02T12:40:01Z","payload":{"type":"task_started","turn_id":"t1"}}
+{"type":"event_msg","timestamp":"2026-07-02T12:40:02Z","payload":{"type":"user_message","turn_id":"t1","message":"$actuating parallel fanout without fan-in fixture."}}
+{"type":"event_msg","timestamp":"2026-07-02T12:40:03Z","payload":{"type":"agent_message","turn_id":"t1","message":"parallel_frontier: review_class_fanout\nsubagent_spawn: class-a\nagent_loop_scheme_receipt:\n  receipt_version: ALSR-v1\nactuation_hylomorphism:\n  machine_version: HYL-v1\nhylo_step_receipt:\n  receipt_version: HSR-v1\n  unfold:\n    produced: parallel_frontier\n  action:\n    effect: classify\n  fold:\n    verdict: continue\n    current_artifact_bound: yes\n    next_state_ref: await-results"}}
+{"type":"event_msg","timestamp":"2026-07-02T12:40:04Z","payload":{"type":"task_complete","turn_id":"t1","duration_ms":5000}}

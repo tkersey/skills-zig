@@ -5,6 +5,7 @@ const retrace_core = @import("retrace_core");
 const canonical_trace = retrace_core.canonical_trace;
 const actuation_afr = @import("../actuation/afr.zig");
 const actuation_gcr = @import("../actuation/gcr.zig");
+const actuation_hylo = @import("../actuation/hylo.zig");
 
 fn runAndReadOutput(
     allocator: std.mem.Allocator,
@@ -28,6 +29,93 @@ fn expectContains(haystack: []const u8, needle: []const u8) !void {
         std.debug.print("missing substring: {s}\noutput:\n{s}\n", .{ needle, haystack });
         return error.MissingExpectedSubstring;
     }
+}
+
+const HyloFixture = struct {
+    name: []const u8,
+    quality: []const u8,
+    failure: ?[]const u8 = null,
+    extra_failure: ?[]const u8 = null,
+    true_runs: usize = 1,
+    hylo_required: usize = 1,
+    alsr_present: usize,
+    hyl_present: usize,
+    hsr_step_count: usize,
+    terminal_atcg: usize,
+};
+
+const hylo_fixtures = [_]HyloFixture{
+    .{ .name = "valid_direct_action_fused", .quality = "present_and_closed", .alsr_present = 0, .hyl_present = 0, .hsr_step_count = 0, .terminal_atcg = 1 },
+    .{ .name = "valid_goal_grind_with_alsr_hyl_hsr", .quality = "present_and_closed", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 1 },
+    .{ .name = "valid_review_fix_three_clean_cas", .quality = "present_and_closed", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 1 },
+    .{ .name = "valid_st_governed_handoff", .quality = "present_and_closed", .alsr_present = 0, .hyl_present = 0, .hsr_step_count = 0, .terminal_atcg = 1 },
+    .{ .name = "valid_parallel_review_class_fanout", .quality = "present_and_closed", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 1 },
+    .{ .name = "valid_branch_race_common_verifier", .quality = "present_and_closed", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 1 },
+    .{ .name = "missing_alsr", .quality = "partial", .failure = "missing_alsr", .alsr_present = 0, .hyl_present = 1, .hsr_step_count = 2, .terminal_atcg = 1 },
+    .{ .name = "missing_hyl", .quality = "partial", .failure = "missing_hyl", .alsr_present = 1, .hyl_present = 0, .hsr_step_count = 2, .terminal_atcg = 1 },
+    .{ .name = "missing_unfold", .quality = "present_verified", .failure = "missing_unfold", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 0 },
+    .{ .name = "mutation_without_unfold", .quality = "present_and_closed", .failure = "mutation_without_unfold", .extra_failure = "missing_unfold", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 1 },
+    .{ .name = "action_without_fold", .quality = "present_unverified", .failure = "action_without_fold", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 0 },
+    .{ .name = "fold_without_current_artifact", .quality = "contradictory", .failure = "fold_without_current_artifact", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 0 },
+    .{ .name = "continue_without_next_seed", .quality = "present_unverified", .failure = "continue_without_next_seed", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 0 },
+    .{ .name = "terminal_without_stop_rule", .quality = "present_and_closed", .failure = "terminal_without_stop_rule", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 1 },
+    .{ .name = "terminal_without_atcg", .quality = "present_verified", .failure = "terminal_without_atcg", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 0 },
+    .{ .name = "stale_hylo_after_diff_change", .quality = "stale", .failure = "stale_hylo_after_diff_change", .extra_failure = "unfold_not_current", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 1 },
+    .{ .name = "parallel_fanout_without_fanin", .quality = "present_verified", .failure = "parallel_fanout_without_fanin", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 0 },
+    .{ .name = "raw_review_to_patch", .quality = "present_and_closed", .failure = "raw_review_to_patch", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 1 },
+    .{ .name = "cached_cas_counted_as_fresh", .quality = "present_verified", .failure = "cached_cas_counted_as_fresh", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 0 },
+    .{ .name = "review_fix_without_review_fold", .quality = "present_and_closed", .failure = "review_fix_without_review_fold", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 1 },
+    .{ .name = "ship_without_terminal_publication_boundary", .quality = "present_and_closed", .failure = "ship_without_terminal_publication_boundary", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 1 },
+    .{ .name = "prompt_contamination_control", .quality = "absent", .true_runs = 0, .hylo_required = 0, .alsr_present = 0, .hyl_present = 0, .hsr_step_count = 0, .terminal_atcg = 0 },
+};
+
+fn fixturePath(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "testdata/actuation/hylo/{s}.jsonl", .{name});
+}
+
+fn expectJsonCount(allocator: std.mem.Allocator, got: []const u8, key: []const u8, count: usize) !void {
+    const needle = try std.fmt.allocPrint(allocator, "\"{s}\": {d}", .{ key, count });
+    defer allocator.free(needle);
+    try expectContains(got, needle);
+}
+
+fn expectHyloFixture(allocator: std.mem.Allocator, fixture: HyloFixture) !void {
+    const path = try fixturePath(allocator, fixture.name);
+    defer allocator.free(path);
+    const out_path = try std.fmt.allocPrint(allocator, ".zig-cache/actuation-hylo-{s}.json", .{fixture.name});
+    defer allocator.free(out_path);
+    const args = [_][]const u8{ "--path", path, "--mode", "hylo", "--format", "json" };
+    const got = try runAndReadOutput(allocator, .actuation_audit, args[0..], out_path);
+    defer allocator.free(got);
+
+    try expectJsonCount(allocator, got, "true_runs", fixture.true_runs);
+    try expectJsonCount(allocator, got, "hylo_required", fixture.hylo_required);
+    try expectJsonCount(allocator, got, "alsr_present", fixture.alsr_present);
+    try expectJsonCount(allocator, got, "hyl_present", fixture.hyl_present);
+    try expectJsonCount(allocator, got, "hsr_step_count", fixture.hsr_step_count);
+    try expectJsonCount(allocator, got, "atcg_after_terminal_fold", fixture.terminal_atcg);
+    try expectJsonCount(allocator, got, fixture.quality, if (fixture.hylo_required == 1) 1 else 0);
+
+    if (fixture.failure) |failure| {
+        const needle = try std.fmt.allocPrint(allocator, "\"{s}\":1", .{failure});
+        defer allocator.free(needle);
+        try expectContains(got, needle);
+    } else {
+        try expectContains(got, "\"failure_classes\": {}");
+    }
+    if (fixture.extra_failure) |failure| {
+        const needle = try std.fmt.allocPrint(allocator, "\"{s}\":1", .{failure});
+        defer allocator.free(needle);
+        try expectContains(got, needle);
+    }
+}
+
+fn hyloFailureCovered(name: []const u8) bool {
+    for (hylo_fixtures) |fixture| {
+        if (fixture.failure) |failure| if (std.mem.eql(u8, failure, name)) return true;
+        if (fixture.extra_failure) |failure| if (std.mem.eql(u8, failure, name)) return true;
+    }
+    return false;
 }
 
 fn writePastedSkillFixture(path: []const u8) !void {
@@ -154,6 +242,31 @@ test "actuation audit hylo mode emits object-shaped governance summary" {
     try expectContains(got, "\"graph_bypass\": 0");
     try expectContains(got, "\"present_and_closed\": 1");
     try expectContains(got, "\"failure_classes\": {}");
+}
+
+test "actuation audit hylo regression fixtures classify expected legal and failure states" {
+    for (hylo_fixtures) |fixture| {
+        try expectHyloFixture(std.testing.allocator, fixture);
+    }
+}
+
+test "actuation audit hylo fixture matrix covers every registered failure class" {
+    for (actuation_hylo.failure_class_names) |name| {
+        if (!hyloFailureCovered(name)) {
+            std.debug.print("missing hylo failure fixture coverage: {s}\n", .{name});
+            return error.MissingHyloFixtureCoverage;
+        }
+    }
+}
+
+test "actuation audit hylo json output is stable for fixture runs" {
+    const fixture = "testdata/actuation/hylo/valid_goal_grind_with_alsr_hyl_hsr.jsonl";
+    const args = [_][]const u8{ "--path", fixture, "--mode", "hylo", "--format", "json" };
+    const first = try runAndReadOutput(std.testing.allocator, .actuation_audit, args[0..], ".zig-cache/actuation-hylo-stable-a.json");
+    defer std.testing.allocator.free(first);
+    const second = try runAndReadOutput(std.testing.allocator, .actuation_audit, args[0..], ".zig-cache/actuation-hylo-stable-b.json");
+    defer std.testing.allocator.free(second);
+    try std.testing.expectEqualStrings(first, second);
 }
 
 test "actuation audit excludes pasted skill blocks as true runs" {

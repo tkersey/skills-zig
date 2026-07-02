@@ -1,0 +1,5 @@
+{"type":"session_meta","timestamp":"2026-07-02T12:10:00Z","payload":{"id":"terminal_without_stop_rule","cwd":"/repo/seq-audit","model":"gpt-5","git":{"branch":"feature/hylo","commit_hash":"head-terminal-no-stop"}}}
+{"type":"event_msg","timestamp":"2026-07-02T12:10:01Z","payload":{"type":"task_started","turn_id":"t1"}}
+{"type":"event_msg","timestamp":"2026-07-02T12:10:02Z","payload":{"type":"user_message","turn_id":"t1","message":"$actuating terminal without stop rule fixture."}}
+{"type":"event_msg","timestamp":"2026-07-02T12:10:03Z","payload":{"type":"agent_message","turn_id":"t1","message":"agent_loop_scheme_receipt:\n  receipt_version: ALSR-v1\nactuation_hylomorphism:\n  machine_version: HYL-v1\nhylo_step_receipt:\n  receipt_version: HSR-v1\n  unfold:\n    produced: work_node\n  action:\n    effect: inspect\n  fold:\n    verdict: complete\n    current_artifact_bound: yes\nATCG-v1:\n  can_mark_goal_complete: yes"}}
+{"type":"event_msg","timestamp":"2026-07-02T12:10:04Z","payload":{"type":"task_complete","turn_id":"t1","duration_ms":5000}}
