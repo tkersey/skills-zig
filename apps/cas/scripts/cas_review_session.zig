@@ -2792,6 +2792,73 @@ const ImportedCasRerRecord = struct {
     }
 };
 
+fn isCasRerObject(obj: std.json.ObjectMap) bool {
+    return std.mem.eql(u8, jsonStringField(obj, "schema") orelse "", cas_review_evidence_schema);
+}
+
+fn collectNestedCasRerRecordsAlloc(allocator: std.mem.Allocator, out: *std.ArrayList([]u8), root: std.json.ObjectMap) !bool {
+    if (isCasRerObject(root)) {
+        try out.append(allocator, try stringifyJsonValueAlloc(allocator, .{ .object = root }));
+        return true;
+    }
+
+    var found = false;
+    if (objectField(root, "record")) |record| {
+        if (isCasRerObject(record)) {
+            try out.append(allocator, try stringifyJsonValueAlloc(allocator, .{ .object = record }));
+            found = true;
+        }
+    }
+    if (root.get("records")) |records_value| switch (records_value) {
+        .array => |records| {
+            for (records.items) |item| {
+                const item_obj = switch (item) {
+                    .object => |value| value,
+                    else => continue,
+                };
+                const record = objectField(item_obj, "record") orelse continue;
+                if (!isCasRerObject(record)) continue;
+                try out.append(allocator, try stringifyJsonValueAlloc(allocator, .{ .object = record }));
+                found = true;
+            }
+        },
+        else => {},
+    };
+    return found;
+}
+
+fn appendImportedCasRerRecordJsonAlloc(
+    allocator: std.mem.Allocator,
+    imported: *std.ArrayList(ImportedCasRerRecord),
+    source_path_raw: []const u8,
+    record_json: []u8,
+) !void {
+    errdefer allocator.free(record_json);
+    var parsed_record = try std.json.parseFromSlice(std.json.Value, allocator, record_json, .{});
+    defer parsed_record.deinit();
+
+    const record_obj = switch (parsed_record.value) {
+        .object => |value| value,
+        else => return error.InvalidCasRerRecord,
+    };
+
+    var validation = try validateCasRerRecordObjectAlloc(allocator, source_path_raw, record_obj);
+    errdefer validation.deinit(allocator);
+    const record_path = if (validation.ok())
+        try writeCasRerRecordJsonToLedgerAlloc(allocator, record_json)
+    else
+        try allocator.dupe(u8, "");
+    errdefer allocator.free(record_path);
+    const source_path = try allocator.dupe(u8, source_path_raw);
+    errdefer allocator.free(source_path);
+    try imported.append(allocator, .{
+        .source_path = source_path,
+        .record_path = record_path,
+        .record_json = record_json,
+        .validation = validation,
+    });
+}
+
 fn cmdReviewImport(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     var paths = try collectInputPathsAlloc(allocator, parsed.receipt_paths, parsed.receipt_globs);
     defer {
@@ -2842,7 +2909,50 @@ fn cmdReviewImport(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs)
 
     const recover_event_logs = paths.items.len <= ReceiptEventLogRecoveryMaxInputs;
     for (paths.items) |path| {
-        const receipt = normalizeReceiptFromPathAlloc(allocator, path, recover_event_logs, normalize_context) catch |err| {
+        const raw = readFileAlloc(allocator, path, 8 * 1024 * 1024) catch |err| {
+            try errors.append(allocator, .{
+                .source_path = try allocator.dupe(u8, path),
+                .message = try allocator.dupe(u8, @errorName(err)),
+            });
+            continue;
+        };
+        defer allocator.free(raw);
+
+        var maybe_parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch null;
+        if (maybe_parsed) |*parsed_value| {
+            defer parsed_value.deinit();
+            if (parsed_value.value == .object) {
+                var nested_records: std.ArrayList([]u8) = .empty;
+                defer {
+                    for (nested_records.items) |record_json| {
+                        if (record_json.len != 0) allocator.free(record_json);
+                    }
+                    nested_records.deinit(allocator);
+                }
+                const found_nested = collectNestedCasRerRecordsAlloc(allocator, &nested_records, parsed_value.value.object) catch |err| {
+                    try errors.append(allocator, .{
+                        .source_path = try allocator.dupe(u8, path),
+                        .message = try allocator.dupe(u8, @errorName(err)),
+                    });
+                    continue;
+                };
+                if (found_nested) {
+                    for (nested_records.items) |*record_json_ref| {
+                        const record_json = record_json_ref.*;
+                        record_json_ref.* = "";
+                        appendImportedCasRerRecordJsonAlloc(allocator, &imported, path, record_json) catch |err| {
+                            try errors.append(allocator, .{
+                                .source_path = try allocator.dupe(u8, path),
+                                .message = try allocator.dupe(u8, @errorName(err)),
+                            });
+                        };
+                    }
+                    continue;
+                }
+            }
+        }
+
+        const receipt = normalizeReceiptFromJsonAlloc(allocator, path, raw, recover_event_logs, normalize_context) catch |err| {
             try errors.append(allocator, .{
                 .source_path = try allocator.dupe(u8, path),
                 .message = try allocator.dupe(u8, @errorName(err)),
@@ -2866,46 +2976,13 @@ fn cmdReviewImport(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs)
             continue;
         };
 
-        var parsed_record = std.json.parseFromSlice(std.json.Value, allocator, record_json, .{}) catch |err| {
-            allocator.free(record_json);
+        appendImportedCasRerRecordJsonAlloc(allocator, &imported, path, record_json) catch |err| {
             try errors.append(allocator, .{
                 .source_path = try allocator.dupe(u8, path),
                 .message = try allocator.dupe(u8, @errorName(err)),
             });
             continue;
         };
-        defer parsed_record.deinit();
-
-        const record_obj = switch (parsed_record.value) {
-            .object => |value| value,
-            else => {
-                allocator.free(record_json);
-                try errors.append(allocator, .{
-                    .source_path = try allocator.dupe(u8, path),
-                    .message = try allocator.dupe(u8, "InvalidCasRerRecord"),
-                });
-                continue;
-            },
-        };
-
-        {
-            errdefer allocator.free(record_json);
-            var validation = try validateCasRerRecordObjectAlloc(allocator, path, record_obj);
-            errdefer validation.deinit(allocator);
-            const record_path = if (validation.ok())
-                try writeCasRerRecordJsonToLedgerAlloc(allocator, record_json)
-            else
-                try allocator.dupe(u8, "");
-            errdefer allocator.free(record_path);
-            const source_path = try allocator.dupe(u8, path);
-            errdefer allocator.free(source_path);
-            try imported.append(allocator, .{
-                .source_path = source_path,
-                .record_path = record_path,
-                .record_json = record_json,
-                .validation = validation,
-            });
-        }
     }
 
     try printReviewImportResults(imported.items, errors.items, if (parsed.json) .json else parsed.receipt_format);
@@ -13511,6 +13588,40 @@ test "CAS-RUN envelope verdict imports through wrapper without tuple mismatch" {
     try std.testing.expectEqualStrings("base", receipt.base_sha.?);
     try std.testing.expectEqualStrings("head", receipt.head_sha.?);
     try std.testing.expectEqualStrings("fp", receipt.target_fingerprint.?);
+}
+
+test "review import extracts nested CAS-RER records from envelopes" {
+    const record_json =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_nested","createdAt":"2026-07-02T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"run","backendSelected":"cas-run","sourceBackendClass":"cas-start-wait","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","resolvedCodexPath":"/bin/codex","resolvedCodexVersion":"codex 0.1.0","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:a","phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-start-wait"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
+    ;
+    const run_envelope = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"schema":"CAS-RUN-v1","record":{s},"reviewVerdict":{{"status":"clean","backendClass":"cas-start-wait","clean":true,"findingCount":0,"baseSha":"base","headSha":"head","targetFingerprint":"fp","reviewThreadId":"thr","findings":[]}}}}
+    , .{record_json});
+    defer std.testing.allocator.free(run_envelope);
+    var run_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, run_envelope, .{});
+    defer run_parsed.deinit();
+
+    var records: std.ArrayList([]u8) = .empty;
+    defer {
+        for (records.items) |record| std.testing.allocator.free(record);
+        records.deinit(std.testing.allocator);
+    }
+    try std.testing.expect(try collectNestedCasRerRecordsAlloc(std.testing.allocator, &records, run_parsed.value.object));
+    try std.testing.expectEqual(@as(usize, 1), records.items.len);
+    var nested = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, records.items[0], .{});
+    defer nested.deinit();
+    try std.testing.expectEqualStrings("rer_nested", nested.value.object.get("recordId").?.string);
+    try std.testing.expectEqualStrings("/bin/codex", nested.value.object.get("tuple").?.object.get("resolvedCodexPath").?.string);
+    try std.testing.expectEqualStrings("acct:test", nested.value.object.get("principal").?.object.get("accountFingerprint").?.string);
+
+    const import_envelope = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"schema":"CAS-IMPORT-v1","records":[{{"sourcePath":"/tmp/receipt.json","record":{s}}}],"errors":[]}}
+    , .{record_json});
+    defer std.testing.allocator.free(import_envelope);
+    var import_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, import_envelope, .{});
+    defer import_parsed.deinit();
+    try std.testing.expect(try collectNestedCasRerRecordsAlloc(std.testing.allocator, &records, import_parsed.value.object));
+    try std.testing.expectEqual(@as(usize, 2), records.items.len);
 }
 
 test "CAS inspect record object keeps malformed JSON output parseable" {
