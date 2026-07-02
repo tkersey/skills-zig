@@ -6472,6 +6472,91 @@ fn jsonFileContentMatches(raw: []const u8, json: []const u8) bool {
     return std.mem.eql(u8, raw[0..end], json);
 }
 
+fn casRerVolatileTimestampField(key: []const u8) bool {
+    return std.mem.eql(u8, key, "createdAt") or std.mem.eql(u8, key, "updatedAt");
+}
+
+fn jsonValueStableEqual(left: std.json.Value, right: std.json.Value, ignore_top_level_cas_rer_timestamps: bool) bool {
+    return switch (left) {
+        .null => right == .null,
+        .bool => |left_bool| switch (right) {
+            .bool => |right_bool| left_bool == right_bool,
+            else => false,
+        },
+        .integer => |left_integer| switch (right) {
+            .integer => |right_integer| left_integer == right_integer,
+            else => false,
+        },
+        .float => |left_float| switch (right) {
+            .float => |right_float| left_float == right_float,
+            else => false,
+        },
+        .number_string => |left_number| switch (right) {
+            .number_string => |right_number| std.mem.eql(u8, left_number, right_number),
+            else => false,
+        },
+        .string => |left_string| switch (right) {
+            .string => |right_string| std.mem.eql(u8, left_string, right_string),
+            else => false,
+        },
+        .array => |left_array| switch (right) {
+            .array => |right_array| blk: {
+                if (left_array.items.len != right_array.items.len) break :blk false;
+                for (left_array.items, right_array.items) |left_item, right_item| {
+                    if (!jsonValueStableEqual(left_item, right_item, false)) break :blk false;
+                }
+                break :blk true;
+            },
+            else => false,
+        },
+        .object => |left_object| switch (right) {
+            .object => |right_object| jsonObjectStableEqual(left_object, right_object, ignore_top_level_cas_rer_timestamps),
+            else => false,
+        },
+    };
+}
+
+fn jsonObjectStableEqual(left: std.json.ObjectMap, right: std.json.ObjectMap, ignore_top_level_cas_rer_timestamps: bool) bool {
+    var left_count: usize = 0;
+    var left_it = left.iterator();
+    while (left_it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (ignore_top_level_cas_rer_timestamps and casRerVolatileTimestampField(key)) continue;
+        left_count += 1;
+        const right_value = right.get(key) orelse return false;
+        if (!jsonValueStableEqual(entry.value_ptr.*, right_value, false)) return false;
+    }
+
+    var right_count: usize = 0;
+    var right_it = right.iterator();
+    while (right_it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (ignore_top_level_cas_rer_timestamps and casRerVolatileTimestampField(key)) continue;
+        right_count += 1;
+    }
+
+    return left_count == right_count;
+}
+
+fn casRerStableContentMatchesAlloc(allocator: std.mem.Allocator, raw: []const u8, json: []const u8) !bool {
+    var existing_parsed = std.json.parseFromSlice(std.json.Value, allocator, std.mem.trim(u8, raw, " \t\r\n"), .{}) catch return false;
+    defer existing_parsed.deinit();
+    var incoming_parsed = std.json.parseFromSlice(std.json.Value, allocator, std.mem.trim(u8, json, " \t\r\n"), .{}) catch return false;
+    defer incoming_parsed.deinit();
+    const existing = switch (existing_parsed.value) {
+        .object => |obj| obj,
+        else => return false,
+    };
+    const incoming = switch (incoming_parsed.value) {
+        .object => |obj| obj,
+        else => return false,
+    };
+    if (!std.mem.eql(u8, jsonStringField(existing, "schema") orelse "", cas_review_evidence_schema)) return false;
+    if (!std.mem.eql(u8, jsonStringField(incoming, "schema") orelse "", cas_review_evidence_schema)) return false;
+    if (!optionalStringsEqual(jsonStringField(existing, "recordId"), jsonStringField(incoming, "recordId"))) return false;
+    return jsonObjectStableEqual(existing, incoming, true);
+}
+
 fn writeRawJsonFileExclusiveOrIdenticalAlloc(allocator: std.mem.Allocator, path: []const u8, json: []const u8) !void {
     try ensureParentPath(path);
     var file = std.Io.Dir.createFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{
@@ -6482,6 +6567,7 @@ fn writeRawJsonFileExclusiveOrIdenticalAlloc(allocator: std.mem.Allocator, path:
             const existing = try readFileAlloc(allocator, path, 8 * 1024 * 1024);
             defer allocator.free(existing);
             if (jsonFileContentMatches(existing, json)) return;
+            if (try casRerStableContentMatchesAlloc(allocator, existing, json)) return;
             return error.CasRerRecordIdCollision;
         },
         else => return err,
@@ -13880,6 +13966,19 @@ test "CAS-RER ledger write rejects recordId collisions" {
     try writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"recordId\":\"rer_collision\",\"value\":1}");
     try writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"recordId\":\"rer_collision\",\"value\":1}");
     try std.testing.expectError(error.CasRerRecordIdCollision, writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"recordId\":\"rer_collision\",\"value\":2}"));
+}
+
+test "CAS-RER ledger write accepts stable content with regenerated timestamps" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "rer_same.json" });
+    defer std.testing.allocator.free(path);
+
+    try writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"schema\":\"CAS-RER-v1\",\"recordId\":\"rer_same\",\"createdAt\":\"2026-07-02T00:00:00Z\",\"updatedAt\":\"2026-07-02T00:00:00Z\",\"value\":1}");
+    try writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"schema\":\"CAS-RER-v1\",\"recordId\":\"rer_same\",\"createdAt\":\"2026-07-02T00:00:01Z\",\"updatedAt\":\"2026-07-02T00:00:01Z\",\"value\":1}");
+    try std.testing.expectError(error.CasRerRecordIdCollision, writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"schema\":\"CAS-RER-v1\",\"recordId\":\"rer_same\",\"createdAt\":\"2026-07-02T00:00:02Z\",\"updatedAt\":\"2026-07-02T00:00:02Z\",\"value\":2}"));
 }
 
 test "CAS-RER record id ignores volatile projection timestamps" {
