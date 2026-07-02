@@ -891,10 +891,7 @@ fn classifyCasRerObject(allocator: std.mem.Allocator, root: std.json.ObjectMap, 
 
     const record_id = nullableString(root, "recordId");
     const raw_status = if (verdict) |value| nullableString(value, "status") else null;
-    const backend_class =
-        (if (command) |cmd| nullableString(cmd, "backendSelected") else null) orelse
-        (if (command) |cmd| nullableString(cmd, "sourceBackendClass") else null) orelse
-        ctx.default_backend_class;
+    const backend_class = casRerBackendClass(command, ctx.default_backend_class);
     const command_surface = if (command) |cmd| nullableString(cmd, "surface") orelse ctx.command_surface else ctx.command_surface;
     const raw_broker_action = if (broker) |value| nullableString(value, "action") else null;
     const raw_broker_reason = if (broker) |value| nullableString(value, "reason") else null;
@@ -966,6 +963,13 @@ fn classifyCasRerObject(allocator: std.mem.Allocator, root: std.json.ObjectMap, 
     try putStringOrNull(&row, "review_broker_action", broker_action);
     try putStringOrNull(&row, "review_broker_reason", broker_reason);
     return row;
+}
+
+fn casRerBackendClass(command: ?std.json.ObjectMap, default_backend_class: []const u8) []const u8 {
+    const selected = if (command) |cmd| nullableString(cmd, "backendSelected") else null;
+    const source = if (command) |cmd| nullableString(cmd, "sourceBackendClass") else null;
+    if (optEql(selected, "imported-legacy")) return source orelse selected.?;
+    return selected orelse source orelse default_backend_class;
 }
 
 fn summarize(rows: []const query.Row) Summary {
@@ -1807,6 +1811,7 @@ test "CAS-RER findings record is canonical ledger evidence" {
 
     try std.testing.expectEqualStrings("cas_review_evidence_ledger", scalarString(row, "canonical_source").?);
     try std.testing.expectEqualStrings("findings", scalarString(row, "canonical_status").?);
+    try std.testing.expectEqualStrings("cas-lane", scalarString(row, "backend_class").?);
     try std.testing.expectEqualStrings("rer_findings", scalarString(row, "record_id").?);
     try std.testing.expectEqualStrings("findings", scalarString(row, "review_verdict_status").?);
     try std.testing.expectEqualStrings("thr_findings", scalarString(row, "review_thread_id").?);

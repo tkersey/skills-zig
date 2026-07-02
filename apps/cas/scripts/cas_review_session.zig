@@ -3606,6 +3606,9 @@ fn validateCasRerRecordObjectAlloc(allocator: std.mem.Allocator, path: []const u
                     try appendGateError(allocator, &errors, "verdict.tupleVerdictExists requires terminal clean or findings status", .{});
                 }
                 if (tuple) |tuple_obj| {
+                    if (nonEmptyOptional(jsonStringField(tuple_obj, "repoRealpath")) == null) {
+                        try appendGateError(allocator, &errors, "verdict.tupleVerdictExists requires tuple.repoRealpath", .{});
+                    }
                     if (nonEmptyOptional(jsonStringField(tuple_obj, "baseSha")) == null) {
                         try appendGateError(allocator, &errors, "verdict.tupleVerdictExists requires tuple.baseSha", .{});
                     }
@@ -12988,7 +12991,7 @@ test "receipt normalizer accepts compact verdict-only artifact" {
 
 test "CAS-RER writer projects terminal findings receipt" {
     const raw =
-        \\{"status":"findings","backendClass":"cas-lane","clean":false,"findingCount":1,"failureCode":null,"failureHint":null,"reviewAttemptPhase":"normalized_verdict","baseSha":"base_rer","headSha":"head_rer","targetFingerprint":"fp_rer","reviewThreadId":"thr_rer","reviewTurnId":"turn_rer","recordPath":"/tmp/record.json","eventLogPath":"/tmp/event.jsonl","findings":[{"title":"Ledger issue","file":"/tmp/a.zig","line":12,"priority":1}]}
+        \\{"cwd":"/tmp/repo","status":"findings","backendClass":"cas-lane","clean":false,"findingCount":1,"failureCode":null,"failureHint":null,"reviewAttemptPhase":"normalized_verdict","baseSha":"base_rer","headSha":"head_rer","targetFingerprint":"fp_rer","reviewThreadId":"thr_rer","reviewTurnId":"turn_rer","recordPath":"/tmp/record.json","eventLogPath":"/tmp/event.jsonl","findings":[{"title":"Ledger issue","file":"/tmp/a.zig","line":12,"priority":1}]}
     ;
     const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "findings-receipt.json", raw, true, .{});
     defer receipt.deinit(std.testing.allocator);
@@ -13204,6 +13207,19 @@ test "CAS-RER validator rejects terminal verdict without attempt" {
     try std.testing.expect(!gate.ok());
     try std.testing.expect(gate.errors.len >= 3);
     try std.testing.expect(std.mem.indexOf(u8, gate.errors[0], "attempt.exists=true") != null);
+}
+
+test "CAS-RER validator rejects terminal tuple verdict without repo binding" {
+    const raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_no_repo","tuple":{"repoRealpath":null,"baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "no-repo-rer.json", parsed.value.object);
+    defer gate.deinit(std.testing.allocator);
+    try std.testing.expect(!gate.ok());
+    try std.testing.expect(gate.errors.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, gate.errors[0], "repoRealpath") != null);
 }
 
 test "CAS-RER validator rejects attempt exists with empty review thread id" {
