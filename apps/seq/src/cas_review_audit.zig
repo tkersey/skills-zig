@@ -559,6 +559,17 @@ fn isCasReviewEvidenceRecord(root: std.json.ObjectMap) bool {
     return optEql(nullableString(root, "schema"), "CAS-RER-v1");
 }
 
+fn isCompleteCasReviewEvidenceRecord(root: std.json.ObjectMap) bool {
+    return isCasReviewEvidenceRecord(root) and
+        nullableString(root, "recordId") != null and
+        objectField(root, "command") != null and
+        objectField(root, "tuple") != null and
+        objectField(root, "attempt") != null and
+        objectField(root, "verdict") != null and
+        objectField(root, "failure") != null and
+        objectField(root, "principal") != null;
+}
+
 fn isCasImportEnvelope(root: std.json.ObjectMap) bool {
     return optEql(nullableString(root, "schema"), "CAS-IMPORT-v1");
 }
@@ -592,13 +603,19 @@ fn appendRowsFromCasRunEnvelope(
     audit: *Audit,
     dedupe: *std.StringHashMap(void),
 ) !void {
-    const record = objectField(root, "record") orelse return;
-    if (!isCasReviewEvidenceRecord(record)) return;
-    const row = try classifyCasRerObject(allocator, record, ctx);
-    const record_id = nullableString(record, "recordId") orelse "cas-run-rer";
-    const key = try std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ dedupe_path, dedupe_id, record_id });
-    defer allocator.free(key);
-    try appendRowIfMatched(allocator, row, key, key, params, audit, dedupe);
+    if (objectField(root, "record")) |record| {
+        if (isCompleteCasReviewEvidenceRecord(record)) {
+            const row = try classifyCasRerObject(allocator, record, ctx);
+            const record_id = nullableString(record, "recordId") orelse "cas-run-rer";
+            const key = try std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ dedupe_path, dedupe_id, record_id });
+            defer allocator.free(key);
+            try appendRowIfMatched(allocator, row, key, key, params, audit, dedupe);
+            return;
+        }
+    }
+    if (!looksLikeReceiptObject(root)) return;
+    const row = classifyReceiptObject(allocator, root, ctx) catch return;
+    try appendRowIfMatched(allocator, row, dedupe_path, dedupe_id, params, audit, dedupe);
 }
 
 fn appendRowsFromCasCurrentEnvelope(
@@ -2067,6 +2084,29 @@ test "CAS run envelope expands nested CAS-RER record" {
     try std.testing.expectEqual(@as(i64, 1), audit.summary.broker_run_count);
     try std.testing.expectEqual(@as(i64, 1), audit.summary.broker_attached_existing_count);
     try std.testing.expectEqual(@as(i64, 0), audit.summary.start_wait_normalized_count);
+}
+
+test "CAS run envelope falls back to verdict when nested CAS-RER is incomplete" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "run.json", .data =
+        \\{"schema":"CAS-RUN-v1","record":{"schema":"CAS-RER-v1"},"reviewVerdict":{"status":"clean","backendClass":"cas-start-wait","clean":true,"findingCount":0,"failureCode":null,"baseSha":"base","headSha":"head","targetFingerprint":"fp","reviewThreadId":"thr_fallback","reviewTurnId":"turn_fallback","findings":[]},"reviewBrokerDecision":{"action":"returned_terminal","reason":"test","freshAttemptRequired":false}}
+    });
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const run_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "run.json" });
+    defer std.testing.allocator.free(run_path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .receipt_paths = &.{run_path},
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), audit.rows.items.len);
+    try std.testing.expectEqualStrings("thr_fallback", scalarString(audit.rows.items[0], "review_thread_id").?);
+    try std.testing.expectEqualStrings("clean", scalarString(audit.rows.items[0], "review_verdict_status").?);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_clean_count);
 }
 
 test "CAS current and list envelopes expand nested ledger records" {

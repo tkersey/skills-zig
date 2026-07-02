@@ -10731,7 +10731,7 @@ fn casRerAttemptIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt
 
 fn casRerRecordIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt, opts: CasRerProjectionOptions) ![]const u8 {
     const effective_repo_realpath = opts.repo_realpath_override orelse receipt.repo_realpath orelse "";
-    const material = try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}", .{
+    const material = try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{d}\x1f{s}\x1f{s}", .{
         receipt.source_path,
         effective_repo_realpath,
         receipt.status,
@@ -10740,7 +10740,10 @@ fn casRerRecordIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt,
         receipt.base_sha orelse "",
         receipt.head_sha orelse "",
         receipt.target_fingerprint orelse "",
-        opts.created_at,
+        receipt.failure_code orelse "",
+        receipt.finding_count,
+        if (receipt.clean) "clean" else "not-clean",
+        receipt.findings_json,
     });
     defer allocator.free(material);
     const digest = try sha256HexBareAlloc(allocator, material);
@@ -13877,6 +13880,46 @@ test "CAS-RER ledger write rejects recordId collisions" {
     try writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"recordId\":\"rer_collision\",\"value\":1}");
     try writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"recordId\":\"rer_collision\",\"value\":1}");
     try std.testing.expectError(error.CasRerRecordIdCollision, writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"recordId\":\"rer_collision\",\"value\":2}"));
+}
+
+test "CAS-RER record id ignores volatile projection timestamps" {
+    const receipt = NormalizedReceipt{
+        .source_path = "source.json",
+        .status = "clean",
+        .backend_class = "cas-start-wait",
+        .clean = true,
+        .finding_count = 0,
+        .review_attempt_phase = "normalized_verdict",
+        .review_attempt_exists = true,
+        .tuple_verdict_exists = true,
+        .principal_strength = principal_strength_strong,
+        .account_fingerprint_reduced_protection = false,
+        .base_sha = "base",
+        .head_sha = "head",
+        .target_fingerprint = "fp",
+        .repo_realpath = "/tmp/repo",
+        .account_fingerprint = "acct:test",
+        .review_thread_id = "thr",
+        .review_turn_id = "turn",
+        .record_path = "/tmp/record.json",
+        .event_log_path = "/tmp/events.ndjson",
+        .failure_code = null,
+        .failure_hint = null,
+        .failure_class = null,
+        .retryable_same_tuple_now = null,
+        .findings_json = "[]",
+    };
+    const first = try casRerRecordIdAlloc(std.testing.allocator, receipt, .{
+        .created_at = "2026-07-02T00:00:00Z",
+        .updated_at = "2026-07-02T00:00:00Z",
+    });
+    defer std.testing.allocator.free(first);
+    const second = try casRerRecordIdAlloc(std.testing.allocator, receipt, .{
+        .created_at = "2026-07-02T00:00:01Z",
+        .updated_at = "2026-07-02T00:00:01Z",
+    });
+    defer std.testing.allocator.free(second);
+    try std.testing.expectEqualStrings(first, second);
 }
 
 test "CAS-RER projection lets requested import cwd override receipt repo" {
