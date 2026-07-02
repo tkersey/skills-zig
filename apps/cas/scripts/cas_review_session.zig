@@ -2752,6 +2752,8 @@ fn cmdReviewImport(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs)
         .requested_identity = requested_identity_opt,
         .requested_identity_required = requested_identity_required,
     };
+    const import_repo_realpath = if (parsed.cwd) |cwd| try repoRealpathAlloc(allocator, cwd) else null;
+    defer if (import_repo_realpath) |value| allocator.free(value);
 
     const recover_event_logs = paths.items.len <= ReceiptEventLogRecoveryMaxInputs;
     for (paths.items) |path| {
@@ -2764,7 +2766,9 @@ fn cmdReviewImport(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs)
         };
         defer receipt.deinit(allocator);
 
-        const record_json = casRerJsonFromReceiptAlloc(allocator, receipt, .{}) catch |err| {
+        const record_json = casRerJsonFromReceiptAlloc(allocator, receipt, .{
+            .repo_realpath_override = import_repo_realpath,
+        }) catch |err| {
             try errors.append(allocator, .{
                 .source_path = try allocator.dupe(u8, path),
                 .message = try allocator.dupe(u8, @errorName(err)),
@@ -3410,6 +3414,8 @@ fn requiredCasRerObjectField(
     const child = try objectFieldOrGateError(allocator, data, key, errors);
     if (child == null and data.get(key) == null) {
         try appendGateError(allocator, errors, "missing {s}", .{key});
+    } else if (child == null) {
+        try appendGateError(allocator, errors, "{s} must be an object", .{key});
     }
     return child;
 }
@@ -6231,9 +6237,9 @@ fn actionRequiredForCasRerRecord(record: CasRerLedgerRecord) []const u8 {
         if (!record.principal_proof_usable) return "run_new_attempt";
         return "none";
     }
-    if (record.attempt_exists and !record.tuple_verdict_exists) return "wait";
     if (std.mem.eql(u8, record.status, "timeout") or std.mem.eql(u8, record.status, "incomplete")) return "inspect";
     if (std.mem.eql(u8, record.status, "transport_failure")) return "run_new_attempt";
+    if (record.attempt_exists and !record.tuple_verdict_exists) return "wait";
     return "workflow_policy";
 }
 
@@ -9932,6 +9938,7 @@ const CasRerProjectionOptions = struct {
     backend_selected: []const u8 = "imported-legacy",
     broker_action: []const u8 = "imported_legacy",
     broker_reason: []const u8 = "legacy review artifact normalized into CAS-RER-v1",
+    repo_realpath_override: ?[]const u8 = null,
     fresh_attempt_required: bool = false,
     tuple_current_at_record_time: bool = true,
     imported_from_receipt: bool = true,
@@ -10101,10 +10108,11 @@ fn writeCasRerCommandObject(writer: *std.Io.Writer, receipt: NormalizedReceipt, 
 }
 
 fn writeCasRerTupleObject(writer: *std.Io.Writer, receipt: NormalizedReceipt, opts: CasRerProjectionOptions) !void {
+    const repo_realpath = receipt.repo_realpath orelse opts.repo_realpath_override;
     try writer.writeByte('{');
     try writeJsonString(writer, "repoRealpath");
     try writer.writeByte(':');
-    try writeNullableJsonString(writer, receipt.repo_realpath);
+    try writeNullableJsonString(writer, repo_realpath);
     try writer.writeByte(',');
     try writeJsonString(writer, "target");
     try writer.writeAll(":null,");
@@ -12715,6 +12723,15 @@ test "CAS-RER ledger record projection matches tuple identity" {
     try std.testing.expect(reduced_record.tuple_verdict_exists);
     try std.testing.expect(!reduced_record.principal_proof_usable);
     try std.testing.expectEqualStrings("run_new_attempt", actionRequiredForCasRerRecord(reduced_record));
+
+    const timeout_raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_timeout","createdAt":"2026-07-02T00:00:02Z","updatedAt":"2026-07-02T00:00:02Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:c","phase":"review_waiting","reviewThreadId":"thr_timeout","reviewTurnId":"turn_timeout"},"verdict":{"tupleVerdictExists":false,"status":"timeout","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":"wait_timed_out","failureClass":"timeout","retryableSameTupleNow":true},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-start-wait"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
+    ;
+    const timeout_record = try casRerLedgerRecordFromJsonAlloc(std.testing.allocator, "/tmp/rer_timeout.json", timeout_raw);
+    defer timeout_record.deinit(std.testing.allocator);
+    try std.testing.expect(timeout_record.attempt_exists);
+    try std.testing.expect(!timeout_record.tuple_verdict_exists);
+    try std.testing.expectEqualStrings("inspect", actionRequiredForCasRerRecord(timeout_record));
 }
 
 test "CAS-RER writer projects pre-review lane transport as non-attempt" {
@@ -12763,6 +12780,54 @@ test "CAS-RER validator rejects findings without finding count" {
     try std.testing.expect(!gate.ok());
     try std.testing.expectEqual(@as(usize, 1), gate.errors.len);
     try std.testing.expect(std.mem.indexOf(u8, gate.errors[0], "findingCount > 0") != null);
+}
+
+test "CAS-RER validator rejects null required sections" {
+    const raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_nulls","tuple":null,"attempt":null,"verdict":null,"failure":null,"principal":null}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "null-rer.json", parsed.value.object);
+    defer gate.deinit(std.testing.allocator);
+    try std.testing.expect(!gate.ok());
+    try std.testing.expect(gate.errors.len >= 5);
+}
+
+test "CAS-RER projection fills missing repo realpath from import cwd" {
+    const receipt = NormalizedReceipt{
+        .source_path = "source.json",
+        .status = "clean",
+        .backend_class = "cas-start-wait",
+        .clean = true,
+        .finding_count = 0,
+        .review_attempt_phase = "normalized_verdict",
+        .review_attempt_exists = true,
+        .tuple_verdict_exists = true,
+        .principal_strength = principal_strength_strong,
+        .account_fingerprint_reduced_protection = false,
+        .base_sha = "base",
+        .head_sha = "head",
+        .target_fingerprint = "fp",
+        .repo_realpath = null,
+        .review_thread_id = "thr",
+        .review_turn_id = "turn",
+        .record_path = "/tmp/record.json",
+        .event_log_path = "/tmp/events.ndjson",
+        .failure_code = null,
+        .failure_hint = null,
+        .failure_class = null,
+        .retryable_same_tuple_now = null,
+        .findings_json = "[]",
+    };
+    const rer_json = try casRerJsonFromReceiptAlloc(std.testing.allocator, receipt, .{
+        .repo_realpath_override = "/tmp/repo",
+    });
+    defer std.testing.allocator.free(rer_json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, rer_json, .{});
+    defer parsed.deinit();
+    const tuple = parsed.value.object.get("tuple").?.object;
+    try std.testing.expectEqualStrings("/tmp/repo", tuple.get("repoRealpath").?.string);
 }
 
 test "receipt normalizer rejects target-only verdict as proof" {

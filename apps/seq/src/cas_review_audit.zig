@@ -797,8 +797,10 @@ fn classifyCasRerObject(allocator: std.mem.Allocator, root: std.json.ObjectMap, 
         (if (command) |cmd| nullableString(cmd, "backendSelected") else null) orelse
         ctx.default_backend_class;
     const command_surface = if (command) |cmd| nullableString(cmd, "surface") orelse ctx.command_surface else ctx.command_surface;
-    const broker_action = if (broker) |value| nullableString(value, "action") else null;
-    const broker_reason = if (broker) |value| nullableString(value, "reason") else null;
+    const raw_broker_action = if (broker) |value| nullableString(value, "action") else null;
+    const raw_broker_reason = if (broker) |value| nullableString(value, "reason") else null;
+    const broker_action = if (optEql(command_surface, "run")) raw_broker_action else null;
+    const broker_reason = if (broker_action != null) raw_broker_reason else null;
     const failure_code = if (failure) |value| nullableString(value, "failureCode") else null;
     const failure_class = (if (failure) |value| nullableString(value, "failureClass") else null) orelse failureClassForCode(failure_code);
     const review_thread_id = if (attempt) |value| nullableString(value, "reviewThreadId") else null;
@@ -874,9 +876,9 @@ fn summarize(rows: []const query.Row) Summary {
         const finding_count = scalarInt(row, "finding_count");
 
         if (broker_action != null or std.mem.indexOf(u8, command_surface, "review_session run") != null) out.broker_run_count += 1;
-        if (optEql(broker_action, "auto_replaced_dead_transport")) out.broker_auto_replaced_dead_transport_count += 1;
+        if (optEql(broker_action, "auto_replaced_dead_transport") or optEql(broker_action, "replaced_dead_transport")) out.broker_auto_replaced_dead_transport_count += 1;
         if (optEql(broker_action, "attached_existing")) out.broker_attached_existing_count += 1;
-        if (optEql(broker_action, "blocked_live_attempt")) out.broker_blocked_live_count += 1;
+        if (optEql(broker_action, "blocked_live_attempt") or optEql(broker_action, "blocked_live")) out.broker_blocked_live_count += 1;
         if (optEql(surface, "manual_recovery_command")) out.manual_recovery_command_count += 1;
 
         if (optEql(failure_code, "pre_review_lane_transport_lost")) {
@@ -1742,13 +1744,14 @@ test "CAS import envelope expands nested CAS-RER records" {
     try std.testing.expectEqual(@as(usize, 1), audit.rows.items.len);
     try std.testing.expectEqualStrings("rer_envelope", scalarString(audit.rows.items[0], "record_id").?);
     try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_clean_count);
+    try std.testing.expectEqual(@as(i64, 0), audit.summary.broker_run_count);
 }
 
 test "CAS run envelope expands nested CAS-RER record" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "run.json", .data =
-        \\{"schema":"CAS-RUN-v1","recordPath":"/tmp/rer-run.json","record":{"schema":"CAS-RER-v1","recordId":"rer_run","command":{"surface":"run","backendSelected":"cas-run","sourceBackendClass":"cas-start-wait"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_run","reviewTurnId":"turn_run"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true}},"reviewBrokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}}
+        \\{"schema":"CAS-RUN-v1","recordPath":"/tmp/rer-run.json","record":{"schema":"CAS-RER-v1","recordId":"rer_run","command":{"surface":"run","backendSelected":"cas-run","sourceBackendClass":"cas-start-wait","brokerDecision":{"action":"replaced_dead_transport","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_run","reviewTurnId":"turn_run"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true}},"reviewBrokerDecision":{"action":"replaced_dead_transport","reason":"test","freshAttemptRequired":false}}
     });
     const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
@@ -1765,6 +1768,8 @@ test "CAS run envelope expands nested CAS-RER record" {
     try std.testing.expectEqualStrings("rer_run", scalarString(audit.rows.items[0], "record_id").?);
     try std.testing.expectEqualStrings("cas_review_evidence_ledger", scalarString(audit.rows.items[0], "canonical_source").?);
     try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_clean_count);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.broker_run_count);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.broker_auto_replaced_dead_transport_count);
 }
 
 test "repo scope matching is path-boundary safe" {
