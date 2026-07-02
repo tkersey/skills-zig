@@ -570,6 +570,20 @@ fn isCompleteCasReviewEvidenceRecord(root: std.json.ObjectMap) bool {
         objectField(root, "principal") != null;
 }
 
+fn isAuditableCasReviewEvidenceRecord(root: std.json.ObjectMap) bool {
+    if (!isCompleteCasReviewEvidenceRecord(root)) return false;
+    const command = objectField(root, "command") orelse return false;
+    const verdict = objectField(root, "verdict") orelse return false;
+    const record_id = nullableString(root, "recordId") orelse return false;
+    const surface = nullableString(command, "surface") orelse return false;
+    const backend_selected = nullableString(command, "backendSelected") orelse return false;
+    const status = nullableString(verdict, "status") orelse return false;
+    return nonEmpty(record_id) != null and
+        nonEmpty(surface) != null and
+        nonEmpty(backend_selected) != null and
+        nonEmpty(status) != null;
+}
+
 fn isCasImportEnvelope(root: std.json.ObjectMap) bool {
     return optEql(nullableString(root, "schema"), "CAS-IMPORT-v1");
 }
@@ -604,7 +618,7 @@ fn appendRowsFromCasRunEnvelope(
     dedupe: *std.StringHashMap(void),
 ) !void {
     if (objectField(root, "record")) |record| {
-        if (isCompleteCasReviewEvidenceRecord(record)) {
+        if (isAuditableCasReviewEvidenceRecord(record)) {
             const row = try classifyCasRerObject(allocator, record, ctx);
             const record_id = nullableString(record, "recordId") orelse "cas-run-rer";
             const key = try std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ dedupe_path, dedupe_id, record_id });
@@ -681,6 +695,15 @@ fn appendRowsFromCasImportEnvelope(
     };
     for (records, 0..) |record_value, idx| {
         const item = object(record_value) orelse continue;
+        if (isCasReviewEvidenceRecord(item)) {
+            const row = try classifyCasRerObject(allocator, item, ctx);
+            var fallback_buf: [64]u8 = undefined;
+            const record_id = nullableString(item, "recordId") orelse std.fmt.bufPrint(fallback_buf[0..], "cas-rer:{d}", .{idx}) catch "cas-rer";
+            const key = try std.fmt.allocPrint(allocator, "{s}:{s}:{s}", .{ dedupe_path, dedupe_id, record_id });
+            defer allocator.free(key);
+            try appendRowIfMatched(allocator, row, key, key, params, audit, dedupe);
+            continue;
+        }
         const validation = objectField(item, "validation") orelse continue;
         if (boolField(validation, "ok") != true) continue;
         const record = objectField(item, "record") orelse continue;
@@ -2054,6 +2077,28 @@ test "CAS import envelope expands nested CAS-RER records" {
     try std.testing.expectEqual(@as(i64, 0), audit.summary.broker_run_count);
 }
 
+test "CAS import envelope expands bare CAS-RER records" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "import.json", .data =
+        \\{"schema":"CAS-IMPORT-v1","records":[{"schema":"CAS-RER-v1","recordId":"rer_bare_import","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_bare","reviewTurnId":"turn_bare"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}],"errors":[]}
+    });
+    const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const import_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "import.json" });
+    defer std.testing.allocator.free(import_path);
+
+    var audit = try compile(std.testing.allocator, .{
+        .root = root_abs,
+        .receipt_paths = &.{import_path},
+    });
+    defer audit.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), audit.rows.items.len);
+    try std.testing.expectEqualStrings("rer_bare_import", scalarString(audit.rows.items[0], "record_id").?);
+    try std.testing.expectEqual(@as(i64, 1), audit.summary.completed_clean_count);
+}
+
 test "CAS import JSONL wrapper expands nested CAS-RER record" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2107,7 +2152,7 @@ test "CAS run envelope falls back to verdict when nested CAS-RER is incomplete" 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "run.json", .data =
-        \\{"schema":"CAS-RUN-v1","record":{"schema":"CAS-RER-v1"},"reviewVerdict":{"status":"clean","backendClass":"cas-start-wait","clean":true,"findingCount":0,"failureCode":null,"baseSha":"base","headSha":"head","targetFingerprint":"fp","reviewThreadId":"thr_fallback","reviewTurnId":"turn_fallback","findings":[]},"reviewBrokerDecision":{"action":"returned_terminal","reason":"test","freshAttemptRequired":false}}
+        \\{"schema":"CAS-RUN-v1","record":{"schema":"CAS-RER-v1","recordId":"rer_placeholder","command":{"surface":"","backendSelected":""},"tuple":{},"attempt":{},"verdict":{"tupleVerdictExists":false},"failure":{},"principal":{}},"reviewVerdict":{"status":"clean","backendClass":"cas-start-wait","clean":true,"findingCount":0,"failureCode":null,"baseSha":"base","headSha":"head","targetFingerprint":"fp","reviewThreadId":"thr_fallback","reviewTurnId":"turn_fallback","findings":[]},"reviewBrokerDecision":{"action":"returned_terminal","reason":"test","freshAttemptRequired":false}}
     });
     const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);

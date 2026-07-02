@@ -6484,7 +6484,13 @@ fn casRerVolatileTimestampField(key: []const u8) bool {
     return std.mem.eql(u8, key, "createdAt") or std.mem.eql(u8, key, "updatedAt");
 }
 
-fn jsonValueStableEqual(left: std.json.Value, right: std.json.Value, ignore_top_level_cas_rer_timestamps: bool) bool {
+fn casRerStableCompareIgnoredField(key: []const u8) bool {
+    return casRerVolatileTimestampField(key) or
+        std.mem.eql(u8, key, "sourcePath") or
+        std.mem.eql(u8, key, "rawReceipt");
+}
+
+fn jsonValueStableEqual(left: std.json.Value, right: std.json.Value, ignore_cas_rer_provenance: bool) bool {
     return switch (left) {
         .null => right == .null,
         .bool => |left_bool| switch (right) {
@@ -6511,35 +6517,35 @@ fn jsonValueStableEqual(left: std.json.Value, right: std.json.Value, ignore_top_
             .array => |right_array| blk: {
                 if (left_array.items.len != right_array.items.len) break :blk false;
                 for (left_array.items, right_array.items) |left_item, right_item| {
-                    if (!jsonValueStableEqual(left_item, right_item, false)) break :blk false;
+                    if (!jsonValueStableEqual(left_item, right_item, ignore_cas_rer_provenance)) break :blk false;
                 }
                 break :blk true;
             },
             else => false,
         },
         .object => |left_object| switch (right) {
-            .object => |right_object| jsonObjectStableEqual(left_object, right_object, ignore_top_level_cas_rer_timestamps),
+            .object => |right_object| jsonObjectStableEqual(left_object, right_object, ignore_cas_rer_provenance),
             else => false,
         },
     };
 }
 
-fn jsonObjectStableEqual(left: std.json.ObjectMap, right: std.json.ObjectMap, ignore_top_level_cas_rer_timestamps: bool) bool {
+fn jsonObjectStableEqual(left: std.json.ObjectMap, right: std.json.ObjectMap, ignore_cas_rer_provenance: bool) bool {
     var left_count: usize = 0;
     var left_it = left.iterator();
     while (left_it.next()) |entry| {
         const key = entry.key_ptr.*;
-        if (ignore_top_level_cas_rer_timestamps and casRerVolatileTimestampField(key)) continue;
+        if (ignore_cas_rer_provenance and casRerStableCompareIgnoredField(key)) continue;
         left_count += 1;
         const right_value = right.get(key) orelse return false;
-        if (!jsonValueStableEqual(entry.value_ptr.*, right_value, false)) return false;
+        if (!jsonValueStableEqual(entry.value_ptr.*, right_value, ignore_cas_rer_provenance)) return false;
     }
 
     var right_count: usize = 0;
     var right_it = right.iterator();
     while (right_it.next()) |entry| {
         const key = entry.key_ptr.*;
-        if (ignore_top_level_cas_rer_timestamps and casRerVolatileTimestampField(key)) continue;
+        if (ignore_cas_rer_provenance and casRerStableCompareIgnoredField(key)) continue;
         right_count += 1;
     }
 
@@ -6745,7 +6751,65 @@ fn appendCasRerLedgerRecordsAlloc(
     }
 }
 
+fn casRerTerminalUsableRank(record: CasRerLedgerRecord) u8 {
+    if (record.tuple_verdict_exists and record.principal_proof_usable and
+        (std.mem.eql(u8, record.status, "clean") or std.mem.eql(u8, record.status, "findings")))
+    {
+        return 1;
+    }
+    return 0;
+}
+
+fn daysFromCivil(year_raw: i64, month_raw: i64, day_raw: i64) i64 {
+    var year = year_raw;
+    const month = month_raw;
+    const day = day_raw;
+    const year_adjustment: i64 = if (month <= 2) 1 else 0;
+    year -= year_adjustment;
+    const era = @divFloor(year, 400);
+    const yoe = year - era * 400;
+    const month_adjustment: i64 = if (month > 2) -3 else 9;
+    const mp = month + month_adjustment;
+    const doy = @divFloor(153 * mp + 2, 5) + day - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+fn parseTwoDigits(text: []const u8) ?i64 {
+    if (text.len != 2) return null;
+    if (!std.ascii.isDigit(text[0]) or !std.ascii.isDigit(text[1])) return null;
+    return @as(i64, text[0] - '0') * 10 + @as(i64, text[1] - '0');
+}
+
+fn parseIsoTimestampNs(text: []const u8) ?i128 {
+    if (text.len < 20) return null;
+    if (text[4] != '-' or text[7] != '-' or text[10] != 'T' or text[13] != ':' or text[16] != ':') return null;
+    const year = std.fmt.parseInt(i64, text[0..4], 10) catch return null;
+    const month = parseTwoDigits(text[5..7]) orelse return null;
+    const day = parseTwoDigits(text[8..10]) orelse return null;
+    const hour = parseTwoDigits(text[11..13]) orelse return null;
+    const minute = parseTwoDigits(text[14..16]) orelse return null;
+    const second = parseTwoDigits(text[17..19]) orelse return null;
+    if (month < 1 or month > 12 or day < 1 or day > 31 or hour > 23 or minute > 59 or second > 60) return null;
+    const days = daysFromCivil(year, month, day);
+    const seconds = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    return @as(i128, seconds) * 1_000_000_000;
+}
+
+fn parseCasRerCreatedAtNs(text: []const u8) ?i128 {
+    if (std.mem.startsWith(u8, text, "unix-ns:")) {
+        return std.fmt.parseInt(i128, text["unix-ns:".len..], 10) catch null;
+    }
+    return parseIsoTimestampNs(text);
+}
+
 fn casRerRecordLessThan(_: void, left: CasRerLedgerRecord, right: CasRerLedgerRecord) bool {
+    const left_rank = casRerTerminalUsableRank(left);
+    const right_rank = casRerTerminalUsableRank(right);
+    if (left_rank != right_rank) return left_rank < right_rank;
+    const left_ns = parseCasRerCreatedAtNs(left.created_at);
+    const right_ns = parseCasRerCreatedAtNs(right.created_at);
+    if (left_ns != null and right_ns != null and left_ns.? != right_ns.?) return left_ns.? < right_ns.?;
     const created_order = std.mem.order(u8, left.created_at, right.created_at);
     if (created_order != .eq) return created_order == .lt;
     return std.mem.order(u8, left.record_id, right.record_id) == .lt;
@@ -10828,8 +10892,7 @@ fn casRerRecordIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt,
     const effective_resolved_codex_path = opts.resolved_codex_path_override orelse receipt.resolved_codex_path orelse "";
     const effective_resolved_codex_version = opts.resolved_codex_version_override orelse receipt.resolved_codex_version orelse "";
     const effective_account_fingerprint = opts.account_fingerprint_override orelse receipt.account_fingerprint orelse "";
-    const material = try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{d}\x1f{s}\x1f{s}", .{
-        receipt.source_path,
+    const material = try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{d}\x1f{s}\x1f{s}", .{
         effective_repo_realpath,
         effective_resolved_codex_path,
         effective_resolved_codex_version,
@@ -13546,6 +13609,21 @@ test "CAS-RER ledger record projection matches tuple identity" {
     try std.testing.expect(reduced_record.tuple_verdict_exists);
     try std.testing.expect(!reduced_record.principal_proof_usable);
     try std.testing.expectEqualStrings("run_new_attempt", actionRequiredForCasRerRecord(reduced_record));
+    const ranked_records = [_]CasRerLedgerRecord{ reduced_record, record };
+    try std.testing.expectEqual(@as(?usize, 1), latestCasRerLedgerRecordIndex(&ranked_records));
+
+    const unix_timestamp_raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_unix_ts","createdAt":"unix-ns:2000000000","updatedAt":"unix-ns:2000000000","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:unix","phase":"normalized_verdict","reviewThreadId":"thr_unix","reviewTurnId":"turn_unix"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-run"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
+    ;
+    const unix_timestamp_record = try casRerLedgerRecordFromJsonAlloc(std.testing.allocator, "/tmp/rer_unix_ts.json", unix_timestamp_raw);
+    defer unix_timestamp_record.deinit(std.testing.allocator);
+    const iso_timestamp_raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_iso_ts","createdAt":"1970-01-01T00:00:03Z","updatedAt":"1970-01-01T00:00:03Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:iso","phase":"normalized_verdict","reviewThreadId":"thr_iso","reviewTurnId":"turn_iso"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-run"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
+    ;
+    const iso_timestamp_record = try casRerLedgerRecordFromJsonAlloc(std.testing.allocator, "/tmp/rer_iso_ts.json", iso_timestamp_raw);
+    defer iso_timestamp_record.deinit(std.testing.allocator);
+    const timestamp_records = [_]CasRerLedgerRecord{ unix_timestamp_record, iso_timestamp_record };
+    try std.testing.expectEqual(@as(?usize, 1), latestCasRerLedgerRecordIndex(&timestamp_records));
 
     const timeout_raw =
         \\{"schema":"CAS-RER-v1","recordId":"rer_timeout","createdAt":"2026-07-02T00:00:02Z","updatedAt":"2026-07-02T00:00:02Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:c","phase":"review_waiting","reviewThreadId":"thr_timeout","reviewTurnId":"turn_timeout"},"verdict":{"tupleVerdictExists":false,"status":"timeout","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":"wait_timed_out","failureClass":"timeout","retryableSameTupleNow":true},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-start-wait"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
@@ -14010,8 +14088,8 @@ test "CAS-RER ledger write accepts stable content with regenerated timestamps" {
     const path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "rer_same.json" });
     defer std.testing.allocator.free(path);
 
-    try writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"schema\":\"CAS-RER-v1\",\"recordId\":\"rer_same\",\"createdAt\":\"2026-07-02T00:00:00Z\",\"updatedAt\":\"2026-07-02T00:00:00Z\",\"value\":1}");
-    try writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"schema\":\"CAS-RER-v1\",\"recordId\":\"rer_same\",\"createdAt\":\"2026-07-02T00:00:01Z\",\"updatedAt\":\"2026-07-02T00:00:01Z\",\"value\":1}");
+    try writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"schema\":\"CAS-RER-v1\",\"recordId\":\"rer_same\",\"createdAt\":\"2026-07-02T00:00:00Z\",\"updatedAt\":\"2026-07-02T00:00:00Z\",\"attachments\":{\"rawReceipt\":\"/tmp/original.json\"},\"legacy\":{\"sourcePath\":\"/tmp/original.json\"},\"value\":1}");
+    try writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"schema\":\"CAS-RER-v1\",\"recordId\":\"rer_same\",\"createdAt\":\"2026-07-02T00:00:01Z\",\"updatedAt\":\"2026-07-02T00:00:01Z\",\"attachments\":{\"rawReceipt\":\"/tmp/copy.json\"},\"legacy\":{\"sourcePath\":\"/tmp/copy.json\"},\"value\":1}");
     try std.testing.expectError(error.CasRerRecordIdCollision, writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"schema\":\"CAS-RER-v1\",\"recordId\":\"rer_same\",\"createdAt\":\"2026-07-02T00:00:02Z\",\"updatedAt\":\"2026-07-02T00:00:02Z\",\"value\":2}"));
 }
 
@@ -14053,6 +14131,15 @@ test "CAS-RER record id ignores volatile projection timestamps" {
     });
     defer std.testing.allocator.free(second);
     try std.testing.expectEqualStrings(first, second);
+
+    var copied_receipt = receipt;
+    copied_receipt.source_path = "/tmp/copied-source.json";
+    const copied = try casRerRecordIdAlloc(std.testing.allocator, copied_receipt, .{
+        .created_at = "2026-07-02T00:00:02Z",
+        .updated_at = "2026-07-02T00:00:02Z",
+    });
+    defer std.testing.allocator.free(copied);
+    try std.testing.expectEqualStrings(first, copied);
 }
 
 test "CAS-RER record id includes stable projection identity" {
