@@ -587,6 +587,8 @@ fn appendRowsFromCasImportEnvelope(
     };
     for (records, 0..) |record_value, idx| {
         const item = object(record_value) orelse continue;
+        const validation = objectField(item, "validation") orelse continue;
+        if (boolField(validation, "ok") != true) continue;
         const record = objectField(item, "record") orelse continue;
         if (!isCasReviewEvidenceRecord(record)) continue;
         const row = try classifyCasRerObject(allocator, record, ctx);
@@ -1728,7 +1730,7 @@ test "CAS import envelope expands nested CAS-RER records" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(defaultIo(), .{ .sub_path = "import.json", .data =
-        \\{"schema":"CAS-IMPORT-v1","records":[{"sourcePath":"/tmp/receipt.json","recordPath":"/tmp/rer.json","validation":{"ok":true,"errors":[],"path":"/tmp/receipt.json"},"record":{"schema":"CAS-RER-v1","recordId":"rer_envelope","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_env","reviewTurnId":"turn_env"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true}}}],"errors":[]}
+        \\{"schema":"CAS-IMPORT-v1","records":[{"sourcePath":"/tmp/receipt.json","recordPath":"/tmp/rer.json","validation":{"ok":true,"errors":[],"path":"/tmp/receipt.json"},"record":{"schema":"CAS-RER-v1","recordId":"rer_envelope","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_env","reviewTurnId":"turn_env"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true}}},{"sourcePath":"/tmp/bad.json","recordPath":"","validation":{"ok":false,"errors":["bad"],"path":"/tmp/bad.json"},"record":{"schema":"CAS-RER-v1","recordId":"rer_rejected","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_bad","reviewTurnId":"turn_bad"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":1,"findings":[{"title":"bad"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true}}}],"errors":[]}
     });
     const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
