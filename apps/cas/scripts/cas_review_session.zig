@@ -7790,7 +7790,7 @@ fn emitReviewTupleLockBlockedAndExit(
         if (std.mem.eql(u8, action_name, "run")) {
             const timestamp = try casRerTimestampAlloc(allocator);
             defer allocator.free(timestamp);
-            const shadow_record_path = try writeCasRerShadowRecordFromJsonAlloc(allocator, if (lock) |value| value.recordPath orelse lock_path else lock_path, payload_json, normalizeContextFromReviewTuple(tuple), .{
+            const shadow_record_path = writeCasRerShadowRecordFromJsonAlloc(allocator, if (lock) |value| value.recordPath orelse lock_path else lock_path, payload_json, normalizeContextFromReviewTuple(tuple), .{
                 .command_surface = "run",
                 .backend_selected = "cas-run",
                 .broker_action = publicReviewBrokerAction(reviewBrokerActionForBlockedLock(decision)),
@@ -7799,8 +7799,8 @@ fn emitReviewTupleLockBlockedAndExit(
                 .tuple_current_at_record_time = true,
                 .created_at = timestamp,
                 .updated_at = timestamp,
-            });
-            defer allocator.free(shadow_record_path);
+            }) catch null;
+            defer if (shadow_record_path) |path| allocator.free(path);
         }
         var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
@@ -9239,7 +9239,7 @@ fn printStartJson(
             defer normalized.deinit(allocator);
             const timestamp = try casRerTimestampAlloc(allocator);
             defer allocator.free(timestamp);
-            const shadow_record_path = try writeCasRerShadowRecordFromReceipt(allocator, normalized, .{
+            const shadow_record_path = writeCasRerShadowRecordFromReceipt(allocator, normalized, .{
                 .command_surface = "start_wait",
                 .backend_selected = "cas-start-wait",
                 .broker_action = "created_new",
@@ -9248,8 +9248,8 @@ fn printStartJson(
                 .tuple_current_at_record_time = true,
                 .created_at = timestamp,
                 .updated_at = timestamp,
-            });
-            defer allocator.free(shadow_record_path);
+            }) catch null;
+            defer if (shadow_record_path) |path| allocator.free(path);
         }
     }
 
