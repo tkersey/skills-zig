@@ -10825,9 +10825,22 @@ fn casRerAttemptIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt
 
 fn casRerRecordIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt, opts: CasRerProjectionOptions) ![]const u8 {
     const effective_repo_realpath = opts.repo_realpath_override orelse receipt.repo_realpath orelse "";
-    const material = try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{d}\x1f{s}\x1f{s}", .{
+    const effective_resolved_codex_path = opts.resolved_codex_path_override orelse receipt.resolved_codex_path orelse "";
+    const effective_resolved_codex_version = opts.resolved_codex_version_override orelse receipt.resolved_codex_version orelse "";
+    const effective_account_fingerprint = opts.account_fingerprint_override orelse receipt.account_fingerprint orelse "";
+    const material = try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{d}\x1f{s}\x1f{s}", .{
         receipt.source_path,
         effective_repo_realpath,
+        effective_resolved_codex_path,
+        effective_resolved_codex_version,
+        effective_account_fingerprint,
+        opts.command_surface,
+        opts.backend_selected,
+        opts.broker_action,
+        opts.broker_reason,
+        if (opts.fresh_attempt_required) "fresh" else "not-fresh",
+        if (opts.tuple_current_at_record_time) "current" else "not-current",
+        if (opts.imported_from_receipt) "imported" else "native",
         receipt.status,
         receipt.review_thread_id orelse "",
         receipt.review_turn_id orelse "",
@@ -14040,6 +14053,52 @@ test "CAS-RER record id ignores volatile projection timestamps" {
     });
     defer std.testing.allocator.free(second);
     try std.testing.expectEqualStrings(first, second);
+}
+
+test "CAS-RER record id includes stable projection identity" {
+    const receipt = NormalizedReceipt{
+        .source_path = "source.json",
+        .status = "clean",
+        .backend_class = "cas-start-wait",
+        .clean = true,
+        .finding_count = 0,
+        .review_attempt_phase = "normalized_verdict",
+        .review_attempt_exists = true,
+        .tuple_verdict_exists = true,
+        .principal_strength = principal_strength_strong,
+        .account_fingerprint_reduced_protection = false,
+        .base_sha = "base",
+        .head_sha = "head",
+        .target_fingerprint = "fp",
+        .repo_realpath = "/tmp/repo",
+        .resolved_codex_path = "/bin/codex",
+        .resolved_codex_version = "codex 1.0.0",
+        .account_fingerprint = "acct:test",
+        .review_thread_id = "thr",
+        .review_turn_id = "turn",
+        .record_path = "/tmp/record.json",
+        .event_log_path = "/tmp/events.ndjson",
+        .failure_code = null,
+        .failure_hint = null,
+        .failure_class = null,
+        .retryable_same_tuple_now = null,
+        .findings_json = "[]",
+    };
+    const start_wait = try casRerRecordIdAlloc(std.testing.allocator, receipt, .{
+        .command_surface = "start_wait",
+        .backend_selected = "cas-start-wait",
+        .broker_action = "created_new",
+        .broker_reason = "test",
+    });
+    defer std.testing.allocator.free(start_wait);
+    const run = try casRerRecordIdAlloc(std.testing.allocator, receipt, .{
+        .command_surface = "run",
+        .backend_selected = "cas-run",
+        .broker_action = "returned_terminal",
+        .broker_reason = "test",
+    });
+    defer std.testing.allocator.free(run);
+    try std.testing.expect(!std.mem.eql(u8, start_wait, run));
 }
 
 test "CAS-RER projection lets requested import cwd override receipt repo" {
