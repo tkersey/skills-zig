@@ -9214,7 +9214,7 @@ fn printStartJson(
             };
             try writeCasRunEnvelopeFromReceipt(allocator, stdout, normalized, broker, receipt.fresh_attempt_required);
             try stdout.writeByte('\n');
-            if (!normalizedReceiptCommandSucceeded(normalized)) return error.ReviewNotClean;
+            if (!normalizedReceiptCommandSucceeded(normalized)) std.process.exit(1);
             return;
         }
     } else if (std.mem.eql(u8, receipt.surface_action, "start") and waited) {
