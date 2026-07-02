@@ -19,16 +19,22 @@ const UsageText =
     \\Control detached Codex review sessions via the app-server.
     \\
     \\Usage:
-    \\  cas_review_session <run|start|status|wait|interrupt|lane|receipt|lock> [options]
+    \\  cas_review_session <run|current|list|import|inspect|validate-record|start|status|wait|interrupt|lane|receipt|lock> [options]
     \\
     \\Actions:
     \\  run        Broker one tuple-bound review verdict; waits and hides lock recovery.
+    \\  current    Read the latest ledger-backed review record for the current tuple.
+    \\  list       List ledger-backed review evidence records for the current tuple.
+    \\  import     Import a legacy review artifact into CAS-RER-v1.
+    \\  inspect    Diagnostic-only inspection of a CAS-RER-v1 evidence record.
+    \\  validate-record
+    \\             Validate a CAS-RER-v1 review evidence record.
     \\  start      Start a detached review session and persist its handle.
     \\  status     Read the persisted session and report current review status.
     \\  wait       Poll the persisted session until the review turn reaches a terminal status.
     \\  interrupt  Interrupt the persisted detached review turn.
     \\  lane       Reuse one managed app-server for multiple fresh-parent reviews.
-    \\  receipt    Normalize or summarize saved CAS review receipts without touching review state.
+    \\  receipt    Debug/compat receipt normalization and classification surfaces.
     \\  lock       Validate saved CAS review tuple-lock records.
     \\
     \\Lane actions:
@@ -45,7 +51,7 @@ const UsageText =
     \\Receipt actions:
     \\  receipt normalize  Normalize saved receipts into the reviewVerdict surface.
     \\  receipt classify   Classify saved receipt records into transport facts.
-    \\  receipt gate       Validate saved receipts against the review transport boundary.
+    \\  receipt gate       Deprecated compatibility gate; prefer import + validate-record.
     \\
     \\Lock actions:
     \\  lock gate          Validate saved CAS-RTL-v1 tuple-lock records.
@@ -97,7 +103,11 @@ const UsageText =
     \\  --json                           Emit machine-readable JSON.
     \\  --verdict-only                   Emit only the compact reviewVerdict JSON for lane review.
     \\  --path FILE                      Receipt or lock file to process; repeatable.
+    \\  --record FILE                    CAS-RER-v1 record file to validate; repeatable.
     \\  --glob PATTERN                   Simple receipt glob; repeatable.
+    \\  --allow-reduced-principal        Diagnostic inspect flag only; never closeout eligible.
+    \\  --allow-native-fallback          Diagnostic inspect flag only; never closeout eligible.
+    \\  --show-attachments               Include attachment paths in diagnostic inspect output.
     \\  --format FORMAT                  Helper output: table|json|jsonl (default: table).
     \\  --summary                        Include aggregate receipt counts.
     \\  --timeout-ms N                   Wait timeout for `wait` (default: 300000).
@@ -108,6 +118,11 @@ const UsageText =
     \\
     \\Examples:
     \\  cas review_session run --cwd /path/to/repo --base main --json
+    \\  cas review_session current --cwd /path/to/repo --base main --json
+    \\  cas review_session list --cwd /path/to/repo --base main --json
+    \\  cas review_session import --path review-1.json --cwd /path/to/repo --base main --json
+    \\  cas review_session inspect --record rer_123.json --json
+    \\  cas review_session validate-record --record rer_123.json --json
     \\  cas review_session start --cwd /path/to/repo --uncommitted --json
     \\  cas review_session start --cwd /path/to/repo --base main --json
     \\  cas review_session start --wait --cwd /path/to/repo --base main --json
@@ -129,6 +144,11 @@ const UsageText =
 
 const Action = enum {
     run,
+    current,
+    list,
+    review_import,
+    inspect,
+    validate_record,
     start,
     status,
     wait,
@@ -139,6 +159,12 @@ const Action = enum {
 
     fn parse(raw: []const u8) ?Action {
         if (std.mem.eql(u8, raw, "run")) return .run;
+        if (std.mem.eql(u8, raw, "current")) return .current;
+        if (std.mem.eql(u8, raw, "list")) return .list;
+        if (std.mem.eql(u8, raw, "import")) return .review_import;
+        if (std.mem.eql(u8, raw, "inspect")) return .inspect;
+        if (std.mem.eql(u8, raw, "validate-record")) return .validate_record;
+        if (std.mem.eql(u8, raw, "validate_record")) return .validate_record;
         if (std.mem.eql(u8, raw, "start")) return .start;
         if (std.mem.eql(u8, raw, "status")) return .status;
         if (std.mem.eql(u8, raw, "wait")) return .wait;
@@ -300,6 +326,9 @@ const ParsedArgs = struct {
     receipt_globs: []const []const u8 = &.{},
     receipt_format: ReceiptFormat = .table,
     receipt_summary: bool = false,
+    allow_reduced_principal: bool = false,
+    allow_native_fallback: bool = false,
+    show_attachments: bool = false,
     show_help: bool = false,
     show_version: bool = false,
 
@@ -362,6 +391,7 @@ const review_tuple_lock_ttl_seconds: i64 = 30 * 60;
 const unknown_account_fingerprint = "unknown-account";
 const principal_strength_strong = "strong";
 const principal_strength_reduced = "reduced";
+const cas_review_evidence_schema = "CAS-RER-v1";
 
 const ReviewTupleIdentity = struct {
     repo_realpath: []const u8,
@@ -566,6 +596,9 @@ const OutputReceipt = struct {
     multi_agent_mode_support: cas.MultiAgentModeSupport = .not_requested,
     multi_agent_mode_metric_eligible: bool = false,
     review_broker_decision: ?ReviewBrokerDecision = null,
+    account_fingerprint: ?[]const u8 = null,
+    account_fingerprint_reduced_protection: bool = true,
+    fresh_attempt_required: bool = false,
 };
 
 const ReviewBrokerDecision = struct {
@@ -777,6 +810,11 @@ pub fn main(init: std.process.Init) !void {
 
     switch (parsed.action.?) {
         .run => try cmdRun(allocator, init.io, parsed),
+        .current => try cmdReviewCurrent(allocator, init.io, parsed),
+        .list => try cmdReviewList(allocator, init.io, parsed),
+        .review_import => try cmdReviewImport(allocator, init.io, parsed),
+        .inspect => try cmdReviewInspect(allocator, parsed),
+        .validate_record => try cmdValidateRecord(allocator, parsed),
         .start => try cmdStart(allocator, init.io, parsed),
         .status => try cmdStatus(allocator, init.io, parsed),
         .wait => try cmdWait(allocator, init.io, parsed),
@@ -873,6 +911,18 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
         }
         if (std.mem.eql(u8, arg, "--summary")) {
             out.receipt_summary = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--allow-reduced-principal")) {
+            out.allow_reduced_principal = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--allow-native-fallback")) {
+            out.allow_native_fallback = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--show-attachments")) {
+            out.show_attachments = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "--uncommitted")) {
@@ -1026,6 +1076,10 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             try receipt_paths.append(allocator, value);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--record")) {
+            try receipt_paths.append(allocator, value);
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--glob")) {
             try receipt_globs.append(allocator, value);
             continue;
@@ -1044,6 +1098,7 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
     if (out.multi_agent_mode != null) {
         switch (out.action.?) {
             .run => {},
+            .current, .list, .review_import, .inspect, .validate_record => return error.MultiAgentModeUnsupportedAction,
             .start => {},
             .lane => switch (out.lane_action orelse return error.MissingLaneAction) {
                 .review, .smoke, .smoke_suite, .smoke_until_fixed => {},
@@ -1055,6 +1110,7 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
     if (out.review_lock_override_reason != null) {
         switch (out.action.?) {
             .run => {},
+            .current, .list, .review_import, .inspect, .validate_record => return error.ReviewLockOverrideUnsupportedAction,
             .start => {},
             .lane => if (out.lane_action != .review and out.lane_action != .smoke) return error.ReviewLockOverrideUnsupportedAction,
             .status, .wait, .interrupt, .receipt, .lock => return error.ReviewLockOverrideUnsupportedAction,
@@ -1063,6 +1119,7 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
     if (out.fresh_attempt_reason != null) {
         switch (out.action.?) {
             .run => {},
+            .current, .list, .review_import, .inspect, .validate_record => return error.FreshAttemptUnsupportedAction,
             .start => {},
             .lane => if (out.lane_action != .review) return error.FreshAttemptUnsupportedAction,
             .status, .wait, .interrupt, .receipt, .lock => return error.FreshAttemptUnsupportedAction,
@@ -1074,6 +1131,13 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             if (out.target == null) return error.MissingTarget;
             if (out.parent_mode == .fresh and out.parent_thread_id != null) return error.FreshParentModeDisallowsParentThreadId;
             if (out.parent_mode == .reuse and out.parent_thread_id == null) return error.ReuseParentModeRequiresParentThreadId;
+        },
+        .current, .list => {
+            if (out.cwd == null) return error.MissingCwd;
+            if (out.target == null) return error.MissingTarget;
+        },
+        .review_import, .inspect, .validate_record => {
+            if (out.receipt_paths.len == 0 and out.receipt_globs.len == 0) return error.MissingReceiptInput;
         },
         .status, .wait => {
             if (out.review_thread_id != null and out.latest_review_session) return error.AmbiguousReviewSessionSelector;
@@ -1195,6 +1259,114 @@ fn cmdRun(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     try cmdStart(allocator, io, broker_parsed);
 }
 
+fn reviewCurrentIdentityAlloc(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !struct {
+    cwd: []const u8,
+    identity: TargetIdentity,
+} {
+    const cwd = try repoRealpathAlloc(allocator, parsed.cwd.?);
+    errdefer allocator.free(cwd);
+    const identity = try computeTargetIdentityAlloc(allocator, io, cwd, targetToRecord(parsed.target.?));
+    errdefer identity.deinit(allocator);
+    return .{ .cwd = cwd, .identity = identity };
+}
+
+fn writeCasRerRecordsArray(writer: *std.Io.Writer, records: []const CasRerLedgerRecord) !void {
+    try writer.writeByte('[');
+    for (records, 0..) |record, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.writeAll(record.raw_json);
+    }
+    try writer.writeByte(']');
+}
+
+fn cmdReviewCurrent(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
+    var resolved = try reviewCurrentIdentityAlloc(allocator, io, parsed);
+    defer allocator.free(resolved.cwd);
+    defer resolved.identity.deinit(allocator);
+
+    var records: std.ArrayList(CasRerLedgerRecord) = .empty;
+    defer {
+        for (records.items) |record| record.deinit(allocator);
+        records.deinit(allocator);
+    }
+    try appendCasRerLedgerRecordsAlloc(allocator, &records, resolved.cwd, resolved.identity);
+    std.mem.sort(CasRerLedgerRecord, records.items, {}, casRerRecordLessThan);
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"schema\":\"CAS-CURRENT-v1\",\"record\":");
+    if (latestCasRerLedgerRecordIndex(records.items)) |idx| {
+        try stdout.writeAll(records.items[idx].raw_json);
+        try stdout.writeAll(",\"tupleCurrent\":true,\"actionRequired\":");
+        try writeJsonString(stdout, actionRequiredForCasRerRecord(records.items[idx]));
+    } else {
+        try stdout.writeAll("null,\"tupleCurrent\":false,\"actionRequired\":\"run_new_attempt\"");
+    }
+    try stdout.writeAll("}\n");
+}
+
+fn cmdReviewList(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
+    var resolved = try reviewCurrentIdentityAlloc(allocator, io, parsed);
+    defer allocator.free(resolved.cwd);
+    defer resolved.identity.deinit(allocator);
+
+    var records: std.ArrayList(CasRerLedgerRecord) = .empty;
+    defer {
+        for (records.items) |record| record.deinit(allocator);
+        records.deinit(allocator);
+    }
+    try appendCasRerLedgerRecordsAlloc(allocator, &records, resolved.cwd, resolved.identity);
+    std.mem.sort(CasRerLedgerRecord, records.items, {}, casRerRecordLessThan);
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"schema\":\"CAS-LIST-v1\",\"records\":");
+    try writeCasRerRecordsArray(stdout, records.items);
+    try stdout.writeAll("}\n");
+}
+
+fn cmdReviewInspect(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
+    var paths = try collectInputPathsAlloc(allocator, parsed.receipt_paths, parsed.receipt_globs);
+    defer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit(allocator);
+    }
+
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"schema\":\"CAS-INSPECT-v1\",\"surface\":\"inspect\",\"closeoutEligible\":false,\"diagnosticOnly\":true");
+    try stdout.writeAll(",\"allowReducedPrincipal\":");
+    try stdout.writeAll(if (parsed.allow_reduced_principal) "true" else "false");
+    try stdout.writeAll(",\"allowNativeFallback\":");
+    try stdout.writeAll(if (parsed.allow_native_fallback) "true" else "false");
+    try stdout.writeAll(",\"records\":[");
+    for (paths.items, 0..) |path, i| {
+        if (i > 0) try stdout.writeByte(',');
+        const validation = try validateCasRerRecordPathAlloc(allocator, path);
+        defer validation.deinit(allocator);
+        try stdout.writeByte('{');
+        try writeJsonString(stdout, "recordPath");
+        try stdout.writeByte(':');
+        try writeJsonString(stdout, path);
+        try stdout.writeByte(',');
+        try writeJsonString(stdout, "validation");
+        try stdout.writeByte(':');
+        try writeGateResultJson(stdout, validation);
+        if (parsed.show_attachments) {
+            const raw = readFileAlloc(allocator, path, 8 * 1024 * 1024) catch null;
+            if (raw) |record_json| {
+                defer allocator.free(record_json);
+                try stdout.writeByte(',');
+                try writeJsonString(stdout, "record");
+                try stdout.writeByte(':');
+                try stdout.writeAll(record_json);
+            }
+        }
+        try stdout.writeByte('}');
+    }
+    try stdout.writeAll("]}\n");
+}
+
 fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     const action_name = if (parsed.action != null and parsed.action.? == .run) "run" else "start";
     const cwd = try repoRealpathAlloc(allocator, parsed.cwd.?);
@@ -1240,6 +1412,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         .selection_reason = "detached_review_requires_cross_process_truth",
         .orphan_ttl_seconds = managed_server_orphan_ttl_seconds,
         .hook_policy = parsed.hook_policy,
+        .fresh_attempt_required = parsed.fresh_attempt_reason != null,
     };
 
     var managed_server = startManagedWebsocketServer(allocator, cwd, resolved_codex_path, parsed.hook_policy, io) catch |err| {
@@ -1308,6 +1481,8 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
     defer identity.deinit(allocator);
     var review_tuple = try reviewTupleIdentityAlloc(allocator, cwd, identity, resolved_codex_path, codex_version, &client);
     defer review_tuple.deinit(allocator);
+    output_receipt.account_fingerprint = review_tuple.account_fingerprint;
+    output_receipt.account_fingerprint_reduced_protection = review_tuple.account_fingerprint_reduced_protection;
     const tuple_lock_bundle = try acquireReviewTupleStartLockOrExit(
         allocator,
         parsed.json,
@@ -2518,6 +2693,192 @@ fn collectInputPathsAlloc(allocator: std.mem.Allocator, paths_raw: []const []con
     return paths;
 }
 
+const ImportedCasRerRecord = struct {
+    source_path: []const u8,
+    record_path: []const u8,
+    record_json: []const u8,
+    validation: GateResult,
+
+    fn deinit(self: ImportedCasRerRecord, allocator: std.mem.Allocator) void {
+        allocator.free(self.source_path);
+        allocator.free(self.record_path);
+        allocator.free(self.record_json);
+        self.validation.deinit(allocator);
+    }
+};
+
+fn cmdReviewImport(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
+    var paths = try collectInputPathsAlloc(allocator, parsed.receipt_paths, parsed.receipt_globs);
+    defer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit(allocator);
+    }
+
+    var imported: std.ArrayList(ImportedCasRerRecord) = .empty;
+    defer {
+        for (imported.items) |record| record.deinit(allocator);
+        imported.deinit(allocator);
+    }
+    var errors: std.ArrayList(ReceiptError) = .empty;
+    defer {
+        for (errors.items) |err| err.deinit(allocator);
+        errors.deinit(allocator);
+    }
+
+    var requested_identity_opt: ?TargetIdentity = null;
+    defer if (requested_identity_opt) |identity| identity.deinit(allocator);
+    const requested_identity_required = parsed.cwd != null and parsed.target != null;
+    if (requested_identity_required) {
+        const target_record = targetToRecord(parsed.target.?);
+        requested_identity_opt = computeTargetIdentityAlloc(allocator, io, parsed.cwd.?, target_record) catch null;
+    }
+    const normalize_context = NormalizeContext{
+        .requested_identity = requested_identity_opt,
+        .requested_identity_required = requested_identity_required,
+    };
+
+    const recover_event_logs = paths.items.len <= ReceiptEventLogRecoveryMaxInputs;
+    for (paths.items) |path| {
+        const receipt = normalizeReceiptFromPathAlloc(allocator, path, recover_event_logs, normalize_context) catch |err| {
+            try errors.append(allocator, .{
+                .source_path = try allocator.dupe(u8, path),
+                .message = try allocator.dupe(u8, @errorName(err)),
+            });
+            continue;
+        };
+        defer receipt.deinit(allocator);
+
+        const record_json = casRerJsonFromReceiptAlloc(allocator, receipt, .{}) catch |err| {
+            try errors.append(allocator, .{
+                .source_path = try allocator.dupe(u8, path),
+                .message = try allocator.dupe(u8, @errorName(err)),
+            });
+            continue;
+        };
+
+        var parsed_record = std.json.parseFromSlice(std.json.Value, allocator, record_json, .{}) catch |err| {
+            allocator.free(record_json);
+            try errors.append(allocator, .{
+                .source_path = try allocator.dupe(u8, path),
+                .message = try allocator.dupe(u8, @errorName(err)),
+            });
+            continue;
+        };
+        defer parsed_record.deinit();
+
+        const record_obj = switch (parsed_record.value) {
+            .object => |value| value,
+            else => {
+                allocator.free(record_json);
+                try errors.append(allocator, .{
+                    .source_path = try allocator.dupe(u8, path),
+                    .message = try allocator.dupe(u8, "InvalidCasRerRecord"),
+                });
+                continue;
+            },
+        };
+
+        {
+            errdefer allocator.free(record_json);
+            var validation = try validateCasRerRecordObjectAlloc(allocator, path, record_obj);
+            errdefer validation.deinit(allocator);
+            const record_path = if (validation.ok())
+                try writeCasRerRecordJsonToLedgerAlloc(allocator, record_json)
+            else
+                try allocator.dupe(u8, "");
+            errdefer allocator.free(record_path);
+            const source_path = try allocator.dupe(u8, path);
+            errdefer allocator.free(source_path);
+            try imported.append(allocator, .{
+                .source_path = source_path,
+                .record_path = record_path,
+                .record_json = record_json,
+                .validation = validation,
+            });
+        }
+    }
+
+    try printReviewImportResults(imported.items, errors.items, if (parsed.json) .json else parsed.receipt_format);
+
+    var failed = errors.items.len > 0;
+    for (imported.items) |record| {
+        if (!record.validation.ok()) failed = true;
+    }
+    if (failed) std.process.exit(1);
+}
+
+fn cmdValidateRecord(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
+    var paths = try collectInputPathsAlloc(allocator, parsed.receipt_paths, parsed.receipt_globs);
+    defer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit(allocator);
+    }
+    try runGateCommand(allocator, paths.items, if (parsed.json) .json else parsed.receipt_format, validateCasRerRecordPathAlloc);
+}
+
+fn writeReviewImportRecordJson(writer: *std.Io.Writer, record: ImportedCasRerRecord) !void {
+    try writer.writeByte('{');
+    try writeJsonString(writer, "sourcePath");
+    try writer.writeByte(':');
+    try writeJsonString(writer, record.source_path);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "recordPath");
+    try writer.writeByte(':');
+    try writeJsonString(writer, record.record_path);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "validation");
+    try writer.writeByte(':');
+    try writeGateResultJson(writer, record.validation);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "record");
+    try writer.writeByte(':');
+    try writer.writeAll(record.record_json);
+    try writer.writeByte('}');
+}
+
+fn printReviewImportResults(records: []const ImportedCasRerRecord, errors: []const ReceiptError, format: ReceiptFormat) !void {
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    switch (format) {
+        .json => {
+            try stdout.writeAll("{\"schema\":\"CAS-IMPORT-v1\",\"records\":[");
+            for (records, 0..) |record, i| {
+                if (i > 0) try stdout.writeByte(',');
+                try writeReviewImportRecordJson(stdout, record);
+            }
+            try stdout.writeAll("],\"errors\":[");
+            for (errors, 0..) |err, i| {
+                if (i > 0) try stdout.writeByte(',');
+                try writeReceiptErrorObject(stdout, err);
+            }
+            try stdout.writeAll("]}\n");
+        },
+        .jsonl => {
+            for (records) |record| {
+                try writeReviewImportRecordJson(stdout, record);
+                try stdout.writeByte('\n');
+            }
+            for (errors) |err| {
+                try writeReceiptErrorObject(stdout, err);
+                try stdout.writeByte('\n');
+            }
+        },
+        .table => {
+            try stdout.writeAll("sourcePath\trecordPath\tok\n");
+            for (records) |record| {
+                try stdout.print("{s}\t{s}\t{s}\n", .{
+                    record.source_path,
+                    record.record_path,
+                    if (record.validation.ok()) "true" else "false",
+                });
+            }
+            for (errors) |err| {
+                try stdout.print("{s}\t\terror:{s}\n", .{ err.source_path, err.message });
+            }
+        },
+    }
+}
+
 fn cmdReceiptNormalize(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     var paths = try collectInputPathsAlloc(allocator, parsed.receipt_paths, parsed.receipt_globs);
     defer {
@@ -2843,6 +3204,8 @@ fn writeReceiptClassificationObject(writer: *std.Io.Writer, source_index: usize,
 }
 
 fn cmdReceiptGate(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
+    var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    try stderr_writer.interface.writeAll("warning: receipt gate is deprecated; use cas review import + cas review validate-record\n");
     var paths = try collectInputPathsAlloc(allocator, parsed.receipt_paths, parsed.receipt_globs);
     defer {
         for (paths.items) |path| allocator.free(path);
@@ -2997,6 +3360,165 @@ fn validateReceiptGateObjectAlloc(allocator: std.mem.Allocator, path: []const u8
         }
         if (tuple_verdict_exists == true and !reviewVerdictStatusIsTupleTerminal(status orelse "")) {
             try appendGateError(allocator, &errors, "tupleVerdictExists=true is inconsistent with reviewVerdict.status", .{});
+        }
+    }
+
+    return .{
+        .path = try allocator.dupe(u8, path),
+        .errors = try errors.toOwnedSlice(allocator),
+    };
+}
+
+fn validateCasRerRecordPathAlloc(allocator: std.mem.Allocator, path: []const u8) !GateResult {
+    const raw = readFileAlloc(allocator, path, 8 * 1024 * 1024) catch |err| {
+        return gateResultFromSingleErrorAlloc(allocator, path, @errorName(err));
+    };
+    defer allocator.free(raw);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch |err| {
+        return gateResultFromSingleErrorAlloc(allocator, path, @errorName(err));
+    };
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |value| value,
+        else => return gateResultFromSingleErrorAlloc(allocator, path, "top-level JSON must be a CAS-RER-v1 object"),
+    };
+    return validateCasRerRecordObjectAlloc(allocator, path, obj);
+}
+
+fn requiredCasRerObjectField(
+    allocator: std.mem.Allocator,
+    data: std.json.ObjectMap,
+    key: []const u8,
+    errors: *std.ArrayList([]const u8),
+) !?std.json.ObjectMap {
+    const child = try objectFieldOrGateError(allocator, data, key, errors);
+    if (child == null and data.get(key) == null) {
+        try appendGateError(allocator, errors, "missing {s}", .{key});
+    }
+    return child;
+}
+
+fn casRerStatusAllowed(value: []const u8) bool {
+    return std.mem.eql(u8, value, "clean") or
+        std.mem.eql(u8, value, "findings") or
+        std.mem.eql(u8, value, "incomplete") or
+        std.mem.eql(u8, value, "timeout") or
+        std.mem.eql(u8, value, "transport_failure") or
+        std.mem.eql(u8, value, "account_resource_exhausted") or
+        std.mem.eql(u8, value, "parse_mismatch") or
+        std.mem.eql(u8, value, "review_untrusted_source");
+}
+
+fn validateCasRerRecordObjectAlloc(allocator: std.mem.Allocator, path: []const u8, data: std.json.ObjectMap) !GateResult {
+    var errors: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (errors.items) |err| allocator.free(err);
+        errors.deinit(allocator);
+    }
+
+    if (!std.mem.eql(u8, jsonStringField(data, "schema") orelse "", cas_review_evidence_schema)) {
+        try appendGateError(allocator, &errors, "schema must be {s}", .{cas_review_evidence_schema});
+    }
+    const record_id = nonEmptyOptional(jsonStringField(data, "recordId"));
+    if (record_id == null) {
+        try appendGateError(allocator, &errors, "recordId must be non-empty", .{});
+    } else {
+        if (!std.mem.startsWith(u8, record_id.?, "rer_")) {
+            try appendGateError(allocator, &errors, "recordId must start with rer_", .{});
+        }
+        if (std.mem.indexOfScalar(u8, record_id.?, '/') != null or std.mem.indexOfScalar(u8, record_id.?, '\\') != null) {
+            try appendGateError(allocator, &errors, "recordId must not contain path separators", .{});
+        }
+    }
+
+    const tuple = try requiredCasRerObjectField(allocator, data, "tuple", &errors);
+    const attempt = try requiredCasRerObjectField(allocator, data, "attempt", &errors);
+    const verdict = try requiredCasRerObjectField(allocator, data, "verdict", &errors);
+    const failure = try requiredCasRerObjectField(allocator, data, "failure", &errors);
+    const principal = try requiredCasRerObjectField(allocator, data, "principal", &errors);
+
+    var attempt_exists_value: ?bool = null;
+    if (attempt) |attempt_obj| {
+        const attempt_exists = jsonBoolField(attempt_obj, "exists");
+        attempt_exists_value = attempt_exists;
+        if (attempt_exists == null) {
+            try appendGateError(allocator, &errors, "attempt.exists must be boolean", .{});
+        }
+        const review_thread_id_present = fieldPresentNonNull(attempt_obj, "reviewThreadId");
+        if (attempt_exists) |value| {
+            if (value != review_thread_id_present) {
+                try appendGateError(allocator, &errors, "attempt.exists must equal attempt.reviewThreadId != null", .{});
+            }
+        }
+        if (jsonStringField(attempt_obj, "phase")) |phase| {
+            if (!reviewPhaseAllowed(phase)) try appendGateError(allocator, &errors, "invalid attempt.phase: {s}", .{phase});
+        } else {
+            try appendGateError(allocator, &errors, "missing attempt.phase", .{});
+        }
+    }
+
+    if (verdict) |verdict_obj| {
+        const status = jsonStringField(verdict_obj, "status");
+        if (status == null or !casRerStatusAllowed(status.?)) {
+            try appendGateError(allocator, &errors, "invalid verdict.status: {s}", .{status orelse "null"});
+        }
+        const finding_count = jsonUsizeField(verdict_obj, "findingCount");
+        if (finding_count == null) {
+            try appendGateError(allocator, &errors, "verdict.findingCount must be a non-negative integer", .{});
+        }
+        if (std.mem.eql(u8, status orelse "", "findings") and (finding_count orelse 0) == 0) {
+            try appendGateError(allocator, &errors, "verdict.status=findings requires findingCount > 0", .{});
+        }
+        if (std.mem.eql(u8, status orelse "", "clean")) {
+            if ((finding_count orelse 1) != 0) {
+                try appendGateError(allocator, &errors, "verdict.status=clean requires findingCount = 0", .{});
+            }
+            if (failure) |failure_obj| {
+                if (fieldPresentNonNull(failure_obj, "failureCode")) {
+                    try appendGateError(allocator, &errors, "verdict.status=clean requires failure.failureCode=null", .{});
+                }
+            }
+        }
+        if (jsonBoolField(verdict_obj, "tupleVerdictExists")) |tuple_verdict_exists| {
+            if (tuple_verdict_exists) {
+                if (tuple) |tuple_obj| {
+                    if (nonEmptyOptional(jsonStringField(tuple_obj, "baseSha")) == null) {
+                        try appendGateError(allocator, &errors, "verdict.tupleVerdictExists requires tuple.baseSha", .{});
+                    }
+                    if (nonEmptyOptional(jsonStringField(tuple_obj, "headSha")) == null) {
+                        try appendGateError(allocator, &errors, "verdict.tupleVerdictExists requires tuple.headSha", .{});
+                    }
+                    if (nonEmptyOptional(jsonStringField(tuple_obj, "targetFingerprint")) == null) {
+                        try appendGateError(allocator, &errors, "verdict.tupleVerdictExists requires tuple.targetFingerprint", .{});
+                    }
+                }
+            }
+        } else {
+            try appendGateError(allocator, &errors, "verdict.tupleVerdictExists must be boolean", .{});
+        }
+    }
+
+    if (failure) |failure_obj| {
+        if (std.mem.eql(u8, jsonStringField(failure_obj, "failureCode") orelse "", "pre_review_lane_transport_lost")) {
+            if (attempt_exists_value != false) {
+                try appendGateError(allocator, &errors, "pre_review_lane_transport_lost requires attempt.exists=false", .{});
+            }
+        }
+    }
+
+    if (principal) |principal_obj| {
+        const kind = jsonStringField(principal_obj, "kind");
+        if (kind == null or
+            !(std.mem.eql(u8, kind.?, "strong") or std.mem.eql(u8, kind.?, "reduced") or std.mem.eql(u8, kind.?, "unknown")))
+        {
+            try appendGateError(allocator, &errors, "principal.kind must be strong, reduced, or unknown", .{});
+        }
+        const proof_usable = jsonBoolField(principal_obj, "proofUsable");
+        if (proof_usable == null) {
+            try appendGateError(allocator, &errors, "principal.proofUsable must be boolean", .{});
+        }
+        if (std.mem.eql(u8, kind orelse "", "reduced") and proof_usable != false) {
+            try appendGateError(allocator, &errors, "principal.kind=reduced requires principal.proofUsable=false", .{});
         }
     }
 
@@ -5526,6 +6048,173 @@ fn sessionDirAlloc(allocator: std.mem.Allocator) ![]const u8 {
     return base;
 }
 
+fn reviewLedgerRecordsDirAlloc(allocator: std.mem.Allocator) ![]const u8 {
+    const base = try core_path.expandHomePath(allocator, "~/.codex/cas/review_ledger/records");
+    try ensureParentPath(base);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), base);
+    return base;
+}
+
+fn casRerRecordIdFromJsonAlloc(allocator: std.mem.Allocator, record_json: []const u8) ![]const u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, record_json, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidCasRerRecord,
+    };
+    const record_id = nonEmptyOptional(jsonStringField(root, "recordId")) orelse return error.MissingCasRerRecordId;
+    if (!std.mem.startsWith(u8, record_id, "rer_")) return error.InvalidCasRerRecordId;
+    if (std.mem.indexOfScalar(u8, record_id, '/') != null or std.mem.indexOfScalar(u8, record_id, '\\') != null) return error.InvalidCasRerRecordId;
+    return allocator.dupe(u8, record_id);
+}
+
+fn writeRawJsonFileAtomic(allocator: std.mem.Allocator, path: []const u8, json: []const u8) !void {
+    try ensureParentPath(path);
+    const temp_path = try std.fmt.allocPrint(allocator, "{s}.tmp-{d}", .{ path, std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds });
+    defer allocator.free(temp_path);
+    var file = try std.Io.Dir.createFileAbsolute(std.Io.Threaded.global_single_threaded.io(), temp_path, .{ .truncate = true });
+    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), json);
+    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), "\n");
+    try std.Io.Dir.renameAbsolute(temp_path, path, std.Io.Threaded.global_single_threaded.io());
+}
+
+fn writeCasRerRecordJsonToLedgerAlloc(allocator: std.mem.Allocator, record_json: []const u8) ![]const u8 {
+    const record_id = try casRerRecordIdFromJsonAlloc(allocator, record_json);
+    defer allocator.free(record_id);
+    const records_dir = try reviewLedgerRecordsDirAlloc(allocator);
+    defer allocator.free(records_dir);
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ records_dir, record_id });
+    errdefer allocator.free(path);
+    try writeRawJsonFileAtomic(allocator, path, record_json);
+    return path;
+}
+
+const CasRerLedgerRecord = struct {
+    path: []const u8,
+    raw_json: []const u8,
+    record_id: []const u8,
+    created_at: []const u8,
+    status: []const u8,
+    tuple_verdict_exists: bool,
+    attempt_exists: bool,
+    review_thread_id: ?[]const u8,
+    base_sha: ?[]const u8,
+    head_sha: ?[]const u8,
+    target_fingerprint: ?[]const u8,
+
+    fn deinit(self: CasRerLedgerRecord, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.raw_json);
+        allocator.free(self.record_id);
+        allocator.free(self.created_at);
+        allocator.free(self.status);
+        if (self.review_thread_id) |value| allocator.free(value);
+        if (self.base_sha) |value| allocator.free(value);
+        if (self.head_sha) |value| allocator.free(value);
+        if (self.target_fingerprint) |value| allocator.free(value);
+    }
+};
+
+fn casRerObjectMatchesIdentity(root: std.json.ObjectMap, repo_realpath: []const u8, identity: TargetIdentity) bool {
+    const tuple = objectField(root, "tuple") orelse return false;
+    const record_repo = jsonStringField(tuple, "repoRealpath") orelse return false;
+    if (!std.mem.eql(u8, record_repo, repo_realpath)) return false;
+    if (!optionalStringsEqual(jsonStringField(tuple, "baseSha"), identity.base_sha)) return false;
+    if (!optionalStringsEqual(jsonStringField(tuple, "headSha"), identity.head_sha)) return false;
+    return optionalStringsEqual(jsonStringField(tuple, "targetFingerprint"), identity.fingerprint);
+}
+
+fn casRerLedgerRecordFromJsonAlloc(allocator: std.mem.Allocator, path: []const u8, raw: []const u8) !CasRerLedgerRecord {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidCasRerRecord,
+    };
+    if (!std.mem.eql(u8, jsonStringField(root, "schema") orelse "", cas_review_evidence_schema)) return error.InvalidCasRerRecord;
+    const tuple = objectField(root, "tuple");
+    const attempt = objectField(root, "attempt");
+    const verdict = objectField(root, "verdict");
+    return .{
+        .path = try allocator.dupe(u8, path),
+        .raw_json = try allocator.dupe(u8, raw),
+        .record_id = try allocator.dupe(u8, jsonStringField(root, "recordId") orelse ""),
+        .created_at = try allocator.dupe(u8, jsonStringField(root, "createdAt") orelse ""),
+        .status = try allocator.dupe(u8, if (verdict) |value| jsonStringField(value, "status") orelse "incomplete" else "incomplete"),
+        .tuple_verdict_exists = if (verdict) |value| jsonBoolField(value, "tupleVerdictExists") orelse false else false,
+        .attempt_exists = if (attempt) |value| jsonBoolField(value, "exists") orelse false else false,
+        .review_thread_id = if (attempt) |value| try dupOptional(allocator, jsonStringField(value, "reviewThreadId")) else null,
+        .base_sha = if (tuple) |value| try dupOptional(allocator, jsonStringField(value, "baseSha")) else null,
+        .head_sha = if (tuple) |value| try dupOptional(allocator, jsonStringField(value, "headSha")) else null,
+        .target_fingerprint = if (tuple) |value| try dupOptional(allocator, jsonStringField(value, "targetFingerprint")) else null,
+    };
+}
+
+fn appendCasRerLedgerRecordsAlloc(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(CasRerLedgerRecord),
+    repo_realpath: ?[]const u8,
+    identity: ?TargetIdentity,
+) !void {
+    const records_dir = reviewLedgerRecordsDirAlloc(allocator) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer allocator.free(records_dir);
+    var dir = std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), records_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close(std.Io.Threaded.global_single_threaded.io());
+
+    var it = dir.iterate();
+    while (try it.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ records_dir, entry.name });
+        defer allocator.free(path);
+        const raw = readFileAlloc(allocator, path, 8 * 1024 * 1024) catch continue;
+        defer allocator.free(raw);
+        if (repo_realpath != null and identity != null) {
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch continue;
+            defer parsed.deinit();
+            const root = switch (parsed.value) {
+                .object => |obj| obj,
+                else => continue,
+            };
+            if (!std.mem.eql(u8, jsonStringField(root, "schema") orelse "", cas_review_evidence_schema)) continue;
+            if (!casRerObjectMatchesIdentity(root, repo_realpath.?, identity.?)) continue;
+        }
+        const record = casRerLedgerRecordFromJsonAlloc(allocator, path, raw) catch continue;
+        errdefer record.deinit(allocator);
+        try out.append(allocator, record);
+    }
+}
+
+fn casRerRecordLessThan(_: void, left: CasRerLedgerRecord, right: CasRerLedgerRecord) bool {
+    const created_order = std.mem.order(u8, left.created_at, right.created_at);
+    if (created_order != .eq) return created_order == .lt;
+    return std.mem.order(u8, left.record_id, right.record_id) == .lt;
+}
+
+fn latestCasRerLedgerRecordIndex(records: []const CasRerLedgerRecord) ?usize {
+    if (records.len == 0) return null;
+    var best: usize = 0;
+    for (records[1..], 1..) |record, idx| {
+        if (casRerRecordLessThan({}, records[best], record)) best = idx;
+    }
+    return best;
+}
+
+fn actionRequiredForCasRerRecord(record: CasRerLedgerRecord) []const u8 {
+    if (record.tuple_verdict_exists and (std.mem.eql(u8, record.status, "clean") or std.mem.eql(u8, record.status, "findings"))) return "none";
+    if (record.attempt_exists and !record.tuple_verdict_exists) return "wait";
+    if (std.mem.eql(u8, record.status, "timeout") or std.mem.eql(u8, record.status, "incomplete")) return "inspect";
+    if (std.mem.eql(u8, record.status, "transport_failure")) return "run_new_attempt";
+    return "workflow_policy";
+}
+
 fn laneIdAlloc(allocator: std.mem.Allocator, process_id: u64) ![]const u8 {
     return std.fmt.allocPrint(allocator, "lane_{d}_{d}", .{
         process_id,
@@ -6266,7 +6955,7 @@ fn printReviewTupleLockExistingAndExit(
     const smoke_status = if (std.mem.eql(u8, action_name, "lane-smoke")) @as(?[]const u8, "failed") else null;
     const lock_points_to_terminal = std.mem.eql(u8, lock.state, "terminal") or std.mem.eql(u8, lock.state, "normalized");
     const broker_decision: ?ReviewBrokerDecision = if (std.mem.eql(u8, action_name, "run")) .{
-        .action = if (decision == .normalize_existing) "normalized_existing" else "blocked_live_attempt",
+        .action = "blocked_live_attempt",
         .reason = if (decision == .normalize_existing)
             "tuple lock points to an existing terminal receipt, but the receipt could not be normalized into a terminal verdict"
         else
@@ -6279,6 +6968,7 @@ fn printReviewTupleLockExistingAndExit(
         .demo = "cas-review-session",
         .action = action_name,
         .reviewBrokerDecision = broker_decision,
+        .cwd = tuple.repo_realpath,
         .smokeStatus = smoke_status,
         .reviewAttemptPhase = if (lock_points_to_terminal) "review_terminal" else "review_waiting",
         .reviewAttemptExists = review_thread_id != null,
@@ -6325,30 +7015,39 @@ fn printReviewTupleLockExistingAndExit(
         defer allocator.free(verdict);
         try stdout.print("{s}\n", .{verdict});
     } else {
-        try std.json.Stringify.value(payload, .{}, stdout);
-        try stdout.writeAll("\n");
+        const payload_json = try stringifyAnyAlloc(allocator, payload);
+        defer allocator.free(payload_json);
+        if (std.mem.eql(u8, action_name, "run")) {
+            const timestamp = try casRerTimestampAlloc(allocator);
+            defer allocator.free(timestamp);
+            const shadow_record_path = try writeCasRerShadowRecordFromJsonAlloc(allocator, lock.recordPath orelse lock_path, payload_json, .{
+                .requested_identity = target_identity,
+                .requested_identity_required = true,
+            }, .{
+                .command_surface = "run",
+                .backend_selected = "cas-run",
+                .broker_action = "blocked_live",
+                .broker_reason = broker_decision.?.reason,
+                .imported_from_receipt = false,
+                .created_at = timestamp,
+                .updated_at = timestamp,
+            });
+            defer allocator.free(shadow_record_path);
+        }
+        try stdout.print("{s}\n", .{payload_json});
     }
     std.process.exit(1);
 }
 
 fn writeRunNormalizedReceiptObject(allocator: std.mem.Allocator, writer: *std.Io.Writer, receipt: NormalizedReceipt, lock: ReviewTupleLock) !void {
-    const broker_json = try stringifyAnyAlloc(allocator, ReviewBrokerDecision{
+    const broker = ReviewBrokerDecision{
         .action = "normalized_existing",
         .reason = "tuple lock points to an existing terminal receipt normalized for the requested tuple",
         .reviewThreadId = lock.reviewThreadId,
         .recordPath = lock.recordPath,
         .eventLogPath = lock.eventLogPath,
-    });
-    defer allocator.free(broker_json);
-    var receipt_out = std.Io.Writer.Allocating.init(allocator);
-    defer receipt_out.deinit();
-    try writeReceiptObject(&receipt_out.writer, receipt);
-    const receipt_json = try receipt_out.toOwnedSlice();
-    defer allocator.free(receipt_json);
-
-    try writer.print("{{\"demo\":\"cas-review-session\",\"action\":\"run\",\"reviewBrokerDecision\":{s},\"reviewVerdict\":", .{broker_json});
-    try writeReceiptReviewVerdictObject(writer, receipt);
-    try writer.print(",\"normalizedReceipt\":{s}}}", .{receipt_json});
+    };
+    try writeCasRunEnvelopeFromReceipt(allocator, writer, receipt, broker, false);
 }
 
 fn reviewBrokerActionForBlockedLock(decision: ReviewTupleLockAction) []const u8 {
@@ -6376,7 +7075,6 @@ fn emitReviewTupleLockBlockedAndExit(
     override_reason: ?[]const u8,
     verdict_only: bool,
 ) !noreturn {
-    _ = allocator;
     const failure_code: []const u8 = switch (decision) {
         .block_account_resource => "review_tuple_lock_account_resource_exhausted",
         .block_stale => "review_tuple_lock_stale",
@@ -6424,6 +7122,7 @@ fn emitReviewTupleLockBlockedAndExit(
             .demo = "cas-review-session",
             .action = action_name,
             .reviewBrokerDecision = broker_decision,
+            .cwd = tuple.repo_realpath,
             .smokeStatus = smoke_status,
             .reviewAttemptPhase = "pre_review_start",
             .reviewAttemptExists = false,
@@ -6465,7 +7164,25 @@ fn emitReviewTupleLockBlockedAndExit(
                 .findings = [_]u8{},
             },
         };
-        try printJson(payload);
+        const payload_json = try stringifyAnyAlloc(allocator, payload);
+        defer allocator.free(payload_json);
+        if (std.mem.eql(u8, action_name, "run")) {
+            const timestamp = try casRerTimestampAlloc(allocator);
+            defer allocator.free(timestamp);
+            const shadow_record_path = try writeCasRerShadowRecordFromJsonAlloc(allocator, if (lock) |value| value.recordPath orelse lock_path else lock_path, payload_json, .{}, .{
+                .command_surface = "run",
+                .backend_selected = "cas-run",
+                .broker_action = publicReviewBrokerAction(reviewBrokerActionForBlockedLock(decision)),
+                .broker_reason = hint,
+                .imported_from_receipt = false,
+                .created_at = timestamp,
+                .updated_at = timestamp,
+            });
+            defer allocator.free(shadow_record_path);
+        }
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        const stdout = &stdout_writer.interface;
+        try stdout.print("{s}\n", .{payload_json});
     } else {
         var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stderr = &stderr_writer.interface;
@@ -6985,6 +7702,23 @@ fn emitPreReviewLaneTransportLostAndExit(
             lane_process_alive,
         );
         defer allocator.free(payload);
+        const normalized = try normalizeReceiptFromJsonAlloc(allocator, lane_record_path, payload, true, .{
+            .requested_identity = identity,
+            .requested_identity_required = true,
+        });
+        defer normalized.deinit(allocator);
+        const timestamp = try casRerTimestampAlloc(allocator);
+        defer allocator.free(timestamp);
+        const shadow_record_path = try writeCasRerShadowRecordFromReceipt(allocator, normalized, .{
+            .command_surface = "lane_review",
+            .backend_selected = "cas-lane",
+            .broker_action = "created_new",
+            .broker_reason = "pre-review lane transport loss shadowed into CAS-RER-v1",
+            .imported_from_receipt = false,
+            .created_at = timestamp,
+            .updated_at = timestamp,
+        });
+        defer allocator.free(shadow_record_path);
         var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stdout = &stdout_writer.interface;
         try stdout.print("{s}\n", .{payload});
@@ -7507,6 +8241,80 @@ fn reviewVerdictJsonForStatusAlloc(
     );
 }
 
+fn casRunSyntheticReceiptJsonAlloc(
+    allocator: std.mem.Allocator,
+    cwd: []const u8,
+    parent_thread_id: []const u8,
+    review_thread_id: ?[]const u8,
+    review_turn_id: ?[]const u8,
+    record_path: []const u8,
+    event_log_path: []const u8,
+    receipt: OutputReceipt,
+    review_verdict_json: []const u8,
+) ![]u8 {
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('{');
+    try writeJsonString(writer, "demo");
+    try writer.writeAll(":\"cas-review-session\",");
+    try writeJsonString(writer, "action");
+    try writer.writeAll(":\"run\",");
+    try writeJsonString(writer, "cwd");
+    try writer.writeByte(':');
+    try writeJsonString(writer, cwd);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "parentThreadId");
+    try writer.writeByte(':');
+    try writeJsonString(writer, parent_thread_id);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "reviewThreadId");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, review_thread_id);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "reviewTurnId");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, review_turn_id);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "recordPath");
+    try writer.writeByte(':');
+    try writeJsonString(writer, record_path);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "eventLogPath");
+    try writer.writeByte(':');
+    try writeJsonString(writer, event_log_path);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "resolvedCodexPath");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.resolved_codex_path);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "resolvedCodexVersion");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.resolved_codex_version);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "accountFingerprint");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.account_fingerprint);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "accountFingerprintReducedProtection");
+    try writer.writeByte(':');
+    try writer.writeAll(if (receipt.account_fingerprint_reduced_protection) "true" else "false");
+    try writer.writeByte(',');
+    try writeJsonString(writer, "principalStrength");
+    try writer.writeByte(':');
+    try writeJsonString(writer, if (receipt.account_fingerprint_reduced_protection) principal_strength_reduced else principal_strength_strong);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "createdAtUnixS");
+    try writer.writeByte(':');
+    try writer.print("{d}", .{unixSeconds()});
+    try writer.writeByte(',');
+    try writeJsonString(writer, "reviewVerdict");
+    try writer.writeByte(':');
+    try writer.writeAll(review_verdict_json);
+    try writer.writeByte('}');
+    return out.toOwnedSlice();
+}
+
 fn printStartJson(
     backing_allocator: std.mem.Allocator,
     cwd: []const u8,
@@ -7621,6 +8429,70 @@ fn printStartJson(
     else
         try allocator.dupe(u8, "");
     defer allocator.free(review_verdict_suffix);
+
+    if (std.mem.eql(u8, receipt.surface_action, "run")) {
+        if (review_verdict_json_opt) |review_verdict_json| {
+            const synthetic_receipt_json = try casRunSyntheticReceiptJsonAlloc(
+                allocator,
+                cwd,
+                parent_thread_id,
+                review_thread_id,
+                review_turn_id,
+                record_path,
+                event_log_path,
+                receipt,
+                review_verdict_json,
+            );
+            defer allocator.free(synthetic_receipt_json);
+            const normalized = try normalizeReceiptFromJsonAlloc(allocator, record_path, synthetic_receipt_json, true, .{
+                .requested_identity = identity,
+                .requested_identity_required = true,
+            });
+            defer normalized.deinit(allocator);
+            const broker = receipt.review_broker_decision orelse ReviewBrokerDecision{
+                .action = "created_new",
+                .reason = "run completed without an explicit broker decision",
+                .reviewThreadId = review_thread_id,
+                .recordPath = record_path,
+                .eventLogPath = event_log_path,
+            };
+            try writeCasRunEnvelopeFromReceipt(allocator, stdout, normalized, broker, receipt.fresh_attempt_required);
+            try stdout.writeByte('\n');
+            return;
+        }
+    } else if (std.mem.eql(u8, receipt.surface_action, "start") and waited) {
+        if (review_verdict_json_opt) |review_verdict_json| {
+            const synthetic_receipt_json = try casRunSyntheticReceiptJsonAlloc(
+                allocator,
+                cwd,
+                parent_thread_id,
+                review_thread_id,
+                review_turn_id,
+                record_path,
+                event_log_path,
+                receipt,
+                review_verdict_json,
+            );
+            defer allocator.free(synthetic_receipt_json);
+            const normalized = try normalizeReceiptFromJsonAlloc(allocator, record_path, synthetic_receipt_json, true, .{
+                .requested_identity = identity,
+                .requested_identity_required = true,
+            });
+            defer normalized.deinit(allocator);
+            const timestamp = try casRerTimestampAlloc(allocator);
+            defer allocator.free(timestamp);
+            const shadow_record_path = try writeCasRerShadowRecordFromReceipt(allocator, normalized, .{
+                .command_surface = "start_wait",
+                .backend_selected = "cas-start-wait",
+                .broker_action = "created_new",
+                .broker_reason = "low-level start --wait output shadowed into CAS-RER-v1",
+                .imported_from_receipt = false,
+                .created_at = timestamp,
+                .updated_at = timestamp,
+            });
+            defer allocator.free(shadow_record_path);
+        }
+    }
 
     try stdout.print(
         "{{\"demo\":\"cas-review-session\",\"action\":{s},\"reviewBrokerDecision\":{s},\"cwd\":{s},\"parentThreadId\":{s}",
@@ -9028,6 +9900,412 @@ fn receiptHasCompleteTuple(receipt: NormalizedReceipt) bool {
     return nonEmptyOptional(receipt.base_sha) != null and
         nonEmptyOptional(receipt.head_sha) != null and
         nonEmptyOptional(receipt.target_fingerprint) != null;
+}
+
+const CasRerProjectionOptions = struct {
+    command_surface: []const u8 = "import",
+    backend_selected: []const u8 = "imported-legacy",
+    broker_action: []const u8 = "imported_legacy",
+    broker_reason: []const u8 = "legacy review artifact normalized into CAS-RER-v1",
+    fresh_attempt_required: bool = false,
+    tuple_current_at_record_time: bool = true,
+    imported_from_receipt: bool = true,
+    created_at: []const u8 = "1970-01-01T00:00:00Z",
+    updated_at: []const u8 = "1970-01-01T00:00:00Z",
+};
+
+fn casRerTimestampAlloc(allocator: std.mem.Allocator) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "unix-ns:{d}", .{std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds});
+}
+
+fn publicReviewBrokerAction(raw: []const u8) []const u8 {
+    if (std.mem.eql(u8, raw, "normalized_existing")) return "returned_terminal";
+    if (std.mem.eql(u8, raw, "auto_replaced_dead_transport")) return "replaced_dead_transport";
+    if (std.mem.eql(u8, raw, "blocked_live_attempt")) return "blocked_live";
+    return raw;
+}
+
+fn writePublicReviewBrokerDecisionObject(writer: *std.Io.Writer, broker: ReviewBrokerDecision, fresh_attempt_required: bool) !void {
+    try writer.writeByte('{');
+    try writeJsonString(writer, "action");
+    try writer.writeByte(':');
+    try writeJsonString(writer, publicReviewBrokerAction(broker.action));
+    try writer.writeByte(',');
+    try writeJsonString(writer, "reason");
+    try writer.writeByte(':');
+    try writeJsonString(writer, broker.reason);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "freshAttemptRequired");
+    try writer.writeByte(':');
+    try writer.writeAll(if (fresh_attempt_required) "true" else "false");
+    try writer.writeByte('}');
+}
+
+fn writeCasRunEnvelopeFromReceipt(allocator: std.mem.Allocator, writer: *std.Io.Writer, receipt: NormalizedReceipt, broker: ReviewBrokerDecision, fresh_attempt_required: bool) !void {
+    const timestamp = try casRerTimestampAlloc(allocator);
+    defer allocator.free(timestamp);
+    const record_json = try casRerJsonFromReceiptAlloc(allocator, receipt, .{
+        .command_surface = "run",
+        .backend_selected = "cas-run",
+        .broker_action = publicReviewBrokerAction(broker.action),
+        .broker_reason = broker.reason,
+        .fresh_attempt_required = fresh_attempt_required,
+        .imported_from_receipt = false,
+        .created_at = timestamp,
+        .updated_at = timestamp,
+    });
+    defer allocator.free(record_json);
+    var parsed_record = try std.json.parseFromSlice(std.json.Value, allocator, record_json, .{});
+    defer parsed_record.deinit();
+    const validation = try validateCasRerRecordObjectAlloc(allocator, receipt.source_path, parsed_record.value.object);
+    defer validation.deinit(allocator);
+    if (!validation.ok()) return error.InvalidCasRerRecord;
+    const ledger_record_path = try writeCasRerRecordJsonToLedgerAlloc(allocator, record_json);
+    defer allocator.free(ledger_record_path);
+    try writer.writeAll("{\"schema\":\"CAS-RUN-v1\",\"recordPath\":");
+    try writeJsonString(writer, ledger_record_path);
+    try writer.writeAll(",\"record\":");
+    try writer.writeAll(record_json);
+    try writer.writeAll(",\"reviewBrokerDecision\":");
+    try writePublicReviewBrokerDecisionObject(writer, broker, fresh_attempt_required);
+    try writer.writeByte('}');
+}
+
+fn writeCasRerShadowRecordFromReceipt(allocator: std.mem.Allocator, receipt: NormalizedReceipt, opts: CasRerProjectionOptions) ![]const u8 {
+    const record_json = try casRerJsonFromReceiptAlloc(allocator, receipt, opts);
+    defer allocator.free(record_json);
+    var parsed_record = try std.json.parseFromSlice(std.json.Value, allocator, record_json, .{});
+    defer parsed_record.deinit();
+    const validation = try validateCasRerRecordObjectAlloc(allocator, receipt.source_path, parsed_record.value.object);
+    defer validation.deinit(allocator);
+    if (!validation.ok()) return error.InvalidCasRerRecord;
+    return writeCasRerRecordJsonToLedgerAlloc(allocator, record_json);
+}
+
+fn writeCasRerShadowRecordFromJsonAlloc(
+    allocator: std.mem.Allocator,
+    source_path: []const u8,
+    payload_json: []const u8,
+    context: NormalizeContext,
+    opts: CasRerProjectionOptions,
+) ![]const u8 {
+    const normalized = try normalizeReceiptFromJsonAlloc(allocator, source_path, payload_json, true, context);
+    defer normalized.deinit(allocator);
+    return writeCasRerShadowRecordFromReceipt(allocator, normalized, opts);
+}
+
+fn casRerVerdictStatus(status: []const u8) []const u8 {
+    if (std.mem.eql(u8, status, "pre_review_transport_failure")) return "transport_failure";
+    if (std.mem.eql(u8, status, "review_transport_failure")) return "transport_failure";
+    return status;
+}
+
+fn casRerPrincipalKind(receipt: NormalizedReceipt) []const u8 {
+    if (std.mem.eql(u8, receipt.principal_strength, principal_strength_strong)) return "strong";
+    if (std.mem.eql(u8, receipt.principal_strength, principal_strength_reduced)) return "reduced";
+    return "unknown";
+}
+
+fn casRerFallbackUsed(receipt: NormalizedReceipt) bool {
+    return std.mem.eql(u8, receipt.backend_class, "cas-native-fallback");
+}
+
+fn casRerPrincipalProofUsable(receipt: NormalizedReceipt) bool {
+    return std.mem.eql(u8, casRerPrincipalKind(receipt), "strong") and !receipt.account_fingerprint_reduced_protection and !casRerFallbackUsed(receipt);
+}
+
+fn casRerAttemptIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt) !?[]const u8 {
+    const review_thread_id = nonEmptyOptional(receipt.review_thread_id) orelse return null;
+    const material = try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}", .{
+        review_thread_id,
+        receipt.review_turn_id orelse "",
+        receipt.source_path,
+    });
+    defer allocator.free(material);
+    return try sha256HexAlloc(allocator, material);
+}
+
+fn casRerRecordIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt, opts: CasRerProjectionOptions) ![]const u8 {
+    const material = try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}", .{
+        receipt.source_path,
+        receipt.status,
+        receipt.review_thread_id orelse "",
+        receipt.review_turn_id orelse "",
+        receipt.base_sha orelse "",
+        receipt.head_sha orelse "",
+        receipt.target_fingerprint orelse "",
+        opts.created_at,
+    });
+    defer allocator.free(material);
+    const digest = try sha256HexBareAlloc(allocator, material);
+    defer allocator.free(digest);
+    return std.fmt.allocPrint(allocator, "rer_{s}", .{digest});
+}
+
+fn writeCasRerCommandObject(writer: *std.Io.Writer, receipt: NormalizedReceipt, opts: CasRerProjectionOptions) !void {
+    try writer.writeByte('{');
+    try writeJsonString(writer, "surface");
+    try writer.writeByte(':');
+    try writeJsonString(writer, opts.command_surface);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "argv");
+    try writer.writeAll(":[]");
+    try writer.writeByte(',');
+    try writeJsonString(writer, "backendSelected");
+    try writer.writeByte(':');
+    try writeJsonString(writer, opts.backend_selected);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "sourceBackendClass");
+    try writer.writeByte(':');
+    try writeJsonString(writer, receipt.backend_class);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "brokerDecision");
+    try writer.writeAll(":{");
+    try writeJsonString(writer, "action");
+    try writer.writeByte(':');
+    try writeJsonString(writer, opts.broker_action);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "reason");
+    try writer.writeByte(':');
+    try writeJsonString(writer, opts.broker_reason);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "freshAttemptRequired");
+    try writer.writeByte(':');
+    try writer.writeAll(if (opts.fresh_attempt_required) "true" else "false");
+    try writer.writeAll("}}");
+}
+
+fn writeCasRerTupleObject(writer: *std.Io.Writer, receipt: NormalizedReceipt, opts: CasRerProjectionOptions) !void {
+    try writer.writeByte('{');
+    try writeJsonString(writer, "repoRealpath");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.repo_realpath);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "target");
+    try writer.writeAll(":null,");
+    try writeJsonString(writer, "baseSha");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.base_sha);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "headSha");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.head_sha);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "targetFingerprint");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.target_fingerprint);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "diffScope");
+    try writer.writeAll(":\"entire_pr\",");
+    try writeJsonString(writer, "tupleCurrentAtRecordTime");
+    try writer.writeByte(':');
+    try writer.writeAll(if (opts.tuple_current_at_record_time) "true" else "false");
+    try writer.writeByte('}');
+}
+
+fn writeCasRerAttemptObject(writer: *std.Io.Writer, receipt: NormalizedReceipt, attempt_id: ?[]const u8) !void {
+    try writer.writeByte('{');
+    try writeJsonString(writer, "exists");
+    try writer.writeByte(':');
+    try writer.writeAll(if (receipt.review_attempt_exists) "true" else "false");
+    try writer.writeByte(',');
+    try writeJsonString(writer, "attemptId");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, attempt_id);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "phase");
+    try writer.writeByte(':');
+    try writeJsonString(writer, receipt.review_attempt_phase);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "reviewThreadId");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.review_thread_id);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "reviewTurnId");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.review_turn_id);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "recordPath");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.record_path);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "eventLogPath");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.event_log_path);
+    try writer.writeByte('}');
+}
+
+fn writeCasRerVerdictObject(writer: *std.Io.Writer, receipt: NormalizedReceipt) !void {
+    try writer.writeByte('{');
+    try writeJsonString(writer, "tupleVerdictExists");
+    try writer.writeByte(':');
+    try writer.writeAll(if (receipt.tuple_verdict_exists) "true" else "false");
+    try writer.writeByte(',');
+    try writeJsonString(writer, "status");
+    try writer.writeByte(':');
+    try writeJsonString(writer, casRerVerdictStatus(receipt.status));
+    try writer.writeByte(',');
+    try writeJsonString(writer, "clean");
+    try writer.writeByte(':');
+    try writer.writeAll(if (receipt.clean) "true" else "false");
+    try writer.writeByte(',');
+    try writeJsonString(writer, "findingCount");
+    try writer.writeByte(':');
+    try writer.print("{d}", .{receipt.finding_count});
+    try writer.writeByte(',');
+    try writeJsonString(writer, "findings");
+    try writer.writeByte(':');
+    try writer.writeAll(receipt.findings_json);
+    try writer.writeByte('}');
+}
+
+fn writeCasRerFailureObject(writer: *std.Io.Writer, receipt: NormalizedReceipt) !void {
+    try writer.writeByte('{');
+    try writeJsonString(writer, "failureCode");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.failure_code);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "failureClass");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.failure_class);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "retryableSameTupleNow");
+    try writer.writeByte(':');
+    if (receipt.retryable_same_tuple_now) |value| try writer.writeAll(if (value) "true" else "false") else try writer.writeAll("null");
+    try writer.writeByte('}');
+}
+
+fn writeCasRerPrincipalObject(writer: *std.Io.Writer, receipt: NormalizedReceipt) !void {
+    try writer.writeByte('{');
+    try writeJsonString(writer, "kind");
+    try writer.writeByte(':');
+    try writeJsonString(writer, casRerPrincipalKind(receipt));
+    try writer.writeByte(',');
+    try writeJsonString(writer, "proofUsable");
+    try writer.writeByte(':');
+    try writer.writeAll(if (casRerPrincipalProofUsable(receipt)) "true" else "false");
+    try writer.writeByte(',');
+    try writeJsonString(writer, "reduced");
+    try writer.writeByte(':');
+    try writer.writeAll(if (receipt.account_fingerprint_reduced_protection) "true" else "false");
+    try writer.writeByte(',');
+    try writeJsonString(writer, "fallbackUsed");
+    try writer.writeByte(':');
+    try writer.writeAll(if (casRerFallbackUsed(receipt)) "true" else "false");
+    try writer.writeByte(',');
+    try writeJsonString(writer, "source");
+    try writer.writeByte(':');
+    try writeJsonString(writer, receipt.backend_class);
+    try writer.writeByte('}');
+}
+
+fn writeCasRerAttachmentsObject(writer: *std.Io.Writer, receipt: NormalizedReceipt) !void {
+    try writer.writeByte('{');
+    try writeJsonString(writer, "stdout");
+    try writer.writeAll(":null,");
+    try writeJsonString(writer, "stderr");
+    try writer.writeAll(":null,");
+    try writeJsonString(writer, "eventLog");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.event_log_path);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "rawSessionRecord");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.record_path);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "rawReceipt");
+    try writer.writeByte(':');
+    try writeJsonString(writer, receipt.source_path);
+    try writer.writeByte('}');
+}
+
+fn writeCasRerLegacyObject(writer: *std.Io.Writer, receipt: NormalizedReceipt, opts: CasRerProjectionOptions) !void {
+    try writer.writeByte('{');
+    try writeJsonString(writer, "importedFromReceipt");
+    try writer.writeByte(':');
+    try writer.writeAll(if (opts.imported_from_receipt) "true" else "false");
+    try writer.writeByte(',');
+    try writeJsonString(writer, "sourcePath");
+    try writer.writeByte(':');
+    try writeJsonString(writer, receipt.source_path);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "normalizationWarnings");
+    if (receipt.tuple_verdict_exists or receiptHasCompleteTuple(receipt)) {
+        try writer.writeAll(":[]");
+    } else {
+        try writer.writeAll(":[\"missing tuple verdict binding\"]");
+    }
+    try writer.writeByte('}');
+}
+
+fn writeCasRerRecordObject(
+    writer: *std.Io.Writer,
+    receipt: NormalizedReceipt,
+    record_id: []const u8,
+    attempt_id: ?[]const u8,
+    opts: CasRerProjectionOptions,
+) !void {
+    try writer.writeByte('{');
+    try writeJsonString(writer, "schema");
+    try writer.writeByte(':');
+    try writeJsonString(writer, cas_review_evidence_schema);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "recordId");
+    try writer.writeByte(':');
+    try writeJsonString(writer, record_id);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "createdAt");
+    try writer.writeByte(':');
+    try writeJsonString(writer, opts.created_at);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "updatedAt");
+    try writer.writeByte(':');
+    try writeJsonString(writer, opts.updated_at);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "command");
+    try writer.writeByte(':');
+    try writeCasRerCommandObject(writer, receipt, opts);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "tuple");
+    try writer.writeByte(':');
+    try writeCasRerTupleObject(writer, receipt, opts);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "attempt");
+    try writer.writeByte(':');
+    try writeCasRerAttemptObject(writer, receipt, attempt_id);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "verdict");
+    try writer.writeByte(':');
+    try writeCasRerVerdictObject(writer, receipt);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "failure");
+    try writer.writeByte(':');
+    try writeCasRerFailureObject(writer, receipt);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "principal");
+    try writer.writeByte(':');
+    try writeCasRerPrincipalObject(writer, receipt);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "attachments");
+    try writer.writeByte(':');
+    try writeCasRerAttachmentsObject(writer, receipt);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "legacy");
+    try writer.writeByte(':');
+    try writeCasRerLegacyObject(writer, receipt, opts);
+    try writer.writeByte('}');
+}
+
+fn casRerJsonFromReceiptAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt, opts: CasRerProjectionOptions) ![]u8 {
+    const record_id = try casRerRecordIdAlloc(allocator, receipt, opts);
+    defer allocator.free(record_id);
+    const attempt_id = try casRerAttemptIdAlloc(allocator, receipt);
+    defer if (attempt_id) |value| allocator.free(value);
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    defer out.deinit();
+    try writeCasRerRecordObject(&out.writer, receipt, record_id, attempt_id, opts);
+    return out.toOwnedSlice();
 }
 
 fn writeReceiptReviewVerdictObject(writer: *std.Io.Writer, receipt: NormalizedReceipt) !void {
@@ -11009,6 +12287,103 @@ test "parseArgs accepts receipt normalize with requested tuple inputs" {
     try std.testing.expectEqual(ReceiptFormat.json, parsed.receipt_format);
 }
 
+test "parseArgs accepts public review import and validate record actions" {
+    const import_argv = [_][]const u8{
+        "cas_review_session",
+        "import",
+        "--path",
+        "legacy-receipt.json",
+        "--cwd",
+        "/tmp/repo",
+        "--base",
+        "main",
+        "--json",
+    };
+    const import_parsed = try parseArgs(std.testing.allocator, &import_argv);
+    defer std.testing.allocator.free(import_parsed.receipt_paths);
+    defer std.testing.allocator.free(import_parsed.receipt_globs);
+    try std.testing.expectEqual(Action.review_import, import_parsed.action.?);
+    try std.testing.expectEqualStrings("legacy-receipt.json", import_parsed.receipt_paths[0]);
+    try std.testing.expectEqualStrings("/tmp/repo", import_parsed.cwd.?);
+    try std.testing.expectEqual(TargetKind.base_branch, import_parsed.target.?.kind);
+    try std.testing.expect(import_parsed.json);
+
+    const validate_argv = [_][]const u8{
+        "cas_review_session",
+        "validate-record",
+        "--record",
+        "rer_123.json",
+        "--json",
+    };
+    const validate_parsed = try parseArgs(std.testing.allocator, &validate_argv);
+    defer std.testing.allocator.free(validate_parsed.receipt_paths);
+    defer std.testing.allocator.free(validate_parsed.receipt_globs);
+    try std.testing.expectEqual(Action.validate_record, validate_parsed.action.?);
+    try std.testing.expectEqualStrings("rer_123.json", validate_parsed.receipt_paths[0]);
+    try std.testing.expect(validate_parsed.json);
+}
+
+test "parseArgs accepts public review current list and inspect actions" {
+    const current_argv = [_][]const u8{
+        "cas_review_session",
+        "current",
+        "--cwd",
+        "/tmp/repo",
+        "--base",
+        "main",
+        "--json",
+    };
+    const current_parsed = try parseArgs(std.testing.allocator, &current_argv);
+    defer std.testing.allocator.free(current_parsed.receipt_paths);
+    defer std.testing.allocator.free(current_parsed.receipt_globs);
+    try std.testing.expectEqual(Action.current, current_parsed.action.?);
+    try std.testing.expectEqualStrings("/tmp/repo", current_parsed.cwd.?);
+    try std.testing.expectEqual(TargetKind.base_branch, current_parsed.target.?.kind);
+    try std.testing.expect(current_parsed.json);
+
+    const list_argv = [_][]const u8{
+        "cas_review_session",
+        "list",
+        "--cwd",
+        "/tmp/repo",
+        "--base",
+        "main",
+        "--json",
+    };
+    const list_parsed = try parseArgs(std.testing.allocator, &list_argv);
+    defer std.testing.allocator.free(list_parsed.receipt_paths);
+    defer std.testing.allocator.free(list_parsed.receipt_globs);
+    try std.testing.expectEqual(Action.list, list_parsed.action.?);
+    try std.testing.expectEqual(TargetKind.base_branch, list_parsed.target.?.kind);
+
+    const inspect_argv = [_][]const u8{
+        "cas_review_session",
+        "inspect",
+        "--record",
+        "rer_123.json",
+        "--allow-reduced-principal",
+        "--allow-native-fallback",
+        "--show-attachments",
+        "--json",
+    };
+    const inspect_parsed = try parseArgs(std.testing.allocator, &inspect_argv);
+    defer std.testing.allocator.free(inspect_parsed.receipt_paths);
+    defer std.testing.allocator.free(inspect_parsed.receipt_globs);
+    try std.testing.expectEqual(Action.inspect, inspect_parsed.action.?);
+    try std.testing.expectEqualStrings("rer_123.json", inspect_parsed.receipt_paths[0]);
+    try std.testing.expect(inspect_parsed.allow_reduced_principal);
+    try std.testing.expect(inspect_parsed.allow_native_fallback);
+    try std.testing.expect(inspect_parsed.show_attachments);
+
+    const missing_target_argv = [_][]const u8{
+        "cas_review_session",
+        "current",
+        "--cwd",
+        "/tmp/repo",
+    };
+    try std.testing.expectError(error.MissingTarget, parseArgs(std.testing.allocator, &missing_target_argv));
+}
+
 test "parseArgs accepts native receipt classify gate and lock gate actions" {
     const classify_argv = [_][]const u8{
         "cas_review_session",
@@ -11242,6 +12617,118 @@ test "receipt normalizer accepts compact verdict-only artifact" {
     try std.testing.expectEqualStrings(principal_strength_reduced, receipt.principal_strength);
     try std.testing.expect(std.mem.indexOf(u8, receipt.findings_json, "Issue") != null);
     try std.testing.expect(!normalizedReceiptCommandSucceeded(receipt));
+}
+
+test "CAS-RER writer projects terminal findings receipt" {
+    const raw =
+        \\{"status":"findings","backendClass":"cas-lane","clean":false,"findingCount":1,"failureCode":null,"failureHint":null,"reviewAttemptPhase":"normalized_verdict","baseSha":"base_rer","headSha":"head_rer","targetFingerprint":"fp_rer","reviewThreadId":"thr_rer","reviewTurnId":"turn_rer","recordPath":"/tmp/record.json","eventLogPath":"/tmp/event.jsonl","findings":[{"title":"Ledger issue","file":"/tmp/a.zig","line":12,"priority":1}]}
+    ;
+    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "findings-receipt.json", raw, true, .{});
+    defer receipt.deinit(std.testing.allocator);
+
+    const rer_json = try casRerJsonFromReceiptAlloc(std.testing.allocator, receipt, .{});
+    defer std.testing.allocator.free(rer_json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, rer_json, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings(cas_review_evidence_schema, root.get("schema").?.string);
+    try std.testing.expect(std.mem.startsWith(u8, root.get("recordId").?.string, "rer_"));
+    try std.testing.expectEqualStrings("import", root.get("command").?.object.get("surface").?.string);
+    try std.testing.expectEqualStrings("base_rer", root.get("tuple").?.object.get("baseSha").?.string);
+    try std.testing.expectEqualStrings("head_rer", root.get("tuple").?.object.get("headSha").?.string);
+    try std.testing.expectEqualStrings("fp_rer", root.get("tuple").?.object.get("targetFingerprint").?.string);
+    const attempt = root.get("attempt").?.object;
+    try std.testing.expect(attempt.get("exists").?.bool);
+    try std.testing.expect(std.mem.startsWith(u8, attempt.get("attemptId").?.string, "sha256:"));
+    try std.testing.expectEqualStrings("thr_rer", attempt.get("reviewThreadId").?.string);
+    const verdict = root.get("verdict").?.object;
+    try std.testing.expect(verdict.get("tupleVerdictExists").?.bool);
+    try std.testing.expectEqualStrings("findings", verdict.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 1), verdict.get("findingCount").?.integer);
+    try std.testing.expect(std.mem.indexOf(u8, rer_json, "Ledger issue") != null);
+    const principal = root.get("principal").?.object;
+    try std.testing.expectEqualStrings(principal_strength_reduced, principal.get("kind").?.string);
+    try std.testing.expect(!principal.get("proofUsable").?.bool);
+    try std.testing.expect(root.get("legacy").?.object.get("importedFromReceipt").?.bool);
+
+    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "rer.json", root);
+    defer gate.deinit(std.testing.allocator);
+    try std.testing.expect(gate.ok());
+}
+
+test "CAS-RER ledger record projection matches tuple identity" {
+    const raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_match","createdAt":"2026-07-02T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"import","backendSelected":"imported-legacy","brokerDecision":{"action":"imported_legacy","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:a","phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":true,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+    const identity = TargetIdentity{
+        .base_sha = "base",
+        .head_sha = "head",
+        .fingerprint = "fp",
+    };
+    try std.testing.expect(casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity));
+    const wrong_identity = TargetIdentity{
+        .base_sha = "base",
+        .head_sha = "other",
+        .fingerprint = "fp",
+    };
+    try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", wrong_identity));
+
+    const record = try casRerLedgerRecordFromJsonAlloc(std.testing.allocator, "/tmp/rer_match.json", raw);
+    defer record.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("rer_match", record.record_id);
+    try std.testing.expectEqualStrings("clean", record.status);
+    try std.testing.expect(record.tuple_verdict_exists);
+    try std.testing.expectEqualStrings("none", actionRequiredForCasRerRecord(record));
+}
+
+test "CAS-RER writer projects pre-review lane transport as non-attempt" {
+    const raw =
+        \\{"demo":"cas-review-session","action":"lane-review","reviewAttemptPhase":"pre_review_start","reviewAttemptExists":false,"tupleVerdictExists":false,"reviewThreadId":null,"reviewTurnId":null,"baseSha":"base_1","headSha":"head_1","targetFingerprint":"fp_1","failureCode":"pre_review_lane_transport_lost","failureClass":"transport_pre_review","failureHint":"restart lane"}
+    ;
+    const receipt = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "pre-review.json", raw, true, .{});
+    defer receipt.deinit(std.testing.allocator);
+
+    const rer_json = try casRerJsonFromReceiptAlloc(std.testing.allocator, receipt, .{});
+    defer std.testing.allocator.free(rer_json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, rer_json, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    const attempt = root.get("attempt").?.object;
+    try std.testing.expect(!attempt.get("exists").?.bool);
+    try std.testing.expectEqualStrings("pre_review_start", attempt.get("phase").?.string);
+    switch (attempt.get("reviewThreadId").?) {
+        .null => {},
+        else => return error.ExpectedNull,
+    }
+    switch (attempt.get("attemptId").?) {
+        .null => {},
+        else => return error.ExpectedNull,
+    }
+    const verdict = root.get("verdict").?.object;
+    try std.testing.expect(!verdict.get("tupleVerdictExists").?.bool);
+    try std.testing.expectEqualStrings("transport_failure", verdict.get("status").?.string);
+    const failure = root.get("failure").?.object;
+    try std.testing.expectEqualStrings("pre_review_lane_transport_lost", failure.get("failureCode").?.string);
+    try std.testing.expectEqualStrings("transport_pre_review", failure.get("failureClass").?.string);
+
+    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "pre-review-rer.json", root);
+    defer gate.deinit(std.testing.allocator);
+    try std.testing.expect(gate.ok());
+}
+
+test "CAS-RER validator rejects findings without finding count" {
+    const raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_bad","tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "bad-rer.json", parsed.value.object);
+    defer gate.deinit(std.testing.allocator);
+    try std.testing.expect(!gate.ok());
+    try std.testing.expectEqual(@as(usize, 1), gate.errors.len);
+    try std.testing.expect(std.mem.indexOf(u8, gate.errors[0], "findingCount > 0") != null);
 }
 
 test "receipt normalizer rejects target-only verdict as proof" {

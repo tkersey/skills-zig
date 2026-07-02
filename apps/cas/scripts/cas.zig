@@ -24,7 +24,8 @@ const UsageText =
     \\  conformance     | conformance-suite  Run cas_conformance_suite.
     \\  goal                                 Run cas_goal.
     \\  instance_runner | instance-runner   Run cas_instance_runner.
-    \\  review_session  | review-session    Run cas_review_session.
+    \\  review          | review_session    Run CAS review evidence commands.
+    \\  review-session                     Run cas_review_session.
     \\  session_inquiry | session-inquiry   Run cas_session_inquiry.
     \\  smoke_check     | smoke-check       Run cas_smoke_check.
     \\
@@ -34,6 +35,12 @@ const UsageText =
     \\  cas conformance --cwd /path/to/repo --json
     \\  cas goal resolve --cwd /path/to/repo --latest --json
     \\  cas instance_runner --cwd /path/to/repo --instances 4
+    \\  cas review run --cwd /path/to/repo --base main --json
+    \\  cas review current --cwd /path/to/repo --base main --json
+    \\  cas review list --cwd /path/to/repo --base main --json
+    \\  cas review import --path review-1.json --cwd /path/to/repo --base main --json
+    \\  cas review inspect --record rer_123.json --json
+    \\  cas review validate-record --record rer_123.json --json
     \\  cas review_session start --cwd /path/to/repo --uncommitted --json
     \\  cas session_inquiry preflight --json
     \\  cas smoke_check --cwd /path/to/repo --json
@@ -181,7 +188,7 @@ fn resolveTarget(subcommand: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, subcommand, "instance_runner") or std.mem.eql(u8, subcommand, "instance-runner")) {
         return "cas_instance_runner";
     }
-    if (std.mem.eql(u8, subcommand, "review_session") or std.mem.eql(u8, subcommand, "review-session")) {
+    if (std.mem.eql(u8, subcommand, "review") or std.mem.eql(u8, subcommand, "review_session") or std.mem.eql(u8, subcommand, "review-session")) {
         return "cas_review_session";
     }
     if (std.mem.eql(u8, subcommand, "session_inquiry") or std.mem.eql(u8, subcommand, "session-inquiry")) {
@@ -245,6 +252,7 @@ test "resolveTarget supports supported subcommands" {
     try std.testing.expectEqualStrings("cas_goal", resolveTarget("goal").?);
     try std.testing.expectEqualStrings("cas_instance_runner", resolveTarget("instance_runner").?);
     try std.testing.expectEqualStrings("cas_instance_runner", resolveTarget("instance-runner").?);
+    try std.testing.expectEqualStrings("cas_review_session", resolveTarget("review").?);
     try std.testing.expectEqualStrings("cas_review_session", resolveTarget("review_session").?);
     try std.testing.expectEqualStrings("cas_review_session", resolveTarget("review-session").?);
     try std.testing.expectEqualStrings("cas_session_inquiry", resolveTarget("session_inquiry").?);
