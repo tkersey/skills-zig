@@ -10329,6 +10329,7 @@ fn normalizedAttemptPhase(root: std.json.ObjectMap, status: []const u8, tuple_ve
     if (jsonStringField(root, "reviewAttemptPhase")) |phase| return phase;
     if (reviewAttemptExists(review_thread_id)) {
         if (std.mem.eql(u8, status, "timeout")) return "review_waiting";
+        if (std.mem.eql(u8, status, "review_transport_failure")) return "review_waiting";
         if (terminalReceiptStatus(status)) return "review_terminal";
         return "review_waiting";
     }
@@ -14883,6 +14884,7 @@ test "receipt normalizer preserves transport failure over requested tuple bindin
     try std.testing.expectEqualStrings("review_transport_failure", receipt.status);
     try std.testing.expect(!receipt.clean);
     try std.testing.expect(!receipt.tuple_verdict_exists);
+    try std.testing.expectEqualStrings("review_waiting", receipt.review_attempt_phase);
     try std.testing.expectEqualStrings("review_transport_lost", receipt.failure_code.?);
 }
 

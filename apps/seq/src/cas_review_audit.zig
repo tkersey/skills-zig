@@ -601,8 +601,12 @@ fn terminalCasRerPhase(phase: []const u8) bool {
 fn terminalCasRerVerdictConsistent(verdict: std.json.ObjectMap, status: []const u8) bool {
     const clean = boolField(verdict, "clean") orelse return false;
     const finding_count = intField(verdict, "findingCount") orelse return false;
-    if (std.mem.eql(u8, status, "clean")) return clean and finding_count == 0;
-    if (std.mem.eql(u8, status, "findings")) return !clean and finding_count > 0;
+    const findings_len = switch (verdict.get("findings") orelse return false) {
+        .array => |array| array.items.len,
+        else => return false,
+    };
+    if (std.mem.eql(u8, status, "clean")) return clean and finding_count == 0 and findings_len == 0;
+    if (std.mem.eql(u8, status, "findings")) return !clean and finding_count > 0 and findings_len == @as(usize, @intCast(finding_count));
     return true;
 }
 
@@ -2349,6 +2353,8 @@ test "bare CAS-RER JSONL rejects invalid terminal evidence" {
         \\{"schema":"CAS-RER-v1","recordId":"rer_clean_false","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_clean_false","reviewTurnId":"turn_clean_false"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
         \\{"schema":"CAS-RER-v1","recordId":"rer_clean_with_findings","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_clean_with_findings","reviewTurnId":"turn_clean_with_findings"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":1,"findings":[{"title":"issue"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
         \\{"schema":"CAS-RER-v1","recordId":"rer_findings_without_count","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_findings_without_count","reviewTurnId":"turn_findings_without_count"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_findings_without_entries","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_findings_without_entries","reviewTurnId":"turn_findings_without_entries"},"verdict":{"tupleVerdictExists":true,"status":"findings","clean":false,"findingCount":1,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_clean_with_entries","command":{"surface":"import","backendSelected":"imported-legacy","sourceBackendClass":"cas-lane"},"tuple":{"repoRealpath":"/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp"},"attempt":{"exists":true,"phase":"normalized_verdict","reviewThreadId":"thr_clean_with_entries","reviewTurnId":"turn_clean_with_entries"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[{"title":"issue"}]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false}}
     });
     const root_abs = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root_abs);
