@@ -6466,15 +6466,29 @@ fn casRerRecordIdFromJsonAlloc(allocator: std.mem.Allocator, record_json: []cons
     return allocator.dupe(u8, record_id);
 }
 
-fn writeRawJsonFileAtomic(allocator: std.mem.Allocator, path: []const u8, json: []const u8) !void {
+fn jsonFileContentMatches(raw: []const u8, json: []const u8) bool {
+    var end = raw.len;
+    while (end > 0 and (raw[end - 1] == '\n' or raw[end - 1] == '\r')) end -= 1;
+    return std.mem.eql(u8, raw[0..end], json);
+}
+
+fn writeRawJsonFileExclusiveOrIdenticalAlloc(allocator: std.mem.Allocator, path: []const u8, json: []const u8) !void {
     try ensureParentPath(path);
-    const temp_path = try std.fmt.allocPrint(allocator, "{s}.tmp-{d}", .{ path, std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds });
-    defer allocator.free(temp_path);
-    var file = try std.Io.Dir.createFileAbsolute(std.Io.Threaded.global_single_threaded.io(), temp_path, .{ .truncate = true });
+    var file = std.Io.Dir.createFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{
+        .truncate = false,
+        .exclusive = true,
+    }) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            const existing = try readFileAlloc(allocator, path, 8 * 1024 * 1024);
+            defer allocator.free(existing);
+            if (jsonFileContentMatches(existing, json)) return;
+            return error.CasRerRecordIdCollision;
+        },
+        else => return err,
+    };
     defer file.close(std.Io.Threaded.global_single_threaded.io());
     try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), json);
     try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), "\n");
-    try std.Io.Dir.renameAbsolute(temp_path, path, std.Io.Threaded.global_single_threaded.io());
 }
 
 fn writeCasRerRecordJsonToLedgerAlloc(allocator: std.mem.Allocator, record_json: []const u8) ![]const u8 {
@@ -6484,7 +6498,7 @@ fn writeCasRerRecordJsonToLedgerAlloc(allocator: std.mem.Allocator, record_json:
     defer allocator.free(records_dir);
     const path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ records_dir, record_id });
     errdefer allocator.free(path);
-    try writeRawJsonFileAtomic(allocator, path, record_json);
+    try writeRawJsonFileExclusiveOrIdenticalAlloc(allocator, path, record_json);
     return path;
 }
 
@@ -13850,6 +13864,19 @@ test "CAS-RER projection fills missing repo realpath from import cwd" {
     try std.testing.expectEqualStrings("/opt/codex", matched_tuple.get("resolvedCodexPath").?.string);
     try std.testing.expectEqualStrings("codex 9.9.9", matched_tuple.get("resolvedCodexVersion").?.string);
     try std.testing.expectEqualStrings("acct:import", matched.value.object.get("principal").?.object.get("accountFingerprint").?.string);
+}
+
+test "CAS-RER ledger write rejects recordId collisions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "rer_collision.json" });
+    defer std.testing.allocator.free(path);
+
+    try writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"recordId\":\"rer_collision\",\"value\":1}");
+    try writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"recordId\":\"rer_collision\",\"value\":1}");
+    try std.testing.expectError(error.CasRerRecordIdCollision, writeRawJsonFileExclusiveOrIdenticalAlloc(std.testing.allocator, path, "{\"recordId\":\"rer_collision\",\"value\":2}"));
 }
 
 test "CAS-RER projection lets requested import cwd override receipt repo" {
