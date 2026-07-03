@@ -22,11 +22,11 @@
     },
     {
       "fixture": {
-        "name": "valid_review_fix_three_clean_cas",
+        "name": "valid_resolve_three_clean_cas",
         "expected_quality": "present_and_closed",
         "expected_failure_class": null,
         "transcript_excerpt": "CAS-RER-v1 clean_run: 3 fresh_attempt: yes",
-        "artifact_state": { "branch": "feature/hylo", "head": "head-review", "diff_digest": "review" },
+        "artifact_state": { "branch": "feature/hylo", "head": "head-resolve", "diff_digest": "resolve" },
         "expected_detection": { "alsr_present": true, "hyl_present": true, "hsr_step_count": 1, "terminal_atcg": true }
       }
     },
@@ -83,7 +83,7 @@
     {
       "fixture": {
         "name": "missing_unfold",
-        "expected_quality": "present_unverified",
+        "expected_quality": "present_verified",
         "expected_failure_class": "missing_unfold",
         "transcript_excerpt": "HSR-v1 action/fold without unfold",
         "artifact_state": { "branch": "feature/hylo", "head": "head-missing-unfold", "diff_digest": "missing-unfold" },
@@ -124,7 +124,7 @@
     {
       "fixture": {
         "name": "continue_without_next_seed",
-        "expected_quality": "present_verified",
+        "expected_quality": "present_unverified",
         "expected_failure_class": "continue_without_next_seed",
         "transcript_excerpt": "verdict: continue without next_state_ref",
         "artifact_state": { "branch": "feature/hylo", "head": "head-continue-no-seed", "diff_digest": "continue-no-seed" },

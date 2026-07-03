@@ -47,7 +47,7 @@ const HyloFixture = struct {
 const hylo_fixtures = [_]HyloFixture{
     .{ .name = "valid_direct_action_fused", .quality = "present_and_closed", .alsr_present = 0, .hyl_present = 0, .hsr_step_count = 0, .terminal_atcg = 1 },
     .{ .name = "valid_goal_grind_with_alsr_hyl_hsr", .quality = "present_and_closed", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 1 },
-    .{ .name = "valid_review_fix_three_clean_cas", .quality = "present_and_closed", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 1 },
+    .{ .name = "valid_resolve_three_clean_cas", .quality = "present_and_closed", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 1 },
     .{ .name = "valid_st_governed_handoff", .quality = "present_and_closed", .alsr_present = 0, .hyl_present = 0, .hsr_step_count = 0, .terminal_atcg = 1 },
     .{ .name = "valid_parallel_review_class_fanout", .quality = "present_and_closed", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 1 },
     .{ .name = "valid_branch_race_common_verifier", .quality = "present_and_closed", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 1 },
@@ -115,6 +115,159 @@ fn hyloFailureCovered(name: []const u8) bool {
         if (fixture.extra_failure) |failure| if (std.mem.eql(u8, failure, name)) return true;
     }
     return false;
+}
+
+fn fixtureByName(name: []const u8) ?HyloFixture {
+    for (hylo_fixtures) |fixture| {
+        if (std.mem.eql(u8, fixture.name, name)) return fixture;
+    }
+    return null;
+}
+
+fn jsonObject(value: std.json.Value) ?std.json.ObjectMap {
+    return switch (value) {
+        .object => |obj| obj,
+        else => null,
+    };
+}
+
+fn jsonArray(value: std.json.Value) ?std.json.Array {
+    return switch (value) {
+        .array => |array| array,
+        else => null,
+    };
+}
+
+fn jsonStringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn jsonBoolField(obj: std.json.ObjectMap, key: []const u8) ?bool {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .bool => |flag| flag,
+        else => null,
+    };
+}
+
+fn jsonIntField(obj: std.json.ObjectMap, key: []const u8) ?i64 {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .integer => |count| count,
+        else => null,
+    };
+}
+
+fn expectObjectField(obj: std.json.ObjectMap, key: []const u8) !std.json.ObjectMap {
+    const value = obj.get(key) orelse {
+        std.debug.print("missing object field: {s}\n", .{key});
+        return error.MissingExpectedField;
+    };
+    return jsonObject(value) orelse {
+        std.debug.print("field is not object: {s}\n", .{key});
+        return error.InvalidExpectedField;
+    };
+}
+
+fn expectStringField(obj: std.json.ObjectMap, key: []const u8) ![]const u8 {
+    return jsonStringField(obj, key) orelse {
+        std.debug.print("missing string field: {s}\n", .{key});
+        return error.MissingExpectedField;
+    };
+}
+
+fn expectBoolField(obj: std.json.ObjectMap, key: []const u8) !bool {
+    return jsonBoolField(obj, key) orelse {
+        std.debug.print("missing bool field: {s}\n", .{key});
+        return error.MissingExpectedField;
+    };
+}
+
+fn expectNullableFailureMatches(obj: std.json.ObjectMap, fixture: HyloFixture) !void {
+    const value = obj.get("expected_failure_class") orelse {
+        std.debug.print("missing expected_failure_class for fixture {s}\n", .{fixture.name});
+        return error.MissingExpectedField;
+    };
+    switch (value) {
+        .null => {
+            if (fixture.failure != null) return error.ManifestFixtureMismatch;
+        },
+        .string => |failure| {
+            if (fixture.failure == null or !std.mem.eql(u8, fixture.failure.?, failure)) return error.ManifestFixtureMismatch;
+        },
+        else => return error.InvalidExpectedField,
+    }
+}
+
+fn expectExtraFailureMatches(obj: std.json.ObjectMap, fixture: HyloFixture) !void {
+    const value = obj.get("expected_failure_classes");
+    if (fixture.extra_failure) |extra| {
+        const array = if (value) |present| jsonArray(present) orelse return error.InvalidExpectedField else return error.MissingExpectedField;
+        for (array.items) |item| {
+            if (item == .string and std.mem.eql(u8, item.string, extra)) return;
+        }
+        return error.ManifestFixtureMismatch;
+    }
+    if (value != null) return error.ManifestFixtureMismatch;
+}
+
+fn expectDetectionMatches(obj: std.json.ObjectMap, fixture: HyloFixture) !void {
+    const detection = try expectObjectField(obj, "expected_detection");
+    if ((try expectBoolField(detection, "alsr_present")) != (fixture.alsr_present > 0)) return error.ManifestFixtureMismatch;
+    if ((try expectBoolField(detection, "hyl_present")) != (fixture.hyl_present > 0)) return error.ManifestFixtureMismatch;
+    if ((jsonIntField(detection, "hsr_step_count") orelse return error.MissingExpectedField) != @as(i64, @intCast(fixture.hsr_step_count))) return error.ManifestFixtureMismatch;
+    if ((try expectBoolField(detection, "terminal_atcg")) != (fixture.terminal_atcg > 0)) return error.ManifestFixtureMismatch;
+}
+
+fn validateHyloManifest(allocator: std.mem.Allocator) !void {
+    const data = try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), "testdata/actuation/hylo/manifest.json", allocator, .limited(1024 * 1024));
+    defer allocator.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{});
+    defer parsed.deinit();
+
+    const root = jsonObject(parsed.value) orelse return error.InvalidManifest;
+    const fixtures_value = root.get("fixtures") orelse return error.MissingExpectedField;
+    const fixtures = jsonArray(fixtures_value) orelse return error.InvalidManifest;
+    try std.testing.expectEqual(@as(usize, hylo_fixtures.len), fixtures.items.len);
+
+    for (fixtures.items) |entry_value| {
+        const entry = jsonObject(entry_value) orelse return error.InvalidManifest;
+        const fixture_obj = try expectObjectField(entry, "fixture");
+        const name = try expectStringField(fixture_obj, "name");
+        const fixture = fixtureByName(name) orelse {
+            std.debug.print("manifest fixture missing from test matrix: {s}\n", .{name});
+            return error.ManifestFixtureMismatch;
+        };
+        try std.testing.expectEqualStrings(fixture.quality, try expectStringField(fixture_obj, "expected_quality"));
+        try expectNullableFailureMatches(fixture_obj, fixture);
+        try expectExtraFailureMatches(fixture_obj, fixture);
+        _ = try expectStringField(fixture_obj, "transcript_excerpt");
+        const artifact_state = try expectObjectField(fixture_obj, "artifact_state");
+        _ = try expectStringField(artifact_state, "branch");
+        _ = try expectStringField(artifact_state, "head");
+        _ = try expectStringField(artifact_state, "diff_digest");
+        try expectDetectionMatches(fixture_obj, fixture);
+    }
+
+    for (hylo_fixtures) |fixture| {
+        var found = false;
+        for (fixtures.items) |entry_value| {
+            const entry = jsonObject(entry_value) orelse return error.InvalidManifest;
+            const fixture_obj = try expectObjectField(entry, "fixture");
+            if (std.mem.eql(u8, try expectStringField(fixture_obj, "name"), fixture.name)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            std.debug.print("test matrix fixture missing from manifest: {s}\n", .{fixture.name});
+            return error.ManifestFixtureMismatch;
+        }
+    }
 }
 
 fn writePastedSkillFixture(path: []const u8) !void {
@@ -249,6 +402,10 @@ test "actuation audit hylo regression fixtures classify expected legal and failu
     }
 }
 
+test "actuation audit hylo manifest mirrors regression fixture matrix" {
+    try validateHyloManifest(std.testing.allocator);
+}
+
 test "actuation audit hylo fixture matrix covers every registered failure class" {
     for (actuation_hylo.failure_class_names) |name| {
         if (!hyloFailureCovered(name)) {
@@ -258,14 +415,36 @@ test "actuation audit hylo fixture matrix covers every registered failure class"
     }
 }
 
-test "actuation audit hylo json output is stable for fixture runs" {
-    const fixture = "testdata/actuation/hylo/valid_goal_grind_with_alsr_hyl_hsr.jsonl";
-    const args = [_][]const u8{ "--path", fixture, "--mode", "hylo", "--format", "json" };
-    const first = try runAndReadOutput(std.testing.allocator, .actuation_audit, args[0..], ".zig-cache/actuation-hylo-stable-a.json");
-    defer std.testing.allocator.free(first);
-    const second = try runAndReadOutput(std.testing.allocator, .actuation_audit, args[0..], ".zig-cache/actuation-hylo-stable-b.json");
-    defer std.testing.allocator.free(second);
-    try std.testing.expectEqualStrings(first, second);
+test "actuation audit hylo json output is stable for every fixture run" {
+    for (hylo_fixtures) |matrix_fixture| {
+        const fixture = try fixturePath(std.testing.allocator, matrix_fixture.name);
+        defer std.testing.allocator.free(fixture);
+        const args = [_][]const u8{ "--path", fixture, "--mode", "hylo", "--format", "json" };
+        const first_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/actuation-hylo-stable-{s}-a.json", .{matrix_fixture.name});
+        defer std.testing.allocator.free(first_path);
+        const second_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/actuation-hylo-stable-{s}-b.json", .{matrix_fixture.name});
+        defer std.testing.allocator.free(second_path);
+        const first = try runAndReadOutput(std.testing.allocator, .actuation_audit, args[0..], first_path);
+        defer std.testing.allocator.free(first);
+        const second = try runAndReadOutput(std.testing.allocator, .actuation_audit, args[0..], second_path);
+        defer std.testing.allocator.free(second);
+        try std.testing.expectEqualStrings(first, second);
+    }
+}
+
+test "actuation audit hylo mode excludes prompt contamination fixture" {
+    const args = [_][]const u8{ "--path", "testdata/actuation/hylo/prompt_contamination_control.jsonl", "--mode", "hylo", "--format", "json" };
+    const got = try runAndReadOutput(std.testing.allocator, .actuation_audit, args[0..], ".zig-cache/actuation-hylo-contamination.json");
+    defer std.testing.allocator.free(got);
+
+    try expectContains(got, "\"true_runs\": 0");
+    try expectContains(got, "\"hylo_required\": 0");
+    try expectContains(got, "\"alsr_present\": 0");
+    try expectContains(got, "\"hyl_present\": 0");
+    try expectContains(got, "\"hsr_step_count\": 0");
+    try expectContains(got, "\"terminal_folds\": 0");
+    try expectContains(got, "\"atcg_after_terminal_fold\": 0");
+    try expectContains(got, "\"failure_classes\": {}");
 }
 
 test "actuation audit excludes pasted skill blocks as true runs" {
