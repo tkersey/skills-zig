@@ -1139,10 +1139,15 @@ fn summarize(rows: []const query.Row) Summary {
 
 fn manualRecoveryCommand(command_surface: []const u8) bool {
     return std.mem.indexOf(u8, command_surface, "review_session lock") != null or
+        std.mem.indexOf(u8, command_surface, "review-session lock") != null or
         std.mem.indexOf(u8, command_surface, "review_session receipt") != null or
+        std.mem.indexOf(u8, command_surface, "review-session receipt") != null or
         std.mem.indexOf(u8, command_surface, "review_session validate-record") != null or
+        std.mem.indexOf(u8, command_surface, "review-session validate-record") != null or
         std.mem.indexOf(u8, command_surface, "review_session validate_record") != null or
+        std.mem.indexOf(u8, command_surface, "review-session validate_record") != null or
         std.mem.indexOf(u8, command_surface, "review_session inspect") != null or
+        std.mem.indexOf(u8, command_surface, "review-session inspect") != null or
         std.mem.indexOf(u8, command_surface, "receipt normalize") != null or
         std.mem.indexOf(u8, command_surface, "lock gate") != null or
         std.mem.indexOf(u8, command_surface, "cas review validate-record") != null or
@@ -1153,6 +1158,7 @@ fn manualRecoveryCommand(command_surface: []const u8) bool {
 
 fn brokerRunCommandSurface(command_surface: []const u8) bool {
     return std.mem.indexOf(u8, command_surface, "cas review run") != null or
+        std.mem.indexOf(u8, command_surface, "cas review-session run") != null or
         std.mem.indexOf(u8, command_surface, "cas review_session run") != null or
         std.mem.indexOf(u8, command_surface, "cas_review_session run") != null or
         std.mem.indexOf(u8, command_surface, "review_session run") != null;
@@ -1177,11 +1183,16 @@ fn inferPhase(
 }
 
 fn tupleBoundVerdict(root: std.json.ObjectMap, verdict: ?std.json.ObjectMap, base: ?[]const u8, head: ?[]const u8, fingerprint: ?[]const u8) bool {
-    const v = verdict orelse root;
-    return base != null and head != null and fingerprint != null and
-        optEql(nullableStringAny(v, &.{ "baseSha", "base_sha" }), base.?) and
-        optEql(nullableStringAny(v, &.{ "headSha", "head_sha" }), head.?) and
-        optEql(nullableStringAny(v, &.{ "targetFingerprint", "target_fingerprint" }), fingerprint.?);
+    if (base == null or head == null or fingerprint == null) return false;
+    if (verdict) |v| return tupleFieldsMatch(v, base.?, head.?, fingerprint.?);
+    if (!fieldPresentNonNull(root, "reviewResult") and !fieldPresentNonNull(root, "review_result")) return false;
+    return tupleFieldsMatch(root, base.?, head.?, fingerprint.?);
+}
+
+fn tupleFieldsMatch(v: std.json.ObjectMap, base: []const u8, head: []const u8, fingerprint: []const u8) bool {
+    return optEql(nullableStringAny(v, &.{ "baseSha", "base_sha" }), base) and
+        optEql(nullableStringAny(v, &.{ "headSha", "head_sha" }), head) and
+        optEql(nullableStringAny(v, &.{ "targetFingerprint", "target_fingerprint" }), fingerprint);
 }
 
 fn reviewVerdictStatusRoot(root: std.json.ObjectMap) ?[]const u8 {
@@ -1352,6 +1363,7 @@ fn claimDedupeKey(
 
 fn looksLikeCasReviewCommand(cmd: []const u8) bool {
     return std.mem.indexOf(u8, cmd, "cas review ") != null or
+        std.mem.indexOf(u8, cmd, "cas review-session") != null or
         std.mem.indexOf(u8, cmd, "cas review_session") != null or
         std.mem.indexOf(u8, cmd, "cas_review_session") != null or
         std.mem.indexOf(u8, cmd, "review_session") != null;
@@ -1654,6 +1666,24 @@ test "explicit false tuple verdict flag is preserved despite tuple fields" {
     try std.testing.expectEqualStrings("review_started", scalarString(row, "review_attempt_phase").?);
     try std.testing.expect(scalarBool(row, "review_attempt_exists"));
     try std.testing.expect(!scalarBool(row, "tuple_verdict_exists"));
+}
+
+test "stored pending session tuple identity is not verdict proof" {
+    var row = try classifyReceiptText(std.testing.allocator,
+        \\{"schema_version":3,"last_observed_status":"inProgress","review_thread_id":"thr_pending","review_turn_id":"turn_pending","base_sha":"b","head_sha":"h","target_fingerprint":"t","terminal_review_result_source":null,"terminal_review_result_json":null}
+    , .{
+        .session_id = "",
+        .cwd = null,
+        .command_surface = "receipt",
+        .source_path = "/tmp/pending-session.json",
+        .default_backend_class = "cas-receipt-normalized",
+    });
+    defer row.deinit();
+
+    try std.testing.expectEqualStrings("review_started", scalarString(row, "review_attempt_phase").?);
+    try std.testing.expect(scalarBool(row, "review_attempt_exists"));
+    try std.testing.expect(!scalarBool(row, "tuple_verdict_exists"));
+    try std.testing.expectEqual(@as(?[]const u8, null), scalarString(row, "review_verdict_status"));
 }
 
 test "lane smoke command pass status is not a review verdict" {
@@ -2473,6 +2503,9 @@ test "summary separates review transport timeout duplicate and degraded lane tup
 }
 
 test "public review diagnostics count as manual recovery commands" {
+    try std.testing.expect(looksLikeCasReviewCommand("cas review-session start --wait --json"));
+    try std.testing.expect(brokerRunCommandSurface("cas review-session run --cwd /repo --json"));
+    try std.testing.expect(manualRecoveryCommand("cas review-session lock gate --path tuple-lock.json --format json"));
     try std.testing.expect(manualRecoveryCommand("cas review validate-record --record rer_1 --json"));
     try std.testing.expect(manualRecoveryCommand("cas review validate_record --record rer_1 --json"));
     try std.testing.expect(manualRecoveryCommand("cas review inspect --record rer_1 --json"));

@@ -7625,7 +7625,7 @@ fn reviewTupleLockActionWithProbe(action_name: []const u8, existing: ?ReviewTupl
         return if (override_reason != null) .takeover_with_override else .block_stale;
     }
     if (std.mem.eql(u8, lock.state, "review_started") or std.mem.eql(u8, lock.state, "waiting")) {
-        if (std.mem.eql(u8, action_name, "run") and dead_transport_proven) return .auto_replace_dead_transport;
+        if (std.mem.eql(u8, action_name, "run") and dead_transport_proven and reviewTupleLockReplaceableDeadFailure(lock)) return .auto_replace_dead_transport;
         if (std.mem.eql(u8, action_name, "lane-smoke") and
             isSmokeSuiteOverride(override_reason) and
             (isSmokeSuiteOverride(lock.overrideReason) or std.mem.eql(u8, lock.lastFailureCode orelse "", "wait_timed_out")))
@@ -7662,8 +7662,14 @@ fn terminalLockNeedsFreshAttempt(
     return !normalizedReceiptReusableTerminal(normalized);
 }
 
+fn reviewTupleLockReplaceableDeadFailure(lock: ReviewTupleLock) bool {
+    const code = lock.lastFailureCode orelse return false;
+    return std.mem.eql(u8, code, "review_transport_lost") or
+        std.mem.eql(u8, code, "wait_timed_out");
+}
+
 fn reviewTupleLockDeadTransportProven(allocator: std.mem.Allocator, lock: ReviewTupleLock) bool {
-    if (!std.mem.eql(u8, lock.lastFailureCode orelse "", "review_transport_lost")) return false;
+    if (!reviewTupleLockReplaceableDeadFailure(lock)) return false;
     if (cas_websocket.processAlive(lock.ownerPid)) return false;
     const record_path = lock.recordPath orelse return false;
     const owned_record_path = allocator.dupe(u8, record_path) catch return false;
@@ -16091,11 +16097,18 @@ test "review tuple lock action classifies active terminal exhausted and stale st
     };
     try std.testing.expectEqual(ReviewTupleLockAction.return_existing, reviewTupleLockAction("lane-review", active, now_s, null, null));
     try std.testing.expectEqual(ReviewTupleLockAction.return_existing, reviewTupleLockAction("run", active, now_s, null, null));
-    try std.testing.expectEqual(ReviewTupleLockAction.auto_replace_dead_transport, reviewTupleLockActionWithProbe("run", active, now_s, null, null, true));
+    try std.testing.expectEqual(ReviewTupleLockAction.return_existing, reviewTupleLockActionWithProbe("run", active, now_s, null, null, true));
+
+    var transport_lost = active;
+    transport_lost.lastFailureCode = "review_transport_lost";
+    try std.testing.expectEqual(ReviewTupleLockAction.return_existing, reviewTupleLockActionWithProbe("run", transport_lost, now_s, null, null, false));
+    try std.testing.expectEqual(ReviewTupleLockAction.auto_replace_dead_transport, reviewTupleLockActionWithProbe("run", transport_lost, now_s, null, null, true));
 
     var timed_out_smoke = active;
     timed_out_smoke.lastFailureCode = "wait_timed_out";
     try std.testing.expectEqualStrings("timeout", tupleLockFallbackVerdictStatus(timed_out_smoke));
+    try std.testing.expectEqual(ReviewTupleLockAction.return_existing, reviewTupleLockActionWithProbe("run", timed_out_smoke, now_s, null, null, false));
+    try std.testing.expectEqual(ReviewTupleLockAction.auto_replace_dead_transport, reviewTupleLockActionWithProbe("run", timed_out_smoke, now_s, null, null, true));
     try std.testing.expectEqual(ReviewTupleLockAction.return_existing, reviewTupleLockAction("lane-review", timed_out_smoke, now_s, "cas-smoke-suite:1", null));
     try std.testing.expectEqual(ReviewTupleLockAction.takeover_with_override, reviewTupleLockAction("lane-smoke", timed_out_smoke, now_s, "cas-smoke-suite:1", null));
     try std.testing.expectEqual(ReviewTupleLockAction.return_existing, reviewTupleLockAction("lane-review", active, now_s, "cas-smoke-suite:2", "run 2"));
