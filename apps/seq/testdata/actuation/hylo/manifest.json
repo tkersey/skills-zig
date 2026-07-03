@@ -194,21 +194,11 @@
     },
     {
       "fixture": {
-        "name": "review_fix_without_review_fold",
+        "name": "resolve_without_review_fold",
         "expected_quality": "present_and_closed",
-        "expected_failure_class": "review_fix_without_review_fold",
+        "expected_failure_class": "resolve_without_review_fold",
         "transcript_excerpt": "$cas review without $review-fold",
-        "artifact_state": { "branch": "feature/hylo", "head": "head-review-no-fold", "diff_digest": "review-no-fold" },
-        "expected_detection": { "alsr_present": true, "hyl_present": true, "hsr_step_count": 1, "terminal_atcg": true }
-      }
-    },
-    {
-      "fixture": {
-        "name": "ship_without_terminal_publication_boundary",
-        "expected_quality": "present_and_closed",
-        "expected_failure_class": "ship_without_terminal_publication_boundary",
-        "transcript_excerpt": "ship_handoff without publication_boundary",
-        "artifact_state": { "branch": "feature/hylo", "head": "head-ship-no-boundary", "diff_digest": "ship-no-boundary" },
+        "artifact_state": { "branch": "feature/hylo", "head": "head-resolve-no-fold", "diff_digest": "resolve-no-fold" },
         "expected_detection": { "alsr_present": true, "hyl_present": true, "hsr_step_count": 1, "terminal_atcg": true }
       }
     },

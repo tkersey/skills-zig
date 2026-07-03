@@ -64,8 +64,7 @@ const hylo_fixtures = [_]HyloFixture{
     .{ .name = "parallel_fanout_without_fanin", .quality = "present_verified", .failure = "parallel_fanout_without_fanin", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 0 },
     .{ .name = "raw_review_to_patch", .quality = "present_and_closed", .failure = "raw_review_to_patch", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 1 },
     .{ .name = "cached_cas_counted_as_fresh", .quality = "present_verified", .failure = "cached_cas_counted_as_fresh", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 0 },
-    .{ .name = "review_fix_without_review_fold", .quality = "present_and_closed", .failure = "review_fix_without_review_fold", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 1 },
-    .{ .name = "ship_without_terminal_publication_boundary", .quality = "present_and_closed", .failure = "ship_without_terminal_publication_boundary", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 1 },
+    .{ .name = "resolve_without_review_fold", .quality = "present_and_closed", .failure = "resolve_without_review_fold", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 1 },
     .{ .name = "prompt_contamination_control", .quality = "absent", .true_runs = 0, .hylo_required = 0, .alsr_present = 0, .hyl_present = 0, .hsr_step_count = 0, .terminal_atcg = 0 },
 };
 

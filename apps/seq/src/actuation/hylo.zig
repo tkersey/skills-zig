@@ -5,7 +5,7 @@ const gcr = @import("gcr.zig");
 const output = @import("../output/mod.zig");
 
 pub const quality_state_count = 7;
-pub const failure_class_count = 16;
+pub const failure_class_count = 15;
 
 pub const quality_state_names = [_][]const u8{
     "absent",
@@ -30,10 +30,9 @@ pub const failure_class_names = [_][]const u8{
     "terminal_without_atcg",
     "parallel_fanout_without_fanin",
     "stale_hylo_after_diff_change",
-    "review_fix_without_review_fold",
+    "resolve_without_review_fold",
     "raw_review_to_patch",
     "cached_cas_counted_as_fresh",
-    "ship_without_terminal_publication_boundary",
 };
 
 const QualityState = enum(u8) {
@@ -59,10 +58,9 @@ const FailureClass = enum(u8) {
     terminal_without_atcg = 9,
     parallel_fanout_without_fanin = 10,
     stale_hylo_after_diff_change = 11,
-    review_fix_without_review_fold = 12,
+    resolve_without_review_fold = 12,
     raw_review_to_patch = 13,
     cached_cas_counted_as_fresh = 14,
-    ship_without_terminal_publication_boundary = 15,
 };
 
 const TextStats = struct {
@@ -294,10 +292,9 @@ fn applyFailures(summary: *RunSummary, stats: TextStats) void {
     if (summary.terminal_folds > 0 and stats.stop_rule_count == 0) addFailure(summary, .terminal_without_stop_rule);
     if (summary.terminal_folds > 0 and summary.atcg_after_terminal_fold == 0) addFailure(summary, .terminal_without_atcg);
     if (stats.parallel_frontier_count > 0 and stats.fanin_count == 0) addFailure(summary, .parallel_fanout_without_fanin);
-    if (stats.review_marker_count > 0 and summary.mutations > 0 and stats.review_fold_count == 0) addFailure(summary, .review_fix_without_review_fold);
+    if (stats.review_marker_count > 0 and summary.mutations > 0 and stats.review_fold_count == 0) addFailure(summary, .resolve_without_review_fold);
     if (stats.raw_review_patch_count > 0) addFailure(summary, .raw_review_to_patch);
     if (stats.cached_cas_counted_fresh_count > 0) addFailure(summary, .cached_cas_counted_as_fresh);
-    if (stats.ship_effect_count > 0 and stats.publication_boundary_count == 0) addFailure(summary, .ship_without_terminal_publication_boundary);
 }
 
 fn qualityState(summary: RunSummary, stats: TextStats) []const u8 {
