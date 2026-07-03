@@ -257,6 +257,7 @@ seq query --root ~/.codex/sessions --spec '{"dataset":"historical_decisions","pa
 - requires a bounded selector: `--session-id`, `--path`, or `--repo`/`--workdir` with `--since`, `--until`, or `--last`
 - classifies true runs separately from pasted skill blocks, examples, reports, and incidental mentions
 - recovers GCR attempts, material mutations without current executable GCR, projection inversion, proof cadence, compaction resume signals, worker linkage, churn, ship flags, and ALSR/HYL/HSR governance coverage from canonical trace evidence
+- `--mode hylo --format json` reports true-run counts, ALSR/HYL/HSR coverage, mutation/unfold/fold continuity, terminal ATCG coverage, quality-state counts, and public failure classes: `missing_alsr`, `missing_hyl`, `missing_unfold`, `unfold_not_current`, `mutation_without_unfold`, `action_without_fold`, `fold_without_current_artifact`, `continue_without_next_seed`, `terminal_without_stop_rule`, `terminal_without_atcg`, `parallel_fanout_without_fanin`, `stale_hylo_after_diff_change`, `resolve_without_review_fold`, `raw_review_to_patch`, and `cached_cas_counted_as_fresh`
 - keeps raw prompts/excerpts out by default; `--include-excerpts` is explicit
 - `--strict` exits 2 for graph bypass or projection inversion rows
 

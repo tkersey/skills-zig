@@ -1,5 +1,0 @@
-{"type":"session_meta","timestamp":"2026-07-02T13:20:00Z","payload":{"id":"ship_without_terminal_publication_boundary","cwd":"/repo/seq-audit","model":"gpt-5","git":{"branch":"feature/hylo","commit_hash":"head-ship-no-boundary"}}}
-{"type":"event_msg","timestamp":"2026-07-02T13:20:01Z","payload":{"type":"task_started","turn_id":"t1"}}
-{"type":"event_msg","timestamp":"2026-07-02T13:20:02Z","payload":{"type":"user_message","turn_id":"t1","message":"$actuating ship without terminal boundary fixture."}}
-{"type":"event_msg","timestamp":"2026-07-02T13:20:03Z","payload":{"type":"agent_message","turn_id":"t1","message":"ship_handoff:\n  target_skill: ship\n  command: gh pr create\nagent_loop_scheme_receipt:\n  receipt_version: ALSR-v1\nactuation_hylomorphism:\n  machine_version: HYL-v1\nhylo_step_receipt:\n  receipt_version: HSR-v1\n  unfold:\n    produced: terminal\n  action:\n    effect: publish\n  fold:\n    verdict: complete\n    current_artifact_bound: yes\n  stop_rule:\n    success: done\nATCG-v1:\n  can_mark_goal_complete: yes"}}
-{"type":"event_msg","timestamp":"2026-07-02T13:20:04Z","payload":{"type":"task_complete","turn_id":"t1","duration_ms":5000}}
