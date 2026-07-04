@@ -61,6 +61,7 @@ pub const Command = enum {
     index,
     actuation_audit,
     execution_policy_audit,
+    policy_calibration,
     st_workspace_audit,
     unknown,
 };
@@ -131,6 +132,7 @@ pub const command_defs = [_]CommandDef{
     .{ .name = "index", .cmd = .index },
     .{ .name = "actuation-audit", .cmd = .actuation_audit },
     .{ .name = "execution-policy-audit", .cmd = .execution_policy_audit },
+    .{ .name = "policy-calibration", .cmd = .policy_calibration },
     .{ .name = "st-workspace-audit", .cmd = .st_workspace_audit },
 };
 

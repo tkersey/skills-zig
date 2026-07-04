@@ -955,6 +955,7 @@ pub fn run(
         .query_diagnose => try cmdQueryDiagnose(allocator, sessions_root, opts),
         .actuation_audit => try cmdActuationAudit(allocator, sessions_root, opts),
         .execution_policy_audit => try cmdExecutionPolicyAudit(allocator, sessions_root, opts),
+        .policy_calibration => try cmdPolicyCalibration(allocator, sessions_root, opts),
         .st_workspace_audit => try cmdStWorkspaceAudit(allocator, sessions_root, opts),
         .capabilities => try cmdCapabilities(allocator, opts),
         .memory_provenance => try cmdMemoryProvenance(allocator, opts),
@@ -1070,7 +1071,9 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\usage: seq orchestration-concurrency [--session-id <id>|--path <jsonl>] [--format table|json|csv|jsonl] [--floor-threshold N] [--fail-on-floor] [--fail-on-mesh-truth]
         ,
         .find_session =>
-        \\usage: seq find-session --prompt <text> [--since <iso>] [--until <iso>] [--limit N] [--format table|json|csv|jsonl]
+        \\usage: seq find-session (--prompt <text>|--session-id <id>) [--since <iso>] [--until <iso>] [--limit N] [--format table|json|csv|jsonl]
+        \\extra options:
+        \\  --session-id <id>         Resolve one session summary by id; when combined with --prompt, search only that session
         ,
         .plan_search =>
         \\usage: seq plan-search [--repo <path>] [--session-id <id>|--path <jsonl>] [--since <iso>] [--until <iso>] [--contains <text>|--regex <expr>] [--sort timestamp|-timestamp] [--include-body] [--stats] [--limit N] [--format table|json|csv|jsonl]
@@ -1196,6 +1199,12 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\  --strict                   Exit 2 for hard current-protocol execution policy failures
         \\  --format markdown          Only valid with --mode report
         ,
+        .policy_calibration =>
+        \\usage: seq policy-calibration --root <path> [--session-id <id>|--path <rollout.jsonl>|--repo <path>|--since <iso>|--until <iso>|--last <duration>] [--exclude-current] [--include-workers] [--policy-root <path>] [--format table|json|jsonl|csv]
+        \\extra options:
+        \\  Emits the execution policy calibration projection; equivalent to execution-policy-audit --mode calibration
+        \\  --policy-root <path>        Include policy artifact root in corpus metadata
+        ,
         .st_workspace_audit =>
         \\usage: seq st-workspace-audit [--root <path>] [--repo <path>] [--workspace-root <path>] [--workspace-id <id>] [--plan <plan-id>] [--session-id <id>] [--since <iso>] [--until <iso>] [--last <duration>] [--exclude-current] [--mode summary|workspaces|plans|claims|sessions|apertures|gcr|graph-control|graph-repair|artifact-maintenance|workflow-provenance|changesets|proof|integration|evidence|report] [--strict] [--format table|json|jsonl|csv|markdown]
         \\extra options:
@@ -1299,6 +1308,7 @@ fn commandSupportsExcludeCurrent(cmd: lib.Command) bool {
     return std.mem.eql(u8, name, "message_audit") or
         std.mem.eql(u8, name, "actuation_audit") or
         std.mem.eql(u8, name, "execution_policy_audit") or
+        std.mem.eql(u8, name, "policy_calibration") or
         std.mem.eql(u8, name, "st_workspace_audit") or
         std.mem.eql(u8, name, "skill_audit") or
         std.mem.eql(u8, name, "skill_cohort") or
@@ -1363,6 +1373,9 @@ fn validateFormatForCommand(cmd: lib.Command, opts: Options) !void {
             const mode = opts.mode orelse "summary";
             if (!isValidExecutionPolicyAuditMode(mode)) return error.InvalidModeArg;
             if (fmt == .markdown and !std.mem.eql(u8, mode, "report")) return error.InvalidFormatForCommand;
+        },
+        .policy_calibration => {
+            if (fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
         .st_workspace_audit => {
             if (fmt == .dot) return error.InvalidFormatForCommand;
@@ -1459,7 +1472,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         else => false,
     };
     const supports_repo = switch (cmd) {
-        .plan_search, .sessions, .resolve_churn_audit, .review_compiler_audit, .skill_decision_audit, .decision_capsule, .actuation_audit, .cas_review_audit, .execution_policy_audit, .st_workspace_audit => true,
+        .plan_search, .sessions, .resolve_churn_audit, .review_compiler_audit, .skill_decision_audit, .decision_capsule, .actuation_audit, .cas_review_audit, .execution_policy_audit, .policy_calibration, .st_workspace_audit => true,
         else => false,
     };
     const supports_status = cmd == .opencode_events or cmd == .turns or cmd == .goal_audit;
@@ -1493,6 +1506,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .skill_decision_audit,
         .actuation_audit,
         .execution_policy_audit,
+        .policy_calibration,
         .role_breakdown,
         .occurrence_export,
         .find_session,
@@ -1540,6 +1554,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .skill_decision_audit,
         .actuation_audit,
         .execution_policy_audit,
+        .policy_calibration,
         .st_workspace_audit,
         .role_breakdown,
         .occurrence_export,
@@ -1648,11 +1663,11 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_window_hours = cmd == .token_window;
     const supports_duration_gte = cmd == .goal_audit;
     const supports_since_cursor = cmd == .skill_evidence or cmd == .skill_decision_audit;
-    const supports_last = cmd == .token_usage or cmd == .token_cost or cmd == .skill_audit or cmd == .skill_evidence or cmd == .skill_decision_audit or cmd == .actuation_audit or cmd == .cas_review_audit or cmd == .execution_policy_audit or cmd == .st_workspace_audit or cmd == .skill_success_rank or cmd == .skill_cohort or cmd == .workflow_audit or cmd == .adjudication_audit or cmd == .message_audit or cmd == .message_search or cmd == .tool_audit or cmd == .tool_search or cmd == .skill_blocks;
+    const supports_last = cmd == .token_usage or cmd == .token_cost or cmd == .skill_audit or cmd == .skill_evidence or cmd == .skill_decision_audit or cmd == .actuation_audit or cmd == .cas_review_audit or cmd == .execution_policy_audit or cmd == .policy_calibration or cmd == .st_workspace_audit or cmd == .skill_success_rank or cmd == .skill_cohort or cmd == .workflow_audit or cmd == .adjudication_audit or cmd == .message_audit or cmd == .message_search or cmd == .tool_audit or cmd == .tool_search or cmd == .skill_blocks;
     const supports_include_root_equivalent = cmd == .adjudication_audit;
     const supports_bundle_dir = cmd == .adjudication_audit;
     const supports_artifact_root = cmd == .review_compiler_audit;
-    const supports_policy_root = cmd == .execution_policy_audit;
+    const supports_policy_root = cmd == .execution_policy_audit or cmd == .policy_calibration;
     const supports_workspace_root = cmd == .st_workspace_audit;
     const supports_token_cost_options = cmd == .token_cost;
     const supports_protocol = cmd == .review_compiler_audit;
@@ -1749,7 +1764,7 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.opencode_source_text != null, supports_opencode_source, "--source", cmd);
     try ensureOptionAllowed(!std.mem.eql(u8, opts.index_mode, "auto"), supports_index_mode, "--index", cmd);
     try ensureOptionAllowed(opts.include_raw, supports_include_raw, "--include-raw", cmd);
-    try ensureOptionAllowed(opts.include_workers, cmd == .skill_decision_audit or cmd == .decision_capsule or cmd == .actuation_audit or cmd == .execution_policy_audit, "--include-workers", cmd);
+    try ensureOptionAllowed(opts.include_workers, cmd == .skill_decision_audit or cmd == .decision_capsule or cmd == .actuation_audit or cmd == .execution_policy_audit or cmd == .policy_calibration, "--include-workers", cmd);
     try ensureOptionAllowed(opts.include_excerpts, cmd == .skill_decision_audit or cmd == .decision_capsule or cmd == .actuation_audit, "--include-excerpts", cmd);
     try ensureOptionAllowed(opts.emit_count_evidence, cmd == .review_compiler_audit, "--emit-count-evidence", cmd);
     try ensureOptionAllowed(opts.actuation_strict, cmd == .actuation_audit, "--strict", cmd);
@@ -1827,6 +1842,10 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
             printCliError("error: skill-decision-audit --mode delta/--since-cursor requires --session-id or --path\n", .{});
             return error.MissingArgValue;
         }
+    }
+    if (cmd == .find_session and opts.prompt == null and opts.session_id == null) {
+        printCliError("error: find-session requires --prompt or --session-id\n", .{});
+        return error.MissingPromptArg;
     }
     if (cmd == .decision_capsule) {
         const mode = try decision_capsule.Mode.parse(opts.mode);
@@ -1963,6 +1982,12 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
             return error.MissingArgValue;
         }
     }
+    if (cmd == .policy_calibration) {
+        if (!hasExecutionPolicyAuditScope(opts)) {
+            printCliError("error: policy-calibration requires --session-id, --path, --repo, --since, --until, or --last\n", .{});
+            return error.MissingArgValue;
+        }
+    }
     if (cmd == .st_workspace_audit) {
         if (opts.mode) |text| {
             if (!isValidStWorkspaceAuditMode(text)) return error.InvalidModeArg;
@@ -1997,6 +2022,7 @@ fn commandSupportsPath(cmd: lib.Command) bool {
         .actuation_audit,
         .cas_review_audit,
         .execution_policy_audit,
+        .policy_calibration,
         .decision_capsule,
         .skill_blocks,
         .token_usage,
@@ -2022,11 +2048,13 @@ fn commandSupportsSessionId(cmd: lib.Command) bool {
         .reply_latency,
         .session_prompts,
         .session_tooling,
+        .find_session,
         .skill_evidence,
         .skill_decision_audit,
         .actuation_audit,
         .cas_review_audit,
         .execution_policy_audit,
+        .policy_calibration,
         .st_workspace_audit,
         .decision_capsule,
         .skill_blocks,
@@ -2967,6 +2995,9 @@ fn cmdTraceToolLifecycle(allocator: std.mem.Allocator, sessions_root: []const u8
 
 fn writeTextOutput(text: []const u8, out_path: ?[]const u8) !void {
     if (out_path) |path| {
+        if (std.fs.path.dirname(path)) |dir| {
+            if (dir.len > 0) try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), dir);
+        }
         try std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = path, .data = text });
         return;
     }
@@ -3574,6 +3605,12 @@ fn cmdExecutionPolicyAudit(allocator: std.mem.Allocator, sessions_root: []const 
     }
 
     try output.writeOutput(allocator, opts.format, rows.items, executionPolicyColumnsForMode(mode), opts.out_path);
+}
+
+fn cmdPolicyCalibration(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
+    var calibration_opts = opts;
+    calibration_opts.mode = "calibration";
+    try cmdExecutionPolicyAudit(allocator, sessions_root, calibration_opts);
 }
 
 fn cmdStWorkspaceAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
@@ -17511,7 +17548,42 @@ fn mergeMaxCounter(
 }
 
 fn cmdFindSession(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
-    const prompt = opts.prompt orelse return error.MissingPromptArg;
+    if (opts.prompt == null) {
+        var lookup_opts = opts;
+        var selected_path: ?[]u8 = null;
+        defer if (selected_path) |path| allocator.free(path);
+
+        if (opts.session_id != null) {
+            const day_filter = deriveSessionDayPathFilterFromOptions(opts);
+            var paths = try resolveSessionPromptInputPaths(allocator, sessions_root, opts, day_filter);
+            defer freePathList(allocator, &paths);
+            if (paths.items.len == 0) return error.SessionNotFound;
+            selected_path = try allocator.dupe(u8, paths.items[0]);
+            lookup_opts.path = selected_path.?;
+            lookup_opts.session_id = null;
+        }
+
+        var rows = try collectTraceDatasetRowsWithOptions(allocator, "sessions", sessions_root, lookup_opts);
+        defer deinitQueryRows(allocator, &rows);
+        try runTraceRows(allocator, &rows, lookup_opts, "start_time", trace_session_columns[0..], null, 0);
+        return;
+    }
+
+    const prompt = opts.prompt.?;
+    var params: std.ArrayList(spec.ParamSpec) = .empty;
+    defer params.deinit(allocator);
+
+    var scoped_path: ?[]u8 = null;
+    defer if (scoped_path) |path| allocator.free(path);
+    if (opts.session_id != null) {
+        const day_filter = deriveSessionDayPathFilterFromOptions(opts);
+        var paths = try resolveSessionPromptInputPaths(allocator, sessions_root, opts, day_filter);
+        defer freePathList(allocator, &paths);
+        if (paths.items.len == 0) return error.SessionNotFound;
+        scoped_path = try allocator.dupe(u8, paths.items[0]);
+        try params.append(allocator, .{ .key = "path", .value = .{ .string = scoped_path.? } });
+    }
+
     var where: std.ArrayList(spec.WhereClause) = .empty;
     defer where.deinit(allocator);
     try where.append(allocator, .{
@@ -17522,6 +17594,7 @@ fn cmdFindSession(allocator: std.mem.Allocator, sessions_root: []const u8, opts:
     try appendSessionTimeBounds(allocator, &where, opts);
     const select = [_][]const u8{ "path", "timestamp", "role", "text" };
     const query_spec = spec.QuerySpec{
+        .params = params.items,
         .where = where.items,
         .select = select[0..],
         .sort = &.{.{ .field = "timestamp", .descending = true }},
@@ -24582,6 +24655,21 @@ test "execution-policy-audit validates bounded selector modes and formats" {
     const session_opts = try parseOptionsForCommand(.execution_policy_audit, &.{ "--session-id", "abc", "--mode", "runs" });
     try validateCommandOptions(.execution_policy_audit, session_opts);
 
+    const calibration_opts = try parseOptionsForCommand(.policy_calibration, &.{
+        "--session-id",
+        "abc",
+        "--format",
+        "json",
+        "--include-workers",
+        "--policy-root",
+        "/tmp/policies",
+    });
+    try validateFormatForCommand(.policy_calibration, calibration_opts);
+    try validateCommandOptions(.policy_calibration, calibration_opts);
+
+    const calibration_mode_opts = try parseOptionsForCommand(.policy_calibration, &.{ "--session-id", "abc", "--mode", "calibration" });
+    try std.testing.expectError(error.UnsupportedOption, validateCommandOptions(.policy_calibration, calibration_mode_opts));
+
     const repo_opts = try parseOptionsForCommand(.execution_policy_audit, &.{ "--repo", "/tmp/repo", "--mode", "policies" });
     try validateCommandOptions(.execution_policy_audit, repo_opts);
 
@@ -24640,6 +24728,19 @@ test "execution-policy-audit exposes report modes and query datasets" {
     try std.testing.expect(std.mem.indexOf(u8, mode_got, "\"matches\": 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, mode_got, "\"misses\": 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, mode_got, "\"unexpected\": 1") != null);
+
+    const calibration_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "policy-calibration.json" });
+    defer std.testing.allocator.free(calibration_out);
+    const calibration_got = try runCommandWithOutput(std.testing.allocator, .policy_calibration, &.{
+        "--root",   root_abs,
+        "--path",   path,
+        "--format", "json",
+    }, calibration_out);
+    defer std.testing.allocator.free(calibration_got);
+    try std.testing.expect(std.mem.indexOf(u8, calibration_got, "\"transition_id\": \"summary\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, calibration_got, "\"matches\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, calibration_got, "\"misses\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, calibration_got, "\"unexpected\": 1") != null);
 
     const query_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "execution-policy-query.json" });
     defer std.testing.allocator.free(query_out);
@@ -27476,6 +27577,42 @@ test "artifact-search supports contains-any across selected surfaces" {
 
     try std.testing.expect(std.mem.indexOf(u8, got, "\"match_kind\":\"contains-any\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "alpha-signal") != null);
+}
+
+test "find-session resolves session id and narrows prompt search" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/09");
+    const content =
+        "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-09T09:00:00Z\",\"payload\":{\"id\":\"find-target\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-09T09:00:01Z\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"needle prompt\"}]}}\n";
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/09/rollout-find-target.jsonl", .data = content });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+
+    const lookup_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "find-session-id.json" });
+    defer std.testing.allocator.free(lookup_out);
+    const lookup_got = try runCommandWithOutput(std.testing.allocator, .find_session, &.{
+        "--root",       root_abs,
+        "--session-id", "find-target",
+        "--format",     "json",
+    }, lookup_out);
+    defer std.testing.allocator.free(lookup_got);
+    try std.testing.expect(std.mem.indexOf(u8, lookup_got, "\"session_id\": \"find-target\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lookup_got, "rollout-find-target.jsonl") != null);
+
+    const prompt_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "find-session-prompt.jsonl" });
+    defer std.testing.allocator.free(prompt_out);
+    const prompt_got = try runCommandWithOutput(std.testing.allocator, .find_session, &.{
+        "--root",       root_abs,
+        "--session-id", "find-target",
+        "--prompt",     "needle",
+        "--format",     "jsonl",
+    }, prompt_out);
+    defer std.testing.allocator.free(prompt_got);
+    try std.testing.expect(std.mem.indexOf(u8, prompt_got, "needle prompt") != null);
 }
 
 test "adjudication-audit extracts route counts and conservative skew flags" {
