@@ -1,9 +1,0 @@
-{
-  "version": 1,
-  "author": "codex",
-  "reason": "Invalid missing proof fixture",
-  "ops": [
-    {"op": "upsert-intent", "intent": {"id": "intent-001", "text": "Missing proof must fail.", "category": "requirement", "disposition": "covered"}},
-    {"op": "upsert-item", "item": {"id": "st-001", "step": "Missing validation", "item_type": "feature", "intent_refs": ["intent-001"], "acceptance": ["done"], "contract": {"objective": "No proof."}}}
-  ]
-}

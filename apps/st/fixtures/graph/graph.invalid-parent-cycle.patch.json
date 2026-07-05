@@ -1,9 +1,0 @@
-{
-  "version": 1,
-  "author": "codex",
-  "reason": "Invalid parent cycle fixture",
-  "ops": [
-    {"op": "upsert-item", "item": {"id": "st-001", "step": "Parent A", "parent_id": "st-002"}},
-    {"op": "upsert-item", "item": {"id": "st-002", "step": "Parent B", "parent_id": "st-001"}}
-  ]
-}

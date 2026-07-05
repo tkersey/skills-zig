@@ -15,7 +15,7 @@ const HelpSurface = core_cli.HelpSurface{
 const UsageText =
     \\cas_conformance_suite
     \\
-    \\Run CAS-backed swarm conformance checks for smoke preflight, durable claims, mesh reconciliation, and retry policy.
+    \\Run CAS-backed conformance checks for smoke preflight and retry policy.
     \\
     \\Usage:
     \\  cas_conformance_suite --cwd DIR [options]
@@ -24,10 +24,8 @@ const UsageText =
     \\  --cwd DIR                         Workspace for CAS smoke preflight.
     \\
     \\Options:
-    \\  --scenario NAME                   Repeatable: claim_safe_wave|stale_claim_reclaim|mesh_row_accountability|overload_backoff.
+    \\  --scenario NAME                   Repeatable: overload_backoff.
     \\  --skip-smoke-check                Skip live cas_smoke_check preflight.
-    \\  --keep-temp                       Keep per-scenario temp roots even on success.
-    \\  --st-binary PATH                  Override st binary path.
     \\  --smoke-binary PATH               Override cas_smoke_check binary path.
     \\  --hooks MODE                      Hook policy for smoke preflight: inherit|off|require-observed (default: inherit).
     \\  --backoff-base-ms N               Base retry delay for overload policy checks (default: 250).
@@ -44,24 +42,15 @@ const DefaultMaxRetries: u32 = 4;
 const DefaultOverloadScript = [_][]const u8{ "overload", "overload", "success" };
 
 const Scenario = enum {
-    claim_safe_wave,
-    stale_claim_reclaim,
-    mesh_row_accountability,
     overload_backoff,
 
     fn parse(raw: []const u8) ?Scenario {
-        if (std.mem.eql(u8, raw, "claim_safe_wave") or std.mem.eql(u8, raw, "claim-safe-wave")) return .claim_safe_wave;
-        if (std.mem.eql(u8, raw, "stale_claim_reclaim") or std.mem.eql(u8, raw, "stale-claim-reclaim")) return .stale_claim_reclaim;
-        if (std.mem.eql(u8, raw, "mesh_row_accountability") or std.mem.eql(u8, raw, "mesh-row-accountability")) return .mesh_row_accountability;
         if (std.mem.eql(u8, raw, "overload_backoff") or std.mem.eql(u8, raw, "overload-backoff")) return .overload_backoff;
         return null;
     }
 
     fn asString(self: Scenario) []const u8 {
         return switch (self) {
-            .claim_safe_wave => "claim_safe_wave",
-            .stale_claim_reclaim => "stale_claim_reclaim",
-            .mesh_row_accountability => "mesh_row_accountability",
             .overload_backoff => "overload_backoff",
         };
     }
@@ -69,15 +58,11 @@ const Scenario = enum {
     fn mode(self: Scenario) []const u8 {
         return switch (self) {
             .overload_backoff => "synthetic",
-            else => "local",
         };
     }
 };
 
 const DefaultScenarios = [_]Scenario{
-    .claim_safe_wave,
-    .stale_claim_reclaim,
-    .mesh_row_accountability,
     .overload_backoff,
 };
 
@@ -85,8 +70,6 @@ const ParsedArgs = struct {
     cwd: ?[]const u8 = null,
     scenarios: []const Scenario = &.{},
     skip_smoke_check: bool = false,
-    keep_temp: bool = false,
-    st_binary: ?[]const u8 = null,
     smoke_binary: ?[]const u8 = null,
     hook_policy: cas_hooks.HookPolicy = .inherit,
     backoff_base_ms: u32 = DefaultBackoffBaseMs,
@@ -99,10 +82,8 @@ const ParsedArgs = struct {
 
 const Context = struct {
     cwd: []const u8,
-    st_binary: []const u8,
     smoke_binary: []const u8,
     hook_policy: cas_hooks.HookPolicy,
-    keep_temp: bool,
     backoff_base_ms: u32,
     max_retries: u32,
     overload_script: []const []const u8,
@@ -179,10 +160,8 @@ pub fn main(init: std.process.Init) !void {
 
     const ctx = Context{
         .cwd = cwd,
-        .st_binary = try resolveExecutable(allocator, parsed.st_binary, "st"),
         .smoke_binary = try resolveExecutable(allocator, parsed.smoke_binary, "cas_smoke_check"),
         .hook_policy = parsed.hook_policy,
-        .keep_temp = parsed.keep_temp,
         .backoff_base_ms = parsed.backoff_base_ms,
         .max_retries = parsed.max_retries,
         .overload_script = parsed.overload_script,
@@ -288,11 +267,6 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             out.skip_smoke_check = true;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--keep-temp")) {
-            out.keep_temp = true;
-            continue;
-        }
-
         i += 1;
         if (i >= argv.len) return error.MissingValue;
         const value = argv[i];
@@ -304,10 +278,6 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
         if (std.mem.eql(u8, arg, "--scenario")) {
             const scenario = Scenario.parse(value) orelse return error.UnknownScenario;
             try scenarios.append(allocator, scenario);
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--st-binary")) {
-            out.st_binary = value;
             continue;
         }
         if (std.mem.eql(u8, arg, "--smoke-binary")) {
@@ -559,13 +529,7 @@ fn runSmokePreflight(allocator: std.mem.Allocator, ctx: Context) !SmokePreflight
 }
 
 fn executeScenario(allocator: std.mem.Allocator, ctx: Context, scenario: Scenario) !ScenarioResult {
-    const needs_temp = scenario != .overload_backoff;
-    const temp_root = if (needs_temp) try makeTempRoot(allocator, scenario.asString()) else "";
-
-    var result = switch (scenario) {
-        .claim_safe_wave => scenarioClaimSafeWave(allocator, ctx, temp_root),
-        .stale_claim_reclaim => scenarioStaleClaimReclaim(allocator, ctx, temp_root),
-        .mesh_row_accountability => scenarioMeshRowAccountability(allocator, ctx, temp_root),
+    const result = switch (scenario) {
         .overload_backoff => scenarioOverloadBackoff(allocator, ctx),
     } catch |err| ScenarioResult{
         .name = scenario.asString(),
@@ -574,232 +538,7 @@ fn executeScenario(allocator: std.mem.Allocator, ctx: Context, scenario: Scenari
         .detail = try std.fmt.allocPrint(allocator, "unexpected error: {s}", .{@errorName(err)}),
     };
 
-    if (needs_temp) {
-        if (ctx.keep_temp or !result.ok) {
-            result.temp_root = temp_root;
-        } else {
-            deleteTreeAbsolute(temp_root) catch {};
-            result.temp_root = "";
-        }
-    }
-
     return result;
-}
-
-fn scenarioClaimSafeWave(allocator: std.mem.Allocator, ctx: Context, temp_root: []const u8) !ScenarioResult {
-    const plan_path = try std.fs.path.join(allocator, &.{ temp_root, "st-plan.jsonl" });
-    const orchplan_path = try std.fs.path.join(allocator, &.{ temp_root, "claim-safe-wave.yaml" });
-    try writeTextFile(allocator, orchplan_path,
-        \\schema_version: 1
-        \\kind: OrchPlan
-        \\tasks:
-        \\  - id: cfg
-        \\    title: Update config loader
-        \\    agent: worker
-        \\    role: implementation
-        \\    scope: ["src/config/**"]
-        \\    location: ["src/config/index.ts"]
-        \\    validation: ["npm test -w config"]
-        \\  - id: ui
-        \\    title: Update settings UI
-        \\    agent: worker
-        \\    role: implementation
-        \\    scope: ["src/ui/**"]
-        \\    location: ["src/ui/Settings.tsx"]
-        \\    validation: ["npm test -w ui"]
-        \\waves:
-        \\  - id: w1
-        \\    tasks: [cfg, ui]
-    );
-
-    if (try runStExitNonZero(allocator, ctx, &.{ "import-orchplan", "--file", plan_path, "--input", orchplan_path, "--replace" })) |detail| {
-        return failedScenario(.claim_safe_wave, detail);
-    }
-    if (try runStExitNonZero(allocator, ctx, &.{ "claim", "--file", plan_path, "--executor", "teams", "--wave", "w1" })) |detail| {
-        return failedScenario(.claim_safe_wave, detail);
-    }
-    if (try runStExitNonZero(allocator, ctx, &.{ "set-runtime", "--file", plan_path, "--id", "cfg", "--substrate", "spawn_agent", "--thread-id", "thread-cfg" })) |detail| {
-        return failedScenario(.claim_safe_wave, detail);
-    }
-    if (try runStExitNonZero(allocator, ctx, &.{ "set-runtime", "--file", plan_path, "--id", "ui", "--substrate", "spawn_agent", "--thread-id", "thread-ui" })) |detail| {
-        return failedScenario(.claim_safe_wave, detail);
-    }
-
-    const show_capture = try runStShowAll(allocator, ctx, plan_path);
-    if (show_capture.exit_code != 0) return failedScenario(.claim_safe_wave, try commandSummary(allocator, show_capture));
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, show_capture.stdout, .{});
-    defer parsed.deinit();
-    const items = try itemsArray(parsed.value);
-    const cfg = findItemObject(items, "cfg") orelse return failedScenario(.claim_safe_wave, "missing cfg item after claim-safe wave run");
-    const ui = findItemObject(items, "ui") orelse return failedScenario(.claim_safe_wave, "missing ui item after claim-safe wave run");
-
-    const ok =
-        stringFieldEquals(cfg, "status", "in_progress") and
-        stringFieldEquals(ui, "status", "in_progress") and
-        stringFieldEquals(cfg, "claim_state", "held") and
-        stringFieldEquals(ui, "claim_state", "held") and
-        stringFieldEquals(cfg, "executor_state", "running") and
-        stringFieldEquals(ui, "executor_state", "running") and
-        stringFieldEquals(cfg, "source", "") == false and
-        boolField(cfg, "in_plan") == true and
-        boolField(ui, "in_plan") == true and
-        stringArrayContains(cfg, "lock_roots", "src/config") and
-        stringArrayContains(ui, "lock_roots", "src/ui");
-
-    if (!ok) {
-        return failedScenario(
-            .claim_safe_wave,
-            try std.fmt.allocPrint(allocator, "expected two disjoint held running claims, got in_progress={d}", .{countItemsWithStatus(items, "in_progress")}),
-        );
-    }
-
-    return .{
-        .name = Scenario.claim_safe_wave.asString(),
-        .mode = Scenario.claim_safe_wave.mode(),
-        .ok = true,
-        .detail = "two disjoint tasks reached in_progress under held claims",
-        .items_total = items.len,
-        .items_ok = 2,
-        .in_progress = countItemsWithStatus(items, "in_progress"),
-    };
-}
-
-fn scenarioStaleClaimReclaim(allocator: std.mem.Allocator, ctx: Context, temp_root: []const u8) !ScenarioResult {
-    const plan_path = try std.fs.path.join(allocator, &.{ temp_root, "st-plan.jsonl" });
-    const orchplan_path = try std.fs.path.join(allocator, &.{ temp_root, "stale-claim.yaml" });
-    try writeTextFile(allocator, orchplan_path,
-        \\schema_version: 1
-        \\kind: OrchPlan
-        \\tasks:
-        \\  - id: api
-        \\    title: Add health endpoint
-        \\    agent: worker
-        \\    role: implementation
-        \\    scope: ["src/api/**"]
-        \\    validation: ["npm test -w api"]
-        \\waves:
-        \\  - id: w1
-        \\    tasks: [api]
-    );
-
-    if (try runStExitNonZero(allocator, ctx, &.{ "import-orchplan", "--file", plan_path, "--input", orchplan_path, "--replace" })) |detail| {
-        return failedScenario(.stale_claim_reclaim, detail);
-    }
-    if (try runStExitNonZero(allocator, ctx, &.{ "claim", "--file", plan_path, "--executor", "teams", "--wave", "w1", "--lease-seconds", "60" })) |detail| {
-        return failedScenario(.stale_claim_reclaim, detail);
-    }
-    if (try runStExitNonZero(allocator, ctx, &.{ "set-runtime", "--file", plan_path, "--id", "api", "--substrate", "spawn_agent", "--thread-id", "thread-api" })) |detail| {
-        return failedScenario(.stale_claim_reclaim, detail);
-    }
-    if (try runStExitNonZero(allocator, ctx, &.{ "reclaim-stale", "--file", plan_path, "--now", "2099-01-01T00:00:00Z" })) |detail| {
-        return failedScenario(.stale_claim_reclaim, detail);
-    }
-
-    const show_capture = try runStShowAll(allocator, ctx, plan_path);
-    if (show_capture.exit_code != 0) return failedScenario(.stale_claim_reclaim, try commandSummary(allocator, show_capture));
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, show_capture.stdout, .{});
-    defer parsed.deinit();
-    const items = try itemsArray(parsed.value);
-    const api = findItemObject(items, "api") orelse return failedScenario(.stale_claim_reclaim, "missing api item after reclaim-stale run");
-
-    const ok =
-        stringFieldEquals(api, "status", "pending") and
-        stringFieldEquals(api, "claim_state", "stale") and
-        boolField(api, "claim_stale") == true and
-        stringFieldEquals(api, "executor_state", "stale") and
-        core_json.objectField(api, "runtime") == null;
-
-    if (!ok) return failedScenario(.stale_claim_reclaim, "reclaim-stale did not leave the claim stale and non-running");
-
-    return .{
-        .name = Scenario.stale_claim_reclaim.asString(),
-        .mode = Scenario.stale_claim_reclaim.mode(),
-        .ok = true,
-        .detail = "expired held claim was reclaimed and returned to pending",
-        .items_total = items.len,
-        .items_ok = 1,
-    };
-}
-
-fn scenarioMeshRowAccountability(allocator: std.mem.Allocator, ctx: Context, temp_root: []const u8) !ScenarioResult {
-    const plan_path = try std.fs.path.join(allocator, &.{ temp_root, "st-plan.jsonl" });
-    const orchplan_path = try std.fs.path.join(allocator, &.{ temp_root, "mesh-accountability.yaml" });
-    const results_path = try std.fs.path.join(allocator, &.{ temp_root, "mesh-results.csv" });
-    try writeTextFile(allocator, orchplan_path,
-        \\schema_version: 1
-        \\kind: OrchPlan
-        \\tasks:
-        \\  - id: api
-        \\    title: Add health endpoint
-        \\    agent: worker
-        \\    role: implementation
-        \\    scope: ["src/api/**"]
-        \\    validation: ["npm test -w api"]
-        \\  - id: docs
-        \\    title: Document health endpoint
-        \\    agent: worker
-        \\    role: implementation
-        \\    scope: ["docs/**"]
-        \\    validation: ["npm test -w docs"]
-        \\waves:
-        \\  - id: w1
-        \\    tasks: [api, docs]
-    );
-    try writeTextFile(allocator, results_path,
-        \\task_id,proof_status,proof_evidence,decision
-        \\api,pass,mesh-proof.txt,proof_complete
-    );
-
-    if (try runStExitNonZero(allocator, ctx, &.{ "import-orchplan", "--file", plan_path, "--input", orchplan_path, "--replace" })) |detail| {
-        return failedScenario(.mesh_row_accountability, detail);
-    }
-    if (try runStExitNonZero(allocator, ctx, &.{ "claim", "--file", plan_path, "--executor", "mesh", "--wave", "w1" })) |detail| {
-        return failedScenario(.mesh_row_accountability, detail);
-    }
-    if (try runStExitNonZero(allocator, ctx, &.{ "set-runtime", "--file", plan_path, "--id", "api", "--substrate", "spawn_agents_on_csv", "--row-id", "api" })) |detail| {
-        return failedScenario(.mesh_row_accountability, detail);
-    }
-    if (try runStExitNonZero(allocator, ctx, &.{ "set-runtime", "--file", plan_path, "--id", "docs", "--substrate", "spawn_agents_on_csv", "--row-id", "docs" })) |detail| {
-        return failedScenario(.mesh_row_accountability, detail);
-    }
-    if (try runStExitNonZero(allocator, ctx, &.{ "import-mesh-results", "--file", plan_path, "--input", results_path })) |detail| {
-        return failedScenario(.mesh_row_accountability, detail);
-    }
-
-    const show_capture = try runStShowAll(allocator, ctx, plan_path);
-    if (show_capture.exit_code != 0) return failedScenario(.mesh_row_accountability, try commandSummary(allocator, show_capture));
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, show_capture.stdout, .{});
-    defer parsed.deinit();
-    const items = try itemsArray(parsed.value);
-    const api = findItemObject(items, "api") orelse return failedScenario(.mesh_row_accountability, "missing api item after mesh reconciliation");
-    const docs = findItemObject(items, "docs") orelse return failedScenario(.mesh_row_accountability, "missing docs item after mesh reconciliation");
-
-    const ok =
-        stringFieldEquals(api, "status", "completed") and
-        stringFieldEquals(api, "claim_state", "released") and
-        stringFieldEquals(api, "executor_state", "released") and
-        stringFieldEquals(core_json.objectField(api, "proof").?, "state", "pass") and
-        stringFieldEquals(docs, "status", "in_progress") and
-        stringFieldEquals(docs, "claim_state", "held") and
-        stringFieldEquals(docs, "executor_state", "running");
-
-    if (!ok) {
-        return failedScenario(.mesh_row_accountability, "mesh reconciliation did not preserve outstanding missing rows");
-    }
-
-    return .{
-        .name = Scenario.mesh_row_accountability.asString(),
-        .mode = Scenario.mesh_row_accountability.mode(),
-        .ok = true,
-        .detail = "one mesh row reconciled and one missing row stayed non-terminal",
-        .items_total = items.len,
-        .items_ok = 1,
-        .in_progress = countItemsWithStatus(items, "in_progress"),
-        .missing_rows = 1,
-    };
 }
 
 fn scenarioOverloadBackoff(allocator: std.mem.Allocator, ctx: Context) !ScenarioResult {
@@ -864,23 +603,6 @@ fn scenarioOverloadBackoff(allocator: std.mem.Allocator, ctx: Context) !Scenario
     };
 }
 
-fn runStExitNonZero(allocator: std.mem.Allocator, ctx: Context, args: []const []const u8) !?[]const u8 {
-    const capture = try runStCommand(allocator, ctx, args);
-    if (capture.exit_code == 0) return null;
-    return try commandSummary(allocator, capture);
-}
-
-fn runStShowAll(allocator: std.mem.Allocator, ctx: Context, plan_path: []const u8) !CommandCapture {
-    return runStCommand(allocator, ctx, &.{ "show", "--file", plan_path, "--surface", "all", "--format", "json" });
-}
-
-fn runStCommand(allocator: std.mem.Allocator, ctx: Context, args: []const []const u8) !CommandCapture {
-    var argv: std.ArrayList([]const u8) = .empty;
-    try argv.append(allocator, ctx.st_binary);
-    try argv.appendSlice(allocator, args);
-    return runCommandCapture(allocator, null, argv.items);
-}
-
 fn commandSummary(allocator: std.mem.Allocator, capture: CommandCapture) ![]const u8 {
     const stdout_trimmed = std.mem.trim(u8, capture.stdout, " \t\r\n");
     const stderr_trimmed = std.mem.trim(u8, capture.stderr, " \t\r\n");
@@ -909,63 +631,12 @@ fn failedScenario(scenario: Scenario, detail: []const u8) ScenarioResult {
     };
 }
 
-fn itemsArray(root_value: std.json.Value) ![]const std.json.Value {
-    const root_obj = switch (root_value) {
-        .object => |obj| obj,
-        else => return error.InvalidShowOutput,
-    };
-    const items_val = root_obj.get("items") orelse return error.InvalidShowOutput;
-    return switch (items_val) {
-        .array => |arr| arr.items,
-        else => error.InvalidShowOutput,
-    };
-}
-
-fn findItemObject(items: []const std.json.Value, id: []const u8) ?core_json.ObjectMap {
-    for (items) |item| {
-        if (item != .object) continue;
-        if (core_json.stringField(item.object, "id")) |item_id| {
-            if (std.mem.eql(u8, item_id, id)) return item.object;
-        }
-    }
-    return null;
-}
-
 fn boolField(obj: core_json.ObjectMap, key: []const u8) ?bool {
     const value = obj.get(key) orelse return null;
     return switch (value) {
         .bool => |flag| flag,
         else => null,
     };
-}
-
-fn stringFieldEquals(obj: core_json.ObjectMap, key: []const u8, expected: []const u8) bool {
-    const value = core_json.stringField(obj, key) orelse return false;
-    return std.mem.eql(u8, value, expected);
-}
-
-fn stringArrayContains(obj: core_json.ObjectMap, key: []const u8, expected: []const u8) bool {
-    const value = obj.get(key) orelse return false;
-    const arr = switch (value) {
-        .array => |list| list.items,
-        else => return false,
-    };
-    for (arr) |entry| {
-        if (entry != .string) continue;
-        if (std.mem.eql(u8, entry.string, expected)) return true;
-    }
-    return false;
-}
-
-fn countItemsWithStatus(items: []const std.json.Value, status: []const u8) usize {
-    var count: usize = 0;
-    for (items) |item| {
-        if (item != .object) continue;
-        if (core_json.stringField(item.object, "status")) |item_status| {
-            if (std.mem.eql(u8, item_status, status)) count += 1;
-        }
-    }
-    return count;
 }
 
 fn computeBackoffDelayMs(base_ms: u32, retry_index: u32) u32 {
@@ -1042,48 +713,14 @@ fn deleteTreeAbsolute(path: []const u8) !void {
     try dir.deleteTree(std.Io.Threaded.global_single_threaded.io(), base);
 }
 
-fn writeTextFile(allocator: std.mem.Allocator, path: []const u8, text: []const u8) !void {
-    try ensureParentPath(path);
-    if (std.fs.path.isAbsolute(path)) {
-        var file = try std.Io.Dir.createFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{ .truncate = true });
-        defer file.close(std.Io.Threaded.global_single_threaded.io());
-        try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), text);
-        return;
-    }
-
-    var file = try std.Io.Dir.cwd().createFile(std.Io.Threaded.global_single_threaded.io(), path, .{ .truncate = true });
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
-    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), text);
-    _ = allocator;
-}
-
-fn ensureParentPath(path: []const u8) !void {
-    const parent = std.fs.path.dirname(path) orelse return;
-    if (parent.len == 0 or std.mem.eql(u8, parent, ".")) return;
-
-    if (std.fs.path.isAbsolute(parent)) {
-        const rel = std.mem.trim(u8, parent, "/");
-        if (rel.len == 0) return;
-        var root = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), "/", .{});
-        defer root.close(std.Io.Threaded.global_single_threaded.io());
-        try root.createDirPath(std.Io.Threaded.global_single_threaded.io(), rel);
-        return;
-    }
-
-    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), parent);
-}
-
 test "parseArgs accepts scenarios and retry knobs" {
     const argv = [_][]const u8{
         "cas_conformance_suite",
         "--cwd",
         "/tmp/repo",
         "--scenario",
-        "claim_safe_wave",
-        "--scenario",
         "overload_backoff",
         "--skip-smoke-check",
-        "--keep-temp",
         "--backoff-base-ms",
         "500",
         "--max-retries",
@@ -1100,11 +737,9 @@ test "parseArgs accepts scenarios and retry knobs" {
     defer std.testing.allocator.free(parsed.overload_script);
 
     try std.testing.expectEqualStrings("/tmp/repo", parsed.cwd.?);
-    try std.testing.expectEqual(@as(usize, 2), parsed.scenarios.len);
-    try std.testing.expectEqual(Scenario.claim_safe_wave, parsed.scenarios[0]);
-    try std.testing.expectEqual(Scenario.overload_backoff, parsed.scenarios[1]);
+    try std.testing.expectEqual(@as(usize, 1), parsed.scenarios.len);
+    try std.testing.expectEqual(Scenario.overload_backoff, parsed.scenarios[0]);
     try std.testing.expect(parsed.skip_smoke_check);
-    try std.testing.expect(parsed.keep_temp);
     try std.testing.expect(parsed.json);
     try std.testing.expectEqual(cas_hooks.HookPolicy.off, parsed.hook_policy);
     try std.testing.expectEqual(@as(u32, 500), parsed.backoff_base_ms);

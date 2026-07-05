@@ -1,3 +1,0 @@
-{"v":3,"ts":"2026-06-03T00:00:00Z","seq":0,"lane":"event","op":"init"}
-{"v":3,"ts":"2026-06-03T00:00:00Z","seq":1,"lane":"event","op":"replace","items":[{"id":"st-001","step":"Legacy v3 item","status":"pending","priority":"medium","in_plan":true,"deps":[],"notes":"","comments":[]}]}
-{"v":3,"ts":"2026-06-03T00:00:00Z","seq":1,"lane":"checkpoint","items":[{"id":"st-001","step":"Legacy v3 item","status":"pending","priority":"medium","in_plan":true,"deps":[],"notes":"","comments":[]}]}

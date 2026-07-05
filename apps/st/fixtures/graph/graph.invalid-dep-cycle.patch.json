@@ -1,9 +1,0 @@
-{
-  "version": 1,
-  "author": "codex",
-  "reason": "Invalid dependency cycle fixture",
-  "ops": [
-    {"op": "upsert-item", "item": {"id": "st-001", "step": "Cycle A", "deps": [{"id": "st-002", "type": "requires"}]}},
-    {"op": "upsert-item", "item": {"id": "st-002", "step": "Cycle B", "deps": [{"id": "st-001", "type": "requires"}]}}
-  ]
-}

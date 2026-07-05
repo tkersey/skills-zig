@@ -5,7 +5,6 @@ const core_perf = @import("core_perf");
 const cron_cli = @import("cron_cli");
 const perf_contract = @import("perf_contract");
 const seq_cli = @import("seq_perf_cli");
-const st_cli = @import("st_cli");
 
 const Version = "0.0.0-dev";
 const HelpSurface = core_cli.HelpSurface{
@@ -77,9 +76,6 @@ const CompatSetup = enum {
     learnings_quality,
     append_learning_help,
     append_learning_append,
-    st_help,
-    st_add_show,
-    st_emit_export,
 };
 
 const CompatCase = struct {
@@ -145,18 +141,6 @@ const DeepSetup = enum {
     cron_run_now,
     cron_delete,
     cron_run_due,
-    st_init,
-    st_set_status,
-    st_set_priority,
-    st_set_deps,
-    st_set_notes,
-    st_add_comment,
-    st_remove,
-    st_ready,
-    st_blocked,
-    st_doctor,
-    st_prime,
-    st_import_plan,
 };
 
 const DeepCase = struct {
@@ -235,26 +219,6 @@ const CronCases = [_]perf_contract.CaseDescriptor{
 
 const CronCoverages = buildCronCoverages();
 
-const StCases = [_]perf_contract.CaseDescriptor{
-    .{ .case_id = "st-help", .binary = "st", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "st-add-show", .binary = "st", .family = "add", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "st-emit-export", .binary = "st", .family = "export", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
-    .{ .case_id = "st-init-deep", .binary = "st", .family = "init", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "st-set-status-deep", .binary = "st", .family = "set-status", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "st-set-priority-deep", .binary = "st", .family = "set-priority", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "st-set-deps-deep", .binary = "st", .family = "set-deps", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "st-set-notes-deep", .binary = "st", .family = "set-notes", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "st-add-comment-deep", .binary = "st", .family = "add-comment", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "st-remove-deep", .binary = "st", .family = "remove", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "st-ready-deep", .binary = "st", .family = "ready", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "st-blocked-deep", .binary = "st", .family = "blocked", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "st-doctor-deep", .binary = "st", .family = "doctor", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "st-prime-deep", .binary = "st", .family = "prime", .case_kind = .driver, .measurement_mode = .latency_alloc },
-    .{ .case_id = "st-import-plan-deep", .binary = "st", .family = "import-plan", .case_kind = .driver, .measurement_mode = .latency_alloc },
-};
-
-const StCoverages = buildStCoverages();
-
 const MiscCases = [_]perf_contract.CaseDescriptor{
     .{ .case_id = "bench-stats-help", .binary = "bench_stats", .family = "help", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
     .{ .case_id = "bench-stats-parse", .binary = "bench_stats", .family = "parse", .case_kind = .subprocess, .measurement_mode = .latency_only, .compat_case = true },
@@ -305,9 +269,6 @@ const CompatCases = [_]CompatCase{
     .{ .descriptor = MiscCases[16], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/learnings", .setup = .learnings_quality, .tolerance_pct = 25.0 },
     .{ .descriptor = MiscCases[17], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/append_learning", .setup = .append_learning_help },
     .{ .descriptor = MiscCases[18], .builder = .root, .build_step = "build-learnings", .binary_path = "zig-out/bin/append_learning", .setup = .append_learning_append, .tolerance_pct = 100.0 },
-    .{ .descriptor = StCases[0], .builder = .root, .build_step = "build-st", .binary_path = "zig-out/bin/st", .setup = .st_help, .tolerance_pct = 25.0 },
-    .{ .descriptor = StCases[1], .builder = .root, .build_step = "build-st", .binary_path = "zig-out/bin/st", .setup = .st_add_show, .tolerance_pct = 20.0 },
-    .{ .descriptor = StCases[2], .builder = .root, .build_step = "build-st", .binary_path = "zig-out/bin/st", .setup = .st_emit_export, .tolerance_pct = 300.0 },
 };
 
 const DeepCases = [_]DeepCase{
@@ -362,18 +323,6 @@ const DeepCases = [_]DeepCase{
     .{ .descriptor = CronCases[7], .setup = .cron_run_now, .tolerance_pct = 70.0 },
     .{ .descriptor = CronCases[8], .setup = .cron_delete, .tolerance_pct = 60.0 },
     .{ .descriptor = CronCases[9], .setup = .cron_run_due, .tolerance_pct = 125.0 },
-    .{ .descriptor = StCases[3], .setup = .st_init, .tolerance_pct = 300.0 },
-    .{ .descriptor = StCases[4], .setup = .st_set_status, .tolerance_pct = 300.0 },
-    .{ .descriptor = StCases[5], .setup = .st_set_priority, .tolerance_pct = 300.0 },
-    .{ .descriptor = StCases[6], .setup = .st_set_deps, .tolerance_pct = 300.0 },
-    .{ .descriptor = StCases[7], .setup = .st_set_notes, .tolerance_pct = 300.0 },
-    .{ .descriptor = StCases[8], .setup = .st_add_comment, .tolerance_pct = 300.0 },
-    .{ .descriptor = StCases[9], .setup = .st_remove, .tolerance_pct = 250.0 },
-    .{ .descriptor = StCases[10], .setup = .st_ready, .tolerance_pct = 300.0 },
-    .{ .descriptor = StCases[11], .setup = .st_blocked, .tolerance_pct = 300.0 },
-    .{ .descriptor = StCases[12], .setup = .st_doctor, .tolerance_pct = 300.0 },
-    .{ .descriptor = StCases[13], .setup = .st_prime, .tolerance_pct = 300.0 },
-    .{ .descriptor = StCases[14], .setup = .st_import_plan, .tolerance_pct = 300.0 },
 };
 
 fn buildSeqCoverages() [seq_cli.commandNames().len]perf_contract.CommandCoverage {
@@ -449,26 +398,10 @@ fn buildCronCoverages() [cron_cli.commandDefinitions().len]perf_contract.Command
     return out;
 }
 
-fn buildStCoverages() [st_cli.commandDefs().len]perf_contract.CommandCoverage {
-    var out: [st_cli.commandDefs().len]perf_contract.CommandCoverage = undefined;
-    for (st_cli.commandDefs(), 0..) |def, idx| {
-        const coverage, const reason = if (std.mem.eql(u8, def.name, "add") or
-            std.mem.eql(u8, def.name, "show") or
-            std.mem.eql(u8, def.name, "emit-plan-sync") or
-            std.mem.eql(u8, def.name, "export"))
-            .{ perf_contract.CoverageKind.shallow, "compat subprocess case exists" }
-        else
-            .{ perf_contract.CoverageKind.deep, "native deep case landed" };
-        out[idx] = .{ .family = def.name, .coverage = coverage, .reason = reason };
-    }
-    return out;
-}
-
 fn allManifests() []const perf_contract.BinaryManifest {
     return &.{
         .{ .binary = "seq", .coverages = &SeqCoverages, .datasets = &SeqDatasets, .cases = &SeqCases },
         .{ .binary = "cron", .coverages = &CronCoverages, .cases = &CronCases },
-        .{ .binary = "st", .coverages = &StCoverages, .cases = &StCases },
         .{ .binary = "misc", .coverages = &MiscCoverages, .cases = &MiscCases },
     };
 }
@@ -1135,18 +1068,6 @@ fn executeDeepCase(allocator: std.mem.Allocator, setup: DeepSetup, temp_root: []
         .cron_run_now => try cron_cli.runPerfCase(allocator, .run_now, temp_root),
         .cron_delete => try cron_cli.runPerfCase(allocator, .delete, temp_root),
         .cron_run_due => try cron_cli.runPerfCase(allocator, .run_due, temp_root),
-        .st_init => _ = try st_cli.runPerfCase(allocator, .init, temp_root),
-        .st_set_status => _ = try st_cli.runPerfCase(allocator, .set_status, temp_root),
-        .st_set_priority => _ = try st_cli.runPerfCase(allocator, .set_priority, temp_root),
-        .st_set_deps => _ = try st_cli.runPerfCase(allocator, .set_deps, temp_root),
-        .st_set_notes => _ = try st_cli.runPerfCase(allocator, .set_notes, temp_root),
-        .st_add_comment => _ = try st_cli.runPerfCase(allocator, .add_comment, temp_root),
-        .st_remove => _ = try st_cli.runPerfCase(allocator, .remove, temp_root),
-        .st_ready => _ = try st_cli.runPerfCase(allocator, .ready, temp_root),
-        .st_blocked => _ = try st_cli.runPerfCase(allocator, .blocked, temp_root),
-        .st_doctor => _ = try st_cli.runPerfCase(allocator, .doctor, temp_root),
-        .st_prime => _ = try st_cli.runPerfCase(allocator, .prime, temp_root),
-        .st_import_plan => _ = try st_cli.runPerfCase(allocator, .import_plan, temp_root),
     }
 }
 
@@ -1285,7 +1206,7 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
 
     switch (case_cfg.setup) {
         .seq_help => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
-        .bench_stats_help, .perf_report_help, .cas_smoke_check_help, .cas_instance_runner_help, .cas_review_session_help, .cron_help, .learnings_help, .st_help => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
+        .bench_stats_help, .perf_report_help, .cas_smoke_check_help, .cas_instance_runner_help, .cas_review_session_help, .cron_help, .learnings_help => try args.appendSlice(allocator, &.{ binary_path, "--help" }),
         .cas_review_session_version => try args.appendSlice(allocator, &.{ binary_path, "--version" }),
         .bench_stats_parse => {
             const input_path = try std.fs.path.join(allocator, &.{ ".", "apps/lift/perf/fixtures/bench_stats_input.txt" });
@@ -1324,33 +1245,6 @@ fn renderCompatRun(allocator: std.mem.Allocator, case_cfg: CompatCase, temp_root
             const fixture_path = try std.fs.path.join(allocator, &.{ temp_root, "learnings.jsonl" });
             try std.Io.Dir.copyFileAbsolute("apps/learnings/perf/fixtures/learnings.jsonl", fixture_path, std.Io.Threaded.global_single_threaded.io(), .{});
             try args.appendSlice(allocator, &.{ binary_path, "--path", fixture_path, "--status", "do_more", "--learning", "When running local perf comparisons, prefer machine-scoped baselines to avoid cross-host noise.", "--evidence", "Local compare uses one machine and one baseline directory.", "--application", "Use .perf-local baselines before refactors to avoid cross-host drift.", "--tag", "perf" });
-        },
-        .st_add_show => {
-            const plan_path = try std.fs.path.join(allocator, &.{ temp_root, "st-plan.jsonl" });
-            {
-                var prep = std.ArrayList([]const u8).empty;
-                defer prep.deinit(allocator);
-                try prep.appendSlice(allocator, &.{ binary_path, "init", "--file", plan_path });
-                const prep_result = try runChildCapture(allocator, ".", prep.items);
-                defer allocator.free(prep_result.stdout);
-                defer allocator.free(prep_result.stderr);
-                if (prep_result.exit_code != 0) return error.CaseFailed;
-            }
-            try args.appendSlice(allocator, &.{ binary_path, "add", "--file", plan_path, "--id", "st-001", "--step", "Reproduce issue", "--priority", "high" });
-        },
-        .st_emit_export => {
-            const plan_path = try std.fs.path.join(allocator, &.{ temp_root, "st-plan.jsonl" });
-            const export_path = try std.fs.path.join(allocator, &.{ temp_root, "snapshot.json" });
-            for (&[_][]const []const u8{
-                &.{ binary_path, "init", "--file", plan_path },
-                &.{ binary_path, "add", "--file", plan_path, "--id", "st-001", "--step", "Reproduce issue", "--priority", "high" },
-            }) |prep_argv| {
-                const prep_result = try runChildCapture(allocator, ".", prep_argv);
-                defer allocator.free(prep_result.stdout);
-                defer allocator.free(prep_result.stderr);
-                if (prep_result.exit_code != 0) return error.CaseFailed;
-            }
-            try args.appendSlice(allocator, &.{ binary_path, "export", "--file", plan_path, "--output", export_path });
         },
         else => return error.InvalidCommand,
     }
@@ -1710,7 +1604,6 @@ fn currentMachineDirName(allocator: std.mem.Allocator) ![]u8 {
 fn inferBinary(case_id: []const u8) []const u8 {
     if (std.mem.startsWith(u8, case_id, "seq-")) return "seq";
     if (std.mem.startsWith(u8, case_id, "cron-")) return "cron";
-    if (std.mem.startsWith(u8, case_id, "st-")) return "st";
     if (std.mem.startsWith(u8, case_id, "learnings-")) return "learnings";
     if (std.mem.startsWith(u8, case_id, "append-learning-")) return "append_learning";
     if (std.mem.startsWith(u8, case_id, "bench-stats")) return "bench_stats";
@@ -1852,7 +1745,6 @@ fn writeCutoverStatus(allocator: std.mem.Allocator, path: []const u8, rows: std.
     const seq_surface_integrated = seq_has_artifact_search and seq_has_memory_blocks;
 
     const cron_status = coverageStatusFor("cron");
-    const st_status = coverageStatusFor("st");
 
     var residuals = std.ArrayList([]const u8).empty;
     defer {
@@ -1876,12 +1768,11 @@ fn writeCutoverStatus(allocator: std.mem.Allocator, path: []const u8, rows: std.
     defer writer_alloc.deinit();
     const writer = &writer_alloc.writer;
     try writer.print(
-        "{{\"native_public_ownership\":true,\"preserved_matrix_parity\":{s},\"seq_surface_integrated\":{s},\"cron_deep_driver_status\":\"{s}\",\"st_deep_driver_status\":\"{s}\",\"wave_b_residuals\":[",
+        "{{\"native_public_ownership\":true,\"preserved_matrix_parity\":{s},\"seq_surface_integrated\":{s},\"cron_deep_driver_status\":\"{s}\",\"wave_b_residuals\":[",
         .{
             if (preserved_matrix_parity) "true" else "false",
             if (seq_surface_integrated) "true" else "false",
             cron_status,
-            st_status,
         },
     );
     for (residuals.items, 0..) |item, idx| {
@@ -1986,7 +1877,6 @@ test "inferBinary maps lift driver case to bench_stats" {
 test "coverageStatusFor reflects current manifest coverage" {
     try std.testing.expectEqualStrings("partial", coverageStatusFor("seq"));
     try std.testing.expectEqualStrings("landed", coverageStatusFor("cron"));
-    try std.testing.expectEqualStrings("landed", coverageStatusFor("st"));
 }
 
 test "compareLatencyMetrics fails closed for latency_alloc legacy baselines" {

@@ -8,7 +8,6 @@ This monorepo uses independent GitHub Actions release workflows per CLI:
 - `cron`: `.github/workflows/release-cron.yml` on tag `cron-v*`
 - `ledger`: `.github/workflows/release-ledger.yml` on tag `ledger-v*`
 - `memory-note`: `.github/workflows/release-memory-note.yml` on tag `memory-note-v*`
-- `st`: `.github/workflows/release-st.yml` on tag `st-v*`
 
 Per-app VERSION files:
 
@@ -18,7 +17,6 @@ Per-app VERSION files:
 - `apps/cron/VERSION`
 - `apps/ledger/VERSION`
 - `apps/memory-note/VERSION`
-- `apps/st/VERSION`
 
 Release contract:
 
@@ -27,9 +25,9 @@ Release contract:
    - `apps/<cli>/**` except the per-app `README.md` counts for that CLI.
    - broad shared shipped surfaces (`build.zig`, `build.zig.zon`, `libs/core/**`) count for every shipped CLI.
    - `apps/learnings/**` and `apps/synesthesia/**` count for `ledger`; they are internal source modules, not shipped CLIs.
-   - `libs/durable_store/**` counts for its shipped consumers: `ledger` and `st`.
+   - `libs/durable_store/**` counts for its shipped consumers: `ledger` and `memory-note`.
    - `.github/workflows/release-<cli>.yml` counts for that CLI's packaged artifact contract.
-   Durable-store changes that alter lease locks, fencing counters, CAS writes, transaction recovery, or semantic concurrency errors must be treated as release-relevant for every shipped consumer whose command behavior depends on those paths. For `st`, that includes workspace mutation and exit code `2` conflict/recovery states.
+   Durable-store changes that alter lease locks, fencing counters, CAS writes, transaction recovery, or semantic concurrency errors must be treated as release-relevant for every shipped consumer whose command behavior depends on those paths.
 3. When those `VERSION` bumps land on `main`, `.github/workflows/auto-release.yml` creates any missing tags and dispatches the matching release workflows automatically.
 4. Do not treat a local `./zig-out/bin` binary as release closure for a shipped CLI. Closure requires a tagged release, tap formula update, Homebrew audit/test proof, and installed binary version proof.
 
@@ -41,7 +39,6 @@ Release tags must match file versions:
 - `cron-v<version>` where `<version>` equals `apps/cron/VERSION`
 - `ledger-v<version>` where `<version>` equals `apps/ledger/VERSION`
 - `memory-note-v<version>` where `<version>` equals `apps/memory-note/VERSION`
-- `st-v<version>` where `<version>` equals `apps/st/VERSION`
 
 Each workflow builds only binaries from its own CLI path and publishes two release archives:
 
@@ -62,8 +59,6 @@ Examples:
 - `ledger-v1.2.3-darwin-arm64.tar.gz`
 - `memory-note-v1.2.3-linux-x86_64.tar.gz`
 - `memory-note-v1.2.3-darwin-arm64.tar.gz`
-- `st-v1.2.3-linux-x86_64.tar.gz`
-- `st-v1.2.3-darwin-arm64.tar.gz`
 
 ## Homebrew Tap Handoff
 

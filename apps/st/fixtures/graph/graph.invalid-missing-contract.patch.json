@@ -1,9 +1,0 @@
-{
-  "version": 1,
-  "author": "codex",
-  "reason": "Invalid missing contract fixture",
-  "ops": [
-    {"op": "upsert-intent", "intent": {"id": "intent-001", "text": "Missing contract must fail.", "category": "requirement", "disposition": "covered"}},
-    {"op": "upsert-item", "item": {"id": "st-001", "step": "Missing contract", "item_type": "feature", "intent_refs": ["intent-001"], "acceptance": ["done"], "validation": ["zig build test-st"]}}
-  ]
-}

@@ -1,9 +1,0 @@
-{
-  "version": 1,
-  "author": "codex",
-  "reason": "Valid waiver fixture",
-  "ops": [
-    {"op": "upsert-intent", "intent": {"id": "intent-001", "text": "Waived intent.", "category": "requirement", "disposition": "deferred", "reason": "Out of scope for fixture"}},
-    {"op": "waive-audit", "waiver": {"id": "waiver-001", "gate": "implementation-ready", "code": "intent-not-covered-or-waived", "target": "intent-001", "reason": "Deferred fixture intent.", "expires": "never", "created_by": "codex"}}
-  ]
-}

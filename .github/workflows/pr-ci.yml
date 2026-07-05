@@ -14,7 +14,6 @@ on:
       - "apps/synesthesia/**"
       - "apps/ledger/**"
       - "apps/memory-note/**"
-      - "apps/st/**"
       - "libs/core/**"
       - "libs/durable_store/**"
       - ".github/scripts/**"
@@ -37,7 +36,6 @@ jobs:
       cron: ${{ steps.filter.outputs.cron }}
       ledger: ${{ steps.filter.outputs.ledger }}
       memory_note: ${{ steps.filter.outputs.memory_note }}
-      st: ${{ steps.filter.outputs.st }}
       core: ${{ steps.filter.outputs.core }}
     steps:
       - uses: actions/checkout@v4
@@ -59,8 +57,6 @@ jobs:
               - "apps/synesthesia/**"
             memory_note:
               - "apps/memory-note/**"
-            st:
-              - "apps/st/**"
             core:
               - "build.zig"
               - "build.zig.zon"
@@ -86,7 +82,7 @@ jobs:
       - name: Root build rejects custom install prefix
         run: |
           set -euo pipefail
-          if zig build build-st -Doptimize=ReleaseFast --prefix "${RUNNER_TEMP}/skills-zig-prefix"; then
+          if zig build build-seq -Doptimize=ReleaseFast --prefix "${RUNNER_TEMP}/skills-zig-prefix"; then
             echo "expected root build to reject a custom install prefix" >&2
             exit 1
           fi
@@ -269,17 +265,3 @@ jobs:
         run: zig build build-memory-note -Doptimize=ReleaseFast
       - name: Test memory-note
         run: zig build test-memory-note
-
-  st:
-    needs: changes
-    if: needs.changes.outputs.st == 'true' || needs.changes.outputs.core == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
-      - name: Build st
-        run: zig build build-st -Doptimize=ReleaseFast
-      - name: Test st
-        run: zig build test-st

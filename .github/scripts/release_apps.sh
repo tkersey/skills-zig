@@ -17,7 +17,6 @@ apps=(
   cron
   ledger
   memory-note
-  st
 )
 
 resolve_ref() {
@@ -50,7 +49,6 @@ case "$mode" in
     mark_durable_store_consumers() {
       mark_app ledger
       mark_app memory-note
-      mark_app st
     }
 
     mark_retrace_core_consumers() {
@@ -60,7 +58,6 @@ case "$mode" in
 
     mark_execution_policy_core_consumers() {
       mark_app seq
-      mark_app st
     }
 
     mark_build_zig() {
@@ -78,6 +75,9 @@ case "$mode" in
             ;;
         esac
         case "$raw" in
+          *"apps/st"*|*"st_meta"*|*"st_root"*|*"st_install"*|*"st_cli"*|*"run_st_tests"*|*"\"st\""*|*"build-st"*|*"test-st"*|*"run-st"*)
+            return 0
+            ;;
           *".target = target,"*|*".optimize = optimize,"*|*".imports = &.{"*|*".build_deps = &.{"*|*".test_deps = &.{"*|*".{ .name = \"core_"*|*".link_libc = true"*)
             return 0
             ;;
@@ -92,6 +92,10 @@ case "$mode" in
         local raw="$1"
         local app token
         case "$raw" in
+          *"const st_"*"= b.createModule"*|*"const st_root = b.createModule"*|*"apps/st"*)
+            current_app="__retired_st"
+            return
+            ;;
           *"const learnings_"*"= b.createModule"*|*"const learnings_root = b.createModule"*|*"const append_learning_root = b.createModule"*|*"apps/learnings/"*)
             current_app="ledger"
             return
@@ -136,21 +140,12 @@ case "$mode" in
 
         for app in "${apps[@]}"; do
           token="${app//-/_}"
-          if [[ "$app" == "st" ]]; then
-            case "$raw" in
-              *"apps/st/"*|*"st_root"*|*"st_install"*|*"\"st\""*|*"build-st"*|*"test-st"*|*"run-st"*)
-                mark_app "$app"
-                matched=1
-                ;;
-            esac
-          else
-            case "$raw" in
-              *"apps/$app/"*|*"apps/$app\""*|*"${token}_"*|*"\"$app\""*|*"build-$app"*|*"test-$app"*|*"run-$app"*)
-                mark_app "$app"
-                matched=1
-                ;;
-            esac
-          fi
+          case "$raw" in
+            *"apps/$app/"*|*"apps/$app\""*|*"${token}_"*|*"\"$app\""*|*"build-$app"*|*"test-$app"*|*"run-$app"*)
+              mark_app "$app"
+              matched=1
+              ;;
+          esac
         done
 
         case "$raw" in
@@ -163,6 +158,10 @@ case "$mode" in
             matched=1
             ;;
         esac
+
+        if [[ "$current_app" == "__retired_st" ]]; then
+          matched=1
+        fi
 
         if [[ "$matched" -eq 0 ]]; then
           case "$raw" in
@@ -240,10 +239,7 @@ case "$mode" in
         .github/workflows/release-memory-note.yml)
           mark_app memory-note
           ;;
-        .github/workflows/release-st.yml)
-          mark_app st
-          ;;
-        apps/seq/README.md|apps/lift/README.md|apps/cas/README.md|apps/cron/README.md|apps/learnings/README.md|apps/ledger/README.md|apps/memory-note/README.md|apps/st/README.md)
+        apps/seq/README.md|apps/lift/README.md|apps/cas/README.md|apps/cron/README.md|apps/learnings/README.md|apps/ledger/README.md|apps/memory-note/README.md)
           ;;
         apps/seq/*)
           mark_app seq
@@ -268,9 +264,6 @@ case "$mode" in
           ;;
         apps/memory-note/*)
           mark_app memory-note
-          ;;
-        apps/st/*)
-          mark_app st
           ;;
       esac
     done < <(git diff --name-only "$base" "$head")

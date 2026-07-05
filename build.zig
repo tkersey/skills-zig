@@ -81,7 +81,6 @@ pub fn build(b: *std.Build) void {
     const cron_meta = addVersionModule(b, @embedFile("apps/cron/VERSION"));
     const ledger_meta = addVersionModule(b, @embedFile("apps/ledger/VERSION"));
     const memory_note_meta = addVersionModule(b, @embedFile("apps/memory-note/VERSION"));
-    const st_meta = addVersionModule(b, @embedFile("apps/st/VERSION"));
 
     const seq_root = b.createModule(.{
         .root_source_file = b.path("apps/seq/src/main.zig"),
@@ -327,17 +326,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = memory_note_meta },
         },
     });
-    const st_root = b.createModule(.{
-        .root_source_file = b.path("apps/st/scripts/st.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "core_cli", .module = core_cli },
-            .{ .name = "durable_store", .module = durable_store },
-            .{ .name = "execution_policy_core", .module = execution_policy_core },
-            .{ .name = "app_meta", .module = st_meta },
-        },
-    });
     const perf_hub_root = b.createModule(.{
         .root_source_file = b.path("tools/perf_hub.zig"),
         .target = target,
@@ -348,7 +336,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "perf_contract", .module = core_perf_contract },
             .{ .name = "seq_perf_cli", .module = seq_perf_cli },
             .{ .name = "cron_cli", .module = cron_root },
-            .{ .name = "st_cli", .module = st_root },
         },
     });
 
@@ -376,7 +363,6 @@ pub fn build(b: *std.Build) void {
     cron.root_module.linkSystemLibrary("sqlite3", .{});
     const ledger = addExecutable(b, "ledger", ledger_root);
     const memory_note = addExecutable(b, "memory-note", memory_note_root);
-    const st = addExecutable(b, "st", st_root);
     const perf_hub = addExecutable(b, "perf_hub", perf_hub_root);
 
     const seq_install = addInstallStep(b, seq);
@@ -396,7 +382,6 @@ pub fn build(b: *std.Build) void {
     const cron_install = addInstallStep(b, cron);
     const ledger_install = addInstallStep(b, ledger);
     const memory_note_install = addInstallStep(b, memory_note);
-    const st_install = addInstallStep(b, st);
     const perf_hub_install = addInstallStep(b, perf_hub);
 
     const install_all = b.getInstallStep();
@@ -417,7 +402,6 @@ pub fn build(b: *std.Build) void {
     install_all.dependOn(&cron_install.step);
     install_all.dependOn(&ledger_install.step);
     install_all.dependOn(&memory_note_install.step);
-    install_all.dependOn(&st_install.step);
     install_all.dependOn(&perf_hub_install.step);
 
     const run_seq_tests = addTestStepWithOptions(
@@ -578,12 +562,6 @@ pub fn build(b: *std.Build) void {
         "test-memory-note",
         "Run memory-note tests",
     );
-    const run_st_tests = addTestStep(
-        b,
-        st_root,
-        "test-st",
-        "Run st tests",
-    );
     const run_perf_hub_tests = addTestStep(
         b,
         perf_hub_root,
@@ -660,13 +638,6 @@ pub fn build(b: *std.Build) void {
             .build_deps = &.{&memory_note_install.step},
             .test_deps = &.{&run_memory_note_tests.step},
         },
-        .{
-            .path = b.path("apps/st"),
-            .build_step_name = "build-st",
-            .build_description = "Build st binary",
-            .build_deps = &.{&st_install.step},
-            .test_deps = &.{&run_st_tests.step},
-        },
     };
 
     for (app_surfaces) |surface| {
@@ -701,7 +672,6 @@ pub fn build(b: *std.Build) void {
     addRunStep(b, seq, "run-seq", "Run seq", &.{});
     addRunStep(b, ledger, "run-ledger", "Run ledger", &.{"--help"});
     addRunStep(b, memory_note, "run-memory-note", "Run memory-note", &.{"--help"});
-    addRunStep(b, st, "run-st", "Run st", &.{"--help"});
     addRunStep(b, bench_stats, "run-bench-stats", "Run bench_stats", &.{"--help"});
     addRunStep(b, cas_smoke_check, "run-cas-smoke-check", "Run cas_smoke_check", &.{"--help"});
     addRunStep(b, cas_conformance_suite, "run-cas-conformance-suite", "Run cas_conformance_suite", &.{"--help"});

@@ -10,7 +10,6 @@ Monorepo for Zig CLIs with shared internal libraries and independent release str
 - `cron` (`cron`)
 - `ledger` (`ledger`, including `ledger --source learnings` and `ledger --source synesthesia`)
 - `memory-note` (`memory-note`)
-- `st` (`st`)
 
 No unified umbrella CLI is introduced. Binaries remain separate.
 
@@ -24,7 +23,6 @@ No unified umbrella CLI is introduced. Binaries remain separate.
 - `apps/synesthesia` (ledger-owned internal Synesthesia source)
 - `apps/ledger`
 - `apps/memory-note`
-- `apps/st`
 - `libs/core`
 - `libs/durable_store`
 - `.github/workflows`
@@ -49,7 +47,6 @@ zig build build-cas -Doptimize=ReleaseFast
 zig build build-cron -Doptimize=ReleaseFast
 zig build build-ledger -Doptimize=ReleaseFast
 zig build build-memory-note -Doptimize=ReleaseFast
-zig build build-st -Doptimize=ReleaseFast
 ```
 
 Run helpers:
@@ -77,7 +74,7 @@ zig build perf-accept-local
 
 # Optional filter by binary or case id substring.
 zig build perf-capture-local -- --target seq
-zig build perf-compare-local -- --target st
+zig build perf-compare-local -- --target cron
 ```
 
 Authoritative baselines live under `.perf-local/<machine-id>/baselines/` and are ignored by git.
@@ -95,10 +92,9 @@ Per-app VERSION files are the source of truth:
 - `apps/cron/VERSION`
 - `apps/ledger/VERSION`
 - `apps/memory-note/VERSION`
-- `apps/st/VERSION`
 
 PRs that touch release-relevant CLI surfaces must bump the corresponding `VERSION` file.
-The check is conservative: app-local changes count for that app, `apps/learnings/**` and `apps/synesthesia/**` count for `ledger`, broad shared shipped surfaces such as `build.zig`, `build.zig.zon`, and `libs/core/**` count for every shipped CLI, and `libs/durable_store/**` counts for its shipped consumers. Durable-store concurrency changes are release-relevant for `st` when they affect workspace mutation, transaction recovery, fencing, CAS, or command exit behavior.
+The check is conservative: app-local changes count for that app, `apps/learnings/**` and `apps/synesthesia/**` count for `ledger`, broad shared shipped surfaces such as `build.zig`, `build.zig.zon`, and `libs/core/**` count for every shipped CLI, and `libs/durable_store/**` counts for its shipped consumers.
 Do not close release-relevant CLI work with a local `./zig-out/bin` binary alone.
 Release closure means the changed CLI has a tagged GitHub release, the tap formula has been updated, Homebrew audit/test have passed, and the installed Homebrew binary reports the expected version.
 
@@ -110,7 +106,6 @@ Independent tags trigger independent workflows, and each tag must match its app 
 - `cron-v*` -> `.github/workflows/release-cron.yml`
 - `ledger-v*` -> `.github/workflows/release-ledger.yml`
 - `memory-note-v*` -> `.github/workflows/release-memory-note.yml`
-- `st-v*` -> `.github/workflows/release-st.yml`
 
 Pushes to `main` auto-create any missing release tags for changed `VERSION` files and dispatch the matching release workflow.
 Manual tag pushes still work, but they are no longer the only path.
@@ -123,7 +118,6 @@ Required tag forms:
 - `cron-v<version>` where `<version>` equals `apps/cron/VERSION`
 - `ledger-v<version>` where `<version>` equals `apps/ledger/VERSION`
 - `memory-note-v<version>` where `<version>` equals `apps/memory-note/VERSION`
-- `st-v<version>` where `<version>` equals `apps/st/VERSION`
 
 Artifacts are published as:
 
