@@ -62,7 +62,7 @@ fn scanGovernanceText(
     conditional_future: *bool,
 ) void {
     if (contains(text, "graph_control_receipt") or contains(text, "GCR-v1")) saw_gcr.* = true;
-    if (contains(text, "selected_task_ids") or contains(text, "st compile aperture")) materializations.* += 1;
+    if (contains(text, "selected_task_ids")) materializations.* += 1;
     if (contains(text, "dormant") and contains(text, "materialized")) dormant.* = true;
     if (contains(text, "more mutating actions") or contains(text, "too many active mutating")) too_many_mutations.* = true;
     if (contains(text, "materialized action differs") or contains(text, "EPD/GCR mismatch") or contains(text, "materialization mismatch")) mismatch.* = true;

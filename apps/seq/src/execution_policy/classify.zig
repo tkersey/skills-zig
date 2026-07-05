@@ -169,7 +169,7 @@ fn inspectToolText(
     source: []const u8,
     text: []const u8,
 ) !void {
-    if (contains(text, "st compile aperture") or contains(text, "graph_control_receipt") or contains(text, "GCR-v1")) {
+    if (contains(text, "graph_control_receipt") or contains(text, "GCR-v1")) {
         counts.controller += 1;
         try appendEvidence(allocator, evidence, source, turn_index, "tool", "controller_event", "gcr", "", "runtime", text, "controller_event");
     }

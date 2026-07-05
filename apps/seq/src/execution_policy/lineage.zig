@@ -90,7 +90,7 @@ fn scanTrace(trace: canonical_trace.CanonicalSessionTrace, counters: *Counters) 
         if (tool.input_text) |text| scanText(text, counters);
         if (tool.output_text) |text| scanText(text, counters);
         if (tool.command_text) |text| {
-            if (contains(text, "apply_patch") or contains(text, "git commit") or contains(text, "st complete")) counters.mutations += 1;
+            if (contains(text, "apply_patch") or contains(text, "git commit")) counters.mutations += 1;
         }
         if (tool.patch_success == true) counters.mutations += 1;
     }
@@ -98,7 +98,7 @@ fn scanTrace(trace: canonical_trace.CanonicalSessionTrace, counters: *Counters) 
 
 fn scanText(text: []const u8, counters: *Counters) void {
     if (contains(text, "graph_control_receipt") or contains(text, "GCR-v1")) counters.gcr += 1;
-    if (contains(text, "st complete") or contains(text, "selected_task_ids") or contains(text, "materialization")) counters.materializations += 1;
+    if (contains(text, "selected_task_ids") or contains(text, "materialization")) counters.materializations += 1;
     if (contains(text, "terminal") or contains(text, "policy_terminal_success")) counters.terminal_mentions += 1;
     if (contains(text, "proof") or contains(text, "tests passed") or contains(text, "Build Summary")) counters.proof_mentions += 1;
     if (contains(text, "https://github.com/") or contains(text, "pr_url") or contains(text, "delivery_success")) counters.delivery_mentions += 1;

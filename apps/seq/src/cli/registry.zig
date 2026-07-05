@@ -157,22 +157,6 @@ const policy_calibration_flags = [_]FlagSpec{
     .{ .name = "--format", .value_kind = .format, .help = "Output format" },
 };
 
-const st_workspace_audit_flags = [_]FlagSpec{
-    .{ .name = "--root", .value_kind = .path, .help = "Codex sessions root" },
-    .{ .name = "--repo", .value_kind = .path, .help = "Require repo/workspace lineage under this path" },
-    .{ .name = "--workspace-root", .value_kind = .path, .help = ".ledger/st workspace artifact root" },
-    .{ .name = "--workspace-id", .value_kind = .string, .help = "Filter one workspace id" },
-    .{ .name = "--plan", .value_kind = .string, .help = "Filter one plan id" },
-    .{ .name = "--session-id", .value_kind = .string, .help = "Filter one session id" },
-    .{ .name = "--since", .value_kind = .string, .help = "Inclusive start timestamp" },
-    .{ .name = "--until", .value_kind = .string, .help = "Inclusive end timestamp" },
-    .{ .name = "--last", .value_kind = .duration, .help = "Relative time window" },
-    .{ .name = "--exclude-current", .value_kind = .bool, .help = "Exclude the current CODEX_THREAD_ID session" },
-    .{ .name = "--mode", .value_kind = .string, .help = "summary, workspaces, plans, claims, sessions, apertures, gcr, changesets, proof, integration, evidence, or report" },
-    .{ .name = "--strict", .value_kind = .bool, .help = "Exit 2 on P0/P1 findings or artifact inconsistency" },
-    .{ .name = "--format", .value_kind = .format, .help = "Output format" },
-};
-
 pub fn commandNames() []const lib.CommandDef {
     return lib.commandNames();
 }
@@ -209,7 +193,6 @@ fn summaryFor(command: lib.Command) []const u8 {
         .cas_review_audit => "Audit CAS review-session proof planes and lane backend reliability",
         .execution_policy_audit => "Audit EPG-guided planning/execution policy runtime lineage and calibration",
         .policy_calibration => "Emit execution-policy transition calibration rows",
-        .st_workspace_audit => "Audit .ledger/st multi-plan workspace claims, projections, GCR, changesets, proof, and legacy writes",
         .skill_contract => "Validate, show, or scaffold SKDC-v1 decision contracts",
         .skill_decision_receipt => "Validate SDR-v1 skill decision receipts",
         .capabilities => "Print seq feature capability flags",
@@ -230,7 +213,6 @@ fn usageFor(command: lib.Command) []const u8 {
         .cas_review_audit => "seq cas-review-audit [--path <jsonl>|--receipt-path <json>|--repo <path>] [--mode summary|rows|report]",
         .execution_policy_audit => "seq execution-policy-audit --root <path> (--session-id <id>|--path <jsonl>|--repo <path>|--last <duration>|--since <iso>|--until <iso>)",
         .policy_calibration => "seq policy-calibration --root <path> (--session-id <id>|--path <jsonl>|--repo <path>|--last <duration>|--since <iso>|--until <iso>)",
-        .st_workspace_audit => "seq st-workspace-audit [--root <path>] [--repo <path>] [--workspace-root <path>] [--workspace-id <id>] [--plan <plan-id>] [--session-id <id>]",
         .skill_contract => "seq skill-contract validate --file <path>",
         .skill_decision_receipt => "seq skill-decision-receipt validate --file <path>",
         .capabilities => "seq capabilities [--format json]",
@@ -248,7 +230,6 @@ fn flagsFor(command: lib.Command) []const FlagSpec {
         .cas_review_audit => cas_review_audit_flags[0..],
         .execution_policy_audit => execution_policy_audit_flags[0..],
         .policy_calibration => policy_calibration_flags[0..],
-        .st_workspace_audit => st_workspace_audit_flags[0..],
         .skill_contract => skill_contract_flags[0..],
         .skill_decision_receipt => skill_decision_receipt_flags[0..],
         .sessions => session_flags[0..],
@@ -265,7 +246,6 @@ fn defaultFormatFor(command: lib.Command) output.Format {
         .cas_review_audit => .table,
         .execution_policy_audit => .table,
         .policy_calibration => .table,
-        .st_workspace_audit => .table,
         .skill_decision_audit => .table,
         .sessions => .table,
         else => .table,
@@ -280,7 +260,6 @@ fn allowedFormatsFor(command: lib.Command) []const output.Format {
         .cas_review_audit => &.{ .table, .json, .csv, .jsonl, .markdown },
         .execution_policy_audit => &.{ .table, .json, .csv, .jsonl, .markdown },
         .policy_calibration => &.{ .table, .json, .csv, .jsonl },
-        .st_workspace_audit => &.{ .table, .json, .csv, .jsonl, .markdown },
         .skill_decision_audit => &.{ .table, .json, .csv, .jsonl, .markdown },
         .capabilities, .skill_contract, .skill_decision_receipt => &.{ .table, .json, .csv, .jsonl },
         .session_detail => &.{ .json, .markdown },

@@ -33,7 +33,7 @@ pub fn classifyTrace(allocator: std.mem.Allocator, trace: canonical_trace.Canoni
     var counts = Counts{};
 
     const has_skill_read = traceHasActuatingSkillRead(trace);
-    if (traceHasCommand(trace, "st compile aperture") and traceHasPatch(trace) and
+    if (traceHasCommand(trace, "graph_control_receipt") and traceHasPatch(trace) and
         (traceHasCommand(trace, "gh pr create") or traceHasCommand(trace, "gh pr edit") or traceHasCommand(trace, "$ship")))
     {
         try addUnique(allocator, &evidence, "tool_sequence:canonical_plan_to_pr");

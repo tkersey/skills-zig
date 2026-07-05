@@ -32,11 +32,11 @@
     },
     {
       "fixture": {
-        "name": "valid_st_governed_handoff",
+        "name": "valid_controller_governed_handoff",
         "expected_quality": "present_and_closed",
         "expected_failure_class": null,
-        "transcript_excerpt": "st_governed_handoff: yes",
-        "artifact_state": { "branch": "feature/hylo", "head": "head-st", "diff_digest": "st" },
+        "transcript_excerpt": "controller_governed_handoff: yes",
+        "artifact_state": { "branch": "feature/hylo", "head": "head-controller", "diff_digest": "controller" },
         "expected_detection": { "alsr_present": false, "hyl_present": false, "hsr_step_count": 0, "terminal_atcg": true }
       }
     },

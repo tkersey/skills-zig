@@ -48,7 +48,7 @@ const hylo_fixtures = [_]HyloFixture{
     .{ .name = "valid_direct_action_fused", .quality = "present_and_closed", .alsr_present = 0, .hyl_present = 0, .hsr_step_count = 0, .terminal_atcg = 1 },
     .{ .name = "valid_goal_grind_with_alsr_hyl_hsr", .quality = "present_and_closed", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 1 },
     .{ .name = "valid_resolve_three_clean_cas", .quality = "present_and_closed", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 1 },
-    .{ .name = "valid_st_governed_handoff", .quality = "present_and_closed", .alsr_present = 0, .hyl_present = 0, .hsr_step_count = 0, .terminal_atcg = 1 },
+    .{ .name = "valid_controller_governed_handoff", .quality = "present_and_closed", .alsr_present = 0, .hyl_present = 0, .hsr_step_count = 0, .terminal_atcg = 1 },
     .{ .name = "valid_parallel_review_class_fanout", .quality = "present_and_closed", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 1 },
     .{ .name = "valid_branch_race_common_verifier", .quality = "present_and_closed", .alsr_present = 1, .hyl_present = 1, .hsr_step_count = 1, .terminal_atcg = 1 },
     .{ .name = "missing_alsr", .quality = "partial", .failure = "missing_alsr", .alsr_present = 0, .hyl_present = 1, .hsr_step_count = 2, .terminal_atcg = 1 },
@@ -529,7 +529,7 @@ test "actuation audit parses embedded artifacts and GCR edge cases" {
     try trace.tools.append(std.testing.allocator, .{
         .path = try std.testing.allocator.dupe(u8, "/tmp/run.jsonl"),
         .kind = .exec_command,
-        .command_text = try std.testing.allocator.dupe(u8, "st compile aperture"),
+        .command_text = try std.testing.allocator.dupe(u8, "gcr compile aperture"),
         .output_text = try std.testing.allocator.dupe(u8, "{\"graph_control_receipt\":{\"gcr_id\":\"GCR-1\",\"execution_allowed\": true,\"blocking_debt\":[]}}"),
         .exit_code = 0,
     });
@@ -548,7 +548,7 @@ test "actuation audit parses embedded artifacts and GCR edge cases" {
     try denied_trace.tools.append(std.testing.allocator, .{
         .path = try std.testing.allocator.dupe(u8, "/tmp/denied.jsonl"),
         .kind = .exec_command,
-        .command_text = try std.testing.allocator.dupe(u8, "st compile aperture"),
+        .command_text = try std.testing.allocator.dupe(u8, "gcr compile aperture"),
         .output_text = try std.testing.allocator.dupe(u8, "{ \"graph_control_receipt\": { \"gcr_id\": \"GCR-2\", \"execution_allowed\": false, \"blocking_debt\": [] } }"),
         .exit_code = 0,
     });

@@ -1,0 +1,5 @@
+{"type":"session_meta","timestamp":"2026-07-02T10:30:00Z","payload":{"id":"valid_controller_governed_handoff","cwd":"/repo/seq-audit","model":"gpt-5","git":{"branch":"feature/hylo","commit_hash":"head-controller"}}}
+{"type":"event_msg","timestamp":"2026-07-02T10:30:01Z","payload":{"type":"task_started","turn_id":"t1"}}
+{"type":"event_msg","timestamp":"2026-07-02T10:30:02Z","payload":{"type":"user_message","turn_id":"t1","message":"$actuating continue with controller-owned work."}}
+{"type":"event_msg","timestamp":"2026-07-02T10:30:03Z","payload":{"type":"agent_message","turn_id":"t1","message":"controller_governed_handoff: yes\ncontroller owns the work with current control receipt\nfold:\n  verdict: complete\n  current_artifact_bound: yes\nstop_rule:\n  success: done\nATCG-v1:\n  can_mark_goal_complete: yes"}}
+{"type":"event_msg","timestamp":"2026-07-02T10:30:04Z","payload":{"type":"task_complete","turn_id":"t1","duration_ms":5000}}

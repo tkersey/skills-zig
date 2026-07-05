@@ -296,7 +296,7 @@ fn classifyAttempt(tool: canonical_trace.ToolLifecycleRecord, gcr: ?GcrEvidence)
 }
 
 fn isCompileAttempt(tool: canonical_trace.ToolLifecycleRecord) bool {
-    return toolInvokesSt(tool, "compile aperture");
+    return toolInvokesGraphControl(tool, "compile aperture");
 }
 
 fn isUpdatePlan(tool: canonical_trace.ToolLifecycleRecord) bool {
@@ -337,13 +337,13 @@ fn containsJsonBoolFalse(text: []const u8, key: []const u8) bool {
 }
 
 fn isGraphInvalidator(tool: canonical_trace.ToolLifecycleRecord) bool {
-    return toolInvokesSt(tool, "complete") or
-        toolInvokesSt(tool, "intake apply") or
-        toolInvokesSt(tool, "set") or
-        toolInvokesSt(tool, "proof record") or
-        toolInvokesSt(tool, "waive") or
-        toolInvokesSt(tool, "graph debt") or
-        toolInvokesSt(tool, "compile aperture");
+    return toolInvokesGraphControl(tool, "complete") or
+        toolInvokesGraphControl(tool, "intake apply") or
+        toolInvokesGraphControl(tool, "set") or
+        toolInvokesGraphControl(tool, "proof record") or
+        toolInvokesGraphControl(tool, "waive") or
+        toolInvokesGraphControl(tool, "graph debt") or
+        toolInvokesGraphControl(tool, "compile aperture");
 }
 
 fn buildViolation(
@@ -459,20 +459,21 @@ fn commandFieldsContain(tool: canonical_trace.ToolLifecycleRecord, needle: []con
     return false;
 }
 
-fn toolInvokesSt(tool: canonical_trace.ToolLifecycleRecord, subcommand: []const u8) bool {
-    if (tool.command_text) |text| if (commandInvokesSt(text, subcommand)) return true;
-    if (tool.input_text) |text| if (commandInvokesSt(text, subcommand)) return true;
+fn toolInvokesGraphControl(tool: canonical_trace.ToolLifecycleRecord, subcommand: []const u8) bool {
+    if (tool.command_text) |text| if (commandInvokesGraphControl(text, subcommand)) return true;
+    if (tool.input_text) |text| if (commandInvokesGraphControl(text, subcommand)) return true;
     return false;
 }
 
-fn commandInvokesSt(command: []const u8, subcommand: []const u8) bool {
+fn commandInvokesGraphControl(command: []const u8, subcommand: []const u8) bool {
     var start: usize = 0;
     while (start < command.len) {
         while (start < command.len and isCommandBoundary(command[start])) start += 1;
         if (start >= command.len) return false;
         const segment_end = findSegmentEnd(command, start);
         const segment = std.mem.trim(u8, command[start..segment_end], " \t\r\n");
-        if (segmentStartsWithWords(segment, "st", subcommand)) return true;
+        if (segmentStartsWithWords(segment, "gcr", subcommand)) return true;
+        if (segmentStartsWithWords(segment, "graph-control", subcommand)) return true;
         start = if (segment_end < command.len) segment_end + 1 else segment_end;
     }
     return false;
@@ -554,7 +555,7 @@ fn deinitViolationList(allocator: std.mem.Allocator, values: []GraphControlViola
 test "gcr analyzer accepts current receipt before material mutation" {
     var trace = try fixtureTrace(std.testing.allocator);
     defer trace.deinit(std.testing.allocator);
-    try appendTool(std.testing.allocator, &trace, .exec_command, "compile", "st compile aperture --file .step/st-plan.jsonl", "graph_control_receipt {\"receipt_id\":\"GCR-1\",\"plan_seq\":1,\"execution_allowed\":true,\"selected_task_ids\":[\"st-aa-003\"]}", 0);
+    try appendTool(std.testing.allocator, &trace, .exec_command, "compile", "gcr compile aperture --file .ledger/actuation-plan.jsonl", "graph_control_receipt {\"receipt_id\":\"GCR-1\",\"plan_seq\":1,\"execution_allowed\":true,\"selected_task_ids\":[\"act-aa-003\"]}", 0);
     try appendTool(std.testing.allocator, &trace, .patch_apply, "apply_patch", null, null, null);
 
     var analysis = try analyzeTrace(std.testing.allocator, trace);
@@ -569,9 +570,9 @@ test "gcr analyzer accepts current receipt before material mutation" {
 test "gcr analyzer detects failed compile projection inversion before patch" {
     var trace = try fixtureTrace(std.testing.allocator);
     defer trace.deinit(std.testing.allocator);
-    try appendTool(std.testing.allocator, &trace, .exec_command, "compile", "st compile aperture --file .step/st-plan.jsonl", "error: blocking debt", 1);
-    try appendTool(std.testing.allocator, &trace, .mcp_tool, "update_plan", "update_plan selected st-aa-003", null, null);
-    try appendTool(std.testing.allocator, &trace, .mcp_tool, "update_plan", "update_plan selected st-aa-003", null, null);
+    try appendTool(std.testing.allocator, &trace, .exec_command, "compile", "gcr compile aperture --file .ledger/actuation-plan.jsonl", "error: blocking debt", 1);
+    try appendTool(std.testing.allocator, &trace, .mcp_tool, "update_plan", "update_plan selected act-aa-003", null, null);
+    try appendTool(std.testing.allocator, &trace, .mcp_tool, "update_plan", "update_plan selected act-aa-003", null, null);
     try appendTool(std.testing.allocator, &trace, .patch_apply, "apply_patch", null, null, null);
 
     var analysis = try analyzeTrace(std.testing.allocator, trace);
@@ -585,7 +586,7 @@ test "gcr analyzer detects failed compile projection inversion before patch" {
 test "gcr analyzer does not infer compile attempts from command output" {
     var trace = try fixtureTrace(std.testing.allocator);
     defer trace.deinit(std.testing.allocator);
-    try appendTool(std.testing.allocator, &trace, .exec_command, "search", "rg GCR apps/seq", "st compile aperture --file .step/st-plan.jsonl", 0);
+    try appendTool(std.testing.allocator, &trace, .exec_command, "search", "rg GCR apps/seq", "gcr compile aperture --file .ledger/actuation-plan.jsonl", 0);
 
     var analysis = try analyzeTrace(std.testing.allocator, trace);
     defer analysis.deinit(std.testing.allocator);
@@ -596,7 +597,7 @@ test "gcr analyzer does not infer compile attempts from command output" {
 test "gcr analyzer does not count searches for compile syntax as compile attempts" {
     var trace = try fixtureTrace(std.testing.allocator);
     defer trace.deinit(std.testing.allocator);
-    try appendTool(std.testing.allocator, &trace, .exec_command, "search", "rg \"st compile aperture\" apps/seq", "apps/seq/src/actuation/gcr.zig:st compile aperture", 0);
+    try appendTool(std.testing.allocator, &trace, .exec_command, "search", "rg \"gcr compile aperture\" apps/seq", "apps/seq/src/actuation/gcr.zig:gcr compile aperture", 0);
 
     var analysis = try analyzeTrace(std.testing.allocator, trace);
     defer analysis.deinit(std.testing.allocator);

@@ -1950,22 +1950,22 @@ test "durable concurrency records render canonical json" {
     };
     const lock: LeaseLock = .{
         .lock_id = "lock-1",
-        .resource = "/repo/.step/st-plan.jsonl",
+        .resource = "/repo/.ledger/plan.jsonl",
         .owner = owner,
         .acquired_at = "2026-06-25T14:00:00Z",
         .expires_at = "2026-06-25T14:00:05Z",
         .fencing_token = 7,
         .transaction_id = "txn-1",
-        .path = "/repo/.step/st-plan.jsonl.lock",
+        .path = "/repo/.ledger/plan.jsonl.lock",
     };
     const expected = [_]TransactionExpected{.{
-        .path = "/repo/.step/st-plan.jsonl",
+        .path = "/repo/.ledger/plan.jsonl",
         .digest = "sha256:before",
         .sequence = 41,
     }};
     const writes = [_]TransactionWrite{.{
-        .path = "/repo/.step/st-plan.jsonl",
-        .staged_ref = "transactions/txn-1/st-plan.jsonl",
+        .path = "/repo/.ledger/plan.jsonl",
+        .staged_ref = "transactions/txn-1/plan.jsonl",
         .digest_after = "sha256:after",
         .sequence_after = 42,
     }};
@@ -1987,14 +1987,14 @@ test "durable concurrency records render canonical json" {
     const lock_bytes = try lock_json.toOwnedSlice();
     defer std.testing.allocator.free(lock_bytes);
     try std.testing.expectEqualStrings(
-        "{\"lock_version\":\"DLK-v1\",\"lock_id\":\"lock-1\",\"resource\":\"/repo/.step/st-plan.jsonl\",\"owner\":{\"process_id\":1234,\"session_id\":\"session-a\",\"executor\":\"codex\"},\"acquired_at\":\"2026-06-25T14:00:00Z\",\"expires_at\":\"2026-06-25T14:00:05Z\",\"fencing_token\":7,\"transaction_id\":\"txn-1\"}",
+        "{\"lock_version\":\"DLK-v1\",\"lock_id\":\"lock-1\",\"resource\":\"/repo/.ledger/plan.jsonl\",\"owner\":{\"process_id\":1234,\"session_id\":\"session-a\",\"executor\":\"codex\"},\"acquired_at\":\"2026-06-25T14:00:00Z\",\"expires_at\":\"2026-06-25T14:00:05Z\",\"fencing_token\":7,\"transaction_id\":\"txn-1\"}",
         lock_bytes,
     );
 
     var cas_json: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer cas_json.deinit();
     try (CasWriteReceipt{
-        .path = "/repo/.step/st-plan.jsonl",
+        .path = "/repo/.ledger/plan.jsonl",
         .digest_before = null,
         .digest_after = "sha256:after",
         .sequence_before = 41,
@@ -2004,7 +2004,7 @@ test "durable concurrency records render canonical json" {
     const cas_bytes = try cas_json.toOwnedSlice();
     defer std.testing.allocator.free(cas_bytes);
     try std.testing.expectEqualStrings(
-        "{\"cas_write_receipt\":{\"path\":\"/repo/.step/st-plan.jsonl\",\"digest_before\":null,\"digest_after\":\"sha256:after\",\"sequence_before\":41,\"sequence_after\":42,\"result\":\"written\"}}",
+        "{\"cas_write_receipt\":{\"path\":\"/repo/.ledger/plan.jsonl\",\"digest_before\":null,\"digest_after\":\"sha256:after\",\"sequence_before\":41,\"sequence_after\":42,\"result\":\"written\"}}",
         cas_bytes,
     );
 
@@ -2014,7 +2014,7 @@ test "durable concurrency records render canonical json" {
     const transaction_bytes = try transaction_json.toOwnedSlice();
     defer std.testing.allocator.free(transaction_bytes);
     try std.testing.expectEqualStrings(
-        "{\"transaction_version\":\"DTX-v1\",\"transaction_id\":\"txn-1\",\"owner\":{\"process_id\":1234,\"session_id\":\"session-a\",\"executor\":\"codex\"},\"state\":\"prepared\",\"expected\":[{\"path\":\"/repo/.step/st-plan.jsonl\",\"digest\":\"sha256:before\",\"sequence\":41}],\"writes\":[{\"path\":\"/repo/.step/st-plan.jsonl\",\"staged_ref\":\"transactions/txn-1/st-plan.jsonl\",\"digest_after\":\"sha256:after\",\"sequence_after\":42}],\"locks\":[{\"lock_version\":\"DLK-v1\",\"lock_id\":\"lock-1\",\"resource\":\"/repo/.step/st-plan.jsonl\",\"owner\":{\"process_id\":1234,\"session_id\":\"session-a\",\"executor\":\"codex\"},\"acquired_at\":\"2026-06-25T14:00:00Z\",\"expires_at\":\"2026-06-25T14:00:05Z\",\"fencing_token\":7,\"transaction_id\":\"txn-1\"}],\"created_at\":\"2026-06-25T14:00:00Z\",\"updated_at\":\"2026-06-25T14:00:01Z\"}",
+        "{\"transaction_version\":\"DTX-v1\",\"transaction_id\":\"txn-1\",\"owner\":{\"process_id\":1234,\"session_id\":\"session-a\",\"executor\":\"codex\"},\"state\":\"prepared\",\"expected\":[{\"path\":\"/repo/.ledger/plan.jsonl\",\"digest\":\"sha256:before\",\"sequence\":41}],\"writes\":[{\"path\":\"/repo/.ledger/plan.jsonl\",\"staged_ref\":\"transactions/txn-1/plan.jsonl\",\"digest_after\":\"sha256:after\",\"sequence_after\":42}],\"locks\":[{\"lock_version\":\"DLK-v1\",\"lock_id\":\"lock-1\",\"resource\":\"/repo/.ledger/plan.jsonl\",\"owner\":{\"process_id\":1234,\"session_id\":\"session-a\",\"executor\":\"codex\"},\"acquired_at\":\"2026-06-25T14:00:00Z\",\"expires_at\":\"2026-06-25T14:00:05Z\",\"fencing_token\":7,\"transaction_id\":\"txn-1\"}],\"created_at\":\"2026-06-25T14:00:00Z\",\"updated_at\":\"2026-06-25T14:00:01Z\"}",
         transaction_bytes,
     );
 }

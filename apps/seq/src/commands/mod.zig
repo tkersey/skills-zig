@@ -28,7 +28,6 @@ const actuation_surface = @import("../actuation/surface.zig");
 const actuation_hylo = @import("../actuation/hylo.zig");
 const cas_review_audit = @import("../cas_review_audit.zig");
 const execution_policy_audit = @import("../execution_policy/mod.zig");
-const st_workspace_audit = @import("../st_workspace_audit.zig");
 const resolve_intent_closed = @import("../resolve_intent_closed/mod.zig");
 const app_meta = @import("app_meta");
 
@@ -318,96 +317,6 @@ pub const dataset_meta = [_]DatasetMeta{
         .name = "execution_policy_regret_candidates",
         .description = "Observational hindsight-separated execution-policy regret candidates",
         .fields = &.{ "run_id", "session_id", "decision_id", "class", "selected_action", "candidate_action", "regret_candidates", "causal_claim_allowed", "evidence_refs" },
-    },
-    .{
-        .name = "st_workspaces",
-        .description = "STWA-v1 .ledger/st workspace lifecycle projections",
-        .fields = st_workspace_audit.workspaces_fields[0..],
-    },
-    .{
-        .name = "st_plans",
-        .description = "STWA-v1 plan namespace and lifecycle projections",
-        .fields = st_workspace_audit.plans_fields[0..],
-    },
-    .{
-        .name = "st_cross_plan_edges",
-        .description = "STWA-v1 cross-plan dependency and blocker edges",
-        .fields = st_workspace_audit.cross_plan_edges_fields[0..],
-    },
-    .{
-        .name = "st_claims",
-        .description = "STWA-v1 claim and fencing-token timeline rows",
-        .fields = st_workspace_audit.claims_fields[0..],
-    },
-    .{
-        .name = "st_resource_conflicts",
-        .description = "STWA-v1 reconstructed claim resource conflict decisions",
-        .fields = st_workspace_audit.resource_conflicts_fields[0..],
-    },
-    .{
-        .name = "st_session_views",
-        .description = "STWA-v1 session projection and selected-task lineage rows",
-        .fields = st_workspace_audit.session_views_fields[0..],
-    },
-    .{
-        .name = "st_workspace_apertures",
-        .description = "STWA-v1 workspace aperture allocation receipts",
-        .fields = st_workspace_audit.workspace_apertures_fields[0..],
-    },
-    .{
-        .name = "st_gcr_v2",
-        .description = "STWA-v1 GCR-v2 currentness and execution-allowed projections",
-        .fields = st_workspace_audit.gcr_v2_fields[0..],
-    },
-    .{
-        .name = "st_graph_control_receipts",
-        .description = "STWA-v1 graph-intelligence GCR-v2 receipt rows",
-        .fields = st_workspace_audit.graph_control_receipts_fields[0..],
-    },
-    .{
-        .name = "st_graph_repair_receipts",
-        .description = "STWA-v1 GRR-v1 graph repair receipt rows",
-        .fields = st_workspace_audit.graph_repair_receipts_fields[0..],
-    },
-    .{
-        .name = "st_artifact_maintenance_receipts",
-        .description = "STWA-v1 AMR-v1 artifact maintenance receipt rows",
-        .fields = st_workspace_audit.artifact_maintenance_receipts_fields[0..],
-    },
-    .{
-        .name = "workflow_provenance_evidence",
-        .description = "Workflow provenance evidence rows, including artifact-under-repair AMR classifications",
-        .fields = st_workspace_audit.workflow_provenance_evidence_fields[0..],
-    },
-    .{
-        .name = "st_changesets",
-        .description = "STWA-v1 change-set claim coverage and proof reference rows",
-        .fields = st_workspace_audit.changesets_fields[0..],
-    },
-    .{
-        .name = "st_integrations",
-        .description = "STWA-v1 target-head CAS and integration queue rows",
-        .fields = st_workspace_audit.integrations_fields[0..],
-    },
-    .{
-        .name = "st_proof_invalidations",
-        .description = "STWA-v1 proof epoch invalidation rows",
-        .fields = st_workspace_audit.proof_invalidations_fields[0..],
-    },
-    .{
-        .name = "st_legacy_artifacts",
-        .description = "STWA-v1 actual legacy .step/.retrace write attempts",
-        .fields = st_workspace_audit.legacy_artifacts_fields[0..],
-    },
-    .{
-        .name = "st_findings",
-        .description = "STWA-v1 normalized findings with severity",
-        .fields = st_workspace_audit.findings_fields[0..],
-    },
-    .{
-        .name = "st_decisions",
-        .description = "STWA-v1 normalized controller decision candidates",
-        .fields = st_workspace_audit.decisions_fields[0..],
     },
     .{
         .name = "token_events",
@@ -840,9 +749,6 @@ const Options = struct {
     bundle_dir_text: ?[]const u8 = null,
     artifact_root_text: ?[]const u8 = null,
     policy_root_text: ?[]const u8 = null,
-    workspace_root_text: ?[]const u8 = null,
-    workspace_id_text: ?[]const u8 = null,
-    plan_text: ?[]const u8 = null,
     receipt_path_texts: [32]?[]const u8 = [_]?[]const u8{null} ** 32,
     receipt_path_count: usize = 0,
     receipt_glob_texts: [32]?[]const u8 = [_]?[]const u8{null} ** 32,
@@ -884,7 +790,6 @@ const Options = struct {
     index_mode: []const u8 = "auto",
     actuation_strict: bool = false,
     execution_policy_strict: bool = false,
-    st_workspace_strict: bool = false,
     review_compiler_strict: bool = false,
     strict: bool = true,
     strict_set: bool = false,
@@ -956,7 +861,6 @@ pub fn run(
         .actuation_audit => try cmdActuationAudit(allocator, sessions_root, opts),
         .execution_policy_audit => try cmdExecutionPolicyAudit(allocator, sessions_root, opts),
         .policy_calibration => try cmdPolicyCalibration(allocator, sessions_root, opts),
-        .st_workspace_audit => try cmdStWorkspaceAudit(allocator, sessions_root, opts),
         .capabilities => try cmdCapabilities(allocator, opts),
         .memory_provenance => try cmdMemoryProvenance(allocator, opts),
         .memory_map => try cmdMemoryMap(allocator, opts),
@@ -1205,13 +1109,6 @@ fn printCommandHelp(cmd: lib.Command) !void {
         \\  Emits the execution policy calibration projection; equivalent to execution-policy-audit --mode calibration
         \\  --policy-root <path>        Include policy artifact root in corpus metadata
         ,
-        .st_workspace_audit =>
-        \\usage: seq st-workspace-audit [--root <path>] [--repo <path>] [--workspace-root <path>] [--workspace-id <id>] [--plan <plan-id>] [--session-id <id>] [--since <iso>] [--until <iso>] [--last <duration>] [--exclude-current] [--mode summary|workspaces|plans|claims|sessions|apertures|gcr|graph-control|graph-repair|artifact-maintenance|workflow-provenance|changesets|proof|integration|evidence|report] [--strict] [--format table|json|jsonl|csv|markdown]
-        \\extra options:
-        \\  --workspace-root <path>     .ledger/st artifact root; controller artifacts are primary evidence
-        \\  --strict                   Exit 2 for P0/P1 findings or artifact inconsistency
-        \\  --format markdown          Only valid with --mode report
-        ,
         .goal_audit =>
         \\usage: seq goal-audit [--mode summary|rows] [--workflow review|resolve|review,resolve] [--duration-gte <seconds|minutes|hours>] [--status <name>] [--contains <text>] [--since <iso>] [--until <iso>] [--path <jsonl>|--session-id <id>] [--exclude-current] [--show-query] [--limit N] [--format table|json|csv|jsonl]
         ,
@@ -1309,7 +1206,6 @@ fn commandSupportsExcludeCurrent(cmd: lib.Command) bool {
         std.mem.eql(u8, name, "actuation_audit") or
         std.mem.eql(u8, name, "execution_policy_audit") or
         std.mem.eql(u8, name, "policy_calibration") or
-        std.mem.eql(u8, name, "st_workspace_audit") or
         std.mem.eql(u8, name, "skill_audit") or
         std.mem.eql(u8, name, "skill_cohort") or
         std.mem.eql(u8, name, "skill_success_rank") or
@@ -1376,12 +1272,6 @@ fn validateFormatForCommand(cmd: lib.Command, opts: Options) !void {
         },
         .policy_calibration => {
             if (fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
-        },
-        .st_workspace_audit => {
-            if (fmt == .dot) return error.InvalidFormatForCommand;
-            const mode = opts.mode orelse "summary";
-            if (!isValidStWorkspaceAuditMode(mode)) return error.InvalidModeArg;
-            if (fmt == .markdown and !std.mem.eql(u8, mode, "report")) return error.InvalidFormatForCommand;
         },
         .skill_contract, .skill_decision_receipt, .capabilities => {
             if (fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
@@ -1472,12 +1362,12 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         else => false,
     };
     const supports_repo = switch (cmd) {
-        .plan_search, .sessions, .resolve_churn_audit, .review_compiler_audit, .skill_decision_audit, .decision_capsule, .actuation_audit, .cas_review_audit, .execution_policy_audit, .policy_calibration, .st_workspace_audit => true,
+        .plan_search, .sessions, .resolve_churn_audit, .review_compiler_audit, .skill_decision_audit, .decision_capsule, .actuation_audit, .cas_review_audit, .execution_policy_audit, .policy_calibration => true,
         else => false,
     };
     const supports_status = cmd == .opencode_events or cmd == .turns or cmd == .goal_audit;
     const supports_mode = switch (cmd) {
-        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .skill_decision_audit, .skill_success_rank, .skill_blocks, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit, .workflow_overlap, .adjudication_audit, .review_compiler_audit, .cas_review_audit, .goal_audit, .decision_capsule, .actuation_audit, .execution_policy_audit, .st_workspace_audit => true,
+        .opencode_prompts, .opencode_events, .reply_latency, .skill_audit, .skill_decision_audit, .skill_success_rank, .skill_blocks, .message_audit, .skill_cohort, .tool_audit, .tool_search, .memory_inventory, .memory_extension_audit, .token_window, .workdir_report, .workflow_audit, .workflow_overlap, .adjudication_audit, .review_compiler_audit, .cas_review_audit, .goal_audit, .decision_capsule, .actuation_audit, .execution_policy_audit => true,
         else => false,
     };
     const supports_kind = cmd == .artifact_search or cmd == .skill_contract;
@@ -1555,7 +1445,6 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
         .actuation_audit,
         .execution_policy_audit,
         .policy_calibration,
-        .st_workspace_audit,
         .role_breakdown,
         .occurrence_export,
         .find_session,
@@ -1663,12 +1552,11 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     const supports_window_hours = cmd == .token_window;
     const supports_duration_gte = cmd == .goal_audit;
     const supports_since_cursor = cmd == .skill_evidence or cmd == .skill_decision_audit;
-    const supports_last = cmd == .token_usage or cmd == .token_cost or cmd == .skill_audit or cmd == .skill_evidence or cmd == .skill_decision_audit or cmd == .actuation_audit or cmd == .cas_review_audit or cmd == .execution_policy_audit or cmd == .policy_calibration or cmd == .st_workspace_audit or cmd == .skill_success_rank or cmd == .skill_cohort or cmd == .workflow_audit or cmd == .adjudication_audit or cmd == .message_audit or cmd == .message_search or cmd == .tool_audit or cmd == .tool_search or cmd == .skill_blocks;
+    const supports_last = cmd == .token_usage or cmd == .token_cost or cmd == .skill_audit or cmd == .skill_evidence or cmd == .skill_decision_audit or cmd == .actuation_audit or cmd == .cas_review_audit or cmd == .execution_policy_audit or cmd == .policy_calibration or cmd == .skill_success_rank or cmd == .skill_cohort or cmd == .workflow_audit or cmd == .adjudication_audit or cmd == .message_audit or cmd == .message_search or cmd == .tool_audit or cmd == .tool_search or cmd == .skill_blocks;
     const supports_include_root_equivalent = cmd == .adjudication_audit;
     const supports_bundle_dir = cmd == .adjudication_audit;
     const supports_artifact_root = cmd == .review_compiler_audit;
     const supports_policy_root = cmd == .execution_policy_audit or cmd == .policy_calibration;
-    const supports_workspace_root = cmd == .st_workspace_audit;
     const supports_token_cost_options = cmd == .token_cost;
     const supports_protocol = cmd == .review_compiler_audit;
     const supports_skill_decision_inputs = cmd == .skill_decision_audit or cmd == .skill_contract or cmd == .skill_decision_receipt;
@@ -1710,9 +1598,6 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.bundle_dir_text != null, supports_bundle_dir, "--bundle-dir", cmd);
     try ensureOptionAllowed(opts.artifact_root_text != null, supports_artifact_root, "--artifact-root", cmd);
     try ensureOptionAllowed(opts.policy_root_text != null, supports_policy_root, "--policy-root", cmd);
-    try ensureOptionAllowed(opts.workspace_root_text != null, supports_workspace_root, "--workspace-root", cmd);
-    try ensureOptionAllowed(opts.workspace_id_text != null, cmd == .st_workspace_audit, "--workspace-id", cmd);
-    try ensureOptionAllowed(opts.plan_text != null, cmd == .st_workspace_audit, "--plan", cmd);
     try ensureOptionAllowed(opts.receipt_path_count > 0, cmd == .cas_review_audit, "--receipt-path", cmd);
     try ensureOptionAllowed(opts.receipt_glob_count > 0, cmd == .cas_review_audit, "--receipt-glob", cmd);
     try ensureOptionAllowed(opts.base_sha_text != null, cmd == .cas_review_audit, "--base-sha", cmd);
@@ -1769,7 +1654,6 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
     try ensureOptionAllowed(opts.emit_count_evidence, cmd == .review_compiler_audit, "--emit-count-evidence", cmd);
     try ensureOptionAllowed(opts.actuation_strict, cmd == .actuation_audit, "--strict", cmd);
     try ensureOptionAllowed(opts.execution_policy_strict, cmd == .execution_policy_audit, "--strict", cmd);
-    try ensureOptionAllowed(opts.st_workspace_strict, cmd == .st_workspace_audit, "--strict", cmd);
     try ensureOptionAllowed(opts.review_compiler_strict, cmd == .review_compiler_audit, "--strict", cmd);
     try ensureOptionAllowed(opts.ongoing, cmd == .sessions, "--ongoing", cmd);
     try ensureOptionAllowed(opts.completed, cmd == .sessions, "--completed", cmd);
@@ -1988,11 +1872,6 @@ fn validateCommandOptions(cmd: lib.Command, opts: Options) !void {
             return error.MissingArgValue;
         }
     }
-    if (cmd == .st_workspace_audit) {
-        if (opts.mode) |text| {
-            if (!isValidStWorkspaceAuditMode(text)) return error.InvalidModeArg;
-        }
-    }
     if (opts.unique_by_text) |text| {
         if (!std.mem.eql(u8, text, "snippet") and !std.mem.eql(u8, text, "path-snippet")) return error.InvalidModeArg;
     }
@@ -2055,7 +1934,6 @@ fn commandSupportsSessionId(cmd: lib.Command) bool {
         .cas_review_audit,
         .execution_policy_audit,
         .policy_calibration,
-        .st_workspace_audit,
         .decision_capsule,
         .skill_blocks,
         .token_usage,
@@ -2243,25 +2121,6 @@ fn isValidExecutionPolicyAuditMode(text: []const u8) bool {
         std.mem.eql(u8, text, "calibration") or
         std.mem.eql(u8, text, "regret") or
         std.mem.eql(u8, text, "proof") or
-        std.mem.eql(u8, text, "report");
-}
-
-fn isValidStWorkspaceAuditMode(text: []const u8) bool {
-    return std.mem.eql(u8, text, "summary") or
-        std.mem.eql(u8, text, "workspaces") or
-        std.mem.eql(u8, text, "plans") or
-        std.mem.eql(u8, text, "claims") or
-        std.mem.eql(u8, text, "sessions") or
-        std.mem.eql(u8, text, "apertures") or
-        std.mem.eql(u8, text, "gcr") or
-        std.mem.eql(u8, text, "graph-control") or
-        std.mem.eql(u8, text, "graph-repair") or
-        std.mem.eql(u8, text, "artifact-maintenance") or
-        std.mem.eql(u8, text, "workflow-provenance") or
-        std.mem.eql(u8, text, "changesets") or
-        std.mem.eql(u8, text, "proof") or
-        std.mem.eql(u8, text, "integration") or
-        std.mem.eql(u8, text, "evidence") or
         std.mem.eql(u8, text, "report");
 }
 
@@ -3418,18 +3277,6 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
             \\      "actuation_audit_v1": true,
             \\      "actuation_hylo_audit_v1": true,
             \\      "execution_policy_audit_v1": true,
-            \\      "st_workspace_audit_v1": true,
-            \\      "st_graph_control_receipt_v1": true,
-            \\      "st_graph_repair_receipt_v1": true,
-            \\      "st_artifact_maintenance_receipt_v1": true,
-            \\      "st_ledger_only_detection_v1": true,
-            \\      "st_workspace_dataset_v1": true,
-            \\      "st_plan_namespace_v1": true,
-            \\      "st_claim_fencing_v1": true,
-            \\      "st_session_view_v1": true,
-            \\      "st_gcr_v2": true,
-            \\      "st_changeset_integration_v1": true,
-            \\      "st_proof_epoch_v1": true,
             \\      "ledger_artifact_root_v1": true,
             \\      "epg_v1": true,
             \\      "eps_v1": true,
@@ -3489,18 +3336,6 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
         .{ .name = "actuation_audit_v1", .enabled = true },
         .{ .name = "actuation_hylo_audit_v1", .enabled = true },
         .{ .name = "execution_policy_audit_v1", .enabled = true },
-        .{ .name = "st_workspace_audit_v1", .enabled = true },
-        .{ .name = "st_graph_control_receipt_v1", .enabled = true },
-        .{ .name = "st_graph_repair_receipt_v1", .enabled = true },
-        .{ .name = "st_artifact_maintenance_receipt_v1", .enabled = true },
-        .{ .name = "st_ledger_only_detection_v1", .enabled = true },
-        .{ .name = "st_workspace_dataset_v1", .enabled = true },
-        .{ .name = "st_plan_namespace_v1", .enabled = true },
-        .{ .name = "st_claim_fencing_v1", .enabled = true },
-        .{ .name = "st_session_view_v1", .enabled = true },
-        .{ .name = "st_gcr_v2", .enabled = true },
-        .{ .name = "st_changeset_integration_v1", .enabled = true },
-        .{ .name = "st_proof_epoch_v1", .enabled = true },
         .{ .name = "ledger_artifact_root_v1", .enabled = true },
         .{ .name = "epg_v1", .enabled = true },
         .{ .name = "eps_v1", .enabled = true },
@@ -3623,121 +3458,6 @@ fn cmdPolicyCalibration(allocator: std.mem.Allocator, sessions_root: []const u8,
     var calibration_opts = opts;
     calibration_opts.mode = "calibration";
     try cmdExecutionPolicyAudit(allocator, sessions_root, calibration_opts);
-}
-
-fn cmdStWorkspaceAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
-    const mode = opts.mode orelse "summary";
-    var audit = try collectStWorkspaceAudit(allocator, sessions_root, opts);
-    defer audit.deinit();
-
-    if (opts.st_workspace_strict and st_workspace_audit.hasStrictFailure(audit)) std.process.exit(2);
-
-    if (std.mem.eql(u8, mode, "report")) {
-        const rendered = try st_workspace_audit.renderReport(allocator, audit, stWorkspaceAuditOptions(sessions_root, opts), opts.format == .markdown);
-        defer allocator.free(rendered);
-        try writeTextOutput(rendered, opts.out_path);
-        return;
-    }
-
-    var rows: std.ArrayList(query.Row) = .empty;
-    defer deinitQueryRows(allocator, &rows);
-    const cols = stWorkspaceColumnsForMode(mode);
-    if (std.mem.eql(u8, mode, "summary")) {
-        try st_workspace_audit.appendSummaryRow(allocator, &rows, audit, opts.workspace_root_text);
-    } else {
-        const dataset_name = stWorkspaceDatasetForMode(mode);
-        const source = stWorkspaceDatasetRows(&audit, dataset_name) orelse return error.UnknownDataset;
-        for (source.items) |row| try rows.append(allocator, try row.cloneAll(allocator));
-    }
-    try output.writeOutput(allocator, opts.format, rows.items, cols, opts.out_path);
-}
-
-fn collectStWorkspaceAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !st_workspace_audit.RowSet {
-    return st_workspace_audit.collect(allocator, stWorkspaceAuditOptions(sessions_root, opts));
-}
-
-fn stWorkspaceAuditOptions(sessions_root: []const u8, opts: Options) st_workspace_audit.Options {
-    _ = sessions_root;
-    return .{
-        .root = opts.root,
-        .repo = opts.repo_text,
-        .workspace_root = opts.workspace_root_text,
-        .workspace_id = opts.workspace_id_text,
-        .plan_id = opts.plan_text,
-        .session_id = opts.session_id,
-        .since = opts.since,
-        .until = opts.until,
-        .last = opts.last_text,
-        .exclude_current = opts.exclude_current,
-    };
-}
-
-fn stWorkspaceDatasetForMode(mode: []const u8) []const u8 {
-    if (std.mem.eql(u8, mode, "workspaces")) return "st_workspaces";
-    if (std.mem.eql(u8, mode, "plans")) return "st_plans";
-    if (std.mem.eql(u8, mode, "claims")) return "st_claims";
-    if (std.mem.eql(u8, mode, "sessions")) return "st_session_views";
-    if (std.mem.eql(u8, mode, "apertures")) return "st_workspace_apertures";
-    if (std.mem.eql(u8, mode, "gcr")) return "st_gcr_v2";
-    if (std.mem.eql(u8, mode, "graph-control")) return "st_graph_control_receipts";
-    if (std.mem.eql(u8, mode, "graph-repair")) return "st_graph_repair_receipts";
-    if (std.mem.eql(u8, mode, "artifact-maintenance")) return "st_artifact_maintenance_receipts";
-    if (std.mem.eql(u8, mode, "workflow-provenance")) return "workflow_provenance_evidence";
-    if (std.mem.eql(u8, mode, "changesets")) return "st_changesets";
-    if (std.mem.eql(u8, mode, "proof")) return "st_proof_invalidations";
-    if (std.mem.eql(u8, mode, "integration")) return "st_integrations";
-    if (std.mem.eql(u8, mode, "evidence")) return "st_findings";
-    return "st_workspaces";
-}
-
-fn stWorkspaceColumnsForMode(mode: []const u8) []const []const u8 {
-    if (std.mem.eql(u8, mode, "summary")) return st_workspace_audit.summary_fields[0..];
-    return st_workspace_audit.fieldsForDataset(stWorkspaceDatasetForMode(mode)) orelse st_workspace_audit.workspaces_fields[0..];
-}
-
-fn stWorkspaceDatasetRows(rowset: *st_workspace_audit.RowSet, name: []const u8) ?*std.ArrayList(query.Row) {
-    if (std.mem.eql(u8, name, "st_workspaces")) return &rowset.workspaces;
-    if (std.mem.eql(u8, name, "st_plans")) return &rowset.plans;
-    if (std.mem.eql(u8, name, "st_cross_plan_edges")) return &rowset.cross_plan_edges;
-    if (std.mem.eql(u8, name, "st_claims")) return &rowset.claims;
-    if (std.mem.eql(u8, name, "st_resource_conflicts")) return &rowset.resource_conflicts;
-    if (std.mem.eql(u8, name, "st_session_views")) return &rowset.session_views;
-    if (std.mem.eql(u8, name, "st_workspace_apertures")) return &rowset.workspace_apertures;
-    if (std.mem.eql(u8, name, "st_gcr_v2")) return &rowset.gcr_v2;
-    if (std.mem.eql(u8, name, "st_graph_control_receipts")) return &rowset.graph_control_receipts;
-    if (std.mem.eql(u8, name, "st_graph_repair_receipts")) return &rowset.graph_repair_receipts;
-    if (std.mem.eql(u8, name, "st_artifact_maintenance_receipts")) return &rowset.artifact_maintenance_receipts;
-    if (std.mem.eql(u8, name, "workflow_provenance_evidence")) return &rowset.workflow_provenance_evidence;
-    if (std.mem.eql(u8, name, "st_changesets")) return &rowset.changesets;
-    if (std.mem.eql(u8, name, "st_integrations")) return &rowset.integrations;
-    if (std.mem.eql(u8, name, "st_proof_invalidations")) return &rowset.proof_invalidations;
-    if (std.mem.eql(u8, name, "st_legacy_artifacts")) return &rowset.legacy_artifacts;
-    if (std.mem.eql(u8, name, "st_findings")) return &rowset.findings;
-    if (std.mem.eql(u8, name, "st_decisions")) return &rowset.decisions;
-    return null;
-}
-
-fn collectStWorkspaceDatasetRows(
-    allocator: std.mem.Allocator,
-    dataset_name: []const u8,
-    sessions_root: []const u8,
-    query_params: []const spec.ParamSpec,
-    out_rows: *std.ArrayList(query.Row),
-) !void {
-    _ = sessions_root;
-    const opts = st_workspace_audit.Options{
-        .root = paramString(query_params, "root"),
-        .repo = paramString(query_params, "repo"),
-        .workspace_root = paramString(query_params, "workspace_root"),
-        .workspace_id = paramString(query_params, "workspace_id"),
-        .plan_id = paramString(query_params, "plan"),
-        .session_id = paramString(query_params, "session_id"),
-        .since = paramString(query_params, "since"),
-        .until = paramString(query_params, "until"),
-        .last = paramString(query_params, "last"),
-        .exclude_current = paramBool(query_params, "exclude_current") orelse false,
-    };
-    try st_workspace_audit.rowsForDataset(allocator, opts, dataset_name, out_rows);
 }
 
 fn executionPolicyColumnsForMode(mode: []const u8) []const []const u8 {
@@ -9608,8 +9328,6 @@ fn containsAuthoritativeC3EventText(text: []const u8) bool {
 
 fn containsIncidentalC3ArtifactMention(text: []const u8) bool {
     return containsAnyIgnoreCaseAscii(text, &.{
-        ".step/st-plan-sidecar.jsonl",
-        "st-plan-sidecar.jsonl",
         ".ledger/c3",
         "review-compiler",
     });
@@ -20976,8 +20694,6 @@ fn collectDatasetRowsTracked(
         try collectActuationDatasetRows(allocator, dataset_name, sessions_root, query_params, &rows);
     } else if (execution_policy_audit.datasets.isExecutionPolicyDataset(dataset_name)) {
         try collectExecutionPolicyDatasetRows(allocator, dataset_name, sessions_root, query_params, &rows);
-    } else if (st_workspace_audit.isStWorkspaceDataset(dataset_name)) {
-        try collectStWorkspaceDatasetRows(allocator, dataset_name, sessions_root, query_params, &rows);
     } else if (std.mem.eql(u8, dataset_name, "token_events")) {
         try collectTokenEventsRows(allocator, sessions_root, day_filter, &rows);
     } else if (std.mem.eql(u8, dataset_name, "token_deltas")) {
@@ -22212,36 +21928,6 @@ fn collectHistoricalDecisionRows(
             try row.putOwnedKey("source_kind", .{ .string = candidate.source_kind });
             try row.putOwnedKey("confidence", .{ .float = candidate.confidence.score() });
             try row.putOwnedKey("contamination_flags", .{ .string = candidate.contamination_flags });
-            try out_rows.append(allocator, row);
-        }
-    }
-
-    if (paramString(query_params, "workspace_root")) |workspace_root| {
-        var st_rows: std.ArrayList(query.Row) = .empty;
-        defer deinitQueryRows(allocator, &st_rows);
-        try collectStWorkspaceDatasetRows(allocator, "st_decisions", sessions_root, &.{
-            .{ .key = "workspace_root", .value = .{ .string = workspace_root } },
-            .{ .key = "workspace_id", .value = spec.paramValue(query_params, "workspace_id") orelse .null },
-            .{ .key = "plan", .value = spec.paramValue(query_params, "plan") orelse .null },
-            .{ .key = "session_id", .value = spec.paramValue(query_params, "session_id") orelse .null },
-        }, &st_rows);
-        for (st_rows.items) |st_row| {
-            var row = query.Row.init(allocator);
-            errdefer row.deinit();
-            try row.putOwnedKey("path", .{ .string = workspace_root });
-            try row.putOwnedKey("decision_id", st_row.valueOrNull("decision_id"));
-            try row.putOwnedKey("session_id", st_row.valueOrNull("session_id"));
-            try row.putOwnedKey("turn_index", .{ .int = 0 });
-            try row.putOwnedKey("turn_id", .{ .string = "" });
-            try row.putOwnedKey("question", st_row.valueOrNull("kind"));
-            try row.putOwnedKey("selected_route", st_row.valueOrNull("selected_route"));
-            try row.putOwnedKey("rejected_routes", st_row.valueOrNull("rejected_routes"));
-            try row.putOwnedKey("explicit_rationale", .{ .string = "controller artifact decision receipt" });
-            try row.putOwnedKey("explicit_assumptions", .{ .string = "" });
-            try row.putOwnedKey("evidence_refs", st_row.valueOrNull("evidence_refs"));
-            try row.putOwnedKey("source_kind", .{ .string = "st_workspace_controller_artifact" });
-            try row.putOwnedKey("confidence", .{ .float = 0.95 });
-            try row.putOwnedKey("contamination_flags", .{ .string = "[]" });
             try out_rows.append(allocator, row);
         }
     }
@@ -24313,9 +23999,6 @@ fn parseOptionsForCommand(cmd: lib.Command, args: []const []const u8) !Options {
     if (cmd == .execution_policy_audit and opts.strict_set and opts.strict) {
         opts.execution_policy_strict = true;
     }
-    if (cmd == .st_workspace_audit and opts.strict_set and opts.strict) {
-        opts.st_workspace_strict = true;
-    }
     if (cmd == .review_compiler_audit and opts.strict_set and opts.strict) {
         opts.review_compiler_strict = true;
     }
@@ -24609,18 +24292,6 @@ fn parseOptions(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
             opts.policy_root_text = args[i];
-        } else if (std.mem.eql(u8, arg, "--workspace-root")) {
-            i += 1;
-            if (i >= args.len) return error.MissingArgValue;
-            opts.workspace_root_text = args[i];
-        } else if (std.mem.eql(u8, arg, "--workspace-id")) {
-            i += 1;
-            if (i >= args.len) return error.MissingArgValue;
-            opts.workspace_id_text = args[i];
-        } else if (std.mem.eql(u8, arg, "--plan")) {
-            i += 1;
-            if (i >= args.len) return error.MissingArgValue;
-            opts.plan_text = args[i];
         } else if (std.mem.eql(u8, arg, "--receipt-path")) {
             i += 1;
             if (i >= args.len) return error.MissingArgValue;
@@ -25006,155 +24677,6 @@ test "execution-policy-audit exposes report modes and query datasets" {
     try std.testing.expect(std.mem.indexOf(u8, report_got, "## Transition calibration") != null);
     try std.testing.expect(std.mem.indexOf(u8, report_got, "## Regret candidates and retrace routes") != null);
     try std.testing.expect(std.mem.indexOf(u8, report_got, "higher_information_candidate") != null);
-}
-
-test "st-workspace-audit reconstructs workspace fixtures and avoids legacy mention false positives" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "ledger/st");
-    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/06/25");
-    const artifacts =
-        "{\"workspace_id\":\"ws-1\",\"repo\":\"/tmp/stwa-repo\",\"target_branch\":\"main\",\"first_seen\":\"2026-06-25T10:00:00Z\",\"last_seen\":\"2026-06-25T10:10:00Z\",\"sequences\":[1,2],\"branch_epochs\":[1],\"plans\":[\"plan-a\",\"plan-b\"],\"storage_mode\":\"ledger\",\"protocol_version\":\"STW-v1\"}\n" ++
-        "{\"workspace_id\":\"ws-1\",\"plan_id\":\"plan-a\",\"alias\":\"A\",\"state\":\"active\",\"source\":\"controller\",\"plan_sequences\":[1],\"items\":[\"a1\"],\"intent\":\"edit seq\",\"debt\":[],\"proof_status\":\"focused\",\"first_seen\":\"2026-06-25T10:00:00Z\",\"last_seen\":\"2026-06-25T10:05:00Z\"}\n" ++
-        "{\"workspace_id\":\"ws-1\",\"plan_id\":\"plan-b\",\"alias\":\"B\",\"state\":\"active\",\"source\":\"controller\",\"plan_sequences\":[1],\"items\":[\"b1\"],\"intent\":\"edit seq lib\",\"debt\":[],\"proof_status\":\"focused\",\"first_seen\":\"2026-06-25T10:00:00Z\",\"last_seen\":\"2026-06-25T10:05:00Z\"}\n" ++
-        "{\"workspace_id\":\"ws-1\",\"claim_id\":\"claim-a\",\"plan_id\":\"plan-a\",\"session_id\":\"agent-a\",\"executor\":\"worker\",\"item_ids\":[\"a1\"],\"resources\":[\"apps/seq/src\"],\"branch_epoch\":1,\"fencing_token\":\"tok-a\",\"state\":\"held\",\"claimed_at\":\"2026-06-25T10:01:00Z\"}\n" ++
-        "{\"workspace_id\":\"ws-1\",\"claim_id\":\"claim-b\",\"plan_id\":\"plan-b\",\"session_id\":\"agent-b\",\"executor\":\"worker\",\"item_ids\":[\"b1\"],\"resources\":[\"apps/seq/src/lib.zig\"],\"branch_epoch\":1,\"fencing_token\":\"tok-b\",\"state\":\"held\",\"claimed_at\":\"2026-06-25T10:02:00Z\"}\n" ++
-        "{\"workspace_id\":\"ws-1\",\"session_id\":\"agent-a\",\"plan_id\":\"plan-a\",\"claim_id\":\"claim-a\",\"projection_digest\":\"sha256:view-a\",\"selected_ids\":[\"plan-a:a1\"],\"workspace_seq\":2,\"plan_seq\":1,\"branch_epoch\":1,\"state\":\"current\"}\n" ++
-        "{\"workspace_id\":\"ws-1\",\"receipt_id\":\"ap-1\",\"allocations\":[\"plan-a\"],\"rejections\":[\"plan-b\"],\"parallel_width\":2,\"plans_considered\":[\"plan-a\",\"plan-b\"],\"fairness_state\":{\"round\":1}}\n" ++
-        "{\"receipt_version\":\"GCR-v2\",\"gcr_id\":\"gcr-1\",\"workspace_id\":\"ws-1\",\"plan_id\":\"plan-a\",\"session_id\":\"agent-a\",\"claim_id\":\"claim-a\",\"fencing_token\":\"tok-a\",\"workspace_seq\":2,\"plan_seq\":1,\"branch_epoch\":1,\"selected_tasks\":[\"plan-a:a1\"],\"execution_allowed\":true,\"denial_reasons\":[],\"current_at_mutation\":true}\n" ++
-        "{\"graph_control_receipt\":{\"receipt_version\":\"GCR-v2\",\"gcr_id\":\"gcr-graph-1\",\"workspace\":{\"workspace_id\":\"ws-1\",\"workspace_sequence\":2},\"plan\":{\"plan_id\":\"plan-a\",\"plan_sequence\":1},\"branch\":{\"epoch\":1},\"claim\":{\"claim_id\":\"claim-a\",\"fencing_token\":\"tok-a\"},\"graph\":{\"ready_frontier\":[\"a1\",\"a2\"],\"selected_frontier\":[\"a1\"],\"unselected_ready\":[\"a2\"],\"critical_path\":[\"a1\"],\"parallel_width\":2},\"proof\":{\"proof_cut_kind\":\"approximation\",\"minimum_proof_cut\":[\"proof-a1\"]},\"session_projection\":{\"session_id\":\"agent-a\"},\"execution_allowed\":\"yes\",\"denial_reasons\":[]}}\n" ++
-        "{\"graph_repair_receipt\":{\"receipt_version\":\"GRR-v1\",\"repair_id\":\"grr-1\",\"workspace\":{\"workspace_id\":\"ws-1\",\"workspace_sequence\":2},\"plan_id\":\"plan-a\",\"plan_sequence\":1,\"command\":\"st graph repair\",\"failure_class\":\"graph_audit_failure\",\"observed_exit_code\":2,\"blocking_debt\":[],\"current_status\":\"blocked\",\"execution_allowed\":false}}\n" ++
-        "{\"st_artifact_maintenance_receipt\":{\"receipt_version\":\"AMR-v1\",\"maintenance_id\":\"amr-1\",\"workspace\":\"ws-1\",\"operation\":\"delete_sidecar\",\"governing_workflow\":\"st\",\"artifact_paths\":[\".step/st-plan-sidecar.jsonl\"],\"mentioned_workflow_names\":[\"review-compiler\"],\"activation_signal\":false,\"controller_invocation\":false,\"reason\":\"duplicate sidecar durable state\",\"evidence_refs\":[]}}\n" ++
-        "{\"workspace_id\":\"ws-1\",\"change_set_id\":\"cs-1\",\"plan_id\":\"plan-a\",\"claim_id\":\"claim-a\",\"base_head\":\"abc\",\"branch_epoch\":1,\"changed_paths\":[\"apps/seq/src/lib.zig\"],\"uncovered_paths\":[],\"proof_refs\":[\"proof-1\"],\"status\":\"queued\"}\n" ++
-        "{\"change_set_id\":\"cs-1\",\"queue_sequence\":1,\"target_branch\":\"main\",\"head_before\":\"abc\",\"head_after\":\"def\",\"epoch_before\":1,\"epoch_after\":2,\"proof\":{\"receipt\":\"proof-1\"},\"result\":\"accepted\",\"latency\":\"2s\"}\n" ++
-        "{\"proof_ref\":\"proof-1\",\"plan_id\":\"plan-a\",\"scope\":\"focused\",\"epoch_before\":1,\"epoch_after\":2,\"foreign_change_set\":\"cs-foreign\",\"dependency_cut_intersection\":true,\"correctly_invalidated\":true}\n" ++
-        "{\"decision_id\":\"dec-claim-a\",\"kind\":\"claim_grant\",\"workspace_id\":\"ws-1\",\"plan_id\":\"plan-a\",\"session_id\":\"agent-a\",\"selected_route\":\"grant\",\"rejected_routes\":[\"deny\"]}\n";
-    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "ledger/st/artifacts.jsonl", .data = artifacts });
-
-    const session_lines =
-        "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"read for migration .step/st-plan.jsonl\"}]}}\n" ++
-        "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"artifact-under-repair mention .step/st-plan.jsonl\"}]}}\n" ++
-        "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"apply_patch\",\"arguments\":\"*** Update File: .step/st-plan.jsonl\\n+{}\\n\"}}\n";
-    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/06/25/run.jsonl", .data = session_lines });
-
-    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
-    defer std.testing.allocator.free(root_abs);
-    const workspace_root = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "ledger/st" });
-    defer std.testing.allocator.free(workspace_root);
-    const sessions_root = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "sessions" });
-    defer std.testing.allocator.free(sessions_root);
-    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "stwa.json" });
-    defer std.testing.allocator.free(output_path);
-
-    const summary = try runCommandWithOutput(std.testing.allocator, .st_workspace_audit, &.{
-        "--root",           sessions_root,
-        "--workspace-root", workspace_root,
-        "--mode",           "summary",
-        "--format",         "json",
-    }, output_path);
-    defer std.testing.allocator.free(summary);
-    try std.testing.expect(std.mem.indexOf(u8, summary, "\"audit_version\": \"STWA-v1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, summary, "\"workspaces\": 1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, summary, "\"plans\": 2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, summary, "\"claims\": 2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, summary, "\"conflicts\": 1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, summary, "\"legacy_writes\": 1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, summary, "\"p0\": 1") != null);
-
-    const gcr = try runCommandWithOutput(std.testing.allocator, .st_workspace_audit, &.{
-        "--workspace-root", workspace_root,
-        "--mode",           "gcr",
-        "--format",         "json",
-    }, output_path);
-    defer std.testing.allocator.free(gcr);
-    try std.testing.expect(std.mem.indexOf(u8, gcr, "\"gcr_id\": \"gcr-1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gcr, "\"execution_allowed\": true") != null);
-
-    const graph_control = try runCommandWithOutput(std.testing.allocator, .st_workspace_audit, &.{
-        "--workspace-root", workspace_root,
-        "--mode",           "graph-control",
-        "--format",         "json",
-    }, output_path);
-    defer std.testing.allocator.free(graph_control);
-    try std.testing.expect(std.mem.indexOf(u8, graph_control, "\"gcr_id\": \"gcr-graph-1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, graph_control, "\"unselected_ready\": \"[\\\"a2\\\"]\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, graph_control, "\"proof_cut_kind\": \"approximation\"") != null);
-
-    const graph_repair = try runCommandWithOutput(std.testing.allocator, .st_workspace_audit, &.{
-        "--workspace-root", workspace_root,
-        "--mode",           "graph-repair",
-        "--format",         "json",
-    }, output_path);
-    defer std.testing.allocator.free(graph_repair);
-    try std.testing.expect(std.mem.indexOf(u8, graph_repair, "\"repair_id\": \"grr-1\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, graph_repair, "\"failure_class\": \"graph_audit_failure\"") != null);
-
-    const workflow_provenance = try runCommandWithOutput(std.testing.allocator, .st_workspace_audit, &.{
-        "--workspace-root", workspace_root,
-        "--mode",           "workflow-provenance",
-        "--format",         "json",
-    }, output_path);
-    defer std.testing.allocator.free(workflow_provenance);
-    try std.testing.expect(std.mem.indexOf(u8, workflow_provenance, "\"workflow_name\": \"review-compiler\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, workflow_provenance, "\"evidence_class\": \"artifact_under_repair\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, workflow_provenance, "\"activation_signal\": false") != null);
-
-    const query_spec_template =
-        \\{"dataset":"st_resource_conflicts","params":{"workspace_root":"WORKSPACE_ROOT"},"select":["workspace_id","candidate_claim","other_claim","decision"],"format":"json"}
-    ;
-    const query_spec = try std.mem.replaceOwned(u8, std.testing.allocator, query_spec_template, "WORKSPACE_ROOT", workspace_root);
-    defer std.testing.allocator.free(query_spec);
-    const conflicts = try runCommandWithOutput(std.testing.allocator, .query, &.{
-        "--root", sessions_root,
-        "--spec", query_spec,
-    }, output_path);
-    defer std.testing.allocator.free(conflicts);
-    try std.testing.expect(std.mem.indexOf(u8, conflicts, "\"decision\": \"unsafe_grant\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, conflicts, "\"candidate_claim\": \"claim-b\"") != null);
-
-    const hist_spec_template =
-        \\{"dataset":"historical_decisions","params":{"workspace_root":"WORKSPACE_ROOT"},"select":["decision_id","source_kind","selected_route"],"format":"json"}
-    ;
-    const hist_spec = try std.mem.replaceOwned(u8, std.testing.allocator, hist_spec_template, "WORKSPACE_ROOT", workspace_root);
-    defer std.testing.allocator.free(hist_spec);
-    const decisions = try runCommandWithOutput(std.testing.allocator, .query, &.{
-        "--root", sessions_root,
-        "--spec", hist_spec,
-    }, output_path);
-    defer std.testing.allocator.free(decisions);
-    try std.testing.expect(std.mem.indexOf(u8, decisions, "\"decision_id\": \"dec-claim-a\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, decisions, "\"source_kind\": \"st_workspace_controller_artifact\"") != null);
-}
-
-test "st-workspace-audit validates modes, formats, and selectors" {
-    const opts = try parseOptionsForCommand(.st_workspace_audit, &.{
-        "--root",            "/tmp/sessions",
-        "--workspace-root",  "/tmp/repo/.ledger/st",
-        "--workspace-id",    "ws-1",
-        "--plan",            "plan-a",
-        "--session-id",      "agent-a",
-        "--last",            "2h",
-        "--exclude-current", "--mode",
-        "claims",            "--format",
-        "json",              "--strict",
-    });
-    try std.testing.expect(opts.st_workspace_strict);
-    try validateFormatForCommand(.st_workspace_audit, opts);
-    try validateCommandOptions(.st_workspace_audit, opts);
-
-    const invalid_mode_opts = try parseOptionsForCommand(.st_workspace_audit, &.{ "--workspace-root", "/tmp/st", "--mode", "mentions" });
-    try std.testing.expectError(error.InvalidModeArg, validateCommandOptions(.st_workspace_audit, invalid_mode_opts));
-
-    const report_markdown_opts = try parseOptionsForCommand(.st_workspace_audit, &.{ "--workspace-root", "/tmp/st", "--mode", "report", "--format", "markdown" });
-    try validateFormatForCommand(.st_workspace_audit, report_markdown_opts);
-    try validateCommandOptions(.st_workspace_audit, report_markdown_opts);
-
-    const summary_markdown_opts = try parseOptionsForCommand(.st_workspace_audit, &.{ "--workspace-root", "/tmp/st", "--format", "markdown" });
-    try std.testing.expectError(error.InvalidFormatForCommand, validateFormatForCommand(.st_workspace_audit, summary_markdown_opts));
-
-    const path_opts = try parseOptionsForCommand(.st_workspace_audit, &.{ "--path", "/tmp/session.jsonl" });
-    try std.testing.expectError(error.UnsupportedOption, validateCommandOptions(.st_workspace_audit, path_opts));
 }
 
 test "actuation-audit selectors are exact bounded and worker-visible" {
@@ -25878,7 +25400,7 @@ test "tool invocation datasets expose command text and flattened args" {
     try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{
         .sub_path = "2026/03/09/sample.jsonl",
         .data =
-        \\{"type":"response_item","timestamp":"2026-03-09T04:01:05Z","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"learnings recall --query \\\"Commit and push the changes for $st\\\" --limit 5 --drop-superseded\",\"workdir\":\"/Users/tk/.dotfiles\",\"yield_time_ms\":1000}"}}
+        \\{"type":"response_item","timestamp":"2026-03-09T04:01:05Z","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"learnings recall --query \\\"Commit and push the release changes\\\" --limit 5 --drop-superseded\",\"workdir\":\"/Users/tk/.dotfiles\",\"yield_time_ms\":1000}"}}
         \\{"type":"response_item","timestamp":"2026-03-09T04:01:06Z","payload":{"type":"function_call_output","call_id":"call-1","output":"Chunk ID: aa\nWall time: 0.050 seconds\nProcess exited with code 0\nOutput:\n"}}
         \\
         ,
@@ -26801,7 +26323,6 @@ test "capabilities advertises resolve intent closed audit flags" {
     try std.testing.expect(std.mem.indexOf(u8, got, "\"execution_policy_audit_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"c3_count_evidence_refs_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"workflow_provenance_mode_v1\": true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, got, "\"st_graph_control_receipt_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"epg_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"policy_transition_dataset_v1\": true") != null);
 }
@@ -27219,13 +26740,13 @@ test "review-compiler-audit c3 protocol treats review-compiler artifact repair a
     try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "sessions/2026/05/15");
     const incidental =
         "{\"type\":\"session_meta\",\"timestamp\":\"2026-05-15T08:00:00Z\",\"payload\":{\"id\":\"c3-artifact-repair\",\"cwd\":\"/repo\",\"model\":\"gpt-5\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:01Z\",\"payload\":{\"type\":\"user_message\",\"turn_id\":\"r1\",\"message\":\"Canonical $st intake should replace the retired review-compiler staged plan.\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:02Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"r1\",\"message\":\"Retiring .step/st-plan-sidecar.jsonl in favor of canonical .step/st-plan.jsonl.\"}}\n" ++
-        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-15T08:00:03Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"apply_patch\",\"call_id\":\"delete-old-plan\",\"arguments\":\"*** Delete File: .step/st-plan-sidecar.jsonl\\n\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:01Z\",\"payload\":{\"type\":\"user_message\",\"turn_id\":\"r1\",\"message\":\"Canonical review-compiler intake should replace the retired staged plan.\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:02Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"r1\",\"message\":\"Retiring .ledger/c3/tmp/plan-sidecar.jsonl in favor of canonical .ledger/c3/tmp/plan.jsonl.\"}}\n" ++
+        "{\"type\":\"response_item\",\"timestamp\":\"2026-05-15T08:00:03Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"apply_patch\",\"call_id\":\"delete-old-plan\",\"arguments\":\"*** Delete File: .ledger/c3/tmp/plan-sidecar.jsonl\\n\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:04Z\",\"payload\":{\"type\":\"patch_apply_end\",\"turn_id\":\"r1\",\"call_id\":\"delete-old-plan\",\"success\":true,\"cwd\":\"/repo\",\"changes\":{\"files\":1}}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:05Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"r1\",\"call_id\":\"jq-read\",\"command\":\"jq -c . .step/st-plan-sidecar.jsonl\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"{}\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:06Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"r1\",\"call_id\":\"git-diff\",\"command\":\"git diff -- .step/st-plan-sidecar.jsonl .step/st-plan.jsonl\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"diff\"}}\n" ++
-        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:07Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"r1\",\"call_id\":\"git-add\",\"command\":\"git add .step/st-plan-sidecar.jsonl .step/st-plan.jsonl\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:05Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"r1\",\"call_id\":\"jq-read\",\"command\":\"jq -c . .ledger/c3/tmp/plan-sidecar.jsonl\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"{}\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:06Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"r1\",\"call_id\":\"git-diff\",\"command\":\"git diff -- .ledger/c3/tmp/plan-sidecar.jsonl .ledger/c3/tmp/plan.jsonl\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"diff\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:07Z\",\"payload\":{\"type\":\"exec_command_end\",\"turn_id\":\"r1\",\"call_id\":\"git-add\",\"command\":\"git add .ledger/c3/tmp/plan-sidecar.jsonl .ledger/c3/tmp/plan.jsonl\",\"cwd\":\"/repo\",\"exit_code\":0,\"stdout\":\"\"}}\n" ++
         "{\"type\":\"event_msg\",\"timestamp\":\"2026-05-15T08:00:08Z\",\"payload\":{\"type\":\"agent_message\",\"turn_id\":\"r1\",\"message\":\"$actuating $land complete; PR merged; goal complete; worktree clean.\"}}\n";
     try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "sessions/2026/05/15/rollout-c3-artifact-repair.jsonl", .data = incidental });
 

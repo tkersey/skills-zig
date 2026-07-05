@@ -86,13 +86,13 @@ const TextStats = struct {
     review_fold_count: usize = 0,
     raw_review_patch_count: usize = 0,
     direct_action_fused_count: usize = 0,
-    st_governed_count: usize = 0,
+    controller_governed_count: usize = 0,
     cached_cas_counted_fresh_count: usize = 0,
     ship_effect_count: usize = 0,
     publication_boundary_count: usize = 0,
 
     fn anyGovernance(self: TextStats) bool {
-        return self.alsr_count > 0 or self.hyl_count > 0 or self.hsr_step_count > 0 or self.resume_packet_count > 0 or self.directActionFused() or self.stGoverned();
+        return self.alsr_count > 0 or self.hyl_count > 0 or self.hsr_step_count > 0 or self.resume_packet_count > 0 or self.directActionFused() or self.controllerGoverned();
     }
 
     fn directActionFused(self: TextStats) bool {
@@ -102,8 +102,8 @@ const TextStats = struct {
             self.ship_effect_count == 0;
     }
 
-    fn stGoverned(self: TextStats) bool {
-        return self.st_governed_count > 0;
+    fn controllerGoverned(self: TextStats) bool {
+        return self.controller_governed_count > 0;
     }
 };
 
@@ -140,7 +140,7 @@ pub fn analyzeTrace(trace: canonical_trace.CanonicalSessionTrace, true_run: bool
 
     const unfold_capacity = @max(stats.unfold_count, stats.hsr_step_count);
     summary.mutations_with_unfold = @min(summary.mutations, unfold_capacity);
-    if (stats.directActionFused() or stats.stGoverned()) summary.mutations_with_unfold = summary.mutations;
+    if (stats.directActionFused() or stats.controllerGoverned()) summary.mutations_with_unfold = summary.mutations;
     summary.actions_without_fold = stats.action_count -| stats.fold_count;
     summary.continues_without_next_state = stats.continue_count -| stats.next_state_count;
     summary.atcg_after_terminal_fold = if (stats.terminal_fold_count > 0) @min(stats.terminal_fold_count, stats.atcg_count) else 0;
@@ -255,7 +255,7 @@ fn scanActiveText(text: []const u8, stats: *TextStats) void {
     stats.review_fold_count += countAny(text, &.{ "$review-fold", "review-fold", "review_fold" });
     stats.raw_review_patch_count += countAny(text, &.{ "raw_review_to_patch", "Finding -> Patch" });
     stats.direct_action_fused_count += countAny(text, &.{ "direct_action_fused: yes", "direct_action fused exemption" });
-    stats.st_governed_count += countAny(text, &.{ "st_governed_handoff: yes", "$st owns the work", "st-owned" });
+    stats.controller_governed_count += countAny(text, &.{ "controller_governed_handoff: yes", "controller owns the work", "controller-owned" });
     stats.cached_cas_counted_fresh_count += countAny(text, &.{ "cached_cas_counted_as_fresh", "cas_receipt_cache_hit: yes\ncounted_as_fresh: yes" });
     stats.ship_effect_count += countAny(text, &.{ "ship_handoff:", "$ship", "gh pr create", "gh pr edit", "gh pr ready", "gh pr merge" });
     stats.publication_boundary_count += countAny(text, &.{ "publication_boundary: yes", "ship_result:", "ADD-v1" });
@@ -279,7 +279,7 @@ fn passiveSpecDiscussion(text: []const u8) bool {
 }
 
 fn applyFailures(summary: *RunSummary, stats: TextStats) void {
-    const governance_exempt = stats.directActionFused() or stats.stGoverned();
+    const governance_exempt = stats.directActionFused() or stats.controllerGoverned();
     if (!governance_exempt and !summary.alsr_present) addFailure(summary, .missing_alsr);
     if (!governance_exempt and !summary.hyl_present) addFailure(summary, .missing_hyl);
     if (!governance_exempt and (summary.hsr_step_count == 0 or stats.unfold_count == 0)) addFailure(summary, .missing_unfold);
@@ -300,7 +300,7 @@ fn applyFailures(summary: *RunSummary, stats: TextStats) void {
 fn qualityState(summary: RunSummary, stats: TextStats) []const u8 {
     if (stats.contradictory_count > 0) return quality_state_names[@intFromEnum(QualityState.contradictory)];
     if (stats.stale_count > 0) return quality_state_names[@intFromEnum(QualityState.stale)];
-    if ((stats.directActionFused() or stats.stGoverned()) and summary.terminal_folds > 0 and summary.atcg_after_terminal_fold > 0) return quality_state_names[@intFromEnum(QualityState.present_and_closed)];
+    if ((stats.directActionFused() or stats.controllerGoverned()) and summary.terminal_folds > 0 and summary.atcg_after_terminal_fold > 0) return quality_state_names[@intFromEnum(QualityState.present_and_closed)];
     if (!summary.alsr_present and !summary.hyl_present and summary.hsr_step_count == 0) return quality_state_names[@intFromEnum(QualityState.absent)];
     if (!summary.alsr_present or !summary.hyl_present or summary.hsr_step_count == 0) return quality_state_names[@intFromEnum(QualityState.partial)];
     if (summary.terminal_folds > 0 and summary.atcg_after_terminal_fold > 0 and !containsFailure(summary, .terminal_without_atcg)) return quality_state_names[@intFromEnum(QualityState.present_and_closed)];
