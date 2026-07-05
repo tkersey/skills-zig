@@ -242,7 +242,7 @@ pub const dataset_meta = [_]DatasetMeta{
     .{
         .name = "actuation_runs",
         .description = "SEQ-ACTRUN-v1 actuation run ledger projections",
-        .fields = &.{ "run_id", "session_id", "path", "repo", "branch", "true_actuating", "verdict", "graph.compile_attempts", "graph.compile_failures", "graph.mutations_without_gcr", "projection.update_plan_calls", "surface.churn.apply_patch_calls", "worker_inclusion", "diagnostic_query_json" },
+        .fields = &.{ "run_id", "session_id", "path", "repo", "branch", "true_actuating", "verdict", "graph.compile_attempts", "graph.compile_failures", "graph.mutations_without_gcr", "projection.update_plan_calls", "surface.churn.apply_patch_calls", "rk_class", "rk_conf", "rk_patch", "rk_no_gcr", "refactor_kernel.classification", "refactor_kernel.confidence", "refactor_kernel.formal_decision_present", "refactor_kernel.outcome_present", "refactor_kernel.explicit_phrase_present", "refactor_kernel.selected_route_present", "refactor_kernel.next_resolution_mode_present", "refactor_kernel.potential_hidden_kernel", "refactor_kernel.graph_bypass", "refactor_kernel.patch_calls", "refactor_kernel.update_plan_calls", "refactor_kernel.mutations_without_graph_control", "refactor_kernel.accepted_liability_markers", "refactor_kernel.owner_boundary_markers", "refactor_kernel.review_fold_markers", "refactor_kernel.cas_bottleneck_markers", "refactor_kernel.rko_graph_bypass_yes", "refactor_kernel.rko_mutations_without_control_nonzero", "refactor_kernel.reasons", "worker_inclusion", "diagnostic_query_json" },
     },
     .{
         .name = "actuation_slices",
@@ -3554,6 +3554,18 @@ fn cmdActuationAudit(allocator: std.mem.Allocator, sessions_root: []const u8, op
         try writeTextOutput(rendered, opts.out_path);
         return;
     }
+    if (std.mem.eql(u8, mode, "runs") and (opts.format == .json or opts.format == .jsonl)) {
+        const rendered = try renderActuationRunsJson(allocator, rows.items, opts.format == .jsonl);
+        defer allocator.free(rendered);
+        try writeTextOutput(rendered, opts.out_path);
+        return;
+    }
+    if ((std.mem.eql(u8, mode, "summary") or std.mem.eql(u8, mode, "report")) and opts.format == .json) {
+        const rendered = try renderActuationSummaryJson(allocator, rows.items);
+        defer allocator.free(rendered);
+        try writeTextOutput(rendered, opts.out_path);
+        return;
+    }
 
     const cols = actuationColumnsForMode(mode);
     try output.writeOutput(allocator, opts.format, rows.items, cols, opts.out_path);
@@ -4010,6 +4022,7 @@ fn cmdActuationAuditReport(allocator: std.mem.Allocator, sessions_root: []const 
         if (std.mem.eql(u8, verdict, "projection_inversion") or std.mem.eql(u8, verdict, "graph_bypass")) violations += 1;
     }
     try writer.print("- control_failures: {d}\n\n", .{violations});
+    try writeRefactorKernelReportSection(writer, summarizeRefactorKernelRows(rows.items));
     try writer.writeAll("| session_id | verdict | compile_failures | mutations_without_gcr |\n");
     try writer.writeAll("| --- | --- | ---: | ---: |\n");
     for (rows.items) |row| {
@@ -4036,14 +4049,213 @@ fn actuationDatasetForMode(mode: []const u8) []const u8 {
 }
 
 fn actuationColumnsForMode(mode: []const u8) []const []const u8 {
-    if (std.mem.eql(u8, mode, "summary")) return &.{ "session_id", "true_actuating", "verdict", "graph.compile_attempts", "graph.compile_failures", "graph.mutations_without_gcr", "projection.update_plan_calls", "surface.churn.apply_patch_calls" };
-    if (std.mem.eql(u8, mode, "runs")) return findDatasetMeta("actuation_runs").?.fields;
+    if (std.mem.eql(u8, mode, "summary")) return &.{ "session_id", "true_actuating", "verdict", "graph.compile_attempts", "graph.compile_failures", "graph.mutations_without_gcr", "projection.update_plan_calls", "surface.churn.apply_patch_calls", "rk_class", "rk_conf", "rk_patch", "rk_no_gcr" };
+    if (std.mem.eql(u8, mode, "runs")) return &.{ "run_id", "session_id", "path", "repo", "branch", "true_actuating", "verdict", "graph.compile_attempts", "graph.compile_failures", "graph.mutations_without_gcr", "projection.update_plan_calls", "surface.churn.apply_patch_calls", "rk_class", "rk_conf", "rk_patch", "rk_no_gcr", "worker_inclusion", "diagnostic_query_json" };
     if (std.mem.eql(u8, mode, "slices")) return findDatasetMeta("actuation_slices").?.fields;
     if (std.mem.eql(u8, mode, "decisions")) return findDatasetMeta("actuation_decisions").?.fields;
     if (std.mem.eql(u8, mode, "proof")) return findDatasetMeta("actuation_proofs").?.fields;
     if (std.mem.eql(u8, mode, "compactions")) return findDatasetMeta("actuation_compactions").?.fields;
     if (std.mem.eql(u8, mode, "hylo")) return findDatasetMeta("actuation_hylo_runs").?.fields;
     return findDatasetMeta("actuation_runs").?.fields;
+}
+
+const refactor_kernel_class_names = [_][]const u8{
+    "governed_refactor_kernel",
+    "governed_refactor_kernel_with_control_violation",
+    "refactor_kernel_decision_missing_outcome",
+    "potential_hidden_refactor_kernel_explicit",
+    "potential_hidden_refactor_kernel_inferred",
+    "large_graph_bypass_unclassified",
+    "ordinary_graph_bypass",
+};
+
+const RefactorKernelClassTotals = struct {
+    sessions: i64 = 0,
+    patch_calls: i64 = 0,
+    mutations_without_graph_control: i64 = 0,
+};
+
+const RefactorKernelSummary = struct {
+    classes: [refactor_kernel_class_names.len]RefactorKernelClassTotals = .{RefactorKernelClassTotals{}} ** refactor_kernel_class_names.len,
+    potential_hidden_patch_calls: i64 = 0,
+    potential_hidden_mutations_without_graph_control: i64 = 0,
+    formal_decision_present: i64 = 0,
+    outcome_present: i64 = 0,
+};
+
+fn renderActuationRunsJson(allocator: std.mem.Allocator, rows: []const query.Row, jsonl: bool) ![]u8 {
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+    if (jsonl) {
+        for (rows) |row| {
+            try writeActuationRunJsonObject(writer, row);
+            try writer.writeByte('\n');
+        }
+    } else {
+        try writer.writeAll("[\n");
+        for (rows, 0..) |row, idx| {
+            if (idx > 0) try writer.writeAll(",\n");
+            try writer.writeAll("  ");
+            try writeActuationRunJsonObject(writer, row);
+        }
+        if (rows.len > 0) try writer.writeByte('\n');
+        try writer.writeAll("]\n");
+    }
+    return writer_alloc.toOwnedSlice();
+}
+
+fn writeActuationRunJsonObject(writer: anytype, row: query.Row) !void {
+    var first = true;
+    try writer.writeByte('{');
+    try writeNamedScalar(writer, "run_id", row.valueOrNull("run_id"), &first);
+    try writeNamedScalar(writer, "session_id", row.valueOrNull("session_id"), &first);
+    try writeNamedScalar(writer, "path", row.valueOrNull("path"), &first);
+    try writeNamedScalar(writer, "repo", row.valueOrNull("repo"), &first);
+    try writeNamedScalar(writer, "branch", row.valueOrNull("branch"), &first);
+    try writeNamedScalar(writer, "true_actuating", row.valueOrNull("true_actuating"), &first);
+    try writeNamedScalar(writer, "verdict", row.valueOrNull("verdict"), &first);
+    try writeNamedScalar(writer, "graph.compile_attempts", row.valueOrNull("graph.compile_attempts"), &first);
+    try writeNamedScalar(writer, "graph.compile_failures", row.valueOrNull("graph.compile_failures"), &first);
+    try writeNamedScalar(writer, "graph.mutations_without_gcr", row.valueOrNull("graph.mutations_without_gcr"), &first);
+    try writeNamedScalar(writer, "projection.update_plan_calls", row.valueOrNull("projection.update_plan_calls"), &first);
+    try writeNamedScalar(writer, "surface.churn.apply_patch_calls", row.valueOrNull("surface.churn.apply_patch_calls"), &first);
+    try writeNamedObjectPrefix(writer, "refactor_kernel", &first);
+    try writeRefactorKernelRowJson(writer, row);
+    try writeNamedScalar(writer, "worker_inclusion", row.valueOrNull("worker_inclusion"), &first);
+    try writeNamedScalar(writer, "diagnostic_query_json", row.valueOrNull("diagnostic_query_json"), &first);
+    try writer.writeByte('}');
+}
+
+fn writeRefactorKernelRowJson(writer: anytype, row: query.Row) !void {
+    var first = true;
+    try writer.writeByte('{');
+    try writeNamedScalar(writer, "classification", row.valueOrNull("refactor_kernel.classification"), &first);
+    try writeNamedScalar(writer, "confidence", row.valueOrNull("refactor_kernel.confidence"), &first);
+    try writeNamedScalar(writer, "formal_decision_present", row.valueOrNull("refactor_kernel.formal_decision_present"), &first);
+    try writeNamedScalar(writer, "outcome_present", row.valueOrNull("refactor_kernel.outcome_present"), &first);
+    try writeNamedScalar(writer, "explicit_phrase_present", row.valueOrNull("refactor_kernel.explicit_phrase_present"), &first);
+    try writeNamedScalar(writer, "selected_route_present", row.valueOrNull("refactor_kernel.selected_route_present"), &first);
+    try writeNamedScalar(writer, "next_resolution_mode_present", row.valueOrNull("refactor_kernel.next_resolution_mode_present"), &first);
+    try writeNamedScalar(writer, "potential_hidden_kernel", row.valueOrNull("refactor_kernel.potential_hidden_kernel"), &first);
+    try writeNamedScalar(writer, "graph_bypass", row.valueOrNull("refactor_kernel.graph_bypass"), &first);
+    try writeNamedScalar(writer, "patch_calls", row.valueOrNull("refactor_kernel.patch_calls"), &first);
+    try writeNamedScalar(writer, "update_plan_calls", row.valueOrNull("refactor_kernel.update_plan_calls"), &first);
+    try writeNamedScalar(writer, "mutations_without_graph_control", row.valueOrNull("refactor_kernel.mutations_without_graph_control"), &first);
+    try writeNamedScalar(writer, "accepted_liability_markers", row.valueOrNull("refactor_kernel.accepted_liability_markers"), &first);
+    try writeNamedScalar(writer, "owner_boundary_markers", row.valueOrNull("refactor_kernel.owner_boundary_markers"), &first);
+    try writeNamedScalar(writer, "review_fold_markers", row.valueOrNull("refactor_kernel.review_fold_markers"), &first);
+    try writeNamedScalar(writer, "cas_bottleneck_markers", row.valueOrNull("refactor_kernel.cas_bottleneck_markers"), &first);
+    try writeNamedScalar(writer, "rko_graph_bypass_yes", row.valueOrNull("refactor_kernel.rko_graph_bypass_yes"), &first);
+    try writeNamedScalar(writer, "rko_mutations_without_control_nonzero", row.valueOrNull("refactor_kernel.rko_mutations_without_control_nonzero"), &first);
+    try writer.writeAll(",\"reasons\":");
+    try writer.writeAll(scalarString(row.valueOrNull("refactor_kernel.reasons")) orelse "[]");
+    try writer.writeByte('}');
+}
+
+fn writeNamedScalar(writer: anytype, name: []const u8, value: spec.Scalar, first: *bool) !void {
+    if (!first.*) try writer.writeByte(',');
+    first.* = false;
+    try output.writeJsonString(writer, name);
+    try writer.writeByte(':');
+    try output.writeScalarJson(writer, value);
+}
+
+fn writeNamedObjectPrefix(writer: anytype, name: []const u8, first: *bool) !void {
+    if (!first.*) try writer.writeByte(',');
+    first.* = false;
+    try output.writeJsonString(writer, name);
+    try writer.writeByte(':');
+}
+
+fn renderStringArrayJson(allocator: std.mem.Allocator, values: []const []u8) ![]u8 {
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    try actuation_audit.render.writeStringArray(&writer_alloc.writer, values);
+    return writer_alloc.toOwnedSlice();
+}
+
+fn renderActuationSummaryJson(allocator: std.mem.Allocator, rows: []const query.Row) ![]u8 {
+    const summary = summarizeRefactorKernelRows(rows);
+    var writer_alloc = std.Io.Writer.Allocating.init(allocator);
+    defer writer_alloc.deinit();
+    const writer = &writer_alloc.writer;
+    try writer.writeAll("{\n  \"included_runs\": ");
+    try writer.print("{d}", .{rows.len});
+    try writer.writeAll(",\n  \"refactor_kernel\": {");
+    try writeRefactorKernelSummaryFields(writer, summary, "    ", true);
+    try writer.writeAll("\n  }\n}\n");
+    return writer_alloc.toOwnedSlice();
+}
+
+fn writeRefactorKernelSummaryFields(writer: anytype, summary: RefactorKernelSummary, indent: []const u8, pretty: bool) !void {
+    for (refactor_kernel_class_names, 0..) |name, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        if (pretty) {
+            try writer.writeByte('\n');
+            try writer.writeAll(indent);
+        }
+        try output.writeJsonString(writer, name);
+        try writer.writeAll(if (pretty) ": " else ":");
+        try writer.print("{d}", .{summary.classes[idx].sessions});
+    }
+    try writeSummaryIntField(writer, "potential_hidden_patch_calls", summary.potential_hidden_patch_calls, indent, pretty);
+    try writeSummaryIntField(writer, "potential_hidden_mutations_without_graph_control", summary.potential_hidden_mutations_without_graph_control, indent, pretty);
+    try writeSummaryIntField(writer, "formal_decision_present", summary.formal_decision_present, indent, pretty);
+    try writeSummaryIntField(writer, "outcome_present", summary.outcome_present, indent, pretty);
+}
+
+fn writeSummaryIntField(writer: anytype, name: []const u8, value: i64, indent: []const u8, pretty: bool) !void {
+    try writer.writeByte(',');
+    if (pretty) {
+        try writer.writeByte('\n');
+        try writer.writeAll(indent);
+    }
+    try output.writeJsonString(writer, name);
+    try writer.writeAll(if (pretty) ": " else ":");
+    try writer.print("{d}", .{value});
+}
+
+fn summarizeRefactorKernelRows(rows: []const query.Row) RefactorKernelSummary {
+    var summary = RefactorKernelSummary{};
+    for (rows) |row| {
+        const class = scalarString(row.valueOrNull("refactor_kernel.classification")) orelse "none";
+        const patch_calls = scalarIntOrZero(row.valueOrNull("refactor_kernel.patch_calls"));
+        const mutations_without_graph_control = scalarIntOrZero(row.valueOrNull("refactor_kernel.mutations_without_graph_control"));
+        if (refactorKernelClassIndex(class)) |idx| {
+            summary.classes[idx].sessions += 1;
+            summary.classes[idx].patch_calls += patch_calls;
+            summary.classes[idx].mutations_without_graph_control += mutations_without_graph_control;
+        }
+        if (std.mem.eql(u8, class, "potential_hidden_refactor_kernel_explicit") or std.mem.eql(u8, class, "potential_hidden_refactor_kernel_inferred")) {
+            summary.potential_hidden_patch_calls += patch_calls;
+            summary.potential_hidden_mutations_without_graph_control += mutations_without_graph_control;
+        }
+        if (scalarBool(row.valueOrNull("refactor_kernel.formal_decision_present"))) summary.formal_decision_present += 1;
+        if (scalarBool(row.valueOrNull("refactor_kernel.outcome_present"))) summary.outcome_present += 1;
+    }
+    return summary;
+}
+
+fn refactorKernelClassIndex(class: []const u8) ?usize {
+    for (refactor_kernel_class_names, 0..) |name, idx| {
+        if (std.mem.eql(u8, class, name)) return idx;
+    }
+    return null;
+}
+
+fn writeRefactorKernelReportSection(writer: anytype, summary: RefactorKernelSummary) !void {
+    try writer.writeAll("## Refactor-Kernel Signal Classification\n\n");
+    try writer.writeAll("| Class | Sessions | Patch calls | Mutations without graph/control |\n");
+    try writer.writeAll("|---|---:|---:|---:|\n");
+    for (refactor_kernel_class_names, 0..) |name, idx| {
+        const totals = summary.classes[idx];
+        try writer.print("| {s} | {d} | {d} | {d} |\n", .{ name, totals.sessions, totals.patch_calls, totals.mutations_without_graph_control });
+    }
+    try writer.writeAll("\n");
+    try writer.writeAll("Potential hidden refactor-kernel is observational evidence, not causal proof.\n");
+    try writer.writeAll("Formal AER/RKO evidence proves route legibility, not successful closure.\n");
+    try writer.writeAll("Graph-bypass inside governed refactor-kernel remains a governance failure.\n\n");
 }
 
 fn renderActuationHyloSummaryJson(allocator: std.mem.Allocator, rows: []const query.Row) ![]u8 {
@@ -21232,6 +21444,31 @@ fn appendActuationRunRow(
     try row.putStaticKey("graph.mutations_without_gcr", .{ .int = @intCast(graph.material_mutations_without_current_executable_gcr) });
     try row.putStaticKey("projection.update_plan_calls", .{ .int = @intCast(graph.projection.update_plan_calls) });
     try row.putStaticKey("surface.churn.apply_patch_calls", .{ .int = @intCast(churn.apply_patch_calls) });
+    try row.putStaticKey("rk_class", .{ .string = ledger.refactor_kernel.classification });
+    try row.putStaticKey("rk_conf", .{ .string = ledger.refactor_kernel.confidence });
+    try row.putStaticKey("rk_patch", .{ .int = @intCast(ledger.refactor_kernel.patch_calls) });
+    try row.putStaticKey("rk_no_gcr", .{ .int = @intCast(ledger.refactor_kernel.mutations_without_graph_control) });
+    try row.putStaticKey("refactor_kernel.classification", .{ .string = ledger.refactor_kernel.classification });
+    try row.putStaticKey("refactor_kernel.confidence", .{ .string = ledger.refactor_kernel.confidence });
+    try row.putStaticKey("refactor_kernel.formal_decision_present", .{ .bool = ledger.refactor_kernel.formal_decision_present });
+    try row.putStaticKey("refactor_kernel.outcome_present", .{ .bool = ledger.refactor_kernel.outcome_present });
+    try row.putStaticKey("refactor_kernel.explicit_phrase_present", .{ .bool = ledger.refactor_kernel.explicit_phrase_present });
+    try row.putStaticKey("refactor_kernel.selected_route_present", .{ .bool = ledger.refactor_kernel.selected_route_present });
+    try row.putStaticKey("refactor_kernel.next_resolution_mode_present", .{ .bool = ledger.refactor_kernel.next_resolution_mode_present });
+    try row.putStaticKey("refactor_kernel.potential_hidden_kernel", .{ .bool = ledger.refactor_kernel.potential_hidden_kernel });
+    try row.putStaticKey("refactor_kernel.graph_bypass", .{ .bool = ledger.refactor_kernel.graph_bypass });
+    try row.putStaticKey("refactor_kernel.patch_calls", .{ .int = @intCast(ledger.refactor_kernel.patch_calls) });
+    try row.putStaticKey("refactor_kernel.update_plan_calls", .{ .int = @intCast(ledger.refactor_kernel.update_plan_calls) });
+    try row.putStaticKey("refactor_kernel.mutations_without_graph_control", .{ .int = @intCast(ledger.refactor_kernel.mutations_without_graph_control) });
+    try row.putStaticKey("refactor_kernel.accepted_liability_markers", .{ .int = @intCast(ledger.refactor_kernel.accepted_liability_markers) });
+    try row.putStaticKey("refactor_kernel.owner_boundary_markers", .{ .int = @intCast(ledger.refactor_kernel.owner_boundary_markers) });
+    try row.putStaticKey("refactor_kernel.review_fold_markers", .{ .int = @intCast(ledger.refactor_kernel.review_fold_markers) });
+    try row.putStaticKey("refactor_kernel.cas_bottleneck_markers", .{ .int = @intCast(ledger.refactor_kernel.cas_bottleneck_markers) });
+    try row.putStaticKey("refactor_kernel.rko_graph_bypass_yes", .{ .bool = ledger.refactor_kernel.rko_graph_bypass_yes });
+    try row.putStaticKey("refactor_kernel.rko_mutations_without_control_nonzero", .{ .bool = ledger.refactor_kernel.rko_mutations_without_control_nonzero });
+    const rk_reasons_json = try renderStringArrayJson(allocator, ledger.refactor_kernel.reasons);
+    defer allocator.free(rk_reasons_json);
+    try row.putStaticKey("refactor_kernel.reasons", .{ .string = rk_reasons_json });
     try row.putStaticKey("worker_inclusion", .{ .bool = ledger.corpus_snapshot.worker_inclusion });
     try row.putStaticKey("diagnostic_query_json", .{ .string = ledger.diagnostic_query_json });
     try rows.append(allocator, row);
@@ -24950,9 +25187,9 @@ test "actuation-audit selectors are exact bounded and worker-visible" {
         "--include-workers",
     }, output_path);
     defer std.testing.allocator.free(exact);
-    try std.testing.expect(std.mem.indexOf(u8, exact, "\"session_id\": \"abc\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, exact, "\"session_id\": \"xabc\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, exact, "\"worker_inclusion\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exact, "\"session_id\":\"abc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, exact, "\"session_id\":\"xabc\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, exact, "\"worker_inclusion\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, exact, "classification.true_actuating") == null);
     try std.testing.expect(std.mem.indexOf(u8, exact, "\\\"true_actuating\\\"") != null);
 
@@ -24965,9 +25202,9 @@ test "actuation-audit selectors are exact bounded and worker-visible" {
         "--format", "json",
     }, output_path);
     defer std.testing.allocator.free(scoped);
-    try std.testing.expect(std.mem.indexOf(u8, scoped, "\"session_id\": \"abc\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, scoped, "\"session_id\": \"xabc\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, scoped, "\"worker_inclusion\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scoped, "\"session_id\":\"abc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scoped, "\"session_id\":\"xabc\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, scoped, "\"worker_inclusion\":false") != null);
 
     const decisions = try runCommandWithOutput(std.testing.allocator, .actuation_audit, &.{
         "--root",       root_abs,

@@ -36,6 +36,7 @@ comptime {
     _ = @import("historical_decisions.zig");
     _ = @import("decision_capsule.zig");
     _ = @import("actuation_audit.zig");
+    _ = @import("actuation/refactor_kernel.zig");
     _ = @import("cas_review_audit.zig");
     _ = @import("resolve_intent_closed/mod.zig");
     _ = @import("datasets/tool_calls.zig");
