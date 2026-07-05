@@ -1,0 +1,7 @@
+{"type":"session_meta","timestamp":"2026-07-05T13:00:00Z","payload":{"id":"rk-ordinary-graph-bypass","cwd":"/repo/seq-audit","model":"gpt-5","git":{"branch":"rk-audit","commit_hash":"head-rk-ordinary"}}}
+{"type":"event_msg","timestamp":"2026-07-05T13:00:01Z","payload":{"type":"task_started","turn_id":"t1"}}
+{"type":"event_msg","timestamp":"2026-07-05T13:00:02Z","payload":{"type":"user_message","turn_id":"t1","message":"$actuating ordinary uncontrolled patch."}}
+{"type":"event_msg","timestamp":"2026-07-05T13:00:03Z","payload":{"type":"agent_message","turn_id":"t1","message":"Single uncontrolled implementation patch."}}
+{"type":"response_item","timestamp":"2026-07-05T13:00:04Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-1","arguments":"*** Begin Patch\n*** Update File: one.txt\n+one\n*** End Patch"}}
+{"type":"response_item","timestamp":"2026-07-05T13:00:05Z","payload":{"type":"function_call_output","call_id":"patch-1","output":"Success. Updated the following files:\nM one.txt\n"}}
+{"type":"event_msg","timestamp":"2026-07-05T13:00:06Z","payload":{"type":"task_complete","turn_id":"t1","duration_ms":6000}}

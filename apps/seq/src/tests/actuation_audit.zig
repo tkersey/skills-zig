@@ -72,6 +72,10 @@ fn fixturePath(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "testdata/actuation/hylo/{s}.jsonl", .{name});
 }
 
+fn refactorKernelFixturePath(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "testdata/actuation/refactor_kernel/{s}.jsonl", .{name});
+}
+
 fn expectJsonCount(allocator: std.mem.Allocator, got: []const u8, key: []const u8, count: usize) !void {
     const needle = try std.fmt.allocPrint(allocator, "\"{s}\": {d}", .{ key, count });
     defer allocator.free(needle);
@@ -314,20 +318,20 @@ test "actuation audit regression fixture exposes projection inversion signals" {
 
     const args = [_][]const u8{
         "--path",   fixture,
-        "--mode",   "summary",
+        "--mode",   "runs",
         "--format", "json",
     };
     const got = try runAndReadOutput(std.testing.allocator, .actuation_audit, args[0..], ".zig-cache/actuation-summary.json");
     defer std.testing.allocator.free(got);
 
-    try expectContains(got, "\"session_id\": \"actuation-long-run\"");
-    try expectContains(got, "\"true_actuating\": true");
-    try expectContains(got, "\"verdict\": \"projection_inversion\"");
-    try expectContains(got, "\"graph.compile_attempts\": 21");
-    try expectContains(got, "\"graph.compile_failures\": 20");
-    try expectContains(got, "\"graph.mutations_without_gcr\": 1");
-    try expectContains(got, "\"projection.update_plan_calls\": 192");
-    try expectContains(got, "\"surface.churn.apply_patch_calls\": 1");
+    try expectContains(got, "\"session_id\":\"actuation-long-run\"");
+    try expectContains(got, "\"true_actuating\":true");
+    try expectContains(got, "\"verdict\":\"projection_inversion\"");
+    try expectContains(got, "\"graph.compile_attempts\":21");
+    try expectContains(got, "\"graph.compile_failures\":20");
+    try expectContains(got, "\"graph.mutations_without_gcr\":1");
+    try expectContains(got, "\"projection.update_plan_calls\":192");
+    try expectContains(got, "\"surface.churn.apply_patch_calls\":1");
 }
 
 test "actuation audit datasets expose lineage proof compaction and query rows" {
@@ -447,17 +451,65 @@ test "actuation audit hylo mode excludes prompt contamination fixture" {
     try expectContains(got, "\"failure_classes\": {}");
 }
 
+test "actuation audit renders refactor-kernel run fixture classifications" {
+    const cases = [_]struct {
+        name: []const u8,
+        classification: []const u8,
+        confidence: []const u8,
+        hidden: bool = false,
+    }{
+        .{ .name = "explicit_hidden", .classification = "potential_hidden_refactor_kernel_explicit", .confidence = "high", .hidden = true },
+        .{ .name = "inferred_hidden", .classification = "potential_hidden_refactor_kernel_inferred", .confidence = "medium", .hidden = true },
+        .{ .name = "governed_complete", .classification = "governed_refactor_kernel", .confidence = "formal" },
+        .{ .name = "governed_control_violation", .classification = "governed_refactor_kernel_with_control_violation", .confidence = "formal" },
+        .{ .name = "decision_missing_outcome", .classification = "refactor_kernel_decision_missing_outcome", .confidence = "formal" },
+        .{ .name = "large_unclassified", .classification = "large_graph_bypass_unclassified", .confidence = "low" },
+        .{ .name = "ordinary_graph_bypass", .classification = "ordinary_graph_bypass", .confidence = "low" },
+        .{ .name = "report_contamination", .classification = "none", .confidence = "none" },
+    };
+
+    for (cases) |case| {
+        const path = try refactorKernelFixturePath(std.testing.allocator, case.name);
+        defer std.testing.allocator.free(path);
+        const out_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/actuation-rk-{s}.json", .{case.name});
+        defer std.testing.allocator.free(out_path);
+        const args = [_][]const u8{ "--path", path, "--mode", "runs", "--format", "json" };
+        const got = try runAndReadOutput(std.testing.allocator, .actuation_audit, args[0..], out_path);
+        defer std.testing.allocator.free(got);
+
+        try expectContains(got, "\"refactor_kernel\"");
+        const class_needle = try std.fmt.allocPrint(std.testing.allocator, "\"classification\":\"{s}\"", .{case.classification});
+        defer std.testing.allocator.free(class_needle);
+        try expectContains(got, class_needle);
+        const conf_needle = try std.fmt.allocPrint(std.testing.allocator, "\"confidence\":\"{s}\"", .{case.confidence});
+        defer std.testing.allocator.free(conf_needle);
+        try expectContains(got, conf_needle);
+        try expectContains(got, if (case.hidden) "\"potential_hidden_kernel\":true" else "\"potential_hidden_kernel\":false");
+    }
+}
+
+test "actuation audit aggregates refactor-kernel summary json" {
+    const args = [_][]const u8{ "--path", "testdata/actuation/refactor_kernel/explicit_hidden.jsonl", "--mode", "summary", "--format", "json" };
+    const got = try runAndReadOutput(std.testing.allocator, .actuation_audit, args[0..], ".zig-cache/actuation-rk-summary.json");
+    defer std.testing.allocator.free(got);
+
+    try expectContains(got, "\"refactor_kernel\"");
+    try expectContains(got, "\"potential_hidden_refactor_kernel_explicit\": 1");
+    try expectContains(got, "\"potential_hidden_patch_calls\": 5");
+    try expectContains(got, "\"potential_hidden_mutations_without_graph_control\": 5");
+}
+
 test "actuation audit excludes pasted skill blocks as true runs" {
     const fixture = ".zig-cache/actuation-pasted-skill.jsonl";
     try writePastedSkillFixture(fixture);
 
-    const args = [_][]const u8{ "--path", fixture, "--mode", "summary", "--format", "json" };
+    const args = [_][]const u8{ "--path", fixture, "--mode", "runs", "--format", "json" };
     const got = try runAndReadOutput(std.testing.allocator, .actuation_audit, args[0..], ".zig-cache/actuation-pasted-skill-summary.json");
     defer std.testing.allocator.free(got);
 
-    try expectContains(got, "\"session_id\": \"actuation-pasted-skill\"");
-    try expectContains(got, "\"true_actuating\": false");
-    try expectContains(got, "\"verdict\": \"insufficient_evidence\"");
+    try expectContains(got, "\"session_id\":\"actuation-pasted-skill\"");
+    try expectContains(got, "\"true_actuating\":false");
+    try expectContains(got, "\"verdict\":\"insufficient_evidence\"");
 }
 
 test "actuation audit parses embedded artifacts and GCR edge cases" {

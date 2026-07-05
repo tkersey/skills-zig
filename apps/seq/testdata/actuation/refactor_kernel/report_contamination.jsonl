@@ -1,0 +1,7 @@
+{"type":"session_meta","timestamp":"2026-07-05T13:10:00Z","payload":{"id":"rk-report-contamination","cwd":"/repo/seq-audit","model":"gpt-5","git":{"branch":"rk-audit","commit_hash":"head-rk-report"}}}
+{"type":"event_msg","timestamp":"2026-07-05T13:10:01Z","payload":{"type":"task_started","turn_id":"t1"}}
+{"type":"event_msg","timestamp":"2026-07-05T13:10:02Z","payload":{"type":"user_message","turn_id":"t1","message":"Summarize the report text."}}
+{"type":"event_msg","timestamp":"2026-07-05T13:10:03Z","payload":{"type":"agent_message","turn_id":"t1","message":"Refactor Kernel Effectiveness Audit\nschema:\n  refactor_kernel_outcome:\n  AER-v1\n  selected_route: refactor-kernel\n  RKO-v1"}}
+{"type":"response_item","timestamp":"2026-07-05T13:10:04Z","payload":{"type":"function_call","name":"exec_command","call_id":"read-1","arguments":"sed -n '1,80p' fixture.jsonl"}}
+{"type":"response_item","timestamp":"2026-07-05T13:10:05Z","payload":{"type":"function_call_output","call_id":"read-1","output":"actuation_escalation_receipt:\n  version: AER-v1\n  selected_route: refactor-kernel\nrefactor_kernel_outcome:\n  version: RKO-v1"}}
+{"type":"event_msg","timestamp":"2026-07-05T13:10:06Z","payload":{"type":"task_complete","turn_id":"t1","duration_ms":6000}}

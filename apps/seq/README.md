@@ -258,12 +258,20 @@ seq query --root ~/.codex/sessions --spec '{"dataset":"historical_decisions","pa
 - classifies true runs separately from pasted skill blocks, examples, reports, and incidental mentions
 - recovers GCR attempts, material mutations without current executable GCR, projection inversion, proof cadence, compaction resume signals, worker linkage, churn, ship flags, and ALSR/HYL/HSR governance coverage from canonical trace evidence
 - `--mode hylo --format json` reports true-run counts, ALSR/HYL/HSR coverage, mutation/unfold/fold continuity, terminal ATCG coverage, quality-state counts, and public failure classes: `missing_alsr`, `missing_hyl`, `missing_unfold`, `unfold_not_current`, `mutation_without_unfold`, `action_without_fold`, `fold_without_current_artifact`, `continue_without_next_seed`, `terminal_without_stop_rule`, `terminal_without_atcg`, `parallel_fanout_without_fanin`, `stale_hylo_after_diff_change`, `resolve_without_review_fold`, `raw_review_to_patch`, and `cached_cas_counted_as_fresh`
+- `--mode runs --format json|jsonl` emits a nested `refactor_kernel` audit object per run; `--mode summary --format json` aggregates `refactor_kernel.potential_hidden_refactor_kernel_explicit`, `refactor_kernel.potential_hidden_refactor_kernel_inferred`, `refactor_kernel.governed_refactor_kernel`, and `refactor_kernel.governed_refactor_kernel_with_control_violation`
+- Potential hidden refactor-kernel is an observational classifier. Use AER-v1/RKO-v1 for formal workflow evidence.
 - keeps raw prompts/excerpts out by default; `--include-excerpts` is explicit
 - `--strict` exits 2 for graph bypass or projection inversion rows
 
 Examples:
 ```bash
 seq actuation-audit --root ~/.codex/sessions --path rollout.jsonl --mode summary --format json
+seq actuation-audit \
+  --root ~/.codex/sessions \
+  --repo /Users/tk/workspace/tk/world-capabilities \
+  --last 24h \
+  --mode summary \
+  --format json
 seq actuation-audit --root ~/.codex/sessions --workdir /path/to/repo --last 7d --exclude-current --mode hylo --format json
 seq actuation-audit --root ~/.codex/sessions --repo /path/to/repo --last 7d --mode report --format markdown
 seq query --root ~/.codex/sessions --spec '{"dataset":"actuation_runs","params":{"path":"rollout.jsonl"},"select":["session_id","verdict","graph.compile_failures","projection.update_plan_calls","surface.churn.apply_patch_calls"],"format":"table"}'

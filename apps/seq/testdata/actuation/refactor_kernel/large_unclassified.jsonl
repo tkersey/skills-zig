@@ -1,0 +1,25 @@
+{"type":"session_meta","timestamp":"2026-07-05T12:50:00Z","payload":{"id":"rk-large-unclassified","cwd":"/repo/seq-audit","model":"gpt-5","git":{"branch":"rk-audit","commit_hash":"head-rk-large"}}}
+{"type":"event_msg","timestamp":"2026-07-05T12:50:01Z","payload":{"type":"task_started","turn_id":"t1"}}
+{"type":"event_msg","timestamp":"2026-07-05T12:50:02Z","payload":{"type":"user_message","turn_id":"t1","message":"$actuating large implementation campaign."}}
+{"type":"event_msg","timestamp":"2026-07-05T12:50:03Z","payload":{"type":"agent_message","turn_id":"t1","message":"Large implementation campaign without review pressure markers."}}
+{"type":"response_item","timestamp":"2026-07-05T12:50:04Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-1","arguments":"*** Begin Patch\n*** Update File: f01.txt\n+1\n*** End Patch"}}
+{"type":"response_item","timestamp":"2026-07-05T12:50:05Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-2","arguments":"*** Begin Patch\n*** Update File: f02.txt\n+2\n*** End Patch"}}
+{"type":"response_item","timestamp":"2026-07-05T12:50:06Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-3","arguments":"*** Begin Patch\n*** Update File: f03.txt\n+3\n*** End Patch"}}
+{"type":"response_item","timestamp":"2026-07-05T12:50:07Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-4","arguments":"*** Begin Patch\n*** Update File: f04.txt\n+4\n*** End Patch"}}
+{"type":"response_item","timestamp":"2026-07-05T12:50:08Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-5","arguments":"*** Begin Patch\n*** Update File: f05.txt\n+5\n*** End Patch"}}
+{"type":"response_item","timestamp":"2026-07-05T12:50:09Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-6","arguments":"*** Begin Patch\n*** Update File: f06.txt\n+6\n*** End Patch"}}
+{"type":"response_item","timestamp":"2026-07-05T12:50:10Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-7","arguments":"*** Begin Patch\n*** Update File: f07.txt\n+7\n*** End Patch"}}
+{"type":"response_item","timestamp":"2026-07-05T12:50:11Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-8","arguments":"*** Begin Patch\n*** Update File: f08.txt\n+8\n*** End Patch"}}
+{"type":"response_item","timestamp":"2026-07-05T12:50:12Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-9","arguments":"*** Begin Patch\n*** Update File: f09.txt\n+9\n*** End Patch"}}
+{"type":"response_item","timestamp":"2026-07-05T12:50:13Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-10","arguments":"*** Begin Patch\n*** Update File: f10.txt\n+10\n*** End Patch"}}
+{"type":"response_item","timestamp":"2026-07-05T12:50:14Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-11","arguments":"*** Begin Patch\n*** Update File: f11.txt\n+11\n*** End Patch"}}
+{"type":"response_item","timestamp":"2026-07-05T12:50:15Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-12","arguments":"*** Begin Patch\n*** Update File: f12.txt\n+12\n*** End Patch"}}
+{"type":"response_item","timestamp":"2026-07-05T12:50:16Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-13","arguments":"*** Begin Patch\n*** Update File: f13.txt\n+13\n*** End Patch"}}
+{"type":"response_item","timestamp":"2026-07-05T12:50:17Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-14","arguments":"*** Begin Patch\n*** Update File: f14.txt\n+14\n*** End Patch"}}
+{"type":"response_item","timestamp":"2026-07-05T12:50:18Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-15","arguments":"*** Begin Patch\n*** Update File: f15.txt\n+15\n*** End Patch"}}
+{"type":"response_item","timestamp":"2026-07-05T12:50:19Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-16","arguments":"*** Begin Patch\n*** Update File: f16.txt\n+16\n*** End Patch"}}
+{"type":"response_item","timestamp":"2026-07-05T12:50:20Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-17","arguments":"*** Begin Patch\n*** Update File: f17.txt\n+17\n*** End Patch"}}
+{"type":"response_item","timestamp":"2026-07-05T12:50:21Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-18","arguments":"*** Begin Patch\n*** Update File: f18.txt\n+18\n*** End Patch"}}
+{"type":"response_item","timestamp":"2026-07-05T12:50:22Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-19","arguments":"*** Begin Patch\n*** Update File: f19.txt\n+19\n*** End Patch"}}
+{"type":"response_item","timestamp":"2026-07-05T12:50:23Z","payload":{"type":"function_call","name":"apply_patch","call_id":"patch-20","arguments":"*** Begin Patch\n*** Update File: f20.txt\n+20\n*** End Patch"}}
+{"type":"event_msg","timestamp":"2026-07-05T12:50:24Z","payload":{"type":"task_complete","turn_id":"t1","duration_ms":24000}}

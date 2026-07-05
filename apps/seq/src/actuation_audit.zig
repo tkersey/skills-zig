@@ -5,6 +5,7 @@ const output = @import("output/mod.zig");
 
 pub const classify = @import("actuation/classify.zig");
 pub const render = @import("actuation/render.zig");
+pub const refactor_kernel = @import("actuation/refactor_kernel.zig");
 
 pub const audit_version = "SEQ-ACTAUDIT-v1";
 pub const run_version = "SEQ-ACTRUN-v1";
@@ -68,6 +69,7 @@ pub const CorpusSnapshot = struct {
 pub const RunLedger = struct {
     identity: Identity,
     classification: classify.Result,
+    refactor_kernel: refactor_kernel.Result,
     corpus_snapshot: CorpusSnapshot,
     limitations: [][]u8,
     diagnostic_query_json: []u8,
@@ -75,6 +77,7 @@ pub const RunLedger = struct {
     pub fn deinit(self: *RunLedger, allocator: std.mem.Allocator) void {
         self.identity.deinit(allocator);
         self.classification.deinit(allocator);
+        self.refactor_kernel.deinit(allocator);
         self.corpus_snapshot.deinit(allocator);
         freeStringList(allocator, self.limitations);
         allocator.free(self.diagnostic_query_json);
@@ -84,6 +87,8 @@ pub const RunLedger = struct {
 pub fn compileRunLedger(allocator: std.mem.Allocator, trace: canonical_trace.CanonicalSessionTrace, opts: AuditOptions) !RunLedger {
     var classification = try classify.classifyTrace(allocator, trace, .{ .strict = opts.strict });
     errdefer classification.deinit(allocator);
+    var rk = try refactor_kernel.analyzeTrace(allocator, trace, classification.true_run);
+    errdefer rk.deinit(allocator);
     var identity = try buildIdentity(allocator, trace, opts);
     errdefer identity.deinit(allocator);
     var snapshot = try buildCorpusSnapshot(allocator, trace, opts);
@@ -95,6 +100,7 @@ pub fn compileRunLedger(allocator: std.mem.Allocator, trace: canonical_trace.Can
     return .{
         .identity = identity,
         .classification = classification,
+        .refactor_kernel = rk,
         .corpus_snapshot = snapshot,
         .limitations = limitations,
         .diagnostic_query_json = diagnostic,
@@ -133,7 +139,9 @@ pub fn renderRunJson(allocator: std.mem.Allocator, ledger: RunLedger) ![]u8 {
     try render.writeStringArray(writer, ledger.classification.contamination_flags);
     try writer.writeAll(",\"reason\":");
     try output.writeJsonString(writer, ledger.classification.reason);
-    try writer.writeAll("},\"corpus_snapshot\":{\"audit_version\":");
+    try writer.writeAll("},\"refactor_kernel\":");
+    try writeRefactorKernelJson(writer, ledger.refactor_kernel);
+    try writer.writeAll(",\"corpus_snapshot\":{\"audit_version\":");
     try output.writeJsonString(writer, ledger.corpus_snapshot.audit_version_text);
     try writer.writeAll(",\"scanner_version\":");
     try output.writeJsonString(writer, ledger.corpus_snapshot.scanner_version_text);
@@ -153,6 +161,52 @@ pub fn renderRunJson(allocator: std.mem.Allocator, ledger: RunLedger) ![]u8 {
     try output.writeJsonString(writer, ledger.diagnostic_query_json);
     try writer.writeAll("}");
     return writer_alloc.toOwnedSlice();
+}
+
+pub fn writeRefactorKernelJson(writer: anytype, rk: refactor_kernel.Result) !void {
+    try writer.writeAll("{\"classification\":");
+    try output.writeJsonString(writer, rk.classification);
+    try writer.writeAll(",\"confidence\":");
+    try output.writeJsonString(writer, rk.confidence);
+    try writer.writeAll(",\"formal_decision_present\":");
+    try writeJsonBool(writer, rk.formal_decision_present);
+    try writer.writeAll(",\"outcome_present\":");
+    try writeJsonBool(writer, rk.outcome_present);
+    try writer.writeAll(",\"explicit_phrase_present\":");
+    try writeJsonBool(writer, rk.explicit_phrase_present);
+    try writer.writeAll(",\"selected_route_present\":");
+    try writeJsonBool(writer, rk.selected_route_present);
+    try writer.writeAll(",\"next_resolution_mode_present\":");
+    try writeJsonBool(writer, rk.next_resolution_mode_present);
+    try writer.writeAll(",\"potential_hidden_kernel\":");
+    try writeJsonBool(writer, rk.potential_hidden_kernel);
+    try writer.writeAll(",\"graph_bypass\":");
+    try writeJsonBool(writer, rk.graph_bypass);
+    try writer.writeAll(",\"patch_calls\":");
+    try writer.print("{d}", .{rk.patch_calls});
+    try writer.writeAll(",\"update_plan_calls\":");
+    try writer.print("{d}", .{rk.update_plan_calls});
+    try writer.writeAll(",\"mutations_without_graph_control\":");
+    try writer.print("{d}", .{rk.mutations_without_graph_control});
+    try writer.writeAll(",\"accepted_liability_markers\":");
+    try writer.print("{d}", .{rk.accepted_liability_markers});
+    try writer.writeAll(",\"owner_boundary_markers\":");
+    try writer.print("{d}", .{rk.owner_boundary_markers});
+    try writer.writeAll(",\"review_fold_markers\":");
+    try writer.print("{d}", .{rk.review_fold_markers});
+    try writer.writeAll(",\"cas_bottleneck_markers\":");
+    try writer.print("{d}", .{rk.cas_bottleneck_markers});
+    try writer.writeAll(",\"rko_graph_bypass_yes\":");
+    try writeJsonBool(writer, rk.rko_graph_bypass_yes);
+    try writer.writeAll(",\"rko_mutations_without_control_nonzero\":");
+    try writeJsonBool(writer, rk.rko_mutations_without_control_nonzero);
+    try writer.writeAll(",\"reasons\":");
+    try render.writeStringArray(writer, rk.reasons);
+    try writer.writeByte('}');
+}
+
+fn writeJsonBool(writer: anytype, value: bool) !void {
+    try writer.writeAll(if (value) "true" else "false");
 }
 
 fn buildIdentity(allocator: std.mem.Allocator, trace: canonical_trace.CanonicalSessionTrace, opts: AuditOptions) !Identity {
@@ -278,6 +332,7 @@ test "actuation ledger classifies explicit run and emits bounded json" {
     const json = try renderRunJson(std.testing.allocator, ledger);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"true_actuating\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"refactor_kernel\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "$actuating") == null);
 }
 
