@@ -174,6 +174,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_json", .module = core_json },
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "core_path", .module = core_path },
+            .{ .name = "durable_store", .module = durable_store },
             .{ .name = "app_meta", .module = cas_meta },
         },
     });
@@ -184,7 +185,9 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "core_json", .module = core_json },
             .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "core_path", .module = core_path },
             .{ .name = "retrace_core", .module = retrace_core },
+            .{ .name = "durable_store", .module = durable_store },
             .{ .name = "app_meta", .module = cas_meta },
         },
     });

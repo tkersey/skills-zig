@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const core_cli = @import("core_cli");
 const core_json = @import("core_json");
 const core_path = @import("core_path");
+const durable_store = @import("durable_store");
 const std = @import("std");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
@@ -102,7 +103,7 @@ const UsageText =
     \\Common options:
     \\  --json                           Emit machine-readable JSON.
     \\  --verdict-only                   Emit only the compact reviewVerdict JSON for lane review.
-    \\  --path FILE                      Receipt or lock file to process; repeatable.
+    \\  --path FILE                      Receipt, lock, or session record file to process; repeatable.
     \\  --record FILE                    CAS-RER-v1 record file to validate; repeatable.
     \\  --glob PATTERN                   Simple receipt glob; repeatable.
     \\  --allow-reduced-principal        Diagnostic inspect flag only; never closeout eligible.
@@ -110,6 +111,8 @@ const UsageText =
     \\  --show-attachments               Include attachment paths in diagnostic inspect output.
     \\  --format FORMAT                  Helper output: table|json|jsonl (default: table).
     \\  --summary                        Include aggregate receipt counts.
+    \\  --codex-thread-id ID             Codex session/thread id for review reuse scoping.
+    \\  --store-root DIR                 Explicit CAS artifact root; default is repo .ledger/cas.
     \\  --timeout-ms N                   Wait timeout for `wait` (default: 300000).
     \\  --poll-interval-ms N             Poll interval for `wait` (default: 250).
     \\  --help                           Show help.
@@ -126,10 +129,11 @@ const UsageText =
     \\  cas review_session start --cwd /path/to/repo --uncommitted --json
     \\  cas review_session start --cwd /path/to/repo --base main --json
     \\  cas review_session start --wait --cwd /path/to/repo --base main --json
-    \\  cas review_session status --review-thread-id thr_123 --json
-    \\  cas review_session status --latest --json
-    \\  cas review_session wait --review-thread-id thr_123 --timeout-ms 300000 --json
-    \\  cas review_session interrupt --review-thread-id thr_123 --json
+    \\  cas review_session status --cwd /path/to/repo --review-thread-id thr_123 --json
+    \\  cas review_session status --path /path/to/repo/.ledger/cas/review_sessions/thr_123.json --json
+    \\  cas review_session status --cwd /path/to/repo --latest --json
+    \\  cas review_session wait --cwd /path/to/repo --review-thread-id thr_123 --timeout-ms 300000 --json
+    \\  cas review_session interrupt --cwd /path/to/repo --review-thread-id thr_123 --json
     \\  cas review_session lane start --cwd /path/to/repo --json
     \\  cas review_session lane smoke --cwd /path/to/repo --base main --json
     \\  cas review_session lane smoke-suite --cwd /path/to/repo --base main --json --cleanup
@@ -322,6 +326,8 @@ const ParsedArgs = struct {
     fallback_mode: FallbackMode = .none,
     review_lock_override_reason: ?[]const u8 = null,
     fresh_attempt_reason: ?[]const u8 = null,
+    codex_thread_id: ?[]const u8 = null,
+    store_root: ?[]const u8 = null,
     receipt_paths: []const []const u8 = &.{},
     receipt_globs: []const []const u8 = &.{},
     receipt_format: ReceiptFormat = .table,
@@ -349,6 +355,10 @@ const TargetRecord = struct {
 const SessionRecord = struct {
     schema_version: u32 = 3,
     cwd: []const u8,
+    store_root: ?[]const u8 = null,
+    store_scope: ?[]const u8 = null,
+    repo_root: ?[]const u8 = null,
+    codex_thread_id: ?[]const u8 = null,
     parent_thread_id: []const u8,
     review_thread_id: []const u8,
     review_turn_id: []const u8,
@@ -392,6 +402,10 @@ const unknown_account_fingerprint = "unknown-account";
 const principal_strength_strong = "strong";
 const principal_strength_reduced = "reduced";
 const cas_review_evidence_schema = "CAS-RER-v1";
+var configured_store_root_override: ?[]const u8 = null;
+var configured_store_cwd: ?[]const u8 = null;
+var configured_codex_thread_id: ?[]const u8 = null;
+var configured_home: ?[]const u8 = null;
 
 const ReviewTupleIdentity = struct {
     repo_realpath: []const u8,
@@ -402,10 +416,12 @@ const ReviewTupleIdentity = struct {
     resolved_codex_version: []const u8,
     account_fingerprint: []const u8,
     account_fingerprint_reduced_protection: bool,
+    codex_thread_id: []const u8,
 
     fn deinit(self: ReviewTupleIdentity, allocator: std.mem.Allocator) void {
         allocator.free(self.repo_realpath);
         allocator.free(self.account_fingerprint);
+        allocator.free(self.codex_thread_id);
     }
 };
 
@@ -428,6 +444,7 @@ const ReviewTupleLock = struct {
     resolvedCodexPath: []const u8,
     resolvedCodexVersion: []const u8,
     accountFingerprint: []const u8,
+    codexThreadId: ?[]const u8 = null,
     state: []const u8,
     reviewThreadId: ?[]const u8 = null,
     reviewTurnId: ?[]const u8 = null,
@@ -440,6 +457,9 @@ const ReviewTupleLock = struct {
     lastFailureCode: ?[]const u8 = null,
     overrideReason: ?[]const u8 = null,
     freshAttemptReason: ?[]const u8 = null,
+    cleanStreakCount: u32 = 0,
+    lastCleanReceiptRecordPath: ?[]const u8 = null,
+    lastCleanStreakResetPath: ?[]const u8 = null,
 };
 
 const LoadedReviewTupleLock = struct {
@@ -598,6 +618,7 @@ const OutputReceipt = struct {
     review_broker_decision: ?ReviewBrokerDecision = null,
     account_fingerprint: ?[]const u8 = null,
     account_fingerprint_reduced_protection: bool = true,
+    codex_thread_id: ?[]const u8 = null,
     fresh_attempt_required: bool = false,
 };
 
@@ -636,6 +657,7 @@ fn withRecordMultiAgentMode(receipt: OutputReceipt, record: SessionRecord) Outpu
     out.multi_agent_mode_metric_eligible = record.multi_agent_mode_metric_eligible;
     out.account_fingerprint = record.accountFingerprint;
     out.account_fingerprint_reduced_protection = record.accountFingerprintReducedProtection;
+    out.codex_thread_id = record.codex_thread_id;
     return out;
 }
 
@@ -795,6 +817,12 @@ pub fn main(init: std.process.Init) !void {
         core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), usageDetailForParseError(err));
     };
     defer parsed.deinit(allocator);
+    configured_store_root_override = parsed.store_root orelse init.environ_map.get("CAS_STORE_ROOT");
+    configured_store_cwd = parsed.cwd;
+    configured_codex_thread_id = parsed.codex_thread_id orelse
+        init.environ_map.get("CODEX_THREAD_ID") orelse
+        init.environ_map.get("CODEX_SESSION_ID");
+    configured_home = init.environ_map.get("HOME");
 
     if (parsed.show_version) {
         var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
@@ -1074,6 +1102,16 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             out.fresh_attempt_reason = value;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--store-root")) {
+            if (value.len == 0) return error.InvalidStoreRoot;
+            out.store_root = value;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--codex-thread-id")) {
+            if (value.len == 0) return error.InvalidCodexThreadId;
+            out.codex_thread_id = value;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--path")) {
             try receipt_paths.append(allocator, value);
             continue;
@@ -1147,11 +1185,13 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
         },
         .status, .wait => {
             if (out.review_thread_id != null and out.latest_review_session) return error.AmbiguousReviewSessionSelector;
-            if (out.review_thread_id == null and !out.latest_review_session) return error.MissingReviewThreadId;
+            if (out.receipt_paths.len > 1 or (out.receipt_paths.len == 1 and (out.review_thread_id != null or out.latest_review_session))) return error.AmbiguousReviewSessionSelector;
+            if (out.review_thread_id == null and !out.latest_review_session and out.receipt_paths.len == 0) return error.MissingReviewThreadId;
         },
         .interrupt => {
             if (out.latest_review_session) return error.LatestReviewSessionUnsupportedAction;
-            if (out.review_thread_id == null) return error.MissingReviewThreadId;
+            if (out.receipt_paths.len > 1 or (out.receipt_paths.len == 1 and out.review_thread_id != null)) return error.AmbiguousReviewSessionSelector;
+            if (out.review_thread_id == null and out.receipt_paths.len == 0) return error.MissingReviewThreadId;
         },
         .lane => switch (out.lane_action orelse return error.MissingLaneAction) {
             .start => {
@@ -1301,6 +1341,7 @@ const ReviewCurrentIdentity = struct {
     resolved_codex_version: []const u8,
     account_fingerprint: []const u8,
     account_fingerprint_reduced_protection: bool,
+    codex_thread_id: []const u8,
 
     fn deinit(self: ReviewCurrentIdentity, allocator: std.mem.Allocator) void {
         allocator.free(self.cwd);
@@ -1308,6 +1349,7 @@ const ReviewCurrentIdentity = struct {
         allocator.free(self.resolved_codex_path);
         allocator.free(self.resolved_codex_version);
         allocator.free(self.account_fingerprint);
+        allocator.free(self.codex_thread_id);
     }
 };
 
@@ -1322,6 +1364,8 @@ fn reviewCurrentIdentityAlloc(allocator: std.mem.Allocator, io: std.Io, parsed: 
     errdefer allocator.free(resolved_codex_version);
     const account_principal = try currentAccountPrincipalAlloc(allocator, io, parsed, cwd);
     errdefer account_principal.deinit(allocator);
+    const codex_thread_id = try currentCodexThreadIdAlloc(allocator);
+    errdefer allocator.free(codex_thread_id);
     return .{
         .cwd = cwd,
         .identity = identity,
@@ -1329,6 +1373,7 @@ fn reviewCurrentIdentityAlloc(allocator: std.mem.Allocator, io: std.Io, parsed: 
         .resolved_codex_version = resolved_codex_version,
         .account_fingerprint = account_principal.fingerprint,
         .account_fingerprint_reduced_protection = account_principal.reduced_protection,
+        .codex_thread_id = codex_thread_id,
     };
 }
 
@@ -1385,7 +1430,7 @@ fn cmdReviewCurrent(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs
         for (records.items) |record| record.deinit(allocator);
         records.deinit(allocator);
     }
-    try appendCasRerLedgerRecordsAlloc(allocator, &records, resolved.cwd, resolved.identity, resolved.resolved_codex_path, resolved.resolved_codex_version, resolved.account_fingerprint, resolved.account_fingerprint_reduced_protection);
+    try appendCasRerLedgerRecordsAlloc(allocator, &records, resolved.cwd, resolved.identity, resolved.resolved_codex_path, resolved.resolved_codex_version, resolved.account_fingerprint, resolved.account_fingerprint_reduced_protection, resolved.codex_thread_id);
     std.mem.sort(CasRerLedgerRecord, records.items, {}, casRerRecordLessThan);
 
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
@@ -1403,7 +1448,7 @@ fn cmdReviewList(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
         for (records.items) |record| record.deinit(allocator);
         records.deinit(allocator);
     }
-    try appendCasRerLedgerRecordsAlloc(allocator, &records, resolved.cwd, resolved.identity, resolved.resolved_codex_path, resolved.resolved_codex_version, resolved.account_fingerprint, resolved.account_fingerprint_reduced_protection);
+    try appendCasRerLedgerRecordsAlloc(allocator, &records, resolved.cwd, resolved.identity, resolved.resolved_codex_path, resolved.resolved_codex_version, resolved.account_fingerprint, resolved.account_fingerprint_reduced_protection, resolved.codex_thread_id);
     std.mem.sort(CasRerLedgerRecord, records.items, {}, casRerRecordLessThan);
 
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
@@ -1589,6 +1634,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
     defer review_tuple.deinit(allocator);
     output_receipt.account_fingerprint = review_tuple.account_fingerprint;
     output_receipt.account_fingerprint_reduced_protection = review_tuple.account_fingerprint_reduced_protection;
+    output_receipt.codex_thread_id = review_tuple.codex_thread_id;
     const tuple_lock_bundle = try acquireReviewTupleStartLockOrExit(
         allocator,
         parsed.json,
@@ -1600,8 +1646,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         false,
         &managed_server,
     );
-    defer allocator.free(tuple_lock_bundle.path);
-    defer allocator.free(tuple_lock_bundle.lock.tupleHash);
+    defer tuple_lock_bundle.deinit(allocator);
     const created_parent_thread = parsed.parent_thread_id == null;
     const parent_thread_id = if (parsed.parent_thread_id) |existing| blk: {
         const existing_parent_event_log_path = try parentEventLogPathAlloc(allocator, session_dir, existing);
@@ -1804,9 +1849,17 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
     if (review_start_retry_used) {
         appendLogRecord(allocator, event_log_path, "review/start", "note", "{\"retry\":\"fresh-parent-materialization\"}") catch {};
     }
+    const store_root = try casStoreRootAlloc(allocator);
+    defer allocator.free(store_root);
+    const repo_root = try repoRootForCwdAlloc(allocator, cwd);
+    defer if (repo_root) |root| allocator.free(root);
 
     var record = SessionRecord{
         .cwd = cwd,
+        .store_root = store_root,
+        .store_scope = "repo-local",
+        .repo_root = repo_root,
+        .codex_thread_id = review_tuple.codex_thread_id,
         .parent_thread_id = parent_thread_id,
         .review_thread_id = review_thread_id,
         .review_turn_id = review_turn_id,
@@ -2535,7 +2588,7 @@ fn cmdWait(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
 }
 
 fn cmdInterrupt(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
-    var loaded = try loadSessionRecord(allocator, parsed.review_thread_id.?);
+    var loaded = try loadSelectedSessionRecord(allocator, parsed);
     defer loaded.deinit(allocator);
     var record = loaded.record;
     const identity_opt: ?TargetIdentity = targetIdentityForRecordAlloc(allocator, io, record) catch null;
@@ -2725,6 +2778,7 @@ const NormalizedReceipt = struct {
     repo_realpath: ?[]const u8 = null,
     resolved_codex_path: ?[]const u8 = null,
     resolved_codex_version: ?[]const u8 = null,
+    codex_thread_id: ?[]const u8 = null,
     account_fingerprint: ?[]const u8 = null,
     review_thread_id: ?[]const u8,
     review_turn_id: ?[]const u8,
@@ -2748,6 +2802,7 @@ const NormalizedReceipt = struct {
         if (self.repo_realpath) |value| allocator.free(value);
         if (self.resolved_codex_path) |value| allocator.free(value);
         if (self.resolved_codex_version) |value| allocator.free(value);
+        if (self.codex_thread_id) |value| allocator.free(value);
         if (self.account_fingerprint) |value| allocator.free(value);
         if (self.review_thread_id) |value| allocator.free(value);
         if (self.review_turn_id) |value| allocator.free(value);
@@ -2932,6 +2987,7 @@ fn appendImportedCasRerRecordJsonAlloc(
                 identity.resolved_codex_version,
                 identity.account_fingerprint,
                 identity.account_fingerprint_reduced_protection,
+                identity.codex_thread_id,
             )) {
                 validation.deinit(allocator);
                 validation = try gateResultFromSingleErrorAlloc(
@@ -4302,8 +4358,7 @@ fn cmdLaneSmoke(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !v
         false,
         &managed_server,
     );
-    defer allocator.free(tuple_lock_bundle.path);
-    defer allocator.free(tuple_lock_bundle.lock.tupleHash);
+    defer tuple_lock_bundle.deinit(allocator);
     try writeLaneRecord(allocator, lane_record_path, lane);
 
     const session_dir = try sessionDirAlloc(allocator);
@@ -4396,9 +4451,17 @@ fn cmdLaneSmoke(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !v
     defer allocator.free(record_path);
     try appendLogRecord(allocator, event_log_path, "review/start", "request", review_params_json);
     try appendLogRecord(allocator, event_log_path, "review/start", "response", review_result_json);
+    const store_root = try casStoreRootAlloc(allocator);
+    defer allocator.free(store_root);
+    const repo_root = try repoRootForCwdAlloc(allocator, cwd);
+    defer if (repo_root) |root| allocator.free(root);
 
     var record = SessionRecord{
         .cwd = cwd,
+        .store_root = store_root,
+        .store_scope = "repo-local",
+        .repo_root = repo_root,
+        .codex_thread_id = review_tuple.codex_thread_id,
         .parent_thread_id = parent_thread_id,
         .review_thread_id = review_thread_id,
         .review_turn_id = review_turn_id,
@@ -5286,8 +5349,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
         parsed.verdict_only,
         null,
     );
-    defer allocator.free(tuple_lock_bundle.path);
-    defer allocator.free(tuple_lock_bundle.lock.tupleHash);
+    defer tuple_lock_bundle.deinit(allocator);
 
     const session_dir = try sessionDirAlloc(allocator);
     const parent_thread_id = startParentThreadAlloc(allocator, &client, lane.cwd, session_dir, parsed.multi_agent_mode) catch |err| {
@@ -5383,9 +5445,17 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
     const record_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ session_dir, review_thread_id });
     try appendLogRecord(allocator, event_log_path, "review/start", "request", review_params_json);
     try appendLogRecord(allocator, event_log_path, "review/start", "response", review_result_json);
+    const store_root = try casStoreRootAlloc(allocator);
+    defer allocator.free(store_root);
+    const repo_root = try repoRootForCwdAlloc(allocator, lane.cwd);
+    defer if (repo_root) |root| allocator.free(root);
 
     var record = SessionRecord{
         .cwd = lane.cwd,
+        .store_root = store_root,
+        .store_scope = "repo-local",
+        .repo_root = repo_root,
+        .codex_thread_id = review_tuple.codex_thread_id,
         .parent_thread_id = parent_thread_id,
         .review_thread_id = review_thread_id,
         .review_turn_id = review_turn_id,
@@ -6495,22 +6565,56 @@ fn targetToRecord(target: TargetConfig) TargetRecord {
     };
 }
 
+fn casStoreRootAlloc(allocator: std.mem.Allocator) ![]const u8 {
+    if (configured_store_root_override) |root| {
+        return absoluteStoreRootOverrideAlloc(allocator, root);
+    }
+    const start_input = if (configured_store_cwd) |cwd|
+        try allocator.dupe(u8, cwd)
+    else
+        try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
+    defer allocator.free(start_input);
+    const start = try std.Io.Dir.cwd().realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), start_input, allocator);
+    defer allocator.free(start);
+    const repo_root = durable_store.findGitRootAlloc(allocator, start) catch |err| switch (err) {
+        error.GitCommandFailed => return std.fmt.allocPrint(allocator, "{s}/.ledger/cas", .{start}),
+        else => return err,
+    };
+    defer allocator.free(repo_root);
+    return std.fmt.allocPrint(allocator, "{s}/.ledger/cas", .{repo_root});
+}
+
+fn absoluteStoreRootOverrideAlloc(allocator: std.mem.Allocator, root: []const u8) ![]const u8 {
+    const expanded = try core_path.expandHomePath(allocator, root);
+    errdefer allocator.free(expanded);
+    if (std.fs.path.isAbsolute(expanded)) return expanded;
+    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
+    defer allocator.free(cwd);
+    const absolute = try std.fs.path.join(allocator, &.{ cwd, expanded });
+    allocator.free(expanded);
+    return absolute;
+}
+
+fn casStorePathAlloc(allocator: std.mem.Allocator, leaf: []const u8) ![]const u8 {
+    const root = try casStoreRootAlloc(allocator);
+    defer allocator.free(root);
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, leaf });
+}
+
 fn sessionDirAlloc(allocator: std.mem.Allocator) ![]const u8 {
-    const base = try core_path.expandHomePath(allocator, "~/.codex/cas/review_sessions");
-    try ensureParentPath(base);
-    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), base);
+    const base = try casStorePathAlloc(allocator, "review_sessions");
+    try durable_store.ensureDirectoryPathNoSymlinks(base);
     return base;
 }
 
 fn reviewLedgerRecordsDirAlloc(allocator: std.mem.Allocator) ![]const u8 {
     const base = try reviewLedgerRecordsDirPathAlloc(allocator);
-    try ensureParentPath(base);
-    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), base);
+    try durable_store.ensureDirectoryPathNoSymlinks(base);
     return base;
 }
 
 fn reviewLedgerRecordsDirPathAlloc(allocator: std.mem.Allocator) ![]const u8 {
-    return core_path.expandHomePath(allocator, "~/.codex/cas/review_ledger/records");
+    return casStorePathAlloc(allocator, "review_ledger/records");
 }
 
 fn casRerRecordIdFromJsonAlloc(allocator: std.mem.Allocator, record_json: []const u8) ![]const u8 {
@@ -6626,21 +6730,11 @@ fn casRerStableContentMatchesAlloc(allocator: std.mem.Allocator, raw: []const u8
 }
 
 fn writeRawJsonFileExclusiveOrIdenticalAlloc(allocator: std.mem.Allocator, path: []const u8, json: []const u8) !void {
-    try ensureParentPath(path);
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const parent = std.fs.path.dirname(path) orelse return error.InvalidPath;
-    const basename = std.fs.path.basename(path);
-    var dir = try std.Io.Dir.openDirAbsolute(io, parent, .{});
-    defer dir.close(io);
-    var atomic_file = try dir.createFileAtomic(io, basename, .{ .replace = false });
-    defer atomic_file.deinit(io);
-    var writer = atomic_file.file.writer(io, &.{});
-    try writer.interface.writeAll(json);
-    try writer.interface.writeAll("\n");
-    try writer.interface.flush();
-    atomic_file.link(io) catch |err| switch (err) {
+    const payload = try std.fmt.allocPrint(allocator, "{s}\n", .{json});
+    defer allocator.free(payload);
+    durable_store.writeTextCreateNewAtomic(allocator, path, payload, .{ .reject_symlinks = true }) catch |err| switch (err) {
         error.PathAlreadyExists => {
-            const existing = try readFileAlloc(allocator, path, 8 * 1024 * 1024);
+            const existing = try durable_store.readRegularFileNoSymlink(allocator, path, 8 * 1024 * 1024);
             defer allocator.free(existing);
             if (jsonFileContentMatches(existing, json)) return;
             if (try casRerStableContentMatchesAlloc(allocator, existing, json)) return;
@@ -6701,6 +6795,7 @@ fn casRerObjectMatchesIdentity(
     resolved_codex_version: []const u8,
     account_fingerprint: []const u8,
     account_fingerprint_reduced_protection: bool,
+    codex_thread_id: []const u8,
 ) bool {
     if (account_fingerprint_reduced_protection) return false;
     const tuple = objectField(root, "tuple") orelse return false;
@@ -6711,6 +6806,9 @@ fn casRerObjectMatchesIdentity(
     if (!optionalStringsEqual(jsonStringField(tuple, "targetFingerprint"), identity.fingerprint)) return false;
     if (!optionalStringsEqual(jsonStringField(tuple, "resolvedCodexPath"), resolved_codex_path)) return false;
     if (!optionalStringsEqual(jsonStringField(tuple, "resolvedCodexVersion"), resolved_codex_version)) return false;
+    if (jsonStringField(tuple, "codexThreadId")) |record_codex_thread_id| {
+        if (!std.mem.eql(u8, record_codex_thread_id, codex_thread_id)) return false;
+    }
     if (!casRerPrincipalFingerprintUsable(account_fingerprint)) return false;
     const principal = objectField(root, "principal") orelse return false;
     const record_account_fingerprint = nonEmptyOptional(jsonStringField(principal, "accountFingerprint")) orelse return false;
@@ -6770,6 +6868,7 @@ fn appendCasRerLedgerRecordsAlloc(
     resolved_codex_version: ?[]const u8,
     account_fingerprint: ?[]const u8,
     account_fingerprint_reduced_protection: ?bool,
+    codex_thread_id: ?[]const u8,
 ) !void {
     const records_dir = try reviewLedgerRecordsDirPathAlloc(allocator);
     defer allocator.free(records_dir);
@@ -6787,7 +6886,7 @@ fn appendCasRerLedgerRecordsAlloc(
         defer allocator.free(path);
         const raw = readFileAlloc(allocator, path, 8 * 1024 * 1024) catch continue;
         defer allocator.free(raw);
-        if (repo_realpath != null and identity != null and resolved_codex_path != null and resolved_codex_version != null and account_fingerprint != null and account_fingerprint_reduced_protection != null) {
+        if (repo_realpath != null and identity != null and resolved_codex_path != null and resolved_codex_version != null and account_fingerprint != null and account_fingerprint_reduced_protection != null and codex_thread_id != null) {
             var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch continue;
             defer parsed.deinit();
             const root = switch (parsed.value) {
@@ -6798,7 +6897,7 @@ fn appendCasRerLedgerRecordsAlloc(
             var validation = validateCasRerRecordObjectAlloc(allocator, path, root) catch continue;
             defer validation.deinit(allocator);
             if (!validation.ok()) continue;
-            if (!casRerObjectMatchesIdentity(root, repo_realpath.?, identity.?, resolved_codex_path.?, resolved_codex_version.?, account_fingerprint.?, account_fingerprint_reduced_protection.?)) continue;
+            if (!casRerObjectMatchesIdentity(root, repo_realpath.?, identity.?, resolved_codex_path.?, resolved_codex_version.?, account_fingerprint.?, account_fingerprint_reduced_protection.?, codex_thread_id.?)) continue;
         } else {
             var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch continue;
             defer parsed.deinit();
@@ -6983,10 +7082,7 @@ const LoadedLaneRecord = struct {
 
 fn loadLaneRecord(allocator: std.mem.Allocator, lane_id: []const u8) !LoadedLaneRecord {
     const record_path = try laneRecordPathAlloc(allocator, lane_id);
-    const file = try std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), record_path, .{});
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
-    var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
-    const raw = try reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
+    const raw = try durable_store.readRegularFileNoSymlink(allocator, record_path, 1024 * 1024);
     const parsed = try std.json.parseFromSlice(LaneRecord, allocator, raw, .{});
     return .{
         .record_path = record_path,
@@ -6997,16 +7093,11 @@ fn loadLaneRecord(allocator: std.mem.Allocator, lane_id: []const u8) !LoadedLane
 }
 
 fn writeLaneRecord(allocator: std.mem.Allocator, path: []const u8, record: LaneRecord) !void {
-    try ensureParentPath(path);
     const json = try stringifyAnyAlloc(allocator, record);
     defer allocator.free(json);
-    const temp_path = try std.fmt.allocPrint(allocator, "{s}.tmp-{d}", .{ path, std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds });
-    defer allocator.free(temp_path);
-    var file = try std.Io.Dir.createFileAbsolute(std.Io.Threaded.global_single_threaded.io(), temp_path, .{ .truncate = true });
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
-    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), json);
-    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), "\n");
-    try std.Io.Dir.renameAbsolute(temp_path, path, std.Io.Threaded.global_single_threaded.io());
+    const payload = try std.fmt.allocPrint(allocator, "{s}\n", .{json});
+    defer allocator.free(payload);
+    try durable_store.writeTextAtomic(allocator, path, payload);
 }
 
 fn laneSmokeRecordPathAlloc(allocator: std.mem.Allocator, tuple_hash: []const u8) ![]const u8 {
@@ -7020,16 +7111,11 @@ fn laneSmokeRecordPathAlloc(allocator: std.mem.Allocator, tuple_hash: []const u8
 }
 
 fn writeLaneSmokeRecord(allocator: std.mem.Allocator, path: []const u8, record: LaneSmokeRecord) !void {
-    try ensureParentPath(path);
     const json = try stringifyAnyAlloc(allocator, record);
     defer allocator.free(json);
-    const temp_path = try std.fmt.allocPrint(allocator, "{s}.tmp-{d}", .{ path, std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds });
-    defer allocator.free(temp_path);
-    var file = try std.Io.Dir.createFileAbsolute(std.Io.Threaded.global_single_threaded.io(), temp_path, .{ .truncate = true });
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
-    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), json);
-    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), "\n");
-    try std.Io.Dir.renameAbsolute(temp_path, path, std.Io.Threaded.global_single_threaded.io());
+    const payload = try std.fmt.allocPrint(allocator, "{s}\n", .{json});
+    defer allocator.free(payload);
+    try durable_store.writeTextAtomic(allocator, path, payload);
 }
 
 fn unixSeconds() i64 {
@@ -7186,8 +7272,12 @@ const LoadedSessionRecord = struct {
     raw: []u8,
     parsed: std.json.Parsed(SessionRecord),
     record: SessionRecord,
+    previous_store_root_override: ?[]const u8 = null,
+    rebound_store_root_override: ?[]const u8 = null,
 
     fn deinit(self: *LoadedSessionRecord, allocator: std.mem.Allocator) void {
+        configured_store_root_override = self.previous_store_root_override;
+        if (self.rebound_store_root_override) |root| allocator.free(root);
         self.parsed.deinit();
         allocator.free(self.raw);
         allocator.free(self.record_path);
@@ -7199,42 +7289,87 @@ fn loadSessionRecord(allocator: std.mem.Allocator, review_thread_id: []const u8)
     defer allocator.free(session_dir);
     const record_path = try std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ session_dir, review_thread_id });
     return loadOwnedSessionRecordPath(allocator, record_path) catch |err| {
-        allocator.free(record_path);
+        if (err == error.FileNotFound) {
+            const legacy_path = try legacySessionRecordPathAlloc(allocator, review_thread_id);
+            return loadOwnedSessionRecordPath(allocator, legacy_path) catch |legacy_err| {
+                return legacy_err;
+            };
+        }
         return err;
     };
 }
 
 fn loadSelectedSessionRecord(allocator: std.mem.Allocator, parsed: ParsedArgs) !LoadedSessionRecord {
+    if (parsed.receipt_paths.len == 1) {
+        const record_path = try absoluteInputPathAlloc(allocator, parsed.receipt_paths[0]);
+        return loadOwnedSessionRecordPath(allocator, record_path) catch |err| {
+            return err;
+        };
+    }
     if (parsed.latest_review_session) {
         const record_path = try latestSessionRecordPathAlloc(allocator);
         return loadOwnedSessionRecordPath(allocator, record_path) catch |err| {
-            allocator.free(record_path);
             return err;
         };
     }
     return loadSessionRecord(allocator, parsed.review_thread_id.?);
 }
 
+fn absoluteInputPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const expanded = try core_path.expandHomePath(allocator, path);
+    errdefer allocator.free(expanded);
+    if (std.fs.path.isAbsolute(expanded)) return expanded;
+    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
+    defer allocator.free(cwd);
+    const absolute = try std.fs.path.join(allocator, &.{ cwd, expanded });
+    allocator.free(expanded);
+    return absolute;
+}
+
 fn loadOwnedSessionRecordPath(allocator: std.mem.Allocator, record_path: []const u8) !LoadedSessionRecord {
     errdefer allocator.free(record_path);
-    const file = try std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), record_path, .{});
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
-    var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
-    const raw = try reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
+    const raw = try durable_store.readRegularFileNoSymlink(allocator, record_path, 1024 * 1024);
     errdefer allocator.free(raw);
     const parsed = try std.json.parseFromSlice(SessionRecord, allocator, raw, .{});
+    errdefer parsed.deinit();
+    const previous_store_root_override = configured_store_root_override;
+    var rebound_store_root_override: ?[]const u8 = null;
+    if (parsed.value.store_root) |store_root| {
+        rebound_store_root_override = try allocator.dupe(u8, store_root);
+        configured_store_root_override = rebound_store_root_override;
+    }
     return .{
         .record_path = record_path,
         .raw = raw,
         .parsed = parsed,
         .record = parsed.value,
+        .previous_store_root_override = previous_store_root_override,
+        .rebound_store_root_override = rebound_store_root_override,
     };
 }
 
 fn latestSessionRecordPathAlloc(allocator: std.mem.Allocator) ![]const u8 {
     const session_dir = try sessionDirAlloc(allocator);
     defer allocator.free(session_dir);
-    return latestSessionRecordPathInDirAlloc(allocator, session_dir);
+    return latestSessionRecordPathInDirAlloc(allocator, session_dir) catch |err| switch (err) {
+        error.NoReviewSessionRecords, error.FileNotFound => {
+            const legacy_dir = try legacySessionDirPathAlloc(allocator);
+            defer allocator.free(legacy_dir);
+            return latestSessionRecordPathInDirAlloc(allocator, legacy_dir);
+        },
+        else => return err,
+    };
+}
+
+fn legacySessionDirPathAlloc(allocator: std.mem.Allocator) ![]const u8 {
+    const home = configured_home orelse return error.FileNotFound;
+    return std.fmt.allocPrint(allocator, "{s}/.codex/cas/review_sessions", .{home});
+}
+
+fn legacySessionRecordPathAlloc(allocator: std.mem.Allocator, review_thread_id: []const u8) ![]const u8 {
+    const session_dir = try legacySessionDirPathAlloc(allocator);
+    defer allocator.free(session_dir);
+    return std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ session_dir, review_thread_id });
 }
 
 fn latestSessionRecordPathInDirAlloc(allocator: std.mem.Allocator, session_dir: []const u8) ![]const u8 {
@@ -7273,16 +7408,11 @@ fn isReviewSessionRecordName(name: []const u8, kind: std.Io.File.Kind) bool {
 }
 
 fn writeSessionRecord(allocator: std.mem.Allocator, path: []const u8, record: SessionRecord) !void {
-    try ensureParentPath(path);
     const json = try stringifyAnyAlloc(allocator, record);
     defer allocator.free(json);
-    const temp_path = try std.fmt.allocPrint(allocator, "{s}.tmp-{d}", .{ path, std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds });
-    defer allocator.free(temp_path);
-    var file = try std.Io.Dir.createFileAbsolute(std.Io.Threaded.global_single_threaded.io(), temp_path, .{ .truncate = true });
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
-    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), json);
-    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), "\n");
-    try std.Io.Dir.renameAbsolute(temp_path, path, std.Io.Threaded.global_single_threaded.io());
+    const payload = try std.fmt.allocPrint(allocator, "{s}\n", .{json});
+    defer allocator.free(payload);
+    try durable_store.writeTextAtomic(allocator, path, payload);
 }
 
 fn currentProcessId() u64 {
@@ -7310,6 +7440,14 @@ fn repoRealpathAlloc(allocator: std.mem.Allocator, cwd: []const u8) ![]const u8 
     const path_z = try std.Io.Dir.cwd().realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), cwd, allocator);
     defer allocator.free(path_z);
     return allocator.dupe(u8, path_z);
+}
+
+fn repoRootForCwdAlloc(allocator: std.mem.Allocator, cwd: []const u8) !?[]const u8 {
+    const repo_root = durable_store.findGitRootAlloc(allocator, cwd) catch |err| switch (err) {
+        error.GitCommandFailed => return null,
+        else => return err,
+    };
+    return repo_root;
 }
 
 fn hashedAccountFingerprintAlloc(allocator: std.mem.Allocator, tag: []const u8, value: []const u8) ![]const u8 {
@@ -7392,7 +7530,10 @@ fn reviewTupleIdentityAlloc(
     client: *cas.Client,
 ) !ReviewTupleIdentity {
     const repo_realpath = try repoRealpathAlloc(allocator, cwd);
+    errdefer allocator.free(repo_realpath);
     const account_principal = try readAccountPrincipalAlloc(allocator, client);
+    errdefer allocator.free(account_principal.fingerprint);
+    const codex_thread_id = try currentCodexThreadIdAlloc(allocator);
     return .{
         .repo_realpath = repo_realpath,
         .base_sha = target_identity.base_sha,
@@ -7402,13 +7543,19 @@ fn reviewTupleIdentityAlloc(
         .resolved_codex_version = resolved_codex_version,
         .account_fingerprint = account_principal.fingerprint,
         .account_fingerprint_reduced_protection = account_principal.reduced_protection,
+        .codex_thread_id = codex_thread_id,
     };
+}
+
+fn currentCodexThreadIdAlloc(allocator: std.mem.Allocator) ![]const u8 {
+    if (configured_codex_thread_id) |value| return allocator.dupe(u8, value);
+    return allocator.dupe(u8, "reduced-unspecified");
 }
 
 fn canonicalReviewTuplePayloadAlloc(allocator: std.mem.Allocator, tuple: ReviewTupleIdentity) ![]const u8 {
     return std.fmt.allocPrint(
         allocator,
-        "repo_realpath={s}\nbase_sha={s}\nhead_sha={s}\ntarget_fingerprint={s}\nresolved_codex_path={s}\nresolved_codex_version={s}\naccount_fingerprint={s}\n",
+        "repo_realpath={s}\nbase_sha={s}\nhead_sha={s}\ntarget_fingerprint={s}\nresolved_codex_path={s}\nresolved_codex_version={s}\naccount_fingerprint={s}\ncodex_thread_id={s}\n",
         .{
             tuple.repo_realpath,
             tuple.base_sha orelse "",
@@ -7417,6 +7564,7 @@ fn canonicalReviewTuplePayloadAlloc(allocator: std.mem.Allocator, tuple: ReviewT
             tuple.resolved_codex_path,
             tuple.resolved_codex_version,
             tuple.account_fingerprint,
+            tuple.codex_thread_id,
         },
     );
 }
@@ -7462,13 +7610,10 @@ fn reviewTupleLockRewriteClaimPathAlloc(allocator: std.mem.Allocator, lock_path:
 }
 
 fn loadReviewTupleLock(allocator: std.mem.Allocator, path: []const u8) !?LoadedReviewTupleLock {
-    const file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch |err| switch (err) {
+    const raw = durable_store.readRegularFileNoSymlink(allocator, path, 1024 * 1024) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
-    var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
-    const raw = try reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
     errdefer allocator.free(raw);
     const parsed = try std.json.parseFromSlice(ReviewTupleLock, allocator, raw, .{});
     return .{
@@ -7496,6 +7641,7 @@ fn makeReviewTupleLock(
         .resolvedCodexPath = tuple.resolved_codex_path,
         .resolvedCodexVersion = tuple.resolved_codex_version,
         .accountFingerprint = tuple.account_fingerprint,
+        .codexThreadId = tuple.codex_thread_id,
         .state = state,
         .createdAtUnixS = now_s,
         .updatedAtUnixS = now_s,
@@ -7529,33 +7675,23 @@ fn withReviewTupleLockState(
 }
 
 fn writeReviewTupleLock(allocator: std.mem.Allocator, path: []const u8, lock: ReviewTupleLock) !void {
-    try ensureParentPath(path);
     const json = try stringifyAnyAlloc(allocator, lock);
     defer allocator.free(json);
-    const temp_path = try std.fmt.allocPrint(allocator, "{s}.tmp-{d}", .{ path, std.Io.Clock.awake.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds });
-    defer allocator.free(temp_path);
-    var file = try std.Io.Dir.createFileAbsolute(std.Io.Threaded.global_single_threaded.io(), temp_path, .{ .truncate = true });
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
-    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), json);
-    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), "\n");
-    try std.Io.Dir.renameAbsolute(temp_path, path, std.Io.Threaded.global_single_threaded.io());
+    const payload = try std.fmt.allocPrint(allocator, "{s}\n", .{json});
+    defer allocator.free(payload);
+    try durable_store.writeTextAtomic(allocator, path, payload);
 }
 
 fn writeReviewTupleLockExclusive(allocator: std.mem.Allocator, path: []const u8, lock: ReviewTupleLock) !void {
-    try ensureParentPath(path);
     const json = try stringifyAnyAlloc(allocator, lock);
     defer allocator.free(json);
-    var file = try std.Io.Dir.createFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{
-        .truncate = false,
-        .exclusive = true,
-    });
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
-    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), json);
-    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), "\n");
+    const payload = try std.fmt.allocPrint(allocator, "{s}\n", .{json});
+    defer allocator.free(payload);
+    try durable_store.writeTextCreateNew(allocator, path, payload, .{ .reject_symlinks = true });
 }
 
 fn reviewTupleLockRewriteClaimExpired(allocator: std.mem.Allocator, claim_path: []const u8, now_s: i64) bool {
-    const raw = readFileAlloc(allocator, claim_path, 4096) catch return true;
+    const raw = durable_store.readRegularFileNoSymlink(allocator, claim_path, 4096) catch return true;
     defer allocator.free(raw);
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return true;
     defer parsed.deinit();
@@ -7574,10 +7710,9 @@ fn claimReviewTupleLockRewriteExclusive(allocator: std.mem.Allocator, lock_path:
 
     var stale_claim_removed = false;
     while (true) {
-        var file = std.Io.Dir.createFileAbsolute(std.Io.Threaded.global_single_threaded.io(), claim_path, .{
-            .truncate = false,
-            .exclusive = true,
-        }) catch |err| switch (err) {
+        const claim = try std.fmt.allocPrint(allocator, "{{\"ownerPid\":{d},\"createdAtUnixS\":{d}}}\n", .{ currentProcessId(), unixSeconds() });
+        defer allocator.free(claim);
+        durable_store.writeTextCreateNew(allocator, claim_path, claim, .{ .reject_symlinks = true }) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 if (!stale_claim_removed and reviewTupleLockRewriteClaimExpired(allocator, claim_path, unixSeconds())) {
                     deleteReviewTupleLockRewriteClaimBestEffort(claim_path);
@@ -7588,16 +7723,16 @@ fn claimReviewTupleLockRewriteExclusive(allocator: std.mem.Allocator, lock_path:
             },
             else => return err,
         };
-        defer file.close(std.Io.Threaded.global_single_threaded.io());
-        const claim = try std.fmt.allocPrint(allocator, "{{\"ownerPid\":{d},\"createdAtUnixS\":{d}}}\n", .{ currentProcessId(), unixSeconds() });
-        defer allocator.free(claim);
-        try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), claim);
         return claim_path;
     }
 }
 
 fn deleteReviewTupleLockRewriteClaimBestEffort(claim_path: []const u8) void {
     std.Io.Dir.deleteFileAbsolute(std.Io.Threaded.global_single_threaded.io(), claim_path) catch {};
+}
+
+fn deleteReviewTupleLockBestEffort(lock_path: []const u8) void {
+    std.Io.Dir.deleteFileAbsolute(std.Io.Threaded.global_single_threaded.io(), lock_path) catch {};
 }
 
 fn isSmokeSuiteOverride(override_reason: ?[]const u8) bool {
@@ -7660,6 +7795,72 @@ fn terminalLockNeedsFreshAttempt(
     }) catch return true;
     defer normalized.deinit(allocator);
     return !normalizedReceiptReusableTerminal(normalized);
+}
+
+fn targetIdentityFromReviewTupleLock(lock: ReviewTupleLock) TargetIdentity {
+    return .{
+        .base_sha = lock.baseSha,
+        .head_sha = lock.headSha,
+        .fingerprint = lock.targetFingerprint,
+    };
+}
+
+fn cleanStreakResetDirAlloc(allocator: std.mem.Allocator) ![]const u8 {
+    const dir = try casStorePathAlloc(allocator, "state/clean_streak_resets");
+    try durable_store.ensureDirectoryPathNoSymlinks(dir);
+    return dir;
+}
+
+fn writeCleanStreakResetRecordAlloc(allocator: std.mem.Allocator, lock_path: []const u8, lock: ReviewTupleLock) ![]const u8 {
+    const dir = try cleanStreakResetDirAlloc(allocator);
+    defer allocator.free(dir);
+    const bare_hash = if (std.mem.startsWith(u8, lock.tupleHash, "sha256:")) lock.tupleHash["sha256:".len..] else lock.tupleHash;
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}-{d}.json", .{ dir, bare_hash, unixSeconds() });
+    errdefer allocator.free(path);
+    const json = try stringifyAnyAlloc(allocator, .{
+        .schema = "CAS-CLEAN-STREAK-RESET-v1",
+        .resetReason = "three_consecutive_clean_reviews",
+        .resetAtUnixS = unixSeconds(),
+        .tupleHash = lock.tupleHash,
+        .codexThreadId = lock.codexThreadId,
+        .cleanStreakCount = lock.cleanStreakCount,
+        .lockPath = lock_path,
+        .finalRecordPath = lock.lastCleanReceiptRecordPath,
+    });
+    defer allocator.free(json);
+    const payload = try std.fmt.allocPrint(allocator, "{s}\n", .{json});
+    defer allocator.free(payload);
+    try durable_store.writeTextCreateNew(allocator, path, payload, .{ .reject_symlinks = true });
+    return path;
+}
+
+fn applyCleanStreakMaintenance(allocator: std.mem.Allocator, lock_path: []const u8, lock: *ReviewTupleLock) bool {
+    if (!(std.mem.eql(u8, lock.state, "terminal") or std.mem.eql(u8, lock.state, "normalized"))) return false;
+    const record_path = lock.recordPath orelse return false;
+    if (lock.lastCleanReceiptRecordPath) |last| {
+        if (std.mem.eql(u8, last, record_path)) return false;
+    }
+    const normalized = normalizeReceiptFromPathAlloc(allocator, record_path, true, .{
+        .requested_identity = targetIdentityFromReviewTupleLock(lock.*),
+        .requested_identity_required = true,
+    }) catch return false;
+    defer normalized.deinit(allocator);
+    if (!normalizedReceiptReusableTerminal(normalized)) return false;
+    if (std.mem.eql(u8, normalized.status, "clean")) {
+        lock.cleanStreakCount += 1;
+        lock.lastCleanReceiptRecordPath = record_path;
+        if (lock.cleanStreakCount >= 3) {
+            const reset_path = writeCleanStreakResetRecordAlloc(allocator, lock_path, lock.*) catch return false;
+            lock.lastCleanStreakResetPath = reset_path;
+            return true;
+        }
+        return false;
+    }
+    if (std.mem.eql(u8, normalized.status, "findings")) {
+        lock.cleanStreakCount = 0;
+        lock.lastCleanReceiptRecordPath = null;
+    }
+    return false;
 }
 
 fn reviewTupleLockReplaceableDeadFailure(lock: ReviewTupleLock) bool {
@@ -7992,6 +8193,24 @@ fn emitReviewTupleLockBlockedAndExit(
     std.process.exit(1);
 }
 
+const ReviewTupleStartLockBundle = struct {
+    path: []const u8,
+    lock: ReviewTupleLock,
+    owns_last_clean_receipt_record_path: bool = false,
+    owns_last_clean_streak_reset_path: bool = false,
+
+    fn deinit(self: ReviewTupleStartLockBundle, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.lock.tupleHash);
+        if (self.owns_last_clean_receipt_record_path) {
+            if (self.lock.lastCleanReceiptRecordPath) |path| allocator.free(path);
+        }
+        if (self.owns_last_clean_streak_reset_path) {
+            if (self.lock.lastCleanStreakResetPath) |path| allocator.free(path);
+        }
+    }
+};
+
 fn acquireReviewTupleStartLockOrExit(
     allocator: std.mem.Allocator,
     json_mode: bool,
@@ -8002,7 +8221,7 @@ fn acquireReviewTupleStartLockOrExit(
     fresh_attempt_reason: ?[]const u8,
     verdict_only: bool,
     managed_server_to_kill_on_exit: ?*cas_websocket.ManagedServer,
-) !struct { path: []const u8, lock: ReviewTupleLock } {
+) !ReviewTupleStartLockBundle {
     const tuple_hash = try reviewTupleHashAlloc(allocator, tuple);
     const lock_path = try reviewTupleLockPathAlloc(allocator, tuple_hash);
     var loaded_opt = loadReviewTupleLock(allocator, lock_path) catch {
@@ -8155,9 +8374,35 @@ fn acquireReviewTupleStartLockOrExit(
                 },
             }
             const replacement_override_reason = if (latest_decision == .auto_replace_dead_transport) "auto-replaced-dead-transport" else override_reason;
-            const lock = makeReviewTupleLock(tuple_hash, tuple, "starting_lane", now_s, replacement_override_reason, fresh_attempt_reason);
+            var lock = makeReviewTupleLock(tuple_hash, tuple, "starting_lane", now_s, replacement_override_reason, fresh_attempt_reason);
+            var owns_last_clean_receipt_record_path = false;
+            var owns_last_clean_streak_reset_path = false;
+            if (latest_decision == .fresh_after_terminal) {
+                lock.cleanStreakCount = latest.record.cleanStreakCount;
+                if (latest.record.lastCleanReceiptRecordPath) |path| {
+                    lock.lastCleanReceiptRecordPath = try allocator.dupe(u8, path);
+                    owns_last_clean_receipt_record_path = true;
+                }
+                if (latest.record.lastCleanStreakResetPath) |path| {
+                    lock.lastCleanStreakResetPath = try allocator.dupe(u8, path);
+                    owns_last_clean_streak_reset_path = true;
+                }
+            }
+            errdefer {
+                if (owns_last_clean_receipt_record_path) {
+                    if (lock.lastCleanReceiptRecordPath) |path| allocator.free(path);
+                }
+                if (owns_last_clean_streak_reset_path) {
+                    if (lock.lastCleanStreakResetPath) |path| allocator.free(path);
+                }
+            }
             try writeReviewTupleLock(allocator, lock_path, lock);
-            return .{ .path = lock_path, .lock = lock };
+            return .{
+                .path = lock_path,
+                .lock = lock,
+                .owns_last_clean_receipt_record_path = owns_last_clean_receipt_record_path,
+                .owns_last_clean_streak_reset_path = owns_last_clean_streak_reset_path,
+            };
         },
         .return_existing, .normalize_existing => {
             const lock = loaded_opt.?.record;
@@ -8196,7 +8441,7 @@ fn updateReviewTupleLockBestEffort(
     record_path: ?[]const u8,
     event_log_path: ?[]const u8,
 ) void {
-    const next = withReviewTupleLockState(
+    var next = withReviewTupleLockState(
         current,
         state,
         unixSeconds(),
@@ -8206,7 +8451,12 @@ fn updateReviewTupleLockBestEffort(
         record_path,
         event_log_path,
     );
+    const clear_reusable_lock = applyCleanStreakMaintenance(allocator, path, &next);
+    defer if (clear_reusable_lock) {
+        if (next.lastCleanStreakResetPath) |reset_path| allocator.free(reset_path);
+    };
     writeReviewTupleLock(allocator, path, next) catch {};
+    if (clear_reusable_lock) deleteReviewTupleLockBestEffort(path);
 }
 
 fn updateReviewTupleLockForRecordBestEffort(
@@ -8315,17 +8565,7 @@ fn appendLogRecord(
         },
     );
     defer allocator.free(json_line);
-    try ensureParentPath(path);
-    var file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{ .mode = .write_only }) catch |err| switch (err) {
-        error.FileNotFound => try std.Io.Dir.createFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{ .truncate = false }),
-        else => return err,
-    };
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
-    const end_pos = (try file.stat(std.Io.Threaded.global_single_threaded.io())).size;
-    var writer = file.writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-    try writer.seekTo(end_pos);
-    try writer.interface.writeAll(json_line);
-    try writer.interface.writeAll("\n");
+    try durable_store.appendLineStreaming(allocator, path, json_line, .{ .reject_symlinks = true });
 }
 
 fn ensureParentPath(path: []const u8) !void {
@@ -9167,6 +9407,10 @@ fn casRunSyntheticReceiptJsonAlloc(
     try writer.writeByte(':');
     try writer.writeAll(if (receipt.account_fingerprint_reduced_protection) "true" else "false");
     try writer.writeByte(',');
+    try writeJsonString(writer, "codexThreadId");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.codex_thread_id);
+    try writer.writeByte(',');
     try writeJsonString(writer, "principalStrength");
     try writer.writeByte(':');
     try writeJsonString(writer, if (receipt.account_fingerprint_reduced_protection) principal_strength_reduced else principal_strength_strong);
@@ -9209,6 +9453,7 @@ fn startShadowReceiptPayloadJsonAlloc(
         .targetFingerprint = identity.fingerprint,
         .resolvedCodexPath = receipt.resolved_codex_path,
         .resolvedCodexVersion = receipt.resolved_codex_version,
+        .codexThreadId = receipt.codex_thread_id,
         .recordPath = record_path,
         .eventLogPath = event_log_path,
         .accountFingerprint = receipt.account_fingerprint,
@@ -10259,6 +10504,10 @@ fn receiptResolvedCodexVersion(root: std.json.ObjectMap) ?[]const u8 {
         jsonStringField(root, "codex_version");
 }
 
+fn receiptCodexThreadId(root: std.json.ObjectMap) ?[]const u8 {
+    return optionalStringFromRootKeys(root, "codexThreadId", "codex_thread_id");
+}
+
 fn receiptAccountFingerprint(verdict: std.json.ObjectMap, root: std.json.ObjectMap) ?[]const u8 {
     return optionalStringFromVerdictOrRoot(verdict, root, "accountFingerprint");
 }
@@ -10548,6 +10797,7 @@ fn normalizeReceiptFromJsonAlloc(allocator: std.mem.Allocator, source_path: []co
         .repo_realpath = try receiptRepoRealpathAlloc(allocator, root),
         .resolved_codex_path = try dupOptional(allocator, receiptResolvedCodexPath(root)),
         .resolved_codex_version = try dupOptional(allocator, receiptResolvedCodexVersion(root)),
+        .codex_thread_id = try dupOptional(allocator, receiptCodexThreadId(root)),
         .account_fingerprint = try dupOptional(allocator, receiptAccountFingerprint(verdict, root)),
         .review_thread_id = try dupOptional(allocator, review_thread_id),
         .review_turn_id = try dupOptional(allocator, optionalStringFromVerdictOrRoot(verdict, root, "reviewTurnId")),
@@ -10597,6 +10847,7 @@ fn normalizeAttemptOnlyReceiptAlloc(allocator: std.mem.Allocator, source_path: [
         .repo_realpath = try receiptRepoRealpathAlloc(allocator, root),
         .resolved_codex_path = try dupOptional(allocator, receiptResolvedCodexPath(root)),
         .resolved_codex_version = try dupOptional(allocator, receiptResolvedCodexVersion(root)),
+        .codex_thread_id = try dupOptional(allocator, receiptCodexThreadId(root)),
         .account_fingerprint = try dupOptional(allocator, receiptAccountFingerprint(root, root)),
         .review_thread_id = try dupOptional(allocator, review_thread_id),
         .review_turn_id = try dupOptional(allocator, jsonStringField(root, "reviewTurnId")),
@@ -10681,6 +10932,7 @@ fn normalizeStartReceiptAlloc(allocator: std.mem.Allocator, source_path: []const
         .repo_realpath = try receiptRepoRealpathAlloc(allocator, root),
         .resolved_codex_path = try dupOptional(allocator, receiptResolvedCodexPath(root)),
         .resolved_codex_version = try dupOptional(allocator, receiptResolvedCodexVersion(root)),
+        .codex_thread_id = try dupOptional(allocator, receiptCodexThreadId(root)),
         .account_fingerprint = try dupOptional(allocator, receiptAccountFingerprint(root, root)),
         .review_thread_id = try dupOptional(allocator, review_thread_id),
         .review_turn_id = try dupOptional(allocator, jsonStringField(root, "reviewTurnId")),
@@ -10816,6 +11068,7 @@ fn normalizeStoredSessionRecordReceiptAlloc(allocator: std.mem.Allocator, source
         .repo_realpath = try receiptRepoRealpathAlloc(allocator, root),
         .resolved_codex_path = try dupOptional(allocator, receiptResolvedCodexPath(root)),
         .resolved_codex_version = try dupOptional(allocator, receiptResolvedCodexVersion(root)),
+        .codex_thread_id = try dupOptional(allocator, receiptCodexThreadId(root)),
         .account_fingerprint = try dupOptional(allocator, receiptAccountFingerprint(root, root)),
         .review_thread_id = try allocator.dupe(u8, review_thread_id),
         .review_turn_id = try dupOptional(allocator, review_turn_id),
@@ -11007,11 +11260,12 @@ fn casRerRecordIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt,
     const effective_resolved_codex_path = opts.resolved_codex_path_override orelse receipt.resolved_codex_path orelse "";
     const effective_resolved_codex_version = opts.resolved_codex_version_override orelse receipt.resolved_codex_version orelse "";
     const effective_account_fingerprint = opts.account_fingerprint_override orelse receipt.account_fingerprint orelse "";
-    const material = try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{d}\x1f{s}\x1f{s}", .{
+    const material = try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{d}\x1f{s}\x1f{s}", .{
         effective_repo_realpath,
         effective_resolved_codex_path,
         effective_resolved_codex_version,
         effective_account_fingerprint,
+        receipt.codex_thread_id orelse "",
         receipt.backend_class,
         receipt.principal_strength,
         if (receipt.account_fingerprint_reduced_protection) "reduced-protection" else "full-protection",
@@ -11102,6 +11356,10 @@ fn writeCasRerTupleObject(writer: *std.Io.Writer, receipt: NormalizedReceipt, op
     try writeJsonString(writer, "resolvedCodexVersion");
     try writer.writeByte(':');
     try writeNullableJsonString(writer, resolved_codex_version);
+    try writer.writeByte(',');
+    try writeJsonString(writer, "codexThreadId");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.codex_thread_id);
     try writer.writeByte(',');
     try writeJsonString(writer, "diffScope");
     try writer.writeAll(":\"entire_pr\",");
@@ -11358,6 +11616,10 @@ fn writeReceiptReviewVerdictObject(writer: *std.Io.Writer, receipt: NormalizedRe
     try writer.writeByte(':');
     try writer.writeAll(if (receipt.account_fingerprint_reduced_protection) "true" else "false");
     try writer.writeByte(',');
+    try writeJsonString(writer, "codexThreadId");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.codex_thread_id);
+    try writer.writeByte(',');
     try writeJsonString(writer, "backendClass");
     try writer.writeByte(':');
     try writeJsonString(writer, receipt.backend_class);
@@ -11461,6 +11723,10 @@ fn writeReceiptObject(writer: *std.Io.Writer, receipt: NormalizedReceipt) !void 
     try writeJsonString(writer, "accountFingerprintReducedProtection");
     try writer.writeByte(':');
     try writer.writeAll(if (receipt.account_fingerprint_reduced_protection) "true" else "false");
+    try writer.writeByte(',');
+    try writeJsonString(writer, "codexThreadId");
+    try writer.writeByte(':');
+    try writeNullableJsonString(writer, receipt.codex_thread_id);
     try writer.writeByte(',');
     try writeJsonString(writer, "baseSha");
     try writer.writeByte(':');
@@ -12453,6 +12719,133 @@ test "parseArgs accepts bare review thread id selectors" {
     try std.testing.expectEqual(Action.status, parsed.action.?);
     try std.testing.expectEqualStrings("019f198b-722f-7b81-a6a9-f6dbbcec5ed8", parsed.review_thread_id.?);
     try std.testing.expect(parsed.json);
+}
+
+test "parseArgs accepts explicit session record path selectors" {
+    const argv = [_][]const u8{
+        "cas_review_session",
+        "status",
+        "--path",
+        "/repo/.ledger/cas/review_sessions/thr_1.json",
+        "--json",
+    };
+
+    var parsed = try parseArgs(std.testing.allocator, &argv);
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Action.status, parsed.action.?);
+    try std.testing.expectEqualStrings("/repo/.ledger/cas/review_sessions/thr_1.json", parsed.receipt_paths[0]);
+    try std.testing.expect(parsed.json);
+
+    const interrupt_argv = [_][]const u8{
+        "cas_review_session",
+        "interrupt",
+        "--path",
+        "/repo/.ledger/cas/review_sessions/thr_1.json",
+        "--json",
+    };
+    var interrupt = try parseArgs(std.testing.allocator, &interrupt_argv);
+    defer interrupt.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Action.interrupt, interrupt.action.?);
+    try std.testing.expectEqualStrings("/repo/.ledger/cas/review_sessions/thr_1.json", interrupt.receipt_paths[0]);
+    try std.testing.expect(interrupt.json);
+}
+
+test "loadSelectedSessionRecord rebinds store root from loaded record" {
+    const old_store_root = configured_store_root_override;
+    configured_store_root_override = "before";
+    defer configured_store_root_override = old_store_root;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const store_root = try std.fs.path.join(std.testing.allocator, &.{ root, "external-store" });
+    defer std.testing.allocator.free(store_root);
+    const record_path = try std.fs.path.join(std.testing.allocator, &.{ root, "record.json" });
+    errdefer std.testing.allocator.free(record_path);
+    const event_log_path = try std.fs.path.join(std.testing.allocator, &.{ store_root, "review_sessions", "thr.events.ndjson" });
+    defer std.testing.allocator.free(event_log_path);
+    const raw = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema_version\":3,\"cwd\":\"{s}\",\"store_root\":\"{s}\",\"store_scope\":\"repo\",\"repo_root\":\"{s}\",\"codex_thread_id\":\"thread\",\"parent_thread_id\":\"parent\",\"review_thread_id\":\"thr\",\"review_turn_id\":\"turn\",\"delivery\":\"review\",\"target\":{{\"type\":\"uncommittedChanges\"}},\"event_log_path\":\"{s}\",\"created_at_unix_s\":1,\"last_observed_status\":\"inProgress\",\"codex_version\":\"codex-cli test\"}}\n",
+        .{ root, store_root, root, event_log_path },
+    );
+    defer std.testing.allocator.free(raw);
+    try durable_store.writeTextAtomic(std.testing.allocator, record_path, raw);
+
+    var loaded = try loadOwnedSessionRecordPath(std.testing.allocator, record_path);
+    try std.testing.expectEqualStrings(store_root, configured_store_root_override.?);
+    loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("before", configured_store_root_override.?);
+}
+
+test "legacy review session records remain readable by id and latest selectors" {
+    const old_store_root = configured_store_root_override;
+    const old_home = configured_home;
+    configured_store_root_override = null;
+    defer configured_store_root_override = old_store_root;
+    defer configured_home = old_home;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const repo_store = try std.fs.path.join(std.testing.allocator, &.{ root, "repo-store" });
+    defer std.testing.allocator.free(repo_store);
+    configured_store_root_override = repo_store;
+    configured_home = root;
+
+    const legacy_dir = try std.fs.path.join(std.testing.allocator, &.{ root, ".codex", "cas", "review_sessions" });
+    defer std.testing.allocator.free(legacy_dir);
+    try durable_store.ensureDirectoryPathNoSymlinks(legacy_dir);
+    const legacy_path = try std.fs.path.join(std.testing.allocator, &.{ legacy_dir, "thr_legacy.json" });
+    defer std.testing.allocator.free(legacy_path);
+    const event_log_path = try std.fs.path.join(std.testing.allocator, &.{ legacy_dir, "thr_legacy.events.ndjson" });
+    defer std.testing.allocator.free(event_log_path);
+    const raw = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema_version\":3,\"cwd\":\"{s}\",\"parent_thread_id\":\"parent\",\"review_thread_id\":\"thr_legacy\",\"review_turn_id\":\"turn\",\"delivery\":\"review\",\"target\":{{\"type\":\"uncommittedChanges\"}},\"event_log_path\":\"{s}\",\"created_at_unix_s\":1,\"last_observed_status\":\"inProgress\",\"codex_version\":\"codex-cli test\"}}\n",
+        .{ root, event_log_path },
+    );
+    defer std.testing.allocator.free(raw);
+    try durable_store.writeTextAtomic(std.testing.allocator, legacy_path, raw);
+
+    var by_id = try loadSessionRecord(std.testing.allocator, "thr_legacy");
+    defer by_id.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(legacy_path, by_id.record_path);
+
+    const latest = try latestSessionRecordPathAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(latest);
+    try std.testing.expectEqualStrings(legacy_path, latest);
+}
+
+test "store root falls back to cwd ledger outside git while repo root stays optional" {
+    const old_store_root = configured_store_root_override;
+    const old_store_cwd = configured_store_cwd;
+    configured_store_root_override = null;
+    defer configured_store_root_override = old_store_root;
+    defer configured_store_cwd = old_store_cwd;
+
+    const root = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "/tmp/cas-review-session-store-root-test-{d}",
+        .{std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds},
+    );
+    defer std.testing.allocator.free(root);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), root);
+    defer std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), root) catch {};
+    configured_store_cwd = root;
+
+    const store_root = try casStoreRootAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(store_root);
+    const real_root = try std.Io.Dir.cwd().realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), root, std.testing.allocator);
+    defer std.testing.allocator.free(real_root);
+    const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}/.ledger/cas", .{real_root});
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, store_root);
+
+    const repo_root = try repoRootForCwdAlloc(std.testing.allocator, root);
+    try std.testing.expect(repo_root == null);
 }
 
 test "parseArgs rejects artifact-like review thread id selectors" {
@@ -13697,7 +14090,7 @@ test "CAS-RER writer projects terminal findings receipt" {
 
 test "CAS-RER ledger record projection matches tuple identity" {
     const raw =
-        \\{"schema":"CAS-RER-v1","recordId":"rer_match","createdAt":"2026-07-02T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"import","backendSelected":"imported-legacy","brokerDecision":{"action":"imported_legacy","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","resolvedCodexPath":"/bin/codex","resolvedCodexVersion":"codex 0.1.0","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:a","phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":true,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_match","createdAt":"2026-07-02T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"import","backendSelected":"imported-legacy","brokerDecision":{"action":"imported_legacy","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","resolvedCodexPath":"/bin/codex","resolvedCodexVersion":"codex 0.1.0","codexThreadId":"thread-test","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:a","phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":true,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
     ;
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
     defer parsed.deinit();
@@ -13706,17 +14099,24 @@ test "CAS-RER ledger record projection matches tuple identity" {
         .head_sha = "head",
         .fingerprint = "fp",
     };
-    try std.testing.expect(casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/bin/codex", "codex 0.1.0", "acct:test", false));
-    try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/bin/codex", "codex 0.1.0", "acct:test", true));
-    try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/usr/local/bin/codex", "codex 0.1.0", "acct:test", false));
-    try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/bin/codex", "codex 0.2.0", "acct:test", false));
-    try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/bin/codex", "codex 0.1.0", "acct:other", false));
+    try std.testing.expect(casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/bin/codex", "codex 0.1.0", "acct:test", false, "thread-test"));
+    try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/bin/codex", "codex 0.1.0", "acct:test", true, "thread-test"));
+    try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/usr/local/bin/codex", "codex 0.1.0", "acct:test", false, "thread-test"));
+    try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/bin/codex", "codex 0.2.0", "acct:test", false, "thread-test"));
+    try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/bin/codex", "codex 0.1.0", "acct:other", false, "thread-test"));
+    try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/bin/codex", "codex 0.1.0", "acct:test", false, "thread-other"));
+    const legacy_without_thread_raw =
+        \\{"schema":"CAS-RER-v1","recordId":"rer_match","createdAt":"2026-07-02T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"import","backendSelected":"imported-legacy","brokerDecision":{"action":"imported_legacy","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","resolvedCodexPath":"/bin/codex","resolvedCodexVersion":"codex 0.1.0","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:a","phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":true,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
+    ;
+    var legacy_without_thread = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, legacy_without_thread_raw, .{});
+    defer legacy_without_thread.deinit();
+    try std.testing.expect(casRerObjectMatchesIdentity(legacy_without_thread.value.object, "/tmp/repo", identity, "/bin/codex", "codex 0.1.0", "acct:test", false, "thread-test"));
     const wrong_identity = TargetIdentity{
         .base_sha = "base",
         .head_sha = "other",
         .fingerprint = "fp",
     };
-    try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", wrong_identity, "/bin/codex", "codex 0.1.0", "acct:test", false));
+    try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", wrong_identity, "/bin/codex", "codex 0.1.0", "acct:test", false, "thread-test"));
 
     const record = try casRerLedgerRecordFromJsonAlloc(std.testing.allocator, "/tmp/rer_match.json", raw);
     defer record.deinit(std.testing.allocator);
@@ -14451,7 +14851,7 @@ test "CAS-RUN envelope verdict imports through wrapper without tuple mismatch" {
 
 test "review import extracts nested CAS-RER records from envelopes" {
     const record_json =
-        \\{"schema":"CAS-RER-v1","recordId":"rer_nested","createdAt":"2026-07-02T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"run","backendSelected":"cas-run","sourceBackendClass":"cas-start-wait","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","resolvedCodexPath":"/bin/codex","resolvedCodexVersion":"codex 0.1.0","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:a","phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-start-wait"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
+        \\{"schema":"CAS-RER-v1","recordId":"rer_nested","createdAt":"2026-07-02T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"run","backendSelected":"cas-run","sourceBackendClass":"cas-start-wait","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","resolvedCodexPath":"/bin/codex","resolvedCodexVersion":"codex 0.1.0","codexThreadId":"thread-test","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:a","phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-start-wait"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
     ;
     const run_envelope = try std.fmt.allocPrint(std.testing.allocator,
         \\{{"schema":"CAS-RUN-v1","record":{s},"reviewVerdict":{{"status":"clean","backendClass":"cas-start-wait","clean":true,"findingCount":0,"baseSha":"base","headSha":"head","targetFingerprint":"fp","reviewThreadId":"thr","findings":[]}}}}
@@ -14477,8 +14877,8 @@ test "review import extracts nested CAS-RER records from envelopes" {
         .head_sha = "head",
         .fingerprint = "fp",
     };
-    try std.testing.expect(casRerObjectMatchesIdentity(nested.value.object, "/tmp/repo", requested_identity, "/bin/codex", "codex 0.1.0", "acct:test", false));
-    try std.testing.expect(!casRerObjectMatchesIdentity(nested.value.object, "/tmp/repo", requested_identity, "/bin/codex", "codex 0.1.0", "acct:other", false));
+    try std.testing.expect(casRerObjectMatchesIdentity(nested.value.object, "/tmp/repo", requested_identity, "/bin/codex", "codex 0.1.0", "acct:test", false, "thread-test"));
+    try std.testing.expect(!casRerObjectMatchesIdentity(nested.value.object, "/tmp/repo", requested_identity, "/bin/codex", "codex 0.1.0", "acct:other", false, "thread-test"));
 
     const import_envelope = try std.fmt.allocPrint(std.testing.allocator,
         \\{{"schema":"CAS-IMPORT-v1","records":[{{"sourcePath":"/tmp/receipt.json","validation":{{"ok":false,"errors":["bad"],"path":"/tmp/receipt.json"}},"record":{s}}},{{"sourcePath":"/tmp/receipt.json","validation":{{"ok":true,"errors":[],"path":"/tmp/receipt.json"}},"record":{s}}},{s}],"errors":[]}}
@@ -15225,6 +15625,7 @@ test "blocked account-resource run payload projects valid CAS-RER" {
         .resolved_codex_version = "codex 0.1.0",
         .account_fingerprint = "acct:test",
         .account_fingerprint_reduced_protection = false,
+        .codex_thread_id = "thread-test",
     };
     const raw = try stringifyAnyAlloc(std.testing.allocator, .{
         .demo = "cas-review-session",
@@ -16058,6 +16459,7 @@ fn testTupleIdentity(account_fingerprint: []const u8) ReviewTupleIdentity {
         .resolved_codex_version = "codex 0.1.0",
         .account_fingerprint = account_fingerprint,
         .account_fingerprint_reduced_protection = std.mem.eql(u8, account_fingerprint, unknown_account_fingerprint),
+        .codex_thread_id = "thread-test",
     };
 }
 
@@ -16288,6 +16690,97 @@ test "review tuple lock exclusive write rejects duplicate first claim" {
     };
     try writeReviewTupleLockExclusive(std.testing.allocator, path, lock);
     try std.testing.expectError(error.PathAlreadyExists, writeReviewTupleLockExclusive(std.testing.allocator, path, lock));
+}
+
+test "third clean receipt records clean-streak reset and clears reusable lock" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const tmp_root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", allocator);
+    const old_store_root = configured_store_root_override;
+    const old_store_cwd = configured_store_cwd;
+    const old_codex_thread_id = configured_codex_thread_id;
+    configured_store_root_override = tmp_root;
+    configured_store_cwd = tmp_root;
+    configured_codex_thread_id = "thread-clean";
+    defer {
+        configured_store_root_override = old_store_root;
+        configured_store_cwd = old_store_cwd;
+        configured_codex_thread_id = old_codex_thread_id;
+        allocator.free(tmp_root);
+    }
+
+    const record_path = try std.fmt.allocPrint(allocator, "{s}/review_sessions/thr_clean.json", .{tmp_root});
+    defer allocator.free(record_path);
+    const event_path = try std.fmt.allocPrint(allocator, "{s}/review_sessions/thr_clean.events.ndjson", .{tmp_root});
+    defer allocator.free(event_path);
+    const clean_result = "{\"findings\":[],\"overallCorrectness\":\"patch is correct\",\"overallExplanation\":\"clean\",\"overallConfidenceScore\":1}";
+    const record = SessionRecord{
+        .cwd = "/repo",
+        .store_root = tmp_root,
+        .store_scope = "repo-local",
+        .repo_root = "/repo",
+        .codex_thread_id = "thread-clean",
+        .parent_thread_id = "parent",
+        .review_thread_id = "thr_clean",
+        .review_turn_id = "turn_clean",
+        .delivery = "detached",
+        .target = .{ .type = "baseBranch", .branch = "main" },
+        .event_log_path = event_path,
+        .created_at_unix_s = 1,
+        .last_observed_status = "completed",
+        .codex_version = "codex 0.1.0",
+        .resolved_codex_path = "/bin/codex",
+        .compatibility_verdict = "compatible",
+        .transport_kind = "websocket",
+        .terminal_review_result_source = "rollout_exited_review_mode",
+        .terminal_review_result_json = clean_result,
+        .base_sha = "base",
+        .head_sha = "head",
+        .target_fingerprint = "fp",
+        .accountFingerprint = "acct:test",
+        .accountFingerprintReducedProtection = false,
+    };
+    try writeSessionRecord(allocator, record_path, record);
+
+    const lock_path = try std.fmt.allocPrint(allocator, "{s}/review_sessions/locks/abc.json", .{tmp_root});
+    defer allocator.free(lock_path);
+    const lock = ReviewTupleLock{
+        .tupleHash = "sha256:abc",
+        .repoRealpath = "/repo",
+        .baseSha = "base",
+        .headSha = "head",
+        .targetFingerprint = "fp",
+        .resolvedCodexPath = "/bin/codex",
+        .resolvedCodexVersion = "codex 0.1.0",
+        .accountFingerprint = "acct:test",
+        .codexThreadId = "thread-clean",
+        .state = "waiting",
+        .reviewThreadId = "thr_old",
+        .reviewTurnId = "turn_old",
+        .createdAtUnixS = 1,
+        .updatedAtUnixS = 1,
+        .expiresAtUnixS = 999,
+        .ownerPid = 1,
+        .cleanStreakCount = 2,
+        .lastCleanReceiptRecordPath = "/previous-clean.json",
+    };
+    try writeReviewTupleLock(allocator, lock_path, lock);
+    try std.testing.expect(durable_store.fileExists(lock_path));
+
+    updateReviewTupleLockBestEffort(allocator, lock_path, lock, "terminal", null, "thr_clean", "turn_clean", record_path, event_path);
+    try std.testing.expect(!durable_store.fileExists(lock_path));
+
+    const reset_dir_path = try std.fmt.allocPrint(allocator, "{s}/state/clean_streak_resets", .{tmp_root});
+    defer allocator.free(reset_dir_path);
+    var reset_dir = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), reset_dir_path, .{ .iterate = true });
+    defer reset_dir.close(std.Io.Threaded.global_single_threaded.io());
+    var iter = reset_dir.iterate();
+    var reset_count: usize = 0;
+    while (try iter.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".json")) reset_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), reset_count);
 }
 
 test "review tuple lock rewrite claim is exclusive" {

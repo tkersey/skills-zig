@@ -2,6 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const core_cli = @import("core_cli");
 const core_json = @import("core_json");
+const core_path = @import("core_path");
+const durable_store = @import("durable_store");
 const retrace_core = @import("retrace_core");
 const app_meta = @import("app_meta");
 const cas_client = @import("cas_proxy_client.zig");
@@ -49,8 +51,12 @@ const UsageText =
     \\  --timeout-ms N
     \\  --max-total-tokens N
     \\  --transport auto|stdio|websocket
+    \\  --store-root DIR
     \\  --json
     \\  --verdict-only
+    \\
+    \\ID lookups are store-scoped. Use --cwd, --store-root, or a recorded
+    \\state_ref when checking from outside the original repo/workspace.
     \\
     \\Unsafe modes are intentionally not exposed: workspace-write, full-access,
     \\approval grants, network enablement, and thread/shellCommand.
@@ -141,6 +147,7 @@ const Options = struct {
     receipt_format: []const u8 = "table",
     receipt_summary: bool = false,
     codex_path: []const u8 = "codex",
+    store_root: ?[]const u8 = null,
     home: []const u8 = "",
     path_env: []const u8 = "",
 };
@@ -398,6 +405,8 @@ pub fn main(init: std.process.Init) !void {
     };
     options.home = init.environ_map.get("HOME") orelse "";
     options.path_env = init.environ_map.get("PATH") orelse "";
+    configured_store_root_override = options.store_root orelse init.environ_map.get("CAS_STORE_ROOT");
+    configured_store_cwd = options.cwd;
 
     switch (options.command) {
         .preflight => try cmdPreflight(allocator, options),
@@ -466,6 +475,10 @@ fn parseArgs(argv: []const []const u8) !Options {
             options.receipt_format = value;
         } else if (std.mem.eql(u8, arg, "--codex-path")) {
             options.codex_path = try takeValue(argv, &i, arg);
+        } else if (std.mem.eql(u8, arg, "--store-root")) {
+            const value = try takeValue(argv, &i, arg);
+            if (value.len == 0) return error.InvalidStoreRoot;
+            options.store_root = value;
         } else {
             return error.UnknownFlag;
         }
@@ -1573,7 +1586,9 @@ fn startDetachedInquiry(
         null,
     );
     try writeSummary(allocator, summary_path, rip.inquiry_id, @tagName(InquiryState.turn_running), 0, 0, preflight.schema_fingerprint, "", "");
-    try spawnDetachedWaitWorker(allocator, options, rip.inquiry_id, rip.timeout_ms);
+    const store_root = try casStoreRootAlloc(allocator);
+    defer allocator.free(store_root);
+    try spawnDetachedWaitWorker(allocator, options, rip.inquiry_id, rip.timeout_ms, store_root);
     std.Io.sleep(std.Io.Threaded.global_single_threaded.io(), .fromMilliseconds(750), .awake) catch {};
     keep_server = true;
     return .{
@@ -1588,7 +1603,7 @@ fn startDetachedInquiry(
     };
 }
 
-fn spawnDetachedWaitWorker(allocator: std.mem.Allocator, options: Options, inquiry_id: []const u8, timeout_ms: u64) !void {
+fn spawnDetachedWaitWorker(allocator: std.mem.Allocator, options: Options, inquiry_id: []const u8, timeout_ms: u64, store_root: []const u8) !void {
     const io = std.Io.Threaded.global_single_threaded.io();
     const self_exe = if (fileExists("zig-out/bin/cas_session_inquiry"))
         try allocator.dupe(u8, "zig-out/bin/cas_session_inquiry")
@@ -1604,6 +1619,8 @@ fn spawnDetachedWaitWorker(allocator: std.mem.Allocator, options: Options, inqui
         inquiry_id,
         "--timeout-ms",
         timeout_text,
+        "--store-root",
+        store_root,
         "--json",
     };
     _ = try cas_websocket.spawnDetachedProcess(allocator, ".", &argv, io);
@@ -2398,7 +2415,7 @@ fn collectLaneFork(
 ) !LaneExecutionResult {
     const observed = try waitForTurnObservation(allocator, client, handle.fork_thread_id, handle.turn_id, options.timeout_ms, handle.lane_events);
     const final_text = if (observed.final_text.len > 0) observed.final_text else "";
-    try writeTextAtomic(allocator, handle.lane_final, final_text);
+    try durable_store.writeTextAtomic(allocator, handle.lane_final, final_text);
     const parsed_answer = parseFiaAnswerAlloc(allocator, final_text, handle.expected_hindsight) catch null;
     const policy_request_observed = client.blockingServerRequestCount() > handle.policy_request_count_before;
     const blocking_event = observed.blocking_event or policy_request_observed;
@@ -3473,14 +3490,14 @@ fn persistInputCopies(allocator: std.mem.Allocator, options: Options, inquiry_id
         defer allocator.free(raw);
         const target = try inquiryPathJoin(allocator, options.home, inquiry_id, "capsule.json");
         defer allocator.free(target);
-        try writeTextAtomic(allocator, target, raw);
+        try durable_store.writeTextAtomic(allocator, target, raw);
     }
     if (options.plan_path) |source| {
         const raw = try readFileAlloc(allocator, source, MaxInputBytes);
         defer allocator.free(raw);
         const target = try inquiryPathJoin(allocator, options.home, inquiry_id, "plan.json");
         defer allocator.free(target);
-        try writeTextAtomic(allocator, target, raw);
+        try durable_store.writeTextAtomic(allocator, target, raw);
     }
 }
 
@@ -3718,18 +3735,55 @@ fn sanitizePathComponentAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]
     return out;
 }
 
+var configured_store_root_override: ?[]const u8 = null;
+var configured_store_cwd: ?[]const u8 = null;
+
+fn casStoreRootAlloc(allocator: std.mem.Allocator) ![]const u8 {
+    if (configured_store_root_override) |root| {
+        return absoluteStoreRootOverrideAlloc(allocator, root);
+    }
+    const start_input = if (configured_store_cwd) |cwd|
+        try allocator.dupe(u8, cwd)
+    else
+        try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
+    defer allocator.free(start_input);
+    const start = try std.Io.Dir.cwd().realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), start_input, allocator);
+    defer allocator.free(start);
+    const repo_root = durable_store.findGitRootAlloc(allocator, start) catch |err| switch (err) {
+        error.GitCommandFailed => return std.fmt.allocPrint(allocator, "{s}/.ledger/cas", .{start}),
+        else => return err,
+    };
+    defer allocator.free(repo_root);
+    return std.fmt.allocPrint(allocator, "{s}/.ledger/cas", .{repo_root});
+}
+
+fn absoluteStoreRootOverrideAlloc(allocator: std.mem.Allocator, root: []const u8) ![]const u8 {
+    const expanded = try core_path.expandHomePath(allocator, root);
+    errdefer allocator.free(expanded);
+    if (std.fs.path.isAbsolute(expanded)) return expanded;
+    const cwd = try std.process.currentPathAlloc(std.Io.Threaded.global_single_threaded.io(), allocator);
+    defer allocator.free(cwd);
+    const absolute = try std.fs.path.join(allocator, &.{ cwd, expanded });
+    allocator.free(expanded);
+    return absolute;
+}
+
 fn stateRecordPath(allocator: std.mem.Allocator, home: []const u8, inquiry_id: []const u8) ![]const u8 {
+    _ = home;
     const safe = try sanitizeInquiryIdAlloc(allocator, inquiry_id);
     defer allocator.free(safe);
-    if (home.len == 0) return std.fmt.allocPrint(allocator, ".codex/cas/session_inquiries/{s}.json", .{safe});
-    return std.fmt.allocPrint(allocator, "{s}/.codex/cas/session_inquiries/{s}.json", .{ home, safe });
+    const root = try casStoreRootAlloc(allocator);
+    defer allocator.free(root);
+    return std.fmt.allocPrint(allocator, "{s}/session_inquiries/{s}.json", .{ root, safe });
 }
 
 fn inquiryPathJoin(allocator: std.mem.Allocator, home: []const u8, inquiry_id: []const u8, leaf: []const u8) ![]const u8 {
+    _ = home;
     const safe = try sanitizeInquiryIdAlloc(allocator, inquiry_id);
     defer allocator.free(safe);
-    if (home.len == 0) return std.fmt.allocPrint(allocator, ".codex/cas/session_inquiries/{s}/{s}", .{ safe, leaf });
-    return std.fmt.allocPrint(allocator, "{s}/.codex/cas/session_inquiries/{s}/{s}", .{ home, safe, leaf });
+    const root = try casStoreRootAlloc(allocator);
+    defer allocator.free(root);
+    return std.fmt.allocPrint(allocator, "{s}/session_inquiries/{s}/{s}", .{ root, safe, leaf });
 }
 
 fn sanitizeInquiryIdAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
@@ -3938,36 +3992,7 @@ fn writeJsonFile(allocator: std.mem.Allocator, path: []const u8, value: anytype)
     try payload.writer.writeByte('\n');
     const text = try payload.toOwnedSlice();
     defer allocator.free(text);
-    try writeTextAtomic(allocator, path, text);
-}
-
-fn writeTextAtomic(allocator: std.mem.Allocator, path: []const u8, text: []const u8) !void {
-    try ensureParentDir(path);
-    const base = std.fs.path.basename(path);
-    const parent = std.fs.path.dirname(path) orelse ".";
-    const tmp_name = try std.fmt.allocPrint(allocator, ".{s}.{d}.tmp", .{ base, nowMillis() });
-    defer allocator.free(tmp_name);
-    if (std.fs.path.isAbsolute(path)) {
-        var dir = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), parent, .{});
-        defer dir.close(std.Io.Threaded.global_single_threaded.io());
-        try writeTempAndRename(&dir, tmp_name, base, text);
-        return;
-    }
-    var dir = try std.Io.Dir.cwd().openDir(std.Io.Threaded.global_single_threaded.io(), parent, .{});
-    defer dir.close(std.Io.Threaded.global_single_threaded.io());
-    try writeTempAndRename(&dir, tmp_name, base, text);
-}
-
-fn writeTempAndRename(dir: *std.Io.Dir, tmp_name: []const u8, base: []const u8, text: []const u8) !void {
-    var file = try dir.createFile(std.Io.Threaded.global_single_threaded.io(), tmp_name, .{ .truncate = true, .read = true });
-    var close_file = true;
-    errdefer if (close_file) file.close(std.Io.Threaded.global_single_threaded.io());
-    try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), text);
-    try file.sync(std.Io.Threaded.global_single_threaded.io());
-    file.close(std.Io.Threaded.global_single_threaded.io());
-    close_file = false;
-    errdefer dir.deleteFile(std.Io.Threaded.global_single_threaded.io(), tmp_name) catch {};
-    try dir.rename(tmp_name, dir.*, base, std.Io.Threaded.global_single_threaded.io());
+    try durable_store.writeTextAtomic(allocator, path, text);
 }
 
 fn appendLine(path: []const u8, line: []const u8) !void {
@@ -3985,7 +4010,7 @@ fn appendLine(path: []const u8, line: []const u8) !void {
     try out.writer.writeByte('\n');
     const payload = try out.toOwnedSlice();
     defer std.heap.page_allocator.free(payload);
-    try writeTextAtomic(std.heap.page_allocator, path, payload);
+    try durable_store.writeTextAtomic(std.heap.page_allocator, path, payload);
 }
 
 fn appendSimpleEvent(allocator: std.mem.Allocator, events_path: []const u8, event_name: []const u8) !void {
@@ -4074,6 +4099,32 @@ test "parseArgs accepts safe common flags and rejects unsafe sandbox" {
 
     const bad = [_][]const u8{ "cas_session_inquiry", "run", "--sandbox", "workspace-write" };
     try std.testing.expectError(error.UnsafeSandbox, parseArgs(&bad));
+}
+
+test "casStoreRootAlloc falls back to cwd ledger outside git" {
+    const old_store_root = configured_store_root_override;
+    const old_store_cwd = configured_store_cwd;
+    configured_store_root_override = null;
+    defer configured_store_root_override = old_store_root;
+    defer configured_store_cwd = old_store_cwd;
+
+    const root = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "/tmp/cas-session-inquiry-store-root-test-{d}",
+        .{std.Io.Clock.real.now(std.Io.Threaded.global_single_threaded.io()).nanoseconds},
+    );
+    defer std.testing.allocator.free(root);
+    try std.Io.Dir.cwd().createDirPath(std.Io.Threaded.global_single_threaded.io(), root);
+    defer std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), root) catch {};
+    configured_store_cwd = root;
+
+    const store_root = try casStoreRootAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(store_root);
+    const real_root = try std.Io.Dir.cwd().realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), root, std.testing.allocator);
+    defer std.testing.allocator.free(real_root);
+    const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}/.ledger/cas", .{real_root});
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, store_root);
 }
 
 test "deriveCapabilities recognizes schema method and field surface" {
