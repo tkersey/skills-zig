@@ -347,6 +347,12 @@ pub const CreateNewOptions = struct {
     sync: bool = true,
 };
 
+pub const AppendLineOptions = struct {
+    reject_symlinks: bool = true,
+    file_mode: ?u32 = 0o600,
+    sync: bool = true,
+};
+
 pub const JsonlTransactionMode = enum {
     append,
     replace,
@@ -1477,6 +1483,47 @@ pub fn writeTextCreateNew(
     _ = allocator;
 }
 
+pub fn writeTextCreateNewAtomic(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    text: []const u8,
+    options: CreateNewOptions,
+) !void {
+    const parent = std.fs.path.dirname(path) orelse ".";
+    const base = std.fs.path.basename(path);
+    if (parent.len == 0 or base.len == 0 or std.mem.eql(u8, base, ".") or std.mem.eql(u8, base, "..")) {
+        return error.InvalidPath;
+    }
+    if (options.reject_symlinks) {
+        try ensureDirectoryPathNoSymlinks(parent);
+        const existing_stat = std.Io.Dir.cwd().statFile(Io.io(), path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (existing_stat) |stat| {
+            if (stat.kind == .sym_link) return error.SymlinkComponent;
+        }
+    } else {
+        try ensureParentPath(path);
+    }
+
+    var dir = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openDirAbsolute(Io.io(), parent, .{ .follow_symlinks = false })
+    else
+        try std.Io.Dir.cwd().openDir(Io.io(), parent, .{ .follow_symlinks = false });
+    defer dir.close(Io.io());
+
+    var atomic_file = try dir.createFileAtomic(Io.io(), base, .{
+        .permissions = filePermissionsFromMode(options.file_mode),
+        .replace = false,
+    });
+    defer atomic_file.deinit(Io.io());
+    try atomic_file.file.writeStreamingAll(Io.io(), text);
+    if (options.sync) try atomic_file.file.sync(Io.io());
+    try atomic_file.link(Io.io());
+    _ = allocator;
+}
+
 pub fn writeTextAtomic(allocator: std.mem.Allocator, path: []const u8, text: []const u8) !void {
     const base = std.fs.path.basename(path);
     const parent = std.fs.path.dirname(path) orelse ".";
@@ -1534,6 +1581,77 @@ pub fn appendLineAtomic(
     const payload = try out.toOwnedSlice();
     defer allocator.free(payload);
     try writeTextAtomic(allocator, path, payload);
+}
+
+pub fn appendLineStreaming(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    line: []const u8,
+    options: AppendLineOptions,
+) !void {
+    const parent = std.fs.path.dirname(path) orelse ".";
+    const base = std.fs.path.basename(path);
+    if (parent.len == 0 or base.len == 0 or std.mem.eql(u8, base, ".") or std.mem.eql(u8, base, "..")) {
+        return error.InvalidPath;
+    }
+    if (options.reject_symlinks) {
+        try ensureDirectoryPathNoSymlinks(parent);
+        const existing_stat = std.Io.Dir.cwd().statFile(Io.io(), path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (existing_stat) |stat| {
+            if (stat.kind == .sym_link) return error.SymlinkComponent;
+            if (stat.kind != .file) return error.NotFile;
+        }
+    } else {
+        try ensureParentPath(path);
+    }
+
+    var dir = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openDirAbsolute(Io.io(), parent, .{ .follow_symlinks = false })
+    else
+        try std.Io.Dir.cwd().openDir(Io.io(), parent, .{ .follow_symlinks = false });
+    defer dir.close(Io.io());
+
+    var file = dir.openFile(Io.io(), base, .{
+        .mode = .read_write,
+        .allow_directory = false,
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => dir.createFile(Io.io(), base, .{
+            .exclusive = true,
+            .read = true,
+            .truncate = false,
+            .permissions = filePermissionsFromMode(options.file_mode),
+        }) catch |create_err| switch (create_err) {
+            error.PathAlreadyExists => try dir.openFile(Io.io(), base, .{
+                .mode = .read_write,
+                .allow_directory = false,
+                .follow_symlinks = false,
+            }),
+            else => return create_err,
+        },
+        else => return err,
+    };
+    defer file.close(Io.io());
+
+    const stat = try file.stat(Io.io());
+    if (stat.kind == .sym_link) return error.SymlinkComponent;
+    if (stat.kind != .file) return error.NotFile;
+    var offset = stat.size;
+    if (stat.size > 0) {
+        var last: [1]u8 = undefined;
+        const read = try file.readPositionalAll(Io.io(), &last, stat.size - 1);
+        if (read == 1 and last[0] != '\n') {
+            try file.writePositionalAll(Io.io(), "\n", offset);
+            offset += 1;
+        }
+    }
+    try file.writePositionalAll(Io.io(), line, offset);
+    try file.writePositionalAll(Io.io(), "\n", offset + line.len);
+    if (options.sync) try file.sync(Io.io());
+    _ = allocator;
 }
 
 pub fn ensureNoPendingTransactions(
@@ -1901,18 +2019,21 @@ fn acquireExclusiveLockPathRetry(
 }
 
 pub fn findGitRootAlloc(allocator: std.mem.Allocator, start: []const u8) ![]u8 {
-    var argv = [_][]const u8{ "git", "-C", start, "rev-parse", "--show-toplevel" };
-    const result = try std.process.run(allocator, Io.io(), .{
-        .argv = &argv,
-        .stdout_limit = .limited(1024 * 1024),
-        .stderr_limit = .limited(1024 * 1024),
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    if (result.term != .exited or result.term.exited != 0) return error.GitCommandFailed;
-    const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
-    if (trimmed.len == 0) return error.GitCommandFailed;
-    return allocator.dupe(u8, trimmed);
+    const current_real = try std.Io.Dir.cwd().realPathFileAlloc(Io.io(), start, allocator);
+    defer allocator.free(current_real);
+    var current: []u8 = try allocator.dupe(u8, current_real);
+    errdefer allocator.free(current);
+    while (true) {
+        const marker = try std.fmt.allocPrint(allocator, "{s}/.git", .{current});
+        defer allocator.free(marker);
+        if (fileExists(marker)) return current;
+
+        const parent = std.fs.path.dirname(current) orelse return error.GitCommandFailed;
+        if (std.mem.eql(u8, parent, current)) return error.GitCommandFailed;
+        const next = try allocator.dupe(u8, parent);
+        allocator.free(current);
+        current = next;
+    }
 }
 
 pub fn ensureLockSidecarGitignored(allocator: std.mem.Allocator, store_path: []const u8) !void {
@@ -2370,6 +2491,21 @@ test "writeTextCreateNew creates once without overwriting" {
     try std.testing.expectEqualStrings("first", data);
 }
 
+test "writeTextCreateNewAtomic links only complete new files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "records", "record.json" });
+    defer std.testing.allocator.free(path);
+
+    try writeTextCreateNewAtomic(std.testing.allocator, path, "{\"ok\":true}\n", .{});
+    try std.testing.expectError(error.PathAlreadyExists, writeTextCreateNewAtomic(std.testing.allocator, path, "{\"ok\":false}\n", .{}));
+    const data = try tryReadForTest(path);
+    defer std.testing.allocator.free(data);
+    try std.testing.expectEqualStrings("{\"ok\":true}\n", data);
+}
+
 test "writeTextCreateNew rejects symlink parent component" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2444,6 +2580,27 @@ test "appendLineAtomic appends newline-delimited records" {
     const data = try tryReadForTest(path);
     defer std.testing.allocator.free(data);
     try std.testing.expectEqualStrings("{\"n\":1}\n{\"n\":2}\n", data);
+}
+
+test "appendLineStreaming appends without reading capped existing log" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "events.ndjson" });
+    defer std.testing.allocator.free(path);
+
+    const large = try std.testing.allocator.alloc(u8, 2048);
+    defer std.testing.allocator.free(large);
+    @memset(large, 'x');
+    try writeTextAtomic(std.testing.allocator, path, large);
+    try std.testing.expectError(error.StreamTooLong, appendLineAtomic(std.testing.allocator, path, "{\"n\":1}", 1024));
+    try appendLineStreaming(std.testing.allocator, path, "{\"n\":1}", .{});
+
+    const data = try tryReadForTest(path);
+    defer std.testing.allocator.free(data);
+    try std.testing.expectEqual(@as(usize, 2048 + "\n{\"n\":1}\n".len), data.len);
+    try std.testing.expectEqualStrings("\n{\"n\":1}\n", data[2048..]);
 }
 
 test "appendJsonlCheckpointTransaction publishes checkpoint and receipts" {
@@ -2561,6 +2718,21 @@ test "nextMonotonicIdAlloc scans matching numeric suffixes" {
     const next = try nextMonotonicIdAlloc(std.testing.allocator, "NEG-", &ids);
     defer std.testing.allocator.free(next);
     try std.testing.expectEqualStrings("NEG-000011", next);
+}
+
+test "findGitRootAlloc walks parents without spawning git" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    try tmp.dir.createDirPath(Io.io(), ".git");
+    try tmp.dir.createDirPath(Io.io(), "a/b/c");
+
+    const nested = try std.fs.path.join(std.testing.allocator, &.{ root, "a", "b", "c" });
+    defer std.testing.allocator.free(nested);
+    const found = try findGitRootAlloc(std.testing.allocator, nested);
+    defer std.testing.allocator.free(found);
+    try std.testing.expectEqualStrings(root, found);
 }
 
 test "acquireLock is exclusive until released" {
