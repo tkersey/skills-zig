@@ -67,6 +67,7 @@ const UsageText =
     \\  --commit SHA                     Review a specific commit.
     \\  --title TITLE                    Optional commit title for --commit.
     \\  --custom-instructions VALUE      Custom review instructions, raw text, @file, or - for stdin.
+    \\  --workflow-binding-json VALUE    Optional workflow binding as JSON or @file.
     \\  --multi-agent-mode MODE          explicit-request-only|proactive for fresh parent request flow.
     \\
     \\Approval/runtime options:
@@ -120,7 +121,7 @@ const UsageText =
     \\  version                          Show version.
     \\
     \\Examples:
-    \\  cas review_session run --cwd /path/to/repo --base main --json
+    \\  cas review_session run --cwd /path/to/repo --base main --workflow-binding-json @binding.json --json
     \\  cas review_session current --cwd /path/to/repo --base main --json
     \\  cas review_session list --cwd /path/to/repo --base main --json
     \\  cas review_session import --path review-1.json --cwd /path/to/repo --base main --json
@@ -285,6 +286,16 @@ const TargetConfig = struct {
     instructions: ?[]const u8 = null,
 };
 
+const WorkflowBinding = struct {
+    actuationRunId: []const u8,
+    artifactStateFingerprint: []const u8,
+    reviewContractFingerprint: []const u8,
+    resolutionDigest: []const u8,
+    selectedLenses: []const []const u8,
+    reviewLane: []const u8,
+    lensContract: []const u8,
+};
+
 const ParsedArgs = struct {
     executable_path: []const u8 = "cas_review_session",
     action: ?Action = null,
@@ -300,6 +311,7 @@ const ParsedArgs = struct {
     latest_review_session: bool = false,
     target: ?TargetConfig = null,
     custom_instructions_arg: ?[]const u8 = null,
+    workflow_binding_arg: ?[]const u8 = null,
     wait_after_start: bool = false,
     archive_lane_threads: bool = true,
     lane_smoke_wait: bool = true,
@@ -393,6 +405,7 @@ const SessionRecord = struct {
     target_fingerprint: ?[]const u8 = null,
     accountFingerprint: ?[]const u8 = null,
     accountFingerprintReducedProtection: bool = true,
+    workflowBinding: ?WorkflowBinding = null,
 };
 
 const review_tuple_lock_version = "CAS-RTL-v1";
@@ -417,11 +430,14 @@ const ReviewTupleIdentity = struct {
     account_fingerprint: []const u8,
     account_fingerprint_reduced_protection: bool,
     codex_thread_id: []const u8,
+    workflow_binding: ?WorkflowBinding = null,
+    workflow_binding_digest: ?[]const u8 = null,
 
     fn deinit(self: ReviewTupleIdentity, allocator: std.mem.Allocator) void {
         allocator.free(self.repo_realpath);
         allocator.free(self.account_fingerprint);
         allocator.free(self.codex_thread_id);
+        if (self.workflow_binding_digest) |value| allocator.free(value);
     }
 };
 
@@ -445,6 +461,7 @@ const ReviewTupleLock = struct {
     resolvedCodexVersion: []const u8,
     accountFingerprint: []const u8,
     codexThreadId: ?[]const u8 = null,
+    workflowBinding: ?WorkflowBinding = null,
     state: []const u8,
     reviewThreadId: ?[]const u8 = null,
     reviewTurnId: ?[]const u8 = null,
@@ -620,6 +637,7 @@ const OutputReceipt = struct {
     account_fingerprint_reduced_protection: bool = true,
     codex_thread_id: ?[]const u8 = null,
     fresh_attempt_required: bool = false,
+    workflow_binding: ?WorkflowBinding = null,
 };
 
 const ReviewBrokerDecision = struct {
@@ -658,6 +676,7 @@ fn withRecordMultiAgentMode(receipt: OutputReceipt, record: SessionRecord) Outpu
     out.account_fingerprint = record.accountFingerprint;
     out.account_fingerprint_reduced_protection = record.accountFingerprintReducedProtection;
     out.codex_thread_id = record.codex_thread_id;
+    out.workflow_binding = record.workflowBinding;
     return out;
 }
 
@@ -1008,6 +1027,12 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             setTarget(&out, .{ .kind = .custom, .instructions = instructions });
             continue;
         }
+        if (std.mem.eql(u8, arg, "--workflow-binding-json")) {
+            if (out.workflow_binding_arg != null) return error.DuplicateWorkflowBinding;
+            if (value.len == 0 or std.mem.eql(u8, value, "-")) return error.InvalidWorkflowBinding;
+            out.workflow_binding_arg = value;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--timeout-ms")) {
             const parsed = try std.fmt.parseInt(i64, value, 10);
             if (parsed <= 0) return error.InvalidTimeout;
@@ -1165,6 +1190,13 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             .status, .wait, .interrupt, .receipt, .lock => return error.FreshAttemptUnsupportedAction,
         }
     }
+    if (out.workflow_binding_arg != null) {
+        switch (out.action.?) {
+            .run, .current, .list, .start => {},
+            .lane => if (out.lane_action != .review) return error.WorkflowBindingUnsupportedAction,
+            .review_import, .inspect, .validate_record, .status, .wait, .interrupt, .receipt, .lock => return error.WorkflowBindingUnsupportedAction,
+        }
+    }
     switch (out.action.?) {
         .run, .start => {
             if (out.cwd == null) return error.MissingCwd;
@@ -1270,6 +1302,43 @@ fn loadCustomInstructionsAlloc(allocator: std.mem.Allocator, raw: []const u8) ![
         return std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), raw[1..], allocator, .limited(1024 * 1024));
     }
     return allocator.dupe(u8, raw);
+}
+
+fn workflowBindingStringValid(value: []const u8) bool {
+    return std.mem.trim(u8, value, " \t\r\n").len != 0;
+}
+
+fn validateWorkflowBinding(binding: WorkflowBinding) !void {
+    if (!workflowBindingStringValid(binding.actuationRunId) or
+        !workflowBindingStringValid(binding.artifactStateFingerprint) or
+        !workflowBindingStringValid(binding.reviewContractFingerprint) or
+        !workflowBindingStringValid(binding.resolutionDigest) or
+        !workflowBindingStringValid(binding.reviewLane) or
+        !workflowBindingStringValid(binding.lensContract) or
+        binding.selectedLenses.len == 0)
+    {
+        return error.InvalidWorkflowBinding;
+    }
+    for (binding.selectedLenses, 0..) |lens, index| {
+        if (!workflowBindingStringValid(lens)) return error.InvalidWorkflowBinding;
+        if (index > 0 and std.mem.order(u8, binding.selectedLenses[index - 1], lens) != .lt) {
+            return error.InvalidWorkflowBinding;
+        }
+    }
+}
+
+fn loadWorkflowBindingAlloc(allocator: std.mem.Allocator, raw_arg: ?[]const u8) !?std.json.Parsed(WorkflowBinding) {
+    const arg = raw_arg orelse return null;
+    const raw = if (std.mem.startsWith(u8, arg, "@")) blk: {
+        if (arg.len == 1) return error.InvalidWorkflowBinding;
+        break :blk try std.Io.Dir.cwd().readFileAlloc(std.Io.Threaded.global_single_threaded.io(), arg[1..], allocator, .limited(1024 * 1024));
+    } else try allocator.dupe(u8, arg);
+    defer allocator.free(raw);
+
+    var parsed = std.json.parseFromSlice(WorkflowBinding, allocator, raw, .{ .allocate = .alloc_always }) catch return error.InvalidWorkflowBinding;
+    errdefer parsed.deinit();
+    try validateWorkflowBinding(parsed.value);
+    return parsed;
 }
 
 fn validateCommaSeparatedNonNegativeU32(raw: []const u8) !void {
@@ -1394,6 +1463,8 @@ fn writeCasRerRecordRefsArray(writer: *std.Io.Writer, records: []const CasRerLed
         try writeJsonString(writer, record.record_id);
         try writer.writeAll(",\"recordPath\":");
         try writeJsonString(writer, record.path);
+        try writer.writeAll(",\"proofCreditEligible\":");
+        try writer.writeAll(if (record.proof_credit_eligible) "true" else "false");
         try writer.writeByte('}');
     }
     try writer.writeByte(']');
@@ -1405,10 +1476,12 @@ fn writeCasReviewCurrentEnvelope(writer: *std.Io.Writer, records: []const CasRer
         try writeJsonString(writer, records[idx].path);
         try writer.writeAll(",\"record\":");
         try writer.writeAll(records[idx].raw_json);
-        try writer.writeAll(",\"tupleCurrent\":true,\"actionRequired\":");
+        try writer.writeAll(",\"tupleCurrent\":true,\"proofCreditEligible\":");
+        try writer.writeAll(if (records[idx].proof_credit_eligible) "true" else "false");
+        try writer.writeAll(",\"actionRequired\":");
         try writeJsonString(writer, actionRequiredForCasRerRecord(records[idx]));
     } else {
-        try writer.writeAll("null,\"record\":null,\"tupleCurrent\":false,\"actionRequired\":\"run_new_attempt\"");
+        try writer.writeAll("null,\"record\":null,\"tupleCurrent\":false,\"proofCreditEligible\":false,\"actionRequired\":\"run_new_attempt\"");
     }
     try writer.writeByte('}');
 }
@@ -1422,6 +1495,9 @@ fn writeCasReviewListEnvelope(writer: *std.Io.Writer, records: []const CasRerLed
 }
 
 fn cmdReviewCurrent(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
+    var loaded_workflow_binding = try loadWorkflowBindingAlloc(allocator, parsed.workflow_binding_arg);
+    defer if (loaded_workflow_binding) |*binding| binding.deinit();
+    const workflow_binding_filter = if (loaded_workflow_binding) |binding| binding.value else null;
     var resolved = try reviewCurrentIdentityAlloc(allocator, io, parsed);
     defer resolved.deinit(allocator);
 
@@ -1430,7 +1506,7 @@ fn cmdReviewCurrent(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs
         for (records.items) |record| record.deinit(allocator);
         records.deinit(allocator);
     }
-    try appendCasRerLedgerRecordsAlloc(allocator, &records, resolved.cwd, resolved.identity, resolved.resolved_codex_path, resolved.resolved_codex_version, resolved.account_fingerprint, resolved.account_fingerprint_reduced_protection, resolved.codex_thread_id);
+    try appendCasRerLedgerRecordsAlloc(allocator, &records, resolved.cwd, resolved.identity, resolved.resolved_codex_path, resolved.resolved_codex_version, resolved.account_fingerprint, resolved.account_fingerprint_reduced_protection, resolved.codex_thread_id, workflow_binding_filter);
     std.mem.sort(CasRerLedgerRecord, records.items, {}, casRerRecordLessThan);
 
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
@@ -1440,6 +1516,9 @@ fn cmdReviewCurrent(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs
 }
 
 fn cmdReviewList(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
+    var loaded_workflow_binding = try loadWorkflowBindingAlloc(allocator, parsed.workflow_binding_arg);
+    defer if (loaded_workflow_binding) |*binding| binding.deinit();
+    const workflow_binding_filter = if (loaded_workflow_binding) |binding| binding.value else null;
     var resolved = try reviewCurrentIdentityAlloc(allocator, io, parsed);
     defer resolved.deinit(allocator);
 
@@ -1448,7 +1527,7 @@ fn cmdReviewList(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
         for (records.items) |record| record.deinit(allocator);
         records.deinit(allocator);
     }
-    try appendCasRerLedgerRecordsAlloc(allocator, &records, resolved.cwd, resolved.identity, resolved.resolved_codex_path, resolved.resolved_codex_version, resolved.account_fingerprint, resolved.account_fingerprint_reduced_protection, resolved.codex_thread_id);
+    try appendCasRerLedgerRecordsAlloc(allocator, &records, resolved.cwd, resolved.identity, resolved.resolved_codex_path, resolved.resolved_codex_version, resolved.account_fingerprint, resolved.account_fingerprint_reduced_protection, resolved.codex_thread_id, workflow_binding_filter);
     std.mem.sort(CasRerLedgerRecord, records.items, {}, casRerRecordLessThan);
 
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
@@ -1520,6 +1599,9 @@ fn writeInspectRecordObject(
 
 fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
     const action_name = if (parsed.action != null and parsed.action.? == .run) "run" else "start";
+    var loaded_workflow_binding = try loadWorkflowBindingAlloc(allocator, parsed.workflow_binding_arg);
+    defer if (loaded_workflow_binding) |*binding| binding.deinit();
+    const workflow_binding = if (loaded_workflow_binding) |binding| binding.value else null;
     const cwd = try repoRealpathAlloc(allocator, parsed.cwd.?);
     defer allocator.free(cwd);
     const resolved_codex_path = cas.resolveExecutableAlloc(allocator, "codex") catch {
@@ -1564,6 +1646,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         .orphan_ttl_seconds = managed_server_orphan_ttl_seconds,
         .hook_policy = parsed.hook_policy,
         .fresh_attempt_required = parsed.fresh_attempt_reason != null,
+        .workflow_binding = workflow_binding,
     };
 
     var managed_server = startManagedWebsocketServer(allocator, cwd, resolved_codex_path, parsed.hook_policy, io) catch |err| {
@@ -1630,7 +1713,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
     const target_record = targetToRecord(target);
     var identity = try computeTargetIdentityAlloc(allocator, io, cwd, target_record);
     defer identity.deinit(allocator);
-    var review_tuple = try reviewTupleIdentityAlloc(allocator, cwd, identity, resolved_codex_path, codex_version, &client);
+    var review_tuple = try reviewTupleIdentityAlloc(allocator, cwd, identity, resolved_codex_path, codex_version, &client, workflow_binding);
     defer review_tuple.deinit(allocator);
     output_receipt.account_fingerprint = review_tuple.account_fingerprint;
     output_receipt.account_fingerprint_reduced_protection = review_tuple.account_fingerprint_reduced_protection;
@@ -1888,6 +1971,7 @@ fn cmdStart(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void 
         .target_fingerprint = identity.fingerprint,
         .accountFingerprint = review_tuple.account_fingerprint,
         .accountFingerprintReducedProtection = review_tuple.account_fingerprint_reduced_protection,
+        .workflowBinding = workflow_binding,
     };
     if (std.mem.eql(u8, action_name, "run")) {
         const auto_replaced = std.mem.eql(u8, tuple_lock_bundle.lock.overrideReason orelse "", "auto-replaced-dead-transport");
@@ -2790,6 +2874,7 @@ const NormalizedReceipt = struct {
     failure_class: ?[]const u8,
     retryable_same_tuple_now: ?bool,
     findings_json: []const u8,
+    workflow_binding_json: ?[]const u8 = null,
 
     fn deinit(self: NormalizedReceipt, allocator: std.mem.Allocator) void {
         allocator.free(self.source_path);
@@ -2812,6 +2897,7 @@ const NormalizedReceipt = struct {
         if (self.failure_hint) |value| allocator.free(value);
         if (self.failure_class) |value| allocator.free(value);
         allocator.free(self.findings_json);
+        if (self.workflow_binding_json) |value| allocator.free(value);
     }
 };
 
@@ -3853,6 +3939,20 @@ fn validateCasRerRecordObjectAlloc(allocator: std.mem.Allocator, path: []const u
         try appendGateError(allocator, &errors, "updatedAt must be a parseable CAS-RER timestamp", .{});
     }
 
+    if (data.get("workflowBinding")) |binding_value| {
+        switch (binding_value) {
+            .object => {
+                const canonical = canonicalWorkflowBindingJsonFromValueAlloc(allocator, binding_value) catch null;
+                if (canonical) |value| {
+                    allocator.free(value);
+                } else {
+                    try appendGateError(allocator, &errors, "workflowBinding must be a complete canonical workflow binding", .{});
+                }
+            },
+            else => try appendGateError(allocator, &errors, "workflowBinding must be an object when present", .{}),
+        }
+    }
+
     var attempt_exists_value: ?bool = null;
     if (attempt) |attempt_obj| {
         const attempt_exists = jsonBoolField(attempt_obj, "exists");
@@ -4098,6 +4198,22 @@ fn validateTupleLockGateObjectAlloc(allocator: std.mem.Allocator, path: []const 
     if (expires_at != 0 and updated_at != 0 and expires_at < updated_at) {
         try appendGateError(allocator, &errors, "expiresAtUnixS must be >= updatedAtUnixS", .{});
     }
+    if (lock.get("workflowBinding")) |binding_value| switch (binding_value) {
+        .object => {
+            const raw = try stringifyJsonValueAlloc(allocator, .{ .object = lock });
+            defer allocator.free(raw);
+            var parsed_lock = std.json.parseFromSlice(ReviewTupleLock, allocator, raw, .{}) catch null;
+            if (parsed_lock) |*parsed| {
+                defer parsed.deinit();
+                if (!(reviewTupleLockWorkflowBindingValidAlloc(allocator, parsed.value) catch false)) {
+                    try appendGateError(allocator, &errors, "workflowBinding must match the tupleHash", .{});
+                }
+            } else {
+                try appendGateError(allocator, &errors, "workflowBinding lock fields are invalid", .{});
+            }
+        },
+        else => try appendGateError(allocator, &errors, "workflowBinding must be an object when present", .{}),
+    };
     return .{
         .path = try allocator.dupe(u8, path),
         .errors = try errors.toOwnedSlice(allocator),
@@ -4336,6 +4452,7 @@ fn cmdLaneSmoke(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !v
             lane_record_path,
             target_record,
             identity,
+            null,
             cas_websocket.processAlive(lane.managed_server_pid),
         );
     };
@@ -4345,7 +4462,7 @@ fn cmdLaneSmoke(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !v
     }
     defer managed_server.deinit(allocator);
 
-    var review_tuple = try reviewTupleIdentityAlloc(allocator, cwd, identity, resolved_codex_path, codex_version, &client);
+    var review_tuple = try reviewTupleIdentityAlloc(allocator, cwd, identity, resolved_codex_path, codex_version, &client, null);
     defer review_tuple.deinit(allocator);
     const tuple_lock_bundle = try acquireReviewTupleStartLockOrExit(
         allocator,
@@ -4377,6 +4494,7 @@ fn cmdLaneSmoke(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !v
                 lane_record_path,
                 target_record,
                 identity,
+                null,
                 cas_websocket.processAlive(lane.managed_server_pid),
             );
         }
@@ -4409,6 +4527,7 @@ fn cmdLaneSmoke(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !v
                     lane_record_path,
                     target_record,
                     identity,
+                    null,
                     cas_websocket.processAlive(lane.managed_server_pid),
                 );
             }
@@ -4433,6 +4552,7 @@ fn cmdLaneSmoke(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !v
                 lane_record_path,
                 target_record,
                 identity,
+                null,
                 cas_websocket.processAlive(lane.managed_server_pid),
             );
         }
@@ -5282,7 +5402,35 @@ fn writeSmokeRunJson(writer: *std.Io.Writer, result: LaneSmokeRunSummary) !void 
     try writer.writeByte('}');
 }
 
+fn writeLaneSessionCasRerShadowAlloc(
+    allocator: std.mem.Allocator,
+    record_path: []const u8,
+    identity: TargetIdentity,
+    broker_reason: []const u8,
+) ![]const u8 {
+    const normalized = try normalizeReceiptFromPathAlloc(allocator, record_path, true, .{
+        .requested_identity = identity,
+        .requested_identity_required = true,
+    });
+    defer normalized.deinit(allocator);
+    const timestamp = try casRerTimestampAlloc(allocator);
+    defer allocator.free(timestamp);
+    return writeCasRerShadowRecordFromReceipt(allocator, normalized, .{
+        .command_surface = "lane_review",
+        .backend_selected = "cas-lane",
+        .broker_action = "created_new",
+        .broker_reason = broker_reason,
+        .imported_from_receipt = false,
+        .tuple_current_at_record_time = true,
+        .created_at = timestamp,
+        .updated_at = timestamp,
+    });
+}
+
 fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !void {
+    var loaded_workflow_binding = try loadWorkflowBindingAlloc(allocator, parsed.workflow_binding_arg);
+    defer if (loaded_workflow_binding) |*binding| binding.deinit();
+    const workflow_binding = if (loaded_workflow_binding) |binding| binding.value else null;
     var loaded = try loadLaneRecord(allocator, parsed.lane_id.?);
     defer loaded.deinit(allocator);
     var lane = loaded.record;
@@ -5303,6 +5451,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
             loaded.record_path,
             target_record,
             identity,
+            workflow_binding,
             false,
         );
     }
@@ -5328,6 +5477,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
             loaded.record_path,
             target_record,
             identity,
+            workflow_binding,
             cas_websocket.processAlive(lane.managed_server_pid),
         );
     };
@@ -5336,7 +5486,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
         client.deinit();
     }
 
-    var review_tuple = try reviewTupleIdentityAlloc(allocator, lane.cwd, identity, lane.resolved_codex_path, lane.codex_version, &client);
+    var review_tuple = try reviewTupleIdentityAlloc(allocator, lane.cwd, identity, lane.resolved_codex_path, lane.codex_version, &client, workflow_binding);
     defer review_tuple.deinit(allocator);
     const tuple_lock_bundle = try acquireReviewTupleStartLockOrExit(
         allocator,
@@ -5366,6 +5516,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
                 loaded.record_path,
                 target_record,
                 identity,
+                workflow_binding,
                 cas_websocket.processAlive(lane.managed_server_pid),
             );
         }
@@ -5397,6 +5548,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
                     loaded.record_path,
                     target_record,
                     identity,
+                    workflow_binding,
                     cas_websocket.processAlive(lane.managed_server_pid),
                 );
             }
@@ -5421,6 +5573,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
                 loaded.record_path,
                 target_record,
                 identity,
+                workflow_binding,
                 cas_websocket.processAlive(lane.managed_server_pid),
             );
         }
@@ -5431,7 +5584,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
             try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, .{
                 .code = "review_failed",
                 .hint = "lane review startup failed; returned explicit native-review fallback",
-            }, parsed.multi_agent_mode, parsed.verdict_only);
+            }, workflow_binding, parsed.multi_agent_mode, parsed.verdict_only);
             std.process.exit(if (fallback.ok) 0 else 1);
         }
         updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "pre_review_start_failed", "review_failed", null, null, null, parent_event_log_path);
@@ -5480,6 +5633,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
         .target_fingerprint = identity.fingerprint,
         .accountFingerprint = review_tuple.account_fingerprint,
         .accountFingerprintReducedProtection = review_tuple.account_fingerprint_reduced_protection,
+        .workflowBinding = workflow_binding,
     };
     try writeSessionRecord(allocator, record_path, record);
     updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "review_started", null, review_thread_id, review_turn_id, record_path, event_log_path);
@@ -5509,6 +5663,13 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
             lane.last_dual_parse_verdict = "timeout";
             lane.last_archive_status = "skipped_timeout";
             try writeLaneRecord(allocator, loaded.record_path, lane);
+            const shadow_record_path = try writeLaneSessionCasRerShadowAlloc(
+                allocator,
+                record_path,
+                identity,
+                "lane review wait timed out",
+            );
+            defer allocator.free(shadow_record_path);
             try printLaneReviewTimeoutJson(
                 allocator,
                 lane,
@@ -5520,6 +5681,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
                 record_path,
                 event_log_path,
                 parsed.timeout_ms,
+                workflow_binding,
                 parsed.multi_agent_mode,
                 parsed.verdict_only,
             );
@@ -5533,7 +5695,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
                 try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, .{
                     .code = "lane_transport_lost",
                     .hint = "persistent CAS lane websocket was lost while waiting; returned explicit native-review fallback",
-                }, parsed.multi_agent_mode, parsed.verdict_only);
+                }, workflow_binding, parsed.multi_agent_mode, parsed.verdict_only);
                 std.process.exit(if (fallback.ok) 0 else 1);
             }
             if (isTransportLossError(err)) {
@@ -5618,7 +5780,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
         if (parsed.fallback_mode == .native_review) {
             var fallback = try runNativeReviewFallbackAlloc(allocator, lane.cwd, lane.resolved_codex_path, target_record);
             defer fallback.deinit(allocator);
-            try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, lane_failure.?, parsed.multi_agent_mode, parsed.verdict_only);
+            try printLaneFallbackJson(allocator, lane, loaded.record_path, target_record, identity, fallback, lane_failure.?, workflow_binding, parsed.multi_agent_mode, parsed.verdict_only);
             std.process.exit(if (fallback.ok) 0 else 1);
         }
     }
@@ -5627,6 +5789,13 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
     const clean = lane_failure == null and finding_count == 0;
     if (lane_failure == null) {
         updateReviewTupleLockBestEffort(allocator, tuple_lock_bundle.path, tuple_lock_bundle.lock, "normalized", null, review_thread_id, review_turn_id, record_path, event_log_path);
+        const shadow_record_path = try writeLaneSessionCasRerShadowAlloc(
+            allocator,
+            record_path,
+            identity,
+            "lane review reached a normalized terminal verdict",
+        );
+        defer allocator.free(shadow_record_path);
     }
     try printLaneReviewJson(
         allocator,
@@ -5643,6 +5812,7 @@ fn cmdLaneReview(allocator: std.mem.Allocator, io: std.Io, parsed: ParsedArgs) !
         archive_status,
         clean,
         lane_failure,
+        workflow_binding,
         parsed.multi_agent_mode,
         parsed.verdict_only,
     );
@@ -6770,6 +6940,7 @@ const CasRerLedgerRecord = struct {
     head_sha: ?[]const u8,
     target_fingerprint: ?[]const u8,
     principal_proof_usable: bool,
+    proof_credit_eligible: bool = false,
     fresh_attempt_required: bool,
 
     fn deinit(self: CasRerLedgerRecord, allocator: std.mem.Allocator) void {
@@ -6787,6 +6958,81 @@ const CasRerLedgerRecord = struct {
     }
 };
 
+fn workflowBindingObjectMatches(root: std.json.ObjectMap, expected: WorkflowBinding) bool {
+    const value = root.get("workflowBinding") orelse return false;
+    const actual = switch (value) {
+        .object => |object| object,
+        else => return false,
+    };
+    if (!std.mem.eql(u8, jsonStringField(actual, "actuationRunId") orelse "", expected.actuationRunId)) return false;
+    if (!std.mem.eql(u8, jsonStringField(actual, "artifactStateFingerprint") orelse "", expected.artifactStateFingerprint)) return false;
+    if (!std.mem.eql(u8, jsonStringField(actual, "reviewContractFingerprint") orelse "", expected.reviewContractFingerprint)) return false;
+    if (!std.mem.eql(u8, jsonStringField(actual, "resolutionDigest") orelse "", expected.resolutionDigest)) return false;
+    if (!std.mem.eql(u8, jsonStringField(actual, "reviewLane") orelse "", expected.reviewLane)) return false;
+    if (!std.mem.eql(u8, jsonStringField(actual, "lensContract") orelse "", expected.lensContract)) return false;
+    const lenses_value = actual.get("selectedLenses") orelse return false;
+    const lenses = switch (lenses_value) {
+        .array => |array| array.items,
+        else => return false,
+    };
+    if (lenses.len != expected.selectedLenses.len) return false;
+    for (lenses, expected.selectedLenses) |actual_lens, expected_lens| {
+        if (actual_lens != .string or !std.mem.eql(u8, actual_lens.string, expected_lens)) return false;
+    }
+    return true;
+}
+
+fn casRerObjectMatchesHistoryScope(
+    root: std.json.ObjectMap,
+    repo_realpath: []const u8,
+    identity: TargetIdentity,
+    codex_thread_id: []const u8,
+    workflow_binding_filter: ?WorkflowBinding,
+) bool {
+    const tuple = objectField(root, "tuple") orelse return false;
+    const record_repo = jsonStringField(tuple, "repoRealpath") orelse return false;
+    if (!std.mem.eql(u8, record_repo, repo_realpath)) return false;
+    if (!optionalStringsEqual(jsonStringField(tuple, "baseSha"), identity.base_sha)) return false;
+    if (!optionalStringsEqual(jsonStringField(tuple, "headSha"), identity.head_sha)) return false;
+    if (!optionalStringsEqual(jsonStringField(tuple, "targetFingerprint"), identity.fingerprint)) return false;
+    const record_has_binding = root.get("workflowBinding") != null and root.get("workflowBinding").? != .null;
+    const record_codex_thread_id = jsonStringField(tuple, "codexThreadId");
+    if (record_codex_thread_id) |value| {
+        if (!std.mem.eql(u8, value, codex_thread_id)) return false;
+    } else if (record_has_binding) {
+        return false;
+    }
+    if (workflow_binding_filter) |expected| {
+        if (record_codex_thread_id == null) return false;
+        if (!workflowBindingObjectMatches(root, expected)) return false;
+    }
+    return true;
+}
+
+fn casRerObjectProofCreditEligible(
+    root: std.json.ObjectMap,
+    repo_realpath: []const u8,
+    identity: TargetIdentity,
+    resolved_codex_path: []const u8,
+    resolved_codex_version: []const u8,
+    account_fingerprint: []const u8,
+    account_fingerprint_reduced_protection: bool,
+    codex_thread_id: []const u8,
+    workflow_binding_filter: ?WorkflowBinding,
+) bool {
+    if (!casRerObjectMatchesHistoryScope(root, repo_realpath, identity, codex_thread_id, workflow_binding_filter)) return false;
+    if (account_fingerprint_reduced_protection) return false;
+    const tuple = objectField(root, "tuple") orelse return false;
+    if (jsonBoolField(tuple, "tupleCurrentAtRecordTime") != true) return false;
+    if (!optionalStringsEqual(jsonStringField(tuple, "resolvedCodexPath"), resolved_codex_path)) return false;
+    if (!optionalStringsEqual(jsonStringField(tuple, "resolvedCodexVersion"), resolved_codex_version)) return false;
+    if (!casRerPrincipalFingerprintUsable(account_fingerprint)) return false;
+    const principal = objectField(root, "principal") orelse return false;
+    if (!casRerPrincipalProofUsableObject(principal)) return false;
+    const record_account_fingerprint = nonEmptyOptional(jsonStringField(principal, "accountFingerprint")) orelse return false;
+    return std.mem.eql(u8, record_account_fingerprint, account_fingerprint);
+}
+
 fn casRerObjectMatchesIdentity(
     root: std.json.ObjectMap,
     repo_realpath: []const u8,
@@ -6797,22 +7043,7 @@ fn casRerObjectMatchesIdentity(
     account_fingerprint_reduced_protection: bool,
     codex_thread_id: []const u8,
 ) bool {
-    if (account_fingerprint_reduced_protection) return false;
-    const tuple = objectField(root, "tuple") orelse return false;
-    const record_repo = jsonStringField(tuple, "repoRealpath") orelse return false;
-    if (!std.mem.eql(u8, record_repo, repo_realpath)) return false;
-    if (!optionalStringsEqual(jsonStringField(tuple, "baseSha"), identity.base_sha)) return false;
-    if (!optionalStringsEqual(jsonStringField(tuple, "headSha"), identity.head_sha)) return false;
-    if (!optionalStringsEqual(jsonStringField(tuple, "targetFingerprint"), identity.fingerprint)) return false;
-    if (!optionalStringsEqual(jsonStringField(tuple, "resolvedCodexPath"), resolved_codex_path)) return false;
-    if (!optionalStringsEqual(jsonStringField(tuple, "resolvedCodexVersion"), resolved_codex_version)) return false;
-    if (jsonStringField(tuple, "codexThreadId")) |record_codex_thread_id| {
-        if (!std.mem.eql(u8, record_codex_thread_id, codex_thread_id)) return false;
-    }
-    if (!casRerPrincipalFingerprintUsable(account_fingerprint)) return false;
-    const principal = objectField(root, "principal") orelse return false;
-    const record_account_fingerprint = nonEmptyOptional(jsonStringField(principal, "accountFingerprint")) orelse return false;
-    return std.mem.eql(u8, record_account_fingerprint, account_fingerprint);
+    return casRerObjectProofCreditEligible(root, repo_realpath, identity, resolved_codex_path, resolved_codex_version, account_fingerprint, account_fingerprint_reduced_protection, codex_thread_id, null);
 }
 
 fn casRerPrincipalProofUsableObject(principal: ?std.json.ObjectMap) bool {
@@ -6869,6 +7100,7 @@ fn appendCasRerLedgerRecordsAlloc(
     account_fingerprint: ?[]const u8,
     account_fingerprint_reduced_protection: ?bool,
     codex_thread_id: ?[]const u8,
+    workflow_binding_filter: ?WorkflowBinding,
 ) !void {
     const records_dir = try reviewLedgerRecordsDirPathAlloc(allocator);
     defer allocator.free(records_dir);
@@ -6886,47 +7118,27 @@ fn appendCasRerLedgerRecordsAlloc(
         defer allocator.free(path);
         const raw = readFileAlloc(allocator, path, 8 * 1024 * 1024) catch continue;
         defer allocator.free(raw);
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch continue;
+        defer parsed.deinit();
+        const root = switch (parsed.value) {
+            .object => |obj| obj,
+            else => continue,
+        };
+        if (!std.mem.eql(u8, jsonStringField(root, "schema") orelse "", cas_review_evidence_schema)) continue;
+        var validation = validateCasRerRecordObjectAlloc(allocator, path, root) catch continue;
+        defer validation.deinit(allocator);
+        if (!validation.ok()) continue;
+
+        var proof_credit_eligible = false;
         if (repo_realpath != null and identity != null and resolved_codex_path != null and resolved_codex_version != null and account_fingerprint != null and account_fingerprint_reduced_protection != null and codex_thread_id != null) {
-            var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch continue;
-            defer parsed.deinit();
-            const root = switch (parsed.value) {
-                .object => |obj| obj,
-                else => continue,
-            };
-            if (!std.mem.eql(u8, jsonStringField(root, "schema") orelse "", cas_review_evidence_schema)) continue;
-            var validation = validateCasRerRecordObjectAlloc(allocator, path, root) catch continue;
-            defer validation.deinit(allocator);
-            if (!validation.ok()) continue;
-            if (!casRerObjectMatchesIdentity(root, repo_realpath.?, identity.?, resolved_codex_path.?, resolved_codex_version.?, account_fingerprint.?, account_fingerprint_reduced_protection.?, codex_thread_id.?)) continue;
-        } else {
-            var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch continue;
-            defer parsed.deinit();
-            const root = switch (parsed.value) {
-                .object => |obj| obj,
-                else => continue,
-            };
-            if (!std.mem.eql(u8, jsonStringField(root, "schema") orelse "", cas_review_evidence_schema)) continue;
-            var validation = validateCasRerRecordObjectAlloc(allocator, path, root) catch continue;
-            defer validation.deinit(allocator);
-            if (!validation.ok()) continue;
+            if (!casRerObjectMatchesHistoryScope(root, repo_realpath.?, identity.?, codex_thread_id.?, workflow_binding_filter)) continue;
+            proof_credit_eligible = casRerObjectProofCreditEligible(root, repo_realpath.?, identity.?, resolved_codex_path.?, resolved_codex_version.?, account_fingerprint.?, account_fingerprint_reduced_protection.?, codex_thread_id.?, workflow_binding_filter);
         }
-        const record = casRerLedgerRecordFromJsonAlloc(allocator, path, raw) catch continue;
+        var record = casRerLedgerRecordFromJsonAlloc(allocator, path, raw) catch continue;
+        record.proof_credit_eligible = proof_credit_eligible;
         errdefer record.deinit(allocator);
         try out.append(allocator, record);
     }
-}
-
-fn casRerTerminalUsableRank(record: CasRerLedgerRecord) u8 {
-    if (record.tuple_verdict_exists and record.principal_proof_usable and
-        (std.mem.eql(u8, record.status, "clean") or std.mem.eql(u8, record.status, "findings")))
-    {
-        return 1;
-    }
-    return 0;
-}
-
-fn casRerFreshNonterminal(record: CasRerLedgerRecord) bool {
-    return record.fresh_attempt_required and record.attempt_exists and !record.tuple_verdict_exists;
 }
 
 fn daysFromCivil(year_raw: i64, month_raw: i64, day_raw: i64) i64 {
@@ -7013,10 +7225,6 @@ fn parseCasRerCreatedAtNs(text: []const u8) ?i128 {
 fn casRerRecordLessThan(_: void, left: CasRerLedgerRecord, right: CasRerLedgerRecord) bool {
     const left_ns = parseCasRerCreatedAtNs(left.created_at);
     const right_ns = parseCasRerCreatedAtNs(right.created_at);
-    if ((casRerFreshNonterminal(left) or casRerFreshNonterminal(right)) and left_ns != null and right_ns != null and left_ns.? != right_ns.?) return left_ns.? < right_ns.?;
-    const left_rank = casRerTerminalUsableRank(left);
-    const right_rank = casRerTerminalUsableRank(right);
-    if (left_rank != right_rank) return left_rank < right_rank;
     if (left_ns != null and right_ns != null and left_ns.? != right_ns.?) return left_ns.? < right_ns.?;
     const created_order = std.mem.order(u8, left.created_at, right.created_at);
     if (created_order != .eq) return created_order == .lt;
@@ -7034,7 +7242,8 @@ fn latestCasRerLedgerRecordIndex(records: []const CasRerLedgerRecord) ?usize {
 
 fn actionRequiredForCasRerRecord(record: CasRerLedgerRecord) []const u8 {
     if (record.tuple_verdict_exists and (std.mem.eql(u8, record.status, "clean") or std.mem.eql(u8, record.status, "findings"))) {
-        if (!record.principal_proof_usable) return "run_new_attempt";
+        if (std.mem.eql(u8, record.status, "findings")) return "review_findings";
+        if (!record.proof_credit_eligible) return "run_new_attempt";
         return "none";
     }
     if (record.failure_code) |code| {
@@ -7332,6 +7541,7 @@ fn loadOwnedSessionRecordPath(allocator: std.mem.Allocator, record_path: []const
     errdefer allocator.free(raw);
     const parsed = try std.json.parseFromSlice(SessionRecord, allocator, raw, .{});
     errdefer parsed.deinit();
+    if (parsed.value.workflowBinding) |binding| try validateWorkflowBinding(binding);
     const previous_store_root_override = configured_store_root_override;
     var rebound_store_root_override: ?[]const u8 = null;
     if (parsed.value.store_root) |store_root| {
@@ -7528,12 +7738,19 @@ fn reviewTupleIdentityAlloc(
     resolved_codex_path: []const u8,
     resolved_codex_version: []const u8,
     client: *cas.Client,
+    workflow_binding: ?WorkflowBinding,
 ) !ReviewTupleIdentity {
     const repo_realpath = try repoRealpathAlloc(allocator, cwd);
     errdefer allocator.free(repo_realpath);
     const account_principal = try readAccountPrincipalAlloc(allocator, client);
     errdefer allocator.free(account_principal.fingerprint);
     const codex_thread_id = try currentCodexThreadIdAlloc(allocator);
+    errdefer allocator.free(codex_thread_id);
+    const workflow_binding_digest = if (workflow_binding) |binding| blk: {
+        const canonical = try stringifyAnyAlloc(allocator, binding);
+        defer allocator.free(canonical);
+        break :blk try sha256HexAlloc(allocator, canonical);
+    } else null;
     return .{
         .repo_realpath = repo_realpath,
         .base_sha = target_identity.base_sha,
@@ -7544,6 +7761,8 @@ fn reviewTupleIdentityAlloc(
         .account_fingerprint = account_principal.fingerprint,
         .account_fingerprint_reduced_protection = account_principal.reduced_protection,
         .codex_thread_id = codex_thread_id,
+        .workflow_binding = workflow_binding,
+        .workflow_binding_digest = workflow_binding_digest,
     };
 }
 
@@ -7553,7 +7772,7 @@ fn currentCodexThreadIdAlloc(allocator: std.mem.Allocator) ![]const u8 {
 }
 
 fn canonicalReviewTuplePayloadAlloc(allocator: std.mem.Allocator, tuple: ReviewTupleIdentity) ![]const u8 {
-    return std.fmt.allocPrint(
+    const legacy_payload = try std.fmt.allocPrint(
         allocator,
         "repo_realpath={s}\nbase_sha={s}\nhead_sha={s}\ntarget_fingerprint={s}\nresolved_codex_path={s}\nresolved_codex_version={s}\naccount_fingerprint={s}\ncodex_thread_id={s}\n",
         .{
@@ -7567,6 +7786,9 @@ fn canonicalReviewTuplePayloadAlloc(allocator: std.mem.Allocator, tuple: ReviewT
             tuple.codex_thread_id,
         },
     );
+    const workflow_binding_digest = tuple.workflow_binding_digest orelse return legacy_payload;
+    defer allocator.free(legacy_payload);
+    return std.fmt.allocPrint(allocator, "{s}workflow_binding_digest={s}\n", .{ legacy_payload, workflow_binding_digest });
 }
 
 fn reviewTupleHashAlloc(allocator: std.mem.Allocator, tuple: ReviewTupleIdentity) ![]const u8 {
@@ -7609,6 +7831,31 @@ fn reviewTupleLockRewriteClaimPathAlloc(allocator: std.mem.Allocator, lock_path:
     return std.fmt.allocPrint(allocator, "{s}.rewrite-claim", .{lock_path});
 }
 
+fn reviewTupleLockWorkflowBindingValidAlloc(allocator: std.mem.Allocator, lock: ReviewTupleLock) !bool {
+    const binding = lock.workflowBinding orelse return true;
+    try validateWorkflowBinding(binding);
+    const codex_thread_id = lock.codexThreadId orelse return false;
+    const canonical = try stringifyAnyAlloc(allocator, binding);
+    defer allocator.free(canonical);
+    const workflow_binding_digest = try sha256HexAlloc(allocator, canonical);
+    defer allocator.free(workflow_binding_digest);
+    const expected_tuple_hash = try reviewTupleHashAlloc(allocator, .{
+        .repo_realpath = lock.repoRealpath,
+        .base_sha = lock.baseSha,
+        .head_sha = lock.headSha,
+        .target_fingerprint = lock.targetFingerprint,
+        .resolved_codex_path = lock.resolvedCodexPath,
+        .resolved_codex_version = lock.resolvedCodexVersion,
+        .account_fingerprint = lock.accountFingerprint,
+        .account_fingerprint_reduced_protection = false,
+        .codex_thread_id = codex_thread_id,
+        .workflow_binding = binding,
+        .workflow_binding_digest = workflow_binding_digest,
+    });
+    defer allocator.free(expected_tuple_hash);
+    return std.mem.eql(u8, lock.tupleHash, expected_tuple_hash);
+}
+
 fn loadReviewTupleLock(allocator: std.mem.Allocator, path: []const u8) !?LoadedReviewTupleLock {
     const raw = durable_store.readRegularFileNoSymlink(allocator, path, 1024 * 1024) catch |err| switch (err) {
         error.FileNotFound => return null,
@@ -7616,6 +7863,8 @@ fn loadReviewTupleLock(allocator: std.mem.Allocator, path: []const u8) !?LoadedR
     };
     errdefer allocator.free(raw);
     const parsed = try std.json.parseFromSlice(ReviewTupleLock, allocator, raw, .{});
+    errdefer parsed.deinit();
+    if (!try reviewTupleLockWorkflowBindingValidAlloc(allocator, parsed.value)) return error.InvalidWorkflowBinding;
     return .{
         .path = try allocator.dupe(u8, path),
         .raw = raw,
@@ -7642,6 +7891,7 @@ fn makeReviewTupleLock(
         .resolvedCodexVersion = tuple.resolved_codex_version,
         .accountFingerprint = tuple.account_fingerprint,
         .codexThreadId = tuple.codex_thread_id,
+        .workflowBinding = tuple.workflow_binding,
         .state = state,
         .createdAtUnixS = now_s,
         .updatedAtUnixS = now_s,
@@ -7979,6 +8229,7 @@ fn printReviewTupleLockExistingAndExit(
         .reviewTupleLockAction = decision.asString(),
         .accountFingerprint = tuple.account_fingerprint,
         .accountFingerprintReducedProtection = tuple.account_fingerprint_reduced_protection,
+        .workflowBinding = tuple.workflow_binding,
         .recordPath = lock.recordPath,
         .eventLogPath = lock.eventLogPath,
         .lastFailureCode = lock.lastFailureCode,
@@ -8144,6 +8395,7 @@ fn emitReviewTupleLockBlockedAndExit(
             .reviewTupleLockAction = decision.asString(),
             .accountFingerprint = tuple.account_fingerprint,
             .accountFingerprintReducedProtection = tuple.account_fingerprint_reduced_protection,
+            .workflowBinding = tuple.workflow_binding,
             .overrideReason = override_reason,
             .recordPath = if (lock) |value| value.recordPath else null,
             .eventLogPath = if (lock) |value| value.eventLogPath else null,
@@ -8476,6 +8728,7 @@ fn updateReviewTupleLockForRecordBestEffort(
             record.resolved_codex_path orelse "codex",
             record.codex_version,
             client,
+            record.workflowBinding,
         ) catch return updateReviewTupleLockByReviewThreadIdBestEffort(allocator, record, record_path, state, failure_code);
         defer tuple.deinit(allocator);
         const tuple_hash = reviewTupleHashAlloc(allocator, tuple) catch return updateReviewTupleLockByReviewThreadIdBestEffort(allocator, record, record_path, state, failure_code);
@@ -8661,6 +8914,7 @@ fn buildPreReviewLaneTransportLostJsonAlloc(
     lane_record_path: []const u8,
     target: TargetRecord,
     identity: TargetIdentity,
+    workflow_binding: ?WorkflowBinding,
     lane_process_alive: bool,
 ) ![]u8 {
     const smoke_status = if (std.mem.eql(u8, action_name, "lane-smoke")) @as(?[]const u8, "failed") else null;
@@ -8677,6 +8931,7 @@ fn buildPreReviewLaneTransportLostJsonAlloc(
         .baseSha = identity.base_sha,
         .headSha = identity.head_sha,
         .targetFingerprint = identity.fingerprint,
+        .workflowBinding = workflow_binding,
         .cwd = lane.cwd,
         .laneId = lane.lane_id,
         .laneRecordPath = lane_record_path,
@@ -8727,6 +8982,7 @@ fn emitPreReviewLaneTransportLostAndExit(
     lane_record_path: []const u8,
     target: TargetRecord,
     identity: TargetIdentity,
+    workflow_binding: ?WorkflowBinding,
     lane_process_alive: bool,
 ) !noreturn {
     if (json_mode) {
@@ -8740,6 +8996,7 @@ fn emitPreReviewLaneTransportLostAndExit(
             lane_record_path,
             target,
             identity,
+            workflow_binding,
             lane_process_alive,
         );
         defer allocator.free(payload);
@@ -9187,6 +9444,10 @@ fn printStatusJson(
             if (receipt.multi_agent_mode_metric_eligible) "true" else "false",
         },
     );
+    if (receipt.workflow_binding) |binding| {
+        try stdout.writeAll(",\"workflowBinding\":");
+        try std.json.Stringify.value(binding, .{}, stdout);
+    }
     try stdout.print(
         ",\"timeoutMs\":{s},\"timedOut\":{s},\"failureCode\":{s},\"failureHint\":{s}{s},\"fallbackUsed\":{s},\"fallbackTransport\":{s},\"fallbackExitCode\":{s},\"fallbackOutputText\":{s},\"fallbackErrorText\":{s},\"hookSummary\":{s},\"reviewResultAvailable\":{s},\"reviewResultSource\":{s},\"reviewResult\":{s},\"rawReviewText\":{s},\"dualParseVerdict\":{s},\"structuredFindingCount\":{s},\"rawFindingCount\":{s},\"clean\":{s}}}\n",
         .{
@@ -9411,6 +9672,14 @@ fn casRunSyntheticReceiptJsonAlloc(
     try writer.writeByte(':');
     try writeNullableJsonString(writer, receipt.codex_thread_id);
     try writer.writeByte(',');
+    try writeJsonString(writer, "workflowBinding");
+    try writer.writeByte(':');
+    if (receipt.workflow_binding) |binding| {
+        try std.json.Stringify.value(binding, .{}, writer);
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeByte(',');
     try writeJsonString(writer, "principalStrength");
     try writer.writeByte(':');
     try writeJsonString(writer, if (receipt.account_fingerprint_reduced_protection) principal_strength_reduced else principal_strength_strong);
@@ -9458,6 +9727,7 @@ fn startShadowReceiptPayloadJsonAlloc(
         .eventLogPath = event_log_path,
         .accountFingerprint = receipt.account_fingerprint,
         .accountFingerprintReducedProtection = receipt.account_fingerprint_reduced_protection,
+        .workflowBinding = receipt.workflow_binding,
     };
     return stringifyAnyAlloc(allocator, payload);
 }
@@ -9714,6 +9984,10 @@ fn printStartJson(
             turn_status_json,
         },
     );
+    if (receipt.workflow_binding) |binding| {
+        try stdout.writeAll(",\"workflowBinding\":");
+        try std.json.Stringify.value(binding, .{}, stdout);
+    }
     try stdout.print(
         ",\"turnCount\":{d},\"materialized\":{s},\"rolloutPath\":{s},\"failureCode\":{s},\"failureHint\":{s}{s},\"fallbackUsed\":{s},\"fallbackTransport\":{s},\"fallbackExitCode\":{s},\"fallbackOutputText\":{s},\"fallbackErrorText\":{s},\"hookSummary\":{s},\"reviewResultAvailable\":{s},\"reviewResultSource\":{s},\"reviewResult\":{s}{s}}}\n",
         .{
@@ -10604,6 +10878,51 @@ fn stringifyJsonValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) 
     return out.toOwnedSlice();
 }
 
+fn canonicalWorkflowBindingJsonFromValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    const raw = try stringifyJsonValueAlloc(allocator, value);
+    defer allocator.free(raw);
+    var parsed = std.json.parseFromSlice(WorkflowBinding, allocator, raw, .{}) catch return error.InvalidWorkflowBinding;
+    defer parsed.deinit();
+    try validateWorkflowBinding(parsed.value);
+    return stringifyAnyAlloc(allocator, parsed.value);
+}
+
+fn workflowBindingJsonFromRootAlloc(allocator: std.mem.Allocator, root: std.json.ObjectMap) !?[]const u8 {
+    const nested_value: ?std.json.Value = if (root.get("record")) |record_value| switch (record_value) {
+        .object => |record| record.get("workflowBinding"),
+        else => null,
+    } else null;
+    const candidates = [_]?std.json.Value{
+        root.get("workflowBinding"),
+        root.get("workflow_binding"),
+        nested_value,
+    };
+    var canonical: ?[]const u8 = null;
+    errdefer if (canonical) |value| allocator.free(value);
+    var saw_explicit_null = false;
+    for (candidates) |candidate| {
+        const value = candidate orelse continue;
+        switch (value) {
+            .null => {
+                if (canonical != null) return error.InvalidWorkflowBinding;
+                saw_explicit_null = true;
+            },
+            .object => {
+                if (saw_explicit_null) return error.InvalidWorkflowBinding;
+                const next = try canonicalWorkflowBindingJsonFromValueAlloc(allocator, value);
+                if (canonical) |existing| {
+                    defer allocator.free(next);
+                    if (!std.mem.eql(u8, existing, next)) return error.InvalidWorkflowBinding;
+                } else {
+                    canonical = next;
+                }
+            },
+            else => return error.InvalidWorkflowBinding,
+        }
+    }
+    return canonical;
+}
+
 fn readReviewTextFromEventLogAlloc(allocator: std.mem.Allocator, event_log_path: []const u8) !?[]u8 {
     const raw = try readFileAlloc(allocator, event_log_path, 16 * 1024 * 1024);
     defer allocator.free(raw);
@@ -10809,6 +11128,7 @@ fn normalizeReceiptFromJsonAlloc(allocator: std.mem.Allocator, source_path: []co
         .failure_class = try dupOptional(allocator, final_failure_class),
         .retryable_same_tuple_now = final_retryable_same_tuple_now,
         .findings_json = findings_json,
+        .workflow_binding_json = try workflowBindingJsonFromRootAlloc(allocator, root),
     };
 }
 
@@ -10859,6 +11179,7 @@ fn normalizeAttemptOnlyReceiptAlloc(allocator: std.mem.Allocator, source_path: [
         .failure_class = try dupOptional(allocator, if (account_failure) "account_resource" else failureClassForCode(failure_code)),
         .retryable_same_tuple_now = if (account_failure) false else retryableSameTupleNowForCode(failure_code),
         .findings_json = try allocator.dupe(u8, "[]"),
+        .workflow_binding_json = try workflowBindingJsonFromRootAlloc(allocator, root),
     };
 }
 
@@ -10944,6 +11265,7 @@ fn normalizeStartReceiptAlloc(allocator: std.mem.Allocator, source_path: []const
         .failure_class = try dupOptional(allocator, final_failure_class),
         .retryable_same_tuple_now = final_retryable_same_tuple_now,
         .findings_json = findings_json,
+        .workflow_binding_json = try workflowBindingJsonFromRootAlloc(allocator, root),
     };
 }
 
@@ -11080,6 +11402,7 @@ fn normalizeStoredSessionRecordReceiptAlloc(allocator: std.mem.Allocator, source
         .failure_class = try dupOptional(allocator, final_failure_class),
         .retryable_same_tuple_now = final_retryable_same_tuple_now,
         .findings_json = findings_json,
+        .workflow_binding_json = try workflowBindingJsonFromRootAlloc(allocator, root),
     };
 }
 
@@ -11260,7 +11583,7 @@ fn casRerRecordIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt,
     const effective_resolved_codex_path = opts.resolved_codex_path_override orelse receipt.resolved_codex_path orelse "";
     const effective_resolved_codex_version = opts.resolved_codex_version_override orelse receipt.resolved_codex_version orelse "";
     const effective_account_fingerprint = opts.account_fingerprint_override orelse receipt.account_fingerprint orelse "";
-    const material = try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{d}\x1f{s}\x1f{s}", .{
+    const legacy_material = try std.fmt.allocPrint(allocator, "{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{s}\x1f{d}\x1f{s}\x1f{s}", .{
         effective_repo_realpath,
         effective_resolved_codex_path,
         effective_resolved_codex_version,
@@ -11287,6 +11610,11 @@ fn casRerRecordIdAlloc(allocator: std.mem.Allocator, receipt: NormalizedReceipt,
         if (receipt.clean) "clean" else "not-clean",
         receipt.findings_json,
     });
+    defer allocator.free(legacy_material);
+    const material = if (receipt.workflow_binding_json) |workflow_binding_json|
+        try std.fmt.allocPrint(allocator, "{s}\x1fworkflowBinding\x1f{s}", .{ legacy_material, workflow_binding_json })
+    else
+        try allocator.dupe(u8, legacy_material);
     defer allocator.free(material);
     const digest = try sha256HexBareAlloc(allocator, material);
     defer allocator.free(digest);
@@ -11547,6 +11875,12 @@ fn writeCasRerRecordObject(
     try writeJsonString(writer, "tuple");
     try writer.writeByte(':');
     try writeCasRerTupleObject(writer, receipt, opts);
+    if (receipt.workflow_binding_json) |workflow_binding_json| {
+        try writer.writeByte(',');
+        try writeJsonString(writer, "workflowBinding");
+        try writer.writeByte(':');
+        try writer.writeAll(workflow_binding_json);
+    }
     try writer.writeByte(',');
     try writeJsonString(writer, "attempt");
     try writer.writeByte(':');
@@ -11647,6 +11981,12 @@ fn writeReceiptReviewVerdictObject(writer: *std.Io.Writer, receipt: NormalizedRe
     try writeJsonString(writer, "retryableSameTupleNow");
     try writer.writeByte(':');
     if (receipt.retryable_same_tuple_now) |value| try writer.writeAll(if (value) "true" else "false") else try writer.writeAll("null");
+    if (receipt.workflow_binding_json) |workflow_binding_json| {
+        try writer.writeByte(',');
+        try writeJsonString(writer, "workflowBinding");
+        try writer.writeByte(':');
+        try writer.writeAll(workflow_binding_json);
+    }
     try writer.writeByte(',');
     try writeJsonString(writer, "baseSha");
     try writer.writeByte(':');
@@ -12375,6 +12715,7 @@ fn printLaneFallbackJson(
     identity: TargetIdentity,
     fallback: NativeFallbackResult,
     failure: FailureInfo,
+    workflow_binding: ?WorkflowBinding,
     multi_agent_mode: ?cas.MultiAgentMode,
     verdict_only: bool,
 ) !void {
@@ -12417,6 +12758,10 @@ fn printLaneFallbackJson(
         },
     );
     try writeReviewAttemptFields(stdout, attempt_fields);
+    if (workflow_binding) |binding| {
+        try stdout.writeAll(",\"workflowBinding\":");
+        try std.json.Stringify.value(binding, .{}, stdout);
+    }
     try stdout.print(
         ",\"target\":{s},\"selectedTransport\":\"native-review\",\"fallbackUsed\":true,\"requestedMultiAgentMode\":{s},\"effectiveMultiAgentMode\":null,\"multiAgentModeSupport\":{s},\"multiAgentModeMetricEligible\":false,\"fallbackTransport\":\"native-review\",\"fallbackExitCode\":{d},\"fallbackOutputText\":{s},\"fallbackErrorText\":{s},\"failureCode\":{s},\"failureHint\":{s}{s},\"reviewVerdict\":{s}}}\n",
         .{
@@ -12449,6 +12794,7 @@ fn printLaneReviewJson(
     archive_status: []const u8,
     clean: bool,
     failure: ?FailureInfo,
+    workflow_binding: ?WorkflowBinding,
     multi_agent_mode: ?cas.MultiAgentMode,
     verdict_only: bool,
 ) !void {
@@ -12499,6 +12845,10 @@ fn printLaneReviewJson(
         .{},
     );
     try writeReviewAttemptStateFields(stdout, attempt_fields);
+    if (workflow_binding) |binding| {
+        try stdout.writeAll(",\"workflowBinding\":");
+        try std.json.Stringify.value(binding, .{}, stdout);
+    }
     try stdout.print(
         ",\"laneId\":{s},\"cwd\":{s},\"laneRecordPath\":{s},\"reviewCount\":{d},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"target\":{s},\"targetFingerprint\":{s},\"headSha\":{s},\"baseSha\":{s},\"selectedTransport\":\"websocket\",\"fallbackUsed\":false,\"requestedMultiAgentMode\":{s},\"effectiveMultiAgentMode\":{s},\"multiAgentModeSupport\":{s},\"multiAgentModeMetricEligible\":{s},\"managedServerPid\":{d},\"managedServerListenUrl\":{s},\"turnStatus\":{s},\"reviewResultAvailable\":{s},\"reviewResultSource\":{s},\"reviewResult\":{s},\"rawReviewText\":{s},\"dualParseVerdict\":{s},\"structuredFindingCount\":{d},\"rawFindingCount\":{s},\"archiveStatus\":{s},\"failureCode\":{s},\"failureHint\":{s}{s},\"clean\":{s},\"reviewVerdict\":{s}}}\n",
         .{
@@ -12549,6 +12899,7 @@ fn printLaneReviewTimeoutJson(
     record_path: []const u8,
     event_log_path: []const u8,
     timeout_ms: u32,
+    workflow_binding: ?WorkflowBinding,
     multi_agent_mode: ?cas.MultiAgentMode,
     verdict_only: bool,
 ) !void {
@@ -12586,6 +12937,10 @@ fn printLaneReviewTimeoutJson(
         .{},
     );
     try writeReviewAttemptStateFields(stdout, attempt_fields);
+    if (workflow_binding) |binding| {
+        try stdout.writeAll(",\"workflowBinding\":");
+        try std.json.Stringify.value(binding, .{}, stdout);
+    }
     try stdout.print(
         ",\"laneId\":{s},\"cwd\":{s},\"laneRecordPath\":{s},\"reviewCount\":{d},\"reviewThreadId\":{s},\"reviewTurnId\":{s},\"recordPath\":{s},\"eventLogPath\":{s},\"target\":{s},\"targetFingerprint\":{s},\"headSha\":{s},\"baseSha\":{s},\"selectedTransport\":\"websocket\",\"fallbackUsed\":false,\"requestedMultiAgentMode\":{s},\"effectiveMultiAgentMode\":{s},\"multiAgentModeSupport\":{s},\"multiAgentModeMetricEligible\":{s},\"managedServerPid\":{d},\"managedServerListenUrl\":{s},\"timeoutMs\":{d},\"timedOut\":true,\"reviewResultAvailable\":false,\"reviewResultSource\":null,\"reviewResult\":null,\"rawReviewText\":null,\"dualParseVerdict\":\"timeout\",\"structuredFindingCount\":0,\"rawFindingCount\":null,\"archiveStatus\":\"skipped_timeout\",\"failureCode\":\"wait_timed_out\",\"failureHint\":\"retry cas review_session wait --review-thread-id {s} --timeout-ms {d} --json\",\"clean\":false,\"reviewVerdict\":{s}}}\n",
         .{
@@ -12621,6 +12976,22 @@ fn floatField(obj: std.json.ObjectMap, key: []const u8) ?f32 {
         .float => |f| @floatCast(f),
         .integer => |n| @floatFromInt(n),
         else => null,
+    };
+}
+
+const test_workflow_binding_json =
+    \\{"actuationRunId":"run-test","artifactStateFingerprint":"sha256:artifact","reviewContractFingerprint":"sha256:contract","resolutionDigest":"sha256:resolution","selectedLenses":["invariant-ace","standard"],"reviewLane":"standard","lensContract":"standard-review-v1"}
+;
+
+fn testWorkflowBinding() WorkflowBinding {
+    return .{
+        .actuationRunId = "run-test",
+        .artifactStateFingerprint = "sha256:artifact",
+        .reviewContractFingerprint = "sha256:contract",
+        .resolutionDigest = "sha256:resolution",
+        .selectedLenses = &.{ "invariant-ace", "standard" },
+        .reviewLane = "standard",
+        .lensContract = "standard-review-v1",
     };
 }
 
@@ -12681,6 +13052,55 @@ test "parseArgs accepts brokered run target" {
     try std.testing.expectEqual(TargetKind.base_branch, parsed.target.?.kind);
     try std.testing.expectEqualStrings("main", parsed.target.?.branch.?);
     try std.testing.expectEqualStrings("run 2", parsed.fresh_attempt_reason.?);
+}
+
+test "workflow binding input is canonical and action scoped" {
+    var loaded = (try loadWorkflowBindingAlloc(std.testing.allocator, test_workflow_binding_json)).?;
+    defer loaded.deinit();
+    const canonical = try stringifyAnyAlloc(std.testing.allocator, loaded.value);
+    defer std.testing.allocator.free(canonical);
+    try std.testing.expectEqualStrings(test_workflow_binding_json, canonical);
+
+    const run_argv = [_][]const u8{
+        "cas_review_session",
+        "run",
+        "--cwd",
+        "/tmp/repo",
+        "--base",
+        "main",
+        "--workflow-binding-json",
+        test_workflow_binding_json,
+    };
+    const parsed = try parseArgs(std.testing.allocator, &run_argv);
+    try std.testing.expectEqualStrings(test_workflow_binding_json, parsed.workflow_binding_arg.?);
+
+    const import_argv = [_][]const u8{
+        "cas_review_session",
+        "import",
+        "--path",
+        "legacy.json",
+        "--workflow-binding-json",
+        test_workflow_binding_json,
+    };
+    try std.testing.expectError(error.WorkflowBindingUnsupportedAction, parseArgs(std.testing.allocator, &import_argv));
+}
+
+test "workflow binding input rejects partial blank and noncanonical values" {
+    const invalid = [_][]const u8{
+        \\{"actuationRunId":"run-test"}
+        ,
+        \\{"actuationRunId":"run-test","artifactStateFingerprint":" ","reviewContractFingerprint":"sha256:contract","resolutionDigest":"sha256:resolution","selectedLenses":["standard"],"reviewLane":"standard","lensContract":"standard-review-v1"}
+        ,
+        \\{"actuationRunId":"run-test","artifactStateFingerprint":"sha256:artifact","reviewContractFingerprint":"sha256:contract","resolutionDigest":"sha256:resolution","selectedLenses":["standard","invariant-ace"],"reviewLane":"standard","lensContract":"standard-review-v1"}
+        ,
+        \\{"actuationRunId":"run-test","artifactStateFingerprint":"sha256:artifact","reviewContractFingerprint":"sha256:contract","resolutionDigest":"sha256:resolution","selectedLenses":["standard","standard"],"reviewLane":"standard","lensContract":"standard-review-v1"}
+        ,
+        \\{"actuationRunId":"run-test","artifactStateFingerprint":"sha256:artifact","reviewContractFingerprint":"sha256:contract","resolutionDigest":"sha256:resolution","selectedLenses":["standard"],"reviewLane":"standard","lensContract":"standard-review-v1","extra":"forbidden"}
+        ,
+    };
+    for (invalid) |raw| {
+        try std.testing.expectError(error.InvalidWorkflowBinding, loadWorkflowBindingAlloc(std.testing.allocator, raw));
+    }
 }
 
 test "parseArgs accepts latest status and wait selectors" {
@@ -12777,6 +13197,42 @@ test "loadSelectedSessionRecord rebinds store root from loaded record" {
     try std.testing.expectEqualStrings(store_root, configured_store_root_override.?);
     loaded.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("before", configured_store_root_override.?);
+}
+
+test "session record owns and validates workflow binding across reload" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const event_log_path = try std.fs.path.join(std.testing.allocator, &.{ root, "thr.events.ndjson" });
+    defer std.testing.allocator.free(event_log_path);
+    const raw = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema_version\":3,\"cwd\":\"{s}\",\"parent_thread_id\":\"parent\",\"review_thread_id\":\"thr\",\"review_turn_id\":\"turn\",\"delivery\":\"review\",\"target\":{{\"type\":\"uncommittedChanges\"}},\"event_log_path\":\"{s}\",\"created_at_unix_s\":1,\"last_observed_status\":\"inProgress\",\"codex_version\":\"codex-cli test\",\"workflowBinding\":{s}}}\n",
+        .{ root, event_log_path, test_workflow_binding_json },
+    );
+    defer std.testing.allocator.free(raw);
+    const record_path = try std.fs.path.join(std.testing.allocator, &.{ root, "record.json" });
+    try durable_store.writeTextAtomic(std.testing.allocator, record_path, raw);
+    var loaded = try loadOwnedSessionRecordPath(std.testing.allocator, record_path);
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("run-test", loaded.record.workflowBinding.?.actuationRunId);
+
+    const normalized = try normalizeReceiptFromJsonAlloc(std.testing.allocator, loaded.record_path, loaded.raw, false, .{});
+    defer normalized.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(test_workflow_binding_json, normalized.workflow_binding_json.?);
+
+    const invalid_raw = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        raw,
+        "[\"invariant-ace\",\"standard\"]",
+        "[\"standard\",\"invariant-ace\"]",
+    );
+    defer std.testing.allocator.free(invalid_raw);
+    const invalid_path = try std.fs.path.join(std.testing.allocator, &.{ root, "invalid-record.json" });
+    try durable_store.writeTextAtomic(std.testing.allocator, invalid_path, invalid_raw);
+    try std.testing.expectError(error.InvalidWorkflowBinding, loadOwnedSessionRecordPath(std.testing.allocator, invalid_path));
 }
 
 test "legacy review session records remain readable by id and latest selectors" {
@@ -13954,6 +14410,18 @@ test "native tuple lock gate validates CAS-RTL-v1 lock records" {
     defer invalid_result.deinit(std.testing.allocator);
     try std.testing.expect(!invalid_result.ok());
     try std.testing.expect(std.mem.indexOf(u8, invalid_result.errors[0], "lockVersion") != null);
+
+    var null_binding = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"accountFingerprint\":\"acct:a\",\"baseSha\":\"base\",\"createdAtUnixS\":1,\"expiresAtUnixS\":30,\"headSha\":\"head\",\"lockVersion\":\"CAS-RTL-v1\",\"ownerPid\":4,\"repoRealpath\":\"/repo\",\"resolvedCodexPath\":\"/bin/codex\",\"resolvedCodexVersion\":\"codex 0.1.0\",\"reviewThreadId\":\"thr_1\",\"state\":\"waiting\",\"targetFingerprint\":\"fp\",\"tupleHash\":\"sha256:tuple\",\"updatedAtUnixS\":2,\"workflowBinding\":null}",
+        .{},
+    );
+    defer null_binding.deinit();
+    const null_binding_result = try validateTupleLockGateObjectAlloc(std.testing.allocator, "null-binding-lock.json", null_binding.value.object);
+    defer null_binding_result.deinit(std.testing.allocator);
+    try std.testing.expect(!null_binding_result.ok());
+    try std.testing.expect(std.mem.indexOf(u8, null_binding_result.errors[0], "workflowBinding") != null);
 }
 
 test "parseArgs rejects removed receipt authority and closure surfaces" {
@@ -14082,10 +14550,55 @@ test "CAS-RER writer projects terminal findings receipt" {
     try std.testing.expectEqualStrings(principal_strength_reduced, principal.get("kind").?.string);
     try std.testing.expect(!principal.get("proofUsable").?.bool);
     try std.testing.expect(root.get("legacy").?.object.get("importedFromReceipt").?.bool);
+    try std.testing.expect(root.get("workflowBinding") == null);
 
     const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "rer.json", root);
     defer gate.deinit(std.testing.allocator);
     try std.testing.expect(gate.ok());
+}
+
+test "CAS-RER binding is source carried validated and identity bearing" {
+    const raw = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"cwd\":\"/tmp/repo\",\"status\":\"clean\",\"backendClass\":\"cas-lane\",\"clean\":true,\"findingCount\":0,\"failureCode\":null,\"reviewAttemptPhase\":\"normalized_verdict\",\"baseSha\":\"base\",\"headSha\":\"head\",\"targetFingerprint\":\"fp\",\"reviewThreadId\":\"thr\",\"reviewTurnId\":\"turn\",\"workflowBinding\":{s},\"findings\":[]}}",
+        .{test_workflow_binding_json},
+    );
+    defer std.testing.allocator.free(raw);
+    const bound = try normalizeReceiptFromJsonAlloc(std.testing.allocator, "bound.json", raw, true, .{});
+    defer bound.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(test_workflow_binding_json, bound.workflow_binding_json.?);
+
+    const bound_json = try casRerJsonFromReceiptAlloc(std.testing.allocator, bound, .{});
+    defer std.testing.allocator.free(bound_json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bound_json, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("run-test", root.get("workflowBinding").?.object.get("actuationRunId").?.string);
+    const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "bound-rer.json", root);
+    defer gate.deinit(std.testing.allocator);
+    try std.testing.expect(gate.ok());
+
+    const invalid_json = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        bound_json,
+        ",\"lensContract\":\"standard-review-v1\"",
+        "",
+    );
+    defer std.testing.allocator.free(invalid_json);
+    var invalid_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, invalid_json, .{});
+    defer invalid_parsed.deinit();
+    const invalid_gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "partial-bound-rer.json", invalid_parsed.value.object);
+    defer invalid_gate.deinit(std.testing.allocator);
+    try std.testing.expect(!invalid_gate.ok());
+
+    var unbound = bound;
+    unbound.workflow_binding_json = null;
+    const bound_id = try casRerRecordIdAlloc(std.testing.allocator, bound, .{});
+    defer std.testing.allocator.free(bound_id);
+    const unbound_id = try casRerRecordIdAlloc(std.testing.allocator, unbound, .{});
+    defer std.testing.allocator.free(unbound_id);
+    try std.testing.expect(!std.mem.eql(u8, bound_id, unbound_id));
 }
 
 test "CAS-RER ledger record projection matches tuple identity" {
@@ -14099,6 +14612,9 @@ test "CAS-RER ledger record projection matches tuple identity" {
         .head_sha = "head",
         .fingerprint = "fp",
     };
+    try std.testing.expect(casRerObjectMatchesHistoryScope(parsed.value.object, "/tmp/repo", identity, "thread-test", null));
+    try std.testing.expect(!casRerObjectMatchesHistoryScope(parsed.value.object, "/tmp/repo", identity, "thread-other", null));
+    try std.testing.expect(!casRerObjectMatchesHistoryScope(parsed.value.object, "/tmp/repo", identity, "thread-test", testWorkflowBinding()));
     try std.testing.expect(casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/bin/codex", "codex 0.1.0", "acct:test", false, "thread-test"));
     try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/bin/codex", "codex 0.1.0", "acct:test", true, "thread-test"));
     try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/usr/local/bin/codex", "codex 0.1.0", "acct:test", false, "thread-test"));
@@ -14118,8 +14634,9 @@ test "CAS-RER ledger record projection matches tuple identity" {
     };
     try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", wrong_identity, "/bin/codex", "codex 0.1.0", "acct:test", false, "thread-test"));
 
-    const record = try casRerLedgerRecordFromJsonAlloc(std.testing.allocator, "/tmp/rer_match.json", raw);
+    var record = try casRerLedgerRecordFromJsonAlloc(std.testing.allocator, "/tmp/rer_match.json", raw);
     defer record.deinit(std.testing.allocator);
+    record.proof_credit_eligible = true;
     try std.testing.expectEqualStrings("rer_match", record.record_id);
     try std.testing.expectEqualStrings("clean", record.status);
     try std.testing.expect(record.tuple_verdict_exists);
@@ -14134,7 +14651,7 @@ test "CAS-RER ledger record projection matches tuple identity" {
     try std.testing.expect(!reduced_record.principal_proof_usable);
     try std.testing.expectEqualStrings("run_new_attempt", actionRequiredForCasRerRecord(reduced_record));
     const ranked_records = [_]CasRerLedgerRecord{ reduced_record, record };
-    try std.testing.expectEqual(@as(?usize, 1), latestCasRerLedgerRecordIndex(&ranked_records));
+    try std.testing.expectEqual(@as(?usize, 0), latestCasRerLedgerRecordIndex(&ranked_records));
 
     const unix_timestamp_raw =
         \\{"schema":"CAS-RER-v1","recordId":"rer_unix_ts","createdAt":"unix-ns:500000000","updatedAt":"unix-ns:500000000","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:unix","phase":"normalized_verdict","reviewThreadId":"thr_unix","reviewTurnId":"turn_unix"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-run"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
@@ -14222,7 +14739,8 @@ test "CAS current and list envelopes include ledger record paths" {
     const current = current_parsed.value.object;
     try std.testing.expectEqualStrings("CAS-CURRENT-v1", current.get("schema").?.string);
     try std.testing.expectEqualStrings("/tmp/rer_path.json", current.get("recordPath").?.string);
-    try std.testing.expectEqualStrings("none", current.get("actionRequired").?.string);
+    try std.testing.expectEqualStrings("review_findings", current.get("actionRequired").?.string);
+    try std.testing.expect(!current.get("proofCreditEligible").?.bool);
     try std.testing.expectEqualStrings("rer_path", current.get("record").?.object.get("recordId").?.string);
 
     var list_out = std.Io.Writer.Allocating.init(std.testing.allocator);
@@ -14239,6 +14757,87 @@ test "CAS current and list envelopes include ledger record paths" {
     const ref = list.get("recordRefs").?.array.items[0].object;
     try std.testing.expectEqualStrings("rer_path", ref.get("recordId").?.string);
     try std.testing.expectEqualStrings("/tmp/rer_path.json", ref.get("recordPath").?.string);
+    try std.testing.expect(!ref.get("proofCreditEligible").?.bool);
+}
+
+test "CAS list retains drifted findings while withholding proof credit" {
+    const old_store_root = configured_store_root_override;
+    defer configured_store_root_override = old_store_root;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    configured_store_root_override = root;
+
+    const records_dir = try reviewLedgerRecordsDirAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(records_dir);
+    const record_path = try std.fs.path.join(std.testing.allocator, &.{ records_dir, "rer_history.json" });
+    defer std.testing.allocator.free(record_path);
+    const raw = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"schema\":\"CAS-RER-v1\",\"recordId\":\"rer_history\",\"createdAt\":\"2026-07-02T00:00:00Z\",\"updatedAt\":\"2026-07-02T00:00:00Z\",\"command\":{{\"surface\":\"run\",\"backendSelected\":\"cas-run\",\"brokerDecision\":{{\"action\":\"created_new\",\"reason\":\"test\",\"freshAttemptRequired\":false}}}},\"tuple\":{{\"repoRealpath\":\"{s}\",\"baseSha\":\"base\",\"headSha\":\"head\",\"targetFingerprint\":\"fp\",\"resolvedCodexPath\":\"/old/codex\",\"resolvedCodexVersion\":\"codex 0.1.0\",\"codexThreadId\":\"thread-test\",\"tupleCurrentAtRecordTime\":true}},\"attempt\":{{\"exists\":true,\"attemptId\":\"sha256:a\",\"phase\":\"normalized_verdict\",\"reviewThreadId\":\"thr\",\"reviewTurnId\":\"turn\"}},\"verdict\":{{\"tupleVerdictExists\":true,\"status\":\"findings\",\"clean\":false,\"findingCount\":1,\"findings\":[{{\"title\":\"drift-visible\"}}]}},\"failure\":{{\"failureCode\":null,\"failureClass\":null,\"retryableSameTupleNow\":null}},\"principal\":{{\"kind\":\"strong\",\"accountFingerprint\":\"acct:old\",\"proofUsable\":true,\"reduced\":false,\"fallbackUsed\":false,\"source\":\"cas-run\"}},\"attachments\":{{\"rawReceipt\":\"/tmp/receipt.json\"}},\"legacy\":{{\"importedFromReceipt\":false,\"sourcePath\":\"/tmp/receipt.json\",\"normalizationWarnings\":[]}}}}",
+        .{root},
+    );
+    defer std.testing.allocator.free(raw);
+    try durable_store.writeTextAtomic(std.testing.allocator, record_path, raw);
+
+    const identity = TargetIdentity{ .base_sha = "base", .head_sha = "head", .fingerprint = "fp" };
+    var drifted: std.ArrayList(CasRerLedgerRecord) = .empty;
+    defer {
+        for (drifted.items) |record| record.deinit(std.testing.allocator);
+        drifted.deinit(std.testing.allocator);
+    }
+    try appendCasRerLedgerRecordsAlloc(
+        std.testing.allocator,
+        &drifted,
+        root,
+        identity,
+        "/new/codex",
+        "codex 0.2.0",
+        "acct:new",
+        false,
+        "thread-test",
+        null,
+    );
+    try std.testing.expectEqual(@as(usize, 1), drifted.items.len);
+    try std.testing.expectEqualStrings("findings", drifted.items[0].status);
+    try std.testing.expect(!drifted.items[0].proof_credit_eligible);
+
+    var exact: std.ArrayList(CasRerLedgerRecord) = .empty;
+    defer {
+        for (exact.items) |record| record.deinit(std.testing.allocator);
+        exact.deinit(std.testing.allocator);
+    }
+    try appendCasRerLedgerRecordsAlloc(
+        std.testing.allocator,
+        &exact,
+        root,
+        identity,
+        "/old/codex",
+        "codex 0.1.0",
+        "acct:old",
+        false,
+        "thread-test",
+        null,
+    );
+    try std.testing.expectEqual(@as(usize, 1), exact.items.len);
+    try std.testing.expect(exact.items[0].proof_credit_eligible);
+
+    var foreign_epoch: std.ArrayList(CasRerLedgerRecord) = .empty;
+    defer foreign_epoch.deinit(std.testing.allocator);
+    try appendCasRerLedgerRecordsAlloc(
+        std.testing.allocator,
+        &foreign_epoch,
+        root,
+        identity,
+        "/old/codex",
+        "codex 0.1.0",
+        "acct:old",
+        false,
+        "thread-test",
+        testWorkflowBinding(),
+    );
+    try std.testing.expectEqual(@as(usize, 0), foreign_epoch.items.len);
 }
 
 test "CAS run shell success requires clean proof usable principal" {
@@ -15807,6 +16406,7 @@ test "pre-review lane transport receipt is attempt-free and tuple-bound" {
         "/tmp/lane.json",
         target,
         identity,
+        null,
         false,
     );
     defer std.testing.allocator.free(payload);
@@ -16475,8 +17075,40 @@ test "review tuple hash is stable and account-bound" {
     const hash_b = try reviewTupleHashAlloc(std.testing.allocator, tuple_b);
     defer std.testing.allocator.free(hash_b);
 
+    try std.testing.expectEqualStrings("sha256:b08f2fe9f5de06f5cf9627b670f3e7135082dcab983727ddb01db9aa89061756", hash_a);
     try std.testing.expectEqualStrings(hash_a, hash_a_again);
     try std.testing.expect(!std.mem.eql(u8, hash_a, hash_b));
+
+    const binding_json = try stringifyAnyAlloc(std.testing.allocator, testWorkflowBinding());
+    defer std.testing.allocator.free(binding_json);
+    const binding_digest = try sha256HexAlloc(std.testing.allocator, binding_json);
+    defer std.testing.allocator.free(binding_digest);
+    var bound_tuple = tuple_a;
+    bound_tuple.workflow_binding = testWorkflowBinding();
+    bound_tuple.workflow_binding_digest = binding_digest;
+    const bound_hash = try reviewTupleHashAlloc(std.testing.allocator, bound_tuple);
+    defer std.testing.allocator.free(bound_hash);
+    try std.testing.expect(!std.mem.eql(u8, hash_a, bound_hash));
+
+    var other_binding = testWorkflowBinding();
+    other_binding.resolutionDigest = "sha256:other-resolution";
+    const other_json = try stringifyAnyAlloc(std.testing.allocator, other_binding);
+    defer std.testing.allocator.free(other_json);
+    const other_digest = try sha256HexAlloc(std.testing.allocator, other_json);
+    defer std.testing.allocator.free(other_digest);
+    bound_tuple.workflow_binding = other_binding;
+    bound_tuple.workflow_binding_digest = other_digest;
+    const other_hash = try reviewTupleHashAlloc(std.testing.allocator, bound_tuple);
+    defer std.testing.allocator.free(other_hash);
+    try std.testing.expect(!std.mem.eql(u8, bound_hash, other_hash));
+
+    bound_tuple.workflow_binding = testWorkflowBinding();
+    bound_tuple.workflow_binding_digest = binding_digest;
+    const bound_lock = makeReviewTupleLock(bound_hash, bound_tuple, "starting_lane", 1, null, null);
+    try std.testing.expect(try reviewTupleLockWorkflowBindingValidAlloc(std.testing.allocator, bound_lock));
+    var tampered_lock = bound_lock;
+    tampered_lock.workflowBinding = other_binding;
+    try std.testing.expect(!try reviewTupleLockWorkflowBindingValidAlloc(std.testing.allocator, tampered_lock));
 }
 
 test "review tuple lock action classifies active terminal exhausted and stale states" {

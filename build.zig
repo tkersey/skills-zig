@@ -513,6 +513,13 @@ pub fn build(b: *std.Build) void {
         "test-cas-proxy-client",
         "Run cas_proxy_client tests",
     );
+    const run_cas_cli_tests = addTestStepWithOptions(
+        b,
+        cas_root,
+        "test-cas-cli",
+        "Run cas dispatcher tests",
+        .{ .link_libc = true },
+    );
     const test_cas = b.step("test-cas", "Run all cas tests");
     test_cas.dependOn(&run_cas_budget_governor_tests.step);
     test_cas.dependOn(&run_cas_smoke_tests.step);
@@ -523,6 +530,7 @@ pub fn build(b: *std.Build) void {
     test_cas.dependOn(&run_cas_goal_tests.step);
     test_cas.dependOn(&run_cas_account_tests.step);
     test_cas.dependOn(&run_cas_proxy_client_tests.step);
+    test_cas.dependOn(&run_cas_cli_tests.step);
 
     const run_cron_tests = addTestStepWithOptions(
         b,

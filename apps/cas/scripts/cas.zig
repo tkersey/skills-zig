@@ -10,6 +10,29 @@ const HelpSurface = core_cli.HelpSurface{
     .help_text = UsageText,
 };
 
+const CapabilitiesText =
+    \\session_inquiry_v1=true
+    \\cas_rer_workflow_binding_v1=true
+;
+
+const CapabilitiesJson =
+    \\{
+    \\  "cas_capabilities": {
+    \\    "features": {
+    \\      "session_inquiry_v1": true,
+    \\      "dcp_v1": true,
+    \\      "rip_v1": true,
+    \\      "fir_v1": true,
+    \\      "exact_fork_rollback_anchor": true,
+    \\      "ephemeral_fork": true,
+    \\      "read_only_inquiry": true,
+    \\      "detached_inquiry": true,
+    \\      "cas_rer_workflow_binding_v1": true
+    \\    }
+    \\  }
+    \\}
+;
+
 const UsageText =
     \\cas
     \\
@@ -222,27 +245,12 @@ fn printCapabilities(args: []const []const u8) !void {
     }
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
-    if (!json) {
-        try stdout.writeAll("session_inquiry_v1=true\n");
-        return;
-    }
-    try stdout.writeAll(
-        \\{
-        \\  "cas_capabilities": {
-        \\    "features": {
-        \\      "session_inquiry_v1": true,
-        \\      "dcp_v1": true,
-        \\      "rip_v1": true,
-        \\      "fir_v1": true,
-        \\      "exact_fork_rollback_anchor": true,
-        \\      "ephemeral_fork": true,
-        \\      "read_only_inquiry": true,
-        \\      "detached_inquiry": true
-        \\    }
-        \\  }
-        \\}
-        \\
-    );
+    try writeCapabilities(stdout, json);
+}
+
+fn writeCapabilities(writer: *std.Io.Writer, json: bool) !void {
+    try writer.writeAll(if (json) CapabilitiesJson else CapabilitiesText);
+    try writer.writeByte('\n');
 }
 
 test "resolveTarget supports supported subcommands" {
@@ -262,6 +270,18 @@ test "resolveTarget supports supported subcommands" {
     try std.testing.expect(resolveTarget("unknown") == null);
 }
 
-test "capabilities accepts json flag" {
-    try printCapabilities(&.{"--json"});
+test "capabilities advertise CAS-RER workflow binding in text and JSON" {
+    var text_output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer text_output.deinit();
+    try writeCapabilities(&text_output.writer, false);
+    try std.testing.expect(std.mem.indexOf(u8, text_output.written(), "cas_rer_workflow_binding_v1=true") != null);
+
+    var json_output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer json_output.deinit();
+    try writeCapabilities(&json_output.writer, true);
+    try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_rer_workflow_binding_v1\": true") != null);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_output.written(), .{});
+    defer parsed.deinit();
+    const features = parsed.value.object.get("cas_capabilities").?.object.get("features").?.object;
+    try std.testing.expect(features.get("cas_rer_workflow_binding_v1").?.bool);
 }
