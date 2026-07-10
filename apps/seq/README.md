@@ -405,7 +405,7 @@ Query-lift commands provide top-level shortcuts for common `seq query` shapes:
 - `skill-cohort` reports skills seen in the same session cohort as `--skill <name>`, or can fall back to summary/mention modes over `skill_mentions`.
 - `tool-search` searches lifecycle-enriched tool invocations and flattened tool arguments without shell `jq` post-processing. Use `--session-id` or `--path` for a single rollout and `--contains-any` when auditing several shell fragments at once.
 - `memory-extension-audit` inventories live memory extensions and labels results as `inventory_only` with `causality_claimed=false` so read/config evidence is not overclaimed.
-- `token-window` computes the max rolling token window from timestamp-sorted `token_deltas` rows and can emit the contributing rows.
+- `token-window` computes the max rolling token window from timestamp-sorted, lineage-owned `token_deltas` rows and can emit the contributing rows with physical/root/parent identity.
 - `goal-audit` summarizes `/goal` runs from `get_goal` / `update_goal` / `create_goal` outputs, with workflow filters for `review` and `resolve` and duration thresholds like `--duration-gte 2h`.
 - `workdir-report` summarizes canonical session rows by `cwd` and can list matching sessions.
 
@@ -526,10 +526,15 @@ Floor flags:
 `token-usage` reports local token usage from `token_count` traces:
 - `--last <duration>` accepts rolling windows such as `90m`, `24h`, or `7d`, ending at `--until` or now
 - `--summary` emits aggregate component totals: `input_tokens`, `cached_input_tokens`, `uncached_input_tokens`, `output_tokens`, and `reasoning_output_tokens`
-- `--audit` adds proof fields for duplicate totals, resets, null/missing-total rows, requested/observed span days, and naive overcount
+- modern rows are counted from `last_token_usage` transitions derived as `predecessor = total_token_usage - last_token_usage`, so interleaved counter lanes do not become reset baselines
+- worker transitions are owned by physical thread ancestry before time filtering; copied ancestor history is excluded while independent sibling and cross-root collisions remain distinct
+- every result includes `accounting_verdict` (`valid`, `estimated`, or `invalid`) and `audit_method`; legacy total-only traces and unresolved lineage are labeled `estimated`
+- `--audit` emits the worker policy, physical/root/parent resolution counts, replay and duplicate exclusions, stream switches, true resets, ambiguous/invalid transitions, signed raw-last discrepancy, legacy adjacency inflation, and a corpus path digest
+- an invalid modern transition fails closed instead of returning an authoritative scalar
 
 `token-cost` estimates token cost from local `token_count` traces:
-- reuses monotonic `total_token_usage` deltas and keeps cached input separate from uncached input
+- reuses the same lineage-owned transitions as `token-usage` and keeps cached input separate from uncached input
+- attributes model and service tier from the owning transition context rather than replayed whole-file metadata
 - `--last <duration>` shares the same rolling window syntax as `token-usage`
 - groups by `day`, `path`, `model`, or `fast_mode`; `--summary` emits one aggregate row
 - defaults to OpenAI Codex credit rates with explicit fast-mode evidence only; missing fast evidence is reported as `standard_assumption`

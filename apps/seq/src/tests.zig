@@ -26,6 +26,7 @@ comptime {
     _ = @import("datasets/skill_blocks.zig");
     _ = @import("datasets/token_events.zig");
     _ = @import("datasets/token_deltas.zig");
+    _ = @import("datasets/token_accounting.zig");
     _ = @import("datasets/token_sessions.zig");
     _ = @import("token_cost.zig");
     _ = @import("skill_contract.zig");

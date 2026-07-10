@@ -323,6 +323,11 @@ pub const dataset_meta = [_]DatasetMeta{
         .description = "Raw token_count events",
         .fields = &.{
             "path",
+            "thread_id",
+            "root_session_id",
+            "parent_thread_id",
+            "model",
+            "service_tier",
             "timestamp",
             "day",
             "week",
@@ -342,9 +347,15 @@ pub const dataset_meta = [_]DatasetMeta{
     },
     .{
         .name = "token_deltas",
-        .description = "Token deltas derived from total_token_usage changes",
+        .description = "Lineage-owned token usage transitions",
         .fields = &.{
             "path",
+            "thread_id",
+            "root_session_id",
+            "parent_thread_id",
+            "model",
+            "service_tier",
+            "accounting_method",
             "timestamp",
             "day",
             "week",
@@ -365,9 +376,13 @@ pub const dataset_meta = [_]DatasetMeta{
     },
     .{
         .name = "token_sessions",
-        .description = "One row per session file: max total_token_usage",
+        .description = "One row per physical session: lineage-owned token usage",
         .fields = &.{
             "path",
+            "thread_id",
+            "root_session_id",
+            "parent_thread_id",
+            "accounting_method",
             "start",
             "end",
             "max_at",
@@ -3293,6 +3308,7 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
             \\      "gcr_projection_inversion_v1": true,
             \\      "actuation_proof_cadence_v1": true,
             \\      "actuation_compaction_resume_v1": true,
+            \\      "token_accounting_v2": true,
             \\      "matched_cohort_v1": false
             \\    }
             \\  }
@@ -3352,6 +3368,7 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
         .{ .name = "gcr_projection_inversion_v1", .enabled = true },
         .{ .name = "actuation_proof_cadence_v1", .enabled = true },
         .{ .name = "actuation_compaction_resume_v1", .enabled = true },
+        .{ .name = "token_accounting_v2", .enabled = true },
         .{ .name = "matched_cohort_v1", .enabled = false },
     };
     for (features) |feature| {
@@ -11591,7 +11608,7 @@ const QueryLiftCommands = struct {
     const memory_extension_summary_columns = [_][]const u8{ "row_kind", "extensions", "with_instructions", "without_instructions", "total_bytes", "provenance_status", "causality_claimed" };
     const memory_extension_row_columns = [_][]const u8{ "extension_name", "has_instructions", "modified_at", "size_bytes", "instructions_path", "provenance_status", "causality_claimed" };
     const token_window_summary_columns = [_][]const u8{ "window_hours", "window_start", "window_end", "observed_end", "total_tokens", "rows", "path_count", "source_dataset", "sorted_by", "since", "until" };
-    const token_window_row_columns = [_][]const u8{ "timestamp", "delta_total_tokens", "path", "segment", "model_context_window" };
+    const token_window_row_columns = [_][]const u8{ "timestamp", "delta_total_tokens", "path", "thread_id", "root_session_id", "parent_thread_id", "model", "service_tier", "accounting_method", "segment", "model_context_window" };
     const workdir_report_summary_columns = [_][]const u8{ "cwd", "sessions", "turns", "total_tokens", "first_seen", "last_seen" };
     const workdir_report_session_columns = [_][]const u8{ "start_time", "end_time", "cwd", "model", "total_tokens", "path" };
     const goal_audit_row_columns = [_][]const u8{
@@ -18355,50 +18372,48 @@ const TokenUsageBucket = struct {
     rows: i64 = 0,
 };
 
-const TokenUsageAudit = struct {
-    files_scanned: i64 = 0,
-    raw_token_count_events: i64 = 0,
-    raw_token_count_info_null_events: i64 = 0,
-    raw_token_count_without_total_events: i64 = 0,
-    duplicate_total_events: i64 = 0,
-    duplicate_total_nonzero_last_events: i64 = 0,
-    duplicate_last_tokens_excluded: i64 = 0,
-    reset_events: i64 = 0,
-    naive_last_total_tokens: i64 = 0,
-
-    fn observeEvents(self: *TokenUsageAudit, events: []const datasets.token_events.Row, since_ms: ?i64, until_ms: ?i64, timezone: time_utils.TimeZone) void {
-        var prev_total_tokens: ?i64 = null;
-        for (events) |event| {
-            const ts_ms = tokenUsageEventTimestampMillis(event) orelse continue;
-            if (!timestampMillisSatisfiesBounds(ts_ms, since_ms, until_ms, timezone)) continue;
-
-            if (event.info_is_null) {
-                self.raw_token_count_info_null_events += 1;
-                continue;
-            }
-
-            self.raw_token_count_events += 1;
-            if (event.last_total_tokens) |last| self.naive_last_total_tokens += last;
-
-            const total = event.total_total_tokens orelse {
-                self.raw_token_count_without_total_events += 1;
-                continue;
-            };
-
-            if (prev_total_tokens) |prev| {
-                if (total == prev) {
-                    self.duplicate_total_events += 1;
-                    if ((event.last_total_tokens orelse 0) != 0) {
-                        self.duplicate_total_nonzero_last_events += 1;
-                        self.duplicate_last_tokens_excluded += event.last_total_tokens.?;
-                    }
-                } else if (total < prev) {
-                    self.reset_events += 1;
-                }
-            }
-            prev_total_tokens = total;
-        }
-    }
+const TokenUsageAudit = datasets.token_accounting.Audit;
+const token_usage_audit_columns = [_][]const u8{
+    "audit_version",
+    "diagnostic_scope",
+    "worker_policy",
+    "files_scanned",
+    "files_with_counted_tokens",
+    "root_lineages",
+    "worker_files",
+    "lineage_edges_resolved",
+    "missing_parent_threads",
+    "lineage_cycles",
+    "raw_token_count_events",
+    "raw_token_count_info_null_events",
+    "raw_token_count_without_total_events",
+    "counted_delta_rows",
+    "owned_transitions",
+    "duplicate_emissions_excluded",
+    "duplicate_total_events",
+    "duplicate_total_nonzero_last_events",
+    "duplicate_last_tokens_excluded",
+    "conflicting_duplicate_emissions",
+    "ancestor_replay_transitions_excluded",
+    "sibling_collision_transitions_retained",
+    "cross_root_collision_transitions_retained",
+    "stream_switches",
+    "true_resets",
+    "reset_events",
+    "ambiguous_transitions",
+    "invalid_transitions",
+    "legacy_total_only_events",
+    "audit_total_tokens",
+    "corpus_owned_total_tokens",
+    "naive_last_total_tokens",
+    "naive_overcount_tokens",
+    "audit_minus_last_tokens",
+    "adjacency_total_tokens",
+    "legacy_inflation_tokens",
+    "corpus_path_digest",
+    "requested_span_days",
+    "observed_span_days",
+    "bucket_days",
 };
 
 fn cmdTokenUsage(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
@@ -18410,8 +18425,21 @@ fn cmdTokenUsage(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
     const window = try resolveTokenCommandWindow(opts);
 
     const day_filter = deriveSessionDayPathFilterFromWindow(window);
-    var paths = try resolveSessionPromptInputPaths(allocator, sessions_root, opts, day_filter);
-    defer freePathList(allocator, &paths);
+    var selected_paths = try resolveSessionPromptInputPaths(allocator, sessions_root, opts, day_filter);
+    defer freePathList(allocator, &selected_paths);
+    var corpus_paths = try collectJsonlPaths(allocator, sessions_root, null);
+    defer freePathList(allocator, &corpus_paths);
+    var selected_path_set: std.StringHashMap(void) = .init(allocator);
+    defer selected_path_set.deinit();
+    for (selected_paths.items) |path| try selected_path_set.put(path, {});
+    const restrict_to_selected_paths = opts.path != null or opts.session_id != null or opts.exclude_current;
+
+    var projection = try datasets.token_accounting.buildProjectionForSelection(allocator, selected_paths.items, corpus_paths.items);
+    defer projection.deinit(allocator);
+    if (projection.audit.verdict == .invalid) {
+        printCliError("error: token accounting is invalid; rerun token-usage --audit for lineage diagnostics\n", .{});
+        return error.TokenAccountingInvalid;
+    }
 
     var buckets: std.ArrayList(TokenUsageBucket) = .empty;
     var bucket_index: std.StringHashMap(usize) = .init(allocator);
@@ -18423,7 +18451,7 @@ fn cmdTokenUsage(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
     var included_paths: std.StringHashMap(void) = .init(allocator);
     defer deinitStringSet(allocator, &included_paths);
 
-    var audit = TokenUsageAudit{ .files_scanned = @intCast(paths.items.len) };
+    const audit = projection.audit;
     var total_tokens: i64 = 0;
     var input_tokens: i64 = 0;
     var cached_input_tokens: i64 = 0;
@@ -18434,53 +18462,43 @@ fn cmdTokenUsage(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
     var max_day_buf: [10]u8 = undefined;
     var have_day_bounds = false;
 
-    for (paths.items) |path| {
-        var events = try datasets.token_events.parseTokenEventsFileWithOptions(allocator, path, .{
-            .dedupe = !opts.audit,
-            .derive_timestamp_fields = true,
-            .include_null_info = opts.audit,
-        });
-        defer events.deinit(allocator);
-        if (opts.audit) audit.observeEvents(events.items, window.since_ms, window.until_ms, timezone);
-        var deltas = try datasets.token_deltas.buildDeltas(allocator, events.items, .{});
-        defer deltas.deinit(allocator);
+    for (projection.rows.items) |row| {
+        const path = row.path;
+        if (restrict_to_selected_paths and !selected_path_set.contains(path)) continue;
+        const ts_text = row.timestamp orelse continue;
+        const ts_ms = time_utils.parseIsoTimestampMillis(ts_text.slice()) orelse continue;
+        if (!timestampMillisSatisfiesBounds(ts_ms, window.since_ms, window.until_ms, timezone)) continue;
 
-        for (deltas.items) |row| {
-            const ts_text = row.timestamp orelse continue;
-            const ts_ms = time_utils.parseIsoTimestampMillis(ts_text.slice()) orelse continue;
-            if (!timestampMillisSatisfiesBounds(ts_ms, window.since_ms, window.until_ms, timezone)) continue;
+        const delta_total = row.delta_total_tokens orelse continue;
+        const delta_input = row.delta_input_tokens orelse 0;
+        const delta_cached_input = row.delta_cached_input_tokens orelse 0;
+        const delta_output = row.delta_output_tokens orelse 0;
+        const delta_reasoning_output = row.delta_reasoning_output_tokens orelse 0;
 
-            const delta_total = row.delta_total_tokens orelse continue;
-            const delta_input = row.delta_input_tokens orelse 0;
-            const delta_cached_input = row.delta_cached_input_tokens orelse 0;
-            const delta_output = row.delta_output_tokens orelse 0;
-            const delta_reasoning_output = row.delta_reasoning_output_tokens orelse 0;
-
-            var day_buf: [10]u8 = undefined;
-            const local_day = tokenUsageDayKeyFromMillis(ts_ms, timezone, &day_buf) orelse continue;
-            if (!have_day_bounds) {
-                @memcpy(min_day_buf[0..], local_day);
-                @memcpy(max_day_buf[0..], local_day);
-                have_day_bounds = true;
-            } else {
-                if (std.mem.order(u8, local_day, min_day_buf[0..]) == .lt) @memcpy(min_day_buf[0..], local_day);
-                if (std.mem.order(u8, local_day, max_day_buf[0..]) == .gt) @memcpy(max_day_buf[0..], local_day);
-            }
-
-            try addTokenUsageBucket(allocator, &daily_bucket_index, &daily_buckets, local_day, row);
-            const bucket_key = switch (group_by) {
-                .day => local_day,
-                .path => path,
-            };
-            try addTokenUsageBucket(allocator, &bucket_index, &buckets, bucket_key, row);
-            try addToStringSet(allocator, &included_paths, path);
-            total_tokens += delta_total;
-            input_tokens += delta_input;
-            cached_input_tokens += delta_cached_input;
-            output_tokens += delta_output;
-            reasoning_output_tokens += delta_reasoning_output;
-            total_rows += 1;
+        var day_buf: [10]u8 = undefined;
+        const local_day = tokenUsageDayKeyFromMillis(ts_ms, timezone, &day_buf) orelse continue;
+        if (!have_day_bounds) {
+            @memcpy(min_day_buf[0..], local_day);
+            @memcpy(max_day_buf[0..], local_day);
+            have_day_bounds = true;
+        } else {
+            if (std.mem.order(u8, local_day, min_day_buf[0..]) == .lt) @memcpy(min_day_buf[0..], local_day);
+            if (std.mem.order(u8, local_day, max_day_buf[0..]) == .gt) @memcpy(max_day_buf[0..], local_day);
         }
+
+        try addTokenUsageBucket(allocator, &daily_bucket_index, &daily_buckets, local_day, row);
+        const bucket_key = switch (group_by) {
+            .day => local_day,
+            .path => path,
+        };
+        try addTokenUsageBucket(allocator, &bucket_index, &buckets, bucket_key, row);
+        try addToStringSet(allocator, &included_paths, path);
+        total_tokens += delta_total;
+        input_tokens += delta_input;
+        cached_input_tokens += delta_cached_input;
+        output_tokens += delta_output;
+        reasoning_output_tokens += delta_reasoning_output;
+        total_rows += 1;
     }
 
     switch (group_by) {
@@ -18516,69 +18534,33 @@ fn cmdTokenUsage(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
             timezone,
             if (opts.audit) audit else null,
         );
+        try out_rows.items[out_rows.items.len - 1].putOwnedKey("accounting_verdict", .{ .string = audit.verdict.label() });
+        try out_rows.items[out_rows.items.len - 1].putOwnedKey("audit_method", .{ .string = "lineage_owned_usage_transitions" });
         const summary_cols = [_][]const u8{
             "scope_kind",
             "scope_target",
             "group_by",
             "tz",
-            "total_tokens",
-            "input_tokens",
-            "cached_input_tokens",
-            "uncached_input_tokens",
-            "output_tokens",
-            "reasoning_output_tokens",
-            "calendar_days",
-            "active_days",
-            "average_tokens_per_calendar_day",
-            "average_tokens_per_active_day",
-            "median_tokens_per_active_day",
-            "first_day",
-            "last_day",
-            "partial_current_day",
-            "path_count",
-            "rows",
-        };
-        const summary_audit_cols = [_][]const u8{
-            "row_kind",
-            "scope_kind",
-            "scope_target",
-            "group_by",
-            "tz",
-            "total_tokens",
-            "input_tokens",
-            "cached_input_tokens",
-            "uncached_input_tokens",
-            "output_tokens",
-            "reasoning_output_tokens",
-            "calendar_days",
-            "active_days",
-            "average_tokens_per_calendar_day",
-            "average_tokens_per_active_day",
-            "median_tokens_per_active_day",
-            "first_day",
-            "last_day",
-            "partial_current_day",
-            "path_count",
-            "rows",
-            "audit_version",
+            "accounting_verdict",
             "audit_method",
-            "files_scanned",
-            "files_with_counted_tokens",
-            "raw_token_count_events",
-            "raw_token_count_info_null_events",
-            "raw_token_count_without_total_events",
-            "counted_delta_rows",
-            "duplicate_total_events",
-            "duplicate_total_nonzero_last_events",
-            "duplicate_last_tokens_excluded",
-            "reset_events",
-            "audit_total_tokens",
-            "naive_last_total_tokens",
-            "naive_overcount_tokens",
-            "requested_span_days",
-            "observed_span_days",
-            "bucket_days",
+            "total_tokens",
+            "input_tokens",
+            "cached_input_tokens",
+            "uncached_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+            "calendar_days",
+            "active_days",
+            "average_tokens_per_calendar_day",
+            "average_tokens_per_active_day",
+            "median_tokens_per_active_day",
+            "first_day",
+            "last_day",
+            "partial_current_day",
+            "path_count",
+            "rows",
         };
+        const summary_audit_cols = [_][]const u8{"row_kind"} ++ summary_cols ++ token_usage_audit_columns;
         const cols = if (opts.audit) summary_audit_cols[0..] else summary_cols[0..];
         try output.writeOutput(allocator, opts.format, out_rows.items, cols, opts.out_path);
         return;
@@ -18590,6 +18572,8 @@ fn cmdTokenUsage(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
         try qrow.putOwnedKey(group_by.fieldName(), .{ .string = bucket.key });
         try qrow.putOwnedKey("total_tokens", .{ .int = bucket.total_tokens });
         try qrow.putOwnedKey("rows", .{ .int = bucket.rows });
+        try qrow.putOwnedKey("accounting_verdict", .{ .string = audit.verdict.label() });
+        try qrow.putOwnedKey("audit_method", .{ .string = "lineage_owned_usage_transitions" });
         if (group_by == .path or opts.timezone_text != null) {
             try qrow.putOwnedKey("tz", .{ .string = timezone_label });
             try qrow.putOwnedKey("scope_kind", .{ .string = tokenUsageScopeKind(opts, group_by) });
@@ -18620,61 +18604,11 @@ fn cmdTokenUsage(allocator: std.mem.Allocator, sessions_root: []const u8, opts: 
             audit,
         );
     }
-    const day_cols_extended = [_][]const u8{ "day", "total_tokens", "rows", "tz", "scope_kind" };
-    const day_cols_legacy = [_][]const u8{ "day", "rows", "total_tokens" };
-    const path_cols = [_][]const u8{ "path", "total_tokens", "rows", "tz", "scope_kind" };
-    const day_audit_cols = [_][]const u8{
-        "row_kind",
-        "day",
-        "total_tokens",
-        "rows",
-        "tz",
-        "scope_kind",
-        "audit_version",
-        "audit_method",
-        "files_scanned",
-        "files_with_counted_tokens",
-        "raw_token_count_events",
-        "raw_token_count_info_null_events",
-        "raw_token_count_without_total_events",
-        "counted_delta_rows",
-        "duplicate_total_events",
-        "duplicate_total_nonzero_last_events",
-        "duplicate_last_tokens_excluded",
-        "reset_events",
-        "audit_total_tokens",
-        "naive_last_total_tokens",
-        "naive_overcount_tokens",
-        "requested_span_days",
-        "observed_span_days",
-        "bucket_days",
-    };
-    const path_audit_cols = [_][]const u8{
-        "row_kind",
-        "path",
-        "total_tokens",
-        "rows",
-        "tz",
-        "scope_kind",
-        "audit_version",
-        "audit_method",
-        "files_scanned",
-        "files_with_counted_tokens",
-        "raw_token_count_events",
-        "raw_token_count_info_null_events",
-        "raw_token_count_without_total_events",
-        "counted_delta_rows",
-        "duplicate_total_events",
-        "duplicate_total_nonzero_last_events",
-        "duplicate_last_tokens_excluded",
-        "reset_events",
-        "audit_total_tokens",
-        "naive_last_total_tokens",
-        "naive_overcount_tokens",
-        "requested_span_days",
-        "observed_span_days",
-        "bucket_days",
-    };
+    const day_cols_extended = [_][]const u8{ "day", "total_tokens", "rows", "tz", "scope_kind", "accounting_verdict", "audit_method" };
+    const day_cols_legacy = [_][]const u8{ "day", "rows", "total_tokens", "accounting_verdict", "audit_method" };
+    const path_cols = [_][]const u8{ "path", "total_tokens", "rows", "tz", "scope_kind", "accounting_verdict", "audit_method" };
+    const day_audit_cols = [_][]const u8{ "row_kind", "day", "total_tokens", "rows", "tz", "scope_kind", "accounting_verdict", "audit_method" } ++ token_usage_audit_columns;
+    const path_audit_cols = [_][]const u8{ "row_kind", "path", "total_tokens", "rows", "tz", "scope_kind", "accounting_verdict", "audit_method" } ++ token_usage_audit_columns;
     const cols: []const []const u8 = if (opts.audit) switch (group_by) {
         .day => day_audit_cols[0..],
         .path => path_audit_cols[0..],
@@ -18758,15 +18692,6 @@ const TokenCostBucket = struct {
     cost_confidence: []const u8 = "",
 };
 
-const TokenCostTraceMeta = struct {
-    model: ?[]u8 = null,
-    fast_mode: token_cost.FastMode = .unknown,
-
-    fn deinit(self: TokenCostTraceMeta, allocator: std.mem.Allocator) void {
-        if (self.model) |value| allocator.free(value);
-    }
-};
-
 fn cmdTokenCost(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
     const group_by = try TokenCostGroupBy.parse(opts.group_by_text);
     const pricing_kind = try TokenCostPricingKind.parse(opts.pricing_text);
@@ -18787,8 +18712,21 @@ fn cmdTokenCost(allocator: std.mem.Allocator, sessions_root: []const u8, opts: O
     defer token_cost.deinitApiPricing(allocator, api_pricing);
 
     const day_filter = deriveSessionDayPathFilterFromWindow(window);
-    var paths = try resolveSessionPromptInputPaths(allocator, sessions_root, opts, day_filter);
-    defer freePathList(allocator, &paths);
+    var selected_paths = try resolveSessionPromptInputPaths(allocator, sessions_root, opts, day_filter);
+    defer freePathList(allocator, &selected_paths);
+    var corpus_paths = try collectJsonlPaths(allocator, sessions_root, null);
+    defer freePathList(allocator, &corpus_paths);
+    var selected_path_set: std.StringHashMap(void) = .init(allocator);
+    defer selected_path_set.deinit();
+    for (selected_paths.items) |path| try selected_path_set.put(path, {});
+    const restrict_to_selected_paths = opts.path != null or opts.session_id != null or opts.exclude_current;
+
+    var projection = try datasets.token_accounting.buildProjectionForSelection(allocator, selected_paths.items, corpus_paths.items);
+    defer projection.deinit(allocator);
+    if (projection.audit.verdict == .invalid) {
+        printCliError("error: token accounting is invalid; token-cost cannot price an unowned transition\n", .{});
+        return error.TokenAccountingInvalid;
+    }
 
     var buckets: std.ArrayList(TokenCostBucket) = .empty;
     var bucket_index: std.StringHashMap(usize) = .init(allocator);
@@ -18796,57 +18734,44 @@ fn cmdTokenCost(allocator: std.mem.Allocator, sessions_root: []const u8, opts: O
 
     var total = TokenCostBucket{ .key = undefined };
 
-    for (paths.items) |path| {
-        const content_opt = try readFileAllocOrSkip(allocator, path);
-        const content = content_opt orelse continue;
-        defer allocator.free(content);
+    for (projection.rows.items) |row| {
+        const path = row.path;
+        if (restrict_to_selected_paths and !selected_path_set.contains(path)) continue;
+        const trace_model: ?[]const u8 = if (row.model) |*model| model.slice() else null;
+        const model_name = opts.model_text orelse trace_model;
+        const model_source: []const u8 = if (opts.model_text != null) "override" else if (trace_model != null) "trace" else "missing";
+        const fast_mode = tokenCostFastModeForRow(row, opts);
+        const ts_text = row.timestamp orelse continue;
+        const ts_ms = time_utils.parseIsoTimestampMillis(ts_text.slice()) orelse continue;
+        if (!timestampMillisSatisfiesBounds(ts_ms, window.since_ms, window.until_ms, timezone)) continue;
 
-        const meta = try loadTokenCostTraceMetaFromContent(allocator, content, opts);
-        defer meta.deinit(allocator);
-        const model_name = opts.model_text orelse meta.model;
-        const model_source: []const u8 = if (opts.model_text != null) "override" else if (meta.model != null) "trace" else "missing";
-        var events = try datasets.token_events.parseTokenEventsWithOptions(allocator, path, content, .{
-            .dedupe = !opts.audit,
-            .derive_timestamp_fields = true,
-            .include_null_info = opts.audit,
-        });
-        defer events.deinit(allocator);
-        var deltas = try datasets.token_deltas.buildDeltas(allocator, events.items, .{});
-        defer deltas.deinit(allocator);
-
-        for (deltas.items) |row| {
-            const ts_text = row.timestamp orelse continue;
-            const ts_ms = time_utils.parseIsoTimestampMillis(ts_text.slice()) orelse continue;
-            if (!timestampMillisSatisfiesBounds(ts_ms, window.since_ms, window.until_ms, timezone)) continue;
-
-            var day_buf: [10]u8 = undefined;
-            const local_day = tokenUsageDayKeyFromMillis(ts_ms, timezone, &day_buf) orelse continue;
-            const usage = token_cost.Usage{
-                .input_tokens = row.delta_input_tokens orelse 0,
-                .cached_input_tokens = row.delta_cached_input_tokens orelse 0,
-                .output_tokens = row.delta_output_tokens orelse 0,
-            };
-            const long_context = if (pricing_kind == .api and model_name != null)
-                if (token_cost.findApiRate(api_pricing, model_name.?)) |rate|
-                    token_cost.apiModelHasLongContext(rate, usage.input_tokens)
-                else
-                    false
+        var day_buf: [10]u8 = undefined;
+        const local_day = tokenUsageDayKeyFromMillis(ts_ms, timezone, &day_buf) orelse continue;
+        const usage = token_cost.Usage{
+            .input_tokens = row.delta_input_tokens orelse 0,
+            .cached_input_tokens = row.delta_cached_input_tokens orelse 0,
+            .output_tokens = row.delta_output_tokens orelse 0,
+        };
+        const long_context = if (pricing_kind == .api and model_name != null)
+            if (token_cost.findApiRate(api_pricing, model_name.?)) |rate|
+                token_cost.apiModelHasLongContext(rate, usage.input_tokens)
             else
-                false;
-            const estimate = switch (pricing_kind) {
-                .codex => token_cost.estimate(pricing, model_name, usage, meta.fast_mode),
-                .api => token_cost.estimateApi(api_pricing, model_name, usage, long_context),
-            };
+                false
+        else
+            false;
+        const estimate = switch (pricing_kind) {
+            .codex => token_cost.estimate(pricing, model_name, usage, fast_mode),
+            .api => token_cost.estimateApi(api_pricing, model_name, usage, long_context),
+        };
 
-            const key = switch (group_by) {
-                .day => local_day,
-                .path => path,
-                .model => model_name orelse "unknown",
-                .fast_mode => meta.fast_mode.label(),
-            };
-            try addTokenCostBucket(allocator, &bucket_index, &buckets, key, row, estimate, meta.fast_mode, model_source);
-            addTokenCostTotals(&total, row, estimate, meta.fast_mode, model_source);
-        }
+        const key = switch (group_by) {
+            .day => local_day,
+            .path => path,
+            .model => model_name orelse "unknown",
+            .fast_mode => fast_mode.label(),
+        };
+        try addTokenCostBucket(allocator, &bucket_index, &buckets, key, row, estimate, fast_mode, model_source);
+        addTokenCostTotals(&total, row, estimate, fast_mode, model_source);
     }
 
     if (pricing_kind == .api and total.unpriced_rows > 0) {
@@ -18868,11 +18793,17 @@ fn cmdTokenCost(allocator: std.mem.Allocator, sessions_root: []const u8, opts: O
         try qrow.putOwnedKey("row_kind", .{ .string = "summary" });
         try qrow.putOwnedKey("scope_kind", .{ .string = tokenCostScopeKind(opts, group_by) });
         try qrow.putOwnedKey("scope_target", .{ .string = tokenUsageScopeTarget(opts, sessions_root) });
+        try qrow.putOwnedKey("accounting_verdict", .{ .string = projection.audit.verdict.label() });
+        try qrow.putOwnedKey("audit_method", .{ .string = "lineage_owned_usage_transitions" });
+        try qrow.putOwnedKey("ancestor_replay_transitions_excluded", .{ .int = projection.audit.ancestor_replay_transitions_excluded });
         try out_rows.append(allocator, qrow);
         const cols = [_][]const u8{
             "row_kind",
             "scope_kind",
             "scope_target",
+            "accounting_verdict",
+            "audit_method",
+            "ancestor_replay_transitions_excluded",
             "group_by",
             "tz",
             "credits_estimate",
@@ -19176,65 +19107,12 @@ fn tokenCostCachePath(allocator: std.mem.Allocator) ![]u8 {
     return std.fs.path.join(allocator, &.{ root, "seq", "pricing", "codex-pricing.json" });
 }
 
-fn loadTokenCostTraceMetaFromContent(allocator: std.mem.Allocator, content: []const u8, opts: Options) !TokenCostTraceMeta {
-    var out = TokenCostTraceMeta{};
-    if (opts.force_fast) out.fast_mode = .override_fast;
-    if (opts.force_standard) out.fast_mode = .override_standard;
-    out.model = try detectTokenCostModel(allocator, content);
-    if (!opts.force_fast and !opts.force_standard) out.fast_mode = detectFastModeEvidence(content);
-    return out;
-}
-
-fn detectTokenCostModel(allocator: std.mem.Allocator, content: []const u8) !?[]u8 {
-    var model: ?[]u8 = null;
-    errdefer if (model) |value| allocator.free(value);
-
-    var lines = std.mem.splitScalar(u8, content, '\n');
-    while (lines.next()) |raw_line| {
-        if (std.mem.indexOf(u8, raw_line, "\"model\"") == null) continue;
-        const line = std.mem.trim(u8, raw_line, " \t\r\n");
-        if (line.len == 0) continue;
-
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-        const parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), line, .{}) catch continue;
-        const root = switch (parsed.value) {
-            .object => |obj| obj,
-            else => continue,
-        };
-        const root_type = stdJsonStringField(root, "type") orelse continue;
-        if (std.mem.eql(u8, root_type, "session_meta")) {
-            const payload = stdJsonObjectField(root, "payload") orelse root;
-            if (stdJsonStringField(payload, "model")) |value| {
-                if (model) |old| allocator.free(old);
-                model = try allocator.dupe(u8, value);
-            }
-            continue;
-        }
-        if (model == null and std.mem.eql(u8, root_type, "turn_context")) {
-            const payload = stdJsonObjectField(root, "payload") orelse root;
-            if (stdJsonStringField(payload, "model")) |value| model = try allocator.dupe(u8, value);
-        }
-    }
-
-    return model;
-}
-
-fn detectFastModeEvidence(content: []const u8) token_cost.FastMode {
-    if (std.mem.containsAtLeast(u8, content, 1, "\"fast_mode\":true") or
-        std.mem.containsAtLeast(u8, content, 1, "\"fast_mode\": true") or
-        std.mem.containsAtLeast(u8, content, 1, "\"service_tier\":\"fast\"") or
-        std.mem.containsAtLeast(u8, content, 1, "\"service_tier\": \"fast\""))
-    {
-        return .explicit_fast;
-    }
-    if (std.mem.containsAtLeast(u8, content, 1, "\"fast_mode\":false") or
-        std.mem.containsAtLeast(u8, content, 1, "\"fast_mode\": false") or
-        std.mem.containsAtLeast(u8, content, 1, "\"service_tier\":\"standard\"") or
-        std.mem.containsAtLeast(u8, content, 1, "\"service_tier\": \"standard\""))
-    {
-        return .explicit_standard;
-    }
+fn tokenCostFastModeForRow(row: datasets.token_deltas.Row, opts: Options) token_cost.FastMode {
+    if (opts.force_fast) return .override_fast;
+    if (opts.force_standard) return .override_standard;
+    const tier = if (row.service_tier) |*value| value.slice() else return .unknown;
+    if (std.ascii.eqlIgnoreCase(tier, "fast")) return .explicit_fast;
+    if (std.ascii.eqlIgnoreCase(tier, "standard") or std.ascii.eqlIgnoreCase(tier, "default")) return .explicit_standard;
     return .unknown;
 }
 
@@ -19396,11 +19274,6 @@ fn parseTokenUsageBoundMillis(raw_opt: ?[]const u8, flag_name: []const u8) !?i64
         printCliError("error: token-usage {s} must be an ISO-8601 timestamp with timezone\n", .{flag_name});
         break :blk error.InvalidTimestampArg;
     };
-}
-
-fn tokenUsageEventTimestampMillis(event: datasets.token_events.Row) ?i64 {
-    const timestamp = event.timestamp orelse return null;
-    return time_utils.parseIsoTimestampMillis(timestamp.slice());
 }
 
 fn timestampMillisSatisfiesBounds(ts_ms: i64, since_ms: ?i64, until_ms: ?i64, timezone: time_utils.TimeZone) bool {
@@ -19677,22 +19550,46 @@ fn putTokenUsageAuditFields(
     until_ms: ?i64,
     timezone: time_utils.TimeZone,
 ) !void {
-    const naive_overcount = if (audit.naive_last_total_tokens > total_tokens) audit.naive_last_total_tokens - total_tokens else 0;
-    try row.putOwnedKey("audit_version", .{ .int = 1 });
-    try row.putOwnedKey("audit_method", .{ .string = "monotonic_total_token_usage_deltas" });
+    const naive_overcount = if (audit.raw_last_total_tokens > audit.owned_total_tokens) audit.raw_last_total_tokens - audit.owned_total_tokens else 0;
+    try row.putOwnedKey("audit_version", .{ .int = 2 });
+    try row.putOwnedKey("accounting_verdict", .{ .string = audit.verdict.label() });
+    try row.putOwnedKey("audit_method", .{ .string = "lineage_owned_usage_transitions" });
+    try row.putOwnedKey("diagnostic_scope", .{ .string = "lineage_closure_before_time_filter" });
+    try row.putOwnedKey("worker_policy", .{ .string = "include_owned_exclude_ancestor_replay" });
     try row.putOwnedKey("files_scanned", .{ .int = audit.files_scanned });
     try row.putOwnedKey("files_with_counted_tokens", .{ .int = path_count });
+    try row.putOwnedKey("root_lineages", .{ .int = audit.root_lineages });
+    try row.putOwnedKey("worker_files", .{ .int = audit.worker_files });
+    try row.putOwnedKey("lineage_edges_resolved", .{ .int = audit.lineage_edges_resolved });
+    try row.putOwnedKey("missing_parent_threads", .{ .int = audit.missing_parent_threads });
+    try row.putOwnedKey("lineage_cycles", .{ .int = audit.lineage_cycles });
     try row.putOwnedKey("raw_token_count_events", .{ .int = audit.raw_token_count_events + audit.raw_token_count_info_null_events });
     try row.putOwnedKey("raw_token_count_info_null_events", .{ .int = audit.raw_token_count_info_null_events });
     try row.putOwnedKey("raw_token_count_without_total_events", .{ .int = audit.raw_token_count_without_total_events });
     try row.putOwnedKey("counted_delta_rows", .{ .int = total_rows });
-    try row.putOwnedKey("duplicate_total_events", .{ .int = audit.duplicate_total_events });
+    try row.putOwnedKey("owned_transitions", .{ .int = audit.owned_transitions });
+    try row.putOwnedKey("duplicate_emissions_excluded", .{ .int = audit.duplicate_emissions_excluded });
+    try row.putOwnedKey("duplicate_total_events", .{ .int = audit.duplicate_emissions_excluded });
     try row.putOwnedKey("duplicate_total_nonzero_last_events", .{ .int = audit.duplicate_total_nonzero_last_events });
     try row.putOwnedKey("duplicate_last_tokens_excluded", .{ .int = audit.duplicate_last_tokens_excluded });
-    try row.putOwnedKey("reset_events", .{ .int = audit.reset_events });
+    try row.putOwnedKey("conflicting_duplicate_emissions", .{ .int = audit.conflicting_duplicate_emissions });
+    try row.putOwnedKey("ancestor_replay_transitions_excluded", .{ .int = audit.ancestor_replay_transitions_excluded });
+    try row.putOwnedKey("sibling_collision_transitions_retained", .{ .int = audit.sibling_collision_transitions_retained });
+    try row.putOwnedKey("cross_root_collision_transitions_retained", .{ .int = audit.cross_root_collision_transitions_retained });
+    try row.putOwnedKey("stream_switches", .{ .int = audit.stream_switches });
+    try row.putOwnedKey("true_resets", .{ .int = audit.true_resets });
+    try row.putOwnedKey("reset_events", .{ .int = audit.true_resets });
+    try row.putOwnedKey("ambiguous_transitions", .{ .int = audit.ambiguous_transitions });
+    try row.putOwnedKey("invalid_transitions", .{ .int = audit.invalid_transitions });
+    try row.putOwnedKey("legacy_total_only_events", .{ .int = audit.legacy_total_only_events });
     try row.putOwnedKey("audit_total_tokens", .{ .int = total_tokens });
-    try row.putOwnedKey("naive_last_total_tokens", .{ .int = audit.naive_last_total_tokens });
+    try row.putOwnedKey("corpus_owned_total_tokens", .{ .int = audit.owned_total_tokens });
+    try row.putOwnedKey("naive_last_total_tokens", .{ .int = audit.raw_last_total_tokens });
     try row.putOwnedKey("naive_overcount_tokens", .{ .int = naive_overcount });
+    try row.putOwnedKey("audit_minus_last_tokens", .{ .int = audit.auditMinusLastTokens() });
+    try row.putOwnedKey("adjacency_total_tokens", .{ .int = audit.adjacency_total_tokens });
+    try row.putOwnedKey("legacy_inflation_tokens", .{ .int = audit.legacyInflationTokens() });
+    try row.putOwnedKey("corpus_path_digest", .{ .string = audit.corpus_path_digest[0..] });
     if (tokenUsageRequestedSpanDays(since_ms, until_ms, timezone)) |days| {
         try row.putOwnedKey("requested_span_days", .{ .int = days });
     } else {
@@ -22334,6 +22231,11 @@ fn collectTokenEventsRows(
         for (parsed.items) |row| {
             var qrow = query.Row.init(allocator);
             try qrow.putStaticKey("path", .{ .string = row.path });
+            try putSmallText(&qrow, "thread_id", row.thread_id);
+            try putSmallText(&qrow, "root_session_id", row.root_session_id);
+            try putSmallText(&qrow, "parent_thread_id", row.parent_thread_id);
+            try putSmallText(&qrow, "model", row.model);
+            try putSmallText(&qrow, "service_tier", row.service_tier);
             try putSmallText(&qrow, "timestamp", row.timestamp);
             try putSmallText(&qrow, "day", row.day);
             try putSmallText(&qrow, "week", row.week);
@@ -22360,36 +22262,41 @@ fn collectTokenDeltasRows(
     day_filter: ?SessionDayPathFilter,
     out_rows: *std.ArrayList(query.Row),
 ) !void {
-    var paths = try collectJsonlPaths(allocator, sessions_root, day_filter);
-    defer freePathList(allocator, &paths);
+    var selected_paths = try collectJsonlPaths(allocator, sessions_root, day_filter);
+    defer freePathList(allocator, &selected_paths);
+    var corpus_paths = try collectJsonlPaths(allocator, sessions_root, null);
+    defer freePathList(allocator, &corpus_paths);
 
-    for (paths.items) |path| {
-        var events = try datasets.token_events.parseTokenEventsFile(allocator, path, true);
-        defer events.deinit(allocator);
-        var deltas = try datasets.token_deltas.buildDeltas(allocator, events.items, .{});
-        defer deltas.deinit(allocator);
+    var projection = try datasets.token_accounting.buildProjectionForSelection(allocator, selected_paths.items, corpus_paths.items);
+    defer projection.deinit(allocator);
+    if (projection.audit.verdict == .invalid) return error.TokenAccountingInvalid;
 
-        for (deltas.items) |row| {
-            var qrow = query.Row.init(allocator);
-            try qrow.putStaticKey("path", .{ .string = row.path });
-            try putSmallText(&qrow, "timestamp", row.timestamp);
-            try putSmallText(&qrow, "day", row.day);
-            try putSmallText(&qrow, "week", row.week);
-            try putSmallText(&qrow, "month", row.month);
-            try qrow.putStaticKey("segment", .{ .int = @intCast(row.segment) });
-            try putOptionalInt(&qrow, "model_context_window", row.model_context_window);
-            try putOptionalInt(&qrow, "delta_input_tokens", row.delta_input_tokens);
-            try putOptionalInt(&qrow, "delta_cached_input_tokens", row.delta_cached_input_tokens);
-            try putOptionalInt(&qrow, "delta_output_tokens", row.delta_output_tokens);
-            try putOptionalInt(&qrow, "delta_reasoning_output_tokens", row.delta_reasoning_output_tokens);
-            try putOptionalInt(&qrow, "delta_total_tokens", row.delta_total_tokens);
-            try putOptionalInt(&qrow, "total_input_tokens", row.total_input_tokens);
-            try putOptionalInt(&qrow, "total_cached_input_tokens", row.total_cached_input_tokens);
-            try putOptionalInt(&qrow, "total_output_tokens", row.total_output_tokens);
-            try putOptionalInt(&qrow, "total_reasoning_output_tokens", row.total_reasoning_output_tokens);
-            try putOptionalInt(&qrow, "total_total_tokens", row.total_total_tokens);
-            try out_rows.append(allocator, qrow);
-        }
+    for (projection.rows.items) |row| {
+        var qrow = query.Row.init(allocator);
+        try qrow.putStaticKey("path", .{ .string = row.path });
+        try putSmallText(&qrow, "thread_id", row.thread_id);
+        try putSmallText(&qrow, "root_session_id", row.root_session_id);
+        try putSmallText(&qrow, "parent_thread_id", row.parent_thread_id);
+        try putSmallText(&qrow, "model", row.model);
+        try putSmallText(&qrow, "service_tier", row.service_tier);
+        try qrow.putStaticKey("accounting_method", .{ .string = row.accounting_method });
+        try putSmallText(&qrow, "timestamp", row.timestamp);
+        try putSmallText(&qrow, "day", row.day);
+        try putSmallText(&qrow, "week", row.week);
+        try putSmallText(&qrow, "month", row.month);
+        try qrow.putStaticKey("segment", .{ .int = @intCast(row.segment) });
+        try putOptionalInt(&qrow, "model_context_window", row.model_context_window);
+        try putOptionalInt(&qrow, "delta_input_tokens", row.delta_input_tokens);
+        try putOptionalInt(&qrow, "delta_cached_input_tokens", row.delta_cached_input_tokens);
+        try putOptionalInt(&qrow, "delta_output_tokens", row.delta_output_tokens);
+        try putOptionalInt(&qrow, "delta_reasoning_output_tokens", row.delta_reasoning_output_tokens);
+        try putOptionalInt(&qrow, "delta_total_tokens", row.delta_total_tokens);
+        try putOptionalInt(&qrow, "total_input_tokens", row.total_input_tokens);
+        try putOptionalInt(&qrow, "total_cached_input_tokens", row.total_cached_input_tokens);
+        try putOptionalInt(&qrow, "total_output_tokens", row.total_output_tokens);
+        try putOptionalInt(&qrow, "total_reasoning_output_tokens", row.total_reasoning_output_tokens);
+        try putOptionalInt(&qrow, "total_total_tokens", row.total_total_tokens);
+        try out_rows.append(allocator, qrow);
     }
 }
 
@@ -22399,26 +22306,82 @@ fn collectTokenSessionsRows(
     day_filter: ?SessionDayPathFilter,
     out_rows: *std.ArrayList(query.Row),
 ) !void {
-    var paths = try collectJsonlPaths(allocator, sessions_root, day_filter);
-    defer freePathList(allocator, &paths);
+    const Bucket = struct {
+        path: []const u8,
+        thread_id: ?datasets.token_events.SmallText = null,
+        root_session_id: ?datasets.token_events.SmallText = null,
+        parent_thread_id: ?datasets.token_events.SmallText = null,
+        start: ?datasets.token_events.SmallText = null,
+        end: ?datasets.token_events.SmallText = null,
+        day: ?datasets.token_events.SmallText = null,
+        week: ?datasets.token_events.SmallText = null,
+        month: ?datasets.token_events.SmallText = null,
+        input_tokens: i64 = 0,
+        cached_input_tokens: i64 = 0,
+        output_tokens: i64 = 0,
+        reasoning_output_tokens: i64 = 0,
+        total_tokens: i64 = 0,
+    };
 
-    for (paths.items) |path| {
-        const maybe_row = try datasets.token_sessions.summarizeFromFile(allocator, path);
-        const row = maybe_row orelse continue;
+    var selected_paths = try collectJsonlPaths(allocator, sessions_root, day_filter);
+    defer freePathList(allocator, &selected_paths);
+    var corpus_paths = try collectJsonlPaths(allocator, sessions_root, null);
+    defer freePathList(allocator, &corpus_paths);
+    var projection = try datasets.token_accounting.buildProjectionForSelection(allocator, selected_paths.items, corpus_paths.items);
+    defer projection.deinit(allocator);
+    if (projection.audit.verdict == .invalid) return error.TokenAccountingInvalid;
 
+    var buckets: std.ArrayList(Bucket) = .empty;
+    defer buckets.deinit(allocator);
+    var index: std.StringHashMap(usize) = .init(allocator);
+    defer index.deinit();
+    for (projection.rows.items) |row| {
+        const bucket_index = if (index.get(row.path)) |existing| existing else blk: {
+            const next = buckets.items.len;
+            try buckets.append(allocator, .{
+                .path = row.path,
+                .thread_id = row.thread_id,
+                .root_session_id = row.root_session_id,
+                .parent_thread_id = row.parent_thread_id,
+            });
+            try index.put(row.path, next);
+            break :blk next;
+        };
+        const bucket = &buckets.items[bucket_index];
+        if (row.timestamp) |timestamp| {
+            if (bucket.start == null or std.mem.order(u8, timestamp.slice(), bucket.start.?.slice()) == .lt) {
+                bucket.start = timestamp;
+                bucket.day = row.day;
+                bucket.week = row.week;
+                bucket.month = row.month;
+            }
+            if (bucket.end == null or std.mem.order(u8, timestamp.slice(), bucket.end.?.slice()) == .gt) bucket.end = timestamp;
+        }
+        bucket.input_tokens += row.delta_input_tokens orelse 0;
+        bucket.cached_input_tokens += row.delta_cached_input_tokens orelse 0;
+        bucket.output_tokens += row.delta_output_tokens orelse 0;
+        bucket.reasoning_output_tokens += row.delta_reasoning_output_tokens orelse 0;
+        bucket.total_tokens += row.delta_total_tokens orelse 0;
+    }
+
+    for (buckets.items) |bucket| {
         var qrow = query.Row.init(allocator);
-        try qrow.putStaticKey("path", .{ .string = row.path });
-        try putSmallText(&qrow, "start", row.start);
-        try putSmallText(&qrow, "end", row.end);
-        try putSmallText(&qrow, "max_at", row.max_at);
-        try putSmallText(&qrow, "day", row.day);
-        try putSmallText(&qrow, "week", row.week);
-        try putSmallText(&qrow, "month", row.month);
-        try putOptionalInt(&qrow, "total_input_tokens", row.total_input_tokens);
-        try putOptionalInt(&qrow, "total_cached_input_tokens", row.total_cached_input_tokens);
-        try putOptionalInt(&qrow, "total_output_tokens", row.total_output_tokens);
-        try putOptionalInt(&qrow, "total_reasoning_output_tokens", row.total_reasoning_output_tokens);
-        try putOptionalInt(&qrow, "total_total_tokens", row.total_total_tokens);
+        try qrow.putStaticKey("path", .{ .string = bucket.path });
+        try putSmallText(&qrow, "thread_id", bucket.thread_id);
+        try putSmallText(&qrow, "root_session_id", bucket.root_session_id);
+        try putSmallText(&qrow, "parent_thread_id", bucket.parent_thread_id);
+        try qrow.putStaticKey("accounting_method", .{ .string = "lineage_owned_usage_transitions" });
+        try putSmallText(&qrow, "start", bucket.start);
+        try putSmallText(&qrow, "end", bucket.end);
+        try putSmallText(&qrow, "max_at", bucket.end);
+        try putSmallText(&qrow, "day", bucket.day);
+        try putSmallText(&qrow, "week", bucket.week);
+        try putSmallText(&qrow, "month", bucket.month);
+        try qrow.putStaticKey("total_input_tokens", .{ .int = bucket.input_tokens });
+        try qrow.putStaticKey("total_cached_input_tokens", .{ .int = bucket.cached_input_tokens });
+        try qrow.putStaticKey("total_output_tokens", .{ .int = bucket.output_tokens });
+        try qrow.putStaticKey("total_reasoning_output_tokens", .{ .int = bucket.reasoning_output_tokens });
+        try qrow.putStaticKey("total_total_tokens", .{ .int = bucket.total_tokens });
         try out_rows.append(allocator, qrow);
     }
 }
@@ -26325,6 +26288,7 @@ test "capabilities advertises resolve intent closed audit flags" {
     try std.testing.expect(std.mem.indexOf(u8, got, "\"workflow_provenance_mode_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"epg_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"policy_transition_dataset_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"token_accounting_v2\": true") != null);
 }
 
 test "skill-audit supports exclude-current option" {

@@ -13,6 +13,7 @@ const max_root_field_entries: usize = 32;
 const max_payload_field_entries: usize = 16;
 const max_info_field_entries: usize = 32;
 const max_usage_field_entries: usize = 16;
+const max_session_meta_field_entries: usize = 64;
 
 pub const SmallText = struct {
     len: u8 = 0,
@@ -31,8 +32,21 @@ pub const SmallText = struct {
     }
 };
 
+pub const TraceMeta = struct {
+    thread_id: ?SmallText = null,
+    root_session_id: ?SmallText = null,
+    parent_thread_id: ?SmallText = null,
+    model: ?SmallText = null,
+    multi_agent_version: ?SmallText = null,
+};
+
 pub const Row = struct {
     path: []const u8,
+    thread_id: ?SmallText = null,
+    root_session_id: ?SmallText = null,
+    parent_thread_id: ?SmallText = null,
+    model: ?SmallText = null,
+    service_tier: ?SmallText = null,
     timestamp: ?SmallText = null,
     day: ?SmallText = null,
     week: ?SmallText = null,
@@ -51,6 +65,15 @@ pub const Row = struct {
     last_total_tokens: ?i64 = null,
 };
 
+pub const Trace = struct {
+    meta: TraceMeta = .{},
+    rows: std.ArrayList(Row) = .empty,
+
+    pub fn deinit(self: *Trace, allocator: std.mem.Allocator) void {
+        self.rows.deinit(allocator);
+    }
+};
+
 pub const ParseOptions = struct {
     dedupe: bool = true,
     derive_timestamp_fields: bool = true,
@@ -63,6 +86,14 @@ const FieldEntry = struct {
 };
 
 const UsageTuple = [token_key_count]?i64;
+
+const ParseState = struct {
+    meta: TraceMeta = .{},
+    first_session_meta_seen: bool = false,
+    current_model: ?SmallText = null,
+    current_service_tier: ?SmallText = null,
+    prev_total_tokens: ?i64 = null,
+};
 
 pub fn parseTokenEvents(
     allocator: std.mem.Allocator,
@@ -82,15 +113,26 @@ pub fn parseTokenEventsWithOptions(
     content: []const u8,
     options: ParseOptions,
 ) !std.ArrayList(Row) {
-    var rows = std.ArrayList(Row).empty;
-    errdefer rows.deinit(allocator);
+    const trace = try parseTokenTraceWithOptions(allocator, path, content, options);
+    return trace.rows;
+}
 
-    var prev_total_tokens: ?i64 = null;
+pub fn parseTokenTraceWithOptions(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    content: []const u8,
+    options: ParseOptions,
+) !Trace {
+    var trace = Trace{};
+    errdefer trace.deinit(allocator);
+
+    var state = ParseState{};
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
-        try appendParsedLine(allocator, &rows, path, options, &prev_total_tokens, line);
+        try appendParsedLine(allocator, &trace.rows, path, options, &state, line);
     }
-    return rows;
+    trace.meta = state.meta;
+    return trace;
 }
 
 pub fn parseTokenEventsReader(
@@ -111,10 +153,20 @@ pub fn parseTokenEventsReaderWithOptions(
     options: ParseOptions,
     reader: *std.Io.Reader,
 ) !std.ArrayList(Row) {
-    var rows = std.ArrayList(Row).empty;
-    errdefer rows.deinit(allocator);
+    const trace = try parseTokenTraceReaderWithOptions(allocator, path, options, reader);
+    return trace.rows;
+}
 
-    var prev_total_tokens: ?i64 = null;
+pub fn parseTokenTraceReaderWithOptions(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    options: ParseOptions,
+    reader: *std.Io.Reader,
+) !Trace {
+    var trace = Trace{};
+    errdefer trace.deinit(allocator);
+
+    var state = ParseState{};
     var carry: std.ArrayList(u8) = .empty;
     defer carry.deinit(allocator);
 
@@ -126,7 +178,7 @@ pub fn parseTokenEventsReaderWithOptions(
         try carry.appendSlice(allocator, chunk[0..read_len]);
         var start: usize = 0;
         while (std.mem.indexOfScalarPos(u8, carry.items, start, '\n')) |newline_idx| {
-            try appendParsedLine(allocator, &rows, path, options, &prev_total_tokens, carry.items[start..newline_idx]);
+            try appendParsedLine(allocator, &trace.rows, path, options, &state, carry.items[start..newline_idx]);
             start = newline_idx + 1;
         }
 
@@ -139,9 +191,10 @@ pub fn parseTokenEventsReaderWithOptions(
     }
 
     if (carry.items.len > 0) {
-        try appendParsedLine(allocator, &rows, path, options, &prev_total_tokens, carry.items);
+        try appendParsedLine(allocator, &trace.rows, path, options, &state, carry.items);
     }
-    return rows;
+    trace.meta = state.meta;
+    return trace;
 }
 
 pub fn parseTokenEventsFile(
@@ -160,11 +213,49 @@ pub fn parseTokenEventsFileWithOptions(
     path: []const u8,
     options: ParseOptions,
 ) !std.ArrayList(Row) {
+    const trace = try parseTokenTraceFileWithOptions(allocator, path, options);
+    return trace.rows;
+}
+
+pub fn parseTokenTraceFileWithOptions(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    options: ParseOptions,
+) !Trace {
     const io = std.Io.Threaded.global_single_threaded.io();
     const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
     defer file.close(io);
     var reader = file.reader(io, &.{});
-    return parseTokenEventsReaderWithOptions(allocator, path, options, &reader.interface);
+    return parseTokenTraceReaderWithOptions(allocator, path, options, &reader.interface);
+}
+
+pub fn parseTraceMetaFile(allocator: std.mem.Allocator, path: []const u8) !TraceMeta {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+
+    var carry: std.ArrayList(u8) = .empty;
+    defer carry.deinit(allocator);
+    var chunk: [stream_chunk_size]u8 = undefined;
+    while (true) {
+        const read_len = try reader.interface.readSliceShort(chunk[0..]);
+        if (read_len == 0) break;
+        try carry.appendSlice(allocator, chunk[0..read_len]);
+        var start: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, carry.items, start, '\n')) |newline_idx| {
+            if (try parseSessionMetaLine(carry.items[start..newline_idx])) |meta| return meta;
+            start = newline_idx + 1;
+        }
+        if (start > 0) {
+            const remaining = carry.items.len - start;
+            @memmove(carry.items[0..remaining], carry.items[start..]);
+            carry.items.len = remaining;
+        }
+        if (carry.items.len > max_line_bytes) return error.LineTooLong;
+    }
+    if (carry.items.len > 0) return (try parseSessionMetaLine(carry.items)) orelse .{};
+    return .{};
 }
 
 fn appendParsedLine(
@@ -172,22 +263,133 @@ fn appendParsedLine(
     rows: *std.ArrayList(Row),
     path: []const u8,
     options: ParseOptions,
-    prev_total_tokens: *?i64,
+    state: *ParseState,
     line: []const u8,
 ) !void {
+    if (!state.first_session_meta_seen) {
+        if (try parseSessionMetaLine(line)) |meta| {
+            state.meta = meta;
+            state.first_session_meta_seen = true;
+            state.current_model = meta.model;
+            return;
+        }
+    } else if (isSessionMetaLine(line)) {
+        return;
+    }
+
+    if (try parseTurnContextLine(line)) |context| {
+        if (context.model) |model| state.current_model = model;
+        if (context.service_tier) |service_tier| state.current_service_tier = service_tier;
+        return;
+    }
+
     const maybe_row = try parseTokenCountLineWithOptions(line, path, options);
-    const row = maybe_row orelse return;
+    var row = maybe_row orelse return;
+
+    row.thread_id = state.meta.thread_id;
+    row.root_session_id = state.meta.root_session_id;
+    row.parent_thread_id = state.meta.parent_thread_id;
+    row.model = state.current_model;
+    row.service_tier = state.current_service_tier;
 
     if (options.dedupe and
-        prev_total_tokens.* != null and
+        state.prev_total_tokens != null and
         row.total_total_tokens != null and
-        prev_total_tokens.*.? == row.total_total_tokens.?)
+        state.prev_total_tokens.? == row.total_total_tokens.?)
     {
         return;
     }
 
-    if (row.total_total_tokens) |v| prev_total_tokens.* = v;
+    if (row.total_total_tokens) |v| state.prev_total_tokens = v;
     try rows.append(allocator, row);
+}
+
+const TurnContext = struct {
+    model: ?SmallText = null,
+    service_tier: ?SmallText = null,
+};
+
+fn isSessionMetaLine(line: []const u8) bool {
+    return std.mem.containsAtLeast(u8, line, 1, "session_meta");
+}
+
+fn smallTextFromJsonString(value_text: ?[]const u8) !?SmallText {
+    const value = value_text orelse return null;
+    const raw = jsonStringSlice(value) orelse return null;
+    var decoded_buf: [64]u8 = undefined;
+    const decoded = jsonDecodeStringInto(raw, decoded_buf[0..]) catch |err| switch (err) {
+        error.InvalidEscape => return null,
+        error.TextTooLong => return error.TextTooLong,
+    };
+    return try SmallText.fromSlice(decoded);
+}
+
+fn nestedParentThreadId(source_value: ?[]const u8) !?SmallText {
+    const source = jsonObjectSlice(source_value orelse return null) orelse return null;
+    const subagent_value = objectFieldValueSlice(source, "subagent") orelse return null;
+    const subagent = jsonObjectSlice(subagent_value) orelse return null;
+    if (try smallTextFromJsonString(objectFieldValueSlice(subagent, "parent_thread_id"))) |value| return value;
+
+    const spawn_value = objectFieldValueSlice(subagent, "thread_spawn") orelse return null;
+    const spawn = jsonObjectSlice(spawn_value) orelse return null;
+    return smallTextFromJsonString(objectFieldValueSlice(spawn, "parent_thread_id"));
+}
+
+fn parseSessionMetaLine(line: []const u8) !?TraceMeta {
+    const trimmed = trimLine(line);
+    if (trimmed.len == 0 or trimmed[0] != '{') return null;
+    if (!std.mem.containsAtLeast(u8, trimmed, 1, "session_meta")) return null;
+
+    var root_storage: [max_root_field_entries]FieldEntry = undefined;
+    const root_fields = indexObjectFields(trimmed, root_storage[0..]) orelse return null;
+    const root_type = lookupIndexedField(root_fields, "type") orelse return null;
+    if (!valueEqString(root_type, "session_meta")) return null;
+
+    const payload_value = lookupIndexedField(root_fields, "payload") orelse return null;
+    const payload = jsonObjectSlice(payload_value) orelse return null;
+    var payload_storage: [max_session_meta_field_entries]FieldEntry = undefined;
+    const fields = indexObjectFields(payload, payload_storage[0..]) orelse return null;
+
+    const thread_id = try smallTextFromJsonString(lookupIndexedField(fields, "id"));
+    const root_session_id = (try smallTextFromJsonString(lookupIndexedField(fields, "session_id"))) orelse thread_id;
+    const parent_thread_id = (try smallTextFromJsonString(lookupIndexedField(fields, "parent_thread_id"))) orelse
+        (try smallTextFromJsonString(lookupIndexedField(fields, "forked_from_id"))) orelse
+        (try nestedParentThreadId(lookupIndexedField(fields, "source")));
+
+    return .{
+        .thread_id = thread_id,
+        .root_session_id = root_session_id,
+        .parent_thread_id = parent_thread_id,
+        .model = try smallTextFromJsonString(lookupIndexedField(fields, "model")),
+        .multi_agent_version = try smallTextFromJsonString(lookupIndexedField(fields, "multi_agent_version")),
+    };
+}
+
+fn parseTurnContextLine(line: []const u8) !?TurnContext {
+    const trimmed = trimLine(line);
+    if (trimmed.len == 0 or trimmed[0] != '{') return null;
+    if (!std.mem.containsAtLeast(u8, trimmed, 1, "turn_context")) return null;
+
+    var root_storage: [max_root_field_entries]FieldEntry = undefined;
+    const root_fields = indexObjectFields(trimmed, root_storage[0..]) orelse return null;
+    const root_type = lookupIndexedField(root_fields, "type") orelse return null;
+    if (!valueEqString(root_type, "turn_context")) return null;
+
+    const payload_value = lookupIndexedField(root_fields, "payload") orelse return null;
+    const payload = jsonObjectSlice(payload_value) orelse return null;
+    var payload_storage: [max_session_meta_field_entries]FieldEntry = undefined;
+    const fields = indexObjectFields(payload, payload_storage[0..]) orelse return null;
+    var service_tier = try smallTextFromJsonString(lookupIndexedField(fields, "service_tier"));
+    if (service_tier == null) {
+        if (lookupIndexedField(fields, "fast_mode")) |fast_mode| {
+            if (valueEqLiteral(fast_mode, "true")) service_tier = try SmallText.fromSlice("fast");
+            if (valueEqLiteral(fast_mode, "false")) service_tier = try SmallText.fromSlice("standard");
+        }
+    }
+    return .{
+        .model = try smallTextFromJsonString(lookupIndexedField(fields, "model")),
+        .service_tier = service_tier,
+    };
 }
 
 pub fn parseTokenCountLine(line: []const u8, path: []const u8) !?Row {
@@ -279,6 +481,35 @@ pub fn totalsTuple(row: Row) [token_key_count]?i64 {
         row.total_reasoning_output_tokens,
         row.total_total_tokens,
     };
+}
+
+pub fn lastTuple(row: Row) [token_key_count]?i64 {
+    return .{
+        row.last_input_tokens,
+        row.last_cached_input_tokens,
+        row.last_output_tokens,
+        row.last_reasoning_output_tokens,
+        row.last_total_tokens,
+    };
+}
+
+test "first session metadata owns physical identity across replay" {
+    const content =
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"child\",\"session_id\":\"root\",\"parent_thread_id\":\"parent\",\"model\":\"child-default\",\"multi_agent_version\":\"v2\"}}\n" ++
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"root\",\"session_id\":\"root\",\"model\":\"replayed-root\"}}\n" ++
+        "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-test\",\"service_tier\":\"fast\"}}\n" ++
+        "{\"type\":\"event_msg\",\"timestamp\":\"2026-07-10T00:00:00Z\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":5},\"last_token_usage\":{\"total_tokens\":5}}}}\n";
+    var trace = try parseTokenTraceWithOptions(std.testing.allocator, "child.jsonl", content, .{ .dedupe = false });
+    defer trace.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("child", trace.meta.thread_id.?.slice());
+    try std.testing.expectEqualStrings("root", trace.meta.root_session_id.?.slice());
+    try std.testing.expectEqualStrings("parent", trace.meta.parent_thread_id.?.slice());
+    try std.testing.expectEqualStrings("v2", trace.meta.multi_agent_version.?.slice());
+    try std.testing.expectEqual(@as(usize, 1), trace.rows.items.len);
+    try std.testing.expectEqualStrings("child", trace.rows.items[0].thread_id.?.slice());
+    try std.testing.expectEqualStrings("gpt-test", trace.rows.items[0].model.?.slice());
+    try std.testing.expectEqualStrings("fast", trace.rows.items[0].service_tier.?.slice());
 }
 
 fn trimLine(line: []const u8) []const u8 {

@@ -9,6 +9,12 @@ pub const Options = struct {
 
 pub const Row = struct {
     path: []const u8,
+    thread_id: ?token_events.SmallText = null,
+    root_session_id: ?token_events.SmallText = null,
+    parent_thread_id: ?token_events.SmallText = null,
+    model: ?token_events.SmallText = null,
+    service_tier: ?token_events.SmallText = null,
+    accounting_method: []const u8 = "legacy_adjacent_totals",
     timestamp: ?token_events.SmallText = null,
     day: ?token_events.SmallText = null,
     week: ?token_events.SmallText = null,
@@ -45,14 +51,18 @@ pub fn buildDeltas(
             continue;
         }
 
-        if (prev_total_tokens != null and total_tokens < prev_total_tokens.?) {
-            segment += 1;
-            prev_totals = null;
-            prev_total_tokens = null;
-        }
-
         var deltas: [token_events.token_key_count]?i64 = .{ null, null, null, null, null };
-        if (prev_totals) |prev| {
+        var accounting_method: []const u8 = "usage_transition";
+        if (event.last_total_tokens != null) {
+            deltas = token_events.lastTuple(event);
+        } else if (prev_totals) |prev| {
+            accounting_method = "legacy_adjacent_totals";
+            if (prev_total_tokens != null and total_tokens < prev_total_tokens.?) {
+                segment += 1;
+                prev_totals = totals;
+                prev_total_tokens = total_tokens;
+                continue;
+            }
             inline for (0..token_events.token_key_count) |idx| {
                 const curr = totals[idx];
                 const prior = prev[idx];
@@ -62,6 +72,7 @@ pub fn buildDeltas(
                 }
             }
         } else if (options.include_base) {
+            accounting_method = "legacy_adjacent_totals";
             deltas = totals;
         }
 
@@ -73,6 +84,12 @@ pub fn buildDeltas(
 
         try rows.append(allocator, .{
             .path = event.path,
+            .thread_id = event.thread_id,
+            .root_session_id = event.root_session_id,
+            .parent_thread_id = event.parent_thread_id,
+            .model = event.model,
+            .service_tier = event.service_tier,
+            .accounting_method = accounting_method,
             .timestamp = event.timestamp,
             .day = event.day,
             .week = event.week,
@@ -95,7 +112,7 @@ pub fn buildDeltas(
     return rows;
 }
 
-test "segment increments when total_total_tokens resets" {
+test "legacy reset advances the segment without recounting its base" {
     const content =
         \\{"type":"event_msg","timestamp":"2026-01-01T00:00:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":10}}}}
         \\{"type":"event_msg","timestamp":"2026-01-01T00:01:00Z","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":15}}}}
@@ -109,13 +126,11 @@ test "segment increments when total_total_tokens resets" {
     var deltas = try buildDeltas(std.testing.allocator, events.items, .{});
     defer deltas.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 4), deltas.items.len);
+    try std.testing.expectEqual(@as(usize, 3), deltas.items.len);
     try std.testing.expectEqual(@as(u32, 0), deltas.items[0].segment);
     try std.testing.expectEqual(@as(i64, 10), deltas.items[0].delta_total_tokens.?);
     try std.testing.expectEqual(@as(u32, 0), deltas.items[1].segment);
     try std.testing.expectEqual(@as(i64, 5), deltas.items[1].delta_total_tokens.?);
     try std.testing.expectEqual(@as(u32, 1), deltas.items[2].segment);
-    try std.testing.expectEqual(@as(i64, 3), deltas.items[2].delta_total_tokens.?);
-    try std.testing.expectEqual(@as(u32, 1), deltas.items[3].segment);
-    try std.testing.expectEqual(@as(i64, 5), deltas.items[3].delta_total_tokens.?);
+    try std.testing.expectEqual(@as(i64, 5), deltas.items[2].delta_total_tokens.?);
 }
