@@ -1,9 +1,11 @@
 const app_meta = @import("app_meta");
+const actuation_cli = @import("actuation.zig");
 const core_cli = @import("core_cli");
 const durable_store = @import("durable_store");
 const learnings_cli = @import("learnings_cli");
 const std = @import("std");
 const synesthesia_cli = @import("synesthesia_cli");
+const validation_cli = @import("validation.zig");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
 const LegacyStorePath = ".ledger/negative-ledger.jsonl";
@@ -14,13 +16,13 @@ const MaxInputBytes = 4 * 1024 * 1024;
 const HelpText =
     \\ledger
     \\
-    \\Durable source-memory ledger.
+    \\Durable source-memory and actuation ledger.
     \\
-    \\usage: ledger {init,capture,query,map,status,reopen,export,compact,handoff,show,doctor,migrate,recent,recall,codify-candidates,quality-audit,value-report,memory-digest,path,datasets,dataset-schema} [options]
+    \\usage: ledger {init,capture,query,map,status,reopen,export,compact,handoff,show,doctor,migrate,recent,recall,codify-candidates,quality-audit,value-report,memory-digest,path,datasets,dataset-schema,validate} [options]
     \\
     \\commands:
     \\  init       Create the ledger store if missing
-    \\  capture    Append witness-backed negative evidence from --json FILE|-; with --source learnings or synesthesia, append a source event
+    \\  capture    Append witness-backed negative evidence from --json FILE|-; source namespaces own their commands
     \\  query      List projected records
     \\  map        Emit negative_route_gate for a route/cluster
     \\  status     Append a lifecycle status event
@@ -31,14 +33,15 @@ const HelpText =
     \\  show       Show one NEG record by --id
     \\  doctor     Validate JSONL store integrity
     \\  migrate    Copy or move legacy source stores into their events.jsonl store
-    \\  recent     With --source learnings or synesthesia, show recent source events
-    \\  recall     With --source learnings or synesthesia, rank relevant source events
-    \\  path       With --source learnings or synesthesia, print the resolved event path
+    \\  recent     With a supporting --source namespace, show recent source events
+    \\  recall     With a supporting --source namespace, rank relevant source events
+    \\  path       With a supporting --source namespace, print the resolved event path
     \\  datasets   With --source learnings, list learning datasets
+    \\  validate   Purely validate a PSC-v1, PSR-v1, or RF-v2 JSON artifact
     \\
     \\options:
     \\  --file PATH       Store path (default: .ledger/negative-ledger/events.jsonl)
-    \\  --source SOURCE   Source namespace; omit for negative-ledger, or use learnings or synesthesia
+    \\  --source SOURCE   Source namespace; omit for negative-ledger, or use actuation, learnings, or synesthesia
     \\  --json PATH|-     Capture input JSON
     \\  --id NEG-ID       Record id for show/reopen/status/export
     \\  --to VALUE        Target status for status, target path for migrate
@@ -50,6 +53,7 @@ const HelpText =
     \\  --cluster ID      Current route cluster for map
     \\  --route ID        Current route id/tag for map
     \\  --artifact ID     Current artifact state id for map
+    \\  --input FILE|-    Canonical JSON input for validate
     \\  -h, --help        Show help
     \\  -V, --version     Show version
 ;
@@ -187,7 +191,19 @@ pub fn main(init: std.process.Init) !void {
             try synesthesia_cli.runWithArgv(allocator, source_argv, init.environ_map.get("CODEX_HOME") orelse "");
             return;
         }
+        if (std.mem.eql(u8, source, "actuation")) {
+            const code = try actuation_cli.runWithArgv(allocator, init.io, source_argv);
+            if (code != 0) std.process.exit(code);
+            return;
+        }
         core_cli.exitUsageFailure(HelpSurface, Version, "UnknownSource", source);
+        return;
+    }
+    if (argv.len > 1 and std.mem.eql(u8, argv[1], "validate")) {
+        const code = validation_cli.runWithArgv(allocator, init.io, argv) catch |err| {
+            core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
+        };
+        if (code != 0) std.process.exit(code);
         return;
     }
     if (try handleHelpAndVersion(allocator, argv)) return;
@@ -1798,4 +1814,31 @@ test "capture compacts multiline input before append" {
     try std.testing.expect(loaded.validation.ok());
     try std.testing.expectEqual(@as(usize, 1), loaded.records.items.len);
     try std.testing.expectEqualStrings("active", loaded.records.items[0].status);
+}
+
+test "actuation source routing preserves the one-transition command" {
+    const argv = [_][]const u8{
+        "ledger",
+        "prepare",
+        "--source",
+        "actuation",
+        "--run",
+        "run-1",
+        "--json",
+        "operation.json",
+    };
+    const routed = try sourceArgvAlloc(std.testing.allocator, &argv, "actuation");
+    defer std.testing.allocator.free(routed);
+    try std.testing.expectEqual(@as(usize, 6), routed.len);
+    try std.testing.expectEqualStrings("ledger", routed[0]);
+    try std.testing.expectEqualStrings("prepare", routed[1]);
+    try std.testing.expectEqualStrings("--run", routed[2]);
+    try std.testing.expectEqualStrings("run-1", routed[3]);
+    try std.testing.expectEqualStrings("--json", routed[4]);
+    try std.testing.expectEqualStrings("operation.json", routed[5]);
+}
+
+test "ledger test graph includes actuation and validation modules" {
+    std.testing.refAllDecls(actuation_cli);
+    std.testing.refAllDecls(validation_cli);
 }

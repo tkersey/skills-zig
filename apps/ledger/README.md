@@ -1,9 +1,11 @@
 # ledger
 
-Repo-local durable source-memory ledger.
+Repo-local durable source and actuation ledger with pure governance-artifact validation.
 
 `ledger` stores disconfirmed hypotheses, failed routes, reopening criteria, and route-exclusion evidence in an append-only JSONL file that future runs can query directly.
-It also owns learning capture under `--source learnings`.
+It also owns causal actuation under `--source actuation` and learning capture under `--source learnings`.
+`ledger validate` checks immutable governance artifacts without reading or writing
+any ledger store and without granting execution authority.
 
 Default store:
 
@@ -16,6 +18,15 @@ Learning source store:
 ```bash
 .ledger/learnings/events.jsonl
 ```
+
+Actuation source store:
+
+```bash
+.ledger/actuation/events.jsonl
+```
+
+The actuation store lock sidecar must be Git-ignored before `open`; ignoring
+`.ledger/` covers the default store and lock.
 
 ## Commands
 
@@ -37,10 +48,115 @@ ledger capture --source learnings --learning "When X, prefer Y because Z." --evi
 ledger recall --source learnings --query "focused task" --limit 5 --drop-superseded
 ledger migrate --source learnings --mode copy
 ledger doctor --source learnings
+ledger open --source actuation --json actuation-open.json
+ledger prepare --source actuation --run RUN-ID --json operation.json
+ledger state --source actuation --run RUN-ID
+ledger decide --source actuation --run RUN-ID
+ledger validate plan-source-contract --input plan-source-contract.json
+ledger validate policy-synthesis-receipt --input synthesis-receipt.json
+ledger validate review-fold --input review-fold.json
 ```
 
 Use `--file PATH` to point at a non-default store.
 For `--source learnings`, `--file PATH` is accepted as an alias for the learning event path.
+
+## Stateless validation
+
+`ledger validate` is the pure validation surface for artifacts that participate
+in planning and review evidence:
+
+```bash
+ledger validate plan-source-contract --input plan-source-contract.json
+ledger validate policy-synthesis-receipt --input synthesis-receipt.json
+ledger validate review-fold --input review-fold.json
+```
+
+Input is canonical JSON from a file or `-` for stdin. Every invocation emits a
+`ledger-validate-decision/v1` object, exits `0` for `pass`, and exits `2` for a
+blocked or malformed artifact. The decision always records
+`authority_granted:false` and `storage_mutated:false`.
+
+This is intentionally a command rather than a `--source` namespace. Sources own
+state and event folds; validation is a deterministic observation over one
+immutable input.
+
+## Actuation kernel
+
+`ledger --source actuation` advances one causal kernel transition per invocation. It does not run a recursive controller: `/goal` observes the projected `next_transition` and decides whether to invoke the kernel again.
+
+The workflow is an executable recursion-scheme split:
+
+```text
+coalgebra: current state -> next legal transition
+handler:   prepared capability -> process effect or external-edit reconciliation
+algebra:   prior state + immutable event -> next state
+```
+
+Open a run with authority, exact path scope, and verifier-backed obligations:
+
+```json
+{
+  "schema": "actuation-open/v1",
+  "run_id": "run-1",
+  "goal_id": "goal-1",
+  "goal_contract_digest": "sha256:...",
+  "resolution_digest": null,
+  "source_ref": "user:turn-1",
+  "execution_authority_ref": "user:turn-1",
+  "mutation_allowed": true,
+  "completion": "complete",
+  "allowed_paths": ["src/kernel.zig"],
+  "obligations": [
+    {
+      "id": "obl-test",
+      "kind": "implementation",
+      "statement": "The kernel law tests pass.",
+      "verifier": ["zig", "build", "test-ledger"]
+    }
+  ]
+}
+```
+
+Prepare exactly one operation:
+
+```json
+{
+  "schema": "actuation-operation/v1",
+  "step_id": "step-1",
+  "effect": "edit",
+  "idempotency_key": "run-1:step-1",
+  "owner_boundary": "actuation-kernel",
+  "paths": ["src/kernel.zig"],
+  "obligation_refs": ["obl-test"]
+}
+```
+
+The transition sequence is:
+
+```bash
+ledger open --source actuation --json actuation-open.json
+ledger prepare --source actuation --run run-1 --json operation.json
+# Perform the admitted edit with the returned capability outstanding.
+ledger record --source actuation --run run-1 --capability AKC1-...
+ledger observe --source actuation --run run-1 --step step-1
+ledger close --source actuation --run run-1
+ledger decide --source actuation --run run-1
+```
+
+For `inspect` and `verify`, use `execute` instead of `record` plus `observe`; the kernel runs the admitted verifier directly. Set `completion` to `ready-to-ship` for a generation that hands off to `$ship`, or `complete` for a terminal local/review generation. Supply `resolution_digest` for a review-bound generation. Obligation `kind` is `implementation`, `review`, `ship`, or `acceptance`; `decide` preserves those proof bases separately. It returns `continue` until the run is closed, then projects the selected terminal verdict as `closure-decision/v1`.
+
+The kernel:
+
+- returns 256-bit capability material once and persists only its SHA-256 digest;
+- rejects duplicate idempotency keys, replay, stale pre-state, path escape, undeclared path movement, verifier substitution, verifier-side repository mutation, and uncovered closure obligations;
+- executes the verifier declared by the obligation rather than accepting a caller-supplied success flag;
+- folds a globally sequenced, predecessor-hashed `actuation-event/v1` chain into one run state;
+- derives both continuation and terminal closure decisions in Zig from that folded state;
+- exits `2` when an executed observation fails and `0` when it passes.
+
+A repo-local process cannot physically intercept in-app mutation tools. Edit effects are therefore admitted before mutation and independently reconciled afterward. The kernel establishes causal admission and observed path conservation; it does not claim to be an OS sandbox.
+
+The returned capability is a causal single-use token, not a secret-transport claim. Automation should capture the `prepare` result without echoing the raw value and consume it promptly; command-line and transcript confidentiality remain caller/runtime responsibilities.
 
 Path migration:
 

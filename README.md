@@ -8,7 +8,7 @@ Monorepo for Zig CLIs with shared internal libraries and independent release str
 - `lift` (`bench_stats`, `perf_report`)
 - `cas` (`cas_smoke_check`, `cas_instance_runner`, `cas_review_session`)
 - `cron` (`cron`)
-- `ledger` (`ledger`, including `ledger --source learnings` and `ledger --source synesthesia`)
+- `ledger` (`ledger`, including `ledger --source actuation`, source-memory namespaces, and pure `ledger validate` governance checks)
 - `memory-note` (`memory-note`)
 
 No unified umbrella CLI is introduced. Binaries remain separate.
@@ -21,7 +21,7 @@ No unified umbrella CLI is introduced. Binaries remain separate.
 - `apps/cron`
 - `apps/learnings` (ledger-owned internal learning source)
 - `apps/synesthesia` (ledger-owned internal Synesthesia source)
-- `apps/ledger`
+- `apps/ledger` (including the internal actuation kernel and stateless governance validators)
 - `apps/memory-note`
 - `libs/core`
 - `libs/durable_store`
