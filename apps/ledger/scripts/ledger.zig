@@ -1,5 +1,6 @@
 const app_meta = @import("app_meta");
 const actuation_cli = @import("actuation.zig");
+const builtin = @import("builtin");
 const core_cli = @import("core_cli");
 const durable_store = @import("durable_store");
 const learnings_cli = @import("learnings_cli");
@@ -13,6 +14,11 @@ const LegacyStorePath = ".ledger/negative-ledger.jsonl";
 const DefaultStorePath = ".ledger/negative-ledger/events.jsonl";
 const MaxStoreBytes = 64 * 1024 * 1024;
 const MaxInputBytes = 4 * 1024 * 1024;
+threadlocal var runtime_io: ?std.Io = null;
+
+fn defaultIo() std.Io {
+    return if (builtin.is_test) std.testing.io else runtime_io orelse std.Io.Threaded.global_single_threaded.io();
+}
 
 const HelpText =
     \\ledger
@@ -180,6 +186,7 @@ const Date = struct {
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
+    runtime_io = init.io;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (argvSource(argv)) |source| {
         const source_argv = try sourceArgvAlloc(allocator, argv, source);
@@ -428,13 +435,40 @@ fn run(allocator: std.mem.Allocator, args: Args) !u8 {
 
 fn cmdInit(allocator: std.mem.Allocator, path: []const u8) !u8 {
     if (!durable_store.fileExists(path)) {
-        try durable_store.writeTextAtomic(std.heap.page_allocator, path, "");
-        try durable_store.ensureLockSidecarGitignored(std.heap.page_allocator, path);
+        try durable_store.writeTextAtomic(allocator, path, "");
+        try ensureInitLockSidecarGitignored(allocator, path);
         try printJsonLine(allocator, .init, "initialized", path, 0);
         return 0;
     }
     try printJsonLine(allocator, .init, "already_initialized", path, 0);
     return 0;
+}
+
+fn ensureInitLockSidecarGitignored(allocator: std.mem.Allocator, store_path: []const u8) !void {
+    const parent = std.fs.path.dirname(store_path) orelse ".";
+    const git_root = durable_store.findGitRootAlloc(allocator, parent) catch return;
+    defer allocator.free(git_root);
+
+    const lock_path = try durable_store.lockPathAlloc(allocator, store_path);
+    defer allocator.free(lock_path);
+    const lock_rel = if (std.fs.path.isAbsolute(lock_path))
+        try std.fs.path.relative(allocator, git_root, null, git_root, lock_path)
+    else
+        try allocator.dupe(u8, lock_path);
+    defer allocator.free(lock_rel);
+
+    const argv = [_][]const u8{ "git", "-C", git_root, "check-ignore", "-q", "--", lock_rel };
+    const result = try std.process.run(allocator, defaultIo(), .{
+        .argv = &argv,
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    if (result.term == .exited and result.term.exited == 0) return;
+    if (result.term == .exited and result.term.exited == 1) return error.LockSidecarNotGitignored;
+    return error.GitCommandFailed;
 }
 
 fn cmdCapture(allocator: std.mem.Allocator, args: Args) !u8 {
@@ -1389,6 +1423,30 @@ test "default store path is namespaced under .ledger/negative-ledger" {
     const argv = [_][]const u8{ "ledger", "query" };
     const parsed = try parseArgs(&argv);
     try std.testing.expectEqualStrings(".ledger/negative-ledger/events.jsonl", parsed.file);
+}
+
+test "init lock check accepts an ignored store inside a git repository" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const gitignore = try std.fs.path.join(std.testing.allocator, &.{ root, ".gitignore" });
+    defer std.testing.allocator.free(gitignore);
+    try durable_store.writeTextAtomic(std.testing.allocator, gitignore, ".ledger/\n");
+
+    const git_result = try std.process.run(std.testing.allocator, std.testing.io, .{
+        .argv = &.{ "git", "init", "--quiet" },
+        .cwd = .{ .path = root },
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
+    });
+    defer std.testing.allocator.free(git_result.stdout);
+    defer std.testing.allocator.free(git_result.stderr);
+    try std.testing.expect(git_result.term == .exited and git_result.term.exited == 0);
+
+    const store = try std.fs.path.join(std.testing.allocator, &.{ root, DefaultStorePath });
+    defer std.testing.allocator.free(store);
+    try ensureInitLockSidecarGitignored(std.testing.allocator, store);
 }
 
 test "migrate parses explicit from and to paths" {
