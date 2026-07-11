@@ -5,6 +5,7 @@ const durable_store = @import("durable_store");
 const learnings_cli = @import("learnings_cli");
 const std = @import("std");
 const synesthesia_cli = @import("synesthesia_cli");
+const universalist_cli = @import("universalist.zig");
 const validation_cli = @import("validation.zig");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
@@ -16,7 +17,7 @@ const MaxInputBytes = 4 * 1024 * 1024;
 const HelpText =
     \\ledger
     \\
-    \\Durable source-memory and actuation ledger.
+    \\Durable source-memory, actuation, and plan ledger.
     \\
     \\usage: ledger {init,capture,query,map,status,reopen,export,compact,handoff,show,doctor,migrate,recent,recall,codify-candidates,quality-audit,value-report,memory-digest,path,datasets,dataset-schema,validate} [options]
     \\
@@ -41,7 +42,7 @@ const HelpText =
     \\
     \\options:
     \\  --file PATH       Store path (default: .ledger/negative-ledger/events.jsonl)
-    \\  --source SOURCE   Source namespace; omit for negative-ledger, or use actuation, learnings, or synesthesia
+    \\  --source SOURCE   Source namespace; omit for negative-ledger, or use actuation, learnings, synesthesia, or universalist
     \\  --json PATH|-     Capture input JSON
     \\  --id NEG-ID       Record id for show/reopen/status/export
     \\  --to VALUE        Target status for status, target path for migrate
@@ -193,6 +194,11 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.eql(u8, source, "actuation")) {
             const code = try actuation_cli.runWithArgv(allocator, init.io, source_argv);
+            if (code != 0) std.process.exit(code);
+            return;
+        }
+        if (std.mem.eql(u8, source, "universalist")) {
+            const code = try universalist_cli.runWithArgv(allocator, init.io, source_argv);
             if (code != 0) std.process.exit(code);
             return;
         }
@@ -1838,7 +1844,30 @@ test "actuation source routing preserves the one-transition command" {
     try std.testing.expectEqualStrings("operation.json", routed[5]);
 }
 
-test "ledger test graph includes actuation and validation modules" {
+test "universalist source routing preserves plan creation arguments" {
+    const argv = [_][]const u8{
+        "ledger",
+        "create",
+        "--source",
+        "universalist",
+        "--repo",
+        "/tmp/repo",
+        "--template",
+        "plan.md",
+    };
+    const routed = try sourceArgvAlloc(std.testing.allocator, &argv, "universalist");
+    defer std.testing.allocator.free(routed);
+    try std.testing.expectEqual(@as(usize, 6), routed.len);
+    try std.testing.expectEqualStrings("ledger", routed[0]);
+    try std.testing.expectEqualStrings("create", routed[1]);
+    try std.testing.expectEqualStrings("--repo", routed[2]);
+    try std.testing.expectEqualStrings("/tmp/repo", routed[3]);
+    try std.testing.expectEqualStrings("--template", routed[4]);
+    try std.testing.expectEqualStrings("plan.md", routed[5]);
+}
+
+test "ledger test graph includes source and validation modules" {
     std.testing.refAllDecls(actuation_cli);
+    std.testing.refAllDecls(universalist_cli);
     std.testing.refAllDecls(validation_cli);
 }

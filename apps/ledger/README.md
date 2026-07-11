@@ -1,6 +1,6 @@
 # ledger
 
-Repo-local durable source and actuation ledger with pure governance-artifact validation.
+Repo-local durable source, actuation, and plan ledger with pure governance-artifact validation.
 
 `ledger` stores disconfirmed hypotheses, failed routes, reopening criteria, and route-exclusion evidence in an append-only JSONL file that future runs can query directly.
 It also owns causal actuation under `--source actuation` and learning capture under `--source learnings`.
@@ -24,6 +24,18 @@ Actuation source store:
 ```bash
 .ledger/actuation/events.jsonl
 ```
+
+Universalist plan artifacts:
+
+```bash
+.ledger/universalist-plan-<UTC_TIMESTAMP>-<ORDINAL>.md
+```
+
+Plan ids use the sortable form `YYYYMMDDTHHMMSSnnnnnnnnnZ-NNNN`. The
+nanosecond UTC timestamp makes recency visible, while atomic ordinal retries
+make creation collision-safe without rewriting an earlier plan. The
+Universalist source resolves `latest` by the greatest valid plan id; it does
+not maintain a mutable latest pointer.
 
 The actuation store lock sidecar must be Git-ignored before `open`; ignoring
 `.ledger/` covers the default store and lock.
@@ -52,6 +64,10 @@ ledger open --source actuation --json actuation-open.json
 ledger prepare --source actuation --run RUN-ID --json operation.json
 ledger state --source actuation --run RUN-ID
 ledger decide --source actuation --run RUN-ID
+ledger create --source universalist --template universalist-plan.md
+ledger latest --source universalist
+ledger latest --source universalist --format path
+ledger path --source universalist --id 20260711T164436123456789Z-0000
 ledger validate plan-source-contract --input plan-source-contract.json
 ledger validate policy-synthesis-receipt --input synthesis-receipt.json
 ledger validate review-fold --input review-fold.json
@@ -59,6 +75,41 @@ ledger validate review-fold --input review-fold.json
 
 Use `--file PATH` to point at a non-default store.
 For `--source learnings`, `--file PATH` is accepted as an alias for the learning event path.
+
+## Universalist plan addressing
+
+`ledger --source universalist` owns plan identity, allocation, and lookup;
+Universalist owns each plan's Markdown fields and subsequent updates.
+
+Create a fresh plan from a skill-owned template:
+
+```bash
+ledger create --source universalist \
+  --template /path/to/templates/universalist-plan.md
+```
+
+The command prepends a `universalist-plan/v1` frontmatter envelope and returns
+`universalist-plan-address/v1` JSON containing `plan_id`, `created_at`, and the
+absolute `path`. Every invocation creates a new file. It never reuses or
+truncates an existing plan.
+
+Resolve the newest plan when no run-specific address survives:
+
+```bash
+ledger latest --source universalist
+ledger latest --source universalist --format path
+```
+
+Prefer the exact id returned by `create` during an active run:
+
+```bash
+ledger path --source universalist \
+  --id 20260711T164436123456789Z-0000
+```
+
+`latest` is a recovery aid, not run identity: concurrent runs must retain their
+own returned plan id and verify a recovered plan's task metadata before
+resuming it.
 
 ## Stateless validation
 
