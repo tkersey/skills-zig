@@ -37,6 +37,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - By default, permissions requests are denied, request-user-input questions are answered with the first option label when present, MCP elicitations are declined, and dynamic tool calls return `success: false` with an explanatory text item.
 - `cas_review_session` now starts detached `review/start` turns over a CAS-managed loopback websocket app-server, persists the detached `reviewThreadId` as the recoverable handle, appends raw request/response artifacts to an NDJSON log, and stores websocket session metadata beside the review-session record so fresh-process `status`, `wait`, and `interrupt` can reconnect to the same detached review transport.
 - `cas review_session run` is the brokered one-review path. It waits by default, returns `reviewVerdict`, reports `reviewBrokerDecision`, normalizes terminal same-tuple evidence, and auto-replaces an active same-tuple attempt only when prior transport loss plus dead owner/server liveness is proven.
+- Review wait defaults are action-aware: `run`, `start --wait`, `wait`, and `lane review` use `1800000` ms; lane smoke/suites and control paths use `300000` ms. An explicit positive `--timeout-ms` value always wins.
 - `cas review_session run`, `start`, and `lane review` accept an optional atomic `--workflow-binding-json JSON|@FILE`. The binding carries `actuationRunId`, `artifactStateFingerprint`, `reviewContractFingerprint`, `resolutionDigest`, canonical `selectedLenses`, `reviewLane`, and `lensContract`. When present, it participates in review-lock and CAS-RER identity without granting workflow authority.
 - `cas review_session current` and `list` return the complete valid history for the exact native repo/base/head/target-fingerprint and Codex-thread scope when no workflow binding is supplied. Passing `--workflow-binding-json` selects one exact binding. Account identity and resolved Codex path/version do not hide historical records.
 - `CAS-CURRENT-v1` and `CAS-LIST-v1` report context-derived `proofCreditEligible` separately from immutable `CAS-RER-v1 principal.proofUsable`. A drifted principal or runtime can make a record ineligible for current proof credit without erasing findings or other historical evidence.
@@ -112,6 +113,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 ./zig-out/bin/cas review_session run \
   --cwd /path/to/workspace \
   --uncommitted \
+  --timeout-ms 1800000 \
   --json
 
 # Bind a review atomically to a caller-owned workflow epoch.
@@ -119,6 +121,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
   --cwd /path/to/workspace \
   --base main \
   --workflow-binding-json @workflow-binding.json \
+  --timeout-ms 1800000 \
   --json
 
 # Read all same-tuple/thread history, or filter to the exact binding.
@@ -157,6 +160,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 # Fresh process reattaches to the same managed websocket transport.
 ./zig-out/bin/cas review_session wait \
   --review-thread-id thr_123 \
+  --timeout-ms 1800000 \
   --json
 
 # Inspect the newest persisted review session and tuple binding.

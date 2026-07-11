@@ -14,6 +14,9 @@ const HelpSurface = core_cli.HelpSurface{
     .help_text = UsageText,
 };
 
+const default_control_timeout_ms: u32 = 300_000;
+const default_review_timeout_ms: u32 = 1_800_000;
+
 const UsageText =
     \\cas_review_session
     \\
@@ -114,14 +117,15 @@ const UsageText =
     \\  --summary                        Include aggregate receipt counts.
     \\  --codex-thread-id ID             Codex session/thread id for review reuse scoping.
     \\  --store-root DIR                 Explicit CAS artifact root; default is repo .ledger/cas.
-    \\  --timeout-ms N                   Wait timeout for `wait` (default: 300000).
+    \\  --timeout-ms N                   Wait timeout. Real review waits default to 1800000;
+    \\                                   smoke/control waits default to 300000.
     \\  --poll-interval-ms N             Poll interval for `wait` (default: 250).
     \\  --help                           Show help.
     \\  --version                        Show version.
     \\  version                          Show version.
     \\
     \\Examples:
-    \\  cas review_session run --cwd /path/to/repo --base main --workflow-binding-json @binding.json --json
+    \\  cas review_session run --cwd /path/to/repo --base main --workflow-binding-json @binding.json --timeout-ms 1800000 --json
     \\  cas review_session current --cwd /path/to/repo --base main --json
     \\  cas review_session list --cwd /path/to/repo --base main --json
     \\  cas review_session import --path review-1.json --cwd /path/to/repo --base main --json
@@ -129,17 +133,17 @@ const UsageText =
     \\  cas review_session validate-record --record rer_123.json --json
     \\  cas review_session start --cwd /path/to/repo --uncommitted --json
     \\  cas review_session start --cwd /path/to/repo --base main --json
-    \\  cas review_session start --wait --cwd /path/to/repo --base main --json
+    \\  cas review_session start --wait --cwd /path/to/repo --base main --timeout-ms 1800000 --json
     \\  cas review_session status --cwd /path/to/repo --review-thread-id thr_123 --json
     \\  cas review_session status --path /path/to/repo/.ledger/cas/review_sessions/thr_123.json --json
     \\  cas review_session status --cwd /path/to/repo --latest --json
-    \\  cas review_session wait --cwd /path/to/repo --review-thread-id thr_123 --timeout-ms 300000 --json
+    \\  cas review_session wait --cwd /path/to/repo --review-thread-id thr_123 --timeout-ms 1800000 --json
     \\  cas review_session interrupt --cwd /path/to/repo --review-thread-id thr_123 --json
     \\  cas review_session lane start --cwd /path/to/repo --json
     \\  cas review_session lane smoke --cwd /path/to/repo --base main --json
     \\  cas review_session lane smoke-suite --cwd /path/to/repo --base main --json --cleanup
     \\  cas review_session lane smoke-until-fixed --cwd /path/to/repo --base main --json --cleanup
-    \\  cas review_session lane review --lane-id lane_123 --base main --json
+    \\  cas review_session lane review --lane-id lane_123 --base main --timeout-ms 1800000 --json
     \\  cas review_session receipt normalize --path review-1.json --format json --summary
     \\  cas review_session receipt classify --path receipts.jsonl --format jsonl
     \\  cas review_session receipt gate --path review-1.json --format json
@@ -324,7 +328,8 @@ const ParsedArgs = struct {
     smoke_hooks: []const u8 = "inherit,off",
     json: bool = false,
     verdict_only: bool = false,
-    timeout_ms: u32 = 300_000,
+    timeout_ms: u32 = default_control_timeout_ms,
+    timeout_ms_explicit: bool = false,
     poll_interval_ms: u32 = 250,
     exec_approval: ?[]const u8 = null,
     file_approval: ?[]const u8 = null,
@@ -874,6 +879,25 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
+fn defaultTimeoutMsForAction(parsed: ParsedArgs) u32 {
+    const action = parsed.action orelse return default_control_timeout_ms;
+    return switch (action) {
+        .run, .wait => default_review_timeout_ms,
+        .start => if (parsed.wait_after_start) default_review_timeout_ms else default_control_timeout_ms,
+        .lane => if (parsed.lane_action == .review) default_review_timeout_ms else default_control_timeout_ms,
+        .current,
+        .list,
+        .review_import,
+        .inspect,
+        .validate_record,
+        .status,
+        .interrupt,
+        .receipt,
+        .lock,
+        => default_control_timeout_ms,
+    };
+}
+
 fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs {
     var out = ParsedArgs{};
     var receipt_paths: std.ArrayList([]const u8) = .empty;
@@ -1037,6 +1061,7 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             const parsed = try std.fmt.parseInt(i64, value, 10);
             if (parsed <= 0) return error.InvalidTimeout;
             out.timeout_ms = @intCast(parsed);
+            out.timeout_ms_explicit = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "--poll-interval-ms")) {
@@ -1260,6 +1285,7 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
         },
     }
 
+    if (!out.timeout_ms_explicit) out.timeout_ms = defaultTimeoutMsForAction(out);
     return out;
 }
 
@@ -13012,6 +13038,8 @@ test "parseArgs accepts detached start target" {
     try std.testing.expect(parsed.json);
     try std.testing.expectEqual(TargetKind.base_branch, parsed.target.?.kind);
     try std.testing.expectEqualStrings("main", parsed.target.?.branch.?);
+    try std.testing.expectEqual(default_control_timeout_ms, parsed.timeout_ms);
+    try std.testing.expect(!parsed.timeout_ms_explicit);
 }
 
 test "parseArgs captures start --wait" {
@@ -13030,6 +13058,8 @@ test "parseArgs captures start --wait" {
     try std.testing.expect(parsed.wait_after_start);
     try std.testing.expectEqual(Action.start, parsed.action.?);
     try std.testing.expectEqual(TargetKind.base_branch, parsed.target.?.kind);
+    try std.testing.expectEqual(default_review_timeout_ms, parsed.timeout_ms);
+    try std.testing.expect(!parsed.timeout_ms_explicit);
 }
 
 test "parseArgs accepts brokered run target" {
@@ -13052,6 +13082,25 @@ test "parseArgs accepts brokered run target" {
     try std.testing.expectEqual(TargetKind.base_branch, parsed.target.?.kind);
     try std.testing.expectEqualStrings("main", parsed.target.?.branch.?);
     try std.testing.expectEqualStrings("run 2", parsed.fresh_attempt_reason.?);
+    try std.testing.expectEqual(default_review_timeout_ms, parsed.timeout_ms);
+    try std.testing.expect(!parsed.timeout_ms_explicit);
+}
+
+test "parseArgs preserves an explicit review timeout" {
+    const argv = [_][]const u8{
+        "cas_review_session",
+        "run",
+        "--cwd",
+        "/tmp/repo",
+        "--base",
+        "main",
+        "--timeout-ms",
+        "60000",
+    };
+
+    const parsed = try parseArgs(std.testing.allocator, &argv);
+    try std.testing.expectEqual(@as(u32, 60_000), parsed.timeout_ms);
+    try std.testing.expect(parsed.timeout_ms_explicit);
 }
 
 test "workflow binding input is canonical and action scoped" {
@@ -13123,6 +13172,8 @@ test "parseArgs accepts latest status and wait selectors" {
     const wait = try parseArgs(std.testing.allocator, &wait_argv);
     try std.testing.expectEqual(Action.wait, wait.action.?);
     try std.testing.expect(wait.latest_review_session);
+    try std.testing.expectEqual(default_review_timeout_ms, wait.timeout_ms);
+    try std.testing.expect(!wait.timeout_ms_explicit);
 }
 
 test "parseArgs accepts bare review thread id selectors" {
@@ -13512,6 +13563,8 @@ test "parseArgs accepts review lane review target" {
     try std.testing.expectEqualStrings("main", parsed.target.?.branch.?);
     try std.testing.expectEqual(FallbackMode.native_review, parsed.fallback_mode);
     try std.testing.expect(!parsed.archive_lane_threads);
+    try std.testing.expectEqual(default_review_timeout_ms, parsed.timeout_ms);
+    try std.testing.expect(!parsed.timeout_ms_explicit);
 }
 
 test "parseArgs accepts review lane smoke target and cleanup flags" {
@@ -13537,6 +13590,8 @@ test "parseArgs accepts review lane smoke target and cleanup flags" {
     try std.testing.expect(!parsed.lane_smoke_wait);
     try std.testing.expect(parsed.lane_smoke_cleanup);
     try std.testing.expect(parsed.json);
+    try std.testing.expectEqual(default_control_timeout_ms, parsed.timeout_ms);
+    try std.testing.expect(!parsed.timeout_ms_explicit);
 }
 
 test "parseArgs accepts review lane smoke suite options" {
@@ -13572,6 +13627,8 @@ test "parseArgs accepts review lane smoke suite options" {
     try std.testing.expectEqualStrings("inherit,off", parsed.smoke_hooks);
     try std.testing.expect(parsed.lane_smoke_cleanup);
     try std.testing.expect(parsed.json);
+    try std.testing.expectEqual(default_control_timeout_ms, parsed.timeout_ms);
+    try std.testing.expect(!parsed.timeout_ms_explicit);
 }
 
 test "smoke suite child inherits approval and runtime options" {
