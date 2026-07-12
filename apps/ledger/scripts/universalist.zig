@@ -7,8 +7,10 @@ const std = @import("std");
 const Io = std.Io.Threaded.global_single_threaded;
 const Version = core_cli.normalizeVersion(app_meta.version);
 const ProgramName = "ledger --source universalist";
-const PlanDir = ".ledger";
-const PlanPrefix = "universalist-plan-";
+const CanonicalPlanDir = ".ledger/universalist";
+const CanonicalPlanPrefix = "plan-";
+const LegacyPlanDir = ".ledger";
+const LegacyPlanPrefix = "universalist-plan-";
 const PlanSuffix = ".md";
 const PlanIdLen = 30;
 const MaxTemplateBytes = 1024 * 1024;
@@ -54,6 +56,11 @@ const Command = enum {
 const OutputFormat = enum {
     json,
     path,
+};
+
+const PlanLayout = enum {
+    canonical,
+    legacy,
 };
 
 const Args = struct {
@@ -220,8 +227,15 @@ fn createPlanAtNs(
     while (ordinal <= MaxOrdinal) : (ordinal += 1) {
         const plan_id = try std.fmt.allocPrint(allocator, "{s}-{d:0>4}", .{ stamp, ordinal });
         errdefer allocator.free(plan_id);
-        const path = try planPathAlloc(allocator, repo, plan_id);
+        const path = try planPathAlloc(allocator, repo, plan_id, .canonical);
         errdefer allocator.free(path);
+        const legacy_path = try planPathAlloc(allocator, repo, plan_id, .legacy);
+        defer allocator.free(legacy_path);
+        if (try planPathOccupied(legacy_path)) {
+            allocator.free(plan_id);
+            allocator.free(path);
+            continue;
+        }
         const body = try renderPlanAlloc(allocator, plan_id, created_at, template);
         defer allocator.free(body);
 
@@ -243,50 +257,76 @@ fn createPlanAtNs(
 }
 
 fn latestPlanAddress(allocator: std.mem.Allocator, repo: []const u8) !PlanAddress {
-    const ledger_dir = try std.fs.path.join(allocator, &.{ repo, PlanDir });
-    defer allocator.free(ledger_dir);
+    const canonical_id = try latestPlanIdInLayoutAlloc(allocator, repo, .canonical);
+    defer if (canonical_id) |plan_id| allocator.free(plan_id);
+    const legacy_id = try latestPlanIdInLayoutAlloc(allocator, repo, .legacy);
+    defer if (legacy_id) |plan_id| allocator.free(plan_id);
 
-    var dir = std.Io.Dir.openDirAbsolute(defaultIo(), ledger_dir, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound => return error.NoPlans,
+    if (canonical_id) |canonical| {
+        if (legacy_id) |legacy| {
+            if (std.mem.lessThan(u8, canonical, legacy)) {
+                return addressFromIdAtLayout(allocator, repo, legacy, .legacy, false);
+            }
+        }
+        return addressFromIdAtLayout(allocator, repo, canonical, .canonical, false);
+    }
+    if (legacy_id) |legacy| {
+        return addressFromIdAtLayout(allocator, repo, legacy, .legacy, false);
+    }
+    return error.NoPlans;
+}
+
+fn latestPlanIdInLayoutAlloc(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    layout: PlanLayout,
+) !?[]u8 {
+    const relative_dir = planDir(layout);
+    const plan_dir = try std.fs.path.join(allocator, &.{ repo, relative_dir });
+    defer allocator.free(plan_dir);
+
+    var dir = std.Io.Dir.openDirAbsolute(defaultIo(), plan_dir, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return null,
         else => return err,
     };
     defer dir.close(defaultIo());
 
-    var latest_name: ?[]u8 = null;
-    defer if (latest_name) |name| allocator.free(name);
+    var latest_id: ?[]u8 = null;
+    errdefer if (latest_id) |plan_id| allocator.free(plan_id);
     var iter = dir.iterate();
     while (try iter.next(defaultIo())) |entry| {
-        if (planIdFromFilename(entry.name) == null) continue;
+        const plan_id = planIdFromFilename(entry.name, planPrefix(layout)) orelse continue;
         const stat = dir.statFile(defaultIo(), entry.name, .{ .follow_symlinks = false }) catch continue;
         if (stat.kind == .sym_link) return error.SymlinkPlan;
         if (stat.kind != .file) continue;
-        if (latest_name == null or std.mem.lessThan(u8, latest_name.?, entry.name)) {
-            if (latest_name) |name| allocator.free(name);
-            latest_name = try allocator.dupe(u8, entry.name);
+        if (latest_id == null or std.mem.lessThan(u8, latest_id.?, plan_id)) {
+            if (latest_id) |current| allocator.free(current);
+            latest_id = try allocator.dupe(u8, plan_id);
         }
     }
-
-    const name = latest_name orelse return error.NoPlans;
-    const plan_id = planIdFromFilename(name) orelse unreachable;
-    return addressFromId(allocator, repo, plan_id, false);
+    return latest_id;
 }
 
 fn resolvePlanAddress(allocator: std.mem.Allocator, repo: []const u8, plan_id: []const u8) !PlanAddress {
     if (!validPlanId(plan_id)) return error.InvalidPlanId;
-    return addressFromId(allocator, repo, plan_id, true);
+    return addressFromIdAtLayout(allocator, repo, plan_id, .canonical, true) catch |err| switch (err) {
+        error.PlanNotFound => addressFromIdAtLayout(allocator, repo, plan_id, .legacy, true),
+        else => return err,
+    };
 }
 
-fn addressFromId(
+fn addressFromIdAtLayout(
     allocator: std.mem.Allocator,
     repo: []const u8,
     plan_id: []const u8,
+    layout: PlanLayout,
     require_existing: bool,
 ) !PlanAddress {
     const owned_id = try allocator.dupe(u8, plan_id);
     errdefer allocator.free(owned_id);
     const created_at = try createdAtFromIdAlloc(allocator, plan_id);
     errdefer allocator.free(created_at);
-    const path = try planPathAlloc(allocator, repo, plan_id);
+    const path = try planPathAlloc(allocator, repo, plan_id, layout);
     errdefer allocator.free(path);
     if (require_existing) {
         const stat = std.Io.Dir.cwd().statFile(defaultIo(), path, .{ .follow_symlinks = false }) catch |err| switch (err) {
@@ -403,17 +443,45 @@ fn isLeapYear(year: u32) bool {
     return @mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0);
 }
 
-fn planIdFromFilename(name: []const u8) ?[]const u8 {
-    if (!std.mem.startsWith(u8, name, PlanPrefix) or !std.mem.endsWith(u8, name, PlanSuffix)) return null;
-    const plan_id = name[PlanPrefix.len .. name.len - PlanSuffix.len];
+fn planIdFromFilename(name: []const u8, prefix: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, name, prefix) or !std.mem.endsWith(u8, name, PlanSuffix)) return null;
+    const plan_id = name[prefix.len .. name.len - PlanSuffix.len];
     return if (validPlanId(plan_id)) plan_id else null;
 }
 
-fn planPathAlloc(allocator: std.mem.Allocator, repo: []const u8, plan_id: []const u8) ![]u8 {
+fn planDir(layout: PlanLayout) []const u8 {
+    return switch (layout) {
+        .canonical => CanonicalPlanDir,
+        .legacy => LegacyPlanDir,
+    };
+}
+
+fn planPrefix(layout: PlanLayout) []const u8 {
+    return switch (layout) {
+        .canonical => CanonicalPlanPrefix,
+        .legacy => LegacyPlanPrefix,
+    };
+}
+
+fn planPathAlloc(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    plan_id: []const u8,
+    layout: PlanLayout,
+) ![]u8 {
     if (!validPlanId(plan_id)) return error.InvalidPlanId;
-    const filename = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ PlanPrefix, plan_id, PlanSuffix });
+    const filename = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ planPrefix(layout), plan_id, PlanSuffix });
     defer allocator.free(filename);
-    return std.fs.path.join(allocator, &.{ repo, PlanDir, filename });
+    return std.fs.path.join(allocator, &.{ repo, planDir(layout), filename });
+}
+
+fn planPathOccupied(path: []const u8) !bool {
+    const stat = std.Io.Dir.cwd().statFile(defaultIo(), path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    if (stat.kind == .sym_link) return error.SymlinkPlan;
+    return true;
 }
 
 fn civilFromDays(days_since_unix_epoch: i64) Date {
@@ -507,6 +575,14 @@ test "create retries a colliding timestamp without overwriting and latest finds 
     try std.testing.expectEqualStrings("19700101T000001234567890Z-0000", first.plan_id);
     try std.testing.expectEqualStrings("19700101T000001234567890Z-0001", second.plan_id);
     try std.testing.expect(!std.mem.eql(u8, first.path, second.path));
+    const expected_first_path = try std.fs.path.join(std.testing.allocator, &.{
+        repo,
+        ".ledger",
+        "universalist",
+        "plan-19700101T000001234567890Z-0000.md",
+    });
+    defer std.testing.allocator.free(expected_first_path);
+    try std.testing.expectEqualStrings(expected_first_path, first.path);
 
     const first_bytes = try durable_store.readFileAlloc(std.testing.allocator, first.path, MaxTemplateBytes);
     defer std.testing.allocator.free(first_bytes);
@@ -516,6 +592,59 @@ test "create retries a colliding timestamp without overwriting and latest finds 
     defer latest.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(second.plan_id, latest.plan_id);
     try std.testing.expectEqualStrings(second.path, latest.path);
+}
+
+test "lookup preserves legacy flat plans and prefers a canonical duplicate" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(repo);
+
+    var canonical = try createPlanAtNs(std.testing.allocator, repo, "# Canonical\n", 1_234_567_890);
+    defer canonical.deinit(std.testing.allocator);
+
+    const legacy_id = "19700101T000002234567890Z-0000";
+    const legacy_path = try planPathAlloc(std.testing.allocator, repo, legacy_id, .legacy);
+    defer std.testing.allocator.free(legacy_path);
+    try durable_store.writeTextCreateNewAtomic(std.testing.allocator, legacy_path, "# Legacy\n", .{});
+
+    var resolved_legacy = try resolvePlanAddress(std.testing.allocator, repo, legacy_id);
+    defer resolved_legacy.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(legacy_path, resolved_legacy.path);
+
+    var latest_legacy = try latestPlanAddress(std.testing.allocator, repo);
+    defer latest_legacy.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(legacy_id, latest_legacy.plan_id);
+    try std.testing.expectEqualStrings(legacy_path, latest_legacy.path);
+
+    const canonical_duplicate_path = try planPathAlloc(std.testing.allocator, repo, legacy_id, .canonical);
+    defer std.testing.allocator.free(canonical_duplicate_path);
+    try durable_store.writeTextCreateNewAtomic(std.testing.allocator, canonical_duplicate_path, "# Canonical duplicate\n", .{});
+
+    var resolved_canonical = try resolvePlanAddress(std.testing.allocator, repo, legacy_id);
+    defer resolved_canonical.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(canonical_duplicate_path, resolved_canonical.path);
+
+    var latest_canonical = try latestPlanAddress(std.testing.allocator, repo);
+    defer latest_canonical.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(legacy_id, latest_canonical.plan_id);
+    try std.testing.expectEqualStrings(canonical_duplicate_path, latest_canonical.path);
+}
+
+test "create does not reuse a legacy flat plan id" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(repo);
+
+    const legacy_id = "19700101T000001234567890Z-0000";
+    const legacy_path = try planPathAlloc(std.testing.allocator, repo, legacy_id, .legacy);
+    defer std.testing.allocator.free(legacy_path);
+    try durable_store.writeTextCreateNewAtomic(std.testing.allocator, legacy_path, "# Legacy\n", .{});
+
+    var created = try createPlanAtNs(std.testing.allocator, repo, "# Canonical\n", 1_234_567_890);
+    defer created.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("19700101T000001234567890Z-0001", created.plan_id);
 }
 
 test "path resolution rejects traversal-shaped ids" {

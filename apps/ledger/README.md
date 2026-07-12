@@ -28,7 +28,7 @@ Actuation source store:
 Universalist plan artifacts:
 
 ```bash
-.ledger/universalist-plan-<UTC_TIMESTAMP>-<ORDINAL>.md
+.ledger/universalist/plan-<UTC_TIMESTAMP>-<ORDINAL>.md
 ```
 
 Plan ids use the sortable form `YYYYMMDDTHHMMSSnnnnnnnnnZ-NNNN`. The
@@ -92,6 +92,11 @@ The command prepends a `universalist-plan/v1` frontmatter envelope and returns
 `universalist-plan-address/v1` JSON containing `plan_id`, `created_at`, and the
 absolute `path`. Every invocation creates a new file. It never reuses or
 truncates an existing plan.
+
+New plans are created under `.ledger/universalist/`. Exact-id and `latest`
+lookup continue to resolve valid legacy `.ledger/universalist-plan-*.md`
+artifacts without rewriting them. When both layouts contain the same plan id,
+the namespaced path is canonical.
 
 Resolve the newest plan when no run-specific address survives:
 
