@@ -1162,6 +1162,21 @@ test "v2 preflight preserves prior standard clean credit through one certified a
     try std.testing.expectEqual(@as(usize, 0), issues.values.items.len);
 }
 
+test "v2 initial preflight starts with an empty chain" {
+    var requests = closeout_requests;
+    for (&requests) |*request| {
+        request.state = "selected-pending";
+        request.attempts = &.{};
+        request.review_fold_refs = &.{};
+    }
+    var policy = validV2CloseoutPolicy(&requests);
+    policy.standard_clean_attempt_ids = &.{};
+    policy.standard_clean_chain = .{ .standard_attempts = &.{}, .carry_transitions = &.{} };
+    var issues = try validateForTest(policy, .preflight);
+    defer issues.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), issues.values.items.len);
+}
+
 test "v2 closeout composes two prior and three current standard cleans" {
     var requests = closeout_requests;
     requests[0].attempts = standard_attempts[2..];
@@ -1272,6 +1287,24 @@ test "v2 tuple movement without an auxiliary carry is invalid proof" {
     var issues = try validateForTest(policy, .closeout);
     defer issues.deinit(std.testing.allocator);
     try std.testing.expect(hasIssue(issues, "standard-chain-missing-carry"));
+}
+
+test "v2 carry requires auxiliary correctness and observation evidence" {
+    var requests = closeout_requests;
+    requests[0].attempts = standard_attempts[2..];
+    var carries = v2_carries;
+    carries[0].source_auxiliary_request_ids = &.{"standard-request-prior"};
+    carries[0].correctness_decision_refs = &.{};
+    carries[0].progress_observation_refs = &.{};
+    var policy = validV2CloseoutPolicy(&requests);
+    var chain = policy.standard_clean_chain.?;
+    chain.carry_transitions = &carries;
+    policy.standard_clean_chain = chain;
+    var issues = try validateForTest(policy, .closeout);
+    defer issues.deinit(std.testing.allocator);
+    try std.testing.expect(hasIssue(issues, "standard-chain-carry-standard-source"));
+    try std.testing.expect(hasIssue(issues, "standard-chain-carry-correctness"));
+    try std.testing.expect(hasIssue(issues, "standard-chain-carry-progress"));
 }
 
 test "v2 standard findings reset instead of crossing an auxiliary carry" {
