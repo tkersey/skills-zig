@@ -1214,8 +1214,17 @@ fn loadRecordsFromSnapshot(allocator: std.mem.Allocator, snapshot: *const durabl
                     validation.add("status event has invalid source_refs", stored.diagnostic_position);
                     continue;
                 }
-            } else if (std.mem.eql(u8, status, "active") or std.mem.eql(u8, status, "reopened")) {
-                validation.add("authority transition lacks typed proof", stored.diagnostic_position);
+            } else if (std.mem.eql(u8, status, "active") or !isInitialCaptureStatus(status)) {
+                const prior_fingerprint = try projectionFingerprintAlloc(allocator, record.*);
+                allocator.free(record.prior_projection_fingerprint);
+                record.prior_projection_fingerprint = prior_fingerprint;
+                allocator.free(record.status);
+                record.status = try allocator.dupe(u8, "need-evidence");
+                const next_chain = try eventChainFingerprintAlloc(allocator, record.event_chain_fingerprint, line);
+                allocator.free(record.event_chain_fingerprint);
+                record.event_chain_fingerprint = next_chain;
+                record.status_event_count += 1;
+                record.source_event_count += 1;
                 continue;
             }
             if (!allowedStatusTransition(record.status, status)) {
@@ -1275,8 +1284,14 @@ fn loadRecordsFromSnapshot(allocator: std.mem.Allocator, snapshot: *const durabl
             continue;
         }
         const version = jsonIntegerField(obj, "v") orelse 1;
-        if (version >= 3 and !validEventIdentity(obj)) validation.add("capture event lacks typed identity", stored.diagnostic_position);
-        var record = try initRecordFromObject(allocator, neg_id, status, raw_record);
+        if (version >= 3) {
+            if (!validEventIdentity(obj)) validation.add("capture event lacks typed identity", stored.diagnostic_position);
+            if (!isInitialCaptureStatus(status)) validation.add("capture event has lifecycle-only initial status", stored.diagnostic_position);
+        }
+        const legacy_requires_evidence = version < 3 and
+            (std.mem.eql(u8, status, "active") or !isInitialCaptureStatus(status));
+        const projected_status = if (legacy_requires_evidence) "need-evidence" else status;
+        var record = try initRecordFromObject(allocator, neg_id, projected_status, raw_record);
         errdefer record.deinit(allocator);
         allocator.free(record.event_chain_fingerprint);
         record.event_chain_fingerprint = try eventChainFingerprintAlloc(allocator, "", line);
@@ -1490,6 +1505,13 @@ fn isKnownStatus(status: []const u8) bool {
         std.mem.eql(u8, status, "unknown");
 }
 
+fn isInitialCaptureStatus(status: []const u8) bool {
+    return std.mem.eql(u8, status, "capture_candidate") or
+        std.mem.eql(u8, status, "need-evidence") or
+        std.mem.eql(u8, status, "unknown") or
+        std.mem.eql(u8, status, "active");
+}
+
 fn deinitRecords(allocator: std.mem.Allocator, records: *std.ArrayList(Record)) void {
     for (records.items) |*record| record.deinit(allocator);
     records.deinit(allocator);
@@ -1514,6 +1536,7 @@ fn validateCaptureInput(obj: std.json.ObjectMap) !void {
     if (!isKnownExclusionScope(exclusion_scope)) return error.InvalidExclusionScope;
     if (jsonStringField(obj, "status")) |status| {
         if (!isKnownStatus(status)) return error.InvalidStatus;
+        if (!isInitialCaptureStatus(status)) return error.InvalidInitialStatus;
     }
     if (!optionalStringFieldsWellTyped(obj)) return error.InvalidCaptureFieldType;
     if (obj.get("source_refs") != null and !sourceRefsValueValid(obj.get("source_refs"))) return error.InvalidSourceRefs;
@@ -1641,10 +1664,28 @@ fn resolveArtifactIdentityAlloc(
     if (raw_id.len == 0) return .{ .id = try allocator.dupe(u8, ""), .label = try allocator.dupe(u8, label) };
     if (isImmutableArtifactIdentity(raw_id)) return .{ .id = try allocator.dupe(u8, raw_id), .label = try allocator.dupe(u8, label) };
 
+    var revision_text = raw_id;
+    var output_prefix: []const u8 = "";
+    var resolve_tree = false;
+    if (std.mem.startsWith(u8, raw_id, "commit:")) {
+        revision_text = raw_id["commit:".len..];
+        output_prefix = "commit:";
+    } else if (std.mem.startsWith(u8, raw_id, "tree:")) {
+        revision_text = raw_id["tree:".len..];
+        output_prefix = "tree:";
+        resolve_tree = true;
+    } else if (std.mem.startsWith(u8, raw_id, "sha256:") or std.mem.startsWith(u8, raw_id, "surface:")) {
+        return .{ .id = try allocator.dupe(u8, ""), .label = try allocator.dupe(u8, label) };
+    }
+    if (revision_text.len == 0) return .{ .id = try allocator.dupe(u8, ""), .label = try allocator.dupe(u8, label) };
+
     const git_root = findGitRootForStoreAlloc(allocator, store_path) catch
         return .{ .id = try allocator.dupe(u8, ""), .label = try allocator.dupe(u8, label) };
     defer allocator.free(git_root);
-    const revision = try std.fmt.allocPrint(allocator, "{s}^{{commit}}", .{raw_id});
+    const revision = if (resolve_tree)
+        try std.fmt.allocPrint(allocator, "{s}^{{tree}}", .{revision_text})
+    else
+        try std.fmt.allocPrint(allocator, "{s}^{{commit}}", .{revision_text});
     defer allocator.free(revision);
     const result = try std.process.run(allocator, defaultIo(), .{
         .argv = &.{ "git", "-C", git_root, "rev-parse", "--verify", revision },
@@ -1655,8 +1696,12 @@ fn resolveArtifactIdentityAlloc(
     defer allocator.free(result.stderr);
     if (result.term == .exited and result.term.exited == 0) {
         const resolved = std.mem.trim(u8, result.stdout, " \t\r\n");
-        if (isImmutableArtifactIdentity(resolved)) {
-            return .{ .id = try allocator.dupe(u8, resolved), .label = try allocator.dupe(u8, label) };
+        if (isGitObjectId(resolved)) {
+            const identity = if (output_prefix.len == 0)
+                try allocator.dupe(u8, resolved)
+            else
+                try std.fmt.allocPrint(allocator, "{s}{s}", .{ output_prefix, resolved });
+            return .{ .id = identity, .label = try allocator.dupe(u8, label) };
         }
     }
     return .{ .id = try allocator.dupe(u8, ""), .label = try allocator.dupe(u8, label) };
@@ -1684,14 +1729,22 @@ fn findGitRootForStoreAlloc(allocator: std.mem.Allocator, store_path: []const u8
 }
 
 fn isImmutableArtifactIdentity(value: []const u8) bool {
-    if (value.len == 40 or value.len == 64) {
-        for (value) |char| if (!std.ascii.isHex(char)) return false;
-        return true;
-    }
-    inline for (&.{ "commit:", "tree:", "sha256:", "surface:" }) |prefix| {
-        if (std.mem.startsWith(u8, value, prefix) and value.len > prefix.len) return true;
-    }
+    if (isGitObjectId(value)) return true;
+    if (std.mem.startsWith(u8, value, "commit:")) return isGitObjectId(value["commit:".len..]);
+    if (std.mem.startsWith(u8, value, "tree:")) return isGitObjectId(value["tree:".len..]);
+    if (std.mem.startsWith(u8, value, "sha256:")) return isHexDigest(value["sha256:".len..], 64);
+    if (std.mem.startsWith(u8, value, "surface:")) return isHexDigest(value["surface:".len..], 64);
     return false;
+}
+
+fn isGitObjectId(value: []const u8) bool {
+    return (value.len == 40 or value.len == 64) and isHexDigest(value, value.len);
+}
+
+fn isHexDigest(value: []const u8, expected_len: usize) bool {
+    if (value.len != expected_len) return false;
+    for (value) |char| if (!std.ascii.isHex(char)) return false;
+    return true;
 }
 
 const TransitionProof = struct {
@@ -2751,12 +2804,47 @@ test "doctor reports unsafe active records" {
     try durable_store.writeTextAtomic(
         std.testing.allocator,
         store,
-        "{\"v\":1,\"event\":\"capture\",\"neg_id\":\"NEG-000001\",\"status\":\"active\",\"record\":{\"hypothesis\":\"h\",\"route_id\":\"route-a\"}}\n",
+        "{\"v\":3,\"event\":\"capture\",\"event_id\":\"evt-unsafe\",\"timestamp\":\"2026-07-12T00:00:00Z\",\"neg_id\":\"NEG-000001\",\"status\":\"active\",\"record\":{\"record_version\":\"NER-v2\",\"hypothesis\":\"h\",\"route_id\":\"route-a\"}}\n",
     );
 
     var loaded = try loadRecordsValidated(std.testing.allocator, store);
     defer loaded.deinit(std.testing.allocator);
     try std.testing.expect(!loaded.validation.ok());
+}
+
+test "pre-NER-v2 active capture projects as recoverable need-evidence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const store = try std.fs.path.join(std.testing.allocator, &.{ root, "negative-ledger.jsonl" });
+    defer std.testing.allocator.free(store);
+    try durable_store.writeTextAtomic(
+        std.testing.allocator,
+        store,
+        "{\"v\":1,\"event\":\"capture\",\"neg_id\":\"NEG-000001\",\"status\":\"active\",\"record\":{\"hypothesis\":\"legacy route failed\",\"route_id\":\"route-a\",\"artifact_state_id\":\"HEAD\",\"source_refs\":[{\"kind\":\"test\",\"ref\":\"legacy proof\"}]}}\n",
+    );
+
+    var legacy = try loadRecordsValidated(std.testing.allocator, store);
+    defer legacy.deinit(std.testing.allocator);
+    try std.testing.expect(legacy.validation.ok());
+    try std.testing.expectEqualStrings("need-evidence", legacy.records.items[0].status);
+    try std.testing.expectEqual(@as(u8, 0), try mapStatusForStore(std.testing.allocator, .{
+        .command = .map,
+        .file = store,
+        .route = "route-a",
+        .artifact = TestArtifact,
+    }));
+
+    const input = try std.fs.path.join(std.testing.allocator, &.{ root, "replacement.json" });
+    defer std.testing.allocator.free(input);
+    const replacement = try testActiveCaptureAlloc(std.testing.allocator, "route", "route_id", "route-a", TestArtifact);
+    defer std.testing.allocator.free(replacement);
+    try durable_store.writeTextAtomic(std.testing.allocator, input, replacement);
+    var capture = try appendCapture(std.testing.allocator, .{ .command = .capture, .file = store, .json_path = input });
+    defer capture.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("NEG-000002", capture.neg_id);
+    try std.testing.expectEqualStrings("active", capture.status);
 }
 
 test "capture rejects unknown exclusion scope before append" {
@@ -2778,7 +2866,7 @@ test "capture rejects unknown exclusion scope before append" {
     try std.testing.expect(!durable_store.fileExists(store));
 }
 
-test "proofless authority transitions are invalid and do not change folded status" {
+test "legacy proofless authority transitions project as need-evidence" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
@@ -2795,12 +2883,47 @@ test "proofless authority transitions are invalid and do not change folded statu
     );
     var promoted_loaded = try loadRecordsValidated(std.testing.allocator, promoted);
     defer promoted_loaded.deinit(std.testing.allocator);
-    try std.testing.expect(!promoted_loaded.validation.ok());
+    try std.testing.expect(promoted_loaded.validation.ok());
     try std.testing.expectEqualStrings("need-evidence", promoted_loaded.records.items[0].status);
 
     const active_record = try testActiveCaptureAlloc(std.testing.allocator, "route", "route_id", "route-a", TestArtifact);
     defer std.testing.allocator.free(active_record);
     const reopened_bytes = try std.fmt.allocPrint(std.testing.allocator, "{{\"v\":1,\"event\":\"capture\",\"neg_id\":\"NEG-000001\",\"status\":\"active\",\"record\":{s}}}\n{{\"v\":1,\"event\":\"status\",\"neg_id\":\"NEG-000001\",\"status\":\"reopened\"}}\n", .{active_record});
+    defer std.testing.allocator.free(reopened_bytes);
+    try durable_store.writeTextAtomic(std.testing.allocator, reopened, reopened_bytes);
+    var reopened_loaded = try loadRecordsValidated(std.testing.allocator, reopened);
+    defer reopened_loaded.deinit(std.testing.allocator);
+    try std.testing.expect(reopened_loaded.validation.ok());
+    try std.testing.expectEqualStrings("need-evidence", reopened_loaded.records.items[0].status);
+}
+
+test "v3 proofless authority transitions are invalid and do not change folded status" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const promoted = try std.fs.path.join(std.testing.allocator, &.{ root, "promoted.jsonl" });
+    defer std.testing.allocator.free(promoted);
+    const reopened = try std.fs.path.join(std.testing.allocator, &.{ root, "reopened.jsonl" });
+    defer std.testing.allocator.free(reopened);
+
+    try durable_store.writeTextAtomic(
+        std.testing.allocator,
+        promoted,
+        "{\"v\":3,\"event\":\"capture\",\"event_id\":\"evt-capture\",\"timestamp\":\"2026-07-12T00:00:00Z\",\"neg_id\":\"NEG-000001\",\"status\":\"need-evidence\",\"record\":{\"hypothesis\":\"h\",\"route_id\":\"route-a\"}}\n{\"v\":3,\"event\":\"status\",\"event_id\":\"evt-promote\",\"timestamp\":\"2026-07-12T00:00:01Z\",\"neg_id\":\"NEG-000001\",\"from\":\"need-evidence\",\"to\":\"active\",\"reason\":\"promote without proof\",\"source_refs\":[]}\n",
+    );
+    var promoted_loaded = try loadRecordsValidated(std.testing.allocator, promoted);
+    defer promoted_loaded.deinit(std.testing.allocator);
+    try std.testing.expect(!promoted_loaded.validation.ok());
+    try std.testing.expectEqualStrings("need-evidence", promoted_loaded.records.items[0].status);
+
+    const active_record = try testActiveCaptureAlloc(std.testing.allocator, "route", "route_id", "route-a", TestArtifact);
+    defer std.testing.allocator.free(active_record);
+    const reopened_bytes = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"v\":3,\"event\":\"capture\",\"event_id\":\"evt-capture\",\"timestamp\":\"2026-07-12T00:00:00Z\",\"neg_id\":\"NEG-000001\",\"status\":\"active\",\"record\":{s}}}\n{{\"v\":3,\"event\":\"status\",\"event_id\":\"evt-reopen\",\"timestamp\":\"2026-07-12T00:00:01Z\",\"neg_id\":\"NEG-000001\",\"from\":\"active\",\"to\":\"reopened\",\"reason\":\"reopen without criterion proof\",\"source_refs\":[{{\"kind\":\"test\",\"ref\":\"fixture\"}}]}}\n",
+        .{active_record},
+    );
     defer std.testing.allocator.free(reopened_bytes);
     try durable_store.writeTextAtomic(std.testing.allocator, reopened, reopened_bytes);
     var reopened_loaded = try loadRecordsValidated(std.testing.allocator, reopened);
@@ -2826,6 +2949,54 @@ test "capture rejects unknown status before append" {
 
     try std.testing.expectError(error.InvalidStatus, appendCapture(std.testing.allocator, .{ .command = .capture, .file = store, .json_path = input }));
     try std.testing.expect(!durable_store.fileExists(store));
+}
+
+test "capture rejects lifecycle-only initial statuses" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const baseline = try testActiveCaptureAlloc(std.testing.allocator, "route", "route_id", "route-a", TestArtifact);
+    defer std.testing.allocator.free(baseline);
+    const terminal_statuses = [_][]const u8{ "accepted_risk", "stale", "superseded", "reopened" };
+
+    for (terminal_statuses, 0..) |status, index| {
+        const store = try std.fmt.allocPrint(std.testing.allocator, "{s}/terminal-{d}.jsonl", .{ root, index });
+        defer std.testing.allocator.free(store);
+        const input = try std.fmt.allocPrint(std.testing.allocator, "{s}/terminal-{d}.json", .{ root, index });
+        defer std.testing.allocator.free(input);
+        const payload = try std.fmt.allocPrint(std.testing.allocator, "{{\"status\":\"{s}\",{s}", .{ status, baseline[1..] });
+        defer std.testing.allocator.free(payload);
+        try durable_store.writeTextAtomic(std.testing.allocator, input, payload);
+        try std.testing.expectError(error.InvalidInitialStatus, appendCapture(std.testing.allocator, .{
+            .command = .capture,
+            .file = store,
+            .json_path = input,
+        }));
+        try std.testing.expect(!durable_store.fileExists(store));
+    }
+}
+
+test "replay rejects v3 captures with lifecycle-only initial status" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const store = try std.fs.path.join(std.testing.allocator, &.{ root, "negative-ledger.jsonl" });
+    defer std.testing.allocator.free(store);
+    const record = try testActiveCaptureAlloc(std.testing.allocator, "route", "route_id", "route-a", TestArtifact);
+    defer std.testing.allocator.free(record);
+    const event = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"v\":3,\"event\":\"capture\",\"event_id\":\"evt-capture\",\"timestamp\":\"2026-07-12T00:00:00Z\",\"neg_id\":\"NEG-000001\",\"status\":\"reopened\",\"record\":{s}}}\n",
+        .{record},
+    );
+    defer std.testing.allocator.free(event);
+    try durable_store.writeTextAtomic(std.testing.allocator, store, event);
+
+    var loaded = try loadRecordsValidated(std.testing.allocator, store);
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(!loaded.validation.ok());
 }
 
 test "capture rejects duplicate neg_id before append" {
@@ -2986,6 +3157,27 @@ test "symbolic HEAD is resolved and empty artifact identity cannot activate" {
     try std.testing.expectEqualStrings(head, loaded.records.items[0].artifact_state_id);
     try std.testing.expectEqualStrings("HEAD", loaded.records.items[0].artifact_state_label);
 
+    const prefixed_store = try std.fs.path.join(std.testing.allocator, &.{ root, "prefixed-artifact.jsonl" });
+    defer std.testing.allocator.free(prefixed_store);
+    const prefixed_input = try std.fs.path.join(std.testing.allocator, &.{ root, "prefixed-artifact.json" });
+    defer std.testing.allocator.free(prefixed_input);
+    const symbolic_prefixed = try testActiveCaptureAlloc(std.testing.allocator, "route", "route_id", "route-a", "commit:HEAD");
+    defer std.testing.allocator.free(symbolic_prefixed);
+    try durable_store.writeTextAtomic(std.testing.allocator, prefixed_input, symbolic_prefixed);
+    var prefixed_capture = try appendCapture(std.testing.allocator, .{
+        .command = .capture,
+        .file = prefixed_store,
+        .json_path = prefixed_input,
+    });
+    defer prefixed_capture.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("active", prefixed_capture.status);
+    var prefixed_loaded = try loadRecordsValidated(std.testing.allocator, prefixed_store);
+    defer prefixed_loaded.deinit(std.testing.allocator);
+    const expected_prefixed = try std.fmt.allocPrint(std.testing.allocator, "commit:{s}", .{head});
+    defer std.testing.allocator.free(expected_prefixed);
+    try std.testing.expectEqualStrings(expected_prefixed, prefixed_loaded.records.items[0].artifact_state_id);
+    try std.testing.expectEqualStrings("commit:HEAD", prefixed_loaded.records.items[0].artifact_state_label);
+
     const empty_store = try std.fs.path.join(std.testing.allocator, &.{ root, "empty-artifact.jsonl" });
     defer std.testing.allocator.free(empty_store);
     const empty_input = try std.fs.path.join(std.testing.allocator, &.{ root, "empty-artifact.json" });
@@ -2996,6 +3188,36 @@ test "symbolic HEAD is resolved and empty artifact identity cannot activate" {
     var empty_capture = try appendCapture(std.testing.allocator, .{ .command = .capture, .file = empty_store, .json_path = empty_input });
     defer empty_capture.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("need-evidence", empty_capture.status);
+
+    const malformed_identities = [_][]const u8{ "sha256:x", "surface:x", "commit:", "tree:not-a-ref" };
+    for (malformed_identities, 0..) |identity, index| {
+        const malformed_store = try std.fmt.allocPrint(std.testing.allocator, "{s}/malformed-{d}.jsonl", .{ root, index });
+        defer std.testing.allocator.free(malformed_store);
+        const malformed_input = try std.fmt.allocPrint(std.testing.allocator, "{s}/malformed-{d}.json", .{ root, index });
+        defer std.testing.allocator.free(malformed_input);
+        const malformed = try testActiveCaptureAlloc(std.testing.allocator, "route", "route_id", "route-a", identity);
+        defer std.testing.allocator.free(malformed);
+        try durable_store.writeTextAtomic(std.testing.allocator, malformed_input, malformed);
+        var malformed_capture = try appendCapture(std.testing.allocator, .{
+            .command = .capture,
+            .file = malformed_store,
+            .json_path = malformed_input,
+        });
+        defer malformed_capture.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("need-evidence", malformed_capture.status);
+    }
+}
+
+test "prefixed artifact identity formats are concrete" {
+    const digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    try std.testing.expect(isImmutableArtifactIdentity("commit:" ++ TestArtifact));
+    try std.testing.expect(isImmutableArtifactIdentity("tree:" ++ TestArtifact));
+    try std.testing.expect(isImmutableArtifactIdentity("sha256:" ++ digest));
+    try std.testing.expect(isImmutableArtifactIdentity("surface:" ++ digest));
+    try std.testing.expect(!isImmutableArtifactIdentity("commit:HEAD"));
+    try std.testing.expect(!isImmutableArtifactIdentity("tree:main"));
+    try std.testing.expect(!isImmutableArtifactIdentity("sha256:x"));
+    try std.testing.expect(!isImmutableArtifactIdentity("surface:x"));
 }
 
 test "all advertised scopes have exact negative and near-match semantics" {

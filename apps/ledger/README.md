@@ -428,9 +428,11 @@ This converts legacy rows from `.ledger/learnings/learnings.jsonl` or `.learning
 }
 ```
 
-Records get monotonic `NEG-*` ids. Git labels such as `HEAD` are resolved to a full commit ID before persistence while the original text remains in `artifact_state_label`. An unresolved, empty, or otherwise mutable artifact identity cannot become active. The CLI derives `repository_id` from the Git remote when the capture omits it.
+Records get monotonic `NEG-*` ids. Git labels such as `HEAD` are resolved to a full commit ID before persistence while the original text remains in `artifact_state_label`. `commit:` and `tree:` identities require a concrete full object ID or a suffix that Git can resolve to one; `sha256:` and `surface:` identities require exactly 64 hexadecimal digits. An unresolved, malformed, empty, or otherwise mutable artifact identity cannot become active. The CLI derives `repository_id` from the Git remote when the capture omits it.
 
 One status-aware NER-v2 validator governs capture, replay/doctor, map, handoff, and export. An incomplete capture that requests or defaults to `active` is stored as `need-evidence`. Malformed typed fields, witness references, applicability arrays, or reopening criteria are rejected before append.
+
+Capture may begin only in `capture_candidate`, `need-evidence`, `unknown`, or `active`; lifecycle-only states must be reached through a proof-bearing status event. Pre-NER-v2 captures and proofless legacy authority events remain readable but project as `need-evidence`, never block, and permit a complete NER-v2 replacement to be appended before the legacy record is superseded.
 
 For learning capture, use `--source learnings` with the learning flags:
 
