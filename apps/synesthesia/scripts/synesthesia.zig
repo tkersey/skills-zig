@@ -59,7 +59,7 @@ const UsageText =
     \\
     \\usage: ledger --source synesthesia [-h] [--path PATH] {capture,doctor,path,recent,recall,query,show,export,memory-digest,migrate} ...
     \\
-    \\Capture, recall, and export durable Synesthesia mapping events from repo-local .ledger/synesthesia/events.jsonl.
+    \\Capture, recall, and export durable Synesthesia mapping events through the repo-local event-store API.
     \\
     \\positional arguments:
     \\  {capture,doctor,path,recent,recall,query,show,export,memory-digest,migrate}
@@ -76,7 +76,7 @@ const UsageText =
     \\
     \\options:
     \\  -h, --help            show this help message and exit
-    \\  --path PATH           Path to Synesthesia JSONL file (relative to repo root by default)
+    \\  --path PATH           Current persistent-adapter path (relative to repo root by default)
     \\  -V, --version         Show version
     \\  version               Show version
 ;
@@ -86,7 +86,7 @@ const CaptureUsageText =
     \\
     \\usage: ledger capture --source synesthesia [-h] --kind KIND --json FILE|- [--path PATH] [--allow-duplicate]
     \\
-    \\Append a durable Synesthesia event to repo-local .ledger/synesthesia/events.jsonl.
+    \\Append a durable Synesthesia event through the repo-local event-store API.
     \\
     \\options:
     \\  -h, --help            show this help message and exit
@@ -501,9 +501,13 @@ fn cmdCapture(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !
     defer allocator.free(line);
     const output_path = try resolveJsonlPathAlloc(allocator, repo_root, args.path);
     defer allocator.free(output_path);
+    var persistence = durable_store.PersistentEventStore.init(output_path);
+    const store = persistence.eventStore();
+    var snapshot = try store.snapshot(allocator, MaxStoreBytes);
+    defer snapshot.deinit(allocator);
 
     if (!args.allow_duplicate) {
-        if (try findDuplicateByFingerprintAlloc(allocator, output_path, normalized.fingerprint)) |existing_id| {
+        if (try findDuplicateByFingerprintInSnapshotAlloc(allocator, snapshot, normalized.fingerprint)) |existing_id| {
             defer allocator.free(existing_id);
             var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
             try stderr_writer.interface.print(
@@ -514,9 +518,13 @@ fn cmdCapture(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !
         }
     }
 
-    var lock = try durable_store.acquireLock(allocator, output_path);
-    defer lock.release(allocator);
-    try durable_store.appendLineAtomic(allocator, output_path, line, MaxStoreBytes);
+    var receipt = try store.append(
+        allocator,
+        line,
+        .{ .revision = snapshot.revision, .exists = snapshot.exists },
+        MaxStoreBytes,
+    );
+    defer receipt.deinit(allocator);
 
     return .{
         .id = try allocator.dupe(u8, syn_id),
@@ -529,19 +537,18 @@ fn cmdCapture(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !
 fn cmdDoctor(allocator: std.mem.Allocator, repo_root: []const u8, args: Args, codex_home: []const u8) !void {
     const path = try resolveJsonlPathAlloc(allocator, repo_root, args.path);
     defer allocator.free(path);
-    const exists = durable_store.fileExists(path);
+    var persistence = durable_store.PersistentEventStore.init(path);
+    var snapshot = persistence.eventStore().snapshot(allocator, MaxStoreBytes) catch |err| {
+        try printDoctorJson(allocator, "invalid", path, 0, @errorName(err));
+        return;
+    };
+    defer snapshot.deinit(allocator);
+    const exists = snapshot.exists;
     var status: []const u8 = "missing";
     var lines: usize = 0;
     var first_issue: []const u8 = "";
     if (exists) {
-        const bytes = durable_store.readRegularFileNoSymlink(allocator, path, MaxStoreBytes) catch |err| {
-            first_issue = @errorName(err);
-            status = "invalid";
-            try printDoctorJson(allocator, status, path, 0, first_issue);
-            return;
-        };
-        defer allocator.free(bytes);
-        const validation = validateJsonlBytes(allocator, bytes);
+        const validation = validateSnapshotRecords(allocator, snapshot);
         if (validation) |count| {
             lines = count;
             status = "current";
@@ -1068,15 +1075,17 @@ fn encodeEventLineAlloc(allocator: std.mem.Allocator, id: []const u8, captured_a
 }
 
 fn loadRecords(allocator: std.mem.Allocator, path: []const u8) !std.ArrayList(StoredRecord) {
+    var persistence = durable_store.PersistentEventStore.init(path);
+    var snapshot = try persistence.eventStore().snapshot(allocator, MaxStoreBytes);
+    defer snapshot.deinit(allocator);
+    return loadRecordsFromSnapshot(allocator, snapshot);
+}
+
+fn loadRecordsFromSnapshot(allocator: std.mem.Allocator, snapshot: durable_store.EventSnapshot) !std.ArrayList(StoredRecord) {
     var records: std.ArrayList(StoredRecord) = .empty;
-    if (!durable_store.fileExists(path)) return records;
-    const bytes = try durable_store.readRegularFileNoSymlink(allocator, path, MaxStoreBytes);
-    defer allocator.free(bytes);
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t\r\n");
-        if (line.len == 0) continue;
-        const record = try parseStoredRecordAlloc(allocator, line);
+    errdefer deinitRecords(allocator, &records);
+    for (snapshot.records) |event| {
+        const record = try parseStoredRecordAlloc(allocator, event.payload);
         try records.append(allocator, record);
     }
     return records;
@@ -1153,8 +1162,12 @@ fn searchTextAlloc(allocator: std.mem.Allocator, obj: std.json.ObjectMap) ![]u8 
     return out.toOwnedSlice();
 }
 
-fn findDuplicateByFingerprintAlloc(allocator: std.mem.Allocator, path: []const u8, fingerprint: []const u8) !?[]u8 {
-    var records = try loadRecords(allocator, path);
+fn findDuplicateByFingerprintInSnapshotAlloc(
+    allocator: std.mem.Allocator,
+    snapshot: durable_store.EventSnapshot,
+    fingerprint: []const u8,
+) !?[]u8 {
+    var records = try loadRecordsFromSnapshot(allocator, snapshot);
     defer deinitRecords(allocator, &records);
     for (records.items) |record| {
         if (std.mem.eql(u8, record.fingerprint, fingerprint)) return try allocator.dupe(u8, record.id);
@@ -1162,17 +1175,12 @@ fn findDuplicateByFingerprintAlloc(allocator: std.mem.Allocator, path: []const u
     return null;
 }
 
-fn validateJsonlBytes(allocator: std.mem.Allocator, bytes: []const u8) !usize {
-    var count: usize = 0;
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t\r\n");
-        if (line.len == 0) continue;
-        var record = try parseStoredRecordAlloc(allocator, line);
+fn validateSnapshotRecords(allocator: std.mem.Allocator, snapshot: durable_store.EventSnapshot) !usize {
+    for (snapshot.records) |event| {
+        var record = try parseStoredRecordAlloc(allocator, event.payload);
         record.deinit(allocator);
-        count += 1;
     }
-    return count;
+    return snapshot.records.len;
 }
 
 fn collectNoteRows(allocator: std.mem.Allocator, notes_dir: []const u8, rows: *std.ArrayList([]u8)) !void {

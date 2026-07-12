@@ -17,6 +17,509 @@ pub const JsonlValidation = struct {
     }
 };
 
+pub const EventRecord = struct {
+    payload: []u8,
+    ordinal: u64,
+    diagnostic_position: ?usize = null,
+
+    pub fn deinit(self: *EventRecord, allocator: std.mem.Allocator) void {
+        allocator.free(self.payload);
+        self.* = .{ .payload = &.{}, .ordinal = 0 };
+    }
+};
+
+pub const EventSnapshot = struct {
+    logical_ref: []u8,
+    exists: bool,
+    revision: []u8,
+    content_digest: []u8,
+    records: []EventRecord,
+    blank_entries: usize = 0,
+    extent_bytes: usize = 0,
+    append_separator_bytes: usize = 0,
+
+    pub fn deinit(self: *EventSnapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.logical_ref);
+        allocator.free(self.revision);
+        allocator.free(self.content_digest);
+        for (self.records) |*record| record.deinit(allocator);
+        allocator.free(self.records);
+        self.* = .{
+            .logical_ref = &.{},
+            .exists = false,
+            .revision = &.{},
+            .content_digest = &.{},
+            .records = &.{},
+        };
+    }
+};
+
+pub const EventAppendExpectation = struct {
+    revision: ?[]const u8 = null,
+    exists: ?bool = null,
+};
+
+pub const EventAppendReceipt = struct {
+    logical_ref: []u8,
+    revision_before: []u8,
+    revision_after: []u8,
+    content_digest_after: []u8,
+    record_count_before: usize,
+    record_count_after: usize,
+
+    pub fn deinit(self: *EventAppendReceipt, allocator: std.mem.Allocator) void {
+        allocator.free(self.logical_ref);
+        allocator.free(self.revision_before);
+        allocator.free(self.revision_after);
+        allocator.free(self.content_digest_after);
+        self.* = .{
+            .logical_ref = &.{},
+            .revision_before = &.{},
+            .revision_after = &.{},
+            .content_digest_after = &.{},
+            .record_count_before = 0,
+            .record_count_after = 0,
+        };
+    }
+};
+
+pub const EventStoreExclusive = struct {
+    context: *anyopaque,
+    vtable: *const VTable,
+    active: bool = true,
+
+    pub const VTable = struct {
+        snapshot: *const fn (context: *anyopaque, allocator: std.mem.Allocator, max_bytes: usize) anyerror!EventSnapshot,
+        append: *const fn (
+            context: *anyopaque,
+            allocator: std.mem.Allocator,
+            payload: []const u8,
+            expectation: EventAppendExpectation,
+            max_bytes: usize,
+        ) anyerror!EventAppendReceipt,
+        replace: *const fn (
+            context: *anyopaque,
+            allocator: std.mem.Allocator,
+            records: []const []const u8,
+            expectation: EventAppendExpectation,
+            max_bytes: usize,
+        ) anyerror!EventAppendReceipt,
+        release: *const fn (context: *anyopaque) void,
+    };
+
+    pub fn snapshot(self: *const EventStoreExclusive, allocator: std.mem.Allocator, max_bytes: usize) !EventSnapshot {
+        if (!self.active) return error.EventStoreSessionReleased;
+        return self.vtable.snapshot(self.context, allocator, max_bytes);
+    }
+
+    pub fn append(
+        self: *const EventStoreExclusive,
+        allocator: std.mem.Allocator,
+        payload: []const u8,
+        expectation: EventAppendExpectation,
+        max_bytes: usize,
+    ) !EventAppendReceipt {
+        if (!self.active) return error.EventStoreSessionReleased;
+        return self.vtable.append(self.context, allocator, payload, expectation, max_bytes);
+    }
+
+    pub fn replace(
+        self: *const EventStoreExclusive,
+        allocator: std.mem.Allocator,
+        records: []const []const u8,
+        expectation: EventAppendExpectation,
+        max_bytes: usize,
+    ) !EventAppendReceipt {
+        if (!self.active) return error.EventStoreSessionReleased;
+        return self.vtable.replace(self.context, allocator, records, expectation, max_bytes);
+    }
+
+    pub fn release(self: *EventStoreExclusive) void {
+        if (!self.active) return;
+        self.vtable.release(self.context);
+        self.active = false;
+    }
+};
+
+pub const EventStore = struct {
+    context: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        logicalRef: *const fn (context: *anyopaque) []const u8,
+        snapshot: *const fn (context: *anyopaque, allocator: std.mem.Allocator, max_bytes: usize) anyerror!EventSnapshot,
+        append: *const fn (
+            context: *anyopaque,
+            allocator: std.mem.Allocator,
+            payload: []const u8,
+            expectation: EventAppendExpectation,
+            max_bytes: usize,
+        ) anyerror!EventAppendReceipt,
+        replace: *const fn (
+            context: *anyopaque,
+            allocator: std.mem.Allocator,
+            records: []const []const u8,
+            expectation: EventAppendExpectation,
+            max_bytes: usize,
+        ) anyerror!EventAppendReceipt,
+        acquireExclusive: *const fn (context: *anyopaque, allocator: std.mem.Allocator) anyerror!EventStoreExclusive,
+    };
+
+    pub fn logicalRef(self: EventStore) []const u8 {
+        return self.vtable.logicalRef(self.context);
+    }
+
+    pub fn snapshot(self: EventStore, allocator: std.mem.Allocator, max_bytes: usize) !EventSnapshot {
+        return self.vtable.snapshot(self.context, allocator, max_bytes);
+    }
+
+    pub fn append(
+        self: EventStore,
+        allocator: std.mem.Allocator,
+        payload: []const u8,
+        expectation: EventAppendExpectation,
+        max_bytes: usize,
+    ) !EventAppendReceipt {
+        return self.vtable.append(self.context, allocator, payload, expectation, max_bytes);
+    }
+
+    pub fn replace(
+        self: EventStore,
+        allocator: std.mem.Allocator,
+        records: []const []const u8,
+        expectation: EventAppendExpectation,
+        max_bytes: usize,
+    ) !EventAppendReceipt {
+        return self.vtable.replace(self.context, allocator, records, expectation, max_bytes);
+    }
+
+    pub fn acquireExclusive(self: EventStore, allocator: std.mem.Allocator) !EventStoreExclusive {
+        return self.vtable.acquireExclusive(self.context, allocator);
+    }
+};
+
+/// Stable construction surface for repo-local persistent event stores.
+/// The locator is a logical store identity; the current compatibility adapter
+/// interprets it as a JSONL path. Source callers depend only on EventStore.
+pub const PersistentEventStore = struct {
+    adapter: JsonlEventStore,
+
+    pub fn init(locator: []const u8) PersistentEventStore {
+        return .{ .adapter = JsonlEventStore.init(locator) };
+    }
+
+    pub fn eventStore(self: *PersistentEventStore) EventStore {
+        return self.adapter.eventStore();
+    }
+};
+
+pub const JsonlEventStore = struct {
+    path: []const u8,
+
+    pub fn init(path: []const u8) JsonlEventStore {
+        return .{ .path = path };
+    }
+
+    pub fn eventStore(self: *JsonlEventStore) EventStore {
+        return .{ .context = self, .vtable = &vtable };
+    }
+
+    const vtable = EventStore.VTable{
+        .logicalRef = logicalRef,
+        .snapshot = snapshot,
+        .append = append,
+        .replace = replace,
+        .acquireExclusive = acquireExclusive,
+    };
+
+    const ExclusiveContext = struct {
+        allocator: std.mem.Allocator,
+        store: *JsonlEventStore,
+        lock: LockFile,
+    };
+
+    const exclusive_vtable = EventStoreExclusive.VTable{
+        .snapshot = exclusiveSnapshot,
+        .append = exclusiveAppend,
+        .replace = exclusiveReplace,
+        .release = releaseExclusive,
+    };
+
+    fn cast(context: *anyopaque) *JsonlEventStore {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn logicalRef(context: *anyopaque) []const u8 {
+        return cast(context).path;
+    }
+
+    fn snapshot(context: *anyopaque, allocator: std.mem.Allocator, max_bytes: usize) !EventSnapshot {
+        const self = cast(context);
+        const data = readRegularFileNoSymlink(allocator, self.path, max_bytes) catch |err| switch (err) {
+            error.FileNotFound => return eventSnapshotFromBytes(allocator, true, self.path, false, ""),
+            else => return err,
+        };
+        defer allocator.free(data);
+        return eventSnapshotFromBytes(allocator, true, self.path, true, data);
+    }
+
+    fn append(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        payload: []const u8,
+        expectation: EventAppendExpectation,
+        max_bytes: usize,
+    ) !EventAppendReceipt {
+        var exclusive = acquireExclusive(context, allocator) catch |err| switch (err) {
+            error.EventStoreBusy => return error.PathAlreadyExists,
+            else => return err,
+        };
+        defer exclusive.release();
+        return exclusive.append(allocator, payload, expectation, max_bytes);
+    }
+
+    fn replace(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        records: []const []const u8,
+        expectation: EventAppendExpectation,
+        max_bytes: usize,
+    ) !EventAppendReceipt {
+        var exclusive = acquireExclusive(context, allocator) catch |err| switch (err) {
+            error.EventStoreBusy => return error.PathAlreadyExists,
+            else => return err,
+        };
+        defer exclusive.release();
+        return exclusive.replace(allocator, records, expectation, max_bytes);
+    }
+
+    fn acquireExclusive(context: *anyopaque, allocator: std.mem.Allocator) !EventStoreExclusive {
+        const self = cast(context);
+        const exclusive = try allocator.create(ExclusiveContext);
+        errdefer allocator.destroy(exclusive);
+        const lock = acquireLock(allocator, self.path) catch |err| switch (err) {
+            error.PathAlreadyExists => return error.EventStoreBusy,
+            else => return err,
+        };
+        exclusive.* = .{ .allocator = allocator, .store = self, .lock = lock };
+        return .{ .context = exclusive, .vtable = &exclusive_vtable };
+    }
+
+    fn exclusiveCast(context: *anyopaque) *ExclusiveContext {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn exclusiveSnapshot(context: *anyopaque, allocator: std.mem.Allocator, max_bytes: usize) !EventSnapshot {
+        const exclusive = exclusiveCast(context);
+        return snapshot(exclusive.store, allocator, max_bytes);
+    }
+
+    fn exclusiveAppend(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        payload: []const u8,
+        expectation: EventAppendExpectation,
+        max_bytes: usize,
+    ) !EventAppendReceipt {
+        const exclusive = exclusiveCast(context);
+        try validateEventPayload(allocator, payload);
+        var before = try snapshot(exclusive.store, allocator, max_bytes);
+        defer before.deinit(allocator);
+        try validateEventExpectation(before, expectation);
+        try validateEventAppendFits(before, payload.len, max_bytes);
+        try appendLineAtomic(allocator, exclusive.store.path, payload, max_bytes);
+        var after = try snapshot(exclusive.store, allocator, max_bytes);
+        defer after.deinit(allocator);
+        return eventAppendReceipt(allocator, before, after);
+    }
+
+    fn exclusiveReplace(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        records: []const []const u8,
+        expectation: EventAppendExpectation,
+        max_bytes: usize,
+    ) !EventAppendReceipt {
+        const exclusive = exclusiveCast(context);
+        for (records) |payload| try validateEventPayload(allocator, payload);
+        var before = try snapshot(exclusive.store, allocator, max_bytes);
+        defer before.deinit(allocator);
+        try validateEventExpectation(before, expectation);
+        const text = try renderEventRecordsAlloc(allocator, records);
+        defer allocator.free(text);
+        if (text.len > max_bytes) return error.StreamTooLong;
+        try writeTextAtomic(allocator, exclusive.store.path, text);
+        var after = try snapshot(exclusive.store, allocator, max_bytes);
+        defer after.deinit(allocator);
+        return eventAppendReceipt(allocator, before, after);
+    }
+
+    fn releaseExclusive(context: *anyopaque) void {
+        const exclusive = exclusiveCast(context);
+        exclusive.lock.release(exclusive.allocator);
+        const allocator = exclusive.allocator;
+        allocator.destroy(exclusive);
+    }
+};
+
+pub const MemoryEventStore = struct {
+    allocator: std.mem.Allocator,
+    logical_ref: []const u8,
+    exists: bool = false,
+    exclusive_active: bool = false,
+    records: std.ArrayList([]u8) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator, logical_ref: []const u8) MemoryEventStore {
+        return .{ .allocator = allocator, .logical_ref = logical_ref };
+    }
+
+    pub fn deinit(self: *MemoryEventStore) void {
+        for (self.records.items) |record| self.allocator.free(record);
+        self.records.deinit(self.allocator);
+        self.* = .{ .allocator = self.allocator, .logical_ref = self.logical_ref };
+    }
+
+    pub fn eventStore(self: *MemoryEventStore) EventStore {
+        return .{ .context = self, .vtable = &vtable };
+    }
+
+    const vtable = EventStore.VTable{
+        .logicalRef = logicalRef,
+        .snapshot = snapshot,
+        .append = append,
+        .replace = replace,
+        .acquireExclusive = acquireExclusive,
+    };
+
+    const ExclusiveContext = struct {
+        allocator: std.mem.Allocator,
+        store: *MemoryEventStore,
+    };
+
+    const exclusive_vtable = EventStoreExclusive.VTable{
+        .snapshot = exclusiveSnapshot,
+        .append = exclusiveAppend,
+        .replace = exclusiveReplace,
+        .release = releaseExclusive,
+    };
+
+    fn cast(context: *anyopaque) *MemoryEventStore {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn logicalRef(context: *anyopaque) []const u8 {
+        return cast(context).logical_ref;
+    }
+
+    fn snapshot(context: *anyopaque, allocator: std.mem.Allocator, max_bytes: usize) !EventSnapshot {
+        const self = cast(context);
+        const text = try renderEventRecordsAlloc(allocator, self.records.items);
+        defer allocator.free(text);
+        if (text.len > max_bytes) return error.StreamTooLong;
+        return eventSnapshotFromBytes(allocator, false, self.logical_ref, self.exists, text);
+    }
+
+    fn append(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        payload: []const u8,
+        expectation: EventAppendExpectation,
+        max_bytes: usize,
+    ) !EventAppendReceipt {
+        var exclusive = try acquireExclusive(context, allocator);
+        defer exclusive.release();
+        return exclusive.append(allocator, payload, expectation, max_bytes);
+    }
+
+    fn replace(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        records: []const []const u8,
+        expectation: EventAppendExpectation,
+        max_bytes: usize,
+    ) !EventAppendReceipt {
+        var exclusive = try acquireExclusive(context, allocator);
+        defer exclusive.release();
+        return exclusive.replace(allocator, records, expectation, max_bytes);
+    }
+
+    fn acquireExclusive(context: *anyopaque, allocator: std.mem.Allocator) !EventStoreExclusive {
+        const self = cast(context);
+        if (self.exclusive_active) return error.EventStoreBusy;
+        const exclusive = try allocator.create(ExclusiveContext);
+        exclusive.* = .{ .allocator = allocator, .store = self };
+        self.exclusive_active = true;
+        return .{ .context = exclusive, .vtable = &exclusive_vtable };
+    }
+
+    fn exclusiveCast(context: *anyopaque) *ExclusiveContext {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn exclusiveSnapshot(context: *anyopaque, allocator: std.mem.Allocator, max_bytes: usize) !EventSnapshot {
+        return snapshot(exclusiveCast(context).store, allocator, max_bytes);
+    }
+
+    fn exclusiveAppend(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        payload: []const u8,
+        expectation: EventAppendExpectation,
+        max_bytes: usize,
+    ) !EventAppendReceipt {
+        const self = exclusiveCast(context).store;
+        try validateEventPayload(allocator, payload);
+        var before = try snapshot(self, allocator, max_bytes);
+        defer before.deinit(allocator);
+        try validateEventExpectation(before, expectation);
+        try validateEventAppendFits(before, payload.len, max_bytes);
+        try self.records.append(self.allocator, try self.allocator.dupe(u8, payload));
+        self.exists = true;
+        var after = try snapshot(self, allocator, max_bytes);
+        defer after.deinit(allocator);
+        return eventAppendReceipt(allocator, before, after);
+    }
+
+    fn exclusiveReplace(
+        context: *anyopaque,
+        allocator: std.mem.Allocator,
+        records: []const []const u8,
+        expectation: EventAppendExpectation,
+        max_bytes: usize,
+    ) !EventAppendReceipt {
+        const self = exclusiveCast(context).store;
+        for (records) |payload| try validateEventPayload(allocator, payload);
+        var before = try snapshot(self, allocator, max_bytes);
+        defer before.deinit(allocator);
+        try validateEventExpectation(before, expectation);
+        const replacement_text = try renderEventRecordsAlloc(allocator, records);
+        defer allocator.free(replacement_text);
+        if (replacement_text.len > max_bytes) return error.StreamTooLong;
+
+        var replacement: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (replacement.items) |record| self.allocator.free(record);
+            replacement.deinit(self.allocator);
+        }
+        for (records) |payload| try replacement.append(self.allocator, try self.allocator.dupe(u8, payload));
+        for (self.records.items) |record| self.allocator.free(record);
+        self.records.deinit(self.allocator);
+        self.records = replacement;
+        replacement = .empty;
+        self.exists = true;
+        var after = try snapshot(self, allocator, max_bytes);
+        defer after.deinit(allocator);
+        return eventAppendReceipt(allocator, before, after);
+    }
+
+    fn releaseExclusive(context: *anyopaque) void {
+        const exclusive = exclusiveCast(context);
+        exclusive.store.exclusive_active = false;
+        const allocator = exclusive.allocator;
+        allocator.destroy(exclusive);
+    }
+};
+
 pub const DurableStoreError = error{
     LockBusy,
     LockExpired,
@@ -1251,6 +1754,123 @@ fn digestBytesAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
     return std.fmt.allocPrint(allocator, "sha256:{s}", .{&hex});
+}
+
+fn validateEventPayload(allocator: std.mem.Allocator, payload: []const u8) !void {
+    if (payload.len == 0 or std.mem.indexOfScalar(u8, payload, '\n') != null or std.mem.indexOfScalar(u8, payload, '\r') != null) {
+        return error.InvalidEventPayload;
+    }
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, payload, .{}) catch return error.InvalidEventPayload;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidEventPayload;
+}
+
+fn eventSnapshotFromBytes(
+    allocator: std.mem.Allocator,
+    include_physical_lines: bool,
+    logical_ref: []const u8,
+    exists: bool,
+    bytes: []const u8,
+) !EventSnapshot {
+    var records: std.ArrayList(EventRecord) = .empty;
+    errdefer {
+        for (records.items) |*record| record.deinit(allocator);
+        records.deinit(allocator);
+    }
+    var blank_entries: usize = 0;
+    var physical_line: usize = 0;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |raw| {
+        physical_line += 1;
+        const payload = std.mem.trim(u8, raw, " \t\r\n");
+        if (payload.len == 0) {
+            if (raw.len != 0 or physical_line <= std.mem.count(u8, bytes, "\n")) blank_entries += 1;
+            continue;
+        }
+        try records.append(allocator, .{
+            .payload = try allocator.dupe(u8, payload),
+            .ordinal = @intCast(records.items.len + 1),
+            .diagnostic_position = if (include_physical_lines) physical_line else null,
+        });
+    }
+
+    const owned_records = try records.toOwnedSlice(allocator);
+    errdefer {
+        for (owned_records) |*record| record.deinit(allocator);
+        allocator.free(owned_records);
+    }
+    var canonical: std.Io.Writer.Allocating = .init(allocator);
+    defer canonical.deinit();
+    for (owned_records) |record| {
+        try canonical.writer.writeAll(record.payload);
+        try canonical.writer.writeByte('\n');
+    }
+    const canonical_bytes = try canonical.toOwnedSlice();
+    defer allocator.free(canonical_bytes);
+    const owned_logical_ref = try allocator.dupe(u8, logical_ref);
+    errdefer allocator.free(owned_logical_ref);
+    const revision = try digestBytesAlloc(allocator, bytes);
+    errdefer allocator.free(revision);
+    const content_digest = try digestBytesAlloc(allocator, canonical_bytes);
+    errdefer allocator.free(content_digest);
+    return .{
+        .logical_ref = owned_logical_ref,
+        .exists = exists,
+        .revision = revision,
+        .content_digest = content_digest,
+        .records = owned_records,
+        .blank_entries = blank_entries,
+        .extent_bytes = bytes.len,
+        .append_separator_bytes = if (bytes.len != 0 and bytes[bytes.len - 1] != '\n') 1 else 0,
+    };
+}
+
+fn validateEventExpectation(snapshot: EventSnapshot, expectation: EventAppendExpectation) !void {
+    if (expectation.exists) |expected| {
+        if (expected != snapshot.exists) return error.ExpectationMismatch;
+    }
+    if (expectation.revision) |expected| {
+        if (!std.mem.eql(u8, expected, snapshot.revision)) return error.ExpectationMismatch;
+    }
+}
+
+fn validateEventAppendFits(snapshot: EventSnapshot, payload_len: usize, max_bytes: usize) !void {
+    if (snapshot.extent_bytes > max_bytes or payload_len >= max_bytes) return error.StreamTooLong;
+    const additional = payload_len + 1 + snapshot.append_separator_bytes;
+    if (additional > max_bytes - snapshot.extent_bytes) return error.StreamTooLong;
+}
+
+fn eventAppendReceipt(
+    allocator: std.mem.Allocator,
+    before: EventSnapshot,
+    after: EventSnapshot,
+) !EventAppendReceipt {
+    const logical_ref = try allocator.dupe(u8, after.logical_ref);
+    errdefer allocator.free(logical_ref);
+    const revision_before = try allocator.dupe(u8, before.revision);
+    errdefer allocator.free(revision_before);
+    const revision_after = try allocator.dupe(u8, after.revision);
+    errdefer allocator.free(revision_after);
+    const content_digest_after = try allocator.dupe(u8, after.content_digest);
+    errdefer allocator.free(content_digest_after);
+    return .{
+        .logical_ref = logical_ref,
+        .revision_before = revision_before,
+        .revision_after = revision_after,
+        .content_digest_after = content_digest_after,
+        .record_count_before = before.records.len,
+        .record_count_after = after.records.len,
+    };
+}
+
+fn renderEventRecordsAlloc(allocator: std.mem.Allocator, records: []const []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    for (records) |payload| {
+        try out.writer.writeAll(payload);
+        try out.writer.writeByte('\n');
+    }
+    return out.toOwnedSlice();
 }
 
 fn jsonlSequenceOrNull(allocator: std.mem.Allocator, bytes: []const u8) !?u64 {
@@ -2701,6 +3321,160 @@ test "appendJsonlCheckpointTransaction reports pending prepared recovery" {
         "{\"workspace_sequence\":1,\"ok\":true}",
         .{ .expected_sequence = 0, .sequence_field = "workspace_sequence" },
     ));
+}
+
+fn assertEventStoreContract(store: EventStore) !void {
+    var initial = try store.snapshot(std.testing.allocator, 4096);
+    defer initial.deinit(std.testing.allocator);
+    try std.testing.expect(!initial.exists);
+    try std.testing.expectEqual(@as(usize, 0), initial.records.len);
+    try std.testing.expectError(error.InvalidEventPayload, store.append(
+        std.testing.allocator,
+        "not-json",
+        .{ .revision = initial.revision, .exists = false },
+        4096,
+    ));
+
+    var first = try store.append(
+        std.testing.allocator,
+        "{\"schema\":\"event/v1\",\"sequence\":1}",
+        .{ .revision = initial.revision, .exists = false },
+        4096,
+    );
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), first.record_count_before);
+    try std.testing.expectEqual(@as(usize, 1), first.record_count_after);
+
+    var after_first = try store.snapshot(std.testing.allocator, 4096);
+    defer after_first.deinit(std.testing.allocator);
+    try std.testing.expect(after_first.exists);
+    try std.testing.expectEqual(@as(usize, 1), after_first.records.len);
+    try std.testing.expectEqualStrings("{\"schema\":\"event/v1\",\"sequence\":1}", after_first.records[0].payload);
+    try std.testing.expectEqualStrings(first.revision_after, after_first.revision);
+    try std.testing.expectError(error.ExpectationMismatch, store.append(
+        std.testing.allocator,
+        "{\"schema\":\"event/v1\",\"sequence\":2}",
+        .{ .revision = initial.revision, .exists = true },
+        4096,
+    ));
+    try std.testing.expectError(error.StreamTooLong, store.append(
+        std.testing.allocator,
+        "{\"schema\":\"event/v1\",\"sequence\":2}",
+        .{ .revision = after_first.revision, .exists = true },
+        after_first.extent_bytes + 1,
+    ));
+    var after_rejected_append = try store.snapshot(std.testing.allocator, 4096);
+    defer after_rejected_append.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(after_first.revision, after_rejected_append.revision);
+    const oversized_replacement = [_][]const u8{"{\"schema\":\"event/v1\",\"sequence\":2,\"padding\":\"too-large\"}"};
+    try std.testing.expectError(error.StreamTooLong, store.replace(
+        std.testing.allocator,
+        &oversized_replacement,
+        .{ .revision = after_first.revision, .exists = true },
+        after_first.extent_bytes,
+    ));
+    var after_rejected_replace = try store.snapshot(std.testing.allocator, 4096);
+    defer after_rejected_replace.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(after_first.revision, after_rejected_replace.revision);
+
+    const replacement = [_][]const u8{
+        "{\"schema\":\"event/v1\",\"sequence\":1}",
+        "{\"schema\":\"event/v1\",\"sequence\":2}",
+    };
+    var replaced = try store.replace(
+        std.testing.allocator,
+        &replacement,
+        .{ .revision = after_first.revision, .exists = true },
+        4096,
+    );
+    defer replaced.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), replaced.record_count_after);
+    var final = try store.snapshot(std.testing.allocator, 4096);
+    defer final.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), final.records.len);
+    try std.testing.expectEqualStrings(replaced.content_digest_after, final.content_digest);
+}
+
+fn assertExclusiveEventStoreContract(store: EventStore) !void {
+    var exclusive = try store.acquireExclusive(std.testing.allocator);
+    defer exclusive.release();
+    try std.testing.expectError(error.EventStoreBusy, store.acquireExclusive(std.testing.allocator));
+
+    var initial = try exclusive.snapshot(std.testing.allocator, 4096);
+    defer initial.deinit(std.testing.allocator);
+    var receipt = try exclusive.append(
+        std.testing.allocator,
+        "{\"schema\":\"exclusive-event/v1\",\"sequence\":1}",
+        .{ .revision = initial.revision, .exists = false },
+        4096,
+    );
+    defer receipt.deinit(std.testing.allocator);
+    exclusive.release();
+    try std.testing.expectError(error.EventStoreSessionReleased, exclusive.snapshot(std.testing.allocator, 4096));
+
+    var reacquired = try store.acquireExclusive(std.testing.allocator);
+    reacquired.release();
+}
+
+test "event store contract is backend independent" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "events.jsonl" });
+    defer std.testing.allocator.free(path);
+
+    var persistent_backend = PersistentEventStore.init(path);
+    try assertEventStoreContract(persistent_backend.eventStore());
+
+    var memory_backend = MemoryEventStore.init(std.testing.allocator, "memory:test");
+    defer memory_backend.deinit();
+    try assertEventStoreContract(memory_backend.eventStore());
+
+    var persistent_snapshot = try persistent_backend.eventStore().snapshot(std.testing.allocator, 4096);
+    defer persistent_snapshot.deinit(std.testing.allocator);
+    var memory_snapshot = try memory_backend.eventStore().snapshot(std.testing.allocator, 4096);
+    defer memory_snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(persistent_snapshot.records.len, memory_snapshot.records.len);
+    try std.testing.expectEqualStrings(persistent_snapshot.content_digest, memory_snapshot.content_digest);
+    for (persistent_snapshot.records, memory_snapshot.records) |persistent_record, memory_record| {
+        try std.testing.expectEqualStrings(persistent_record.payload, memory_record.payload);
+    }
+}
+
+test "event store exclusive sessions preserve effectful transition ownership" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "exclusive-events.jsonl" });
+    defer std.testing.allocator.free(path);
+
+    var persistent_backend = PersistentEventStore.init(path);
+    try assertExclusiveEventStoreContract(persistent_backend.eventStore());
+
+    var memory_backend = MemoryEventStore.init(std.testing.allocator, "memory:exclusive-test");
+    defer memory_backend.deinit();
+    try assertExclusiveEventStoreContract(memory_backend.eventStore());
+}
+
+test "jsonl event store contains physical diagnostics in its adapter" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "events.jsonl" });
+    defer std.testing.allocator.free(path);
+    try writeTextAtomic(std.testing.allocator, path, "{\"sequence\":1}\n\n{\"sequence\":2}");
+
+    var backend = JsonlEventStore.init(path);
+    var snapshot = try backend.eventStore().snapshot(std.testing.allocator, 4096);
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.records.len);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.blank_entries);
+    try std.testing.expectEqual(@as(?usize, 1), snapshot.records[0].diagnostic_position);
+    try std.testing.expectEqual(@as(?usize, 3), snapshot.records[1].diagnostic_position);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.append_separator_bytes);
 }
 
 test "validateJsonlBytes reports first invalid row" {

@@ -18,7 +18,7 @@ This directory is no longer an independently shipped CLI surface.
   `$CODEX_HOME/memories/extensions/learnings/resources/latest_learnings_digest.md`
   (falling back to `$HOME/.codex/...` when `CODEX_HOME` is unset).
 
-Default store:
+Current persistent-adapter path:
 
 ```bash
 .ledger/learnings/events.jsonl
@@ -27,6 +27,10 @@ Default store:
 Breaking/default-path change: ledger now stores learning events under
 `.ledger/learnings/events.jsonl`. Use `ledger migrate --source learnings` to
 copy legacy rows.
+
+Learning queries and captures use the shared backend-neutral event-store API;
+JSONL is the current compatibility adapter, not a caller contract. Legacy
+JSONL parsing remains only at the explicit migration and repair boundary.
 
 Preflight before appending in a repo with possible legacy rows:
 

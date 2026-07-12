@@ -39,8 +39,8 @@ const HelpText =
     \\  compact    Report compaction candidates
     \\  handoff    Emit active exclusions for handoff
     \\  show       Show one NEG record by --id
-    \\  doctor     Validate JSONL store integrity
-    \\  migrate    Copy or move legacy source stores into their events.jsonl store
+    \\  doctor     Validate event-store integrity
+    \\  migrate    Copy or move legacy source stores into the current persistent adapter
     \\  recent     With a supporting --source namespace, show recent source events
     \\  recall     With a supporting --source namespace, rank relevant source events
     \\  path       With a supporting --source namespace, print the resolved event path
@@ -48,7 +48,7 @@ const HelpText =
     \\  validate   Purely validate governance and review artifacts
     \\
     \\options:
-    \\  --file PATH       Store path (default: .ledger/negative-ledger/events.jsonl)
+    \\  --file PATH       Persistent-adapter path (default: .ledger/negative-ledger/events.jsonl)
     \\  --source SOURCE   Source namespace; omit for negative-ledger, or use actuation, hylo, learnings, synesthesia, or universalist
     \\  --json PATH|-     Capture input JSON
     \\  --id NEG-ID       Record id for show/reopen/status/export
@@ -159,10 +159,14 @@ const RouteGate = struct {
 const ValidationIssue = struct {
     issue_count: usize = 0,
     first_issue: ?[]const u8 = null,
+    first_issue_line: usize = 0,
 
-    fn add(self: *ValidationIssue, message: []const u8) void {
+    fn add(self: *ValidationIssue, message: []const u8, diagnostic_position: ?usize) void {
         self.issue_count += 1;
-        if (self.first_issue == null) self.first_issue = message;
+        if (self.first_issue == null) {
+            self.first_issue = message;
+            self.first_issue_line = diagnostic_position orelse 0;
+        }
     }
 
     fn ok(self: ValidationIssue) bool {
@@ -440,8 +444,13 @@ fn run(allocator: std.mem.Allocator, args: Args) !u8 {
 }
 
 fn cmdInit(allocator: std.mem.Allocator, path: []const u8) !u8 {
-    if (!durable_store.fileExists(path)) {
-        try durable_store.writeTextAtomic(allocator, path, "");
+    var backend = durable_store.PersistentEventStore.init(path);
+    const store = backend.eventStore();
+    var snapshot = try store.snapshot(allocator, MaxStoreBytes);
+    defer snapshot.deinit(allocator);
+    if (!snapshot.exists) {
+        var receipt = try store.replace(allocator, &.{}, .{ .revision = snapshot.revision, .exists = false }, MaxStoreBytes);
+        defer receipt.deinit(allocator);
         try ensureInitLockSidecarGitignored(allocator, path);
         try printJsonLine(allocator, .init, "initialized", path, 0);
         return 0;
@@ -504,11 +513,13 @@ fn appendCapture(allocator: std.mem.Allocator, args: Args) !CaptureResult {
     };
     try validateCaptureInput(obj);
 
-    var lock = try durable_store.acquireLock(allocator, args.file);
-    defer lock.release(allocator);
-
-    var records = try loadRecords(allocator, args.file);
-    defer deinitRecords(allocator, &records);
+    var backend = durable_store.PersistentEventStore.init(args.file);
+    const store = backend.eventStore();
+    var snapshot = try store.snapshot(allocator, MaxStoreBytes);
+    defer snapshot.deinit(allocator);
+    var loaded = try loadRecordsFromSnapshot(allocator, &snapshot);
+    defer loaded.deinit(allocator);
+    const records = &loaded.records;
     const neg_id = if (jsonStringField(obj, "neg_id")) |id|
         try allocator.dupe(u8, id)
     else
@@ -535,7 +546,13 @@ fn appendCapture(allocator: std.mem.Allocator, args: Args) !CaptureResult {
     try out.writer.writeByte('}');
     const line = try out.toOwnedSlice();
     defer allocator.free(line);
-    try durable_store.appendLineAtomic(allocator, args.file, line, MaxStoreBytes);
+    var receipt = try store.append(
+        allocator,
+        line,
+        .{ .revision = snapshot.revision, .exists = snapshot.exists },
+        MaxStoreBytes,
+    );
+    defer receipt.deinit(allocator);
 
     return .{
         .neg_id = try allocator.dupe(u8, neg_id),
@@ -580,11 +597,14 @@ fn cmdMap(allocator: std.mem.Allocator, args: Args) !u8 {
         try writeRouteGate(allocator, args, .{}, null, 3, false, "invalid_gate_input");
         return 3;
     }
-    if (!durable_store.fileExists(args.file)) {
+    var backend = durable_store.PersistentEventStore.init(args.file);
+    var snapshot = try backend.eventStore().snapshot(allocator, MaxStoreBytes);
+    defer snapshot.deinit(allocator);
+    if (!snapshot.exists) {
         try writeRouteGate(allocator, args, .{}, null, 3, false, "ledger_missing");
         return 3;
     }
-    var loaded = try loadRecordsValidated(allocator, args.file);
+    var loaded = try loadRecordsFromSnapshot(allocator, &snapshot);
     defer loaded.deinit(allocator);
     if (!loaded.validation.ok()) {
         try writeRouteGate(allocator, args, .{}, null, 3, true, "store_invalid");
@@ -654,8 +674,11 @@ fn writeMapCommandJson(writer: anytype, args: Args) !void {
 
 fn mapStatusForStore(allocator: std.mem.Allocator, args: Args) !u8 {
     if (args.route.len == 0 or args.cluster.len == 0 or args.artifact.len == 0) return 3;
-    if (!durable_store.fileExists(args.file)) return 3;
-    var loaded = try loadRecordsValidated(allocator, args.file);
+    var backend = durable_store.PersistentEventStore.init(args.file);
+    var snapshot = try backend.eventStore().snapshot(allocator, MaxStoreBytes);
+    defer snapshot.deinit(allocator);
+    if (!snapshot.exists) return 3;
+    var loaded = try loadRecordsFromSnapshot(allocator, &snapshot);
     defer loaded.deinit(allocator);
     if (!loaded.validation.ok()) return 3;
     const gate = evaluateRouteGate(loaded.records.items, args);
@@ -680,10 +703,11 @@ fn evaluateRouteGate(records: []const Record, args: Args) RouteGate {
 fn cmdStatusEvent(allocator: std.mem.Allocator, path: []const u8, neg_id: []const u8, status: []const u8, reason: []const u8, command: Command) !u8 {
     if (!isKnownStatus(status)) return error.InvalidStatus;
     if (reason.len == 0) return error.MissingReason;
-    var lock = try durable_store.acquireLock(allocator, path);
-    defer lock.release(allocator);
-
-    var loaded = try loadRecordsValidated(allocator, path);
+    var backend = durable_store.PersistentEventStore.init(path);
+    const store = backend.eventStore();
+    var snapshot = try store.snapshot(allocator, MaxStoreBytes);
+    defer snapshot.deinit(allocator);
+    var loaded = try loadRecordsFromSnapshot(allocator, &snapshot);
     defer loaded.deinit(allocator);
     if (findRecord(loaded.records.items, neg_id) == null) {
         var missing: std.Io.Writer.Allocating = .init(allocator);
@@ -706,7 +730,13 @@ fn cmdStatusEvent(allocator: std.mem.Allocator, path: []const u8, neg_id: []cons
     try out.writer.writeByte('}');
     const line = try out.toOwnedSlice();
     defer allocator.free(line);
-    try durable_store.appendLineAtomic(allocator, path, line, MaxStoreBytes);
+    var receipt = try store.append(
+        allocator,
+        line,
+        .{ .revision = snapshot.revision, .exists = snapshot.exists },
+        MaxStoreBytes,
+    );
+    defer receipt.deinit(allocator);
     try printJsonLine(allocator, command, status, neg_id, 0);
     return 0;
 }
@@ -758,24 +788,22 @@ fn cmdHandoff(allocator: std.mem.Allocator, path: []const u8) !u8 {
 }
 
 fn cmdDoctor(allocator: std.mem.Allocator, path: []const u8) !u8 {
-    const jsonl_result = try durable_store.validateJsonl(allocator, path, MaxStoreBytes);
-    var loaded = try loadRecordsValidated(allocator, path);
+    var backend = durable_store.PersistentEventStore.init(path);
+    var snapshot = try backend.eventStore().snapshot(allocator, MaxStoreBytes);
+    defer snapshot.deinit(allocator);
+    var loaded = try loadRecordsFromSnapshot(allocator, &snapshot);
     defer loaded.deinit(allocator);
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    const ok = jsonl_result.ok() and loaded.validation.ok();
+    const ok = loaded.validation.ok();
     try out.writer.print("{{\"command\":\"doctor\",\"ok\":{s},\"records\":{d},\"blank_lines\":{d},\"issues\":{d}", .{
         if (ok) "true" else "false",
         loaded.records.items.len,
-        jsonl_result.blank_lines,
-        loaded.validation.issue_count + if (jsonl_result.ok()) @as(usize, 0) else @as(usize, 1),
+        snapshot.blank_entries,
+        loaded.validation.issue_count,
     });
-    if (jsonl_result.first_issue) |issue| {
-        try out.writer.print(",\"first_issue\":{{\"line\":{d},\"message\":", .{issue.line});
-        try writeJsonString(&out.writer, issue.message);
-        try out.writer.writeAll("}");
-    } else if (loaded.validation.first_issue) |message| {
-        try out.writer.writeAll(",\"first_issue\":{\"line\":0,\"message\":");
+    if (loaded.validation.first_issue) |message| {
+        try out.writer.print(",\"first_issue\":{{\"line\":{d},\"message\":", .{loaded.validation.first_issue_line});
         try writeJsonString(&out.writer, message);
         try out.writer.writeAll("}");
     }
@@ -931,70 +959,69 @@ fn loadRecords(allocator: std.mem.Allocator, path: []const u8) !std.ArrayList(Re
 }
 
 fn loadRecordsValidated(allocator: std.mem.Allocator, path: []const u8) !LoadResult {
-    var records = std.ArrayList(Record).empty;
-    const data = durable_store.readFileAlloc(allocator, path, MaxStoreBytes) catch |err| switch (err) {
-        error.FileNotFound => return .{ .records = records },
-        else => return err,
-    };
-    defer allocator.free(data);
+    var backend = durable_store.PersistentEventStore.init(path);
+    var snapshot = try backend.eventStore().snapshot(allocator, MaxStoreBytes);
+    defer snapshot.deinit(allocator);
+    return loadRecordsFromSnapshot(allocator, &snapshot);
+}
 
+fn loadRecordsFromSnapshot(allocator: std.mem.Allocator, snapshot: *const durable_store.EventSnapshot) !LoadResult {
+    var records = std.ArrayList(Record).empty;
     var validation = ValidationIssue{};
-    var lines = std.mem.splitScalar(u8, data, '\n');
-    while (lines.next()) |raw_line| {
-        const line = std.mem.trim(u8, raw_line, " \t\r\n");
-        if (line.len == 0) continue;
+    for (snapshot.records) |stored| {
+        const line = stored.payload;
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch {
-            validation.add("invalid json");
+            validation.add("invalid json", stored.diagnostic_position);
             continue;
         };
         defer parsed.deinit();
         const obj = switch (parsed.value) {
             .object => |value| value,
             else => {
-                validation.add("event is not an object");
+                validation.add("event is not an object", stored.diagnostic_position);
                 continue;
             },
         };
         const event = jsonStringField(obj, "event") orelse {
-            validation.add("missing event");
+            validation.add("missing event", stored.diagnostic_position);
             continue;
         };
         const neg_id = jsonStringField(obj, "neg_id") orelse {
-            validation.add("missing neg_id");
+            validation.add("missing neg_id", stored.diagnostic_position);
             continue;
         };
         if (std.mem.eql(u8, event, "status")) {
             const status = jsonStringField(obj, "status") orelse {
-                validation.add("status event missing status");
+                validation.add("status event missing status", stored.diagnostic_position);
                 continue;
             };
-            if (!isKnownStatus(status)) validation.add("unknown status");
+            if (!isKnownStatus(status)) validation.add("unknown status", stored.diagnostic_position);
             if (findRecord(records.items, neg_id)) |idx| {
                 allocator.free(records.items[idx].status);
                 records.items[idx].status = try allocator.dupe(u8, status);
             } else {
-                validation.add("status references missing neg_id");
+                validation.add("status references missing neg_id", stored.diagnostic_position);
             }
             continue;
         }
         if (!std.mem.eql(u8, event, "capture")) {
-            validation.add("unknown event");
+            validation.add("unknown event", stored.diagnostic_position);
             continue;
         }
         const raw_record = obj.get("record") orelse {
-            validation.add("capture missing record object");
+            validation.add("capture missing record object", stored.diagnostic_position);
             continue;
         };
         const record_obj = switch (raw_record) {
             .object => |value| value,
             else => {
-                validation.add("capture missing record object");
+                validation.add("capture missing record object", stored.diagnostic_position);
                 continue;
             },
         };
         const status = jsonStringField(obj, "status") orelse jsonStringField(record_obj, "status") orelse "unknown";
         if (findRecord(records.items, neg_id)) |idx| {
-            validation.add("duplicate capture neg_id");
+            validation.add("duplicate capture neg_id", stored.diagnostic_position);
             records.items[idx].evidence_count += 1;
             continue;
         }
@@ -1029,12 +1056,12 @@ fn loadRecordsValidated(allocator: std.mem.Allocator, path: []const u8) !LoadRes
 }
 
 fn validateProjectedRecord(record: Record, validation: *ValidationIssue) void {
-    if (!isKnownStatus(record.status)) validation.add("unknown status");
+    if (!isKnownStatus(record.status)) validation.add("unknown status", null);
     if (!isKnownExclusionScope(record.exclusion_scope)) {
-        validation.add("unknown exclusion_scope");
+        validation.add("unknown exclusion_scope", null);
     }
     if (std.mem.eql(u8, record.status, "active") and !recordActiveComplete(record)) {
-        validation.add("active record lacks required evidence");
+        validation.add("active record lacks required evidence", null);
     }
 }
 

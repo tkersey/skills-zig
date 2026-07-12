@@ -16,11 +16,15 @@ This directory is not an independently shipped CLI surface.
 - Digest: `ledger memory-digest --source synesthesia` writes the disposable
   Synesthesia digest resource.
 
-Default store:
+Current persistent-adapter path:
 
 ```bash
 .ledger/synesthesia/events.jsonl
 ```
+
+Capture, recall, and doctor operations use the shared backend-neutral
+event-store API. JSONL remains the current compatibility adapter and explicit
+note-import target; source logic does not manage file locks or parse the store.
 
 Synesthesia capture remains gated by durable mapping or activation-boundary
 authority. Ordinary metaphorical or diagnostic prose is not a ledger event.

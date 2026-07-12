@@ -352,10 +352,13 @@ const RunState = struct {
 const LedgerLoad = struct {
     event_count: u64 = 0,
     last_digest: []u8,
+    store_revision: []u8,
+    store_exists: bool,
     state: ?RunState = null,
 
     fn deinit(self: *LedgerLoad, allocator: std.mem.Allocator) void {
         allocator.free(self.last_digest);
+        allocator.free(self.store_revision);
         if (self.state) |*state| state.deinit(allocator);
     }
 };
@@ -594,9 +597,10 @@ fn cmdOpen(
     const completion = try validateOpenInput(input);
     if (!builtin.is_test) try ensureStoreLockIgnored(allocator, repo, store_path);
 
-    var lock = try durable_store.acquireLock(allocator, store_path);
-    defer lock.release(allocator);
-    var loaded = try loadLedger(allocator, store_path, input.run_id);
+    var persistence = durable_store.PersistentEventStore.init(store_path);
+    var exclusive = try acquireActuationExclusive(allocator, persistence.eventStore());
+    defer exclusive.release();
+    var loaded = try loadLedgerExclusive(allocator, &exclusive, input.run_id);
     defer loaded.deinit(allocator);
     if (loaded.state != null) return error.DuplicateRunId;
 
@@ -618,7 +622,7 @@ fn cmdOpen(
     };
     const body_json = try encodeBodyAlloc(allocator, body);
     defer allocator.free(body_json);
-    const event_digest = try appendEventAlloc(allocator, store_path, loaded, input.run_id, "run_opened", body_json);
+    const event_digest = try appendEventAlloc(allocator, &exclusive, loaded, input.run_id, "run_opened", body_json);
     errdefer allocator.free(event_digest);
     return .{
         .run_id = try allocator.dupe(u8, input.run_id),
@@ -660,9 +664,10 @@ fn cmdPrepare(
     const operation = parsed.value;
     const effect = try validateOperationInput(operation);
 
-    var lock = try durable_store.acquireLock(allocator, store_path);
-    defer lock.release(allocator);
-    var loaded = try loadLedger(allocator, store_path, run_id);
+    var persistence = durable_store.PersistentEventStore.init(store_path);
+    var exclusive = try acquireActuationExclusive(allocator, persistence.eventStore());
+    defer exclusive.release();
+    var loaded = try loadLedgerExclusive(allocator, &exclusive, run_id);
     defer loaded.deinit(allocator);
     const state = if (loaded.state) |*value| value else return error.RunNotFound;
     try validateContext(state, repo, store_path);
@@ -703,7 +708,7 @@ fn cmdPrepare(
     };
     const body_json = try encodeBodyAlloc(allocator, body);
     defer allocator.free(body_json);
-    const event_digest = try appendEventAlloc(allocator, store_path, loaded, run_id, "operation_prepared", body_json);
+    const event_digest = try appendEventAlloc(allocator, &exclusive, loaded, run_id, "operation_prepared", body_json);
     errdefer allocator.free(event_digest);
 
     return .{
@@ -721,9 +726,10 @@ fn cmdRecord(
     run_id: []const u8,
     raw_capability: []const u8,
 ) !TransitionResult {
-    var lock = try durable_store.acquireLock(allocator, store_path);
-    defer lock.release(allocator);
-    var loaded = try loadLedger(allocator, store_path, run_id);
+    var persistence = durable_store.PersistentEventStore.init(store_path);
+    var exclusive = try acquireActuationExclusive(allocator, persistence.eventStore());
+    defer exclusive.release();
+    var loaded = try loadLedgerExclusive(allocator, &exclusive, run_id);
     defer loaded.deinit(allocator);
     const state = if (loaded.state) |*value| value else return error.RunNotFound;
     try validateContext(state, repo, store_path);
@@ -760,7 +766,7 @@ fn cmdRecord(
     };
     const body_json = try encodeBodyAlloc(allocator, body);
     defer allocator.free(body_json);
-    const event_digest = try appendEventAlloc(allocator, store_path, loaded, run_id, "effect_recorded", body_json);
+    const event_digest = try appendEventAlloc(allocator, &exclusive, loaded, run_id, "effect_recorded", body_json);
     errdefer allocator.free(event_digest);
 
     return .{
@@ -799,9 +805,10 @@ fn observeOperation(
     raw_capability: ?[]const u8,
     direct_execute: bool,
 ) !TransitionResult {
-    var lock = try durable_store.acquireLock(allocator, store_path);
-    defer lock.release(allocator);
-    var loaded = try loadLedger(allocator, store_path, run_id);
+    var persistence = durable_store.PersistentEventStore.init(store_path);
+    var exclusive = try acquireActuationExclusive(allocator, persistence.eventStore());
+    defer exclusive.release();
+    var loaded = try loadLedgerExclusive(allocator, &exclusive, run_id);
     defer loaded.deinit(allocator);
     const state = if (loaded.state) |*value| value else return error.RunNotFound;
     try validateContext(state, repo, store_path);
@@ -849,7 +856,7 @@ fn observeOperation(
     };
     const body_json = try encodeBodyAlloc(allocator, body);
     defer allocator.free(body_json);
-    const event_digest = try appendEventAlloc(allocator, store_path, loaded, run_id, "operation_observed", body_json);
+    const event_digest = try appendEventAlloc(allocator, &exclusive, loaded, run_id, "operation_observed", body_json);
     errdefer allocator.free(event_digest);
 
     return .{
@@ -867,9 +874,10 @@ fn cmdClose(
     store_path: []const u8,
     run_id: []const u8,
 ) !TransitionResult {
-    var lock = try durable_store.acquireLock(allocator, store_path);
-    defer lock.release(allocator);
-    var loaded = try loadLedger(allocator, store_path, run_id);
+    var persistence = durable_store.PersistentEventStore.init(store_path);
+    var exclusive = try acquireActuationExclusive(allocator, persistence.eventStore());
+    defer exclusive.release();
+    var loaded = try loadLedgerExclusive(allocator, &exclusive, run_id);
     defer loaded.deinit(allocator);
     const state = if (loaded.state) |*value| value else return error.RunNotFound;
     try validateContext(state, repo, store_path);
@@ -889,7 +897,7 @@ fn cmdClose(
     };
     const body_json = try encodeBodyAlloc(allocator, body);
     defer allocator.free(body_json);
-    const event_digest = try appendEventAlloc(allocator, store_path, loaded, run_id, "run_closed", body_json);
+    const event_digest = try appendEventAlloc(allocator, &exclusive, loaded, run_id, "run_closed", body_json);
     errdefer allocator.free(event_digest);
 
     return .{
@@ -1087,7 +1095,7 @@ fn decisionDigestAlloc(
 
 fn appendEventAlloc(
     allocator: std.mem.Allocator,
-    store_path: []const u8,
+    exclusive: *const durable_store.EventStoreExclusive,
     loaded: LedgerLoad,
     run_id: []const u8,
     kind: []const u8,
@@ -1129,17 +1137,48 @@ fn appendEventAlloc(
     try out.writer.writeByte('}');
     const line = try out.toOwnedSlice();
     defer allocator.free(line);
-    try durable_store.appendLineAtomic(allocator, store_path, line, MaxStoreBytes);
+    var receipt = try exclusive.append(
+        allocator,
+        line,
+        .{ .revision = loaded.store_revision, .exists = loaded.store_exists },
+        MaxStoreBytes,
+    );
+    defer receipt.deinit(allocator);
     return event_digest;
 }
 
 fn loadLedger(allocator: std.mem.Allocator, store_path: []const u8, target_run_id: ?[]const u8) !LedgerLoad {
-    const bytes = durable_store.readRegularFileNoSymlink(allocator, store_path, MaxStoreBytes) catch |err| switch (err) {
-        error.FileNotFound => return .{ .last_digest = try allocator.dupe(u8, GenesisDigest) },
-        else => return err,
-    };
-    defer allocator.free(bytes);
+    var persistence = durable_store.PersistentEventStore.init(store_path);
+    var snapshot = try persistence.eventStore().snapshot(allocator, MaxStoreBytes);
+    defer snapshot.deinit(allocator);
+    return loadLedgerFromSnapshot(allocator, snapshot, target_run_id);
+}
 
+fn acquireActuationExclusive(
+    allocator: std.mem.Allocator,
+    store: durable_store.EventStore,
+) !durable_store.EventStoreExclusive {
+    return store.acquireExclusive(allocator) catch |err| switch (err) {
+        error.EventStoreBusy => error.PathAlreadyExists,
+        else => err,
+    };
+}
+
+fn loadLedgerExclusive(
+    allocator: std.mem.Allocator,
+    exclusive: *const durable_store.EventStoreExclusive,
+    target_run_id: ?[]const u8,
+) !LedgerLoad {
+    var snapshot = try exclusive.snapshot(allocator, MaxStoreBytes);
+    defer snapshot.deinit(allocator);
+    return loadLedgerFromSnapshot(allocator, snapshot, target_run_id);
+}
+
+fn loadLedgerFromSnapshot(
+    allocator: std.mem.Allocator,
+    snapshot: durable_store.EventSnapshot,
+    target_run_id: ?[]const u8,
+) !LedgerLoad {
     var states: std.ArrayList(RunState) = .empty;
     defer {
         for (states.items) |*state| state.deinit(allocator);
@@ -1148,11 +1187,8 @@ fn loadLedger(allocator: std.mem.Allocator, store_path: []const u8, target_run_i
     var last_digest = try allocator.dupe(u8, GenesisDigest);
     errdefer allocator.free(last_digest);
     var expected_sequence: u64 = 1;
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |raw_line| {
-        const line = std.mem.trim(u8, raw_line, " \t\r");
-        if (line.len == 0) continue;
-        var parsed = try std.json.parseFromSlice(EventWire, allocator, line, .{});
+    for (snapshot.records) |record| {
+        var parsed = try std.json.parseFromSlice(EventWire, allocator, record.payload, .{});
         defer parsed.deinit();
         const event = parsed.value;
         if (!std.mem.eql(u8, event.schema, "actuation-event/v1")) return error.InvalidEventSchema;
@@ -1186,7 +1222,10 @@ fn loadLedger(allocator: std.mem.Allocator, store_path: []const u8, target_run_i
     var result = LedgerLoad{
         .event_count = expected_sequence - 1,
         .last_digest = last_digest,
+        .store_revision = try allocator.dupe(u8, snapshot.revision),
+        .store_exists = snapshot.exists,
     };
+    errdefer allocator.free(result.store_revision);
     if (target_run_id) |wanted| {
         for (states.items, 0..) |state, index| {
             if (!std.mem.eql(u8, state.run_id, wanted)) continue;

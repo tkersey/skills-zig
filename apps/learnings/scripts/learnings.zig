@@ -72,7 +72,7 @@ const UsageText =
     \\
     \\usage: ledger --source learnings [-h] [--path PATH] {capture,datasets,dataset-schema,query,recent,recall,codify-candidates,quality-audit,value-report,memory-digest,migrate,doctor,path} ...
     \\
-    \\Mine, recall, and promote records from repo-local .ledger/learnings/events.jsonl.
+    \\Mine, recall, and promote records through the repo-local learning-source API.
     \\
     \\positional arguments:
     \\  {capture,datasets,dataset-schema,query,recent,recall,codify-candidates,quality-audit,value-report,memory-digest,migrate,doctor,path}
@@ -92,7 +92,7 @@ const UsageText =
     \\
     \\options:
     \\  -h, --help            show this help message and exit
-    \\  --path PATH           Path to learnings JSONL file (relative to repo root by default)
+    \\  --path PATH           Current persistent-adapter path (relative to repo root by default)
     \\  -V, --version         Show version
     \\  version               Show version
 ;
@@ -1402,9 +1402,25 @@ fn cmdDoctor(allocator: std.mem.Allocator, repo_root: []const u8) !u8 {
     defer allocator.free(previous_path);
     const legacy_path = try resolveJsonlPathAlloc(allocator, repo_root, LegacyLearningsPath);
     defer allocator.free(legacy_path);
-    const next_exists = durable_store.fileExists(next_path);
     const previous_exists = durable_store.fileExists(previous_path);
     const legacy_exists = durable_store.fileExists(legacy_path);
+    var persistence = durable_store.PersistentEventStore.init(next_path);
+    var next_snapshot = persistence.eventStore().snapshot(allocator, MaxLearningsBytes) catch |err| {
+        const issue = MigrationIssue{ .start_line = 0, .end_line = 0, .reason = @errorName(err) };
+        const issues = [_]MigrationIssue{issue};
+        try printDoctorResult(.{
+            .status = "invalid",
+            .selected_path = next_path,
+            .selected_kind = "current",
+            .default_exists = true,
+            .previous_exists = previous_exists,
+            .legacy_exists = legacy_exists,
+            .issues = &issues,
+        });
+        return 1;
+    };
+    defer next_snapshot.deinit(allocator);
+    const next_exists = next_snapshot.exists;
     const selected_path: ?[]const u8 = if (next_exists)
         next_path
     else if (previous_exists)
@@ -1434,6 +1450,23 @@ fn cmdDoctor(allocator: std.mem.Allocator, repo_root: []const u8) !u8 {
         return 0;
     }
 
+    if (next_exists) {
+        var inspection = try inspectCanonicalSnapshotAlloc(allocator, next_snapshot);
+        defer inspection.deinit(allocator);
+        try printDoctorResult(.{
+            .status = if (inspection.issues.items.len == 0) "current" else "invalid",
+            .selected_path = selected_path,
+            .selected_kind = selected_kind,
+            .default_exists = next_exists,
+            .previous_exists = previous_exists,
+            .legacy_exists = legacy_exists,
+            .records = inspection.records,
+            .blank_lines = inspection.blank_lines,
+            .issues = inspection.issues.items,
+        });
+        return if (inspection.issues.items.len == 0) 0 else 1;
+    }
+
     const selected_bytes = durable_store.readRegularFileNoSymlink(allocator, selected_path.?, MaxLearningsBytes) catch |err| {
         const issue = MigrationIssue{ .start_line = 0, .end_line = 0, .reason = @errorName(err) };
         const issues = [_]MigrationIssue{issue};
@@ -1449,23 +1482,6 @@ fn cmdDoctor(allocator: std.mem.Allocator, repo_root: []const u8) !u8 {
         return 1;
     };
     defer allocator.free(selected_bytes);
-
-    if (next_exists) {
-        var inspection = try inspectCanonicalJsonlAlloc(allocator, selected_bytes);
-        defer inspection.deinit(allocator);
-        try printDoctorResult(.{
-            .status = if (inspection.issues.items.len == 0) "current" else "invalid",
-            .selected_path = selected_path,
-            .selected_kind = selected_kind,
-            .default_exists = next_exists,
-            .previous_exists = previous_exists,
-            .legacy_exists = legacy_exists,
-            .records = inspection.records,
-            .blank_lines = inspection.blank_lines,
-            .issues = inspection.issues.items,
-        });
-        return if (inspection.issues.items.len == 0) 0 else 1;
-    }
 
     var conversion = try convertLearningRowsToEventsAlloc(allocator, selected_bytes);
     defer conversion.deinit(allocator);
@@ -1991,6 +2007,51 @@ fn inspectCanonicalJsonlAlloc(allocator: std.mem.Allocator, bytes: []const u8) !
         inspection.records += 1;
     }
     if (bytes.len > 0 and bytes[bytes.len - 1] == '\n' and inspection.blank_lines > 0) inspection.blank_lines -= 1;
+    return inspection;
+}
+
+fn inspectCanonicalSnapshotAlloc(
+    allocator: std.mem.Allocator,
+    snapshot: durable_store.EventSnapshot,
+) !StoreInspection {
+    var inspection = StoreInspection{ .blank_lines = snapshot.blank_entries };
+    errdefer inspection.deinit(allocator);
+    var seen_ids = std.StringHashMap(void).init(allocator);
+    defer {
+        var key_it = seen_ids.keyIterator();
+        while (key_it.next()) |key| allocator.free(key.*);
+        seen_ids.deinit();
+    }
+
+    for (snapshot.records) |event| {
+        const line_number = event.diagnostic_position orelse @as(usize, @intCast(event.ordinal));
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, event.payload, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                try inspection.issues.append(allocator, .{ .start_line = line_number, .end_line = line_number, .reason = @errorName(err) });
+                continue;
+            },
+        };
+        defer parsed.deinit();
+        const obj = switch (parsed.value) {
+            .object => |value| value,
+            else => {
+                try inspection.issues.append(allocator, .{ .start_line = line_number, .end_line = line_number, .reason = "NonObjectJson" });
+                continue;
+            },
+        };
+        const id = learningIdFromObject(obj);
+        if (id.len == 0) {
+            try inspection.issues.append(allocator, .{ .start_line = line_number, .end_line = line_number, .reason = "MissingLearningId" });
+            continue;
+        }
+        if (seen_ids.contains(id)) {
+            try inspection.issues.append(allocator, .{ .start_line = line_number, .end_line = line_number, .reason = "DuplicateLearningId" });
+            continue;
+        }
+        try seen_ids.put(try allocator.dupe(u8, id), {});
+        inspection.records += 1;
+    }
     return inspection;
 }
 
@@ -3642,21 +3703,12 @@ fn collectDigestRows(
     jsonl_path: []const u8,
 ) !std.ArrayList(query_engine.Row) {
     var rows: std.ArrayList(query_engine.Row) = .empty;
+    var persistence = durable_store.PersistentEventStore.init(jsonl_path);
+    var snapshot = try persistence.eventStore().snapshot(allocator, MaxLearningsBytes);
+    defer snapshot.deinit(allocator);
 
-    const file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), jsonl_path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return rows,
-        else => return err,
-    };
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
-
-    var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
-    const data = try reader.interface.allocRemaining(allocator, .limited(64 * 1024 * 1024));
-    defer allocator.free(data);
-
-    var lines = std.mem.splitScalar(u8, data, '\n');
-    while (lines.next()) |raw_line| {
-        const line = std.mem.trim(u8, raw_line, " \t\r\n");
-        if (line.len == 0) continue;
+    for (snapshot.records) |event| {
+        const line = event.payload;
         if (!rawLineDigestStatusMaybeEligible(line)) continue;
 
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
@@ -4367,17 +4419,12 @@ fn collectLearningRows(
     jsonl_path: []const u8,
 ) !std.ArrayList(query_engine.Row) {
     var rows: std.ArrayList(query_engine.Row) = .empty;
+    var persistence = durable_store.PersistentEventStore.init(jsonl_path);
+    var snapshot = try persistence.eventStore().snapshot(allocator, MaxLearningsBytes);
+    defer snapshot.deinit(allocator);
 
-    const data = durable_store.readFileAlloc(allocator, jsonl_path, 64 * 1024 * 1024) catch |err| switch (err) {
-        error.FileNotFound => return rows,
-        else => return err,
-    };
-    defer allocator.free(data);
-
-    var lines = std.mem.splitScalar(u8, data, '\n');
-    while (lines.next()) |raw_line| {
-        const line = std.mem.trim(u8, raw_line, " \t\r\n");
-        if (line.len == 0) continue;
+    for (snapshot.records) |event| {
+        const line = event.payload;
 
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
         defer parsed.deinit();
@@ -5245,7 +5292,7 @@ fn resolveReadJsonlPathAlloc(
 
     const next_path = try resolveJsonlPathAlloc(allocator, repo_root, DefaultLearningsPath);
     errdefer allocator.free(next_path);
-    if (durable_store.fileExists(next_path)) return next_path;
+    if (try persistentStoreExists(allocator, next_path)) return next_path;
 
     const previous_path = try resolveJsonlPathAlloc(allocator, repo_root, PreviousLearningsPath);
     if (durable_store.fileExists(previous_path)) {
@@ -5272,6 +5319,13 @@ fn resolveReadJsonlPathAlloc(
 
     allocator.free(legacy_path);
     return next_path;
+}
+
+fn persistentStoreExists(allocator: std.mem.Allocator, locator: []const u8) !bool {
+    var persistence = durable_store.PersistentEventStore.init(locator);
+    var snapshot = try persistence.eventStore().snapshot(allocator, MaxLearningsBytes);
+    defer snapshot.deinit(allocator);
+    return snapshot.exists;
 }
 
 fn normalizeRepoProbePathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {

@@ -2,24 +2,32 @@
 
 Repo-local durable source, actuation, replay, and plan ledger with pure validation of governance and review artifacts.
 
-`ledger` stores disconfirmed hypotheses, failed routes, reopening criteria, and route-exclusion evidence in an append-only JSONL file that future runs can query directly.
+`ledger` stores disconfirmed hypotheses, failed routes, reopening criteria, and route-exclusion evidence in an append-only event store that future runs can query through the Ledger API.
 It also owns causal actuation under `--source actuation`, replay-campaign evidence under `--source hylo`, and learning capture under `--source learnings`.
 `ledger validate` checks immutable governance and review artifacts without reading or writing
 any ledger store and without granting execution authority.
 
-Default store:
+The negative ledger, actuation, learning, and Synesthesia sources share one
+storage contract: ordered snapshots, opaque revisions, compare-and-append,
+atomic replacement, exclusive effectful-transition sessions, and logical store
+identity. The current persistent adapter is JSONL, so existing commands, paths,
+stores, and migration workflows remain compatible. A backend change is
+confined to the persistent adapter; migrated source callers do not split lines
+or coordinate storage locks.
+
+Current negative-ledger adapter path:
 
 ```bash
 .ledger/negative-ledger/events.jsonl
 ```
 
-Learning source store:
+Current learning-source adapter path:
 
 ```bash
 .ledger/learnings/events.jsonl
 ```
 
-Actuation source store:
+Current actuation-source adapter path:
 
 ```bash
 .ledger/actuation/events.jsonl
@@ -72,6 +80,7 @@ ledger state --source actuation --run RUN-ID
 ledger decide --source actuation --run RUN-ID
 ledger --source hylo validate-campaign --campaign campaign.json
 ledger --source hylo fingerprint --input artifact.json
+ledger --source hylo snapshot-target --repo . --revision INDEX --input target-roots.json
 ledger --source hylo append --repo . --json event-intent.json
 ledger --source hylo doctor --repo .
 ledger --source hylo progress --repo . --campaign-id cmp-example --format markdown
@@ -133,7 +142,7 @@ resuming it.
 ## Hylo replay kernel
 
 `ledger --source hylo` owns the durable evidence boundary for replay-driven
-improvement campaigns:
+improvement campaigns. This hardened contract requires Ledger 0.6.1 or newer:
 
 ```text
 unfold historical evidence -> portable campaign and scenarios
@@ -151,9 +160,27 @@ ledger --source hylo validate-campaign --campaign campaign.json
 
 Use `fingerprint` to obtain the canonical lowercase SHA-256 fingerprint of any
 JSON snapshot. A `campaign_created` intent embeds the complete
-`hylo-campaign/v1` snapshot and its fingerprint; a `scenario_admitted` intent
-does the same for one `hylo-scenario/v1`. This keeps later folds independent of
-mutable campaign files.
+`hylo-campaign/v1` snapshot, its complete scenario manifest, and its
+fingerprint; a `scenario_admitted` intent does the same for one
+`hylo-scenario/v1`. Attempts remain blocked until every manifest member is
+admitted. This keeps later folds independent of mutable campaign files and
+prevents selective admission of easy cases.
+
+For Git-backed targets, capture the exact tree projection used by a replay:
+
+```bash
+ledger --source hylo snapshot-target \
+  --repo /path/to/repo \
+  --revision INDEX \
+  --input target-roots.json
+```
+
+The request is `hylo-target-snapshot-request/v1` with ordered `roots`. Use
+`INDEX` for a staged candidate. A baseline input such as `HEAD` is resolved in
+the receipt to its full immutable commit SHA; scenario and attempt contracts
+store that resolved SHA rather than the moving name. Comparable attempts in a
+commit-authorized campaign embed the receipt's revision, snapshot, and
+fingerprint.
 
 Only `append` mutates `.ledger/hylo/events.jsonl`:
 
@@ -163,28 +190,43 @@ ledger --source hylo append --repo /path/to/repo --json event-intent.json
 
 The native source supplies global and per-campaign sequence numbers,
 timestamps, predecessor digests, canonical body digests, and event digests. It
-then validates the proposed state transition before atomically appending one
-line. `doctor` replays both hash chains and all transition laws from genesis.
+then validates the proposed state transition inside one exclusive durable
+event-store session, appends against the loaded revision, and enforces a strict
+post-append reload cap. `doctor` replays both hash chains and all transition
+laws from genesis.
 
 The fold distinguishes two baselines:
 
 - `historical_baseline` records and grades the response that actually happened;
   its grades are diagnostic and cannot enter progress denominators.
 - `replay_baseline` is a fresh blind controlled replay of the frozen baseline
-  target; only eligible blind replays can be compared with candidates.
+  target; its attempt must predate the candidate attempt for the same scenario.
+  Only eligible blind replays can be compared with candidates.
 
 For comparable pass/fail grades, Ledger re-derives the aggregate from the
 campaign's frozen dimension weights. It rejects duplicate eligible grades for
-one attempt, target/environment/replay-policy drift, historical comparison,
-non-blind comparison, and critical violations that contradict the pass policy.
+one attempt, target/environment/replay-policy drift, grader drift, historical
+comparison, non-blind comparison, pass/fail labels that contradict policy, and
+critical oracles without evidence from their declared authority. Candidate
+comparison requires a like-for-like controlled replay baseline. Ledger freezes
+declared judge and dimension authority in campaign syntax and oracle authority
+in scenario syntax before replay; the referenced receipts or human
+confirmations establish authenticity outside this declaration-consistency
+check.
 
 Hylo does not edit a target or create a commit by itself. An authorized owner
 workflow may apply the change and, only when the campaign grants publication
-authority, create the commit. Ledger records those transitions and rejects an
-applied change outside the campaign's allowed paths. A committed publication
-must cite a later comparison-eligible passing grade for every required
-holdout repeat. The append path independently resolves the cited Git commit,
-tree, and exact changed-path set before accepting the publication event.
+authority, create the commit. An applied change must be the exact staged
+`git-index:HEAD` diff: Ledger re-derives its fingerprint, requires the staged
+path set to equal the event paths, and rejects tracked or untracked
+contamination under every target root. Each candidate attempt rechecks that
+diff and recomputes its staged snapshot. Only practice evidence may motivate
+repair; once an eligible holdout or challenge grade is exposed, the campaign
+rejects further applied changes. A committed publication must cite exactly the
+latest configured repeat cohort for every frozen scenario, and the entire
+cohort must pass. The append path independently resolves the cited Git commit,
+tree, and exact changed-path set, then requires the committed target projection
+to equal the snapshot used by every promotion attempt.
 
 Derive a current view without storing a mutable summary:
 
@@ -195,10 +237,13 @@ ledger --source hylo progress \
   --format json
 ```
 
-The `hylo-progress/v1` projection reports split results, target summaries,
-per-dimension means, latest scenario outcomes, unresolved frontier cases, and
-comparable cross-target edges. Its fingerprint is bound to the campaign chain
-head. A changed rubric, visibility policy, environment observation surface, or
+The `hylo-progress/v1` projection reports current-target split results,
+target-by-split summaries, per-dimension means, current-target scenario
+outcomes, repeat-aware frontier cases, and grader-stable cross-target edges.
+Passing repeats are consecutive in the latest current-target cohort, so a new
+failure reopens the frontier. Its fingerprint is bound to the campaign chain
+head. A changed rubric,
+visibility policy, environment observation surface, grader configuration, or
 replay policy requires a new campaign rather than a misleading continuation.
 
 ## Stateless validation
@@ -422,7 +467,7 @@ Example shape:
 }
 ```
 
-`doctor` validates both JSONL integrity and projection safety, including malformed events and active records that cannot legally block.
+`doctor` validates both event-stream integrity and projection safety, including malformed events and active records that cannot legally block. With the current JSONL adapter, diagnostics retain physical line locations.
 
 ## Lifecycle and memory projection
 

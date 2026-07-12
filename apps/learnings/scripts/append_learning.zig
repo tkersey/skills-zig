@@ -7,6 +7,7 @@ const Version = core_cli.normalizeVersion(app_meta.version);
 pub const LegacyLearningsPath = ".learnings.jsonl";
 pub const PreviousLearningsPath = ".ledger/learnings/learnings.jsonl";
 pub const DefaultLearningsPath = ".ledger/learnings/events.jsonl";
+const MaxStoreBytes = 64 * 1024 * 1024;
 
 pub const Surface = struct {
     program_name: []const u8,
@@ -22,7 +23,7 @@ const StandaloneSurface = Surface{
     \\
     \\usage: append_learning [-h] [--status STATUS] --learning LEARNING [--evidence EVIDENCE] [--application APPLICATION] [--tag TAG] [--related-id RELATED_ID] [--supersedes-id SUPERSEDES_ID] [--repo REPO] [--path PATH] [--record-source SOURCE] [--allow-duplicate] [--quality-mode {strict,best_effort}] [--allow-temp-path]
     \\
-    \\Append a structured learning event to repo-local .ledger/learnings/events.jsonl.
+    \\Append a structured learning event through the repo-local learning-source API.
     \\
     \\options:
     \\  -h, --help            show this help message and exit
@@ -37,7 +38,7 @@ const StandaloneSurface = Surface{
     \\  --supersedes-id SUPERSEDES_ID
     \\                        If this learning supersedes an older record id
     \\  --repo REPO           Repo identifier override (defaults to remote origin slug or repo dir name)
-    \\  --path PATH           Path to JSONL file, relative to repo root by default
+    \\  --path PATH           Current persistent-adapter path, relative to repo root by default
     \\  --record-source SOURCE
     \\                        Source marker for the record
     \\  --allow-duplicate     Append even if an existing record has the same fingerprint
@@ -57,7 +58,7 @@ const SubcommandSurface = Surface{
     \\
     \\usage: ledger capture --source learnings [-h] [--status STATUS] --learning LEARNING [--evidence EVIDENCE] [--application APPLICATION] [--tag TAG] [--related-id RELATED_ID] [--supersedes-id SUPERSEDES_ID] [--repo REPO] [--path PATH] [--record-source SOURCE] [--allow-duplicate] [--quality-mode {strict,best_effort}] [--allow-temp-path]
     \\
-    \\Append a structured learning event to repo-local .ledger/learnings/events.jsonl.
+    \\Append a structured learning event through the repo-local learning-source API.
     \\
     \\options:
     \\  -h, --help            show this help message and exit
@@ -72,7 +73,7 @@ const SubcommandSurface = Surface{
     \\  --supersedes-id SUPERSEDES_ID
     \\                        If this learning supersedes an older record id
     \\  --repo REPO           Repo identifier override (defaults to remote origin slug or repo dir name)
-    \\  --path PATH           Path to JSONL file, relative to repo root by default
+    \\  --path PATH           Current persistent-adapter path, relative to repo root by default
     \\  --record-source SOURCE
     \\                        Source marker for the record
     \\  --allow-duplicate     Append even if an existing record has the same fingerprint
@@ -422,9 +423,13 @@ pub fn runWithAllocator(
 
     const output_path = try resolveWritePathAlloc(allocator, repo_root, opts.path, opts.path_explicit);
     defer allocator.free(output_path);
+    var persistence = durable_store.PersistentEventStore.init(output_path);
+    const store = persistence.eventStore();
+    var snapshot = try store.snapshot(allocator, MaxStoreBytes);
+    defer snapshot.deinit(allocator);
 
     if (!opts.allow_duplicate) {
-        const existing_id = try findDuplicateExistingIdAlloc(allocator, output_path, fp);
+        const existing_id = try findDuplicateExistingIdInSnapshotAlloc(allocator, snapshot, fp);
         if (existing_id) |id| {
             defer allocator.free(id);
             var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
@@ -454,7 +459,13 @@ pub fn runWithAllocator(
     const line = try encodeLearningEventJsonAlloc(allocator, record);
     defer allocator.free(line);
 
-    try appendJsonLine(output_path, line);
+    var receipt = try store.append(
+        allocator,
+        line,
+        .{ .revision = snapshot.revision, .exists = snapshot.exists },
+        MaxStoreBytes,
+    );
+    defer receipt.deinit(allocator);
 
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
@@ -994,7 +1005,7 @@ fn resolveWritePathAlloc(
 
     const next_path = try resolveOutputPathAlloc(allocator, repo_root, DefaultLearningsPath);
     errdefer allocator.free(next_path);
-    if (durable_store.fileExists(next_path)) return next_path;
+    if (try persistentStoreExists(allocator, next_path)) return next_path;
 
     const previous_path = try resolveOutputPathAlloc(allocator, repo_root, PreviousLearningsPath);
     defer allocator.free(previous_path);
@@ -1007,27 +1018,41 @@ fn resolveWritePathAlloc(
     return next_path;
 }
 
+fn persistentStoreExists(allocator: std.mem.Allocator, locator: []const u8) !bool {
+    var persistence = durable_store.PersistentEventStore.init(locator);
+    var snapshot = try persistence.eventStore().snapshot(allocator, MaxStoreBytes);
+    defer snapshot.deinit(allocator);
+    return snapshot.exists;
+}
+
 fn appendJsonLine(path: []const u8, json_line: []const u8) !void {
-    return durable_store.appendLineAtomic(std.heap.page_allocator, path, json_line, 64 * 1024 * 1024);
+    var persistence = durable_store.PersistentEventStore.init(path);
+    const store = persistence.eventStore();
+    var snapshot = try store.snapshot(std.heap.page_allocator, MaxStoreBytes);
+    defer snapshot.deinit(std.heap.page_allocator);
+    var receipt = try store.append(
+        std.heap.page_allocator,
+        json_line,
+        .{ .revision = snapshot.revision, .exists = snapshot.exists },
+        MaxStoreBytes,
+    );
+    defer receipt.deinit(std.heap.page_allocator);
 }
 
 fn findDuplicateExistingIdAlloc(allocator: std.mem.Allocator, path: []const u8, fingerprint: []const u8) !?[]u8 {
-    const file = std.Io.Dir.openFileAbsolute(std.Io.Threaded.global_single_threaded.io(), path, .{}) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    defer file.close(std.Io.Threaded.global_single_threaded.io());
+    var persistence = durable_store.PersistentEventStore.init(path);
+    var snapshot = try persistence.eventStore().snapshot(allocator, MaxStoreBytes);
+    defer snapshot.deinit(allocator);
+    return findDuplicateExistingIdInSnapshotAlloc(allocator, snapshot, fingerprint);
+}
 
-    var reader = file.reader(std.Io.Threaded.global_single_threaded.io(), &.{});
-    const data = try reader.interface.allocRemaining(allocator, .limited(64 * 1024 * 1024));
-    defer allocator.free(data);
-
-    var lines = std.mem.splitScalar(u8, data, '\n');
-    while (lines.next()) |raw_line| {
-        const line = std.mem.trim(u8, raw_line, " \t\r\n");
-        if (line.len == 0) continue;
-
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
+fn findDuplicateExistingIdInSnapshotAlloc(
+    allocator: std.mem.Allocator,
+    snapshot: durable_store.EventSnapshot,
+    fingerprint: []const u8,
+) !?[]u8 {
+    for (snapshot.records) |event| {
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, event.payload, .{}) catch continue;
         defer parsed.deinit();
 
         const obj = switch (parsed.value) {

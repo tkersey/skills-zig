@@ -30,7 +30,9 @@ No unified umbrella CLI is introduced. Binaries remain separate.
 
 ## Shared Libraries
 
-`libs/durable_store` provides the file-state substrate used by shipped CLIs that persist local ledgers. Legacy helpers such as `writeTextAtomic`, `appendLineAtomic`, `acquireLock`, and `acquireAbsoluteExclusiveLock` remain available for single-file replacement, append, and basic exclusive-lock callers. Coordinated multi-record mutation must use the newer lease, fencing, CAS, JSONL snapshot, and DTX-v1 transaction APIs so stale workers fail through semantic concurrency errors instead of losing updates.
+`libs/durable_store` provides the backend-neutral `EventStore` contract for stateful Ledger sources. Migrated callers observe logical records, opaque revisions, compare-and-append receipts, stable store identities, and exclusive sessions for effectful transitions; they do not parse lines, manage storage locks, or choose a storage format. `PersistentEventStore` is the stable construction surface. Its current compatibility adapter stores JSONL at the established paths, while `MemoryEventStore` proves the same caller contract without a filesystem. Replacing the persistent adapter therefore changes the storage boundary, not migrated Ledger source logic or CLI behavior.
+
+Legacy file helpers remain available for explicit import, export, repair, and unrelated single-file workflows. Coordinated multi-record mutation still uses lease, fencing, CAS, snapshot, and DTX-v1 transaction APIs.
 
 ## Build
 

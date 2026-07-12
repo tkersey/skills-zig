@@ -21,13 +21,14 @@ fn defaultIo() std.Io {
 const UsageText =
     \\ledger --source hylo
     \\
-    \\usage: ledger --source hylo [-h] [--repo PATH] [--path PATH] {validate-campaign,fingerprint,append,doctor,progress,path} ...
+    \\usage: ledger --source hylo [-h] [--repo PATH] [--path PATH] {validate-campaign,fingerprint,snapshot-target,append,doctor,progress,path} ...
     \\
     \\Own portable replay-campaign validation, append-only evidence, and deterministic progress folds.
     \\
     \\commands:
     \\  validate-campaign  Validate campaign.json and its scenarios JSONL
     \\  fingerprint        Emit the canonical SHA-256 fingerprint of one JSON artifact
+    \\  snapshot-target    Snapshot Git target roots from HEAD, a commit, or INDEX
     \\  append             Validate and append one hylo-event-intent/v1
     \\  doctor             Validate schemas, sequence, hash chain, and state transitions
     \\  progress           Fold one campaign into hylo-progress/v1
@@ -37,7 +38,8 @@ const UsageText =
     \\  --repo PATH        Git repository to address (default: current repository)
     \\  --path PATH        Event store path (default: .ledger/hylo/events.jsonl)
     \\  --campaign FILE    campaign.json for validate-campaign
-    \\  --input FILE|-     JSON input for fingerprint
+    \\  --input FILE|-     JSON input for fingerprint or snapshot-target
+    \\  --revision REV     Git revision or INDEX for snapshot-target (default: HEAD)
     \\  --json FILE|-      event intent for append
     \\  --campaign-id ID   Campaign identity for progress
     \\  --format FORMAT    json|markdown for progress (default: json)
@@ -53,6 +55,7 @@ const HelpSurface = core_cli.HelpSurface{
 const Command = enum {
     validate_campaign,
     fingerprint,
+    snapshot_target,
     append,
     doctor,
     progress,
@@ -69,6 +72,8 @@ const Args = struct {
     input_path: ?[]const u8 = null,
     json_path: ?[]const u8 = null,
     campaign_id: ?[]const u8 = null,
+    revision: []const u8 = "HEAD",
+    revision_set: bool = false,
     format: OutputFormat = .json,
 };
 
@@ -229,9 +234,19 @@ const SourceInput = struct {
     exclusions: []const []const u8,
 };
 
+const RedactionReceiptInput = struct {
+    schema: []const u8,
+    tool: []const u8,
+    version: []const u8,
+    source_fingerprint: []const u8,
+    output_fingerprint: []const u8,
+    evidence_refs: []const []const u8,
+};
+
 const PrivacyInput = struct {
     mode: []const u8,
     redactions: []const []const u8,
+    redaction_receipt: RedactionReceiptInput,
 };
 
 const RubricDimensionInput = struct {
@@ -239,6 +254,8 @@ const RubricDimensionInput = struct {
     kind: []const u8,
     weight: f64,
     critical: bool,
+    grader_ref: []const u8,
+    grader_fingerprint: []const u8,
 };
 
 const PassPolicyInput = struct {
@@ -250,6 +267,7 @@ const RubricInput = struct {
     id: []const u8,
     fingerprint: []const u8,
     dimensions: []const RubricDimensionInput,
+    judge: JudgeInput,
     pass_policy: PassPolicyInput,
 };
 
@@ -262,9 +280,7 @@ const ReplayPolicyInput = struct {
 };
 
 const StopPolicyInput = struct {
-    max_cycles: u64,
     max_attempts: u64,
-    patience_cycles: u64,
     require_holdout_pass: bool,
     zero_critical_violations: bool,
 };
@@ -274,6 +290,12 @@ const ChangePolicyInput = struct {
     publication_authority: []const u8,
     allowed_paths: []const []const u8,
     require_clean_scope: bool,
+};
+
+const ScenarioManifestInput = struct {
+    scenario_id: []const u8,
+    scenario_fingerprint: []const u8,
+    split: []const u8,
 };
 
 const CampaignInput = struct {
@@ -287,6 +309,7 @@ const CampaignInput = struct {
     stop_policy: StopPolicyInput,
     change_policy: ChangePolicyInput,
     scenarios_file: []const u8,
+    scenario_manifest: []const ScenarioManifestInput,
 };
 
 const RequestInput = struct {
@@ -295,12 +318,44 @@ const RequestInput = struct {
     hidden_reference_ref: []const u8,
 };
 
+const EnvironmentAdapterInput = struct {
+    id: []const u8,
+    version: []const u8,
+    contract_ref: []const u8,
+    contract_fingerprint: []const u8,
+};
+
+const EnvironmentSnapshotInput = struct {
+    kind: []const u8,
+    ref: []const u8,
+    fingerprint: []const u8,
+};
+
+const ToolchainInput = struct {
+    id: []const u8,
+    version: []const u8,
+};
+
+const EffectPolicyInput = struct {
+    filesystem: []const u8,
+    allowed_paths: []const []const u8,
+    network: []const u8,
+    network_allowlist: []const []const u8,
+    external_side_effects: []const u8,
+    external_effect_allowlist: []const []const u8,
+};
+
 const EnvironmentInput = struct {
     fidelity: []const u8,
     fingerprint: []const u8,
     repo_revision: []const u8,
-    tools: []const std.json.Value,
-    permissions: []const u8,
+    adapter: EnvironmentAdapterInput,
+    snapshot: EnvironmentSnapshotInput,
+    setup_ref: []const u8,
+    setup_fingerprint: []const u8,
+    toolchain: []const ToolchainInput,
+    fixtures: []const SourceRef,
+    effect_policy: EffectPolicyInput,
     limitations: []const []const u8,
 };
 
@@ -309,6 +364,8 @@ const OracleInput = struct {
     kind: []const u8,
     critical: bool,
     observation: []const u8,
+    grader_ref: []const u8,
+    grader_fingerprint: []const u8,
 };
 
 const MutationInput = struct {
@@ -372,23 +429,56 @@ const ScenarioAdmittedPayload = struct {
     scenario: std.json.Value,
 };
 
+const HistoricalProvenanceInput = struct {
+    status: []const u8,
+    environment_fingerprint: ?[]const u8,
+    repo_revision: ?[]const u8,
+    limitations: []const []const u8,
+    evidence_refs: []const []const u8,
+};
+
+const TargetSnapshotEntryInput = struct {
+    mode: []const u8,
+    object_id: []const u8,
+    object_type: []const u8,
+    path: []const u8,
+};
+
+const TargetSnapshotInput = struct {
+    schema: []const u8,
+    roots: []const []const u8,
+    entries: []const TargetSnapshotEntryInput,
+};
+
+const TargetSnapshotRequest = struct {
+    schema: []const u8,
+    roots: []const []const u8,
+};
+
 const AttemptPayload = struct {
     status: []const u8,
     target_fingerprint: []const u8,
-    environment_fingerprint: []const u8,
-    replay_policy_fingerprint: []const u8,
+    environment_fingerprint: ?[]const u8,
+    replay_policy_fingerprint: ?[]const u8,
     origin: []const u8,
     role: []const u8,
     blind: bool,
     evidence_refs: []const []const u8,
     trace_ref: ?[]const u8 = null,
     trace_fingerprint: ?[]const u8 = null,
+    historical_provenance: ?HistoricalProvenanceInput = null,
+    target_snapshot_revision: ?[]const u8 = null,
+    target_snapshot_fingerprint: ?[]const u8 = null,
+    target_snapshot: ?std.json.Value = null,
 };
 
 const GradeDimensionInput = struct {
     id: []const u8,
     score: f64,
     weight: f64,
+    grader_kind: []const u8,
+    grader_ref: []const u8,
+    grader_fingerprint: []const u8,
     evidence_refs: []const []const u8,
 };
 
@@ -396,18 +486,29 @@ const JudgeInput = struct {
     kind: []const u8,
     id: []const u8,
     version: []const u8,
+    config_fingerprint: []const u8,
+};
+
+const OracleResultInput = struct {
+    id: []const u8,
+    status: []const u8,
+    grader_kind: []const u8,
+    grader_ref: []const u8,
+    grader_fingerprint: []const u8,
+    evidence_refs: []const []const u8,
 };
 
 const GradePayload = struct {
     status: []const u8,
     target_fingerprint: []const u8,
     rubric_fingerprint: []const u8,
-    environment_fingerprint: []const u8,
-    replay_policy_fingerprint: []const u8,
+    environment_fingerprint: ?[]const u8,
+    replay_policy_fingerprint: ?[]const u8,
     blind: bool,
     comparison_eligible: bool,
     aggregate: ?f64,
     dimensions: []const GradeDimensionInput,
+    oracle_results: []const OracleResultInput,
     critical_violations: []const []const u8,
     judge: JudgeInput,
     evidence_refs: []const []const u8,
@@ -493,6 +594,7 @@ fn runWithArgvInner(allocator: std.mem.Allocator, argv: []const []const u8) !u8 
     switch (args.command orelse return error.MissingCommand) {
         .validate_campaign => try cmdValidateCampaign(allocator, args.campaign_path.?),
         .fingerprint => try cmdFingerprint(allocator, args.input_path.?),
+        .snapshot_target => try cmdSnapshotTarget(allocator, repo, args.input_path.?, args.revision),
         .append => try cmdAppend(allocator, repo, store_path, args.json_path.?),
         .doctor => return try cmdDoctor(allocator, store_path),
         .progress => try cmdProgress(allocator, store_path, args.campaign_id.?, args.format),
@@ -540,6 +642,13 @@ fn parseArgs(argv: []const []const u8) !Args {
             args.json_path = argv[i];
             continue;
         }
+        if (std.mem.eql(u8, token, "--revision")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.revision = argv[i];
+            args.revision_set = true;
+            continue;
+        }
         if (std.mem.eql(u8, token, "--campaign-id")) {
             i += 1;
             if (i >= argv.len) return error.MissingValue;
@@ -567,8 +676,9 @@ fn parseArgs(argv: []const []const u8) !Args {
     const command = args.command orelse return error.MissingCommand;
     if (command == .validate_campaign and args.campaign_path == null) return error.MissingCampaign;
     if (command != .validate_campaign and args.campaign_path != null) return error.CampaignNotAllowed;
-    if (command == .fingerprint and args.input_path == null) return error.MissingInput;
-    if (command != .fingerprint and args.input_path != null) return error.InputNotAllowed;
+    if ((command == .fingerprint or command == .snapshot_target) and args.input_path == null) return error.MissingInput;
+    if (command != .fingerprint and command != .snapshot_target and args.input_path != null) return error.InputNotAllowed;
+    if (command != .snapshot_target and args.revision_set) return error.RevisionNotAllowed;
     if (command == .append and args.json_path == null) return error.MissingJson;
     if (command != .append and args.json_path != null) return error.JsonNotAllowed;
     if (command == .progress and args.campaign_id == null) return error.MissingCampaignId;
@@ -579,6 +689,7 @@ fn parseArgs(argv: []const []const u8) !Args {
 
 fn parseCommand(raw: []const u8) ?Command {
     if (std.mem.eql(u8, raw, "validate-campaign")) return .validate_campaign;
+    if (std.mem.eql(u8, raw, "snapshot-target")) return .snapshot_target;
     inline for (@typeInfo(Command).@"enum".fields) |field| {
         if (std.mem.eql(u8, raw, field.name)) return @enumFromInt(field.value);
     }
@@ -830,6 +941,16 @@ fn validateCampaignInput(campaign: CampaignInput) !void {
     if (!containsString(&.{ "sanitized", "local_full" }, campaign.privacy.mode)) return error.InvalidPrivacyMode;
     if (!containsString(campaign.privacy.redactions, "secrets") or
         !containsString(campaign.privacy.redactions, "private_reasoning")) return error.RequiredRedactionMissing;
+    const redaction = campaign.privacy.redaction_receipt;
+    if (!std.mem.eql(u8, redaction.schema, "hylo-redaction-receipt/v1")) return error.InvalidRedactionReceipt;
+    try validateNonEmpty(redaction.tool);
+    try validateNonEmpty(redaction.version);
+    try validateFingerprint(redaction.source_fingerprint);
+    try validateFingerprint(redaction.output_fingerprint);
+    try validateStringList(redaction.evidence_refs, true);
+    if (!std.mem.eql(u8, redaction.output_fingerprint, campaign.source.corpus_fingerprint)) {
+        return error.RedactionCorpusMismatch;
+    }
     try validateId(campaign.rubric.id);
     try validateFingerprint(campaign.rubric.fingerprint);
     if (campaign.rubric.dimensions.len == 0) return error.RubricDimensionsMissing;
@@ -843,6 +964,8 @@ fn validateCampaignInput(campaign: CampaignInput) !void {
         if (!containsString(&.{ "deterministic", "trace", "model", "human" }, dimension.kind)) {
             return error.InvalidGraderKind;
         }
+        try validateNonEmpty(dimension.grader_ref);
+        try validateFingerprint(dimension.grader_fingerprint);
         if (dimension.critical) {
             critical_model = critical_model or std.mem.eql(u8, dimension.kind, "model");
             critical_non_model = critical_non_model or !std.mem.eql(u8, dimension.kind, "model");
@@ -853,6 +976,7 @@ fn validateCampaignInput(campaign: CampaignInput) !void {
     }
     if (!positive_weight) return error.PositiveWeightMissing;
     if (critical_model and !critical_non_model) return error.ModelSoleCriticalAuthority;
+    try validateJudge(campaign.rubric.judge);
     if (!std.math.isFinite(campaign.rubric.pass_policy.minimum_aggregate) or
         campaign.rubric.pass_policy.minimum_aggregate < 0 or
         campaign.rubric.pass_policy.minimum_aggregate > 1) return error.InvalidAggregate;
@@ -862,10 +986,23 @@ fn validateCampaignInput(campaign: CampaignInput) !void {
     if (!containsString(&.{ "transcript_only", "workspace_snapshot", "controlled_replay", "synthetic_mutation" }, campaign.replay_policy.default_fidelity)) {
         return error.InvalidFidelity;
     }
-    if (campaign.replay_policy.repeat_count == 0 or campaign.stop_policy.max_cycles == 0 or
-        campaign.stop_policy.max_attempts == 0 or campaign.stop_policy.patience_cycles == 0) return error.InvalidPositiveCount;
+    if (campaign.replay_policy.repeat_count == 0 or campaign.stop_policy.max_attempts == 0) {
+        return error.InvalidPositiveCount;
+    }
     _ = try validateChangePolicy(campaign.change_policy);
     try validateRelativePath(campaign.scenarios_file);
+    if (campaign.scenario_manifest.len == 0) return error.ScenariosMissing;
+    var manifest_has_holdout = false;
+    for (campaign.scenario_manifest, 0..) |entry, index| {
+        try validateId(entry.scenario_id);
+        try validateFingerprint(entry.scenario_fingerprint);
+        const split = Split.parse(entry.split) orelse return error.InvalidSplit;
+        manifest_has_holdout = manifest_has_holdout or split == .holdout;
+        for (campaign.scenario_manifest[0..index]) |prior| {
+            if (std.mem.eql(u8, prior.scenario_id, entry.scenario_id)) return error.DuplicateScenario;
+        }
+    }
+    if (campaign.stop_policy.require_holdout_pass and !manifest_has_holdout) return error.HoldoutScenarioMissing;
 }
 
 fn validateScenarioInput(scenario: ScenarioInput, campaign: CampaignInput) !void {
@@ -898,7 +1035,62 @@ fn validateScenarioAgainstCampaign(
     }
     try validateFingerprint(scenario.environment.fingerprint);
     try validateNonEmpty(scenario.environment.repo_revision);
-    try validateNonEmpty(scenario.environment.permissions);
+    try validateId(scenario.environment.adapter.id);
+    try validateNonEmpty(scenario.environment.adapter.version);
+    try validateNonEmpty(scenario.environment.adapter.contract_ref);
+    try validateFingerprint(scenario.environment.adapter.contract_fingerprint);
+    if (!containsString(&.{ "git", "archive", "container", "synthetic", "transcript" }, scenario.environment.snapshot.kind)) {
+        return error.InvalidSnapshotKind;
+    }
+    try validateNonEmpty(scenario.environment.snapshot.ref);
+    if (std.mem.eql(u8, scenario.environment.snapshot.kind, "git")) {
+        if (!std.mem.startsWith(u8, scenario.environment.snapshot.ref, "git:")) {
+            return error.InvalidGitSnapshotRef;
+        }
+        try validateCommitSha(scenario.environment.snapshot.ref["git:".len..]);
+        if (!std.mem.eql(u8, scenario.environment.repo_revision, scenario.environment.snapshot.ref)) {
+            return error.GitRevisionSnapshotMismatch;
+        }
+    }
+    try validateFingerprint(scenario.environment.snapshot.fingerprint);
+    try validateNonEmpty(scenario.environment.setup_ref);
+    try validateFingerprint(scenario.environment.setup_fingerprint);
+    if (!std.mem.eql(u8, scenario.environment.fidelity, "transcript_only") and scenario.environment.toolchain.len == 0) {
+        return error.ToolchainMissing;
+    }
+    for (scenario.environment.toolchain, 0..) |tool, index| {
+        try validateId(tool.id);
+        try validateNonEmpty(tool.version);
+        for (scenario.environment.toolchain[0..index]) |prior| {
+            if (std.mem.eql(u8, prior.id, tool.id)) return error.DuplicateToolchainEntry;
+        }
+    }
+    for (scenario.environment.fixtures) |fixture| {
+        try validateNonEmpty(fixture.kind);
+        try validateNonEmpty(fixture.ref);
+        try validateFingerprint(fixture.fingerprint);
+    }
+    const effects = scenario.environment.effect_policy;
+    if (!containsString(&.{ "read_only", "workspace_write", "scoped_write" }, effects.filesystem)) {
+        return error.InvalidFilesystemPolicy;
+    }
+    for (effects.allowed_paths, 0..) |path, index| {
+        try validateRelativePath(path);
+        for (effects.allowed_paths[0..index]) |prior| if (std.mem.eql(u8, prior, path)) return error.DuplicatePath;
+    }
+    if (std.mem.eql(u8, effects.filesystem, "scoped_write") and effects.allowed_paths.len == 0) {
+        return error.PathsMissing;
+    }
+    if (!containsString(&.{ "deny", "allowlist", "unrestricted" }, effects.network)) return error.InvalidNetworkPolicy;
+    try validateStringList(effects.network_allowlist, false);
+    if (std.mem.eql(u8, effects.network, "allowlist") and effects.network_allowlist.len == 0) {
+        return error.NetworkAllowlistMissing;
+    }
+    if (!containsString(&.{ "deny", "allowlist" }, effects.external_side_effects)) return error.InvalidEffectPolicy;
+    try validateStringList(effects.external_effect_allowlist, false);
+    if (std.mem.eql(u8, effects.external_side_effects, "allowlist") and effects.external_effect_allowlist.len == 0) {
+        return error.ExternalEffectAllowlistMissing;
+    }
     try validateStringList(scenario.environment.limitations, false);
     try validateFingerprint(scenario.replay_policy_fingerprint);
     if (!std.mem.eql(u8, scenario.replay_policy_fingerprint, replay_policy_fingerprint)) {
@@ -911,6 +1103,8 @@ fn validateScenarioAgainstCampaign(
         try validateId(oracle.id);
         if (!containsString(&.{ "deterministic", "trace", "model", "human" }, oracle.kind)) return error.InvalidGraderKind;
         try validateNonEmpty(oracle.observation);
+        try validateNonEmpty(oracle.grader_ref);
+        try validateFingerprint(oracle.grader_fingerprint);
         if (oracle.critical) {
             critical_model = critical_model or std.mem.eql(u8, oracle.kind, "model");
             critical_non_model = critical_non_model or !std.mem.eql(u8, oracle.kind, "model");
@@ -983,9 +1177,21 @@ fn cmdValidateCampaign(allocator: std.mem.Allocator, campaign_path: []const u8) 
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r");
         if (line.len == 0) continue;
+        if (scenario_count >= campaign.scenario_manifest.len) return error.ScenarioManifestMismatch;
+        var scenario_value = try parseValue(allocator, line);
+        defer scenario_value.deinit();
         var scenario = try parseTyped(ScenarioInput, allocator, line);
         defer scenario.deinit();
         try validateScenarioInput(scenario.value, campaign);
+        const scenario_fingerprint = try digestValueAlloc(allocator, scenario_value.value);
+        defer allocator.free(scenario_fingerprint);
+        const manifest = campaign.scenario_manifest[scenario_count];
+        if (!std.mem.eql(u8, manifest.scenario_id, scenario.value.scenario_id) or
+            !std.mem.eql(u8, manifest.split, scenario.value.split) or
+            !std.mem.eql(u8, manifest.scenario_fingerprint, scenario_fingerprint))
+        {
+            return error.ScenarioManifestMismatch;
+        }
         if (scenario.value.mutation) |mutation| {
             var parent_found = false;
             for (scenario_ids.items) |prior| {
@@ -1008,6 +1214,7 @@ fn cmdValidateCampaign(allocator: std.mem.Allocator, campaign_path: []const u8) 
         scenario_count += 1;
     }
     if (scenario_count == 0) return error.ScenariosMissing;
+    if (scenario_count != campaign.scenario_manifest.len) return error.ScenarioManifestMismatch;
     if (campaign.stop_policy.require_holdout_pass and holdout_count == 0) return error.HoldoutScenarioMissing;
 
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -1025,18 +1232,47 @@ fn cmdValidateCampaign(allocator: std.mem.Allocator, campaign_path: []const u8) 
     try writeStdoutAlloc(allocator, &out);
 }
 
+const OracleState = struct {
+    id: []u8,
+    kind: []u8,
+    critical: bool,
+    grader_ref: []u8,
+    grader_fingerprint: []u8,
+
+    fn deinit(self: *OracleState, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.kind);
+        allocator.free(self.grader_ref);
+        allocator.free(self.grader_fingerprint);
+    }
+};
+
 const ScenarioState = struct {
     id: []u8,
     split: Split,
     fingerprint: []u8,
     environment_fingerprint: []u8,
     replay_policy_fingerprint: []u8,
+    oracles: []OracleState,
 
     fn deinit(self: *ScenarioState, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.fingerprint);
         allocator.free(self.environment_fingerprint);
         allocator.free(self.replay_policy_fingerprint);
+        for (self.oracles) |*oracle| oracle.deinit(allocator);
+        allocator.free(self.oracles);
+    }
+};
+
+const ExpectedScenarioState = struct {
+    id: []u8,
+    fingerprint: []u8,
+    split: Split,
+
+    fn deinit(self: *ExpectedScenarioState, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.fingerprint);
     }
 };
 
@@ -1045,37 +1281,52 @@ const AttemptState = struct {
     scenario_id: []u8,
     status: AttemptStatus,
     target_fingerprint: []u8,
-    environment_fingerprint: []u8,
-    replay_policy_fingerprint: []u8,
+    environment_fingerprint: ?[]u8,
+    replay_policy_fingerprint: ?[]u8,
+    target_snapshot_fingerprint: ?[]u8,
     origin: AttemptOrigin,
     role: AttemptRole,
     blind: bool,
+    sequence: u64,
 
     fn deinit(self: *AttemptState, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.scenario_id);
         allocator.free(self.target_fingerprint);
-        allocator.free(self.environment_fingerprint);
-        allocator.free(self.replay_policy_fingerprint);
+        if (self.environment_fingerprint) |value| allocator.free(value);
+        if (self.replay_policy_fingerprint) |value| allocator.free(value);
+        if (self.target_snapshot_fingerprint) |value| allocator.free(value);
     }
 };
 
 const DimensionState = struct {
     id: []u8,
     score: f64,
+    grader_kind: []u8,
+    grader_ref: []u8,
+    grader_fingerprint: []u8,
 
     fn deinit(self: *DimensionState, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
+        allocator.free(self.grader_kind);
+        allocator.free(self.grader_ref);
+        allocator.free(self.grader_fingerprint);
     }
 };
 
 const RubricDimensionState = struct {
     id: []u8,
+    kind: []u8,
     weight: f64,
     critical: bool,
+    grader_ref: []u8,
+    grader_fingerprint: []u8,
 
     fn deinit(self: *RubricDimensionState, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
+        allocator.free(self.kind);
+        allocator.free(self.grader_ref);
+        allocator.free(self.grader_fingerprint);
     }
 };
 
@@ -1086,8 +1337,13 @@ const GradeState = struct {
     status: GradeStatus,
     target_fingerprint: []u8,
     rubric_fingerprint: []u8,
-    environment_fingerprint: []u8,
-    replay_policy_fingerprint: []u8,
+    environment_fingerprint: ?[]u8,
+    replay_policy_fingerprint: ?[]u8,
+    judge_kind: []u8,
+    judge_id: []u8,
+    judge_version: []u8,
+    judge_config_fingerprint: []u8,
+    oracle_authority_fingerprint: []u8,
     blind: bool,
     comparison_eligible: bool,
     aggregate: ?f64,
@@ -1101,8 +1357,13 @@ const GradeState = struct {
         allocator.free(self.scenario_id);
         allocator.free(self.target_fingerprint);
         allocator.free(self.rubric_fingerprint);
-        allocator.free(self.environment_fingerprint);
-        allocator.free(self.replay_policy_fingerprint);
+        if (self.environment_fingerprint) |value| allocator.free(value);
+        if (self.replay_policy_fingerprint) |value| allocator.free(value);
+        allocator.free(self.judge_kind);
+        allocator.free(self.judge_id);
+        allocator.free(self.judge_version);
+        allocator.free(self.judge_config_fingerprint);
+        allocator.free(self.oracle_authority_fingerprint);
         for (self.dimensions) |*dimension| dimension.deinit(allocator);
         allocator.free(self.dimensions);
     }
@@ -1113,6 +1374,7 @@ const ChangeState = struct {
     status: ChangeStatus,
     before_target_fingerprint: []u8,
     after_target_fingerprint: []u8,
+    diff_fingerprint: []u8,
     paths: [][]u8,
     sequence: u64,
 
@@ -1120,6 +1382,7 @@ const ChangeState = struct {
         allocator.free(self.id);
         allocator.free(self.before_target_fingerprint);
         allocator.free(self.after_target_fingerprint);
+        allocator.free(self.diff_fingerprint);
         freeStringList(allocator, self.paths);
     }
 };
@@ -1153,6 +1416,7 @@ const CampaignState = struct {
     source_corpus_fingerprint: ?[]u8 = null,
     rubric_fingerprint: ?[]u8 = null,
     replay_policy_fingerprint: ?[]u8 = null,
+    grader_authority_fingerprint: ?[]u8 = null,
     minimum_aggregate: f64 = 0,
     zero_critical_violations: bool = true,
     repeat_count: u64 = 1,
@@ -1163,6 +1427,7 @@ const CampaignState = struct {
     publication_authority: PublicationAuthority = .none,
     allowed_paths: [][]u8 = &.{},
     rubric_dimensions: []RubricDimensionState = &.{},
+    expected_scenarios: []ExpectedScenarioState = &.{},
     scenarios: std.ArrayList(ScenarioState) = .empty,
     attempts: std.ArrayList(AttemptState) = .empty,
     grades: std.ArrayList(GradeState) = .empty,
@@ -1178,9 +1443,12 @@ const CampaignState = struct {
         if (self.source_corpus_fingerprint) |value| allocator.free(value);
         if (self.rubric_fingerprint) |value| allocator.free(value);
         if (self.replay_policy_fingerprint) |value| allocator.free(value);
+        if (self.grader_authority_fingerprint) |value| allocator.free(value);
         freeStringList(allocator, self.allowed_paths);
         for (self.rubric_dimensions) |*value| value.deinit(allocator);
         if (self.rubric_dimensions.len != 0) allocator.free(self.rubric_dimensions);
+        for (self.expected_scenarios) |*value| value.deinit(allocator);
+        if (self.expected_scenarios.len != 0) allocator.free(self.expected_scenarios);
         for (self.scenarios.items) |*value| value.deinit(allocator);
         self.scenarios.deinit(allocator);
         for (self.attempts.items) |*value| value.deinit(allocator);
@@ -1196,10 +1464,13 @@ const CampaignState = struct {
 
 const LedgerLoad = struct {
     event_count: u64 = 0,
+    store_revision: []u8,
+    store_exists: bool = false,
     last_digest: []u8,
     campaigns: std.ArrayList(CampaignState) = .empty,
 
     fn deinit(self: *LedgerLoad, allocator: std.mem.Allocator) void {
+        allocator.free(self.store_revision);
         allocator.free(self.last_digest);
         for (self.campaigns.items) |*campaign| campaign.deinit(allocator);
         self.campaigns.deinit(allocator);
@@ -1247,28 +1518,62 @@ fn findCampaign(campaigns: []CampaignState, id: []const u8) ?usize {
     return null;
 }
 
-fn findScenario(campaign: *CampaignState, id: []const u8) ?*ScenarioState {
+fn findScenario(campaign: *const CampaignState, id: []const u8) ?*const ScenarioState {
     for (campaign.scenarios.items) |*scenario| {
         if (std.mem.eql(u8, scenario.id, id)) return scenario;
     }
     return null;
 }
 
-fn findAttempt(campaign: *CampaignState, id: []const u8) ?*AttemptState {
+fn findScenarioMut(campaign: *CampaignState, id: []const u8) ?*ScenarioState {
+    for (campaign.scenarios.items) |*scenario| {
+        if (std.mem.eql(u8, scenario.id, id)) return scenario;
+    }
+    return null;
+}
+
+fn findExpectedScenario(campaign: *const CampaignState, id: []const u8) ?*const ExpectedScenarioState {
+    for (campaign.expected_scenarios) |*scenario| {
+        if (std.mem.eql(u8, scenario.id, id)) return scenario;
+    }
+    return null;
+}
+
+fn allScenariosAdmitted(campaign: *const CampaignState) bool {
+    if (campaign.scenarios.items.len != campaign.expected_scenarios.len) return false;
+    for (campaign.expected_scenarios) |expected| {
+        var found = false;
+        for (campaign.scenarios.items) |scenario| {
+            if (std.mem.eql(u8, expected.id, scenario.id)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+fn optionalStringsEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
+fn findAttempt(campaign: *const CampaignState, id: []const u8) ?*const AttemptState {
     for (campaign.attempts.items) |*attempt| {
         if (std.mem.eql(u8, attempt.id, id)) return attempt;
     }
     return null;
 }
 
-fn findGrade(campaign: *CampaignState, id: []const u8) ?*GradeState {
+fn findGrade(campaign: *const CampaignState, id: []const u8) ?*const GradeState {
     for (campaign.grades.items) |*grade| {
         if (std.mem.eql(u8, grade.id, id)) return grade;
     }
     return null;
 }
 
-fn findChange(campaign: *CampaignState, id: []const u8) ?*ChangeState {
+fn findChange(campaign: *const CampaignState, id: []const u8) ?*const ChangeState {
     for (campaign.changes.items) |*change| {
         if (std.mem.eql(u8, change.id, id)) return change;
     }
@@ -1340,6 +1645,11 @@ fn validateGradeDimensions(values: []const GradeDimensionInput, required: bool) 
             return error.InvalidScore;
         }
         if (!std.math.isFinite(dimension.weight) or dimension.weight < 0) return error.InvalidWeight;
+        if (!containsString(&.{ "deterministic", "trace", "model", "human" }, dimension.grader_kind)) {
+            return error.InvalidGraderKind;
+        }
+        try validateNonEmpty(dimension.grader_ref);
+        try validateFingerprint(dimension.grader_fingerprint);
         try validateStringList(dimension.evidence_refs, true);
         for (values[0..index]) |prior| if (std.mem.eql(u8, dimension.id, prior.id)) return error.DuplicateDimension;
     }
@@ -1351,6 +1661,7 @@ fn validateJudge(judge: JudgeInput) !void {
     }
     try validateNonEmpty(judge.id);
     try validateNonEmpty(judge.version);
+    try validateFingerprint(judge.config_fingerprint);
 }
 
 fn nextActionValid(value: []const u8) bool {
@@ -1405,11 +1716,187 @@ fn validateAndComputeAggregate(campaign: *const CampaignState, values: []const G
     for (values) |dimension| {
         const expected = rubricDimension(campaign, dimension.id) orelse return error.RubricDimensionMismatch;
         if (dimension.weight != expected.weight) return error.RubricWeightMismatch;
+        if (!std.mem.eql(u8, dimension.grader_kind, expected.kind)) return error.RubricGraderKindMismatch;
+        if (!std.mem.eql(u8, dimension.grader_ref, expected.grader_ref) or
+            !std.mem.eql(u8, dimension.grader_fingerprint, expected.grader_fingerprint))
+        {
+            return error.RubricGraderAuthorityMismatch;
+        }
         weighted_sum += dimension.score * expected.weight;
         total_weight += expected.weight;
     }
     if (total_weight <= 0) return error.PositiveWeightMissing;
     return weighted_sum / total_weight;
+}
+
+fn declaredGraderAuthorityFingerprintAlloc(
+    allocator: std.mem.Allocator,
+    rubric: RubricInput,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"dimensions\":[");
+    for (rubric.dimensions, 0..) |dimension, index| {
+        if (index != 0) try out.writer.writeByte(',');
+        try out.writer.writeAll("{\"grader_fingerprint\":");
+        try std.json.Stringify.value(dimension.grader_fingerprint, .{}, &out.writer);
+        try out.writer.writeAll(",\"grader_kind\":");
+        try std.json.Stringify.value(dimension.kind, .{}, &out.writer);
+        try out.writer.writeAll(",\"grader_ref\":");
+        try std.json.Stringify.value(dimension.grader_ref, .{}, &out.writer);
+        try out.writer.writeAll(",\"id\":");
+        try std.json.Stringify.value(dimension.id, .{}, &out.writer);
+        try out.writer.writeByte('}');
+    }
+    try out.writer.writeAll("],\"judge\":{\"config_fingerprint\":");
+    try std.json.Stringify.value(rubric.judge.config_fingerprint, .{}, &out.writer);
+    try out.writer.writeAll(",\"id\":");
+    try std.json.Stringify.value(rubric.judge.id, .{}, &out.writer);
+    try out.writer.writeAll(",\"kind\":");
+    try std.json.Stringify.value(rubric.judge.kind, .{}, &out.writer);
+    try out.writer.writeAll(",\"version\":");
+    try std.json.Stringify.value(rubric.judge.version, .{}, &out.writer);
+    try out.writer.writeAll("}}");
+    return digestBytesAlloc(allocator, out.written());
+}
+
+fn graderAuthorityFingerprintAlloc(
+    allocator: std.mem.Allocator,
+    campaign: *const CampaignState,
+    judge: JudgeInput,
+    dimensions: []const GradeDimensionInput,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"dimensions\":[");
+    for (campaign.rubric_dimensions, 0..) |expected, index| {
+        if (index != 0) try out.writer.writeByte(',');
+        var actual: ?GradeDimensionInput = null;
+        for (dimensions) |dimension| {
+            if (std.mem.eql(u8, dimension.id, expected.id)) {
+                actual = dimension;
+                break;
+            }
+        }
+        const dimension = actual orelse return error.RubricDimensionMismatch;
+        try out.writer.writeAll("{\"grader_fingerprint\":");
+        try std.json.Stringify.value(dimension.grader_fingerprint, .{}, &out.writer);
+        try out.writer.writeAll(",\"grader_kind\":");
+        try std.json.Stringify.value(dimension.grader_kind, .{}, &out.writer);
+        try out.writer.writeAll(",\"grader_ref\":");
+        try std.json.Stringify.value(dimension.grader_ref, .{}, &out.writer);
+        try out.writer.writeAll(",\"id\":");
+        try std.json.Stringify.value(dimension.id, .{}, &out.writer);
+        try out.writer.writeByte('}');
+    }
+    try out.writer.writeAll("],\"judge\":{\"config_fingerprint\":");
+    try std.json.Stringify.value(judge.config_fingerprint, .{}, &out.writer);
+    try out.writer.writeAll(",\"id\":");
+    try std.json.Stringify.value(judge.id, .{}, &out.writer);
+    try out.writer.writeAll(",\"kind\":");
+    try std.json.Stringify.value(judge.kind, .{}, &out.writer);
+    try out.writer.writeAll(",\"version\":");
+    try std.json.Stringify.value(judge.version, .{}, &out.writer);
+    try out.writer.writeAll("}}");
+    return digestBytesAlloc(allocator, out.written());
+}
+
+fn validateOracleResults(scenario: *const ScenarioState, values: []const OracleResultInput) !usize {
+    if (values.len != scenario.oracles.len) return error.OracleResultMismatch;
+    var critical_failures: usize = 0;
+    for (values, 0..) |result, index| {
+        try validateId(result.id);
+        if (!std.mem.eql(u8, result.id, scenario.oracles[index].id)) return error.OracleResultOrderMismatch;
+        if (!containsString(&.{ "pass", "fail", "unavailable" }, result.status)) return error.InvalidOracleStatus;
+        try validateNonEmpty(result.grader_ref);
+        try validateFingerprint(result.grader_fingerprint);
+        try validateStringList(result.evidence_refs, true);
+        for (values[0..index]) |prior| if (std.mem.eql(u8, prior.id, result.id)) return error.DuplicateOracleResult;
+        var expected: ?OracleState = null;
+        for (scenario.oracles) |oracle| {
+            if (std.mem.eql(u8, oracle.id, result.id)) {
+                expected = oracle;
+                break;
+            }
+        }
+        const oracle = expected orelse return error.OracleResultMismatch;
+        if (!std.mem.eql(u8, oracle.kind, result.grader_kind)) return error.OracleGraderKindMismatch;
+        if (!std.mem.eql(u8, oracle.grader_ref, result.grader_ref) or
+            !std.mem.eql(u8, oracle.grader_fingerprint, result.grader_fingerprint))
+        {
+            return error.OracleGraderAuthorityMismatch;
+        }
+        if (oracle.critical and !std.mem.eql(u8, result.status, "pass")) critical_failures += 1;
+    }
+    return critical_failures;
+}
+
+fn oracleAuthorityFingerprintAlloc(
+    allocator: std.mem.Allocator,
+    values: []const OracleResultInput,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeByte('[');
+    for (values, 0..) |result, index| {
+        if (index != 0) try out.writer.writeByte(',');
+        try out.writer.writeAll("{\"grader_fingerprint\":");
+        try std.json.Stringify.value(result.grader_fingerprint, .{}, &out.writer);
+        try out.writer.writeAll(",\"grader_kind\":");
+        try std.json.Stringify.value(result.grader_kind, .{}, &out.writer);
+        try out.writer.writeAll(",\"grader_ref\":");
+        try std.json.Stringify.value(result.grader_ref, .{}, &out.writer);
+        try out.writer.writeAll(",\"id\":");
+        try std.json.Stringify.value(result.id, .{}, &out.writer);
+        try out.writer.writeByte('}');
+    }
+    try out.writer.writeByte(']');
+    return digestBytesAlloc(allocator, out.written());
+}
+
+fn hasComparableReplayBaseline(
+    campaign: *CampaignState,
+    scenario_id: []const u8,
+    rubric_fingerprint: []const u8,
+    environment_fingerprint: []const u8,
+    replay_policy_fingerprint: []const u8,
+    judge: JudgeInput,
+    dimensions: []const GradeDimensionInput,
+    oracle_authority_fingerprint: []const u8,
+    candidate_attempt_sequence: u64,
+) bool {
+    for (campaign.grades.items) |grade| {
+        if (!grade.comparison_eligible or !std.mem.eql(u8, grade.scenario_id, scenario_id)) continue;
+        if (!std.mem.eql(u8, grade.target_fingerprint, campaign.baseline_target_fingerprint.?)) continue;
+        if (!std.mem.eql(u8, grade.rubric_fingerprint, rubric_fingerprint)) continue;
+        if (!optionalStringsEqual(grade.environment_fingerprint, environment_fingerprint)) continue;
+        if (!optionalStringsEqual(grade.replay_policy_fingerprint, replay_policy_fingerprint)) continue;
+        if (!std.mem.eql(u8, grade.judge_kind, judge.kind) or
+            !std.mem.eql(u8, grade.judge_id, judge.id) or
+            !std.mem.eql(u8, grade.judge_version, judge.version) or
+            !std.mem.eql(u8, grade.judge_config_fingerprint, judge.config_fingerprint)) continue;
+        if (!std.mem.eql(u8, grade.oracle_authority_fingerprint, oracle_authority_fingerprint)) continue;
+        if (grade.dimensions.len != dimensions.len) continue;
+        var dimensions_match = true;
+        for (dimensions) |dimension| {
+            var matched = false;
+            for (grade.dimensions) |prior_dimension| {
+                if (!std.mem.eql(u8, prior_dimension.id, dimension.id)) continue;
+                matched = std.mem.eql(u8, prior_dimension.grader_kind, dimension.grader_kind) and
+                    std.mem.eql(u8, prior_dimension.grader_ref, dimension.grader_ref) and
+                    std.mem.eql(u8, prior_dimension.grader_fingerprint, dimension.grader_fingerprint);
+                break;
+            }
+            if (!matched) {
+                dimensions_match = false;
+                break;
+            }
+        }
+        if (!dimensions_match) continue;
+        const attempt = findAttempt(campaign, grade.attempt_id) orelse continue;
+        if (attempt.role == .replay_baseline and attempt.sequence < candidate_attempt_sequence) return true;
+    }
+    return false;
 }
 
 fn validateCommitSha(value: []const u8) !void {
@@ -1422,6 +1909,66 @@ fn validateCommitSha(value: []const u8) !void {
 fn validateCommitTreeRef(value: []const u8) !void {
     if (!std.mem.startsWith(u8, value, "git-tree:")) return error.InvalidCommitTreeRef;
     try validateCommitSha(value["git-tree:".len..]);
+}
+
+fn validateTargetSnapshot(snapshot: TargetSnapshotInput, campaign: *const CampaignState) !void {
+    if (!std.mem.eql(u8, snapshot.schema, "hylo-target-snapshot/v1")) return error.InvalidTargetSnapshotSchema;
+    if (snapshot.roots.len != campaign.allowed_paths.len) return error.TargetSnapshotRootsMismatch;
+    for (snapshot.roots, campaign.allowed_paths) |root, expected| {
+        if (!std.mem.eql(u8, root, expected)) return error.TargetSnapshotRootsMismatch;
+    }
+    for (snapshot.roots) |root| try validateRelativePath(root);
+    var previous_path: ?[]const u8 = null;
+    for (snapshot.entries) |entry| {
+        try validateRelativePath(entry.path);
+        if (!containsString(&.{ "100644", "100755", "120000", "160000" }, entry.mode)) {
+            return error.InvalidGitMode;
+        }
+        if (!containsString(&.{ "blob", "commit" }, entry.object_type)) return error.InvalidGitObjectType;
+        if (std.mem.eql(u8, entry.mode, "160000") != std.mem.eql(u8, entry.object_type, "commit")) {
+            return error.GitModeTypeMismatch;
+        }
+        try validateCommitSha(entry.object_id);
+        var in_scope = false;
+        for (snapshot.roots) |root| {
+            if (pathWithin(entry.path, root)) {
+                in_scope = true;
+                break;
+            }
+        }
+        if (!in_scope) return error.TargetSnapshotPathOutsideRoots;
+        if (previous_path) |previous| {
+            if (!std.mem.lessThan(u8, previous, entry.path)) return error.TargetSnapshotEntriesNotSorted;
+        }
+        previous_path = entry.path;
+    }
+}
+
+fn validateHistoricalProvenance(provenance: HistoricalProvenanceInput) !void {
+    if (!containsString(&.{ "exact", "partial", "unavailable" }, provenance.status)) {
+        return error.InvalidHistoricalProvenance;
+    }
+    if (provenance.environment_fingerprint) |fingerprint| try validateFingerprint(fingerprint);
+    if (provenance.repo_revision) |revision| try validateNonEmpty(revision);
+    try validateStringList(provenance.limitations, !std.mem.eql(u8, provenance.status, "exact"));
+    try validateStringList(provenance.evidence_refs, true);
+    if (std.mem.eql(u8, provenance.status, "exact") and provenance.environment_fingerprint == null) {
+        return error.ExactHistoricalEnvironmentMissing;
+    }
+}
+
+fn targetSnapshotConsistent(
+    campaign: *const CampaignState,
+    target_fingerprint: []const u8,
+    snapshot_fingerprint: []const u8,
+) bool {
+    for (campaign.attempts.items) |attempt| {
+        if (attempt.origin == .historical or !std.mem.eql(u8, attempt.target_fingerprint, target_fingerprint)) continue;
+        if (attempt.target_snapshot_fingerprint) |prior| {
+            if (!std.mem.eql(u8, prior, snapshot_fingerprint)) return false;
+        }
+    }
+    return true;
 }
 
 fn processExitCode(term: std.process.Child.Term) u8 {
@@ -1454,10 +2001,282 @@ fn runGitStdoutAlloc(
     return result.stdout;
 }
 
+const GitSnapshotEntry = struct {
+    mode: []const u8,
+    object_id: []const u8,
+    object_type: []const u8,
+    path: []const u8,
+};
+
+const TargetSnapshotArtifact = struct {
+    json: []u8,
+    fingerprint: []u8,
+
+    fn deinit(self: *TargetSnapshotArtifact, allocator: std.mem.Allocator) void {
+        allocator.free(self.json);
+        allocator.free(self.fingerprint);
+    }
+};
+
+fn parseGitSnapshotEntries(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    from_index: bool,
+) !std.ArrayList(GitSnapshotEntry) {
+    var entries: std.ArrayList(GitSnapshotEntry) = .empty;
+    errdefer entries.deinit(allocator);
+    var records = std.mem.splitScalar(u8, raw, 0);
+    while (records.next()) |record| {
+        if (record.len == 0) continue;
+        const tab = std.mem.indexOfScalar(u8, record, '\t') orelse return error.InvalidGitSnapshot;
+        const metadata = record[0..tab];
+        const path = record[tab + 1 ..];
+        try validateRelativePath(path);
+        var parts = std.mem.splitScalar(u8, metadata, ' ');
+        const mode = parts.next() orelse return error.InvalidGitSnapshot;
+        const second = parts.next() orelse return error.InvalidGitSnapshot;
+        const third = parts.next() orelse return error.InvalidGitSnapshot;
+        if (parts.next() != null) return error.InvalidGitSnapshot;
+        const object_type = if (from_index)
+            (if (std.mem.eql(u8, mode, "160000")) "commit" else "blob")
+        else
+            second;
+        const object_id = if (from_index) second else third;
+        if (from_index and !std.mem.eql(u8, third, "0")) return error.UnmergedGitIndex;
+        try entries.append(allocator, .{
+            .mode = mode,
+            .object_id = object_id,
+            .object_type = object_type,
+            .path = path,
+        });
+    }
+    std.mem.sort(GitSnapshotEntry, entries.items, {}, struct {
+        fn lessThan(_: void, left: GitSnapshotEntry, right: GitSnapshotEntry) bool {
+            return std.mem.lessThan(u8, left.path, right.path);
+        }
+    }.lessThan);
+    return entries;
+}
+
+fn targetSnapshotArtifactAlloc(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    revision: []const u8,
+    roots: []const []const u8,
+) !TargetSnapshotArtifact {
+    if (roots.len == 0) return error.TargetSnapshotRootsMissing;
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    const from_index = std.mem.eql(u8, revision, "INDEX");
+    if (from_index) {
+        try argv.appendSlice(allocator, &.{ "ls-files", "--stage", "-z", "--" });
+    } else {
+        try validateNonEmpty(revision);
+        try argv.appendSlice(allocator, &.{ "ls-tree", "-r", "-z", "--full-tree", revision, "--" });
+    }
+    for (roots) |root| {
+        try validateRelativePath(root);
+        try argv.append(allocator, root);
+    }
+    const raw = try runGitStdoutAlloc(allocator, repo, argv.items);
+    defer allocator.free(raw);
+    var entries = try parseGitSnapshotEntries(allocator, raw, from_index);
+    defer entries.deinit(allocator);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"entries\":[");
+    for (entries.items, 0..) |entry, index| {
+        if (index != 0) try out.writer.writeByte(',');
+        try out.writer.writeAll("{\"mode\":");
+        try std.json.Stringify.value(entry.mode, .{}, &out.writer);
+        try out.writer.writeAll(",\"object_id\":");
+        try std.json.Stringify.value(entry.object_id, .{}, &out.writer);
+        try out.writer.writeAll(",\"object_type\":");
+        try std.json.Stringify.value(entry.object_type, .{}, &out.writer);
+        try out.writer.writeAll(",\"path\":");
+        try std.json.Stringify.value(entry.path, .{}, &out.writer);
+        try out.writer.writeByte('}');
+    }
+    try out.writer.writeAll("],\"roots\":[");
+    for (roots, 0..) |root, index| {
+        if (index != 0) try out.writer.writeByte(',');
+        try std.json.Stringify.value(root, .{}, &out.writer);
+    }
+    try out.writer.writeAll("],\"schema\":\"hylo-target-snapshot/v1\"}");
+    const json = try out.toOwnedSlice();
+    errdefer allocator.free(json);
+    return .{ .json = json, .fingerprint = try digestBytesAlloc(allocator, json) };
+}
+
+fn resolveSnapshotRevisionAlloc(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    revision: []const u8,
+) ![]u8 {
+    if (std.mem.eql(u8, revision, "INDEX")) return allocator.dupe(u8, revision);
+    try validateNonEmpty(revision);
+    const commit_spec = try std.fmt.allocPrint(allocator, "{s}^{{commit}}", .{revision});
+    defer allocator.free(commit_spec);
+    const resolved_raw = try runGitStdoutAlloc(allocator, repo, &.{ "rev-parse", "--verify", commit_spec });
+    defer allocator.free(resolved_raw);
+    const resolved = std.mem.trim(u8, resolved_raw, " \t\r\n");
+    try validateCommitSha(resolved);
+    return allocator.dupe(u8, resolved);
+}
+
+fn cmdSnapshotTarget(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    input_path: []const u8,
+    revision: []const u8,
+) !void {
+    const bytes = try readInputAlloc(allocator, input_path);
+    defer allocator.free(bytes);
+    var request = try parseTyped(TargetSnapshotRequest, allocator, bytes);
+    defer request.deinit();
+    if (!std.mem.eql(u8, request.value.schema, "hylo-target-snapshot-request/v1")) {
+        return error.InvalidTargetSnapshotRequest;
+    }
+    const resolved_revision = try resolveSnapshotRevisionAlloc(allocator, repo, revision);
+    defer allocator.free(resolved_revision);
+    var artifact = try targetSnapshotArtifactAlloc(allocator, repo, resolved_revision, request.value.roots);
+    defer artifact.deinit(allocator);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"schema\":\"hylo-target-snapshot-receipt/v1\",\"revision\":");
+    try std.json.Stringify.value(resolved_revision, .{}, &out.writer);
+    try out.writer.writeAll(",\"fingerprint\":");
+    try std.json.Stringify.value(artifact.fingerprint, .{}, &out.writer);
+    try out.writer.writeAll(",\"snapshot\":");
+    try out.writer.writeAll(artifact.json);
+    try out.writer.writeAll("}\n");
+    try writeStdoutAlloc(allocator, &out);
+}
+
+fn verifyStagedChange(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    paths: []const []const u8,
+    target_roots: []const []const u8,
+    expected_diff_fingerprint: []const u8,
+) !void {
+    const staged_paths_raw = try runGitStdoutAlloc(
+        allocator,
+        repo,
+        &.{ "diff", "--cached", "--name-only", "-z", "HEAD", "--" },
+    );
+    defer allocator.free(staged_paths_raw);
+    var staged_paths: std.ArrayList([]const u8) = .empty;
+    defer staged_paths.deinit(allocator);
+    var records = std.mem.splitScalar(u8, staged_paths_raw, 0);
+    while (records.next()) |path| {
+        if (path.len == 0) continue;
+        try validateRelativePath(path);
+        try staged_paths.append(allocator, path);
+    }
+    if (!pathsEqualAsSets(paths, staged_paths.items)) return error.AppliedDiffPathsMismatch;
+
+    var unstaged_argv: std.ArrayList([]const u8) = .empty;
+    defer unstaged_argv.deinit(allocator);
+    try unstaged_argv.appendSlice(allocator, &.{ "diff", "--name-only", "-z", "--" });
+    try unstaged_argv.appendSlice(allocator, target_roots);
+    const unstaged_paths = try runGitStdoutAlloc(allocator, repo, unstaged_argv.items);
+    defer allocator.free(unstaged_paths);
+    if (unstaged_paths.len != 0) return error.AppliedDiffScopeDirty;
+
+    var untracked_argv: std.ArrayList([]const u8) = .empty;
+    defer untracked_argv.deinit(allocator);
+    try untracked_argv.appendSlice(allocator, &.{ "ls-files", "--others", "--exclude-standard", "-z", "--" });
+    try untracked_argv.appendSlice(allocator, target_roots);
+    const untracked_paths = try runGitStdoutAlloc(allocator, repo, untracked_argv.items);
+    defer allocator.free(untracked_paths);
+    if (untracked_paths.len != 0) return error.AppliedDiffScopeUntracked;
+
+    var ignored_argv: std.ArrayList([]const u8) = .empty;
+    defer ignored_argv.deinit(allocator);
+    try ignored_argv.appendSlice(allocator, &.{ "ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--" });
+    try ignored_argv.appendSlice(allocator, target_roots);
+    const ignored_paths = try runGitStdoutAlloc(allocator, repo, ignored_argv.items);
+    defer allocator.free(ignored_paths);
+    if (ignored_paths.len != 0) return error.AppliedDiffScopeIgnored;
+
+    const diff = try runGitStdoutAlloc(
+        allocator,
+        repo,
+        &.{ "diff", "--cached", "--binary", "--full-index", "--no-ext-diff", "--no-color", "HEAD", "--" },
+    );
+    defer allocator.free(diff);
+    const diff_fingerprint = try digestBytesAlloc(allocator, diff);
+    defer allocator.free(diff_fingerprint);
+    if (!std.mem.eql(u8, diff_fingerprint, expected_diff_fingerprint)) return error.AppliedDiffFingerprintMismatch;
+}
+
+fn verifyAppliedChange(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    campaign: *const CampaignState,
+    change: ChangePayload,
+) !void {
+    if (!std.mem.eql(u8, change.status, "applied")) return;
+    return verifyStagedChange(
+        allocator,
+        repo,
+        change.paths,
+        @ptrCast(campaign.allowed_paths),
+        change.diff_fingerprint,
+    );
+}
+
+fn findAppliedChangeForTarget(campaign: *const CampaignState, target_fingerprint: []const u8) ?*const ChangeState {
+    var index = campaign.changes.items.len;
+    while (index > 0) {
+        index -= 1;
+        const change = &campaign.changes.items[index];
+        if (change.status == .applied and std.mem.eql(u8, change.after_target_fingerprint, target_fingerprint)) {
+            return change;
+        }
+    }
+    return null;
+}
+
+fn verifyAttemptTarget(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    campaign: *const CampaignState,
+    attempt: AttemptPayload,
+) !void {
+    const role = AttemptRole.parse(attempt.role) orelse return error.InvalidAttemptRole;
+    if (role == .candidate or role == .mutation) {
+        const change = findAppliedChangeForTarget(campaign, attempt.target_fingerprint) orelse return error.ChangeMissing;
+        try verifyStagedChange(
+            allocator,
+            repo,
+            @ptrCast(change.paths),
+            @ptrCast(campaign.allowed_paths),
+            change.diff_fingerprint,
+        );
+    }
+    if (attempt.target_snapshot) |_| {
+        const revision = attempt.target_snapshot_revision orelse return error.IncompleteTargetSnapshot;
+        var observed = try targetSnapshotArtifactAlloc(
+            allocator,
+            repo,
+            revision,
+            @ptrCast(campaign.allowed_paths),
+        );
+        defer observed.deinit(allocator);
+        if (!std.mem.eql(u8, observed.fingerprint, attempt.target_snapshot_fingerprint.?)) {
+            return error.TargetSnapshotObservationMismatch;
+        }
+    }
+}
+
 fn verifyPublicationCommit(
     allocator: std.mem.Allocator,
     repo: []const u8,
     publication: PublicationPayload,
+    campaign: *CampaignState,
 ) !void {
     if (!std.mem.eql(u8, publication.status, "committed")) return;
     const commit_sha = publication.commit_sha orelse return error.CommitShaMissing;
@@ -1496,6 +2315,66 @@ fn verifyPublicationCommit(
         try changed_paths.append(allocator, path);
     }
     if (!pathsEqualAsSets(publication.paths, changed_paths.items)) return error.CommitPathsClaimMismatch;
+
+    var promotion_snapshot: ?[]const u8 = null;
+    for (publication.promotion_grade_ids) |grade_id| {
+        const grade = findGrade(campaign, grade_id) orelse return error.GradeMissing;
+        const attempt = findAttempt(campaign, grade.attempt_id) orelse return error.AttemptMissing;
+        const fingerprint = attempt.target_snapshot_fingerprint orelse return error.TargetSnapshotMissing;
+        if (promotion_snapshot) |prior| {
+            if (!std.mem.eql(u8, prior, fingerprint)) return error.PromotionTargetSnapshotMismatch;
+        } else {
+            promotion_snapshot = fingerprint;
+        }
+    }
+    var committed_snapshot = try targetSnapshotArtifactAlloc(allocator, repo, commit_sha, @ptrCast(campaign.allowed_paths));
+    defer committed_snapshot.deinit(allocator);
+    if (!std.mem.eql(u8, promotion_snapshot orelse return error.TargetSnapshotMissing, committed_snapshot.fingerprint)) {
+        return error.CommittedTargetSnapshotMismatch;
+    }
+}
+
+fn stringListContains(values: []const []const u8, wanted: []const u8) bool {
+    for (values) |value| if (std.mem.eql(u8, value, wanted)) return true;
+    return false;
+}
+
+fn validatePromotionCohort(
+    campaign: *const CampaignState,
+    change: *const ChangeState,
+    publication: PublicationPayload,
+) !void {
+    if (campaign.repeat_count > std.math.maxInt(usize)) return error.InvalidPositiveCount;
+    const required_repeats: usize = @intCast(campaign.repeat_count);
+    if (campaign.scenarios.items.len != 0 and
+        required_repeats > std.math.maxInt(usize) / campaign.scenarios.items.len)
+    {
+        return error.InvalidPositiveCount;
+    }
+    const expected_count = campaign.scenarios.items.len * required_repeats;
+    if (publication.promotion_grade_ids.len != expected_count) return error.PromotionCohortMismatch;
+
+    for (campaign.scenarios.items) |scenario| {
+        var selected: usize = 0;
+        var index = campaign.grades.items.len;
+        while (index > 0 and selected < required_repeats) {
+            index -= 1;
+            const grade = &campaign.grades.items[index];
+            if (grade.sequence <= change.sequence) break;
+            if (!grade.comparison_eligible or
+                !std.mem.eql(u8, grade.target_fingerprint, change.after_target_fingerprint) or
+                !std.mem.eql(u8, grade.scenario_id, scenario.id)) continue;
+            if (grade.status != .pass) return error.PromotionCohortFailed;
+            if (campaign.stop_zero_critical_violations and grade.critical_violation_count != 0) {
+                return error.PromotionHasCriticalViolation;
+            }
+            if (!stringListContains(publication.promotion_grade_ids, grade.id)) {
+                return error.PromotionCohortMismatch;
+            }
+            selected += 1;
+        }
+        if (selected != required_repeats) return error.ScenarioPromotionIncomplete;
+    }
 }
 
 fn applyEvent(
@@ -1549,12 +2428,49 @@ fn applyEvent(
                 allocator.free(rubric_dimensions);
             }
             for (campaign_input.value.rubric.dimensions, 0..) |dimension, index| {
+                const dimension_id = try allocator.dupe(u8, dimension.id);
+                errdefer allocator.free(dimension_id);
+                const dimension_kind = try allocator.dupe(u8, dimension.kind);
+                errdefer allocator.free(dimension_kind);
+                const grader_ref = try allocator.dupe(u8, dimension.grader_ref);
+                errdefer allocator.free(grader_ref);
+                const grader_fingerprint = try allocator.dupe(u8, dimension.grader_fingerprint);
+                errdefer allocator.free(grader_fingerprint);
                 rubric_dimensions[index] = .{
-                    .id = try allocator.dupe(u8, dimension.id),
+                    .id = dimension_id,
+                    .kind = dimension_kind,
                     .weight = dimension.weight,
                     .critical = dimension.critical,
+                    .grader_ref = grader_ref,
+                    .grader_fingerprint = grader_fingerprint,
                 };
                 rubric_dimensions_initialized += 1;
+            }
+            const grader_authority_fingerprint = try declaredGraderAuthorityFingerprintAlloc(
+                allocator,
+                campaign_input.value.rubric,
+            );
+            errdefer allocator.free(grader_authority_fingerprint);
+            const expected_scenarios = try allocator.alloc(
+                ExpectedScenarioState,
+                campaign_input.value.scenario_manifest.len,
+            );
+            var expected_scenarios_initialized: usize = 0;
+            errdefer {
+                for (expected_scenarios[0..expected_scenarios_initialized]) |*scenario| scenario.deinit(allocator);
+                allocator.free(expected_scenarios);
+            }
+            for (campaign_input.value.scenario_manifest, 0..) |entry, index| {
+                const expected_id = try allocator.dupe(u8, entry.scenario_id);
+                errdefer allocator.free(expected_id);
+                const expected_fingerprint = try allocator.dupe(u8, entry.scenario_fingerprint);
+                errdefer allocator.free(expected_fingerprint);
+                expected_scenarios[index] = .{
+                    .id = expected_id,
+                    .fingerprint = expected_fingerprint,
+                    .split = Split.parse(entry.split).?,
+                };
+                expected_scenarios_initialized += 1;
             }
 
             campaign.target_id = target_id;
@@ -1562,6 +2478,7 @@ fn applyEvent(
             campaign.source_corpus_fingerprint = corpus;
             campaign.rubric_fingerprint = rubric;
             campaign.replay_policy_fingerprint = replay;
+            campaign.grader_authority_fingerprint = grader_authority_fingerprint;
             campaign.minimum_aggregate = campaign_input.value.rubric.pass_policy.minimum_aggregate;
             campaign.zero_critical_violations = campaign_input.value.rubric.pass_policy.zero_critical_violations;
             campaign.repeat_count = campaign_input.value.replay_policy.repeat_count;
@@ -1572,6 +2489,7 @@ fn applyEvent(
             campaign.publication_authority = policy.publication;
             campaign.allowed_paths = allowed;
             campaign.rubric_dimensions = rubric_dimensions;
+            campaign.expected_scenarios = expected_scenarios;
             campaign.created = true;
         },
         .scenario_admitted => {
@@ -1579,6 +2497,7 @@ fn applyEvent(
             try validateBodyIds(body.value, true, false, false);
             const scenario_id = body.value.scenario_id.?;
             if (findScenario(campaign, scenario_id) != null) return error.DuplicateScenario;
+            const expected = findExpectedScenario(campaign, scenario_id) orelse return error.ScenarioNotInManifest;
             var payload = try parseValueAs(ScenarioAdmittedPayload, allocator, body.value.payload);
             defer payload.deinit();
             try validateFingerprint(payload.value.scenario_fingerprint);
@@ -1586,6 +2505,9 @@ fn applyEvent(
             defer allocator.free(actual_fingerprint);
             if (!std.mem.eql(u8, actual_fingerprint, payload.value.scenario_fingerprint)) {
                 return error.ScenarioFingerprintMismatch;
+            }
+            if (!std.mem.eql(u8, expected.fingerprint, payload.value.scenario_fingerprint)) {
+                return error.ScenarioManifestMismatch;
             }
             var scenario_input = try parseValueAs(ScenarioInput, allocator, payload.value.scenario);
             defer scenario_input.deinit();
@@ -1595,6 +2517,7 @@ fn applyEvent(
                 campaign.replay_policy_fingerprint.?,
             );
             if (!std.mem.eql(u8, scenario_input.value.scenario_id, scenario_id)) return error.ScenarioMismatch;
+            if (Split.parse(scenario_input.value.split).? != expected.split) return error.ScenarioManifestMismatch;
             if (scenario_input.value.mutation) |mutation| {
                 if (findScenario(campaign, mutation.parent_scenario_id) == null) return error.MutationParentMissing;
             }
@@ -1607,22 +2530,48 @@ fn applyEvent(
             errdefer allocator.free(environment_fingerprint);
             const replay_policy_fingerprint = try allocator.dupe(u8, scenario_input.value.replay_policy_fingerprint);
             errdefer allocator.free(replay_policy_fingerprint);
+            const oracles = try allocator.alloc(OracleState, scenario_input.value.oracles.len);
+            var oracles_initialized: usize = 0;
+            errdefer {
+                for (oracles[0..oracles_initialized]) |*oracle| oracle.deinit(allocator);
+                allocator.free(oracles);
+            }
+            for (scenario_input.value.oracles, 0..) |oracle, index| {
+                const oracle_id = try allocator.dupe(u8, oracle.id);
+                errdefer allocator.free(oracle_id);
+                const oracle_kind = try allocator.dupe(u8, oracle.kind);
+                errdefer allocator.free(oracle_kind);
+                const grader_ref = try allocator.dupe(u8, oracle.grader_ref);
+                errdefer allocator.free(grader_ref);
+                const grader_fingerprint = try allocator.dupe(u8, oracle.grader_fingerprint);
+                errdefer allocator.free(grader_fingerprint);
+                oracles[index] = .{
+                    .id = oracle_id,
+                    .kind = oracle_kind,
+                    .critical = oracle.critical,
+                    .grader_ref = grader_ref,
+                    .grader_fingerprint = grader_fingerprint,
+                };
+                oracles_initialized += 1;
+            }
             const state = ScenarioState{
                 .id = state_id,
                 .split = Split.parse(scenario_input.value.split).?,
                 .fingerprint = fingerprint,
                 .environment_fingerprint = environment_fingerprint,
                 .replay_policy_fingerprint = replay_policy_fingerprint,
+                .oracles = oracles,
             };
             try campaign.scenarios.append(allocator, state);
         },
         .attempt_recorded => {
             try requireCreated(campaign);
+            if (!allScenariosAdmitted(campaign)) return error.ScenarioManifestNotSealed;
             if (campaign.attempts.items.len >= campaign.max_attempts) return error.AttemptBudgetExhausted;
             try validateBodyIds(body.value, true, true, false);
             const scenario_id = body.value.scenario_id.?;
             const attempt_id = body.value.attempt_id.?;
-            const scenario = findScenario(campaign, scenario_id) orelse return error.ScenarioMissing;
+            const scenario = findScenarioMut(campaign, scenario_id) orelse return error.ScenarioMissing;
             if (findAttempt(campaign, attempt_id) != null) return error.DuplicateAttempt;
             var payload = try parseValueAs(AttemptPayload, allocator, body.value.payload);
             defer payload.deinit();
@@ -1635,14 +2584,20 @@ fn applyEvent(
                 .mutation => if (origin != .synthetic) return error.AttemptRoleOriginMismatch,
             }
             try validateFingerprint(payload.value.target_fingerprint);
-            try validateFingerprint(payload.value.environment_fingerprint);
-            try validateFingerprint(payload.value.replay_policy_fingerprint);
             try validateStringList(payload.value.evidence_refs, true);
-            if (!std.mem.eql(u8, payload.value.environment_fingerprint, scenario.environment_fingerprint)) {
-                return error.EnvironmentMismatch;
-            }
-            if (!std.mem.eql(u8, payload.value.replay_policy_fingerprint, scenario.replay_policy_fingerprint)) {
-                return error.ReplayPolicyMismatch;
+            if (origin == .historical) {
+                if (payload.value.environment_fingerprint != null or payload.value.replay_policy_fingerprint != null) {
+                    return error.HistoricalReplayIdentityForbidden;
+                }
+                try validateHistoricalProvenance(payload.value.historical_provenance orelse return error.HistoricalProvenanceMissing);
+            } else {
+                if (payload.value.historical_provenance != null) return error.UnexpectedHistoricalProvenance;
+                const environment = payload.value.environment_fingerprint orelse return error.EnvironmentMissing;
+                const replay_policy = payload.value.replay_policy_fingerprint orelse return error.ReplayPolicyMissing;
+                try validateFingerprint(environment);
+                try validateFingerprint(replay_policy);
+                if (!std.mem.eql(u8, environment, scenario.environment_fingerprint)) return error.EnvironmentMismatch;
+                if (!std.mem.eql(u8, replay_policy, scenario.replay_policy_fingerprint)) return error.ReplayPolicyMismatch;
             }
             if ((role == .historical_baseline or role == .replay_baseline) and
                 !std.mem.eql(u8, payload.value.target_fingerprint, campaign.baseline_target_fingerprint.?))
@@ -1650,6 +2605,42 @@ fn applyEvent(
                 return error.BaselineTargetMismatch;
             }
             if (!targetFingerprintKnown(campaign, payload.value.target_fingerprint)) return error.UnknownTargetFingerprint;
+            if ((role == .candidate or role == .mutation) and
+                findAppliedChangeForTarget(campaign, payload.value.target_fingerprint) == null)
+            {
+                return error.ChangeMissing;
+            }
+            const has_snapshot = payload.value.target_snapshot != null;
+            if ((payload.value.target_snapshot_fingerprint != null) != has_snapshot or
+                (payload.value.target_snapshot_revision != null) != has_snapshot)
+            {
+                return error.IncompleteTargetSnapshot;
+            }
+            if (origin == .historical and has_snapshot) return error.HistoricalTargetSnapshotForbidden;
+            if (origin != .historical and campaign.publication_authority == .commit and !has_snapshot) {
+                return error.TargetSnapshotMissing;
+            }
+            if (payload.value.target_snapshot) |snapshot_value| {
+                const snapshot_revision = payload.value.target_snapshot_revision.?;
+                if (role == .candidate or role == .mutation) {
+                    if (!std.mem.eql(u8, snapshot_revision, "INDEX")) return error.CandidateSnapshotMustUseIndex;
+                } else {
+                    try validateCommitSha(snapshot_revision);
+                }
+                const snapshot_fingerprint = payload.value.target_snapshot_fingerprint.?;
+                try validateFingerprint(snapshot_fingerprint);
+                const actual_snapshot_fingerprint = try digestValueAlloc(allocator, snapshot_value);
+                defer allocator.free(actual_snapshot_fingerprint);
+                if (!std.mem.eql(u8, actual_snapshot_fingerprint, snapshot_fingerprint)) {
+                    return error.TargetSnapshotFingerprintMismatch;
+                }
+                var snapshot = try parseValueAs(TargetSnapshotInput, allocator, snapshot_value);
+                defer snapshot.deinit();
+                try validateTargetSnapshot(snapshot.value, campaign);
+                if (!targetSnapshotConsistent(campaign, payload.value.target_fingerprint, snapshot_fingerprint)) {
+                    return error.TargetSnapshotMismatch;
+                }
+            }
             if (status == .completed) {
                 try validateNonEmpty(payload.value.trace_ref orelse return error.TraceMissing);
                 try validateFingerprint(payload.value.trace_fingerprint orelse return error.TraceMissing);
@@ -1662,10 +2653,12 @@ fn applyEvent(
             errdefer allocator.free(state_scenario_id);
             const target_fingerprint = try allocator.dupe(u8, payload.value.target_fingerprint);
             errdefer allocator.free(target_fingerprint);
-            const environment_fingerprint = try allocator.dupe(u8, payload.value.environment_fingerprint);
-            errdefer allocator.free(environment_fingerprint);
-            const replay_policy_fingerprint = try allocator.dupe(u8, payload.value.replay_policy_fingerprint);
-            errdefer allocator.free(replay_policy_fingerprint);
+            const environment_fingerprint = if (payload.value.environment_fingerprint) |value| try allocator.dupe(u8, value) else null;
+            errdefer if (environment_fingerprint) |value| allocator.free(value);
+            const replay_policy_fingerprint = if (payload.value.replay_policy_fingerprint) |value| try allocator.dupe(u8, value) else null;
+            errdefer if (replay_policy_fingerprint) |value| allocator.free(value);
+            const target_snapshot_fingerprint = if (payload.value.target_snapshot_fingerprint) |value| try allocator.dupe(u8, value) else null;
+            errdefer if (target_snapshot_fingerprint) |value| allocator.free(value);
             const state = AttemptState{
                 .id = state_id,
                 .scenario_id = state_scenario_id,
@@ -1673,9 +2666,11 @@ fn applyEvent(
                 .target_fingerprint = target_fingerprint,
                 .environment_fingerprint = environment_fingerprint,
                 .replay_policy_fingerprint = replay_policy_fingerprint,
+                .target_snapshot_fingerprint = target_snapshot_fingerprint,
                 .origin = origin,
                 .role = role,
                 .blind = payload.value.blind,
+                .sequence = sequence,
             };
             try campaign.attempts.append(allocator, state);
         },
@@ -1686,6 +2681,7 @@ fn applyEvent(
             const attempt_id = body.value.attempt_id.?;
             const grade_id = body.value.grade_id.?;
             const attempt = findAttempt(campaign, attempt_id) orelse return error.AttemptMissing;
+            const scenario = findScenarioMut(campaign, scenario_id) orelse return error.ScenarioMissing;
             if (!std.mem.eql(u8, attempt.scenario_id, scenario_id)) return error.ScenarioMismatch;
             if (findGrade(campaign, grade_id) != null) return error.DuplicateGrade;
             var payload = try parseValueAs(GradePayload, allocator, body.value.payload);
@@ -1693,12 +2689,20 @@ fn applyEvent(
             const status = GradeStatus.parse(payload.value.status) orelse return error.InvalidGradeStatus;
             try validateFingerprint(payload.value.target_fingerprint);
             try validateFingerprint(payload.value.rubric_fingerprint);
-            try validateFingerprint(payload.value.environment_fingerprint);
-            try validateFingerprint(payload.value.replay_policy_fingerprint);
             if (!std.mem.eql(u8, payload.value.target_fingerprint, attempt.target_fingerprint)) return error.TargetMismatch;
             if (!std.mem.eql(u8, payload.value.rubric_fingerprint, campaign.rubric_fingerprint.?)) return error.RubricMismatch;
-            if (!std.mem.eql(u8, payload.value.environment_fingerprint, attempt.environment_fingerprint)) return error.EnvironmentMismatch;
-            if (!std.mem.eql(u8, payload.value.replay_policy_fingerprint, attempt.replay_policy_fingerprint)) return error.ReplayPolicyMismatch;
+            if (attempt.origin == .historical) {
+                if (payload.value.environment_fingerprint != null or payload.value.replay_policy_fingerprint != null) {
+                    return error.HistoricalReplayIdentityForbidden;
+                }
+            } else {
+                const environment = payload.value.environment_fingerprint orelse return error.EnvironmentMissing;
+                const replay_policy = payload.value.replay_policy_fingerprint orelse return error.ReplayPolicyMissing;
+                try validateFingerprint(environment);
+                try validateFingerprint(replay_policy);
+                if (!optionalStringsEqual(environment, attempt.environment_fingerprint)) return error.EnvironmentMismatch;
+                if (!optionalStringsEqual(replay_policy, attempt.replay_policy_fingerprint)) return error.ReplayPolicyMismatch;
+            }
             if (payload.value.blind != attempt.blind) return error.BlindnessMismatch;
             if (payload.value.aggregate) |aggregate| {
                 if (!std.math.isFinite(aggregate) or aggregate < 0 or aggregate > 1) return error.InvalidAggregate;
@@ -1707,17 +2711,53 @@ fn applyEvent(
             try validateStringList(payload.value.critical_violations, false);
             try validateJudge(payload.value.judge);
             try validateStringList(payload.value.evidence_refs, true);
+            var critical_violation_count = payload.value.critical_violations.len;
+            var grader_authority_fingerprint: ?[]u8 = null;
+            defer if (grader_authority_fingerprint) |value| allocator.free(value);
             if (status == .pass or status == .fail) {
                 const computed_aggregate = try validateAndComputeAggregate(campaign, payload.value.dimensions);
+                grader_authority_fingerprint = try graderAuthorityFingerprintAlloc(
+                    allocator,
+                    campaign,
+                    payload.value.judge,
+                    payload.value.dimensions,
+                );
+                if (!std.mem.eql(
+                    u8,
+                    campaign.grader_authority_fingerprint.?,
+                    grader_authority_fingerprint.?,
+                )) return error.CampaignGraderAuthorityDrift;
                 const claimed_aggregate = payload.value.aggregate orelse return error.GradeAggregateMissing;
                 if (@abs(computed_aggregate - claimed_aggregate) > 1e-12) return error.GradeAggregateMismatch;
+                critical_violation_count += try validateOracleResults(scenario, payload.value.oracle_results);
+                const satisfies_pass_policy = claimed_aggregate >= campaign.minimum_aggregate and
+                    (!campaign.zero_critical_violations or critical_violation_count == 0);
+                if (status == .pass and !satisfies_pass_policy) return error.PassPolicyMismatch;
+                if (status == .fail and satisfies_pass_policy) return error.FailSatisfiesPassPolicy;
+            } else if (payload.value.oracle_results.len != 0) {
+                _ = try validateOracleResults(scenario, payload.value.oracle_results);
             }
+            const oracle_authority_fingerprint = try oracleAuthorityFingerprintAlloc(allocator, payload.value.oracle_results);
+            errdefer allocator.free(oracle_authority_fingerprint);
             if (payload.value.comparison_eligible) {
                 if (attempt.status != .completed) return error.AttemptNotCompleted;
                 if (!payload.value.blind) return error.ComparisonRequiresBlindAttempt;
                 if (status != .pass and status != .fail) return error.InvalidComparableStatus;
                 if (payload.value.aggregate == null) return error.ComparableAggregateMissing;
                 if (attempt.origin == .historical) return error.HistoricalGradeDiagnosticOnly;
+                if (attempt.role != .replay_baseline) {
+                    if (!hasComparableReplayBaseline(
+                        campaign,
+                        scenario_id,
+                        payload.value.rubric_fingerprint,
+                        payload.value.environment_fingerprint.?,
+                        payload.value.replay_policy_fingerprint.?,
+                        payload.value.judge,
+                        payload.value.dimensions,
+                        oracle_authority_fingerprint,
+                        attempt.sequence,
+                    )) return error.ReplayBaselineMissing;
+                }
                 for (campaign.grades.items) |prior| {
                     if (prior.comparison_eligible and std.mem.eql(u8, prior.attempt_id, attempt_id)) {
                         return error.DuplicateComparableGrade;
@@ -1725,12 +2765,7 @@ fn applyEvent(
                 }
             }
             if (status == .pass) {
-                if (campaign.zero_critical_violations and payload.value.critical_violations.len != 0) {
-                    return error.PassWithCriticalViolation;
-                }
-                if (payload.value.aggregate == null or payload.value.aggregate.? < campaign.minimum_aggregate) {
-                    return error.PassBelowThreshold;
-                }
+                if (campaign.zero_critical_violations and critical_violation_count != 0) return error.PassWithCriticalViolation;
             }
             const dimensions = try allocator.alloc(DimensionState, payload.value.dimensions.len);
             var initialized: usize = 0;
@@ -1739,9 +2774,20 @@ fn applyEvent(
                 allocator.free(dimensions);
             }
             for (payload.value.dimensions, 0..) |dimension, index| {
+                const dimension_id = try allocator.dupe(u8, dimension.id);
+                errdefer allocator.free(dimension_id);
+                const grader_kind = try allocator.dupe(u8, dimension.grader_kind);
+                errdefer allocator.free(grader_kind);
+                const grader_ref = try allocator.dupe(u8, dimension.grader_ref);
+                errdefer allocator.free(grader_ref);
+                const grader_fingerprint = try allocator.dupe(u8, dimension.grader_fingerprint);
+                errdefer allocator.free(grader_fingerprint);
                 dimensions[index] = .{
-                    .id = try allocator.dupe(u8, dimension.id),
+                    .id = dimension_id,
                     .score = dimension.score,
+                    .grader_kind = grader_kind,
+                    .grader_ref = grader_ref,
+                    .grader_fingerprint = grader_fingerprint,
                 };
                 initialized += 1;
             }
@@ -1755,10 +2801,18 @@ fn applyEvent(
             errdefer allocator.free(target_fingerprint);
             const rubric_fingerprint = try allocator.dupe(u8, payload.value.rubric_fingerprint);
             errdefer allocator.free(rubric_fingerprint);
-            const environment_fingerprint = try allocator.dupe(u8, payload.value.environment_fingerprint);
-            errdefer allocator.free(environment_fingerprint);
-            const replay_policy_fingerprint = try allocator.dupe(u8, payload.value.replay_policy_fingerprint);
-            errdefer allocator.free(replay_policy_fingerprint);
+            const environment_fingerprint = if (payload.value.environment_fingerprint) |value| try allocator.dupe(u8, value) else null;
+            errdefer if (environment_fingerprint) |value| allocator.free(value);
+            const replay_policy_fingerprint = if (payload.value.replay_policy_fingerprint) |value| try allocator.dupe(u8, value) else null;
+            errdefer if (replay_policy_fingerprint) |value| allocator.free(value);
+            const judge_kind = try allocator.dupe(u8, payload.value.judge.kind);
+            errdefer allocator.free(judge_kind);
+            const judge_id = try allocator.dupe(u8, payload.value.judge.id);
+            errdefer allocator.free(judge_id);
+            const judge_version = try allocator.dupe(u8, payload.value.judge.version);
+            errdefer allocator.free(judge_version);
+            const judge_config_fingerprint = try allocator.dupe(u8, payload.value.judge.config_fingerprint);
+            errdefer allocator.free(judge_config_fingerprint);
             const state = GradeState{
                 .id = state_id,
                 .attempt_id = state_attempt_id,
@@ -1768,11 +2822,16 @@ fn applyEvent(
                 .rubric_fingerprint = rubric_fingerprint,
                 .environment_fingerprint = environment_fingerprint,
                 .replay_policy_fingerprint = replay_policy_fingerprint,
+                .judge_kind = judge_kind,
+                .judge_id = judge_id,
+                .judge_version = judge_version,
+                .judge_config_fingerprint = judge_config_fingerprint,
+                .oracle_authority_fingerprint = oracle_authority_fingerprint,
                 .blind = payload.value.blind,
                 .comparison_eligible = payload.value.comparison_eligible,
                 .aggregate = payload.value.aggregate,
                 .dimensions = dimensions,
-                .critical_violation_count = payload.value.critical_violations.len,
+                .critical_violation_count = critical_violation_count,
                 .sequence = sequence,
             };
             try campaign.grades.append(allocator, state);
@@ -1806,6 +2865,7 @@ fn applyEvent(
             try validateFingerprint(payload.value.diff_fingerprint);
             if (status == .applied) {
                 if (campaign.target_change_authority != .apply_via_owner) return error.ChangeNotAuthorized;
+                if (!std.mem.eql(u8, payload.value.diff_ref, "git-index:HEAD")) return error.InvalidAppliedDiffRef;
                 if (payload.value.paths.len == 0) return error.PathsMissing;
                 if (payload.value.motivation_grade_ids.len == 0) return error.MotivationGradesMissing;
                 if (!std.mem.eql(
@@ -1815,6 +2875,15 @@ fn applyEvent(
                 )) return error.ChangeBaseMismatch;
                 if (std.mem.eql(u8, payload.value.before_target_fingerprint, payload.value.after_target_fingerprint)) {
                     return error.TargetUnchanged;
+                }
+                if (targetFingerprintKnown(campaign, payload.value.after_target_fingerprint)) {
+                    return error.TargetFingerprintReused;
+                }
+                for (campaign.grades.items) |grade| {
+                    if (!grade.comparison_eligible or
+                        !std.mem.eql(u8, grade.target_fingerprint, payload.value.before_target_fingerprint)) continue;
+                    const graded_scenario = findScenario(campaign, grade.scenario_id) orelse return error.ScenarioMissing;
+                    if (graded_scenario.split != .practice) return error.PromotionEvidenceAlreadyExposed;
                 }
             }
             for (payload.value.paths, 0..) |path, index| {
@@ -1834,6 +2903,8 @@ fn applyEvent(
                 const grade = findGrade(campaign, grade_id) orelse return error.GradeMissing;
                 if (status == .applied) {
                     if (!grade.comparison_eligible or grade.status != .fail) return error.InvalidMotivationGrade;
+                    const motivation_scenario = findScenario(campaign, grade.scenario_id) orelse return error.ScenarioMissing;
+                    if (motivation_scenario.split != .practice) return error.MotivationRequiresPractice;
                     if (!std.mem.eql(u8, grade.target_fingerprint, payload.value.before_target_fingerprint)) {
                         return error.TargetMismatch;
                     }
@@ -1846,6 +2917,8 @@ fn applyEvent(
             errdefer allocator.free(before_target_fingerprint);
             const after_target_fingerprint = try allocator.dupe(u8, payload.value.after_target_fingerprint);
             errdefer allocator.free(after_target_fingerprint);
+            const diff_fingerprint = try allocator.dupe(u8, payload.value.diff_fingerprint);
+            errdefer allocator.free(diff_fingerprint);
             const state_paths = try dupeStringList(allocator, payload.value.paths);
             errdefer freeStringList(allocator, state_paths);
             const state = ChangeState{
@@ -1853,6 +2926,7 @@ fn applyEvent(
                 .status = status,
                 .before_target_fingerprint = before_target_fingerprint,
                 .after_target_fingerprint = after_target_fingerprint,
+                .diff_fingerprint = diff_fingerprint,
                 .paths = state_paths,
                 .sequence = sequence,
             };
@@ -1878,6 +2952,7 @@ fn applyEvent(
                 }
             }
             if (status == .committed) {
+                if (!allScenariosAdmitted(campaign)) return error.ScenarioManifestNotSealed;
                 if (campaign.publication_authority != .commit) return error.PublicationNotAuthorized;
                 if (change.status != .applied) return error.ChangeNotApplied;
                 if (!std.mem.eql(u8, payload.value.candidate_target_fingerprint, change.after_target_fingerprint)) {
@@ -1898,6 +2973,9 @@ fn applyEvent(
                     }
                     const grade = findGrade(campaign, grade_id) orelse return error.GradeMissing;
                     if (!grade.comparison_eligible or grade.status != .pass) return error.InvalidPromotionGrade;
+                    const attempt = findAttempt(campaign, grade.attempt_id) orelse return error.AttemptMissing;
+                    if (attempt.role != .candidate and attempt.role != .mutation) return error.InvalidPromotionAttemptRole;
+                    if (attempt.target_snapshot_fingerprint == null) return error.TargetSnapshotMissing;
                     if (!std.mem.eql(u8, grade.target_fingerprint, change.after_target_fingerprint)) {
                         return error.TargetMismatch;
                     }
@@ -1906,20 +2984,14 @@ fn applyEvent(
                         return error.PromotionHasCriticalViolation;
                     }
                 }
-                if (campaign.require_holdout_pass) {
-                    var saw_holdout = false;
-                    for (campaign.scenarios.items) |scenario| {
-                        if (scenario.split != .holdout) continue;
-                        saw_holdout = true;
-                        var passing_repeats: u64 = 0;
-                        for (payload.value.promotion_grade_ids) |grade_id| {
-                            const grade = findGrade(campaign, grade_id).?;
-                            if (std.mem.eql(u8, grade.scenario_id, scenario.id)) passing_repeats += 1;
-                        }
-                        if (passing_repeats < campaign.repeat_count) return error.HoldoutPromotionIncomplete;
+                if (campaign.stop_zero_critical_violations) {
+                    for (campaign.grades.items) |grade| {
+                        if (grade.sequence <= change.sequence or !grade.comparison_eligible) continue;
+                        if (!std.mem.eql(u8, grade.target_fingerprint, change.after_target_fingerprint)) continue;
+                        if (grade.critical_violation_count != 0) return error.PromotionHasCriticalViolation;
                     }
-                    if (!saw_holdout) return error.HoldoutScenarioMissing;
                 }
+                try validatePromotionCohort(campaign, change, payload.value);
             } else {
                 if (payload.value.commit_sha != null or payload.value.commit_tree_ref != null) {
                     return error.BlockedPublicationHasCommit;
@@ -1964,20 +3036,19 @@ fn requireCreated(campaign: *const CampaignState) !void {
     if (!campaign.created) return error.CampaignMissing;
 }
 
-fn loadLedger(allocator: std.mem.Allocator, store_path: []const u8) !LedgerLoad {
-    const bytes = durable_store.readRegularFileNoSymlink(allocator, store_path, MaxStoreBytes) catch |err| switch (err) {
-        error.FileNotFound => return .{ .last_digest = try allocator.dupe(u8, GenesisDigest) },
-        else => return err,
+fn loadLedgerFromSnapshot(
+    allocator: std.mem.Allocator,
+    snapshot: *const durable_store.EventSnapshot,
+) !LedgerLoad {
+    var result = LedgerLoad{
+        .store_revision = try allocator.dupe(u8, snapshot.revision),
+        .store_exists = snapshot.exists,
+        .last_digest = try allocator.dupe(u8, GenesisDigest),
     };
-    defer allocator.free(bytes);
-
-    var result = LedgerLoad{ .last_digest = try allocator.dupe(u8, GenesisDigest) };
     errdefer result.deinit(allocator);
     var expected_sequence: u64 = 1;
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |raw_line| {
-        const line = std.mem.trim(u8, raw_line, " \t\r");
-        if (line.len == 0) continue;
+    for (snapshot.records) |record| {
+        const line = record.payload;
         var parsed = try parseTyped(EventWire, allocator, line);
         defer parsed.deinit();
         const event = parsed.value;
@@ -2027,6 +3098,13 @@ fn loadLedger(allocator: std.mem.Allocator, store_path: []const u8) !LedgerLoad 
         expected_sequence += 1;
     }
     return result;
+}
+
+fn loadLedger(allocator: std.mem.Allocator, store_path: []const u8) !LedgerLoad {
+    var backend = durable_store.PersistentEventStore.init(store_path);
+    var snapshot = try backend.eventStore().snapshot(allocator, MaxStoreBytes);
+    defer snapshot.deinit(allocator);
+    return loadLedgerFromSnapshot(allocator, &snapshot);
 }
 
 fn renderEventLineAlloc(
@@ -2089,7 +3167,12 @@ fn appendIntentToStore(
     const body_digest = try digestBytesAlloc(allocator, body_json);
     defer allocator.free(body_digest);
 
-    var loaded = try loadLedger(allocator, store_path);
+    var backend = durable_store.PersistentEventStore.init(store_path);
+    var exclusive = try backend.eventStore().acquireExclusive(allocator);
+    defer exclusive.release();
+    var snapshot = try exclusive.snapshot(allocator, MaxStoreBytes);
+    defer snapshot.deinit(allocator);
+    var loaded = try loadLedgerFromSnapshot(allocator, &snapshot);
     defer loaded.deinit(allocator);
     const campaign = try getOrCreateCampaign(allocator, &loaded.campaigns, intent.campaign_id);
     const sequence = loaded.event_count + 1;
@@ -2108,10 +3191,20 @@ fn appendIntentToStore(
     );
     errdefer allocator.free(event_digest);
     try applyEvent(allocator, campaign, kind, body_value.value, sequence);
+    if (kind == .change_recorded) {
+        var change = try parseValueAs(ChangePayload, allocator, intent.payload);
+        defer change.deinit();
+        try verifyAppliedChange(allocator, repo, campaign, change.value);
+    }
+    if (kind == .attempt_recorded) {
+        var attempt = try parseValueAs(AttemptPayload, allocator, intent.payload);
+        defer attempt.deinit();
+        try verifyAttemptTarget(allocator, repo, campaign, attempt.value);
+    }
     if (kind == .publication_recorded) {
         var publication = try parseValueAs(PublicationPayload, allocator, intent.payload);
         defer publication.deinit();
-        try verifyPublicationCommit(allocator, repo, publication.value);
+        try verifyPublicationCommit(allocator, repo, publication.value, campaign);
     }
 
     const line = try renderEventLineAlloc(
@@ -2132,7 +3225,16 @@ fn appendIntentToStore(
     errdefer allocator.free(campaign_id);
     const kind_name = try allocator.dupe(u8, kind.name());
     errdefer allocator.free(kind_name);
-    try durable_store.appendLineAtomic(allocator, store_path, line, MaxStoreBytes);
+    var append_receipt = exclusive.append(
+        allocator,
+        line,
+        .{ .revision = loaded.store_revision, .exists = loaded.store_exists },
+        MaxStoreBytes,
+    ) catch |err| switch (err) {
+        error.StreamTooLong => return error.StoreSizeLimitExceeded,
+        else => return err,
+    };
+    defer append_receipt.deinit(allocator);
     return .{
         .campaign_id = campaign_id,
         .kind = kind_name,
@@ -2151,8 +3253,6 @@ fn cmdAppend(
     try ensureStoreLockIgnored(allocator, repo, store_path);
     const input = try readInputAlloc(allocator, input_path);
     defer allocator.free(input);
-    var lock = try durable_store.acquireLock(allocator, store_path);
-    defer lock.release(allocator);
     var result = try appendIntentToStore(allocator, repo, store_path, input);
     defer result.deinit(allocator);
 
@@ -2259,20 +3359,77 @@ fn progressDigestAlloc(allocator: std.mem.Allocator, campaign: *const CampaignSt
     return finishDigestAlloc(allocator, &hasher);
 }
 
-fn latestEligibleGrade(campaign: *const CampaignState, scenario_id: []const u8) ?*const GradeState {
+fn latestEligibleGradeForTarget(
+    campaign: *const CampaignState,
+    scenario_id: []const u8,
+    target_fingerprint: []const u8,
+) ?*const GradeState {
     var latest: ?*const GradeState = null;
     for (campaign.grades.items) |*grade| {
-        if (!grade.comparison_eligible or !std.mem.eql(u8, grade.scenario_id, scenario_id)) continue;
+        if (!grade.comparison_eligible or
+            !std.mem.eql(u8, grade.scenario_id, scenario_id) or
+            !std.mem.eql(u8, grade.target_fingerprint, target_fingerprint)) continue;
         if (latest == null or grade.sequence > latest.?.sequence) latest = grade;
     }
     return latest;
 }
 
+fn dimensionGradersComparable(left: []const DimensionState, right: []const DimensionState) bool {
+    if (left.len != right.len) return false;
+    for (left) |left_dimension| {
+        var matched = false;
+        for (right) |right_dimension| {
+            if (!std.mem.eql(u8, left_dimension.id, right_dimension.id)) continue;
+            if (!std.mem.eql(u8, left_dimension.grader_kind, right_dimension.grader_kind) or
+                !std.mem.eql(u8, left_dimension.grader_ref, right_dimension.grader_ref) or
+                !std.mem.eql(u8, left_dimension.grader_fingerprint, right_dimension.grader_fingerprint)) return false;
+            matched = true;
+            break;
+        }
+        if (!matched) return false;
+    }
+    return true;
+}
+
+fn scenarioPassingRepeatCount(
+    campaign: *const CampaignState,
+    scenario_id: []const u8,
+    target_fingerprint: []const u8,
+) u64 {
+    var count: u64 = 0;
+    var index = campaign.grades.items.len;
+    while (index > 0) {
+        index -= 1;
+        const grade = campaign.grades.items[index];
+        if (!grade.comparison_eligible) continue;
+        if (!std.mem.eql(u8, grade.scenario_id, scenario_id) or
+            !std.mem.eql(u8, grade.target_fingerprint, target_fingerprint)) continue;
+        if (grade.status != .pass or
+            (campaign.stop_zero_critical_violations and grade.critical_violation_count != 0)) break;
+        count += 1;
+    }
+    return count;
+}
+
+fn scenarioOnFrontier(
+    campaign: *const CampaignState,
+    scenario_id: []const u8,
+    target_fingerprint: []const u8,
+) bool {
+    return scenarioPassingRepeatCount(campaign, scenario_id, target_fingerprint) < campaign.repeat_count;
+}
+
 fn gradesComparable(left: *const GradeState, right: *const GradeState) bool {
     return std.mem.eql(u8, left.scenario_id, right.scenario_id) and
         std.mem.eql(u8, left.rubric_fingerprint, right.rubric_fingerprint) and
-        std.mem.eql(u8, left.environment_fingerprint, right.environment_fingerprint) and
-        std.mem.eql(u8, left.replay_policy_fingerprint, right.replay_policy_fingerprint);
+        optionalStringsEqual(left.environment_fingerprint, right.environment_fingerprint) and
+        optionalStringsEqual(left.replay_policy_fingerprint, right.replay_policy_fingerprint) and
+        std.mem.eql(u8, left.judge_kind, right.judge_kind) and
+        std.mem.eql(u8, left.judge_id, right.judge_id) and
+        std.mem.eql(u8, left.judge_version, right.judge_version) and
+        std.mem.eql(u8, left.judge_config_fingerprint, right.judge_config_fingerprint) and
+        std.mem.eql(u8, left.oracle_authority_fingerprint, right.oracle_authority_fingerprint) and
+        dimensionGradersComparable(left.dimensions, right.dimensions);
 }
 
 fn previousComparableGrade(grades: []GradeState, index: usize) ?*const GradeState {
@@ -2310,6 +3467,63 @@ const SplitSummary = struct {
     critical_violations: usize = 0,
 };
 
+fn writeTargetSplitRow(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    campaign: *const CampaignState,
+    target_id: []const u8,
+    split: Split,
+) !void {
+    var eligible: usize = 0;
+    var passes: usize = 0;
+    var failures: usize = 0;
+    var critical: usize = 0;
+    var aggregate_sum: f64 = 0;
+    var dimension_ids: std.ArrayList([]const u8) = .empty;
+    defer dimension_ids.deinit(allocator);
+    for (campaign.grades.items) |grade| {
+        if (!grade.comparison_eligible or !std.mem.eql(u8, grade.target_fingerprint, target_id)) continue;
+        const scenario = findScenario(campaign, grade.scenario_id).?;
+        if (scenario.split != split) continue;
+        eligible += 1;
+        if (grade.status == .pass) passes += 1 else failures += 1;
+        critical += grade.critical_violation_count;
+        aggregate_sum += grade.aggregate.?;
+        for (grade.dimensions) |dimension| try appendUniqueRef(&dimension_ids, allocator, dimension.id);
+    }
+    try writer.print(
+        "{{\"eligible_grades\":{d},\"passes\":{d},\"failures\":{d},\"critical_violations\":{d},\"aggregate_mean\":",
+        .{ eligible, passes, failures, critical },
+    );
+    if (eligible == 0) try writer.writeAll("null") else try std.json.Stringify.value(
+        aggregate_sum / @as(f64, @floatFromInt(eligible)),
+        .{},
+        writer,
+    );
+    try writer.writeAll(",\"dimensions\":[");
+    for (dimension_ids.items, 0..) |dimension_id, dimension_index| {
+        if (dimension_index != 0) try writer.writeByte(',');
+        var sum: f64 = 0;
+        var count: usize = 0;
+        for (campaign.grades.items) |grade| {
+            if (!grade.comparison_eligible or !std.mem.eql(u8, grade.target_fingerprint, target_id)) continue;
+            const scenario = findScenario(campaign, grade.scenario_id).?;
+            if (scenario.split != split) continue;
+            for (grade.dimensions) |dimension| {
+                if (!std.mem.eql(u8, dimension.id, dimension_id)) continue;
+                sum += dimension.score;
+                count += 1;
+            }
+        }
+        try writer.writeAll("{\"id\":");
+        try std.json.Stringify.value(dimension_id, .{}, writer);
+        try writer.print(",\"count\":{d},\"mean\":", .{count});
+        try std.json.Stringify.value(sum / @as(f64, @floatFromInt(count)), .{}, writer);
+        try writer.writeByte('}');
+    }
+    try writer.writeAll("]}");
+}
+
 fn writeTargetRows(
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
@@ -2336,52 +3550,18 @@ fn writeTargetRows(
             }
             if (attempt.origin == .historical) historical += 1;
         }
-        var eligible: usize = 0;
-        var passes: usize = 0;
-        var failures: usize = 0;
-        var critical: usize = 0;
-        var aggregate_sum: f64 = 0;
-        var dimension_ids: std.ArrayList([]const u8) = .empty;
-        defer dimension_ids.deinit(allocator);
-        for (campaign.grades.items) |grade| {
-            if (!grade.comparison_eligible or !std.mem.eql(u8, grade.target_fingerprint, target_id)) continue;
-            eligible += 1;
-            if (grade.status == .pass) passes += 1 else failures += 1;
-            critical += grade.critical_violation_count;
-            aggregate_sum += grade.aggregate.?;
-            for (grade.dimensions) |dimension| try appendUniqueRef(&dimension_ids, allocator, dimension.id);
-        }
         try writer.writeAll("{\"target_fingerprint\":");
         try std.json.Stringify.value(target_id, .{}, writer);
         try writer.print(
-            ",\"attempts\":{d},\"attempt_statuses\":{{\"blocked\":{d},\"completed\":{d},\"failed\":{d}}},\"historical_baselines\":{d},\"eligible_grades\":{d},\"passes\":{d},\"failures\":{d},\"critical_violations\":{d},\"aggregate_mean\":",
-            .{ attempts, blocked, completed, failed, historical, eligible, passes, failures, critical },
+            ",\"attempts\":{d},\"attempt_statuses\":{{\"blocked\":{d},\"completed\":{d},\"failed\":{d}}},\"historical_baselines\":{d},\"splits\":{{\"practice\":",
+            .{ attempts, blocked, completed, failed, historical },
         );
-        if (eligible == 0) {
-            try writer.writeAll("null");
-        } else {
-            try std.json.Stringify.value(aggregate_sum / @as(f64, @floatFromInt(eligible)), .{}, writer);
-        }
-        try writer.writeAll(",\"dimensions\":[");
-        for (dimension_ids.items, 0..) |dimension_id, dimension_index| {
-            if (dimension_index != 0) try writer.writeByte(',');
-            var sum: f64 = 0;
-            var count: usize = 0;
-            for (campaign.grades.items) |grade| {
-                if (!grade.comparison_eligible or !std.mem.eql(u8, grade.target_fingerprint, target_id)) continue;
-                for (grade.dimensions) |dimension| {
-                    if (!std.mem.eql(u8, dimension.id, dimension_id)) continue;
-                    sum += dimension.score;
-                    count += 1;
-                }
-            }
-            try writer.writeAll("{\"id\":");
-            try std.json.Stringify.value(dimension_id, .{}, writer);
-            try writer.print(",\"count\":{d},\"mean\":", .{count});
-            try std.json.Stringify.value(sum / @as(f64, @floatFromInt(count)), .{}, writer);
-            try writer.writeByte('}');
-        }
-        try writer.writeAll("]}");
+        try writeTargetSplitRow(allocator, writer, campaign, target_id, .practice);
+        try writer.writeAll(",\"holdout\":");
+        try writeTargetSplitRow(allocator, writer, campaign, target_id, .holdout);
+        try writer.writeAll(",\"challenge\":");
+        try writeTargetSplitRow(allocator, writer, campaign, target_id, .challenge);
+        try writer.writeAll("}}");
     }
     try writer.writeByte(']');
 }
@@ -2398,6 +3578,7 @@ fn cmdProgress(
     const campaign_index = findCampaign(loaded.campaigns.items, campaign_id) orelse return error.CampaignMissing;
     const campaign = &loaded.campaigns.items[campaign_index];
     try requireCreated(campaign);
+    const current_target = currentTargetFingerprint(campaign);
     const progress_digest = try progressDigestAlloc(allocator, campaign);
     defer allocator.free(progress_digest);
 
@@ -2407,6 +3588,7 @@ fn cmdProgress(
     for (campaign.grades.items) |grade| {
         if (!grade.comparison_eligible) continue;
         eligible_grade_count += 1;
+        if (!std.mem.eql(u8, grade.target_fingerprint, current_target)) continue;
         const scenario = findScenario(campaign, grade.scenario_id).?;
         const summary = &split_summaries[splitIndex(scenario.split)];
         summary.eligible_grades += 1;
@@ -2419,8 +3601,7 @@ fn cmdProgress(
     };
     var frontier_count: usize = 0;
     for (campaign.scenarios.items) |scenario| {
-        const latest = latestEligibleGrade(campaign, scenario.id);
-        if (latest == null or latest.?.status != .pass or latest.?.critical_violation_count != 0) frontier_count += 1;
+        if (scenarioOnFrontier(campaign, scenario.id, current_target)) frontier_count += 1;
     }
     var improvement_edge_count: usize = 0;
     for (campaign.grades.items, 0..) |grade, index| {
@@ -2432,10 +3613,11 @@ fn cmdProgress(
         var out: std.Io.Writer.Allocating = .init(allocator);
         defer out.deinit();
         try out.writer.print(
-            "# Hylo Progress: {s}\n\n- Status: {s}\n- Events: {d}\n- Scenarios: {d}\n- Attempts: {d}\n- Historical baselines: {d}\n- Eligible grades: {d}\n- Candidate changes: {d}\n- Publications: {d}\n- Frontier: {d}\n- Progress fingerprint: {s}\n\n## Splits\n\n",
+            "# Hylo Progress: {s}\n\n- Status: {s}\n- Current target: {s}\n- Events: {d}\n- Scenarios: {d}\n- Attempts: {d}\n- Historical baselines: {d}\n- Eligible grades: {d}\n- Candidate changes: {d}\n- Publications: {d}\n- Frontier: {d}\n- Progress fingerprint: {s}\n\n## Current-target splits\n\n",
             .{
                 campaign.id,
                 if (campaign.closed) "closed" else "open",
+                current_target,
                 campaign.event_count,
                 campaign.scenarios.items.len,
                 campaign.attempts.items.len,
@@ -2459,8 +3641,8 @@ fn cmdProgress(
             try out.writer.writeAll("Empty for the recorded campaign contract.\n");
         } else {
             for (campaign.scenarios.items) |scenario| {
-                const latest = latestEligibleGrade(campaign, scenario.id);
-                if (latest != null and latest.?.status == .pass and latest.?.critical_violation_count == 0) continue;
+                if (!scenarioOnFrontier(campaign, scenario.id, current_target)) continue;
+                const latest = latestEligibleGradeForTarget(campaign, scenario.id, current_target);
                 try out.writer.print("- {s} ({s}): {s}\n", .{
                     scenario.id,
                     @tagName(scenario.split),
@@ -2481,6 +3663,8 @@ fn cmdProgress(
     try std.json.Stringify.value(if (campaign.closed) "closed" else "open", .{}, &out.writer);
     try out.writer.writeAll(",\"close_reason\":");
     try writeOptionalString(&out.writer, campaign.close_reason);
+    try out.writer.writeAll(",\"current_target_fingerprint\":");
+    try std.json.Stringify.value(current_target, .{}, &out.writer);
     try out.writer.print(",\"event_count\":{d},\"campaign_event_digest\":", .{campaign.event_count});
     try std.json.Stringify.value(campaign.last_digest, .{}, &out.writer);
     try out.writer.print(",\"scenario_count\":{d},\"split_results\":{{\"practice\":", .{campaign.scenarios.items.len});
@@ -2504,7 +3688,7 @@ fn cmdProgress(
     try out.writer.writeAll(",\"latest_scenario_outcomes\":[");
     for (campaign.scenarios.items, 0..) |scenario, index| {
         if (index != 0) try out.writer.writeByte(',');
-        const latest = latestEligibleGrade(campaign, scenario.id);
+        const latest = latestEligibleGradeForTarget(campaign, scenario.id, current_target);
         try out.writer.writeAll("{\"scenario_id\":");
         try std.json.Stringify.value(scenario.id, .{}, &out.writer);
         try out.writer.writeAll(",\"split\":");
@@ -2522,13 +3706,17 @@ fn cmdProgress(
         } else {
             try out.writer.writeAll("null,\"critical_violations\":0");
         }
+        try out.writer.print(
+            ",\"passing_repeats\":{d},\"required_repeats\":{d}",
+            .{ scenarioPassingRepeatCount(campaign, scenario.id, current_target), campaign.repeat_count },
+        );
         try out.writer.writeByte('}');
     }
     try out.writer.writeAll("],\"frontier\":[");
     var frontier_index: usize = 0;
     for (campaign.scenarios.items) |scenario| {
-        const latest = latestEligibleGrade(campaign, scenario.id);
-        if (latest != null and latest.?.status == .pass and latest.?.critical_violation_count == 0) continue;
+        if (!scenarioOnFrontier(campaign, scenario.id, current_target)) continue;
+        const latest = latestEligibleGradeForTarget(campaign, scenario.id, current_target);
         if (frontier_index != 0) try out.writer.writeByte(',');
         frontier_index += 1;
         try out.writer.writeAll("{\"scenario_id\":");
@@ -2537,6 +3725,10 @@ fn cmdProgress(
         try std.json.Stringify.value(@tagName(scenario.split), .{}, &out.writer);
         try out.writer.writeAll(",\"status\":");
         try std.json.Stringify.value(if (latest) |grade| @tagName(grade.status) else "ungraded", .{}, &out.writer);
+        try out.writer.print(
+            ",\"passing_repeats\":{d},\"required_repeats\":{d}",
+            .{ scenarioPassingRepeatCount(campaign, scenario.id, current_target), campaign.repeat_count },
+        );
         try out.writer.writeByte('}');
     }
     try out.writer.writeAll("],\"improvement_edges\":[");
@@ -2584,11 +3776,16 @@ const TestCampaignJson =
     \\    "session_refs": [{"kind": "codex_session", "ref": "session-test", "fingerprint": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}],
     \\    "exclusions": ["current_session"]
     \\  },
-    \\  "privacy": {"mode": "sanitized", "redactions": ["secrets", "private_reasoning"]},
+    \\  "privacy": {
+    \\    "mode": "sanitized",
+    \\    "redactions": ["secrets", "private_reasoning"],
+    \\    "redaction_receipt": {"schema": "hylo-redaction-receipt/v1", "tool": "seq", "version": "test", "source_fingerprint": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "output_fingerprint": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "evidence_refs": ["seq:redaction-test"]}
+    \\  },
     \\  "rubric": {
     \\    "id": "rubric-test",
     \\    "fingerprint": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-    \\    "dimensions": [{"id": "correctness", "kind": "deterministic", "weight": 1.0, "critical": true}],
+    \\    "dimensions": [{"id": "correctness", "kind": "deterministic", "weight": 1.0, "critical": true, "grader_ref": "test:dimension", "grader_fingerprint": "sha256:5555555555555555555555555555555555555555555555555555555555555555"}],
+    \\    "judge": {"kind": "composite", "id": "test-judge", "version": "1", "config_fingerprint": "sha256:6666666666666666666666666666666666666666666666666666666666666666"},
     \\    "pass_policy": {"minimum_aggregate": 1.0, "zero_critical_violations": true}
     \\  },
     \\  "replay_policy": {
@@ -2598,9 +3795,14 @@ const TestCampaignJson =
     \\    "default_fidelity": "controlled_replay",
     \\    "repeat_count": 1
     \\  },
-    \\  "stop_policy": {"max_cycles": 4, "max_attempts": 8, "patience_cycles": 2, "require_holdout_pass": true, "zero_critical_violations": true},
-    \\  "change_policy": {"target_change_authority": "apply_via_owner", "publication_authority": "commit", "allowed_paths": ["target.txt"], "require_clean_scope": true},
-    \\  "scenarios_file": "scenarios.jsonl"
+    \\  "stop_policy": {"max_attempts": 10, "require_holdout_pass": true, "zero_critical_violations": true},
+    \\  "change_policy": {"target_change_authority": "apply_via_owner", "publication_authority": "commit", "allowed_paths": ["target.txt", "target-scope"], "require_clean_scope": true},
+    \\  "scenarios_file": "scenarios.jsonl",
+    \\  "scenario_manifest": [
+    \\    {"scenario_id": "scenario-holdout", "scenario_fingerprint": "sha256:3dbc2a117751f42078d15a82dab707eef4ac2c2b19a8addd9286a873fa6ffb65", "split": "practice"},
+    \\    {"scenario_id": "scenario-holdout-2", "scenario_fingerprint": "sha256:3925186748d399006485774f4a26a3c041ec6145f93b5519410ac819c0b152c8", "split": "holdout"},
+    \\    {"scenario_id": "scenario-challenge", "scenario_fingerprint": "sha256:84e19934c43ea5bd690bf8424129edcd4e44a719d250b163837ede303f7b2937", "split": "challenge"}
+    \\  ]
     \\}
 ;
 
@@ -2609,13 +3811,81 @@ const TestScenarioJson =
     \\  "schema": "hylo-scenario/v1",
     \\  "campaign_id": "cmp-test",
     \\  "scenario_id": "scenario-holdout",
-    \\  "split": "holdout",
+    \\  "split": "practice",
     \\  "source_refs": [{"kind": "decision_capsule", "ref": "capsule-test", "fingerprint": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}],
     \\  "source_episode_fingerprint": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     \\  "request": {"message": "Improve the target without seeing the hidden reference.", "visible_context": [], "hidden_reference_ref": "local:hidden-test"},
-    \\  "environment": {"fidelity": "controlled_replay", "fingerprint": "sha256:1111111111111111111111111111111111111111111111111111111111111111", "repo_revision": "git:test", "tools": [], "permissions": "workspace-write", "limitations": []},
+    \\  "environment": {
+    \\    "fidelity": "controlled_replay",
+    \\    "fingerprint": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    \\    "repo_revision": "git:0000000000000000000000000000000000000000",
+    \\    "adapter": {"id": "cas-replay", "version": "test", "contract_ref": "artifact:adapter", "contract_fingerprint": "sha256:2222222222222222222222222222222222222222222222222222222222222222"},
+    \\    "snapshot": {"kind": "git", "ref": "git:0000000000000000000000000000000000000000", "fingerprint": "sha256:3333333333333333333333333333333333333333333333333333333333333333"},
+    \\    "setup_ref": "artifact:setup",
+    \\    "setup_fingerprint": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    \\    "toolchain": [{"id": "zig", "version": "0.16.0"}],
+    \\    "fixtures": [],
+    \\    "effect_policy": {"filesystem": "workspace_write", "allowed_paths": [], "network": "deny", "network_allowlist": [], "external_side_effects": "deny", "external_effect_allowlist": []},
+    \\    "limitations": []
+    \\  },
     \\  "replay_policy_fingerprint": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-    \\  "oracles": [{"id": "required-test", "kind": "deterministic", "critical": true, "observation": "target behavior passes"}],
+    \\  "oracles": [{"id": "required-test", "kind": "deterministic", "critical": true, "observation": "target behavior passes", "grader_ref": "test:oracle-grader", "grader_fingerprint": "sha256:8888888888888888888888888888888888888888888888888888888888888888"}],
+    \\  "mutation": null
+    \\}
+;
+
+const TestHoldoutScenarioJson =
+    \\{
+    \\  "schema": "hylo-scenario/v1",
+    \\  "campaign_id": "cmp-test",
+    \\  "scenario_id": "scenario-holdout-2",
+    \\  "split": "holdout",
+    \\  "source_refs": [{"kind": "decision_capsule", "ref": "capsule-holdout", "fingerprint": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}],
+    \\  "source_episode_fingerprint": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    \\  "request": {"message": "Verify the candidate on an untouched holdout.", "visible_context": [], "hidden_reference_ref": "local:hidden-holdout"},
+    \\  "environment": {
+    \\    "fidelity": "controlled_replay",
+    \\    "fingerprint": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    \\    "repo_revision": "git:0000000000000000000000000000000000000000",
+    \\    "adapter": {"id": "cas-replay", "version": "test", "contract_ref": "artifact:adapter", "contract_fingerprint": "sha256:2222222222222222222222222222222222222222222222222222222222222222"},
+    \\    "snapshot": {"kind": "git", "ref": "git:0000000000000000000000000000000000000000", "fingerprint": "sha256:3333333333333333333333333333333333333333333333333333333333333333"},
+    \\    "setup_ref": "artifact:setup",
+    \\    "setup_fingerprint": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    \\    "toolchain": [{"id": "zig", "version": "0.16.0"}],
+    \\    "fixtures": [],
+    \\    "effect_policy": {"filesystem": "workspace_write", "allowed_paths": [], "network": "deny", "network_allowlist": [], "external_side_effects": "deny", "external_effect_allowlist": []},
+    \\    "limitations": []
+    \\  },
+    \\  "replay_policy_fingerprint": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    \\  "oracles": [{"id": "required-test", "kind": "deterministic", "critical": true, "observation": "target behavior passes", "grader_ref": "test:oracle-grader", "grader_fingerprint": "sha256:8888888888888888888888888888888888888888888888888888888888888888"}],
+    \\  "mutation": null
+    \\}
+;
+
+const TestChallengeScenarioJson =
+    \\{
+    \\  "schema": "hylo-scenario/v1",
+    \\  "campaign_id": "cmp-test",
+    \\  "scenario_id": "scenario-challenge",
+    \\  "split": "challenge",
+    \\  "source_refs": [{"kind": "decision_capsule", "ref": "capsule-challenge", "fingerprint": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}],
+    \\  "source_episode_fingerprint": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    \\  "request": {"message": "Verify baseline ordering on a challenge case.", "visible_context": [], "hidden_reference_ref": "local:hidden-challenge"},
+    \\  "environment": {
+    \\    "fidelity": "controlled_replay",
+    \\    "fingerprint": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    \\    "repo_revision": "git:0000000000000000000000000000000000000000",
+    \\    "adapter": {"id": "cas-replay", "version": "test", "contract_ref": "artifact:adapter", "contract_fingerprint": "sha256:2222222222222222222222222222222222222222222222222222222222222222"},
+    \\    "snapshot": {"kind": "git", "ref": "git:0000000000000000000000000000000000000000", "fingerprint": "sha256:3333333333333333333333333333333333333333333333333333333333333333"},
+    \\    "setup_ref": "artifact:setup",
+    \\    "setup_fingerprint": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    \\    "toolchain": [{"id": "zig", "version": "0.16.0"}],
+    \\    "fixtures": [],
+    \\    "effect_policy": {"filesystem": "workspace_write", "allowed_paths": [], "network": "deny", "network_allowlist": [], "external_side_effects": "deny", "external_effect_allowlist": []},
+    \\    "limitations": []
+    \\  },
+    \\  "replay_policy_fingerprint": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    \\  "oracles": [{"id": "required-test", "kind": "deterministic", "critical": true, "observation": "target behavior passes", "grader_ref": "test:oracle-grader", "grader_fingerprint": "sha256:8888888888888888888888888888888888888888888888888888888888888888"}],
     \\  "mutation": null
     \\}
 ;
@@ -2661,8 +3931,12 @@ fn testCampaignIntentAlloc(allocator: std.mem.Allocator) ![]u8 {
     return testIntentAlloc(allocator, "campaign_created", null, null, null, payload.written());
 }
 
-fn testScenarioIntentAlloc(allocator: std.mem.Allocator) ![]u8 {
-    var scenario = try parseValue(allocator, TestScenarioJson);
+fn testScenarioIntentAlloc(
+    allocator: std.mem.Allocator,
+    scenario_json: []const u8,
+    scenario_id: []const u8,
+) ![]u8 {
+    var scenario = try parseValue(allocator, scenario_json);
     defer scenario.deinit();
     const fingerprint = try digestValueAlloc(allocator, scenario.value);
     defer allocator.free(fingerprint);
@@ -2675,7 +3949,7 @@ fn testScenarioIntentAlloc(allocator: std.mem.Allocator) ![]u8 {
     try payload.writer.writeAll(",\"scenario\":");
     try payload.writer.writeAll(canonical);
     try payload.writer.writeByte('}');
-    return testIntentAlloc(allocator, "scenario_admitted", "scenario-holdout", null, null, payload.written());
+    return testIntentAlloc(allocator, "scenario_admitted", scenario_id, null, null, payload.written());
 }
 
 fn appendTestPayload(
@@ -2709,6 +3983,97 @@ fn runTestGit(allocator: std.mem.Allocator, repo: []const u8, args: []const []co
     allocator.free(stdout);
 }
 
+fn testAttemptPayloadAlloc(
+    allocator: std.mem.Allocator,
+    target_fingerprint: []const u8,
+    origin: []const u8,
+    role: []const u8,
+    trace_label: []const u8,
+    snapshot: ?*const TargetSnapshotArtifact,
+    snapshot_revision: ?[]const u8,
+) ![]u8 {
+    const historical = std.mem.eql(u8, origin, "historical");
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"status\":\"completed\",\"target_fingerprint\":");
+    try std.json.Stringify.value(target_fingerprint, .{}, &out.writer);
+    try out.writer.writeAll(",\"environment_fingerprint\":");
+    if (historical) try out.writer.writeAll("null") else try std.json.Stringify.value(
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        .{},
+        &out.writer,
+    );
+    try out.writer.writeAll(",\"replay_policy_fingerprint\":");
+    if (historical) try out.writer.writeAll("null") else try std.json.Stringify.value(
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        .{},
+        &out.writer,
+    );
+    try out.writer.writeAll(",\"origin\":");
+    try std.json.Stringify.value(origin, .{}, &out.writer);
+    try out.writer.writeAll(",\"role\":");
+    try std.json.Stringify.value(role, .{}, &out.writer);
+    try out.writer.writeAll(",\"blind\":true,\"evidence_refs\":[\"test:attempt\"],\"trace_ref\":");
+    try std.json.Stringify.value(trace_label, .{}, &out.writer);
+    try out.writer.writeAll(",\"trace_fingerprint\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"historical_provenance\":");
+    if (historical) {
+        try out.writer.writeAll("{\"status\":\"partial\",\"environment_fingerprint\":null,\"repo_revision\":null,\"limitations\":[\"historical workspace unavailable\"],\"evidence_refs\":[\"session:test\"]}");
+    } else {
+        try out.writer.writeAll("null");
+    }
+    try out.writer.writeAll(",\"target_snapshot_revision\":");
+    if (snapshot_revision) |revision| {
+        try std.json.Stringify.value(revision, .{}, &out.writer);
+    } else {
+        try out.writer.writeAll("null");
+    }
+    try out.writer.writeAll(",\"target_snapshot_fingerprint\":");
+    if (snapshot) |artifact| {
+        try std.json.Stringify.value(artifact.fingerprint, .{}, &out.writer);
+    } else {
+        try out.writer.writeAll("null");
+    }
+    try out.writer.writeAll(",\"target_snapshot\":");
+    if (snapshot) |artifact| try out.writer.writeAll(artifact.json) else try out.writer.writeAll("null");
+    try out.writer.writeByte('}');
+    return out.toOwnedSlice();
+}
+
+fn testGradePayloadAlloc(
+    allocator: std.mem.Allocator,
+    target_fingerprint: []const u8,
+    historical: bool,
+    comparison_eligible: bool,
+    status: []const u8,
+    score: f64,
+    aggregate: f64,
+    critical_violation: bool,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll("{\"status\":");
+    try std.json.Stringify.value(status, .{}, &out.writer);
+    try out.writer.writeAll(",\"target_fingerprint\":");
+    try std.json.Stringify.value(target_fingerprint, .{}, &out.writer);
+    try out.writer.writeAll(",\"rubric_fingerprint\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"environment_fingerprint\":");
+    if (historical) try out.writer.writeAll("null") else try out.writer.writeAll("\"sha256:1111111111111111111111111111111111111111111111111111111111111111\"");
+    try out.writer.writeAll(",\"replay_policy_fingerprint\":");
+    if (historical) try out.writer.writeAll("null") else try out.writer.writeAll("\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"");
+    try out.writer.print(
+        ",\"blind\":true,\"comparison_eligible\":{s},\"aggregate\":",
+        .{if (comparison_eligible) "true" else "false"},
+    );
+    try std.json.Stringify.value(aggregate, .{}, &out.writer);
+    try out.writer.writeAll(",\"dimensions\":[{\"id\":\"correctness\",\"score\":");
+    try std.json.Stringify.value(score, .{}, &out.writer);
+    try out.writer.writeAll(",\"weight\":1.0,\"grader_kind\":\"deterministic\",\"grader_ref\":\"test:dimension\",\"grader_fingerprint\":\"sha256:5555555555555555555555555555555555555555555555555555555555555555\",\"evidence_refs\":[\"test:dimension\"]}],\"oracle_results\":[{\"id\":\"required-test\",\"status\":");
+    try std.json.Stringify.value(if (critical_violation) "fail" else "pass", .{}, &out.writer);
+    try out.writer.writeAll(",\"grader_kind\":\"deterministic\",\"grader_ref\":\"test:oracle-grader\",\"grader_fingerprint\":\"sha256:8888888888888888888888888888888888888888888888888888888888888888\",\"evidence_refs\":[\"test:oracle\"]}],\"critical_violations\":");
+    if (critical_violation) try out.writer.writeAll("[\"incorrect\"]") else try out.writer.writeAll("[]");
+    try out.writer.writeAll(",\"judge\":{\"kind\":\"composite\",\"id\":\"test-judge\",\"version\":\"1\",\"config_fingerprint\":\"sha256:6666666666666666666666666666666666666666666666666666666666666666\"},\"evidence_refs\":[\"test:grade\"]}");
+    return out.toOwnedSlice();
+}
+
 test "hylo canonical fingerprints ignore object key order" {
     var left = try parseValue(std.testing.allocator, "{\"b\":2,\"a\":1}");
     defer left.deinit();
@@ -2726,8 +4091,26 @@ test "hylo campaign and scenario contracts validate together" {
     defer campaign.deinit();
     var scenario = try parseTyped(ScenarioInput, std.testing.allocator, TestScenarioJson);
     defer scenario.deinit();
+    var holdout = try parseTyped(ScenarioInput, std.testing.allocator, TestHoldoutScenarioJson);
+    defer holdout.deinit();
+    var challenge = try parseTyped(ScenarioInput, std.testing.allocator, TestChallengeScenarioJson);
+    defer challenge.deinit();
     try validateCampaignInput(campaign.value);
     try validateScenarioInput(scenario.value, campaign.value);
+    try validateScenarioInput(holdout.value, campaign.value);
+    try validateScenarioInput(challenge.value, campaign.value);
+
+    const moving_ref = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        TestScenarioJson,
+        "git:0000000000000000000000000000000000000000",
+        "git:HEAD",
+    );
+    defer std.testing.allocator.free(moving_ref);
+    var moving = try parseTyped(ScenarioInput, std.testing.allocator, moving_ref);
+    defer moving.deinit();
+    try std.testing.expectError(error.InvalidCommitSha, validateScenarioInput(moving.value, campaign.value));
 }
 
 test "hylo event stores remain repo local" {
@@ -2744,6 +4127,18 @@ test "hylo event stores remain repo local" {
     try std.testing.expect(pathWithin(inside, repo));
 }
 
+test "hylo folds backend-independent event-store snapshots" {
+    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hylo-test");
+    defer backend.deinit();
+    var snapshot = try backend.eventStore().snapshot(std.testing.allocator, MaxStoreBytes);
+    defer snapshot.deinit(std.testing.allocator);
+    var loaded = try loadLedgerFromSnapshot(std.testing.allocator, &snapshot);
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(!loaded.store_exists);
+    try std.testing.expectEqualStrings(snapshot.revision, loaded.store_revision);
+    try std.testing.expectEqual(@as(u64, 0), loaded.event_count);
+}
+
 test "hylo ledger rejects gaming and proves a full promoted publication" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2757,6 +4152,8 @@ test "hylo ledger rejects gaming and proves a full promoted publication" {
     defer std.testing.allocator.free(gitignore_path);
     const target_path = try std.fs.path.join(std.testing.allocator, &.{ repo, "target.txt" });
     defer std.testing.allocator.free(target_path);
+    const target_scope_path = try std.fs.path.join(std.testing.allocator, &.{ repo, "target-scope" });
+    defer std.testing.allocator.free(target_scope_path);
     const store_path = try std.fs.path.join(std.testing.allocator, &.{ repo, DefaultStorePath });
     defer std.testing.allocator.free(store_path);
     try durable_store.writeTextAtomic(std.testing.allocator, gitignore_path, ".ledger/\n");
@@ -2767,88 +4164,152 @@ test "hylo ledger rejects gaming and proves a full promoted publication" {
     const campaign_intent = try testCampaignIntentAlloc(std.testing.allocator);
     defer std.testing.allocator.free(campaign_intent);
     try appendTestSnapshot(std.testing.allocator, repo, store_path, campaign_intent);
-    const scenario_intent = try testScenarioIntentAlloc(std.testing.allocator);
+    const scenario_intent = try testScenarioIntentAlloc(std.testing.allocator, TestScenarioJson, "scenario-holdout");
     defer std.testing.allocator.free(scenario_intent);
     try appendTestSnapshot(std.testing.allocator, repo, store_path, scenario_intent);
-
-    try appendTestPayload(
+    const unsealed_attempt = try testAttemptPayloadAlloc(
         std.testing.allocator,
-        repo,
-        store_path,
-        "attempt_recorded",
-        "scenario-holdout",
-        "attempt-historical",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "historical",
+        "historical_baseline",
+        "artifact:unsealed",
         null,
-        "{\"status\":\"completed\",\"target_fingerprint\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"environment_fingerprint\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"replay_policy_fingerprint\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"origin\":\"historical\",\"role\":\"historical_baseline\",\"blind\":true,\"evidence_refs\":[\"session:test\"],\"trace_ref\":\"artifact:historical\",\"trace_fingerprint\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}",
+        null,
     );
+    defer std.testing.allocator.free(unsealed_attempt);
+    const before_unsealed_attempt = try durable_store.readRegularFileNoSymlink(std.testing.allocator, store_path, MaxStoreBytes);
+    defer std.testing.allocator.free(before_unsealed_attempt);
+    try std.testing.expectError(
+        error.ScenarioManifestNotSealed,
+        appendTestPayload(std.testing.allocator, repo, store_path, "attempt_recorded", "scenario-holdout", "attempt-unsealed", null, unsealed_attempt),
+    );
+    const after_unsealed_attempt = try durable_store.readRegularFileNoSymlink(std.testing.allocator, store_path, MaxStoreBytes);
+    defer std.testing.allocator.free(after_unsealed_attempt);
+    try std.testing.expectEqualStrings(before_unsealed_attempt, after_unsealed_attempt);
+    const holdout_scenario_intent = try testScenarioIntentAlloc(
+        std.testing.allocator,
+        TestHoldoutScenarioJson,
+        "scenario-holdout-2",
+    );
+    defer std.testing.allocator.free(holdout_scenario_intent);
+    try appendTestSnapshot(std.testing.allocator, repo, store_path, holdout_scenario_intent);
+    const challenge_scenario_intent = try testScenarioIntentAlloc(
+        std.testing.allocator,
+        TestChallengeScenarioJson,
+        "scenario-challenge",
+    );
+    defer std.testing.allocator.free(challenge_scenario_intent);
+    try appendTestSnapshot(std.testing.allocator, repo, store_path, challenge_scenario_intent);
+
+    const target_roots = [_][]const u8{ "target.txt", "target-scope" };
+    const baseline_revision = try resolveSnapshotRevisionAlloc(std.testing.allocator, repo, "HEAD");
+    defer std.testing.allocator.free(baseline_revision);
+    var baseline_snapshot = try targetSnapshotArtifactAlloc(std.testing.allocator, repo, baseline_revision, &target_roots);
+    defer baseline_snapshot.deinit(std.testing.allocator);
+    const historical_attempt_payload = try testAttemptPayloadAlloc(
+        std.testing.allocator,
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "historical",
+        "historical_baseline",
+        "artifact:historical",
+        null,
+        null,
+    );
+    defer std.testing.allocator.free(historical_attempt_payload);
+    try appendTestPayload(std.testing.allocator, repo, store_path, "attempt_recorded", "scenario-holdout", "attempt-historical", null, historical_attempt_payload);
+    const invalid_historical_grade = try testGradePayloadAlloc(
+        std.testing.allocator,
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        true,
+        true,
+        "fail",
+        0.25,
+        0.25,
+        true,
+    );
+    defer std.testing.allocator.free(invalid_historical_grade);
     const before_invalid_historical = try durable_store.readRegularFileNoSymlink(std.testing.allocator, store_path, MaxStoreBytes);
     defer std.testing.allocator.free(before_invalid_historical);
     try std.testing.expectError(
         error.HistoricalGradeDiagnosticOnly,
-        appendTestPayload(
-            std.testing.allocator,
-            repo,
-            store_path,
-            "grade_recorded",
-            "scenario-holdout",
-            "attempt-historical",
-            "grade-historical-invalid",
-            "{\"status\":\"fail\",\"target_fingerprint\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rubric_fingerprint\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"environment_fingerprint\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"replay_policy_fingerprint\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"blind\":true,\"comparison_eligible\":true,\"aggregate\":0.25,\"dimensions\":[{\"id\":\"correctness\",\"score\":0.25,\"weight\":1.0,\"evidence_refs\":[\"test:historical\"]}],\"critical_violations\":[\"incorrect\"],\"judge\":{\"kind\":\"deterministic\",\"id\":\"test\",\"version\":\"1\"},\"evidence_refs\":[\"test:historical\"]}",
-        ),
+        appendTestPayload(std.testing.allocator, repo, store_path, "grade_recorded", "scenario-holdout", "attempt-historical", "grade-historical-invalid", invalid_historical_grade),
     );
     const after_invalid_historical = try durable_store.readRegularFileNoSymlink(std.testing.allocator, store_path, MaxStoreBytes);
     defer std.testing.allocator.free(after_invalid_historical);
     try std.testing.expectEqualStrings(before_invalid_historical, after_invalid_historical);
-    try appendTestPayload(
-        std.testing.allocator,
-        repo,
-        store_path,
-        "grade_recorded",
-        "scenario-holdout",
-        "attempt-historical",
-        "grade-historical",
-        "{\"status\":\"fail\",\"target_fingerprint\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rubric_fingerprint\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"environment_fingerprint\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"replay_policy_fingerprint\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"blind\":true,\"comparison_eligible\":false,\"aggregate\":0.25,\"dimensions\":[{\"id\":\"correctness\",\"score\":0.25,\"weight\":1.0,\"evidence_refs\":[\"test:historical\"]}],\"critical_violations\":[\"incorrect\"],\"judge\":{\"kind\":\"deterministic\",\"id\":\"test\",\"version\":\"1\"},\"evidence_refs\":[\"test:historical\"]}",
-    );
+    const historical_grade = try testGradePayloadAlloc(std.testing.allocator, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true, false, "fail", 0.25, 0.25, true);
+    defer std.testing.allocator.free(historical_grade);
+    try appendTestPayload(std.testing.allocator, repo, store_path, "grade_recorded", "scenario-holdout", "attempt-historical", "grade-historical", historical_grade);
 
-    try appendTestPayload(
+    const replay_attempt_payload = try testAttemptPayloadAlloc(
         std.testing.allocator,
-        repo,
-        store_path,
-        "attempt_recorded",
-        "scenario-holdout",
-        "attempt-replay",
-        null,
-        "{\"status\":\"completed\",\"target_fingerprint\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"environment_fingerprint\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"replay_policy_fingerprint\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"origin\":\"controlled_replay\",\"role\":\"replay_baseline\",\"blind\":true,\"evidence_refs\":[\"cas:replay\"],\"trace_ref\":\"artifact:replay\",\"trace_fingerprint\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "controlled_replay",
+        "replay_baseline",
+        "artifact:replay-practice",
+        &baseline_snapshot,
+        baseline_revision,
     );
+    defer std.testing.allocator.free(replay_attempt_payload);
+    try appendTestPayload(std.testing.allocator, repo, store_path, "attempt_recorded", "scenario-holdout", "attempt-replay", null, replay_attempt_payload);
+    const gamed_grade = try testGradePayloadAlloc(std.testing.allocator, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false, true, "pass", 0.0, 1.0, false);
+    defer std.testing.allocator.free(gamed_grade);
     const before_gamed_grade = try durable_store.readRegularFileNoSymlink(std.testing.allocator, store_path, MaxStoreBytes);
     defer std.testing.allocator.free(before_gamed_grade);
     try std.testing.expectError(
         error.GradeAggregateMismatch,
-        appendTestPayload(
-            std.testing.allocator,
-            repo,
-            store_path,
-            "grade_recorded",
-            "scenario-holdout",
-            "attempt-replay",
-            "grade-replay-gamed",
-            "{\"status\":\"pass\",\"target_fingerprint\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rubric_fingerprint\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"environment_fingerprint\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"replay_policy_fingerprint\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"blind\":true,\"comparison_eligible\":true,\"aggregate\":1.0,\"dimensions\":[{\"id\":\"correctness\",\"score\":0.0,\"weight\":1.0,\"evidence_refs\":[\"test:replay\"]}],\"critical_violations\":[],\"judge\":{\"kind\":\"deterministic\",\"id\":\"test\",\"version\":\"1\"},\"evidence_refs\":[\"test:replay\"]}",
-        ),
+        appendTestPayload(std.testing.allocator, repo, store_path, "grade_recorded", "scenario-holdout", "attempt-replay", "grade-replay-gamed", gamed_grade),
     );
     const after_gamed_grade = try durable_store.readRegularFileNoSymlink(std.testing.allocator, store_path, MaxStoreBytes);
     defer std.testing.allocator.free(after_gamed_grade);
     try std.testing.expectEqualStrings(before_gamed_grade, after_gamed_grade);
-    try appendTestPayload(
-        std.testing.allocator,
-        repo,
-        store_path,
-        "grade_recorded",
-        "scenario-holdout",
-        "attempt-replay",
-        "grade-replay",
-        "{\"status\":\"fail\",\"target_fingerprint\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"rubric_fingerprint\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"environment_fingerprint\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"replay_policy_fingerprint\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"blind\":true,\"comparison_eligible\":true,\"aggregate\":0.0,\"dimensions\":[{\"id\":\"correctness\",\"score\":0.0,\"weight\":1.0,\"evidence_refs\":[\"test:replay\"]}],\"critical_violations\":[\"incorrect\"],\"judge\":{\"kind\":\"deterministic\",\"id\":\"test\",\"version\":\"1\"},\"evidence_refs\":[\"test:replay\"]}",
+    const manufactured_failure = try testGradePayloadAlloc(std.testing.allocator, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false, true, "fail", 1.0, 1.0, false);
+    defer std.testing.allocator.free(manufactured_failure);
+    try std.testing.expectError(
+        error.FailSatisfiesPassPolicy,
+        appendTestPayload(std.testing.allocator, repo, store_path, "grade_recorded", "scenario-holdout", "attempt-replay", "grade-replay-manufactured", manufactured_failure),
     );
+    const replay_grade = try testGradePayloadAlloc(std.testing.allocator, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false, true, "fail", 0.0, 0.0, true);
+    defer std.testing.allocator.free(replay_grade);
+    const model_only_grade = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        replay_grade,
+        "\"grader_kind\":\"deterministic\"",
+        "\"grader_kind\":\"model\"",
+    );
+    defer std.testing.allocator.free(model_only_grade);
+    try std.testing.expectError(
+        error.RubricGraderKindMismatch,
+        appendTestPayload(std.testing.allocator, repo, store_path, "grade_recorded", "scenario-holdout", "attempt-replay", "grade-replay-model-only", model_only_grade),
+    );
+    const drifted_oracle_grade = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        replay_grade,
+        "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+        "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+    );
+    defer std.testing.allocator.free(drifted_oracle_grade);
+    try std.testing.expectError(
+        error.OracleGraderAuthorityMismatch,
+        appendTestPayload(std.testing.allocator, repo, store_path, "grade_recorded", "scenario-holdout", "attempt-replay", "grade-replay-oracle-drift", drifted_oracle_grade),
+    );
+    try appendTestPayload(std.testing.allocator, repo, store_path, "grade_recorded", "scenario-holdout", "attempt-replay", "grade-replay", replay_grade);
 
+    const holdout_replay_attempt_payload = try testAttemptPayloadAlloc(
+        std.testing.allocator,
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "controlled_replay",
+        "replay_baseline",
+        "artifact:replay-holdout",
+        &baseline_snapshot,
+        baseline_revision,
+    );
+    defer std.testing.allocator.free(holdout_replay_attempt_payload);
+    try appendTestPayload(std.testing.allocator, repo, store_path, "attempt_recorded", "scenario-holdout-2", "attempt-holdout-replay", null, holdout_replay_attempt_payload);
+    const holdout_replay_grade = try testGradePayloadAlloc(std.testing.allocator, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false, true, "pass", 1.0, 1.0, false);
+    defer std.testing.allocator.free(holdout_replay_grade);
     const before_out_of_scope = try durable_store.readRegularFileNoSymlink(std.testing.allocator, store_path, MaxStoreBytes);
     defer std.testing.allocator.free(before_out_of_scope);
     try std.testing.expectError(
@@ -2861,7 +4322,7 @@ test "hylo ledger rejects gaming and proves a full promoted publication" {
             null,
             null,
             null,
-            "{\"change_id\":\"change-outside\",\"status\":\"applied\",\"before_target_fingerprint\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after_target_fingerprint\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"owner_route\":\"skill-owner\",\"authority_ref\":\"user:test\",\"paths\":[\"outside.txt\"],\"diff_ref\":\"git:worktree\",\"diff_fingerprint\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"motivation_grade_ids\":[\"grade-replay\"],\"validation_refs\":[\"test:unit\"]}",
+            "{\"change_id\":\"change-outside\",\"status\":\"applied\",\"before_target_fingerprint\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after_target_fingerprint\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"owner_route\":\"skill-owner\",\"authority_ref\":\"user:test\",\"paths\":[\"outside.txt\"],\"diff_ref\":\"git-index:HEAD\",\"diff_fingerprint\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"motivation_grade_ids\":[\"grade-replay\"],\"validation_refs\":[\"test:unit\"]}",
         ),
     );
     const after_out_of_scope = try durable_store.readRegularFileNoSymlink(std.testing.allocator, store_path, MaxStoreBytes);
@@ -2869,37 +4330,202 @@ test "hylo ledger rejects gaming and proves a full promoted publication" {
     try std.testing.expectEqualStrings(before_out_of_scope, after_out_of_scope);
 
     try durable_store.writeTextAtomic(std.testing.allocator, target_path, "candidate\n");
-    try appendTestPayload(
-        std.testing.allocator,
-        repo,
-        store_path,
-        "change_recorded",
-        null,
-        null,
-        null,
-        "{\"change_id\":\"change-1\",\"status\":\"applied\",\"before_target_fingerprint\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after_target_fingerprint\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"owner_route\":\"skill-owner\",\"authority_ref\":\"user:test\",\"paths\":[\"target.txt\"],\"diff_ref\":\"git:worktree\",\"diff_fingerprint\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"motivation_grade_ids\":[\"grade-replay\"],\"validation_refs\":[\"test:unit\"]}",
-    );
-    try appendTestPayload(
-        std.testing.allocator,
-        repo,
-        store_path,
-        "attempt_recorded",
-        "scenario-holdout",
-        "attempt-candidate",
-        null,
-        "{\"status\":\"completed\",\"target_fingerprint\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"environment_fingerprint\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"replay_policy_fingerprint\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"origin\":\"controlled_replay\",\"role\":\"candidate\",\"blind\":true,\"evidence_refs\":[\"cas:candidate\"],\"trace_ref\":\"artifact:candidate\",\"trace_fingerprint\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}",
-    );
-    try appendTestPayload(
-        std.testing.allocator,
-        repo,
-        store_path,
-        "grade_recorded",
-        "scenario-holdout",
-        "attempt-candidate",
-        "grade-candidate",
-        "{\"status\":\"pass\",\"target_fingerprint\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"rubric_fingerprint\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"environment_fingerprint\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"replay_policy_fingerprint\":\"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"blind\":true,\"comparison_eligible\":true,\"aggregate\":1.0,\"dimensions\":[{\"id\":\"correctness\",\"score\":1.0,\"weight\":1.0,\"evidence_refs\":[\"test:candidate\"]}],\"critical_violations\":[],\"judge\":{\"kind\":\"deterministic\",\"id\":\"test\",\"version\":\"1\"},\"evidence_refs\":[\"test:candidate\"]}",
-    );
     try runTestGit(std.testing.allocator, repo, &.{ "add", "target.txt" });
+    const staged_diff = try runGitStdoutAlloc(std.testing.allocator, repo, &.{ "diff", "--cached", "--binary", "--full-index", "--no-ext-diff", "--no-color", "HEAD", "--" });
+    defer std.testing.allocator.free(staged_diff);
+    const staged_diff_fingerprint = try digestBytesAlloc(std.testing.allocator, staged_diff);
+    defer std.testing.allocator.free(staged_diff_fingerprint);
+    const valid_change_payload = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"change_id\":\"change-1\",\"status\":\"applied\",\"before_target_fingerprint\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after_target_fingerprint\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"owner_route\":\"skill-owner\",\"authority_ref\":\"user:test\",\"paths\":[\"target.txt\"],\"diff_ref\":\"git-index:HEAD\",\"diff_fingerprint\":\"{s}\",\"motivation_grade_ids\":[\"grade-replay\"],\"validation_refs\":[\"test:unit\"]}}",
+        .{staged_diff_fingerprint},
+    );
+    defer std.testing.allocator.free(valid_change_payload);
+    const invalid_diff_payload = "{\"change_id\":\"change-1\",\"status\":\"applied\",\"before_target_fingerprint\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after_target_fingerprint\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"owner_route\":\"skill-owner\",\"authority_ref\":\"user:test\",\"paths\":[\"target.txt\"],\"diff_ref\":\"git-index:HEAD\",\"diff_fingerprint\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"motivation_grade_ids\":[\"grade-replay\"],\"validation_refs\":[\"test:unit\"]}";
+    const before_invalid_diff = try durable_store.readRegularFileNoSymlink(std.testing.allocator, store_path, MaxStoreBytes);
+    defer std.testing.allocator.free(before_invalid_diff);
+    try std.testing.expectError(
+        error.AppliedDiffFingerprintMismatch,
+        appendTestPayload(std.testing.allocator, repo, store_path, "change_recorded", null, null, null, invalid_diff_payload),
+    );
+    const after_invalid_diff = try durable_store.readRegularFileNoSymlink(std.testing.allocator, store_path, MaxStoreBytes);
+    defer std.testing.allocator.free(after_invalid_diff);
+    try std.testing.expectEqualStrings(before_invalid_diff, after_invalid_diff);
+
+    try durable_store.writeTextAtomic(std.testing.allocator, target_scope_path, "untracked replay contamination\n");
+    try std.testing.expectError(
+        error.AppliedDiffScopeUntracked,
+        appendTestPayload(std.testing.allocator, repo, store_path, "change_recorded", null, null, null, valid_change_payload),
+    );
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, target_scope_path);
+    try appendTestPayload(std.testing.allocator, repo, store_path, "change_recorded", null, null, null, valid_change_payload);
+    var after_change = try loadLedger(std.testing.allocator, store_path);
+    defer after_change.deinit(std.testing.allocator);
+    const after_change_campaign = &after_change.campaigns.items[0];
+    try std.testing.expect(scenarioOnFrontier(after_change_campaign, "scenario-holdout-2", TestCandidateFingerprint));
+
+    const drifted_holdout_baseline_grade = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        holdout_replay_grade,
+        "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+        "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+    );
+    defer std.testing.allocator.free(drifted_holdout_baseline_grade);
+    try std.testing.expectError(
+        error.CampaignGraderAuthorityDrift,
+        appendTestPayload(std.testing.allocator, repo, store_path, "grade_recorded", "scenario-holdout-2", "attempt-holdout-replay", "grade-holdout-replay-drifted", drifted_holdout_baseline_grade),
+    );
+    try appendTestPayload(std.testing.allocator, repo, store_path, "grade_recorded", "scenario-holdout-2", "attempt-holdout-replay", "grade-holdout-replay", holdout_replay_grade);
+
+    var candidate_snapshot = try targetSnapshotArtifactAlloc(std.testing.allocator, repo, "INDEX", &target_roots);
+    defer candidate_snapshot.deinit(std.testing.allocator);
+    try durable_store.writeTextAtomic(std.testing.allocator, target_path, "candidate drift\n");
+    try runTestGit(std.testing.allocator, repo, &.{ "add", "target.txt" });
+    const drifted_attempt_payload = try testAttemptPayloadAlloc(
+        std.testing.allocator,
+        TestCandidateFingerprint,
+        "controlled_replay",
+        "candidate",
+        "artifact:candidate-drifted",
+        &candidate_snapshot,
+        "INDEX",
+    );
+    defer std.testing.allocator.free(drifted_attempt_payload);
+    try std.testing.expectError(
+        error.AppliedDiffFingerprintMismatch,
+        appendTestPayload(std.testing.allocator, repo, store_path, "attempt_recorded", "scenario-holdout", "attempt-candidate-drifted", null, drifted_attempt_payload),
+    );
+    try durable_store.writeTextAtomic(std.testing.allocator, target_path, "candidate\n");
+    try runTestGit(std.testing.allocator, repo, &.{ "add", "target.txt" });
+
+    const early_challenge_candidate_attempt = try testAttemptPayloadAlloc(
+        std.testing.allocator,
+        TestCandidateFingerprint,
+        "controlled_replay",
+        "candidate",
+        "artifact:challenge-candidate-early",
+        &candidate_snapshot,
+        "INDEX",
+    );
+    defer std.testing.allocator.free(early_challenge_candidate_attempt);
+    try appendTestPayload(std.testing.allocator, repo, store_path, "attempt_recorded", "scenario-challenge", "attempt-challenge-candidate-early", null, early_challenge_candidate_attempt);
+    const late_challenge_baseline_attempt = try testAttemptPayloadAlloc(
+        std.testing.allocator,
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "controlled_replay",
+        "replay_baseline",
+        "artifact:challenge-baseline-late",
+        &baseline_snapshot,
+        baseline_revision,
+    );
+    defer std.testing.allocator.free(late_challenge_baseline_attempt);
+    try appendTestPayload(std.testing.allocator, repo, store_path, "attempt_recorded", "scenario-challenge", "attempt-challenge-baseline-late", null, late_challenge_baseline_attempt);
+    const challenge_baseline_grade = try testGradePayloadAlloc(std.testing.allocator, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false, true, "pass", 1.0, 1.0, false);
+    defer std.testing.allocator.free(challenge_baseline_grade);
+    try appendTestPayload(std.testing.allocator, repo, store_path, "grade_recorded", "scenario-challenge", "attempt-challenge-baseline-late", "grade-challenge-baseline-late", challenge_baseline_grade);
+    const early_challenge_candidate_grade = try testGradePayloadAlloc(std.testing.allocator, TestCandidateFingerprint, false, true, "pass", 1.0, 1.0, false);
+    defer std.testing.allocator.free(early_challenge_candidate_grade);
+    try std.testing.expectError(
+        error.ReplayBaselineMissing,
+        appendTestPayload(std.testing.allocator, repo, store_path, "grade_recorded", "scenario-challenge", "attempt-challenge-candidate-early", "grade-challenge-candidate-early", early_challenge_candidate_grade),
+    );
+
+    const candidate_attempt_payload = try testAttemptPayloadAlloc(std.testing.allocator, TestCandidateFingerprint, "controlled_replay", "candidate", "artifact:candidate-practice", &candidate_snapshot, "INDEX");
+    defer std.testing.allocator.free(candidate_attempt_payload);
+    try appendTestPayload(std.testing.allocator, repo, store_path, "attempt_recorded", "scenario-holdout", "attempt-candidate", null, candidate_attempt_payload);
+    const candidate_grade = try testGradePayloadAlloc(std.testing.allocator, TestCandidateFingerprint, false, true, "pass", 1.0, 1.0, false);
+    defer std.testing.allocator.free(candidate_grade);
+    const drifted_grader_grade = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        candidate_grade,
+        "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+        "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+    );
+    defer std.testing.allocator.free(drifted_grader_grade);
+    try std.testing.expectError(
+        error.CampaignGraderAuthorityDrift,
+        appendTestPayload(std.testing.allocator, repo, store_path, "grade_recorded", "scenario-holdout", "attempt-candidate", "grade-candidate-drifted", drifted_grader_grade),
+    );
+    try appendTestPayload(std.testing.allocator, repo, store_path, "grade_recorded", "scenario-holdout", "attempt-candidate", "grade-candidate", candidate_grade);
+
+    const holdout_candidate_attempt_payload = try testAttemptPayloadAlloc(std.testing.allocator, TestCandidateFingerprint, "controlled_replay", "candidate", "artifact:candidate-holdout", &candidate_snapshot, "INDEX");
+    defer std.testing.allocator.free(holdout_candidate_attempt_payload);
+    try appendTestPayload(std.testing.allocator, repo, store_path, "attempt_recorded", "scenario-holdout-2", "attempt-holdout-candidate", null, holdout_candidate_attempt_payload);
+    const holdout_candidate_grade = try testGradePayloadAlloc(std.testing.allocator, TestCandidateFingerprint, false, true, "pass", 1.0, 1.0, false);
+    defer std.testing.allocator.free(holdout_candidate_grade);
+    try appendTestPayload(std.testing.allocator, repo, store_path, "grade_recorded", "scenario-holdout-2", "attempt-holdout-candidate", "grade-holdout-candidate", holdout_candidate_grade);
+
+    const challenge_candidate_attempt = try testAttemptPayloadAlloc(
+        std.testing.allocator,
+        TestCandidateFingerprint,
+        "controlled_replay",
+        "candidate",
+        "artifact:challenge-candidate",
+        &candidate_snapshot,
+        "INDEX",
+    );
+    defer std.testing.allocator.free(challenge_candidate_attempt);
+    try appendTestPayload(std.testing.allocator, repo, store_path, "attempt_recorded", "scenario-challenge", "attempt-challenge-candidate", null, challenge_candidate_attempt);
+    const challenge_candidate_grade = try testGradePayloadAlloc(std.testing.allocator, TestCandidateFingerprint, false, true, "pass", 1.0, 1.0, false);
+    defer std.testing.allocator.free(challenge_candidate_grade);
+    try appendTestPayload(std.testing.allocator, repo, store_path, "grade_recorded", "scenario-challenge", "attempt-challenge-candidate", "grade-challenge-candidate", challenge_candidate_grade);
+
+    const post_holdout_change = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"change_id\":\"change-after-holdout\",\"status\":\"applied\",\"before_target_fingerprint\":\"{s}\",\"after_target_fingerprint\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"owner_route\":\"skill-owner\",\"authority_ref\":\"user:test\",\"paths\":[\"target.txt\"],\"diff_ref\":\"git-index:HEAD\",\"diff_fingerprint\":\"{s}\",\"motivation_grade_ids\":[\"grade-replay\"],\"validation_refs\":[\"test:unit\"]}}",
+        .{ TestCandidateFingerprint, staged_diff_fingerprint },
+    );
+    defer std.testing.allocator.free(post_holdout_change);
+    try std.testing.expectError(
+        error.PromotionEvidenceAlreadyExposed,
+        appendTestPayload(std.testing.allocator, repo, store_path, "change_recorded", null, null, null, post_holdout_change),
+    );
+
+    const candidate_failure_attempt = try testAttemptPayloadAlloc(
+        std.testing.allocator,
+        TestCandidateFingerprint,
+        "controlled_replay",
+        "candidate",
+        "artifact:candidate-practice-failure",
+        &candidate_snapshot,
+        "INDEX",
+    );
+    defer std.testing.allocator.free(candidate_failure_attempt);
+    try appendTestPayload(std.testing.allocator, repo, store_path, "attempt_recorded", "scenario-holdout", "attempt-candidate-failure", null, candidate_failure_attempt);
+    const candidate_failure_grade = try testGradePayloadAlloc(std.testing.allocator, TestCandidateFingerprint, false, true, "fail", 0.0, 0.0, false);
+    defer std.testing.allocator.free(candidate_failure_grade);
+    try appendTestPayload(std.testing.allocator, repo, store_path, "grade_recorded", "scenario-holdout", "attempt-candidate-failure", "grade-candidate-failure", candidate_failure_grade);
+    var after_candidate_failure = try loadLedger(std.testing.allocator, store_path);
+    defer after_candidate_failure.deinit(std.testing.allocator);
+    try std.testing.expect(scenarioOnFrontier(&after_candidate_failure.campaigns.items[0], "scenario-holdout", TestCandidateFingerprint));
+
+    const cherry_picked_publication =
+        "{\"publication_id\":\"publication-cherry-picked\",\"status\":\"committed\",\"change_id\":\"change-1\",\"authority_ref\":\"user:test\",\"candidate_target_fingerprint\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"commit_sha\":\"0000000000000000000000000000000000000000\",\"commit_tree_ref\":\"git-tree:0000000000000000000000000000000000000000\",\"paths\":[\"target.txt\"],\"validation_refs\":[\"test:unit\"],\"promotion_grade_ids\":[\"grade-candidate\",\"grade-holdout-candidate\",\"grade-challenge-candidate\"]}";
+    try std.testing.expectError(
+        error.PromotionCohortFailed,
+        appendTestPayload(std.testing.allocator, repo, store_path, "publication_recorded", null, null, null, cherry_picked_publication),
+    );
+
+    const candidate_recovery_attempt = try testAttemptPayloadAlloc(
+        std.testing.allocator,
+        TestCandidateFingerprint,
+        "controlled_replay",
+        "candidate",
+        "artifact:candidate-practice-recovery",
+        &candidate_snapshot,
+        "INDEX",
+    );
+    defer std.testing.allocator.free(candidate_recovery_attempt);
+    try appendTestPayload(std.testing.allocator, repo, store_path, "attempt_recorded", "scenario-holdout", "attempt-candidate-recovery", null, candidate_recovery_attempt);
+    const candidate_recovery_grade = try testGradePayloadAlloc(std.testing.allocator, TestCandidateFingerprint, false, true, "pass", 1.0, 1.0, false);
+    defer std.testing.allocator.free(candidate_recovery_grade);
+    try appendTestPayload(std.testing.allocator, repo, store_path, "grade_recorded", "scenario-holdout", "attempt-candidate-recovery", "grade-candidate-recovery", candidate_recovery_grade);
+    var after_candidate_recovery = try loadLedger(std.testing.allocator, store_path);
+    defer after_candidate_recovery.deinit(std.testing.allocator);
+    try std.testing.expect(!scenarioOnFrontier(&after_candidate_recovery.campaigns.items[0], "scenario-holdout", TestCandidateFingerprint));
+
     try runTestGit(std.testing.allocator, repo, &.{ "commit", "--quiet", "-m", "candidate" });
     const commit_raw = try runGitStdoutAlloc(std.testing.allocator, repo, &.{ "rev-parse", "HEAD" });
     defer std.testing.allocator.free(commit_raw);
@@ -2907,18 +4533,42 @@ test "hylo ledger rejects gaming and proves a full promoted publication" {
     const tree_raw = try runGitStdoutAlloc(std.testing.allocator, repo, &.{ "rev-parse", "HEAD^{tree}" });
     defer std.testing.allocator.free(tree_raw);
     const tree_sha = std.mem.trim(u8, tree_raw, " \t\r\n");
+    try durable_store.writeTextAtomic(std.testing.allocator, target_path, "different after promotion\n");
+    try runTestGit(std.testing.allocator, repo, &.{ "add", "target.txt" });
+    try runTestGit(std.testing.allocator, repo, &.{ "commit", "--quiet", "-m", "different candidate" });
+    const different_commit_raw = try runGitStdoutAlloc(std.testing.allocator, repo, &.{ "rev-parse", "HEAD" });
+    defer std.testing.allocator.free(different_commit_raw);
+    const different_commit_sha = std.mem.trim(u8, different_commit_raw, " \t\r\n");
+    const different_tree_raw = try runGitStdoutAlloc(std.testing.allocator, repo, &.{ "rev-parse", "HEAD^{tree}" });
+    defer std.testing.allocator.free(different_tree_raw);
+    const different_tree_sha = std.mem.trim(u8, different_tree_raw, " \t\r\n");
     const valid_publication_payload = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"publication_id\":\"publication-1\",\"status\":\"committed\",\"change_id\":\"change-1\",\"authority_ref\":\"user:test\",\"candidate_target_fingerprint\":\"{s}\",\"commit_sha\":\"{s}\",\"commit_tree_ref\":\"git-tree:{s}\",\"paths\":[\"target.txt\"],\"validation_refs\":[\"test:unit\"],\"promotion_grade_ids\":[\"grade-candidate\"]}}",
+        "{{\"publication_id\":\"publication-1\",\"status\":\"committed\",\"change_id\":\"change-1\",\"authority_ref\":\"user:test\",\"candidate_target_fingerprint\":\"{s}\",\"commit_sha\":\"{s}\",\"commit_tree_ref\":\"git-tree:{s}\",\"paths\":[\"target.txt\"],\"validation_refs\":[\"test:unit\"],\"promotion_grade_ids\":[\"grade-candidate-recovery\",\"grade-holdout-candidate\",\"grade-challenge-candidate\"]}}",
         .{ TestCandidateFingerprint, commit_sha, tree_sha },
     );
     defer std.testing.allocator.free(valid_publication_payload);
     const invalid_publication_payload = try std.fmt.allocPrint(
         std.testing.allocator,
-        "{{\"publication_id\":\"publication-1\",\"status\":\"committed\",\"change_id\":\"change-1\",\"authority_ref\":\"user:test\",\"candidate_target_fingerprint\":\"{s}\",\"commit_sha\":\"{s}\",\"commit_tree_ref\":\"git-tree:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"paths\":[\"target.txt\"],\"validation_refs\":[\"test:unit\"],\"promotion_grade_ids\":[\"grade-candidate\"]}}",
+        "{{\"publication_id\":\"publication-1\",\"status\":\"committed\",\"change_id\":\"change-1\",\"authority_ref\":\"user:test\",\"candidate_target_fingerprint\":\"{s}\",\"commit_sha\":\"{s}\",\"commit_tree_ref\":\"git-tree:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"paths\":[\"target.txt\"],\"validation_refs\":[\"test:unit\"],\"promotion_grade_ids\":[\"grade-candidate-recovery\",\"grade-holdout-candidate\",\"grade-challenge-candidate\"]}}",
         .{ TestCandidateFingerprint, commit_sha },
     );
     defer std.testing.allocator.free(invalid_publication_payload);
+    const different_content_publication = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"publication_id\":\"publication-1\",\"status\":\"committed\",\"change_id\":\"change-1\",\"authority_ref\":\"user:test\",\"candidate_target_fingerprint\":\"{s}\",\"commit_sha\":\"{s}\",\"commit_tree_ref\":\"git-tree:{s}\",\"paths\":[\"target.txt\"],\"validation_refs\":[\"test:unit\"],\"promotion_grade_ids\":[\"grade-candidate-recovery\",\"grade-holdout-candidate\",\"grade-challenge-candidate\"]}}",
+        .{ TestCandidateFingerprint, different_commit_sha, different_tree_sha },
+    );
+    defer std.testing.allocator.free(different_content_publication);
+    const before_different_content = try durable_store.readRegularFileNoSymlink(std.testing.allocator, store_path, MaxStoreBytes);
+    defer std.testing.allocator.free(before_different_content);
+    try std.testing.expectError(
+        error.CommittedTargetSnapshotMismatch,
+        appendTestPayload(std.testing.allocator, repo, store_path, "publication_recorded", null, null, null, different_content_publication),
+    );
+    const after_different_content = try durable_store.readRegularFileNoSymlink(std.testing.allocator, store_path, MaxStoreBytes);
+    defer std.testing.allocator.free(after_different_content);
+    try std.testing.expectEqualStrings(before_different_content, after_different_content);
     const before_invalid_publication = try durable_store.readRegularFileNoSymlink(std.testing.allocator, store_path, MaxStoreBytes);
     defer std.testing.allocator.free(before_invalid_publication);
     try std.testing.expectError(
@@ -2932,11 +4582,11 @@ test "hylo ledger rejects gaming and proves a full promoted publication" {
 
     var loaded = try loadLedger(std.testing.allocator, store_path);
     defer loaded.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u64, 10), loaded.event_count);
+    try std.testing.expectEqual(@as(u64, 25), loaded.event_count);
     try std.testing.expectEqual(@as(usize, 1), loaded.campaigns.items.len);
     const state = &loaded.campaigns.items[0];
-    try std.testing.expectEqual(@as(usize, 3), state.attempts.items.len);
-    try std.testing.expectEqual(@as(usize, 3), state.grades.items.len);
+    try std.testing.expectEqual(@as(usize, 10), state.attempts.items.len);
+    try std.testing.expectEqual(@as(usize, 9), state.grades.items.len);
     try std.testing.expectEqual(@as(usize, 1), state.changes.items.len);
     try std.testing.expectEqual(@as(usize, 1), state.publications.items.len);
     const progress_digest = try progressDigestAlloc(std.testing.allocator, state);
