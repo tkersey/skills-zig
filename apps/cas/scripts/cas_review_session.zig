@@ -69,8 +69,8 @@ const UsageText =
     \\  --base BRANCH                    Review changes against a base branch.
     \\  --commit SHA                     Review a specific commit.
     \\  --title TITLE                    Optional commit title for --commit.
-    \\  --custom-instructions VALUE      Custom review instructions, raw text, @file, or - for stdin.
-    \\  --workflow-binding-json VALUE    Optional workflow binding as JSON or @file.
+    \\  --custom-instructions VALUE      Exact review prompt, raw text, @file, or -; may accompany a target selector.
+    \\  --workflow-binding-json VALUE    Optional opaque request binding as JSON or @file.
     \\  --multi-agent-mode MODE          explicit-request-only|proactive for fresh parent request flow.
     \\
     \\Approval/runtime options:
@@ -110,8 +110,8 @@ const UsageText =
     \\  --path FILE                      Receipt, lock, or session record file to process; repeatable.
     \\  --record FILE                    CAS-RER-v1 record file to validate; repeatable.
     \\  --glob PATTERN                   Simple receipt glob; repeatable.
-    \\  --allow-reduced-principal        Diagnostic inspect flag only; never closeout eligible.
-    \\  --allow-native-fallback          Diagnostic inspect flag only; never closeout eligible.
+    \\  --allow-reduced-principal        Include reduced-principal records in diagnostic inspection.
+    \\  --allow-native-fallback          Include native-fallback records in diagnostic inspection.
     \\  --show-attachments               Include attachment paths in diagnostic inspect output.
     \\  --format FORMAT                  Helper output: table|json|jsonl (default: table).
     \\  --summary                        Include aggregate receipt counts.
@@ -125,7 +125,7 @@ const UsageText =
     \\  version                          Show version.
     \\
     \\Examples:
-    \\  cas review_session run --cwd /path/to/repo --base main --workflow-binding-json @binding.json --timeout-ms 1800000 --json
+    \\  cas review_session run --cwd /path/to/repo --base main --custom-instructions @review.txt --workflow-binding-json @binding.json --timeout-ms 1800000 --json
     \\  cas review_session current --cwd /path/to/repo --base main --json
     \\  cas review_session list --cwd /path/to/repo --base main --json
     \\  cas review_session import --path review-1.json --cwd /path/to/repo --base main --json
@@ -291,13 +291,8 @@ const TargetConfig = struct {
 };
 
 const WorkflowBinding = struct {
-    actuationRunId: []const u8,
-    artifactStateFingerprint: []const u8,
-    reviewContractFingerprint: []const u8,
-    resolutionDigest: []const u8,
-    selectedLenses: []const []const u8,
-    reviewLane: []const u8,
-    lensContract: []const u8,
+    requestId: []const u8,
+    requestFingerprint: []const u8,
 };
 
 const ParsedArgs = struct {
@@ -414,7 +409,6 @@ const SessionRecord = struct {
 };
 
 const review_tuple_lock_version = "CAS-RTL-v1";
-const legacy_review_tuple_lock_version = "CRTL-v1";
 const review_tuple_lock_ttl_seconds: i64 = 30 * 60;
 const unknown_account_fingerprint = "unknown-account";
 const principal_strength_strong = "strong";
@@ -479,9 +473,6 @@ const ReviewTupleLock = struct {
     lastFailureCode: ?[]const u8 = null,
     overrideReason: ?[]const u8 = null,
     freshAttemptReason: ?[]const u8 = null,
-    cleanStreakCount: u32 = 0,
-    lastCleanReceiptRecordPath: ?[]const u8 = null,
-    lastCleanStreakResetPath: ?[]const u8 = null,
 };
 
 const LoadedReviewTupleLock = struct {
@@ -1046,9 +1037,14 @@ fn parseArgs(allocator: std.mem.Allocator, argv: []const []const u8) !ParsedArgs
             continue;
         }
         if (std.mem.eql(u8, arg, "--custom-instructions")) {
+            if (out.custom_instructions_arg != null) return error.DuplicateCustomInstructions;
             const instructions = try loadCustomInstructionsAlloc(allocator, value);
             out.custom_instructions_arg = value;
-            setTarget(&out, .{ .kind = .custom, .instructions = instructions });
+            if (out.target) |*target| {
+                target.instructions = instructions;
+            } else {
+                setTarget(&out, .{ .kind = .custom, .instructions = instructions });
+            }
             continue;
         }
         if (std.mem.eql(u8, arg, "--workflow-binding-json")) {
@@ -1316,7 +1312,9 @@ fn validateReviewThreadIdSelector(value: []const u8) !void {
 }
 
 fn setTarget(parsed: *ParsedArgs, target: TargetConfig) void {
-    parsed.target = target;
+    var next = target;
+    if (parsed.target) |current| next.instructions = current.instructions;
+    parsed.target = next;
 }
 
 fn loadCustomInstructionsAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
@@ -1335,21 +1333,10 @@ fn workflowBindingStringValid(value: []const u8) bool {
 }
 
 fn validateWorkflowBinding(binding: WorkflowBinding) !void {
-    if (!workflowBindingStringValid(binding.actuationRunId) or
-        !workflowBindingStringValid(binding.artifactStateFingerprint) or
-        !workflowBindingStringValid(binding.reviewContractFingerprint) or
-        !workflowBindingStringValid(binding.resolutionDigest) or
-        !workflowBindingStringValid(binding.reviewLane) or
-        !workflowBindingStringValid(binding.lensContract) or
-        binding.selectedLenses.len == 0)
+    if (!workflowBindingStringValid(binding.requestId) or
+        !workflowBindingStringValid(binding.requestFingerprint))
     {
         return error.InvalidWorkflowBinding;
-    }
-    for (binding.selectedLenses, 0..) |lens, index| {
-        if (!workflowBindingStringValid(lens)) return error.InvalidWorkflowBinding;
-        if (index > 0 and std.mem.order(u8, binding.selectedLenses[index - 1], lens) != .lt) {
-            return error.InvalidWorkflowBinding;
-        }
     }
 }
 
@@ -1489,31 +1476,29 @@ fn writeCasRerRecordRefsArray(writer: *std.Io.Writer, records: []const CasRerLed
         try writeJsonString(writer, record.record_id);
         try writer.writeAll(",\"recordPath\":");
         try writeJsonString(writer, record.path);
-        try writer.writeAll(",\"proofCreditEligible\":");
-        try writer.writeAll(if (record.proof_credit_eligible) "true" else "false");
+        try writer.writeAll(",\"contextIdentityMatches\":");
+        try writer.writeAll(if (record.context_identity_matches) "true" else "false");
         try writer.writeByte('}');
     }
     try writer.writeByte(']');
 }
 
 fn writeCasReviewCurrentEnvelope(writer: *std.Io.Writer, records: []const CasRerLedgerRecord) !void {
-    try writer.writeAll("{\"schema\":\"CAS-CURRENT-v1\",\"recordPath\":");
+    try writer.writeAll("{\"schema\":\"CAS-CURRENT-v2\",\"recordPath\":");
     if (latestCasRerLedgerRecordIndex(records)) |idx| {
         try writeJsonString(writer, records[idx].path);
         try writer.writeAll(",\"record\":");
         try writer.writeAll(records[idx].raw_json);
-        try writer.writeAll(",\"tupleCurrent\":true,\"proofCreditEligible\":");
-        try writer.writeAll(if (records[idx].proof_credit_eligible) "true" else "false");
-        try writer.writeAll(",\"actionRequired\":");
-        try writeJsonString(writer, actionRequiredForCasRerRecord(records[idx]));
+        try writer.writeAll(",\"tupleCurrent\":true,\"contextIdentityMatches\":");
+        try writer.writeAll(if (records[idx].context_identity_matches) "true" else "false");
     } else {
-        try writer.writeAll("null,\"record\":null,\"tupleCurrent\":false,\"proofCreditEligible\":false,\"actionRequired\":\"run_new_attempt\"");
+        try writer.writeAll("null,\"record\":null,\"tupleCurrent\":false,\"contextIdentityMatches\":false");
     }
     try writer.writeByte('}');
 }
 
 fn writeCasReviewListEnvelope(writer: *std.Io.Writer, records: []const CasRerLedgerRecord) !void {
-    try writer.writeAll("{\"schema\":\"CAS-LIST-v1\",\"records\":");
+    try writer.writeAll("{\"schema\":\"CAS-LIST-v2\",\"records\":");
     try writeCasRerRecordsArray(writer, records);
     try writer.writeAll(",\"recordRefs\":");
     try writeCasRerRecordRefsArray(writer, records);
@@ -1571,7 +1556,7 @@ fn cmdReviewInspect(allocator: std.mem.Allocator, parsed: ParsedArgs) !void {
 
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     const stdout = &stdout_writer.interface;
-    try stdout.writeAll("{\"schema\":\"CAS-INSPECT-v1\",\"surface\":\"inspect\",\"closeoutEligible\":false,\"diagnosticOnly\":true");
+    try stdout.writeAll("{\"schema\":\"CAS-INSPECT-v1\",\"surface\":\"inspect\",\"diagnosticOnly\":true");
     try stdout.writeAll(",\"allowReducedPrincipal\":");
     try stdout.writeAll(if (parsed.allow_reduced_principal) "true" else "false");
     try stdout.writeAll(",\"allowNativeFallback\":");
@@ -3972,7 +3957,7 @@ fn validateCasRerRecordObjectAlloc(allocator: std.mem.Allocator, path: []const u
                 if (canonical) |value| {
                     allocator.free(value);
                 } else {
-                    try appendGateError(allocator, &errors, "workflowBinding must be a complete canonical workflow binding", .{});
+                    try appendGateError(allocator, &errors, "workflowBinding must be a complete canonical opaque request binding", .{});
                 }
             },
             else => try appendGateError(allocator, &errors, "workflowBinding must be an object when present", .{}),
@@ -4228,7 +4213,7 @@ fn validateTupleLockGateObjectAlloc(allocator: std.mem.Allocator, path: []const 
         .object => {
             const raw = try stringifyJsonValueAlloc(allocator, .{ .object = lock });
             defer allocator.free(raw);
-            var parsed_lock = std.json.parseFromSlice(ReviewTupleLock, allocator, raw, .{}) catch null;
+            var parsed_lock = std.json.parseFromSlice(ReviewTupleLock, allocator, raw, .{ .ignore_unknown_fields = true }) catch null;
             if (parsed_lock) |*parsed| {
                 defer parsed.deinit();
                 if (!(reviewTupleLockWorkflowBindingValidAlloc(allocator, parsed.value) catch false)) {
@@ -5181,13 +5166,10 @@ fn appendTargetCliArgs(allocator: std.mem.Allocator, argv: *std.ArrayList([]cons
             try argv.appendSlice(allocator, &.{ "--commit", target.sha.? });
             if (target.title) |title| try argv.appendSlice(allocator, &.{ "--title", title });
         },
-        .custom => {
-            const child_arg = if (std.mem.eql(u8, parsed.custom_instructions_arg orelse "", "-"))
-                target.instructions.?
-            else
-                parsed.custom_instructions_arg orelse target.instructions.?;
-            try argv.appendSlice(allocator, &.{ "--custom-instructions", child_arg });
-        },
+        .custom => {},
+    }
+    if (target.instructions) |instructions| {
+        try argv.appendSlice(allocator, &.{ "--custom-instructions", instructions });
     }
 }
 
@@ -6524,6 +6506,10 @@ fn targetIdentityForRecordAlloc(
 }
 
 fn appendNativeReviewArgs(allocator: std.mem.Allocator, args: *std.ArrayList([]const u8), target: TargetRecord) !void {
+    if (target.instructions) |instructions| {
+        try args.append(allocator, instructions);
+        return;
+    }
     if (std.mem.eql(u8, target.type, "uncommittedChanges")) {
         try args.append(allocator, "--uncommitted");
         return;
@@ -6743,11 +6729,14 @@ fn buildReviewStartParamsJson(
 }
 
 fn buildTargetJson(allocator: std.mem.Allocator, target: TargetConfig) ![]u8 {
+    if (target.instructions) |instructions| {
+        return stringifyAnyAlloc(allocator, .{ .type = "custom", .instructions = instructions });
+    }
     return switch (target.kind) {
         .uncommitted => stringifyAnyAlloc(allocator, .{ .type = "uncommittedChanges" }),
         .base_branch => stringifyAnyAlloc(allocator, .{ .type = "baseBranch", .branch = target.branch.? }),
         .commit => stringifyAnyAlloc(allocator, .{ .type = "commit", .sha = target.sha.?, .title = target.title }),
-        .custom => stringifyAnyAlloc(allocator, .{ .type = "custom", .instructions = target.instructions.? }),
+        .custom => error.MissingCustomInstructions,
     };
 }
 
@@ -6966,7 +6955,7 @@ const CasRerLedgerRecord = struct {
     head_sha: ?[]const u8,
     target_fingerprint: ?[]const u8,
     principal_proof_usable: bool,
-    proof_credit_eligible: bool = false,
+    context_identity_matches: bool = false,
     fresh_attempt_required: bool,
 
     fn deinit(self: CasRerLedgerRecord, allocator: std.mem.Allocator) void {
@@ -6990,22 +6979,9 @@ fn workflowBindingObjectMatches(root: std.json.ObjectMap, expected: WorkflowBind
         .object => |object| object,
         else => return false,
     };
-    if (!std.mem.eql(u8, jsonStringField(actual, "actuationRunId") orelse "", expected.actuationRunId)) return false;
-    if (!std.mem.eql(u8, jsonStringField(actual, "artifactStateFingerprint") orelse "", expected.artifactStateFingerprint)) return false;
-    if (!std.mem.eql(u8, jsonStringField(actual, "reviewContractFingerprint") orelse "", expected.reviewContractFingerprint)) return false;
-    if (!std.mem.eql(u8, jsonStringField(actual, "resolutionDigest") orelse "", expected.resolutionDigest)) return false;
-    if (!std.mem.eql(u8, jsonStringField(actual, "reviewLane") orelse "", expected.reviewLane)) return false;
-    if (!std.mem.eql(u8, jsonStringField(actual, "lensContract") orelse "", expected.lensContract)) return false;
-    const lenses_value = actual.get("selectedLenses") orelse return false;
-    const lenses = switch (lenses_value) {
-        .array => |array| array.items,
-        else => return false,
-    };
-    if (lenses.len != expected.selectedLenses.len) return false;
-    for (lenses, expected.selectedLenses) |actual_lens, expected_lens| {
-        if (actual_lens != .string or !std.mem.eql(u8, actual_lens.string, expected_lens)) return false;
-    }
-    return true;
+    if (actual.count() != 2) return false;
+    return std.mem.eql(u8, jsonStringField(actual, "requestId") orelse "", expected.requestId) and
+        std.mem.eql(u8, jsonStringField(actual, "requestFingerprint") orelse "", expected.requestFingerprint);
 }
 
 fn casRerObjectMatchesHistoryScope(
@@ -7035,7 +7011,7 @@ fn casRerObjectMatchesHistoryScope(
     return true;
 }
 
-fn casRerObjectProofCreditEligible(
+fn casRerObjectContextIdentityMatches(
     root: std.json.ObjectMap,
     repo_realpath: []const u8,
     identity: TargetIdentity,
@@ -7054,7 +7030,6 @@ fn casRerObjectProofCreditEligible(
     if (!optionalStringsEqual(jsonStringField(tuple, "resolvedCodexVersion"), resolved_codex_version)) return false;
     if (!casRerPrincipalFingerprintUsable(account_fingerprint)) return false;
     const principal = objectField(root, "principal") orelse return false;
-    if (!casRerPrincipalProofUsableObject(principal)) return false;
     const record_account_fingerprint = nonEmptyOptional(jsonStringField(principal, "accountFingerprint")) orelse return false;
     return std.mem.eql(u8, record_account_fingerprint, account_fingerprint);
 }
@@ -7069,7 +7044,7 @@ fn casRerObjectMatchesIdentity(
     account_fingerprint_reduced_protection: bool,
     codex_thread_id: []const u8,
 ) bool {
-    return casRerObjectProofCreditEligible(root, repo_realpath, identity, resolved_codex_path, resolved_codex_version, account_fingerprint, account_fingerprint_reduced_protection, codex_thread_id, null);
+    return casRerObjectContextIdentityMatches(root, repo_realpath, identity, resolved_codex_path, resolved_codex_version, account_fingerprint, account_fingerprint_reduced_protection, codex_thread_id, null);
 }
 
 fn casRerPrincipalProofUsableObject(principal: ?std.json.ObjectMap) bool {
@@ -7155,13 +7130,13 @@ fn appendCasRerLedgerRecordsAlloc(
         defer validation.deinit(allocator);
         if (!validation.ok()) continue;
 
-        var proof_credit_eligible = false;
+        var context_identity_matches = false;
         if (repo_realpath != null and identity != null and resolved_codex_path != null and resolved_codex_version != null and account_fingerprint != null and account_fingerprint_reduced_protection != null and codex_thread_id != null) {
             if (!casRerObjectMatchesHistoryScope(root, repo_realpath.?, identity.?, codex_thread_id.?, workflow_binding_filter)) continue;
-            proof_credit_eligible = casRerObjectProofCreditEligible(root, repo_realpath.?, identity.?, resolved_codex_path.?, resolved_codex_version.?, account_fingerprint.?, account_fingerprint_reduced_protection.?, codex_thread_id.?, workflow_binding_filter);
+            context_identity_matches = casRerObjectContextIdentityMatches(root, repo_realpath.?, identity.?, resolved_codex_path.?, resolved_codex_version.?, account_fingerprint.?, account_fingerprint_reduced_protection.?, codex_thread_id.?, workflow_binding_filter);
         }
         var record = casRerLedgerRecordFromJsonAlloc(allocator, path, raw) catch continue;
-        record.proof_credit_eligible = proof_credit_eligible;
+        record.context_identity_matches = context_identity_matches;
         errdefer record.deinit(allocator);
         try out.append(allocator, record);
     }
@@ -7264,29 +7239,6 @@ fn latestCasRerLedgerRecordIndex(records: []const CasRerLedgerRecord) ?usize {
         if (casRerRecordLessThan({}, records[best], record)) best = idx;
     }
     return best;
-}
-
-fn actionRequiredForCasRerRecord(record: CasRerLedgerRecord) []const u8 {
-    if (record.tuple_verdict_exists and (std.mem.eql(u8, record.status, "clean") or std.mem.eql(u8, record.status, "findings"))) {
-        if (std.mem.eql(u8, record.status, "findings")) return "review_findings";
-        if (!record.proof_credit_eligible) return "run_new_attempt";
-        return "none";
-    }
-    if (record.failure_code) |code| {
-        if (std.mem.eql(u8, code, "review_tuple_lock_stale") or std.mem.eql(u8, code, "review_tuple_lock_invalid")) return "inspect";
-    }
-    if (std.mem.eql(u8, record.status, "timeout")) return "inspect";
-    if (std.mem.eql(u8, record.status, "transport_failure")) {
-        if (!record.attempt_exists) return "run_new_attempt";
-        if (std.mem.eql(u8, record.phase, "review_terminal") or std.mem.eql(u8, record.phase, "normalized_verdict")) return "inspect";
-        return "wait";
-    }
-    if (record.attempt_exists and !record.tuple_verdict_exists) {
-        if (std.mem.eql(u8, record.phase, "review_waiting") or std.mem.eql(u8, record.phase, "review_started")) return "wait";
-        if (record.phase.len == 0 and record.failure_code == null) return "wait";
-    }
-    if (std.mem.eql(u8, record.status, "incomplete")) return "inspect";
-    return "workflow_policy";
 }
 
 fn laneIdAlloc(allocator: std.mem.Allocator, process_id: u64) ![]const u8 {
@@ -7888,7 +7840,7 @@ fn loadReviewTupleLock(allocator: std.mem.Allocator, path: []const u8) !?LoadedR
         else => return err,
     };
     errdefer allocator.free(raw);
-    const parsed = try std.json.parseFromSlice(ReviewTupleLock, allocator, raw, .{});
+    const parsed = try std.json.parseFromSlice(ReviewTupleLock, allocator, raw, .{ .ignore_unknown_fields = true });
     errdefer parsed.deinit();
     if (!try reviewTupleLockWorkflowBindingValidAlloc(allocator, parsed.value)) return error.InvalidWorkflowBinding;
     return .{
@@ -8007,10 +7959,6 @@ fn deleteReviewTupleLockRewriteClaimBestEffort(claim_path: []const u8) void {
     std.Io.Dir.deleteFileAbsolute(std.Io.Threaded.global_single_threaded.io(), claim_path) catch {};
 }
 
-fn deleteReviewTupleLockBestEffort(lock_path: []const u8) void {
-    std.Io.Dir.deleteFileAbsolute(std.Io.Threaded.global_single_threaded.io(), lock_path) catch {};
-}
-
 fn isSmokeSuiteOverride(override_reason: ?[]const u8) bool {
     return if (override_reason) |reason| std.mem.startsWith(u8, reason, "cas-smoke-suite:") else false;
 }
@@ -8071,72 +8019,6 @@ fn terminalLockNeedsFreshAttempt(
     }) catch return true;
     defer normalized.deinit(allocator);
     return !normalizedReceiptReusableTerminal(normalized);
-}
-
-fn targetIdentityFromReviewTupleLock(lock: ReviewTupleLock) TargetIdentity {
-    return .{
-        .base_sha = lock.baseSha,
-        .head_sha = lock.headSha,
-        .fingerprint = lock.targetFingerprint,
-    };
-}
-
-fn cleanStreakResetDirAlloc(allocator: std.mem.Allocator) ![]const u8 {
-    const dir = try casStorePathAlloc(allocator, "state/clean_streak_resets");
-    try durable_store.ensureDirectoryPathNoSymlinks(dir);
-    return dir;
-}
-
-fn writeCleanStreakResetRecordAlloc(allocator: std.mem.Allocator, lock_path: []const u8, lock: ReviewTupleLock) ![]const u8 {
-    const dir = try cleanStreakResetDirAlloc(allocator);
-    defer allocator.free(dir);
-    const bare_hash = if (std.mem.startsWith(u8, lock.tupleHash, "sha256:")) lock.tupleHash["sha256:".len..] else lock.tupleHash;
-    const path = try std.fmt.allocPrint(allocator, "{s}/{s}-{d}.json", .{ dir, bare_hash, unixSeconds() });
-    errdefer allocator.free(path);
-    const json = try stringifyAnyAlloc(allocator, .{
-        .schema = "CAS-CLEAN-STREAK-RESET-v1",
-        .resetReason = "three_consecutive_clean_reviews",
-        .resetAtUnixS = unixSeconds(),
-        .tupleHash = lock.tupleHash,
-        .codexThreadId = lock.codexThreadId,
-        .cleanStreakCount = lock.cleanStreakCount,
-        .lockPath = lock_path,
-        .finalRecordPath = lock.lastCleanReceiptRecordPath,
-    });
-    defer allocator.free(json);
-    const payload = try std.fmt.allocPrint(allocator, "{s}\n", .{json});
-    defer allocator.free(payload);
-    try durable_store.writeTextCreateNew(allocator, path, payload, .{ .reject_symlinks = true });
-    return path;
-}
-
-fn applyCleanStreakMaintenance(allocator: std.mem.Allocator, lock_path: []const u8, lock: *ReviewTupleLock) bool {
-    if (!(std.mem.eql(u8, lock.state, "terminal") or std.mem.eql(u8, lock.state, "normalized"))) return false;
-    const record_path = lock.recordPath orelse return false;
-    if (lock.lastCleanReceiptRecordPath) |last| {
-        if (std.mem.eql(u8, last, record_path)) return false;
-    }
-    const normalized = normalizeReceiptFromPathAlloc(allocator, record_path, true, .{
-        .requested_identity = targetIdentityFromReviewTupleLock(lock.*),
-        .requested_identity_required = true,
-    }) catch return false;
-    defer normalized.deinit(allocator);
-    if (!normalizedReceiptReusableTerminal(normalized)) return false;
-    if (std.mem.eql(u8, normalized.status, "clean")) {
-        lock.cleanStreakCount += 1;
-        lock.lastCleanReceiptRecordPath = record_path;
-        if (lock.cleanStreakCount >= 3) {
-            const reset_path = writeCleanStreakResetRecordAlloc(allocator, lock_path, lock.*) catch return false;
-            lock.lastCleanStreakResetPath = reset_path;
-            return true;
-        }
-        return false;
-    }
-    if (std.mem.eql(u8, normalized.status, "findings")) {
-        lock.cleanStreakCount = 0;
-        lock.lastCleanReceiptRecordPath = null;
-    }
-    return false;
 }
 
 fn reviewTupleLockReplaceableDeadFailure(lock: ReviewTupleLock) bool {
@@ -8474,18 +8356,10 @@ fn emitReviewTupleLockBlockedAndExit(
 const ReviewTupleStartLockBundle = struct {
     path: []const u8,
     lock: ReviewTupleLock,
-    owns_last_clean_receipt_record_path: bool = false,
-    owns_last_clean_streak_reset_path: bool = false,
 
     fn deinit(self: ReviewTupleStartLockBundle, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
         allocator.free(self.lock.tupleHash);
-        if (self.owns_last_clean_receipt_record_path) {
-            if (self.lock.lastCleanReceiptRecordPath) |path| allocator.free(path);
-        }
-        if (self.owns_last_clean_streak_reset_path) {
-            if (self.lock.lastCleanStreakResetPath) |path| allocator.free(path);
-        }
     }
 };
 
@@ -8652,35 +8526,9 @@ fn acquireReviewTupleStartLockOrExit(
                 },
             }
             const replacement_override_reason = if (latest_decision == .auto_replace_dead_transport) "auto-replaced-dead-transport" else override_reason;
-            var lock = makeReviewTupleLock(tuple_hash, tuple, "starting_lane", now_s, replacement_override_reason, fresh_attempt_reason);
-            var owns_last_clean_receipt_record_path = false;
-            var owns_last_clean_streak_reset_path = false;
-            if (latest_decision == .fresh_after_terminal) {
-                lock.cleanStreakCount = latest.record.cleanStreakCount;
-                if (latest.record.lastCleanReceiptRecordPath) |path| {
-                    lock.lastCleanReceiptRecordPath = try allocator.dupe(u8, path);
-                    owns_last_clean_receipt_record_path = true;
-                }
-                if (latest.record.lastCleanStreakResetPath) |path| {
-                    lock.lastCleanStreakResetPath = try allocator.dupe(u8, path);
-                    owns_last_clean_streak_reset_path = true;
-                }
-            }
-            errdefer {
-                if (owns_last_clean_receipt_record_path) {
-                    if (lock.lastCleanReceiptRecordPath) |path| allocator.free(path);
-                }
-                if (owns_last_clean_streak_reset_path) {
-                    if (lock.lastCleanStreakResetPath) |path| allocator.free(path);
-                }
-            }
+            const lock = makeReviewTupleLock(tuple_hash, tuple, "starting_lane", now_s, replacement_override_reason, fresh_attempt_reason);
             try writeReviewTupleLock(allocator, lock_path, lock);
-            return .{
-                .path = lock_path,
-                .lock = lock,
-                .owns_last_clean_receipt_record_path = owns_last_clean_receipt_record_path,
-                .owns_last_clean_streak_reset_path = owns_last_clean_streak_reset_path,
-            };
+            return .{ .path = lock_path, .lock = lock };
         },
         .return_existing, .normalize_existing => {
             const lock = loaded_opt.?.record;
@@ -8719,7 +8567,7 @@ fn updateReviewTupleLockBestEffort(
     record_path: ?[]const u8,
     event_log_path: ?[]const u8,
 ) void {
-    var next = withReviewTupleLockState(
+    const next = withReviewTupleLockState(
         current,
         state,
         unixSeconds(),
@@ -8729,12 +8577,7 @@ fn updateReviewTupleLockBestEffort(
         record_path,
         event_log_path,
     );
-    const clear_reusable_lock = applyCleanStreakMaintenance(allocator, path, &next);
-    defer if (clear_reusable_lock) {
-        if (next.lastCleanStreakResetPath) |reset_path| allocator.free(reset_path);
-    };
     writeReviewTupleLock(allocator, path, next) catch {};
-    if (clear_reusable_lock) deleteReviewTupleLockBestEffort(path);
 }
 
 fn updateReviewTupleLockForRecordBestEffort(
@@ -10463,14 +10306,6 @@ fn writeNullableJsonString(writer: *std.Io.Writer, text: ?[]const u8) !void {
     if (text) |value| try writeJsonString(writer, value) else try writer.writeAll("null");
 }
 
-fn writeNullableJsonBool(writer: *std.Io.Writer, value: ?bool) !void {
-    if (value) |flag| try writer.writeAll(if (flag) "true" else "false") else try writer.writeAll("null");
-}
-
-fn writeNullableJsonUsize(writer: *std.Io.Writer, value: ?usize) !void {
-    if (value) |number| try writer.print("{d}", .{number}) else try writer.writeAll("null");
-}
-
 fn nonEmptyOptional(text: ?[]const u8) ?[]const u8 {
     const value = text orelse return null;
     return if (value.len == 0) null else value;
@@ -10907,10 +10742,18 @@ fn stringifyJsonValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) 
 fn canonicalWorkflowBindingJsonFromValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
     const raw = try stringifyJsonValueAlloc(allocator, value);
     defer allocator.free(raw);
-    var parsed = std.json.parseFromSlice(WorkflowBinding, allocator, raw, .{}) catch return error.InvalidWorkflowBinding;
-    defer parsed.deinit();
-    try validateWorkflowBinding(parsed.value);
-    return stringifyAnyAlloc(allocator, parsed.value);
+    if (std.json.parseFromSlice(WorkflowBinding, allocator, raw, .{}) catch null) |parsed_value| {
+        var parsed = parsed_value;
+        defer parsed.deinit();
+        try validateWorkflowBinding(parsed.value);
+        return stringifyAnyAlloc(allocator, parsed.value);
+    }
+
+    // Any non-empty retired object remains canonicalized historical evidence.
+    // Active commands still accept only the typed two-field shape above.
+    if (value != .object or value.object.count() == 0) return error.InvalidWorkflowBinding;
+    if (value.object.contains("requestId") or value.object.contains("requestFingerprint")) return error.InvalidWorkflowBinding;
+    return allocator.dupe(u8, raw);
 }
 
 fn workflowBindingJsonFromRootAlloc(allocator: std.mem.Allocator, root: std.json.ObjectMap) !?[]const u8 {
@@ -11439,11 +11282,6 @@ fn summarizeReceipts(receipts: []const NormalizedReceipt) ReceiptSummary {
         if (std.mem.eql(u8, receipt.backend_class, "cas-lane")) summary.cas_lane += 1 else if (std.mem.eql(u8, receipt.backend_class, "cas-native-fallback")) summary.cas_native_fallback += 1 else summary.other_backend += 1;
     }
     return summary;
-}
-
-fn receiptAttemptKey(receipt: NormalizedReceipt) ?[]const u8 {
-    if (!receipt.review_attempt_exists or !receipt.tuple_verdict_exists) return null;
-    return nonEmptyOptional(receipt.review_thread_id);
 }
 
 fn receiptHasCompleteTuple(receipt: NormalizedReceipt) bool {
@@ -13006,18 +12844,17 @@ fn floatField(obj: std.json.ObjectMap, key: []const u8) ?f32 {
 }
 
 const test_workflow_binding_json =
-    \\{"actuationRunId":"run-test","artifactStateFingerprint":"sha256:artifact","reviewContractFingerprint":"sha256:contract","resolutionDigest":"sha256:resolution","selectedLenses":["invariant-ace","standard"],"reviewLane":"standard","lensContract":"standard-review-v1"}
+    \\{"requestId":"request-test","requestFingerprint":"sha256:request"}
+;
+
+const test_legacy_workflow_binding_json =
+    \\{"retiredField":"retained-value"}
 ;
 
 fn testWorkflowBinding() WorkflowBinding {
     return .{
-        .actuationRunId = "run-test",
-        .artifactStateFingerprint = "sha256:artifact",
-        .reviewContractFingerprint = "sha256:contract",
-        .resolutionDigest = "sha256:resolution",
-        .selectedLenses = &.{ "invariant-ace", "standard" },
-        .reviewLane = "standard",
-        .lensContract = "standard-review-v1",
+        .requestId = "request-test",
+        .requestFingerprint = "sha256:request",
     };
 }
 
@@ -13134,22 +12971,30 @@ test "workflow binding input is canonical and action scoped" {
     try std.testing.expectError(error.WorkflowBindingUnsupportedAction, parseArgs(std.testing.allocator, &import_argv));
 }
 
-test "workflow binding input rejects partial blank and noncanonical values" {
+test "workflow binding input accepts only complete opaque request identity" {
     const invalid = [_][]const u8{
-        \\{"actuationRunId":"run-test"}
+        \\{"requestId":"request-test"}
         ,
-        \\{"actuationRunId":"run-test","artifactStateFingerprint":" ","reviewContractFingerprint":"sha256:contract","resolutionDigest":"sha256:resolution","selectedLenses":["standard"],"reviewLane":"standard","lensContract":"standard-review-v1"}
+        \\{"requestId":" ","requestFingerprint":"sha256:request"}
         ,
-        \\{"actuationRunId":"run-test","artifactStateFingerprint":"sha256:artifact","reviewContractFingerprint":"sha256:contract","resolutionDigest":"sha256:resolution","selectedLenses":["standard","invariant-ace"],"reviewLane":"standard","lensContract":"standard-review-v1"}
+        \\{"requestId":"request-test","requestFingerprint":" "}
         ,
-        \\{"actuationRunId":"run-test","artifactStateFingerprint":"sha256:artifact","reviewContractFingerprint":"sha256:contract","resolutionDigest":"sha256:resolution","selectedLenses":["standard","standard"],"reviewLane":"standard","lensContract":"standard-review-v1"}
+        \\{"requestId":"request-test","requestFingerprint":"sha256:request","extra":"forbidden"}
         ,
-        \\{"actuationRunId":"run-test","artifactStateFingerprint":"sha256:artifact","reviewContractFingerprint":"sha256:contract","resolutionDigest":"sha256:resolution","selectedLenses":["standard"],"reviewLane":"standard","lensContract":"standard-review-v1","extra":"forbidden"}
-        ,
+        test_legacy_workflow_binding_json,
     };
     for (invalid) |raw| {
         try std.testing.expectError(error.InvalidWorkflowBinding, loadWorkflowBindingAlloc(std.testing.allocator, raw));
     }
+}
+
+test "legacy workflow binding is historical evidence but not active input" {
+    try std.testing.expectError(error.InvalidWorkflowBinding, loadWorkflowBindingAlloc(std.testing.allocator, test_legacy_workflow_binding_json));
+    var value = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, test_legacy_workflow_binding_json, .{});
+    defer value.deinit();
+    const canonical = try canonicalWorkflowBindingJsonFromValueAlloc(std.testing.allocator, value.value);
+    defer std.testing.allocator.free(canonical);
+    try std.testing.expectEqualStrings(test_legacy_workflow_binding_json, canonical);
 }
 
 test "parseArgs accepts latest status and wait selectors" {
@@ -13267,7 +13112,7 @@ test "session record owns and validates workflow binding across reload" {
     try durable_store.writeTextAtomic(std.testing.allocator, record_path, raw);
     var loaded = try loadOwnedSessionRecordPath(std.testing.allocator, record_path);
     defer loaded.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("run-test", loaded.record.workflowBinding.?.actuationRunId);
+    try std.testing.expectEqualStrings("request-test", loaded.record.workflowBinding.?.requestId);
 
     const normalized = try normalizeReceiptFromJsonAlloc(std.testing.allocator, loaded.record_path, loaded.raw, false, .{});
     defer normalized.deinit(std.testing.allocator);
@@ -13277,8 +13122,8 @@ test "session record owns and validates workflow binding across reload" {
         u8,
         std.testing.allocator,
         raw,
-        "[\"invariant-ace\",\"standard\"]",
-        "[\"standard\",\"invariant-ace\"]",
+        "sha256:request",
+        " ",
     );
     defer std.testing.allocator.free(invalid_raw);
     const invalid_path = try std.fs.path.join(std.testing.allocator, &.{ root, "invalid-record.json" });
@@ -14084,7 +13929,7 @@ test "parseArgs rejects no-wait smoke suites" {
     try std.testing.expectError(error.NoWaitUnsupportedForSmokeSuite, parseArgs(std.testing.allocator, &promotion_argv));
 }
 
-test "smoke suite child preserves custom instructions argument" {
+test "target selector and custom instructions remain independently bound" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "review.txt", .data = "loaded instruction body" });
@@ -14098,19 +13943,59 @@ test "smoke suite child preserves custom instructions argument" {
         "smoke-suite",
         "--cwd",
         "/tmp/repo",
+        "--base",
+        "main",
         "--custom-instructions",
         instruction_arg,
     };
     const parsed = try parseArgs(std.testing.allocator, &argv);
     defer if (parsed.target) |target| if (target.instructions) |instructions| std.testing.allocator.free(instructions);
+    try std.testing.expectEqual(TargetKind.base_branch, parsed.target.?.kind);
+    try std.testing.expectEqualStrings("main", parsed.target.?.branch.?);
     try std.testing.expectEqualStrings("loaded instruction body", parsed.target.?.instructions.?);
 
     var child_argv: std.ArrayList([]const u8) = .empty;
     defer child_argv.deinit(std.testing.allocator);
     try appendTargetCliArgs(std.testing.allocator, &child_argv, parsed);
-    try std.testing.expectEqual(@as(usize, 2), child_argv.items.len);
-    try std.testing.expectEqualStrings("--custom-instructions", child_argv.items[0]);
-    try std.testing.expectEqualStrings(instruction_arg, child_argv.items[1]);
+    try std.testing.expectEqual(@as(usize, 4), child_argv.items.len);
+    try std.testing.expectEqualStrings("--base", child_argv.items[0]);
+    try std.testing.expectEqualStrings("main", child_argv.items[1]);
+    try std.testing.expectEqualStrings("--custom-instructions", child_argv.items[2]);
+    try std.testing.expectEqualStrings("loaded instruction body", child_argv.items[3]);
+
+    const target_json = try buildTargetJson(std.testing.allocator, parsed.target.?);
+    defer std.testing.allocator.free(target_json);
+    var target_value = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, target_json, .{});
+    defer target_value.deinit();
+    try std.testing.expectEqualStrings("custom", target_value.value.object.get("type").?.string);
+    try std.testing.expectEqualStrings("loaded instruction body", target_value.value.object.get("instructions").?.string);
+
+    const target_record = targetToRecord(parsed.target.?);
+    try std.testing.expectEqualStrings("baseBranch", target_record.type);
+    try std.testing.expectEqualStrings("main", target_record.branch.?);
+    try std.testing.expectEqualStrings("loaded instruction body", target_record.instructions.?);
+
+    var native_argv: std.ArrayList([]const u8) = .empty;
+    defer native_argv.deinit(std.testing.allocator);
+    try appendNativeReviewArgs(std.testing.allocator, &native_argv, target_record);
+    try std.testing.expectEqual(@as(usize, 1), native_argv.items.len);
+    try std.testing.expectEqualStrings("loaded instruction body", native_argv.items[0]);
+
+    const reverse_argv = [_][]const u8{
+        "cas_review_session",
+        "run",
+        "--cwd",
+        "/tmp/repo",
+        "--custom-instructions",
+        instruction_arg,
+        "--base",
+        "main",
+    };
+    const reverse = try parseArgs(std.testing.allocator, &reverse_argv);
+    defer if (reverse.target) |target| if (target.instructions) |instructions| std.testing.allocator.free(instructions);
+    try std.testing.expectEqual(TargetKind.base_branch, reverse.target.?.kind);
+    try std.testing.expectEqualStrings("main", reverse.target.?.branch.?);
+    try std.testing.expectEqualStrings("loaded instruction body", reverse.target.?.instructions.?);
 
     const stdin_parsed = ParsedArgs{
         .target = .{ .kind = .custom, .instructions = "loaded stdin body" },
@@ -14630,7 +14515,7 @@ test "CAS-RER binding is source carried validated and identity bearing" {
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bound_json, .{});
     defer parsed.deinit();
     const root = parsed.value.object;
-    try std.testing.expectEqualStrings("run-test", root.get("workflowBinding").?.object.get("actuationRunId").?.string);
+    try std.testing.expectEqualStrings("request-test", root.get("workflowBinding").?.object.get("requestId").?.string);
     const gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "bound-rer.json", root);
     defer gate.deinit(std.testing.allocator);
     try std.testing.expect(gate.ok());
@@ -14639,7 +14524,7 @@ test "CAS-RER binding is source carried validated and identity bearing" {
         u8,
         std.testing.allocator,
         bound_json,
-        ",\"lensContract\":\"standard-review-v1\"",
+        ",\"requestFingerprint\":\"sha256:request\"",
         "",
     );
     defer std.testing.allocator.free(invalid_json);
@@ -14648,6 +14533,16 @@ test "CAS-RER binding is source carried validated and identity bearing" {
     const invalid_gate = try validateCasRerRecordObjectAlloc(std.testing.allocator, "partial-bound-rer.json", invalid_parsed.value.object);
     defer invalid_gate.deinit(std.testing.allocator);
     try std.testing.expect(!invalid_gate.ok());
+
+    var extra = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\{"workflowBinding":{"requestId":"request-test","requestFingerprint":"sha256:request","extra":"not-exact"}}
+    ,
+        .{},
+    );
+    defer extra.deinit();
+    try std.testing.expect(!workflowBindingObjectMatches(extra.value.object, testWorkflowBinding()));
 
     var unbound = bound;
     unbound.workflow_binding_json = null;
@@ -14678,6 +14573,17 @@ test "CAS-RER ledger record projection matches tuple identity" {
     try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/bin/codex", "codex 0.2.0", "acct:test", false, "thread-test"));
     try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/bin/codex", "codex 0.1.0", "acct:other", false, "thread-test"));
     try std.testing.expect(!casRerObjectMatchesIdentity(parsed.value.object, "/tmp/repo", identity, "/bin/codex", "codex 0.1.0", "acct:test", false, "thread-other"));
+    const non_proof_raw = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        raw,
+        "\"proofUsable\":true",
+        "\"proofUsable\":false",
+    );
+    defer std.testing.allocator.free(non_proof_raw);
+    var non_proof = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, non_proof_raw, .{});
+    defer non_proof.deinit();
+    try std.testing.expect(casRerObjectMatchesIdentity(non_proof.value.object, "/tmp/repo", identity, "/bin/codex", "codex 0.1.0", "acct:test", false, "thread-test"));
     const legacy_without_thread_raw =
         \\{"schema":"CAS-RER-v1","recordId":"rer_match","createdAt":"2026-07-02T00:00:00Z","updatedAt":"2026-07-02T00:00:00Z","command":{"surface":"import","backendSelected":"imported-legacy","brokerDecision":{"action":"imported_legacy","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","resolvedCodexPath":"/bin/codex","resolvedCodexVersion":"codex 0.1.0","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:a","phase":"normalized_verdict","reviewThreadId":"thr","reviewTurnId":"turn"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-lane"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":true,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
     ;
@@ -14693,11 +14599,10 @@ test "CAS-RER ledger record projection matches tuple identity" {
 
     var record = try casRerLedgerRecordFromJsonAlloc(std.testing.allocator, "/tmp/rer_match.json", raw);
     defer record.deinit(std.testing.allocator);
-    record.proof_credit_eligible = true;
+    record.context_identity_matches = true;
     try std.testing.expectEqualStrings("rer_match", record.record_id);
     try std.testing.expectEqualStrings("clean", record.status);
     try std.testing.expect(record.tuple_verdict_exists);
-    try std.testing.expectEqualStrings("none", actionRequiredForCasRerRecord(record));
 
     const reduced_raw =
         \\{"schema":"CAS-RER-v1","recordId":"rer_reduced","createdAt":"2026-07-02T00:00:01Z","updatedAt":"2026-07-02T00:00:01Z","command":{"surface":"import","backendSelected":"imported-legacy","brokerDecision":{"action":"imported_legacy","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:b","phase":"normalized_verdict","reviewThreadId":"thr_reduced","reviewTurnId":"turn_reduced"},"verdict":{"tupleVerdictExists":true,"status":"clean","clean":true,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":null},"principal":{"kind":"reduced","proofUsable":false,"reduced":true,"fallbackUsed":false,"source":"cas-lane"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":true,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
@@ -14706,7 +14611,6 @@ test "CAS-RER ledger record projection matches tuple identity" {
     defer reduced_record.deinit(std.testing.allocator);
     try std.testing.expect(reduced_record.tuple_verdict_exists);
     try std.testing.expect(!reduced_record.principal_proof_usable);
-    try std.testing.expectEqualStrings("run_new_attempt", actionRequiredForCasRerRecord(reduced_record));
     const ranked_records = [_]CasRerLedgerRecord{ reduced_record, record };
     try std.testing.expectEqual(@as(?usize, 0), latestCasRerLedgerRecordIndex(&ranked_records));
 
@@ -14733,7 +14637,6 @@ test "CAS-RER ledger record projection matches tuple identity" {
     defer fresh_waiting_record.deinit(std.testing.allocator);
     const fresh_records = [_]CasRerLedgerRecord{ record, fresh_waiting_record };
     try std.testing.expectEqual(@as(?usize, 1), latestCasRerLedgerRecordIndex(&fresh_records));
-    try std.testing.expectEqualStrings("wait", actionRequiredForCasRerRecord(fresh_waiting_record));
 
     const timeout_raw =
         \\{"schema":"CAS-RER-v1","recordId":"rer_timeout","createdAt":"2026-07-02T00:00:02Z","updatedAt":"2026-07-02T00:00:02Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:c","phase":"review_waiting","reviewThreadId":"thr_timeout","reviewTurnId":"turn_timeout"},"verdict":{"tupleVerdictExists":false,"status":"timeout","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":"wait_timed_out","failureClass":"timeout","retryableSameTupleNow":true},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-start-wait"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
@@ -14742,7 +14645,6 @@ test "CAS-RER ledger record projection matches tuple identity" {
     defer timeout_record.deinit(std.testing.allocator);
     try std.testing.expect(timeout_record.attempt_exists);
     try std.testing.expect(!timeout_record.tuple_verdict_exists);
-    try std.testing.expectEqualStrings("inspect", actionRequiredForCasRerRecord(timeout_record));
 
     const active_incomplete_raw =
         \\{"schema":"CAS-RER-v1","recordId":"rer_active","createdAt":"2026-07-02T00:00:03Z","updatedAt":"2026-07-02T00:00:03Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"blocked_live","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:d","phase":"review_waiting","reviewThreadId":"thr_active","reviewTurnId":"turn_active"},"verdict":{"tupleVerdictExists":false,"status":"incomplete","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":null,"failureClass":null,"retryableSameTupleNow":true},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-run"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
@@ -14751,14 +14653,12 @@ test "CAS-RER ledger record projection matches tuple identity" {
     defer active_record.deinit(std.testing.allocator);
     try std.testing.expect(active_record.attempt_exists);
     try std.testing.expect(!active_record.tuple_verdict_exists);
-    try std.testing.expectEqualStrings("wait", actionRequiredForCasRerRecord(active_record));
 
     const stale_lock_raw =
         \\{"schema":"CAS-RER-v1","recordId":"rer_stale_lock","createdAt":"2026-07-02T00:00:03Z","updatedAt":"2026-07-02T00:00:03Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"blocked_live","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:d","phase":"review_waiting","reviewThreadId":"thr_stale","reviewTurnId":"turn_stale"},"verdict":{"tupleVerdictExists":false,"status":"incomplete","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":"review_tuple_lock_stale","failureClass":"coordination","retryableSameTupleNow":false},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-run"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
     ;
     const stale_lock_record = try casRerLedgerRecordFromJsonAlloc(std.testing.allocator, "/tmp/rer_stale_lock.json", stale_lock_raw);
     defer stale_lock_record.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("inspect", actionRequiredForCasRerRecord(stale_lock_record));
 
     const active_transport_raw =
         \\{"schema":"CAS-RER-v1","recordId":"rer_active_transport","createdAt":"2026-07-02T00:00:04Z","updatedAt":"2026-07-02T00:00:04Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:e","phase":"review_waiting","reviewThreadId":"thr_transport","reviewTurnId":"turn_transport"},"verdict":{"tupleVerdictExists":false,"status":"transport_failure","clean":false,"findingCount":0,"findings":[]},"failure":{"failureCode":"review_transport_lost","failureClass":"transport","retryableSameTupleNow":true},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-start-wait"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
@@ -14766,7 +14666,6 @@ test "CAS-RER ledger record projection matches tuple identity" {
     const active_transport_record = try casRerLedgerRecordFromJsonAlloc(std.testing.allocator, "/tmp/rer_active_transport.json", active_transport_raw);
     defer active_transport_record.deinit(std.testing.allocator);
     try std.testing.expect(active_transport_record.attempt_exists);
-    try std.testing.expectEqualStrings("wait", actionRequiredForCasRerRecord(active_transport_record));
 
     const terminal_incomplete_raw =
         \\{"schema":"CAS-RER-v1","recordId":"rer_terminal_incomplete","createdAt":"2026-07-02T00:00:05Z","updatedAt":"2026-07-02T00:00:05Z","command":{"surface":"run","backendSelected":"cas-run","brokerDecision":{"action":"created_new","reason":"test","freshAttemptRequired":false}},"tuple":{"repoRealpath":"/tmp/repo","baseSha":"base","headSha":"head","targetFingerprint":"fp","tupleCurrentAtRecordTime":true},"attempt":{"exists":true,"attemptId":"sha256:f","phase":"review_terminal","reviewThreadId":"thr_terminal","reviewTurnId":"turn_terminal"},"verdict":{"tupleVerdictExists":false,"status":"incomplete","clean":false,"findingCount":1,"findings":[{"title":"tuple mismatch"}]},"failure":{"failureCode":"tuple_mismatch","failureClass":"caller_error","retryableSameTupleNow":null},"principal":{"kind":"strong","accountFingerprint":"acct:test","proofUsable":true,"reduced":false,"fallbackUsed":false,"source":"cas-start-wait"},"attachments":{"rawReceipt":"/tmp/receipt.json"},"legacy":{"importedFromReceipt":false,"sourcePath":"/tmp/receipt.json","normalizationWarnings":[]}}
@@ -14775,7 +14674,6 @@ test "CAS-RER ledger record projection matches tuple identity" {
     defer terminal_incomplete_record.deinit(std.testing.allocator);
     try std.testing.expect(terminal_incomplete_record.attempt_exists);
     try std.testing.expect(!terminal_incomplete_record.tuple_verdict_exists);
-    try std.testing.expectEqualStrings("inspect", actionRequiredForCasRerRecord(terminal_incomplete_record));
 }
 
 test "CAS current and list envelopes include ledger record paths" {
@@ -14794,10 +14692,10 @@ test "CAS current and list envelopes include ledger record paths" {
     var current_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, current_json, .{});
     defer current_parsed.deinit();
     const current = current_parsed.value.object;
-    try std.testing.expectEqualStrings("CAS-CURRENT-v1", current.get("schema").?.string);
+    try std.testing.expectEqualStrings("CAS-CURRENT-v2", current.get("schema").?.string);
     try std.testing.expectEqualStrings("/tmp/rer_path.json", current.get("recordPath").?.string);
-    try std.testing.expectEqualStrings("review_findings", current.get("actionRequired").?.string);
-    try std.testing.expect(!current.get("proofCreditEligible").?.bool);
+    try std.testing.expect(current.get("actionRequired") == null);
+    try std.testing.expect(!current.get("contextIdentityMatches").?.bool);
     try std.testing.expectEqualStrings("rer_path", current.get("record").?.object.get("recordId").?.string);
 
     var list_out = std.Io.Writer.Allocating.init(std.testing.allocator);
@@ -14808,16 +14706,16 @@ test "CAS current and list envelopes include ledger record paths" {
     var list_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, list_json, .{});
     defer list_parsed.deinit();
     const list = list_parsed.value.object;
-    try std.testing.expectEqualStrings("CAS-LIST-v1", list.get("schema").?.string);
+    try std.testing.expectEqualStrings("CAS-LIST-v2", list.get("schema").?.string);
     try std.testing.expectEqual(@as(usize, 1), list.get("records").?.array.items.len);
     try std.testing.expectEqualStrings("rer_path", list.get("records").?.array.items[0].object.get("recordId").?.string);
     const ref = list.get("recordRefs").?.array.items[0].object;
     try std.testing.expectEqualStrings("rer_path", ref.get("recordId").?.string);
     try std.testing.expectEqualStrings("/tmp/rer_path.json", ref.get("recordPath").?.string);
-    try std.testing.expect(!ref.get("proofCreditEligible").?.bool);
+    try std.testing.expect(!ref.get("contextIdentityMatches").?.bool);
 }
 
-test "CAS list retains drifted findings while withholding proof credit" {
+test "CAS list retains drifted findings while reporting context mismatch" {
     const old_store_root = configured_store_root_override;
     defer configured_store_root_override = old_store_root;
     var tmp = std.testing.tmpDir(.{});
@@ -14858,7 +14756,7 @@ test "CAS list retains drifted findings while withholding proof credit" {
     );
     try std.testing.expectEqual(@as(usize, 1), drifted.items.len);
     try std.testing.expectEqualStrings("findings", drifted.items[0].status);
-    try std.testing.expect(!drifted.items[0].proof_credit_eligible);
+    try std.testing.expect(!drifted.items[0].context_identity_matches);
 
     var exact: std.ArrayList(CasRerLedgerRecord) = .empty;
     defer {
@@ -14878,7 +14776,7 @@ test "CAS list retains drifted findings while withholding proof credit" {
         null,
     );
     try std.testing.expectEqual(@as(usize, 1), exact.items.len);
-    try std.testing.expect(exact.items[0].proof_credit_eligible);
+    try std.testing.expect(exact.items[0].context_identity_matches);
 
     var foreign_epoch: std.ArrayList(CasRerLedgerRecord) = .empty;
     defer foreign_epoch.deinit(std.testing.allocator);
@@ -17148,7 +17046,7 @@ test "review tuple hash is stable and account-bound" {
     try std.testing.expect(!std.mem.eql(u8, hash_a, bound_hash));
 
     var other_binding = testWorkflowBinding();
-    other_binding.resolutionDigest = "sha256:other-resolution";
+    other_binding.requestFingerprint = "sha256:other-request";
     const other_json = try stringifyAnyAlloc(std.testing.allocator, other_binding);
     defer std.testing.allocator.free(other_json);
     const other_digest = try sha256HexAlloc(std.testing.allocator, other_json);
@@ -17381,7 +17279,7 @@ test "review tuple lock exclusive write rejects duplicate first claim" {
     try std.testing.expectError(error.PathAlreadyExists, writeReviewTupleLockExclusive(std.testing.allocator, path, lock));
 }
 
-test "third clean receipt records clean-streak reset and clears reusable lock" {
+test "terminal clean receipt preserves transport lock" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const allocator = std.testing.allocator;
@@ -17451,25 +17349,16 @@ test "third clean receipt records clean-streak reset and clears reusable lock" {
         .updatedAtUnixS = 1,
         .expiresAtUnixS = 999,
         .ownerPid = 1,
-        .cleanStreakCount = 2,
-        .lastCleanReceiptRecordPath = "/previous-clean.json",
     };
     try writeReviewTupleLock(allocator, lock_path, lock);
     try std.testing.expect(durable_store.fileExists(lock_path));
 
     updateReviewTupleLockBestEffort(allocator, lock_path, lock, "terminal", null, "thr_clean", "turn_clean", record_path, event_path);
-    try std.testing.expect(!durable_store.fileExists(lock_path));
-
-    const reset_dir_path = try std.fmt.allocPrint(allocator, "{s}/state/clean_streak_resets", .{tmp_root});
-    defer allocator.free(reset_dir_path);
-    var reset_dir = try std.Io.Dir.openDirAbsolute(std.Io.Threaded.global_single_threaded.io(), reset_dir_path, .{ .iterate = true });
-    defer reset_dir.close(std.Io.Threaded.global_single_threaded.io());
-    var iter = reset_dir.iterate();
-    var reset_count: usize = 0;
-    while (try iter.next(std.Io.Threaded.global_single_threaded.io())) |entry| {
-        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".json")) reset_count += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 1), reset_count);
+    try std.testing.expect(durable_store.fileExists(lock_path));
+    var updated = (try loadReviewTupleLock(allocator, lock_path)).?;
+    defer updated.deinit(allocator);
+    try std.testing.expectEqualStrings("terminal", updated.record.state);
+    try std.testing.expectEqualStrings(record_path, updated.record.recordPath.?);
 }
 
 test "review tuple lock rewrite claim is exclusive" {

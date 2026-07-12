@@ -12,7 +12,10 @@ const HelpSurface = core_cli.HelpSurface{
 
 const CapabilitiesText =
     \\session_inquiry_v1=true
-    \\cas_rer_workflow_binding_v1=true
+    \\cas_rer_workflow_binding_v1=false
+    \\cas_rer_opaque_request_binding_v1=true
+    \\cas_review_history_v2=true
+    \\cas_review_scoped_instructions_v1=true
 ;
 
 const CapabilitiesJson =
@@ -27,7 +30,10 @@ const CapabilitiesJson =
     \\      "ephemeral_fork": true,
     \\      "read_only_inquiry": true,
     \\      "detached_inquiry": true,
-    \\      "cas_rer_workflow_binding_v1": true
+    \\      "cas_rer_workflow_binding_v1": false,
+    \\      "cas_rer_opaque_request_binding_v1": true,
+    \\      "cas_review_history_v2": true,
+    \\      "cas_review_scoped_instructions_v1": true
     \\    }
     \\  }
     \\}
@@ -270,18 +276,27 @@ test "resolveTarget supports supported subcommands" {
     try std.testing.expect(resolveTarget("unknown") == null);
 }
 
-test "capabilities advertise CAS-RER workflow binding in text and JSON" {
+test "capabilities advertise opaque request binding and retire semantic workflow binding" {
     var text_output = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer text_output.deinit();
     try writeCapabilities(&text_output.writer, false);
-    try std.testing.expect(std.mem.indexOf(u8, text_output.written(), "cas_rer_workflow_binding_v1=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_output.written(), "cas_rer_workflow_binding_v1=false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_output.written(), "cas_rer_opaque_request_binding_v1=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_output.written(), "cas_review_history_v2=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text_output.written(), "cas_review_scoped_instructions_v1=true") != null);
 
     var json_output = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer json_output.deinit();
     try writeCapabilities(&json_output.writer, true);
-    try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_rer_workflow_binding_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_rer_workflow_binding_v1\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_rer_opaque_request_binding_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_review_history_v2\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_output.written(), "\"cas_review_scoped_instructions_v1\": true") != null);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_output.written(), .{});
     defer parsed.deinit();
     const features = parsed.value.object.get("cas_capabilities").?.object.get("features").?.object;
-    try std.testing.expect(features.get("cas_rer_workflow_binding_v1").?.bool);
+    try std.testing.expect(!features.get("cas_rer_workflow_binding_v1").?.bool);
+    try std.testing.expect(features.get("cas_rer_opaque_request_binding_v1").?.bool);
+    try std.testing.expect(features.get("cas_review_history_v2").?.bool);
+    try std.testing.expect(features.get("cas_review_scoped_instructions_v1").?.bool);
 }

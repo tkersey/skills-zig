@@ -38,16 +38,17 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - `cas_review_session` now starts detached `review/start` turns over a CAS-managed loopback websocket app-server, persists the detached `reviewThreadId` as the recoverable handle, appends raw request/response artifacts to an NDJSON log, and stores websocket session metadata beside the review-session record so fresh-process `status`, `wait`, and `interrupt` can reconnect to the same detached review transport.
 - `cas review_session run` is the brokered one-review path. It waits by default, returns `reviewVerdict`, reports `reviewBrokerDecision`, normalizes terminal same-tuple evidence, and auto-replaces an active same-tuple attempt only when prior transport loss plus dead owner/server liveness is proven.
 - Review wait defaults are action-aware: `run`, `start --wait`, `wait`, and `lane review` use `1800000` ms; lane smoke/suites and control paths use `300000` ms. An explicit positive `--timeout-ms` value always wins.
-- `cas review_session run`, `start`, and `lane review` accept an optional atomic `--workflow-binding-json JSON|@FILE`. The binding carries `actuationRunId`, `artifactStateFingerprint`, `reviewContractFingerprint`, `resolutionDigest`, canonical `selectedLenses`, `reviewLane`, and `lensContract`. When present, it participates in review-lock and CAS-RER identity without granting workflow authority.
+- `cas review_session run`, `start`, and `lane review` accept an optional atomic `--workflow-binding-json JSON|@FILE`. For new runs the binding contains only caller-owned `requestId` and `requestFingerprint` strings. CAS validates both as non-empty, binds the object to review-lock and CAS-RER identity, and returns it unchanged.
+- `--custom-instructions` may accompany `--base`, `--commit`, or `--uncommitted`. CAS sends the exact supplied prompt as the native custom review target while retaining the selector for base/head/fingerprint identity and recovery.
 - `cas review_session current` and `list` return the complete valid history for the exact native repo/base/head/target-fingerprint and Codex-thread scope when no workflow binding is supplied. Passing `--workflow-binding-json` selects one exact binding. Account identity and resolved Codex path/version do not hide historical records.
-- `CAS-CURRENT-v1` and `CAS-LIST-v1` report context-derived `proofCreditEligible` separately from immutable `CAS-RER-v1 principal.proofUsable`. A drifted principal or runtime can make a record ineligible for current proof credit without erasing findings or other historical evidence.
-- `CAS-RER-v1 workflowBinding` remains optional for compatibility. Import preserves a binding already present in source evidence and never attaches or relabels one on legacy evidence.
+- `CAS-CURRENT-v2` and `CAS-LIST-v2` report `contextIdentityMatches` separately from immutable `CAS-RER-v1 principal.proofUsable`. The current flag compares runtime, principal, thread, tuple, and optional opaque binding without hiding historical records when those facts drift.
+- `CAS-RER-v1 workflowBinding` remains optional. Import preserves pre-0.2.75 non-empty binding objects as historical compatibility evidence; new review runs require the two-field opaque shape. CAS never attaches, relabels, or interprets an imported binding.
 - `cas review_session start` supports `--parent-mode auto|fresh|reuse`. `reuse` rejects unsafe parent threads. On Codex `0.118.x`, `auto` pre-materializes a fresh parent thread before detached `review/start`; `fresh` still forces the literal fresh-parent attempt and only retries after bootstrap materialization if the runtime rejects it.
 - `cas review_session status --latest --json` and `cas review_session wait --latest --json` select the newest persisted review-session record, so callers can inspect tuple binding and current status without manually listing `~/.codex/cas/review_sessions/*.json`.
 - `cas review_session` now forwards the native approval/runtime overrides already supported by the CAS Zig client: `--exec-approval`, `--file-approval`, `--permissions-approval`, `--request-user-input-response-json`, `--elicitation-action`, `--elicitation-content-json`, `--dynamic-tool-response-json`, and `--read-only`.
 - `cas review_session start` and `cas review_session lane review` accept `--multi-agent-mode explicit-request-only|proactive` for the fresh parent `thread/start` and bootstrap `turn/start` request flow. Reused parent threads are reported as unproven because CAS cannot prove it changed inherited parent execution context.
 - JSON review-session output now includes `resolvedCodexPath`, `resolvedCodexVersion`, `compatibilityVerdict`, `selectedTransport`, `selectionReason`, `degradedFallback`, `managedServerPid`, `managedServerListenUrl`, `orphanTtlSeconds`, `requestedMultiAgentMode`, `effectiveMultiAgentMode`, `multiAgentModeSupport`, `multiAgentModeMetricEligible`, `failureCode`, `failureHint`, plus optional `fallback*` fields when `--fallback native-review` is used.
-- `cas review_session lane smoke` starts a current persistent lane and verifies that the target tuple can create a first detached review attempt. Callers that require multiple independent reviews must count those review attempts outside CAS.
+- `cas review_session lane smoke` starts a current persistent lane and verifies that the target tuple can create a first detached review attempt.
 - `cas review_session lane review` includes a compact `reviewVerdict` object for caller control flow. The full receipt remains the audit artifact. Pass `--verdict-only` to emit only `reviewVerdict` while preserving the same exit semantics.
 - `cas review_session run`, `cas review_session start`, and `cas review_session lane review` accept `--fresh-attempt REASON` to start a new same-tuple review after a terminal or normalized receipt. This never bypasses live active review locks or account/resource exhaustion locks.
 - `cas review_session receipt classify`, `cas review_session receipt gate`, and `cas review_session lock gate` provide the native Zig validator/classifier helpers for `$cas` skill fixtures and review receipts. These replace the old skill-local Python helper scripts.
@@ -58,7 +59,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - Thread-backed DCPs use `thread_fork` lineage with app-server `thread/fork` plus rollback anchoring. Rollout-backed DCPs with `source.thread_id = null` use `rollout_transcript` lineage: CAS verifies the DCP source and retained-anchor digests from `source.rollout_path`, requires `workspace_policy = transcript_only`, starts a fresh inquiry thread, and sends one bounded transcript-context `turn/start`. Rollout transcript replay is not live workspace reconstruction.
 - SIR/FIR receipts report `lineage_mode`, `source_thread_id_present`, `source_rollout_path`, and `source_artifact_reconstructability`. Rollout transcript receipts set `workspace_reconstruction.mode = transcript_only`.
 - `cas session_inquiry preflight --json` generates or reuses the Codex app-server schema cache under `~/.cache/cas/app-server-schema/<codex-version>/`, fingerprints it, and reports both `thread_fork_replay` and `rollout_transcript_replay` support.
-- `cas capabilities --json` includes compiled feature flags for `session_inquiry_v1`, `dcp_v1`, `rip_v1`, `fir_v1`, exact fork/rollback anchoring, ephemeral forks, read-only inquiry, detached inquiry, and `cas_rer_workflow_binding_v1`.
+- `cas capabilities --json` includes compiled feature flags for `session_inquiry_v1`, `dcp_v1`, `rip_v1`, `fir_v1`, exact fork/rollback anchoring, ephemeral forks, read-only inquiry, detached inquiry, `cas_rer_opaque_request_binding_v1`, `cas_review_history_v2`, and `cas_review_scoped_instructions_v1`.
 
 ## API Examples
 
@@ -116,10 +117,11 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
   --timeout-ms 1800000 \
   --json
 
-# Bind a review atomically to a caller-owned workflow epoch.
+# Bind a review atomically to an opaque caller-owned request identity.
 ./zig-out/bin/cas review_session run \
   --cwd /path/to/workspace \
   --base main \
+  --custom-instructions @review-prompt.txt \
   --workflow-binding-json @workflow-binding.json \
   --timeout-ms 1800000 \
   --json
@@ -128,11 +130,13 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 ./zig-out/bin/cas review_session list \
   --cwd /path/to/workspace \
   --base main \
+  --custom-instructions @review-prompt.txt \
   --codex-thread-id thr_workflow \
   --json
 ./zig-out/bin/cas review_session list \
   --cwd /path/to/workspace \
   --base main \
+  --custom-instructions @review-prompt.txt \
   --codex-thread-id thr_workflow \
   --workflow-binding-json @workflow-binding.json \
   --json
