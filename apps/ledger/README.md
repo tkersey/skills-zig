@@ -7,7 +7,7 @@ It also owns causal actuation under `--source actuation`, replay-campaign eviden
 `ledger validate` checks immutable governance and review artifacts without reading or writing
 any ledger store and without granting execution authority.
 
-The negative ledger, actuation, learning, and Synesthesia sources share one
+The negative ledger, actuation, learning, Synesthesia, and Hylo sources share one
 storage contract: ordered snapshots, opaque revisions, compare-and-append,
 atomic replacement, exclusive effectful-transition sessions, and logical store
 identity. The current persistent adapter is JSONL, so existing commands, paths,
@@ -33,7 +33,7 @@ Current actuation-source adapter path:
 .ledger/actuation/events.jsonl
 ```
 
-Hylo source store:
+Current Hylo adapter path:
 
 ```bash
 .ledger/hylo/events.jsonl
@@ -60,10 +60,10 @@ The actuation store lock sidecar must be Git-ignored before `open`; ignoring
 ledger init
 ledger capture --json capture.json
 ledger query
-ledger map --route review-route --cluster same-cluster --artifact HEAD
+ledger map --route review-route --cluster same-cluster --artifact "$(git rev-parse HEAD)"
 ledger show --id NEG-000001
-ledger status --id NEG-000001 --to stale --reason "artifact state changed"
-ledger reopen --id NEG-000001
+ledger status --id NEG-000001 --to stale --json transition.json
+ledger reopen --id NEG-000001 --json reopen-proof.json
 ledger export --id NEG-000001 --format full
 ledger export --id NEG-000001 --format memory-note
 ledger handoff
@@ -182,7 +182,8 @@ store that resolved SHA rather than the moving name. Comparable attempts in a
 commit-authorized campaign embed the receipt's revision, snapshot, and
 fingerprint.
 
-Only `append` mutates `.ledger/hylo/events.jsonl`:
+Only `append` mutates the logical Hylo event store; the current JSONL adapter
+retains the default path above:
 
 ```bash
 ledger --source hylo append --repo /path/to/repo --json event-intent.json
@@ -390,17 +391,38 @@ This converts legacy rows from `.ledger/learnings/learnings.jsonl` or `.learning
 
 ```json
 {
-  "hypothesis": "route fails under current artifact",
+  "record_version": "NER-v2",
+  "kind": "realization_route",
   "route_id": "review-route",
   "cluster_id": "same-cluster",
   "artifact_state_id": "HEAD",
+  "artifact_state_label": "HEAD",
+  "hypothesis": "The route fails under the current artifact.",
+  "attempted_change": "Implemented the review-route repair.",
+  "observed_outcome": "The representative contract test still fails.",
+  "failure_class": "no-effect",
   "source_refs": [
     { "kind": "test", "ref": "zig build test-ledger --summary all" }
-  ]
+  ],
+  "falsifying_evidence": ["The representative contract test still fails."],
+  "exclusion_scope": "route",
+  "exclusion_rule": "Do not retry review-route while this artifact and proof surface apply.",
+  "applicability_conditions": ["The current implementation and contract fixture are unchanged."],
+  "reopening_criteria": [
+    {
+      "id": "artifact-or-fixture-changed",
+      "condition": "The implementation or representative fixture changes."
+    }
+  ],
+  "confidence": "high",
+  "next_search_hint": "Inspect the adjacent owner boundary.",
+  "applicable_paths": ["apps/ledger"]
 }
 ```
 
-Records get monotonic `NEG-*` ids. A capture that requests `active` without witness evidence is stored as `need-evidence`, not as an active exclusion.
+Records get monotonic `NEG-*` ids. Git labels such as `HEAD` are resolved to a full commit ID before persistence while the original text remains in `artifact_state_label`. An unresolved, empty, or otherwise mutable artifact identity cannot become active. The CLI derives `repository_id` from the Git remote when the capture omits it.
+
+One status-aware NER-v2 validator governs capture, replay/doctor, map, handoff, and export. An incomplete capture that requests or defaults to `active` is stored as `need-evidence`. Malformed typed fields, witness references, applicability arrays, or reopening criteria are rejected before append.
 
 For learning capture, use `--source learnings` with the learning flags:
 
@@ -415,19 +437,15 @@ ledger capture --source learnings \
 
 Use `--record-source SOURCE` to override the source marker stored inside the learning row.
 
-Active exclusions are route-scoped by default. Same-cluster recurrence is reusable memory, not an automatic ban.
+Active exclusions require an explicit supported scope. Same-cluster recurrence is reusable memory, not an automatic ban.
 
-To block a whole cluster, the capture must explicitly use `exclusion_scope:"cluster"` and include a non-empty `exclusion_rule`:
+To block a whole cluster, use the complete active record above but replace its route identity with an explicit cluster identity:
 
 ```json
 {
-  "hypothesis": "cluster route family is falsified",
   "cluster_id": "same-cluster",
   "exclusion_scope": "cluster",
-  "exclusion_rule": "do not repeat this route family until reopened",
-  "source_refs": [
-    { "kind": "cas-review", "ref": "RGR-v2 wave 3" }
-  ]
+  "exclusion_rule": "Do not repeat this cluster while the recorded applicability conditions hold."
 }
 ```
 
@@ -435,9 +453,11 @@ To block a whole cluster, the capture must explicitly use `exclusion_scope:"clus
 
 `map` emits a machine-readable `negative_route_gate` object.
 
-- Exact route matches can block when active, witnessed, and artifact-applicable.
-- Exact cluster matches can block only when the record is explicitly cluster-scoped with an `exclusion_rule`.
+- Every advertised scope has a native exact matcher: `exact`, `route`, `route_family`, `cluster`, `authority_model`, `distinction_pattern`, and `proof_pattern`.
+- Supply the corresponding selector with `--route`, `--route-family`, `--cluster`, `--authority-model`, `--distinction-pattern`, or `--proof-pattern`.
+- An active record blocks only when its declared scope identity and immutable artifact identity both match.
 - Fuzzy lexical matches are advisory only.
+- A matching `reopened` record is reported as `reopen_required` rather than disappearing from the gate.
 - A missing store fails closed with exit code `3` and `failure:"ledger_missing"`.
 - Invalid gate input or invalid store content fails closed with exit code `3`.
 - An active exact exclusion exits `2`.
@@ -454,13 +474,17 @@ Example shape:
     "query_or_map": "yes",
     "ledger_cli": "ledger",
     "store": ".ledger/negative-ledger/events.jsonl",
-    "command": "ledger map --route review-route --cluster same-cluster --artifact HEAD",
+    "command": "ledger map --route review-route --cluster same-cluster --artifact 0123456789abcdef0123456789abcdef01234567",
     "exit_code": 0,
     "ledger_available": true,
     "active_exclusion_match": false,
     "exclusion_id": "none",
+    "reopen_required": false,
+    "reopen_evidence_id": "none",
     "fuzzy_candidates": 0,
     "fuzzy_authority": "suggest_only",
+    "artifact_state_id": "0123456789abcdef0123456789abcdef01234567",
+    "artifact_state_label": "0123456789abcdef0123456789abcdef01234567",
     "failure": "none",
     "handoff_allowed": true
   }
@@ -471,16 +495,48 @@ Example shape:
 
 ## Lifecycle and memory projection
 
-`status` appends lifecycle events without rewriting historical captures:
+`status` and `reopen` append typed lifecycle events without rewriting historical captures. Every transition requires a JSON proof packet with a reason and structured source references:
+
+```json
+{
+  "reason": "The prior evidence was accepted as a bounded risk.",
+  "source_refs": [
+    { "kind": "review", "ref": "PR 123 acceptance" }
+  ]
+}
+```
 
 ```bash
 ledger status \
   --id NEG-000001 \
-  --to reopened \
-  --reason "The old benchmark fixture was replaced."
+  --to accepted_risk \
+  --json transition.json
 ```
 
-Supported projected statuses are `capture_candidate`, `need-evidence`, `unknown`, `active`, `accepted_risk`, `stale`, `reopened`, and `superseded`. Only `active` records can block route selection.
+A reopen packet must prove an actual before/after change for at least one recorded criterion:
+
+```json
+{
+  "reason": "The implementation and representative fixture changed.",
+  "criterion_changes": [
+    {
+      "criterion_id": "artifact-or-fixture-changed",
+      "before": "commit abc123 with fixture v1",
+      "after": "commit def456 with fixture v2"
+    }
+  ],
+  "source_refs": [
+    { "kind": "git", "ref": "commit:def456" },
+    { "kind": "test", "ref": "zig build test-ledger --summary all" }
+  ]
+}
+```
+
+```bash
+ledger reopen --id NEG-000001 --json reopen-proof.json
+```
+
+Ledger rejects illegal status edges, mismatched `from` state, proofless promotion, and reopen packets whose criterion is absent or unchanged before append. New transition events carry an event ID, timestamp, `from`, `to`, reason, criterion IDs and changes, and source references. Supported projected statuses are `capture_candidate`, `need-evidence`, `unknown`, `active`, `accepted_risk`, `stale`, `reopened`, and `superseded`. Only `active` records block; `reopened` records remain visible as retry proof obligations.
 
 Use `export` for complete current projections:
 
@@ -490,4 +546,6 @@ ledger export --id NEG-000001 --format memory-note |
   memory-note append --extension negative-ledger --kind ledger-projection --json -
 ```
 
-`show` remains concise and now includes `source_event_count` and `projection_fingerprint`; memory admission should use `export --format memory-note`.
+`export` and `handoff` fail closed when the store or selected projection is semantically invalid. Repo-scoped memory projections include a stable repository identity and applicable paths, so identical `NEG-*` IDs from different repositories remain distinct.
+
+`show` remains concise. Full projections expose separate `capture_event_count`, `status_event_count`, and `source_event_count`, the event-chain fingerprint, the current projection fingerprint, and the prior projection fingerprint when a lifecycle transition created a linked projection. Transport-only export timestamps do not affect projection identity. Re-exporting unchanged memory-note output is byte-stable; a meaningful lifecycle transition produces a new projection linked to the prior fingerprint.
