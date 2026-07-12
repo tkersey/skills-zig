@@ -1,10 +1,10 @@
 # ledger
 
-Repo-local durable source, actuation, and plan ledger with pure governance-artifact validation.
+Repo-local durable source, actuation, replay, and plan ledger with pure validation of governance and review artifacts.
 
 `ledger` stores disconfirmed hypotheses, failed routes, reopening criteria, and route-exclusion evidence in an append-only JSONL file that future runs can query directly.
-It also owns causal actuation under `--source actuation` and learning capture under `--source learnings`.
-`ledger validate` checks immutable governance artifacts without reading or writing
+It also owns causal actuation under `--source actuation`, replay-campaign evidence under `--source hylo`, and learning capture under `--source learnings`.
+`ledger validate` checks immutable governance and review artifacts without reading or writing
 any ledger store and without granting execution authority.
 
 Default store:
@@ -23,6 +23,12 @@ Actuation source store:
 
 ```bash
 .ledger/actuation/events.jsonl
+```
+
+Hylo source store:
+
+```bash
+.ledger/hylo/events.jsonl
 ```
 
 Universalist plan artifacts:
@@ -64,6 +70,12 @@ ledger open --source actuation --json actuation-open.json
 ledger prepare --source actuation --run RUN-ID --json operation.json
 ledger state --source actuation --run RUN-ID
 ledger decide --source actuation --run RUN-ID
+ledger --source hylo validate-campaign --campaign campaign.json
+ledger --source hylo fingerprint --input artifact.json
+ledger --source hylo append --repo . --json event-intent.json
+ledger --source hylo doctor --repo .
+ledger --source hylo progress --repo . --campaign-id cmp-example --format markdown
+ledger --source hylo path --repo .
 ledger create --source universalist --template universalist-plan.md
 ledger latest --source universalist
 ledger latest --source universalist --format path
@@ -71,6 +83,8 @@ ledger path --source universalist --id 20260711T164436123456789Z-0000
 ledger validate plan-source-contract --input plan-source-contract.json
 ledger validate policy-synthesis-receipt --input synthesis-receipt.json
 ledger validate review-fold --input review-fold.json
+ledger validate actuation-review-policy --phase preflight --input review-policy.json
+ledger validate review-resolution --phase preflight --input review-resolution.json
 ```
 
 Use `--file PATH` to point at a non-default store.
@@ -116,6 +130,77 @@ ledger path --source universalist \
 own returned plan id and verify a recovered plan's task metadata before
 resuming it.
 
+## Hylo replay kernel
+
+`ledger --source hylo` owns the durable evidence boundary for replay-driven
+improvement campaigns:
+
+```text
+unfold historical evidence -> portable campaign and scenarios
+interpret one scenario      -> attempt trace
+grade frozen observations   -> evidence-bound grade
+fold immutable events       -> progress, deltas, and frontier
+```
+
+Campaigns and scenarios are language-neutral JSON contracts. Validate the
+portable pair before running it:
+
+```bash
+ledger --source hylo validate-campaign --campaign campaign.json
+```
+
+Use `fingerprint` to obtain the canonical lowercase SHA-256 fingerprint of any
+JSON snapshot. A `campaign_created` intent embeds the complete
+`hylo-campaign/v1` snapshot and its fingerprint; a `scenario_admitted` intent
+does the same for one `hylo-scenario/v1`. This keeps later folds independent of
+mutable campaign files.
+
+Only `append` mutates `.ledger/hylo/events.jsonl`:
+
+```bash
+ledger --source hylo append --repo /path/to/repo --json event-intent.json
+```
+
+The native source supplies global and per-campaign sequence numbers,
+timestamps, predecessor digests, canonical body digests, and event digests. It
+then validates the proposed state transition before atomically appending one
+line. `doctor` replays both hash chains and all transition laws from genesis.
+
+The fold distinguishes two baselines:
+
+- `historical_baseline` records and grades the response that actually happened;
+  its grades are diagnostic and cannot enter progress denominators.
+- `replay_baseline` is a fresh blind controlled replay of the frozen baseline
+  target; only eligible blind replays can be compared with candidates.
+
+For comparable pass/fail grades, Ledger re-derives the aggregate from the
+campaign's frozen dimension weights. It rejects duplicate eligible grades for
+one attempt, target/environment/replay-policy drift, historical comparison,
+non-blind comparison, and critical violations that contradict the pass policy.
+
+Hylo does not edit a target or create a commit by itself. An authorized owner
+workflow may apply the change and, only when the campaign grants publication
+authority, create the commit. Ledger records those transitions and rejects an
+applied change outside the campaign's allowed paths. A committed publication
+must cite a later comparison-eligible passing grade for every required
+holdout repeat. The append path independently resolves the cited Git commit,
+tree, and exact changed-path set before accepting the publication event.
+
+Derive a current view without storing a mutable summary:
+
+```bash
+ledger --source hylo progress \
+  --repo /path/to/repo \
+  --campaign-id cmp-example \
+  --format json
+```
+
+The `hylo-progress/v1` projection reports split results, target summaries,
+per-dimension means, latest scenario outcomes, unresolved frontier cases, and
+comparable cross-target edges. Its fingerprint is bound to the campaign chain
+head. A changed rubric, visibility policy, environment observation surface, or
+replay policy requires a new campaign rather than a misleading continuation.
+
 ## Stateless validation
 
 `ledger validate` is the pure validation surface for artifacts that participate
@@ -125,12 +210,15 @@ in planning and review evidence:
 ledger validate plan-source-contract --input plan-source-contract.json
 ledger validate policy-synthesis-receipt --input synthesis-receipt.json
 ledger validate review-fold --input review-fold.json
+ledger validate actuation-review-policy --phase preflight --input review-policy.json
+ledger validate review-resolution --phase preflight --input review-resolution.json
 ```
 
-Input is canonical JSON from a file or `-` for stdin. Every invocation emits a
-`ledger-validate-decision/v1` object, exits `0` for `pass`, and exits `2` for a
-blocked or malformed artifact. The decision always records
-`authority_granted:false` and `storage_mutated:false`.
+Input is canonical JSON from a file or `-` for stdin. The general governance
+contracts emit `ledger-validate-decision/v1`; the Actuating contracts emit their
+domain decision schemas and require `--phase preflight|closeout`. Every
+invocation exits `0` for `pass` and `2` for a blocked or malformed artifact.
+Every decision records `authority_granted:false` and `storage_mutated:false`.
 
 This is intentionally a command rather than a `--source` namespace. Sources own
 state and event folds; validation is a deterministic observation over one

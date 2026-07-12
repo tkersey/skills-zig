@@ -3,6 +3,7 @@ const actuation_cli = @import("actuation.zig");
 const builtin = @import("builtin");
 const core_cli = @import("core_cli");
 const durable_store = @import("durable_store");
+const hylo_cli = @import("hylo.zig");
 const learnings_cli = @import("learnings_cli");
 const std = @import("std");
 const synesthesia_cli = @import("synesthesia_cli");
@@ -23,7 +24,7 @@ fn defaultIo() std.Io {
 const HelpText =
     \\ledger
     \\
-    \\Durable source-memory, actuation, and plan ledger.
+    \\Durable source-memory, actuation, replay, and plan ledger.
     \\
     \\usage: ledger {init,capture,query,map,status,reopen,export,compact,handoff,show,doctor,migrate,recent,recall,codify-candidates,quality-audit,value-report,memory-digest,path,datasets,dataset-schema,validate} [options]
     \\
@@ -44,11 +45,11 @@ const HelpText =
     \\  recall     With a supporting --source namespace, rank relevant source events
     \\  path       With a supporting --source namespace, print the resolved event path
     \\  datasets   With --source learnings, list learning datasets
-    \\  validate   Purely validate a PSC-v1, PSR-v1, or RF-v2 JSON artifact
+    \\  validate   Purely validate governance and review artifacts
     \\
     \\options:
     \\  --file PATH       Store path (default: .ledger/negative-ledger/events.jsonl)
-    \\  --source SOURCE   Source namespace; omit for negative-ledger, or use actuation, learnings, synesthesia, or universalist
+    \\  --source SOURCE   Source namespace; omit for negative-ledger, or use actuation, hylo, learnings, synesthesia, or universalist
     \\  --json PATH|-     Capture input JSON
     \\  --id NEG-ID       Record id for show/reopen/status/export
     \\  --to VALUE        Target status for status, target path for migrate
@@ -201,6 +202,11 @@ pub fn main(init: std.process.Init) !void {
         }
         if (std.mem.eql(u8, source, "actuation")) {
             const code = try actuation_cli.runWithArgv(allocator, init.io, source_argv);
+            if (code != 0) std.process.exit(code);
+            return;
+        }
+        if (std.mem.eql(u8, source, "hylo")) {
+            const code = try hylo_cli.runWithArgv(allocator, init.io, source_argv);
             if (code != 0) std.process.exit(code);
             return;
         }
@@ -1924,8 +1930,16 @@ test "universalist source routing preserves plan creation arguments" {
     try std.testing.expectEqualStrings("plan.md", routed[5]);
 }
 
+test "hylo source routing preserves replay commands" {
+    const argv = [_][]const u8{ "ledger", "--source", "hylo", "doctor", "--repo", "." };
+    const routed = try sourceArgvAlloc(std.testing.allocator, &argv, "hylo");
+    defer std.testing.allocator.free(routed);
+    try std.testing.expectEqualSlices([]const u8, &.{ "ledger", "doctor", "--repo", "." }, routed);
+}
+
 test "ledger test graph includes source and validation modules" {
     std.testing.refAllDecls(actuation_cli);
+    std.testing.refAllDecls(hylo_cli);
     std.testing.refAllDecls(universalist_cli);
     std.testing.refAllDecls(validation_cli);
 }

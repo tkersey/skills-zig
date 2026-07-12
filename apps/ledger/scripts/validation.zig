@@ -1,4 +1,6 @@
 const app_meta = @import("app_meta");
+const actuating_review_policy_cli = @import("actuating_review_policy.zig");
+const actuating_review_resolution_cli = @import("actuating_review_resolution.zig");
 const builtin = @import("builtin");
 const core_cli = @import("core_cli");
 const std = @import("std");
@@ -11,16 +13,19 @@ threadlocal var runtime_io: ?std.Io = null;
 const UsageText =
     \\ledger validate
     \\
-    \\usage: ledger validate {plan-source-contract,policy-synthesis-receipt,review-fold} --input FILE|-
+    \\usage: ledger validate CONTRACT [--phase {preflight|closeout}] --input FILE|-
     \\
-    \\Purely validate one governance artifact. This command never reads or writes .ledger and never grants authority.
+    \\Purely validate one governance or review artifact. This command never reads or writes .ledger and never grants authority.
     \\
     \\contracts:
+    \\  actuation-review-policy  Check an actuation-review-policy/v1 snapshot
     \\  plan-source-contract       Validate a PSC-v1 plan source contract
     \\  policy-synthesis-receipt  Validate a PSR-v1 policy synthesis receipt
     \\  review-fold               Validate an RF-v2 review-fold receipt
+    \\  review-resolution         Check the correctness-refinement sub-contract in review-resolution/v1
     \\
     \\options:
+    \\  --phase PHASE  preflight|closeout for Actuating contracts
     \\  --input FILE|-  Canonical JSON input path, or - for stdin
     \\  -h, --help      Show help
     \\  -V, --version   Show version
@@ -79,6 +84,15 @@ const Issues = struct {
 pub fn runWithArgv(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !u8 {
     runtime_io = io;
     defer runtime_io = null;
+
+    if (argv.len >= 3 and std.mem.eql(u8, argv[1], "validate")) {
+        if (std.mem.eql(u8, argv[2], "actuation-review-policy")) {
+            return actuating_review_policy_cli.runWithArgv(allocator, io, argv[2..]);
+        }
+        if (std.mem.eql(u8, argv[2], "review-resolution")) {
+            return actuating_review_resolution_cli.runWithArgv(allocator, io, argv[2..]);
+        }
+    }
 
     for (argv[1..]) |token| {
         if (core_cli.isHelpArg(token)) {
@@ -717,6 +731,11 @@ fn routeCoverageMatches(findings: []const std.json.Value, trigger: []const u8, i
 
 fn lessString(_: void, lhs: []const u8, rhs: []const u8) bool {
     return std.mem.order(u8, lhs, rhs) == .lt;
+}
+
+test "Actuating validation modules are part of the Ledger test graph" {
+    std.testing.refAllDecls(actuating_review_policy_cli);
+    std.testing.refAllDecls(actuating_review_resolution_cli);
 }
 
 test "plan source contract validation passes a complete PSC-v1" {
