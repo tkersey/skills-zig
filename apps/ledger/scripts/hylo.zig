@@ -36,7 +36,7 @@ const UsageText =
     \\
     \\options:
     \\  --repo PATH        Git repository to address (default: current repository)
-    \\  --path PATH        Event store path (default: .ledger/hylo/events.jsonl)
+    \\  --path PATH        Persistent-adapter path (default: .ledger/hylo/events.jsonl)
     \\  --campaign FILE    campaign.json for validate-campaign
     \\  --input FILE|-     JSON input for fingerprint or snapshot-target
     \\  --revision REV     Git revision or INDEX for snapshot-target (default: HEAD)
@@ -590,14 +590,19 @@ fn runWithArgvInner(allocator: std.mem.Allocator, argv: []const []const u8) !u8 
     defer allocator.free(repo);
     const store_path = try resolveStorePathAlloc(allocator, repo, args.path);
     defer allocator.free(store_path);
+    var persistence = durable_store.PersistentEventStore.init(store_path);
+    const store = persistence.eventStore();
 
     switch (args.command orelse return error.MissingCommand) {
         .validate_campaign => try cmdValidateCampaign(allocator, args.campaign_path.?),
         .fingerprint => try cmdFingerprint(allocator, args.input_path.?),
         .snapshot_target => try cmdSnapshotTarget(allocator, repo, args.input_path.?, args.revision),
-        .append => try cmdAppend(allocator, repo, store_path, args.json_path.?),
-        .doctor => return try cmdDoctor(allocator, store_path),
-        .progress => try cmdProgress(allocator, store_path, args.campaign_id.?, args.format),
+        .append => {
+            try ensureStoreLockIgnored(allocator, repo, store_path);
+            try cmdAppend(allocator, repo, store, args.json_path.?);
+        },
+        .doctor => return try cmdDoctor(allocator, store),
+        .progress => try cmdProgress(allocator, store, args.campaign_id.?, args.format),
         .path => {
             var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
             try stdout_writer.interface.print("{s}\n", .{store_path});
@@ -3100,9 +3105,8 @@ fn loadLedgerFromSnapshot(
     return result;
 }
 
-fn loadLedger(allocator: std.mem.Allocator, store_path: []const u8) !LedgerLoad {
-    var backend = durable_store.PersistentEventStore.init(store_path);
-    var snapshot = try backend.eventStore().snapshot(allocator, MaxStoreBytes);
+fn loadLedger(allocator: std.mem.Allocator, store: durable_store.EventStore) !LedgerLoad {
+    var snapshot = try store.snapshot(allocator, MaxStoreBytes);
     defer snapshot.deinit(allocator);
     return loadLedgerFromSnapshot(allocator, &snapshot);
 }
@@ -3149,7 +3153,7 @@ fn renderEventLineAlloc(
 fn appendIntentToStore(
     allocator: std.mem.Allocator,
     repo: []const u8,
-    store_path: []const u8,
+    store: durable_store.EventStore,
     intent_json: []const u8,
 ) !AppendResult {
     var intent_parsed = try parseTyped(EventIntent, allocator, intent_json);
@@ -3167,8 +3171,7 @@ fn appendIntentToStore(
     const body_digest = try digestBytesAlloc(allocator, body_json);
     defer allocator.free(body_digest);
 
-    var backend = durable_store.PersistentEventStore.init(store_path);
-    var exclusive = try backend.eventStore().acquireExclusive(allocator);
+    var exclusive = try store.acquireExclusive(allocator);
     defer exclusive.release();
     var snapshot = try exclusive.snapshot(allocator, MaxStoreBytes);
     defer snapshot.deinit(allocator);
@@ -3247,19 +3250,18 @@ fn appendIntentToStore(
 fn cmdAppend(
     allocator: std.mem.Allocator,
     repo: []const u8,
-    store_path: []const u8,
+    store: durable_store.EventStore,
     input_path: []const u8,
 ) !void {
-    try ensureStoreLockIgnored(allocator, repo, store_path);
     const input = try readInputAlloc(allocator, input_path);
     defer allocator.free(input);
-    var result = try appendIntentToStore(allocator, repo, store_path, input);
+    var result = try appendIntentToStore(allocator, repo, store, input);
     defer result.deinit(allocator);
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try out.writer.writeAll("{\"schema\":\"hylo-ledger-append-receipt/v1\",\"status\":\"appended\",\"path\":");
-    try std.json.Stringify.value(store_path, .{}, &out.writer);
+    try std.json.Stringify.value(store.logicalRef(), .{}, &out.writer);
     try out.writer.writeAll(",\"campaign_id\":");
     try std.json.Stringify.value(result.campaign_id, .{}, &out.writer);
     try out.writer.writeAll(",\"kind\":");
@@ -3273,21 +3275,34 @@ fn cmdAppend(
     try writeStdoutAlloc(allocator, &out);
 }
 
-fn cmdDoctor(allocator: std.mem.Allocator, store_path: []const u8) !u8 {
-    if (!durable_store.fileExists(store_path)) {
+fn cmdDoctor(allocator: std.mem.Allocator, store: durable_store.EventStore) !u8 {
+    const logical_ref = store.logicalRef();
+    var snapshot = store.snapshot(allocator, MaxStoreBytes) catch |err| {
+        var invalid: std.Io.Writer.Allocating = .init(allocator);
+        defer invalid.deinit();
+        try invalid.writer.writeAll("{\"schema\":\"hylo-ledger-doctor/v1\",\"status\":\"invalid\",\"path\":");
+        try std.json.Stringify.value(logical_ref, .{}, &invalid.writer);
+        try invalid.writer.writeAll(",\"error\":");
+        try std.json.Stringify.value(@errorName(err), .{}, &invalid.writer);
+        try invalid.writer.writeAll("}\n");
+        try writeStdoutAlloc(allocator, &invalid);
+        return 2;
+    };
+    defer snapshot.deinit(allocator);
+    if (!snapshot.exists) {
         var missing: std.Io.Writer.Allocating = .init(allocator);
         defer missing.deinit();
         try missing.writer.writeAll("{\"schema\":\"hylo-ledger-doctor/v1\",\"status\":\"missing\",\"path\":");
-        try std.json.Stringify.value(store_path, .{}, &missing.writer);
+        try std.json.Stringify.value(logical_ref, .{}, &missing.writer);
         try missing.writer.writeAll(",\"records\":0,\"campaigns\":0,\"chain_head\":null}\n");
         try writeStdoutAlloc(allocator, &missing);
         return 0;
     }
-    var loaded = loadLedger(allocator, store_path) catch |err| {
+    var loaded = loadLedgerFromSnapshot(allocator, &snapshot) catch |err| {
         var invalid: std.Io.Writer.Allocating = .init(allocator);
         defer invalid.deinit();
         try invalid.writer.writeAll("{\"schema\":\"hylo-ledger-doctor/v1\",\"status\":\"invalid\",\"path\":");
-        try std.json.Stringify.value(store_path, .{}, &invalid.writer);
+        try std.json.Stringify.value(logical_ref, .{}, &invalid.writer);
         try invalid.writer.writeAll(",\"error\":");
         try std.json.Stringify.value(@errorName(err), .{}, &invalid.writer);
         try invalid.writer.writeAll("}\n");
@@ -3298,7 +3313,7 @@ fn cmdDoctor(allocator: std.mem.Allocator, store_path: []const u8) !u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try out.writer.writeAll("{\"schema\":\"hylo-ledger-doctor/v1\",\"status\":\"valid\",\"path\":");
-    try std.json.Stringify.value(store_path, .{}, &out.writer);
+    try std.json.Stringify.value(logical_ref, .{}, &out.writer);
     try out.writer.print(
         ",\"records\":{d},\"campaigns\":{d},\"chain_head\":",
         .{ loaded.event_count, loaded.campaigns.items.len },
@@ -3568,12 +3583,12 @@ fn writeTargetRows(
 
 fn cmdProgress(
     allocator: std.mem.Allocator,
-    store_path: []const u8,
+    store: durable_store.EventStore,
     campaign_id: []const u8,
     format: OutputFormat,
 ) !void {
     try validateId(campaign_id);
-    var loaded = try loadLedger(allocator, store_path);
+    var loaded = try loadLedger(allocator, store);
     defer loaded.deinit(allocator);
     const campaign_index = findCampaign(loaded.campaigns.items, campaign_id) orelse return error.CampaignMissing;
     const campaign = &loaded.campaigns.items[campaign_index];
@@ -3964,7 +3979,8 @@ fn appendTestPayload(
 ) !void {
     const intent = try testIntentAlloc(allocator, kind, scenario_id, attempt_id, grade_id, payload_json);
     defer allocator.free(intent);
-    var result = try appendIntentToStore(allocator, repo, store_path, intent);
+    var persistence = durable_store.PersistentEventStore.init(store_path);
+    var result = try appendIntentToStore(allocator, repo, persistence.eventStore(), intent);
     defer result.deinit(allocator);
 }
 
@@ -3974,8 +3990,14 @@ fn appendTestSnapshot(
     store_path: []const u8,
     intent: []const u8,
 ) !void {
-    var result = try appendIntentToStore(allocator, repo, store_path, intent);
+    var persistence = durable_store.PersistentEventStore.init(store_path);
+    var result = try appendIntentToStore(allocator, repo, persistence.eventStore(), intent);
     defer result.deinit(allocator);
+}
+
+fn loadTestLedger(allocator: std.mem.Allocator, store_path: []const u8) !LedgerLoad {
+    var persistence = durable_store.PersistentEventStore.init(store_path);
+    return loadLedger(allocator, persistence.eventStore());
 }
 
 fn runTestGit(allocator: std.mem.Allocator, repo: []const u8, args: []const []const u8) !void {
@@ -4127,16 +4149,26 @@ test "hylo event stores remain repo local" {
     try std.testing.expect(pathWithin(inside, repo));
 }
 
-test "hylo folds backend-independent event-store snapshots" {
+test "hylo appends and folds through backend-independent event stores" {
     var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hylo-test");
     defer backend.deinit();
-    var snapshot = try backend.eventStore().snapshot(std.testing.allocator, MaxStoreBytes);
+    const store = backend.eventStore();
+    const intent = try testCampaignIntentAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(intent);
+    var result = try appendIntentToStore(std.testing.allocator, "memory:repo", store, intent);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 1), result.sequence);
+    try std.testing.expectEqualStrings("campaign_created", result.kind);
+
+    var snapshot = try store.snapshot(std.testing.allocator, MaxStoreBytes);
     defer snapshot.deinit(std.testing.allocator);
-    var loaded = try loadLedgerFromSnapshot(std.testing.allocator, &snapshot);
+    var loaded = try loadLedger(std.testing.allocator, store);
     defer loaded.deinit(std.testing.allocator);
-    try std.testing.expect(!loaded.store_exists);
+    try std.testing.expect(loaded.store_exists);
     try std.testing.expectEqualStrings(snapshot.revision, loaded.store_revision);
-    try std.testing.expectEqual(@as(u64, 0), loaded.event_count);
+    try std.testing.expectEqual(@as(u64, 1), loaded.event_count);
+    try std.testing.expectEqual(@as(usize, 1), loaded.campaigns.items.len);
+    try std.testing.expect(loaded.campaigns.items[0].created);
 }
 
 test "hylo ledger rejects gaming and proves a full promoted publication" {
@@ -4359,7 +4391,7 @@ test "hylo ledger rejects gaming and proves a full promoted publication" {
     );
     try std.Io.Dir.cwd().deleteFile(std.testing.io, target_scope_path);
     try appendTestPayload(std.testing.allocator, repo, store_path, "change_recorded", null, null, null, valid_change_payload);
-    var after_change = try loadLedger(std.testing.allocator, store_path);
+    var after_change = try loadTestLedger(std.testing.allocator, store_path);
     defer after_change.deinit(std.testing.allocator);
     const after_change_campaign = &after_change.campaigns.items[0];
     try std.testing.expect(scenarioOnFrontier(after_change_campaign, "scenario-holdout-2", TestCandidateFingerprint));
@@ -4497,7 +4529,7 @@ test "hylo ledger rejects gaming and proves a full promoted publication" {
     const candidate_failure_grade = try testGradePayloadAlloc(std.testing.allocator, TestCandidateFingerprint, false, true, "fail", 0.0, 0.0, false);
     defer std.testing.allocator.free(candidate_failure_grade);
     try appendTestPayload(std.testing.allocator, repo, store_path, "grade_recorded", "scenario-holdout", "attempt-candidate-failure", "grade-candidate-failure", candidate_failure_grade);
-    var after_candidate_failure = try loadLedger(std.testing.allocator, store_path);
+    var after_candidate_failure = try loadTestLedger(std.testing.allocator, store_path);
     defer after_candidate_failure.deinit(std.testing.allocator);
     try std.testing.expect(scenarioOnFrontier(&after_candidate_failure.campaigns.items[0], "scenario-holdout", TestCandidateFingerprint));
 
@@ -4522,7 +4554,7 @@ test "hylo ledger rejects gaming and proves a full promoted publication" {
     const candidate_recovery_grade = try testGradePayloadAlloc(std.testing.allocator, TestCandidateFingerprint, false, true, "pass", 1.0, 1.0, false);
     defer std.testing.allocator.free(candidate_recovery_grade);
     try appendTestPayload(std.testing.allocator, repo, store_path, "grade_recorded", "scenario-holdout", "attempt-candidate-recovery", "grade-candidate-recovery", candidate_recovery_grade);
-    var after_candidate_recovery = try loadLedger(std.testing.allocator, store_path);
+    var after_candidate_recovery = try loadTestLedger(std.testing.allocator, store_path);
     defer after_candidate_recovery.deinit(std.testing.allocator);
     try std.testing.expect(!scenarioOnFrontier(&after_candidate_recovery.campaigns.items[0], "scenario-holdout", TestCandidateFingerprint));
 
@@ -4580,7 +4612,7 @@ test "hylo ledger rejects gaming and proves a full promoted publication" {
     try std.testing.expectEqualStrings(before_invalid_publication, after_invalid_publication);
     try appendTestPayload(std.testing.allocator, repo, store_path, "publication_recorded", null, null, null, valid_publication_payload);
 
-    var loaded = try loadLedger(std.testing.allocator, store_path);
+    var loaded = try loadTestLedger(std.testing.allocator, store_path);
     defer loaded.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 25), loaded.event_count);
     try std.testing.expectEqual(@as(usize, 1), loaded.campaigns.items.len);
@@ -4604,5 +4636,5 @@ test "hylo ledger rejects gaming and proves a full promoted publication" {
     const tampered_path = try std.fs.path.join(std.testing.allocator, &.{ repo, "tampered.jsonl" });
     defer std.testing.allocator.free(tampered_path);
     try durable_store.writeTextAtomic(std.testing.allocator, tampered_path, tampered);
-    try std.testing.expectError(error.EventDigestMismatch, loadLedger(std.testing.allocator, tampered_path));
+    try std.testing.expectError(error.EventDigestMismatch, loadTestLedger(std.testing.allocator, tampered_path));
 }

@@ -266,6 +266,14 @@ domain decision schemas and require `--phase preflight|closeout`. Every
 invocation exits `0` for `pass` and `2` for a blocked or malformed artifact.
 Every decision records `authority_granted:false` and `storage_mutated:false`.
 
+The Actuating review-policy checker preserves `actuation-review-policy/v1`
+same-tuple suffix semantics and also accepts `actuation-review-policy/v2`.
+Version 2 derives the standard clean suffix from an ordered attempt history and
+permits tuple movement only through an `auxiliary-remediation` carry that binds
+the resolution, correctness observations, actuation events, and SHIP receipt.
+Carry transitions preserve credit but never add it, and closeout still requires
+a clean standard attempt plus current auxiliary evidence on the current tuple.
+
 This is intentionally a command rather than a `--source` namespace. Sources own
 state and event folds; validation is a deterministic observation over one
 immutable input.
