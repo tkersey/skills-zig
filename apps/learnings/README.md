@@ -36,7 +36,24 @@ ledger migrate --source learnings --dry-run --mode copy
 ledger migrate --source learnings --mode copy
 ```
 
-If `ledger doctor --source learnings` reports `legacy-only`, migrate before
-`ledger capture --source learnings`.
+`doctor` validates the selected store, reports physical line spans for invalid
+records, and exits nonzero for `status: "invalid"`. Migration reads logical JSON
+objects rather than assuming every physical line is a full record. It reports
+multiline recoveries and applies only a bounded, verified repair for a known
+legacy defect: a missing opening quote on a recognized continuation key.
+
+If irreparable records remain, migration fails closed by default. To retain all
+valid records while preserving the original legacy source as evidence, use:
+
+```bash
+ledger migrate --source learnings --dry-run --mode copy --invalid-policy skip
+ledger migrate --source learnings --mode copy --invalid-policy skip
+```
+
+`--invalid-policy skip` is intentionally incompatible with `--mode move` and
+`--remove-legacy`. Its receipt uses a `*_with_skips` status and lists every
+skipped physical line span. If
+`doctor` reports `legacy-only`, migrate before `ledger capture --source
+learnings`.
 Append fails closed with `MigrationRequired` instead of splitting writes across
 legacy and canonical stores.

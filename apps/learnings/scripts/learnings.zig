@@ -87,7 +87,7 @@ const UsageText =
     \\    value-report        Compare recall-loaded sessions against a non-recall comparator
     \\    memory-digest       Generate a disposable cross-repo memory consolidation digest
     \\    migrate             Copy or move legacy learning rows into .ledger/learnings/events.jsonl
-    \\    doctor              Report learnings store path status
+    \\    doctor              Validate the selected learnings store and report path status
     \\    path                Print the resolved default learnings path
     \\
     \\options:
@@ -100,13 +100,14 @@ const UsageText =
 const MigrateUsageText =
     \\ledger migrate --source learnings
     \\
-    \\usage: ledger migrate --source learnings [-h] [--from PATH] [--to PATH] [--mode {copy,move}] [--dry-run] [--allow-existing-target] [--remove-legacy]
+    \\usage: ledger migrate --source learnings [-h] [--from PATH] [--to PATH] [--mode {copy,move}] [--invalid-policy {error,skip}] [--dry-run] [--allow-existing-target] [--remove-legacy]
     \\
     \\Copy or move legacy learning rows into .ledger/learnings/events.jsonl.
     \\
     \\Migration states:
     \\  legacy-only           old learnings store exists and .ledger/learnings/events.jsonl is missing; run --mode copy before append
     \\  migrated              canonical .ledger/learnings/events.jsonl exists; append is allowed
+    \\  invalid               selected store contains irreparable records; inspect doctor spans or use source-preserving --invalid-policy skip
     \\  missing               no learnings store exists yet
     \\
     \\options:
@@ -114,6 +115,8 @@ const MigrateUsageText =
     \\  --from PATH           Legacy source path relative to repo root (default: .ledger/learnings/learnings.jsonl when present, then .learnings.jsonl)
     \\  --to PATH             Canonical target path relative to repo root (default: .ledger/learnings/events.jsonl)
     \\  --mode {copy,move}    Copy preserves the legacy file; move may remove it when safe (default: copy)
+    \\  --invalid-policy {error,skip}
+    \\                        Error rejects any irreparable logical record (default); skip copies valid records, reports skipped line spans, and preserves the legacy source
     \\  --dry-run             Validate and report the migration without writing
     \\  --allow-existing-target
     \\                        Merge compatible target rows instead of requiring a missing target
@@ -256,7 +259,7 @@ const DoctorUsageText =
     \\
     \\usage: ledger doctor --source learnings [-h]
     \\
-    \\Report learnings store path status.
+    \\Validate the selected learnings store and report path status, repairs, and invalid physical line spans.
     \\
     \\options:
     \\  -h, --help            show this help message and exit
@@ -467,6 +470,11 @@ const MigrationMode = enum {
     move,
 };
 
+const InvalidPolicy = enum {
+    reject,
+    skip,
+};
+
 const Args = struct {
     path: []const u8 = DefaultLearningsPath,
     path_explicit: bool = false,
@@ -489,6 +497,7 @@ const Args = struct {
     migrate_from: []const u8 = "",
     migrate_to: []const u8 = DefaultLearningsPath,
     migrate_mode: MigrationMode = .copy,
+    invalid_policy: InvalidPolicy = .reject,
     dry_run: bool = false,
     allow_existing_target: bool = false,
     remove_legacy: bool = false,
@@ -709,7 +718,7 @@ pub fn runWithArgv(allocator: std.mem.Allocator, argv: []const []const u8, codex
             true,
         ),
         .migrate => std.process.exit(try cmdMigrate(allocator, repo_root, parsed)),
-        .doctor => try cmdDoctor(allocator, repo_root),
+        .doctor => std.process.exit(try cmdDoctor(allocator, repo_root)),
         .path => try cmdPath(allocator, repo_root, parsed.path, parsed.path_explicit),
     }
 }
@@ -1017,6 +1026,18 @@ fn parseArgs(argv: []const []const u8) !Args {
                     }
                     continue;
                 }
+                if (std.mem.eql(u8, arg, "--invalid-policy")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingInvalidPolicyValue;
+                    if (std.mem.eql(u8, argv[i], "error")) {
+                        args.invalid_policy = .reject;
+                    } else if (std.mem.eql(u8, argv[i], "skip")) {
+                        args.invalid_policy = .skip;
+                    } else {
+                        return error.InvalidPolicyValue;
+                    }
+                    continue;
+                }
                 if (std.mem.eql(u8, arg, "--dry-run")) {
                     args.dry_run = true;
                     continue;
@@ -1043,6 +1064,11 @@ fn parseArgs(argv: []const []const u8) !Args {
         .query => if (args.spec == null) return error.MissingSpecValue,
         .recall => if (args.query == null) return error.MissingQueryValue,
         else => {},
+    }
+    if (args.command.? == .migrate and args.invalid_policy == .skip and
+        (args.migrate_mode != .copy or args.remove_legacy))
+    {
+        return error.UnsafeSkipPolicy;
     }
 
     return args;
@@ -1108,8 +1134,17 @@ fn printParseError(err: anyerror, argv: []const []const u8) noreturn {
         error.MissingModeValue => {
             stderr.print("error: argument --mode: expected one argument\n", .{}) catch {};
         },
+        error.MissingInvalidPolicyValue => {
+            stderr.print("error: argument --invalid-policy: expected one argument\n", .{}) catch {};
+        },
         error.InvalidMigrationMode => {
             stderr.print("error: argument --mode: expected copy or move\n", .{}) catch {};
+        },
+        error.InvalidPolicyValue => {
+            stderr.print("error: argument --invalid-policy: expected error or skip\n", .{}) catch {};
+        },
+        error.UnsafeSkipPolicy => {
+            stderr.print("error: --invalid-policy skip requires --mode copy and forbids --remove-legacy\n", .{}) catch {};
         },
         error.InvalidPositiveInt => {
             stderr.print("error: expected non-negative integer\n", .{}) catch {};
@@ -1178,6 +1213,43 @@ const JsonlStats = struct {
     }
 };
 
+const MigrationIssue = struct {
+    start_line: usize,
+    end_line: usize,
+    reason: []const u8,
+};
+
+const MigrationRepair = struct {
+    start_line: usize,
+    end_line: usize,
+    repair: []const u8,
+};
+
+const ConvertedLearningRows = struct {
+    bytes: []u8,
+    records: usize,
+    blank_lines: usize,
+    recovered_multiline_records: usize,
+    repairs: std.ArrayList(MigrationRepair),
+    issues: std.ArrayList(MigrationIssue),
+
+    fn deinit(self: *ConvertedLearningRows, allocator: std.mem.Allocator) void {
+        allocator.free(self.bytes);
+        self.repairs.deinit(allocator);
+        self.issues.deinit(allocator);
+    }
+};
+
+const StoreInspection = struct {
+    records: usize = 0,
+    blank_lines: usize = 0,
+    issues: std.ArrayList(MigrationIssue) = .empty,
+
+    fn deinit(self: *StoreInspection, allocator: std.mem.Allocator) void {
+        self.issues.deinit(allocator);
+    }
+};
+
 fn cmdMigrate(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !u8 {
     const effective_from = try resolveMigrateFromPathAlloc(allocator, repo_root, args.migrate_from);
     defer allocator.free(effective_from);
@@ -1192,8 +1264,21 @@ fn cmdMigrate(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !
     };
     defer allocator.free(source_bytes);
 
-    const converted_source = try convertLearningRowsToEventsAlloc(allocator, source_bytes);
-    defer allocator.free(converted_source);
+    var conversion = try convertLearningRowsToEventsAlloc(allocator, source_bytes);
+    defer conversion.deinit(allocator);
+
+    if (conversion.issues.items.len > 0 and args.invalid_policy == .reject) {
+        try printMigrationIssueFailure(
+            allocator,
+            from_path,
+            to_path,
+            "invalid_source_record",
+            conversion.issues.items[0],
+            conversion.issues.items.len,
+        );
+        return 1;
+    }
+    const converted_source = conversion.bytes;
 
     var source_stats = validateJsonlBytes(allocator, converted_source) catch |err| {
         try printMigrationFailure(allocator, from_path, to_path, "invalid_source_jsonl", @errorName(err));
@@ -1205,12 +1290,16 @@ fn cmdMigrate(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !
 
     if (args.dry_run) {
         try printMigrationResult(allocator, .{
-            .status = "would_migrate",
+            .status = migrationStatus("would_migrate", conversion.issues.items.len),
             .from = from_path,
             .to = to_path,
             .mode = migrationModeText(args.migrate_mode),
+            .invalid_policy = invalidPolicyText(args.invalid_policy),
             .records = source_stats.records,
             .blank_lines = source_stats.blank_lines,
+            .recovered_multiline_records = conversion.recovered_multiline_records,
+            .repairs = conversion.repairs.items,
+            .issues = conversion.issues.items,
             .source_sha256 = source_sha,
             .target_sha256 = source_stats.sha256,
             .legacy_left_in_place = true,
@@ -1234,12 +1323,16 @@ fn cmdMigrate(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !
         if (std.mem.eql(u8, converted_source, target_bytes)) {
             try maybeRemoveLegacy(args, from_path);
             try printMigrationResult(allocator, .{
-                .status = "already_migrated",
+                .status = migrationStatus("already_migrated", conversion.issues.items.len),
                 .from = from_path,
                 .to = to_path,
                 .mode = migrationModeText(args.migrate_mode),
+                .invalid_policy = invalidPolicyText(args.invalid_policy),
                 .records = source_stats.records,
                 .blank_lines = source_stats.blank_lines,
+                .recovered_multiline_records = conversion.recovered_multiline_records,
+                .repairs = conversion.repairs.items,
+                .issues = conversion.issues.items,
                 .source_sha256 = source_sha,
                 .target_sha256 = target_stats.sha256,
                 .legacy_left_in_place = !args.remove_legacy and args.migrate_mode == .copy,
@@ -1263,12 +1356,16 @@ fn cmdMigrate(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !
         defer allocator.free(target_sha);
         try maybeRemoveLegacy(args, from_path);
         try printMigrationResult(allocator, .{
-            .status = "merged",
+            .status = migrationStatus("merged", conversion.issues.items.len),
             .from = from_path,
             .to = to_path,
             .mode = migrationModeText(args.migrate_mode),
+            .invalid_policy = invalidPolicyText(args.invalid_policy),
             .records = source_stats.records,
             .blank_lines = source_stats.blank_lines,
+            .recovered_multiline_records = conversion.recovered_multiline_records,
+            .repairs = conversion.repairs.items,
+            .issues = conversion.issues.items,
             .source_sha256 = source_sha,
             .target_sha256 = target_sha,
             .legacy_left_in_place = !args.remove_legacy and args.migrate_mode == .copy,
@@ -1281,12 +1378,16 @@ fn cmdMigrate(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !
     defer target_stats.deinit(allocator);
     try maybeRemoveLegacy(args, from_path);
     try printMigrationResult(allocator, .{
-        .status = "migrated",
+        .status = migrationStatus("migrated", conversion.issues.items.len),
         .from = from_path,
         .to = to_path,
         .mode = migrationModeText(args.migrate_mode),
+        .invalid_policy = invalidPolicyText(args.invalid_policy),
         .records = source_stats.records,
         .blank_lines = source_stats.blank_lines,
+        .recovered_multiline_records = conversion.recovered_multiline_records,
+        .repairs = conversion.repairs.items,
+        .issues = conversion.issues.items,
         .source_sha256 = source_sha,
         .target_sha256 = target_stats.sha256,
         .legacy_left_in_place = !args.remove_legacy and args.migrate_mode == .copy,
@@ -1294,7 +1395,7 @@ fn cmdMigrate(allocator: std.mem.Allocator, repo_root: []const u8, args: Args) !
     return 0;
 }
 
-fn cmdDoctor(allocator: std.mem.Allocator, repo_root: []const u8) !void {
+fn cmdDoctor(allocator: std.mem.Allocator, repo_root: []const u8) !u8 {
     const next_path = try resolveJsonlPathAlloc(allocator, repo_root, DefaultLearningsPath);
     defer allocator.free(next_path);
     const previous_path = try resolveJsonlPathAlloc(allocator, repo_root, PreviousLearningsPath);
@@ -1304,20 +1405,84 @@ fn cmdDoctor(allocator: std.mem.Allocator, repo_root: []const u8) !void {
     const next_exists = durable_store.fileExists(next_path);
     const previous_exists = durable_store.fileExists(previous_path);
     const legacy_exists = durable_store.fileExists(legacy_path);
-    const status =
-        if (next_exists) "current" else if (previous_exists or legacy_exists) "legacy-only" else "missing";
+    const selected_path: ?[]const u8 = if (next_exists)
+        next_path
+    else if (previous_exists)
+        previous_path
+    else if (legacy_exists)
+        legacy_path
+    else
+        null;
+    const selected_kind = if (next_exists)
+        "current"
+    else if (previous_exists)
+        "previous"
+    else if (legacy_exists)
+        "legacy"
+    else
+        "none";
 
-    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
-    const stdout = &stdout_writer.interface;
-    try stdout.writeAll("{\"command\":\"doctor\",\"status\":");
-    try writeJsonString(stdout, status);
-    try stdout.writeAll(",\"default_path\":");
-    try writeJsonString(stdout, DefaultLearningsPath);
-    try stdout.print(",\"default_exists\":{s},\"previous_exists\":{s},\"legacy_exists\":{s}}}\n", .{
-        if (next_exists) "true" else "false",
-        if (previous_exists) "true" else "false",
-        if (legacy_exists) "true" else "false",
+    if (selected_path == null) {
+        try printDoctorResult(.{
+            .status = "missing",
+            .selected_path = null,
+            .selected_kind = selected_kind,
+            .default_exists = next_exists,
+            .previous_exists = previous_exists,
+            .legacy_exists = legacy_exists,
+        });
+        return 0;
+    }
+
+    const selected_bytes = durable_store.readRegularFileNoSymlink(allocator, selected_path.?, MaxLearningsBytes) catch |err| {
+        const issue = MigrationIssue{ .start_line = 0, .end_line = 0, .reason = @errorName(err) };
+        const issues = [_]MigrationIssue{issue};
+        try printDoctorResult(.{
+            .status = "invalid",
+            .selected_path = selected_path,
+            .selected_kind = selected_kind,
+            .default_exists = next_exists,
+            .previous_exists = previous_exists,
+            .legacy_exists = legacy_exists,
+            .issues = &issues,
+        });
+        return 1;
+    };
+    defer allocator.free(selected_bytes);
+
+    if (next_exists) {
+        var inspection = try inspectCanonicalJsonlAlloc(allocator, selected_bytes);
+        defer inspection.deinit(allocator);
+        try printDoctorResult(.{
+            .status = if (inspection.issues.items.len == 0) "current" else "invalid",
+            .selected_path = selected_path,
+            .selected_kind = selected_kind,
+            .default_exists = next_exists,
+            .previous_exists = previous_exists,
+            .legacy_exists = legacy_exists,
+            .records = inspection.records,
+            .blank_lines = inspection.blank_lines,
+            .issues = inspection.issues.items,
+        });
+        return if (inspection.issues.items.len == 0) 0 else 1;
+    }
+
+    var conversion = try convertLearningRowsToEventsAlloc(allocator, selected_bytes);
+    defer conversion.deinit(allocator);
+    try printDoctorResult(.{
+        .status = if (conversion.issues.items.len == 0) "legacy-only" else "invalid",
+        .selected_path = selected_path,
+        .selected_kind = selected_kind,
+        .default_exists = next_exists,
+        .previous_exists = previous_exists,
+        .legacy_exists = legacy_exists,
+        .records = conversion.records,
+        .blank_lines = conversion.blank_lines,
+        .recovered_multiline_records = conversion.recovered_multiline_records,
+        .repairs = conversion.repairs.items,
+        .issues = conversion.issues.items,
     });
+    return if (conversion.issues.items.len == 0) 0 else 1;
 }
 
 fn cmdPath(allocator: std.mem.Allocator, repo_root: []const u8, raw_path: []const u8, path_explicit: bool) !void {
@@ -1332,8 +1497,12 @@ const MigrationPrint = struct {
     from: []const u8,
     to: []const u8,
     mode: []const u8,
+    invalid_policy: []const u8,
     records: usize,
     blank_lines: usize,
+    recovered_multiline_records: usize,
+    repairs: []const MigrationRepair,
+    issues: []const MigrationIssue,
     source_sha256: []const u8,
     target_sha256: []const u8,
     legacy_left_in_place: bool,
@@ -1351,11 +1520,84 @@ fn printMigrationResult(allocator: std.mem.Allocator, result: MigrationPrint) !v
     try writeJsonString(stdout, result.to);
     try stdout.writeAll(",\"mode\":");
     try writeJsonString(stdout, result.mode);
-    try stdout.print(",\"records\":{d},\"blank_lines\":{d},\"source_sha256\":", .{ result.records, result.blank_lines });
+    try stdout.writeAll(",\"invalid_policy\":");
+    try writeJsonString(stdout, result.invalid_policy);
+    try stdout.print(",\"records\":{d},\"blank_lines\":{d},\"recovered_multiline_records\":{d},\"repaired_records\":{d},\"repairs\":", .{
+        result.records,
+        result.blank_lines,
+        result.recovered_multiline_records,
+        result.repairs.len,
+    });
+    try writeMigrationRepairs(stdout, result.repairs);
+    try stdout.print(",\"skipped_records\":{d},\"skipped\":", .{result.issues.len});
+    try writeMigrationIssues(stdout, result.issues);
+    try stdout.writeAll(",\"source_sha256\":");
     try writeJsonString(stdout, result.source_sha256);
     try stdout.writeAll(",\"target_sha256\":");
     try writeJsonString(stdout, result.target_sha256);
     try stdout.print(",\"legacy_left_in_place\":{s}}}\n", .{if (result.legacy_left_in_place) "true" else "false"});
+}
+
+const DoctorPrint = struct {
+    status: []const u8,
+    selected_path: ?[]const u8,
+    selected_kind: []const u8,
+    default_exists: bool,
+    previous_exists: bool,
+    legacy_exists: bool,
+    records: usize = 0,
+    blank_lines: usize = 0,
+    recovered_multiline_records: usize = 0,
+    repairs: []const MigrationRepair = &.{},
+    issues: []const MigrationIssue = &.{},
+};
+
+fn printDoctorResult(result: DoctorPrint) !void {
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"command\":\"doctor\",\"status\":");
+    try writeJsonString(stdout, result.status);
+    try stdout.writeAll(",\"default_path\":");
+    try writeJsonString(stdout, DefaultLearningsPath);
+    try stdout.writeAll(",\"selected_path\":");
+    if (result.selected_path) |path| try writeJsonString(stdout, path) else try stdout.writeAll("null");
+    try stdout.writeAll(",\"selected_kind\":");
+    try writeJsonString(stdout, result.selected_kind);
+    try stdout.print(",\"default_exists\":{s},\"previous_exists\":{s},\"legacy_exists\":{s},\"records\":{d},\"blank_lines\":{d},\"recovered_multiline_records\":{d},\"repaired_records\":{d},\"repairs\":", .{
+        if (result.default_exists) "true" else "false",
+        if (result.previous_exists) "true" else "false",
+        if (result.legacy_exists) "true" else "false",
+        result.records,
+        result.blank_lines,
+        result.recovered_multiline_records,
+        result.repairs.len,
+    });
+    try writeMigrationRepairs(stdout, result.repairs);
+    try stdout.print(",\"invalid_records\":{d},\"issues\":", .{result.issues.len});
+    try writeMigrationIssues(stdout, result.issues);
+    try stdout.writeAll("}\n");
+}
+
+fn writeMigrationRepairs(writer: *std.Io.Writer, repairs: []const MigrationRepair) !void {
+    try writer.writeByte('[');
+    for (repairs, 0..) |repair, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writer.print("{{\"start_line\":{d},\"end_line\":{d},\"repair\":", .{ repair.start_line, repair.end_line });
+        try writeJsonString(writer, repair.repair);
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
+}
+
+fn writeMigrationIssues(writer: *std.Io.Writer, issues: []const MigrationIssue) !void {
+    try writer.writeByte('[');
+    for (issues, 0..) |issue, idx| {
+        if (idx > 0) try writer.writeByte(',');
+        try writer.print("{{\"start_line\":{d},\"end_line\":{d},\"reason\":", .{ issue.start_line, issue.end_line });
+        try writeJsonString(writer, issue.reason);
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
 }
 
 fn printMigrationFailure(allocator: std.mem.Allocator, from_path: []const u8, to_path: []const u8, reason: []const u8, detail: []const u8) !void {
@@ -1373,11 +1615,53 @@ fn printMigrationFailure(allocator: std.mem.Allocator, from_path: []const u8, to
     try stdout.writeAll("}\n");
 }
 
+fn printMigrationIssueFailure(
+    allocator: std.mem.Allocator,
+    from_path: []const u8,
+    to_path: []const u8,
+    reason: []const u8,
+    issue: MigrationIssue,
+    invalid_records: usize,
+) !void {
+    _ = allocator;
+    var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+    const stdout = &stdout_writer.interface;
+    try stdout.writeAll("{\"command\":\"migrate\",\"status\":\"failed\",\"reason\":");
+    try writeJsonString(stdout, reason);
+    try stdout.writeAll(",\"detail\":");
+    try writeJsonString(stdout, issue.reason);
+    try stdout.print(",\"start_line\":{d},\"end_line\":{d},\"invalid_records\":{d},\"from\":", .{
+        issue.start_line,
+        issue.end_line,
+        invalid_records,
+    });
+    try writeJsonString(stdout, from_path);
+    try stdout.writeAll(",\"to\":");
+    try writeJsonString(stdout, to_path);
+    try stdout.writeAll("}\n");
+}
+
 fn migrationModeText(mode: MigrationMode) []const u8 {
     return switch (mode) {
         .copy => "copy",
         .move => "move",
     };
+}
+
+fn invalidPolicyText(policy: InvalidPolicy) []const u8 {
+    return switch (policy) {
+        .reject => "error",
+        .skip => "skip",
+    };
+}
+
+fn migrationStatus(base: []const u8, skipped_records: usize) []const u8 {
+    if (skipped_records == 0) return base;
+    if (std.mem.eql(u8, base, "would_migrate")) return "would_migrate_with_skips";
+    if (std.mem.eql(u8, base, "already_migrated")) return "already_migrated_with_skips";
+    if (std.mem.eql(u8, base, "merged")) return "merged_with_skips";
+    if (std.mem.eql(u8, base, "migrated")) return "migrated_with_skips";
+    return base;
 }
 
 fn maybeRemoveLegacy(args: Args, from_path: []const u8) !void {
@@ -1395,42 +1679,319 @@ fn resolveMigrateFromPathAlloc(allocator: std.mem.Allocator, repo_root: []const 
     return allocator.dupe(u8, LegacyLearningsPath);
 }
 
-fn convertLearningRowsToEventsAlloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+const JsonFragmentState = struct {
+    depth: usize = 0,
+    in_string: bool = false,
+    escaped: bool = false,
+    invalid_closing: bool = false,
+
+    fn scan(self: *JsonFragmentState, bytes: []const u8) void {
+        for (bytes) |byte| {
+            if (self.in_string) {
+                if (self.escaped) {
+                    self.escaped = false;
+                } else if (byte == '\\') {
+                    self.escaped = true;
+                } else if (byte == '"') {
+                    self.in_string = false;
+                }
+                continue;
+            }
+
+            switch (byte) {
+                '"' => self.in_string = true,
+                '{', '[' => self.depth += 1,
+                '}', ']' => {
+                    if (self.depth == 0) {
+                        self.invalid_closing = true;
+                    } else {
+                        self.depth -= 1;
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+};
+
+const RecordConversion = union(enum) {
+    appended,
+    issue: []const u8,
+};
+
+fn convertLearningRowsToEventsAlloc(allocator: std.mem.Allocator, bytes: []const u8) !ConvertedLearningRows {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
+    var repairs: std.ArrayList(MigrationRepair) = .empty;
+    errdefer repairs.deinit(allocator);
+    var issues: std.ArrayList(MigrationIssue) = .empty;
+    errdefer issues.deinit(allocator);
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(allocator);
+    var seen_ids = std.StringHashMap(void).init(allocator);
+    defer {
+        var key_it = seen_ids.keyIterator();
+        while (key_it.next()) |key| allocator.free(key.*);
+        seen_ids.deinit();
+    }
 
+    var records: usize = 0;
+    var blank_lines: usize = 0;
+    var recovered_multiline_records: usize = 0;
+    var pending_start_line: usize = 0;
+    var pending_end_line: usize = 0;
+    var fragment_state = JsonFragmentState{};
+    var line_number: usize = 0;
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |raw_line| {
+        line_number += 1;
         const line = std.mem.trim(u8, raw_line, " \t\r\n");
-        if (line.len == 0) continue;
-
-        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return error.InvalidJsonLine;
-        defer parsed.deinit();
-        const obj = switch (parsed.value) {
-            .object => |value| value,
-            else => return error.InvalidJsonLine,
-        };
-
-        if (learningEventRecordObject(obj)) |_| {
-            try out.appendSlice(allocator, line);
-            try out.append(allocator, '\n');
+        if (line.len == 0) {
+            blank_lines += 1;
+            if (pending.items.len > 0) {
+                try pending.append(allocator, '\n');
+                pending_end_line = line_number;
+            }
             continue;
         }
 
-        const id = jsonObjectString(obj, "id");
-        if (id.len == 0) return error.MissingLearningId;
-        const status = jsonObjectString(obj, "status");
+        if (pending.items.len == 0) {
+            pending_start_line = line_number;
+            fragment_state = .{};
+        } else {
+            if (try repairMissingOpeningKeyQuoteAlloc(allocator, pending.items, line)) |repaired_record| {
+                defer allocator.free(repaired_record);
+                const outcome = try appendConvertedLearningRecord(allocator, &out, &seen_ids, repaired_record);
+                switch (outcome) {
+                    .appended => {
+                        records += 1;
+                        recovered_multiline_records += 1;
+                        try repairs.append(allocator, .{
+                            .start_line = pending_start_line,
+                            .end_line = line_number,
+                            .repair = "insert_missing_opening_key_quote",
+                        });
+                    },
+                    .issue => |reason| try issues.append(allocator, .{
+                        .start_line = pending_start_line,
+                        .end_line = line_number,
+                        .reason = reason,
+                    }),
+                }
+                pending.clearRetainingCapacity();
+                fragment_state = .{};
+                continue;
+            }
+            try pending.append(allocator, '\n');
+        }
+        try pending.appendSlice(allocator, line);
+        pending_end_line = line_number;
+        fragment_state.scan(line);
 
+        if (fragment_state.in_string) {
+            try issues.append(allocator, .{
+                .start_line = pending_start_line,
+                .end_line = pending_end_line,
+                .reason = "MalformedJsonValue",
+            });
+            pending.clearRetainingCapacity();
+            fragment_state = .{};
+            continue;
+        }
+        if (fragment_state.depth != 0 and !fragment_state.invalid_closing) continue;
+
+        const outcome = try appendConvertedLearningRecord(allocator, &out, &seen_ids, pending.items);
+        switch (outcome) {
+            .appended => {
+                records += 1;
+                if (pending_end_line > pending_start_line) recovered_multiline_records += 1;
+            },
+            .issue => |reason| try issues.append(allocator, .{
+                .start_line = pending_start_line,
+                .end_line = pending_end_line,
+                .reason = reason,
+            }),
+        }
+        pending.clearRetainingCapacity();
+        fragment_state = .{};
+    }
+
+    if (pending.items.len > 0) {
+        try issues.append(allocator, .{
+            .start_line = pending_start_line,
+            .end_line = pending_end_line,
+            .reason = "UnexpectedEndOfInput",
+        });
+    }
+    if (bytes.len > 0 and bytes[bytes.len - 1] == '\n' and blank_lines > 0) blank_lines -= 1;
+
+    return .{
+        .bytes = try out.toOwnedSlice(allocator),
+        .records = records,
+        .blank_lines = blank_lines,
+        .recovered_multiline_records = recovered_multiline_records,
+        .repairs = repairs,
+        .issues = issues,
+    };
+}
+
+const LegacyMissingOpeningQuotePrefixes = [_][]const u8{
+    "id\":",
+    "captured_at\":",
+    "status\":",
+    "learning\":",
+    "evidence\":",
+    "application\":",
+    "context\":",
+    "source\":",
+    "fingerprint\":",
+    "tags\":",
+    "related_ids\":",
+    "supersedes_id\":",
+};
+
+fn repairMissingOpeningKeyQuoteAlloc(
+    allocator: std.mem.Allocator,
+    pending: []const u8,
+    continuation_line: []const u8,
+) !?[]u8 {
+    var recognized_prefix = false;
+    for (LegacyMissingOpeningQuotePrefixes) |prefix| {
+        if (std.mem.startsWith(u8, continuation_line, prefix)) {
+            recognized_prefix = true;
+            break;
+        }
+    }
+    if (!recognized_prefix) return null;
+
+    var candidate: std.ArrayList(u8) = .empty;
+    defer candidate.deinit(allocator);
+    try candidate.appendSlice(allocator, pending);
+    try candidate.append(allocator, '\n');
+    try candidate.append(allocator, '"');
+    try candidate.appendSlice(allocator, continuation_line);
+    const candidate_bytes = try candidate.toOwnedSlice(allocator);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, candidate_bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => {
+            allocator.free(candidate_bytes);
+            return error.OutOfMemory;
+        },
+        else => {
+            allocator.free(candidate_bytes);
+            return null;
+        },
+    };
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |value| value,
+        else => {
+            allocator.free(candidate_bytes);
+            return null;
+        },
+    };
+    if (learningIdFromObject(obj).len == 0) {
+        allocator.free(candidate_bytes);
+        return null;
+    }
+    return candidate_bytes;
+}
+
+fn appendConvertedLearningRecord(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    seen_ids: *std.StringHashMap(void),
+    record_bytes: []const u8,
+) !RecordConversion {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, record_bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .{ .issue = @errorName(err) },
+    };
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |value| value,
+        else => return .{ .issue = "NonObjectJson" },
+    };
+    const id = learningIdFromObject(obj);
+    if (id.len == 0) return .{ .issue = "MissingLearningId" };
+    if (seen_ids.contains(id)) return .{ .issue = "DuplicateLearningId" };
+
+    const normalized_record = try stringifyJsonValueAlloc(allocator, parsed.value);
+    defer allocator.free(normalized_record);
+    if (learningEventRecordObject(obj) != null) {
+        try out.appendSlice(allocator, normalized_record);
+        try out.append(allocator, '\n');
+    } else {
+        const status = jsonObjectString(obj, "status");
         try out.appendSlice(allocator, "{\"v\":1,\"source\":\"learnings\",\"event\":\"learning.capture\",\"learning_id\":");
-        try appendJsonString(allocator, &out, id);
+        try appendJsonString(allocator, out, id);
         try out.appendSlice(allocator, ",\"status\":");
-        try appendJsonString(allocator, &out, status);
+        try appendJsonString(allocator, out, status);
         try out.appendSlice(allocator, ",\"record\":");
-        try out.appendSlice(allocator, line);
+        try out.appendSlice(allocator, normalized_record);
         try out.appendSlice(allocator, "}\n");
     }
 
-    return out.toOwnedSlice(allocator);
+    try seen_ids.put(try allocator.dupe(u8, id), {});
+    return .appended;
+}
+
+fn stringifyJsonValueAlloc(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(value, .{}, &out.writer);
+    return out.toOwnedSlice();
+}
+
+fn inspectCanonicalJsonlAlloc(allocator: std.mem.Allocator, bytes: []const u8) !StoreInspection {
+    var inspection = StoreInspection{};
+    errdefer inspection.deinit(allocator);
+    var seen_ids = std.StringHashMap(void).init(allocator);
+    defer {
+        var key_it = seen_ids.keyIterator();
+        while (key_it.next()) |key| allocator.free(key.*);
+        seen_ids.deinit();
+    }
+
+    var line_number: usize = 0;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |raw_line| {
+        line_number += 1;
+        const line = std.mem.trim(u8, raw_line, " \t\r\n");
+        if (line.len == 0) {
+            inspection.blank_lines += 1;
+            continue;
+        }
+
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                try inspection.issues.append(allocator, .{ .start_line = line_number, .end_line = line_number, .reason = @errorName(err) });
+                continue;
+            },
+        };
+        defer parsed.deinit();
+        const obj = switch (parsed.value) {
+            .object => |value| value,
+            else => {
+                try inspection.issues.append(allocator, .{ .start_line = line_number, .end_line = line_number, .reason = "NonObjectJson" });
+                continue;
+            },
+        };
+        const id = learningIdFromObject(obj);
+        if (id.len == 0) {
+            try inspection.issues.append(allocator, .{ .start_line = line_number, .end_line = line_number, .reason = "MissingLearningId" });
+            continue;
+        }
+        if (seen_ids.contains(id)) {
+            try inspection.issues.append(allocator, .{ .start_line = line_number, .end_line = line_number, .reason = "DuplicateLearningId" });
+            continue;
+        }
+        try seen_ids.put(try allocator.dupe(u8, id), {});
+        inspection.records += 1;
+    }
+    if (bytes.len > 0 and bytes[bytes.len - 1] == '\n' and inspection.blank_lines > 0) inspection.blank_lines -= 1;
+    return inspection;
 }
 
 fn appendJsonString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
@@ -1490,6 +2051,7 @@ fn validateJsonlBytes(allocator: std.mem.Allocator, bytes: []const u8) !JsonlSta
         gop.value_ptr.* = try allocator.dupe(u8, line);
         stats.records += 1;
     }
+    if (bytes.len > 0 and bytes[bytes.len - 1] == '\n' and stats.blank_lines > 0) stats.blank_lines -= 1;
 
     return stats;
 }
@@ -4946,6 +5508,86 @@ test "migrate copies legacy rows preserving byte content" {
     const copied = try durable_store.readFileAlloc(std.testing.allocator, target_path, MaxLearningsBytes);
     defer std.testing.allocator.free(copied);
     try std.testing.expectEqualStrings(payload, copied);
+}
+
+test "migrate parser accepts source-preserving invalid-record skip policy" {
+    const argv = [_][]const u8{ ProgramName, "migrate", "--invalid-policy", "skip", "--mode", "copy" };
+    const parsed = try parseArgs(&argv);
+    try std.testing.expectEqual(InvalidPolicy.skip, parsed.invalid_policy);
+
+    const move_argv = [_][]const u8{ ProgramName, "migrate", "--invalid-policy", "skip", "--mode", "move" };
+    try std.testing.expectError(error.UnsafeSkipPolicy, parseArgs(&move_argv));
+
+    const remove_argv = [_][]const u8{ ProgramName, "migrate", "--invalid-policy", "skip", "--remove-legacy" };
+    try std.testing.expectError(error.UnsafeSkipPolicy, parseArgs(&remove_argv));
+    try std.testing.expectEqualStrings("would_migrate", migrationStatus("would_migrate", 0));
+    try std.testing.expectEqualStrings("would_migrate_with_skips", migrationStatus("would_migrate", 1));
+}
+
+test "migrate recovers a legacy JSON object split across physical lines" {
+    const payload =
+        "{\"id\":\"lrn-1\",\"captured_at\":\"2026-06-21T00:00:00Z\",\"status\":\"do_more\",\"learning\":\"When migrating, recover logical JSON values.\",\"evidence\":[],\"application\":\"Parse values, not lines.\",\"context\":{\"repo\":\"r\",\"branch\":\"main\",\"paths\":[]},\"fingerprint\":\"fp\",\n" ++
+        "\"tags\":[\"migration\"],\"related_ids\":[]}\n";
+    var conversion = try convertLearningRowsToEventsAlloc(std.testing.allocator, payload);
+    defer conversion.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), conversion.records);
+    try std.testing.expectEqual(@as(usize, 1), conversion.recovered_multiline_records);
+    try std.testing.expectEqual(@as(usize, 0), conversion.issues.items.len);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, conversion.bytes, "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, conversion.bytes, "\"tags\":[\"migration\"]") != null);
+
+    var stats = try validateJsonlBytes(std.testing.allocator, conversion.bytes);
+    defer stats.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), stats.records);
+}
+
+test "migrate repairs a uniquely valid missing opening quote on a known continuation key" {
+    const payload =
+        "{\"id\":\"lrn-1\",\"status\":\"do_more\",\"fingerprint\":\"fp\",\n" ++
+        "tags\":[\"migration\"]}\n";
+    var conversion = try convertLearningRowsToEventsAlloc(std.testing.allocator, payload);
+    defer conversion.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), conversion.records);
+    try std.testing.expectEqual(@as(usize, 1), conversion.recovered_multiline_records);
+    try std.testing.expectEqual(@as(usize, 1), conversion.repairs.items.len);
+    try std.testing.expectEqualStrings("insert_missing_opening_key_quote", conversion.repairs.items[0].repair);
+    try std.testing.expectEqual(@as(usize, 0), conversion.issues.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, conversion.bytes, "\"tags\":[\"migration\"]") != null);
+}
+
+test "migrate isolates irreparable records and retains later valid records" {
+    const payload =
+        "{bad json}\n" ++
+        "{\"id\":\"lrn-2\",\"status\":\"do_more\",\"learning\":\"Keep valid rows.\"}\n";
+    var conversion = try convertLearningRowsToEventsAlloc(std.testing.allocator, payload);
+    defer conversion.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), conversion.records);
+    try std.testing.expectEqual(@as(usize, 1), conversion.issues.items.len);
+    try std.testing.expectEqual(@as(usize, 1), conversion.issues.items[0].start_line);
+    try std.testing.expectEqual(@as(usize, 1), conversion.issues.items[0].end_line);
+    try std.testing.expect(std.mem.indexOf(u8, conversion.bytes, "lrn-2") != null);
+
+    var stats = try validateJsonlBytes(std.testing.allocator, conversion.bytes);
+    defer stats.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), stats.records);
+}
+
+test "doctor inspection reports canonical issue line spans" {
+    const payload =
+        "{\"id\":\"lrn-1\"}\n" ++
+        "{bad json}\n" ++
+        "{\"id\":\"lrn-1\"}\n";
+    var inspection = try inspectCanonicalJsonlAlloc(std.testing.allocator, payload);
+    defer inspection.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), inspection.records);
+    try std.testing.expectEqual(@as(usize, 2), inspection.issues.items.len);
+    try std.testing.expectEqual(@as(usize, 2), inspection.issues.items[0].start_line);
+    try std.testing.expectEqualStrings("DuplicateLearningId", inspection.issues.items[1].reason);
+    try std.testing.expectEqual(@as(usize, 3), inspection.issues.items[1].end_line);
 }
 
 test "migrate refuses invalid JSONL" {

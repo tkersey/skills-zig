@@ -224,6 +224,22 @@ Learning path migration:
 ledger migrate --source learnings --mode copy
 ```
 
+The learnings migrator groups physical lines into logical JSON objects, reports
+verified repairs and invalid line spans, and rejects irreparable records by
+default. When preserving the legacy source is acceptable, an explicit copy-only
+policy can migrate valid records and report the skipped spans:
+
+```bash
+ledger migrate --source learnings --dry-run --mode copy --invalid-policy skip
+ledger migrate --source learnings --mode copy --invalid-policy skip
+```
+
+Successful partial migrations use a `*_with_skips` receipt status so omission
+cannot be mistaken for a lossless migration.
+
+`ledger doctor --source learnings` validates the selected canonical or legacy
+store and exits nonzero when its JSON receipt has `status: "invalid"`.
+
 This converts legacy rows from `.ledger/learnings/learnings.jsonl` or `.learnings.jsonl` into event envelopes:
 
 ```json
