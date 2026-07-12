@@ -18,7 +18,7 @@ const UsageText =
     \\Purely validate one governance or review artifact. This command never reads or writes .ledger and never grants authority.
     \\
     \\contracts:
-    \\  actuation-review-policy  Check an actuation-review-policy/v1 snapshot
+    \\  actuation-review-policy  Check an actuation-review-policy/v1 or v2 snapshot
     \\  plan-source-contract       Validate a PSC-v1 plan source contract
     \\  policy-synthesis-receipt  Validate a PSR-v1 policy synthesis receipt
     \\  review-fold               Validate an RF-v2 review-fold receipt
