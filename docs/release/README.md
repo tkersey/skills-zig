@@ -8,6 +8,7 @@ This monorepo uses independent GitHub Actions release workflows per CLI:
 - `cron`: `.github/workflows/release-cron.yml` on tag `cron-v*`
 - `ledger`: `.github/workflows/release-ledger.yml` on tag `ledger-v*`
 - `memory-note`: `.github/workflows/release-memory-note.yml` on tag `memory-note-v*`
+- `img`: `.github/workflows/release-img.yml` on tag `img-v*`
 
 Per-app VERSION files:
 
@@ -17,6 +18,7 @@ Per-app VERSION files:
 - `apps/cron/VERSION`
 - `apps/ledger/VERSION`
 - `apps/memory-note/VERSION`
+- `apps/img/VERSION`
 
 Release contract:
 
@@ -39,8 +41,9 @@ Release tags must match file versions:
 - `cron-v<version>` where `<version>` equals `apps/cron/VERSION`
 - `ledger-v<version>` where `<version>` equals `apps/ledger/VERSION`
 - `memory-note-v<version>` where `<version>` equals `apps/memory-note/VERSION`
+- `img-v<version>` where `<version>` equals `apps/img/VERSION` (`img-v0.1.0` for the initial release)
 
-Each workflow builds only binaries from its own CLI path and publishes two release archives:
+Each workflow builds only binaries from its own CLI path and publishes two release archives. The `img` archives also carry `apps/img/LICENSES/**` beside the binary so the embedded-font and upstream notices survive distribution:
 
 - `<tag>-linux-x86_64.tar.gz`
 - `<tag>-darwin-arm64.tar.gz`
@@ -59,6 +62,8 @@ Examples:
 - `ledger-v1.2.3-darwin-arm64.tar.gz`
 - `memory-note-v1.2.3-linux-x86_64.tar.gz`
 - `memory-note-v1.2.3-darwin-arm64.tar.gz`
+- `img-v0.1.0-linux-x86_64.tar.gz`
+- `img-v0.1.0-darwin-arm64.tar.gz`
 
 ## Homebrew Tap Handoff
 
@@ -83,6 +88,7 @@ Use explicit queue checks first:
 ```bash
 gh run list --workflow release-seq.yml --status queued --limit 20
 gh run list --workflow release-ledger.yml --status queued --limit 20
+gh run list --workflow release-img.yml --status queued --limit 20
 gh run view <run-id> --json status,jobs,headBranch,createdAt
 ```
 

@@ -17,6 +17,7 @@ apps=(
   cron
   ledger
   memory-note
+  img
 )
 
 resolve_ref() {
@@ -239,7 +240,10 @@ case "$mode" in
         .github/workflows/release-memory-note.yml)
           mark_app memory-note
           ;;
-        apps/seq/README.md|apps/lift/README.md|apps/cas/README.md|apps/cron/README.md|apps/learnings/README.md|apps/ledger/README.md|apps/memory-note/README.md)
+        .github/workflows/release-img.yml)
+          mark_app img
+          ;;
+        apps/seq/README.md|apps/lift/README.md|apps/cas/README.md|apps/cron/README.md|apps/learnings/README.md|apps/ledger/README.md|apps/memory-note/README.md|apps/img/README.md)
           ;;
         apps/seq/*)
           mark_app seq
@@ -264,6 +268,9 @@ case "$mode" in
           ;;
         apps/memory-note/*)
           mark_app memory-note
+          ;;
+        apps/img/*)
+          mark_app img
           ;;
       esac
     done < <(git diff --name-only "$base" "$head")

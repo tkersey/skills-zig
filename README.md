@@ -10,6 +10,7 @@ Monorepo for Zig CLIs with shared internal libraries and independent release str
 - `cron` (`cron`)
 - `ledger` (`ledger`, including `ledger --source actuation`, source-memory namespaces, and pure `ledger validate` governance checks)
 - `memory-note` (`memory-note`)
+- `img` (pure-Zig document and source-code PNG rendering)
 
 No unified umbrella CLI is introduced. Binaries remain separate.
 
@@ -23,6 +24,7 @@ No unified umbrella CLI is introduced. Binaries remain separate.
 - `apps/synesthesia` (ledger-owned internal Synesthesia source)
 - `apps/ledger` (including the internal actuation kernel and stateless governance validators)
 - `apps/memory-note`
+- `apps/img`
 - `libs/core`
 - `libs/durable_store`
 - `.github/workflows`
@@ -49,6 +51,7 @@ zig build build-cas -Doptimize=ReleaseFast
 zig build build-cron -Doptimize=ReleaseFast
 zig build build-ledger -Doptimize=ReleaseFast
 zig build build-memory-note -Doptimize=ReleaseFast
+zig build build-img -Doptimize=ReleaseFast
 ```
 
 Run helpers:
@@ -58,6 +61,7 @@ zig build -Doptimize=ReleaseFast
 ./zig-out/bin/seq --help
 ./zig-out/bin/bench_stats --help
 ./zig-out/bin/cas_smoke_check --help
+./zig-out/bin/img --help
 ```
 
 ## Local Perf
@@ -94,6 +98,7 @@ Per-app VERSION files are the source of truth:
 - `apps/cron/VERSION`
 - `apps/ledger/VERSION`
 - `apps/memory-note/VERSION`
+- `apps/img/VERSION`
 
 PRs that touch release-relevant CLI surfaces must bump the corresponding `VERSION` file.
 The check is conservative: app-local changes count for that app, `apps/learnings/**` and `apps/synesthesia/**` count for `ledger`, broad shared shipped surfaces such as `build.zig`, `build.zig.zon`, and `libs/core/**` count for every shipped CLI, and `libs/durable_store/**` counts for its shipped consumers.
@@ -108,6 +113,7 @@ Independent tags trigger independent workflows, and each tag must match its app 
 - `cron-v*` -> `.github/workflows/release-cron.yml`
 - `ledger-v*` -> `.github/workflows/release-ledger.yml`
 - `memory-note-v*` -> `.github/workflows/release-memory-note.yml`
+- `img-v*` -> `.github/workflows/release-img.yml`
 
 Pushes to `main` auto-create any missing release tags for changed `VERSION` files and dispatch the matching release workflow.
 Manual tag pushes still work, but they are no longer the only path.
@@ -120,6 +126,7 @@ Required tag forms:
 - `cron-v<version>` where `<version>` equals `apps/cron/VERSION`
 - `ledger-v<version>` where `<version>` equals `apps/ledger/VERSION`
 - `memory-note-v<version>` where `<version>` equals `apps/memory-note/VERSION`
+- `img-v<version>` where `<version>` equals `apps/img/VERSION` (`img-v0.1.0` for the initial release)
 
 Artifacts are published as:
 
