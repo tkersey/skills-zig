@@ -770,14 +770,15 @@ pub fn build(b: *std.Build) void {
             b,
             cas_trial_tests_root,
             "test-cas-trial-macos-runtime",
-            "Run macOS CAS trial descriptor, cwd, deadline, and descendant-cleanup laws",
+            "Run macOS CAS trial descriptor, cwd, timeout, and directly supervised process laws",
             .{
                 .link_libc = true,
                 .filters = &.{
                     "executor inherits only standard allowlisted descriptors",
                     "executor runs in the requested isolated cwd",
                     "executor deadline kills and reaps a hung child",
-                    "nonzero executor cannot leave a descendant after terminal observation",
+                    "advisory group STOP permission failure skips census and still proves kill reap and absence",
+                    "nonzero executor preserves the directly supervised terminal observation",
                 },
             },
         );

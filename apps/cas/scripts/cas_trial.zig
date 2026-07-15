@@ -4308,48 +4308,103 @@ fn superviseExecutorProcessAlloc(
     };
 }
 
+const ExecutorTerminationFault = enum {
+    none,
+    group_stop_permission_denied,
+};
+
+const ExecutorTerminationProbe = struct {
+    descendant_census_attempted: bool = false,
+};
+
 fn terminateAndReapExecutorGroup(allocator: std.mem.Allocator, pid: std.posix.pid_t) !void {
+    return terminateAndReapExecutorGroupWithFault(allocator, pid, .none, null);
+}
+
+fn terminateAndReapExecutorGroupWithFault(
+    allocator: std.mem.Allocator,
+    pid: std.posix.pid_t,
+    fault: ExecutorTerminationFault,
+    probe: ?*ExecutorTerminationProbe,
+) !void {
     const stop_result = std.posix.system.kill(pid, .STOP);
-    switch (std.posix.errno(stop_result)) {
-        .SUCCESS, .SRCH => {},
-        else => return error.ExecutorGroupKillFailed,
-    }
-    const stop_group_result = std.posix.system.kill(-pid, .STOP);
-    switch (std.posix.errno(stop_group_result)) {
-        .SUCCESS, .SRCH => {},
-        else => return error.ExecutorGroupKillFailed,
-    }
+    const direct_stop_succeeded = std.posix.errno(stop_result) == .SUCCESS;
+    const group_stop_errno: std.posix.E = if (fault == .group_stop_permission_denied)
+        .PERM
+    else
+        std.posix.errno(std.posix.system.kill(-pid, .STOP));
+    const group_stop_succeeded = group_stop_errno == .SUCCESS;
+    // STOP narrows the descendant-enumeration race, but it is preparatory: a
+    // denial must not suppress the mandatory kill, reap, and absence proof.
     var descendants: std.ArrayList(std.posix.pid_t) = .empty;
     defer descendants.deinit(allocator);
-    collectDarwinDescendants(allocator, pid, &descendants, 0) catch {};
-    const signal_result = std.posix.system.kill(pid, .KILL);
-    switch (std.posix.errno(signal_result)) {
-        .SUCCESS, .SRCH => {},
-        else => return error.ExecutorGroupKillFailed,
+    if (direct_stop_succeeded and group_stop_succeeded) {
+        if (probe) |termination_probe| termination_probe.descendant_census_attempted = true;
+        collectDarwinDescendants(allocator, pid, &descendants, 0) catch {};
     }
+
+    // Group and direct KILL are both attempted. Their syscall results are not
+    // terminal observations; the bounded reap-and-absence proof below is.
+    _ = std.posix.system.kill(-pid, .KILL);
+    _ = std.posix.system.kill(pid, .KILL);
+    var descendant_kill_failed = false;
     var descendant_index = descendants.items.len;
     while (descendant_index != 0) {
         descendant_index -= 1;
         const descendant_result = std.posix.system.kill(descendants.items[descendant_index], .KILL);
         switch (std.posix.errno(descendant_result)) {
             .SUCCESS, .SRCH => {},
-            else => return error.ExecutorGroupKillFailed,
+            else => descendant_kill_failed = true,
         }
     }
-    try killExecutorGroup(pid);
-    var status: c_int = undefined;
-    while (true) switch (std.posix.errno(std.posix.system.waitpid(pid, &status, 0))) {
-        .SUCCESS, .CHILD => break,
-        .INTR => continue,
-        else => return error.ExecutorWaitFailed,
-    };
-    try waitExecutorGroupGone(pid);
+    try waitExecutorChildReapedAndGroupGone(pid);
+    if (descendant_kill_failed) return error.ExecutorGroupKillFailed;
+}
+
+fn waitExecutorChildReapedAndGroupGone(pid: std.posix.pid_t) !void {
+    const deadline = std.Io.Clock.awake.now(defaultIo()).addDuration(.fromMilliseconds(2_000));
+    var child_reaped = false;
+    var group_gone = false;
+    var child_wait_failed = false;
+    var group_wait_failed = false;
+    while (true) {
+        if (!child_reaped) {
+            var status: c_int = undefined;
+            const wait_result = std.posix.system.waitpid(pid, &status, std.posix.W.NOHANG);
+            switch (std.posix.errno(wait_result)) {
+                .SUCCESS => {
+                    if (wait_result == pid) child_reaped = true;
+                },
+                .CHILD => child_reaped = true,
+                .INTR => {},
+                else => child_wait_failed = true,
+            }
+        }
+        if (!group_gone) {
+            const group_result = std.c.kill(-pid, @enumFromInt(0));
+            switch (std.posix.errno(group_result)) {
+                .SRCH => group_gone = true,
+                .SUCCESS, .PERM => {},
+                else => group_wait_failed = true,
+            }
+        }
+        if (child_reaped and group_gone) return;
+        if (std.Io.Clock.awake.now(defaultIo()).nanoseconds >= deadline.nanoseconds) {
+            if (!child_reaped or child_wait_failed) return error.ExecutorWaitFailed;
+            if (group_wait_failed) return error.ExecutorGroupWaitFailed;
+            return error.ExecutorGroupStillAlive;
+        }
+        std.Io.sleep(defaultIo(), .fromMilliseconds(ExecutorPollIntervalMs), .awake) catch {};
+    }
 }
 
 fn proveExecutorTerminationAfterFailure(allocator: std.mem.Allocator, pid: std.posix.pid_t) !void {
     const retry_deadline = std.Io.Clock.awake.now(defaultIo()).addDuration(.fromMilliseconds(2_000));
     while (true) {
-        terminateAndReapExecutorGroup(allocator, pid) catch {
+        terminateAndReapExecutorGroup(allocator, pid) catch |termination_error| {
+            if (termination_error == error.ExecutorGroupKillFailed) {
+                return error.ExecutorLivenessUnproved;
+            }
             if (std.Io.Clock.awake.now(defaultIo()).nanoseconds >= retry_deadline.nanoseconds) {
                 return error.ExecutorLivenessUnproved;
             }
@@ -8799,6 +8854,65 @@ test "executor deadline kills and reaps a hung child" {
     const late = try std.fmt.allocPrint(std.testing.allocator, "{s}.late", .{result});
     defer std.testing.allocator.free(late);
     try std.testing.expect(!pathExists(late));
+}
+
+test "advisory group STOP permission failure skips census and still proves kill reap and absence" {
+    var ready_pipe: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&ready_pipe) != 0) return error.TestFdSetupFailed;
+    const child_pid = std.c.fork();
+    if (child_pid < 0) {
+        closeRawFd(ready_pipe[0]);
+        closeRawFd(ready_pipe[1]);
+        return error.TestForkFailed;
+    }
+    if (child_pid == 0) {
+        _ = std.c.close(ready_pipe[0]);
+        if (std.c.setpgid(0, 0) != 0) std.c._exit(91);
+        var ready = [_]u8{1};
+        if (std.c.write(ready_pipe[1], &ready, ready.len) != ready.len) std.c._exit(92);
+        _ = std.c.close(ready_pipe[1]);
+        const sleep_time = std.c.timespec{ .sec = 5, .nsec = 0 };
+        _ = std.c.nanosleep(&sleep_time, null);
+        std.c._exit(0);
+    }
+
+    closeRawFd(ready_pipe[1]);
+    var termination_complete = false;
+    defer if (!termination_complete) {
+        _ = std.posix.system.kill(-child_pid, .KILL);
+        _ = std.posix.system.kill(child_pid, .KILL);
+        var status: c_int = undefined;
+        while (true) switch (std.posix.errno(std.posix.system.waitpid(child_pid, &status, 0))) {
+            .SUCCESS, .CHILD => break,
+            .INTR => continue,
+            else => break,
+        };
+    };
+    var ready: [1]u8 = undefined;
+    if (std.c.read(ready_pipe[0], &ready, ready.len) != ready.len) {
+        closeRawFd(ready_pipe[0]);
+        return error.TestFdSetupFailed;
+    }
+    closeRawFd(ready_pipe[0]);
+
+    var termination_probe: ExecutorTerminationProbe = .{};
+    try terminateAndReapExecutorGroupWithFault(
+        std.testing.allocator,
+        child_pid,
+        .group_stop_permission_denied,
+        &termination_probe,
+    );
+    termination_complete = true;
+    try std.testing.expect(!termination_probe.descendant_census_attempted);
+    var status: c_int = undefined;
+    try std.testing.expectEqual(
+        std.posix.E.CHILD,
+        std.posix.errno(std.posix.system.waitpid(child_pid, &status, std.posix.W.NOHANG)),
+    );
+    try std.testing.expectEqual(
+        std.posix.E.SRCH,
+        std.posix.errno(std.c.kill(-child_pid, @enumFromInt(0))),
+    );
 }
 
 test "nonzero executor preserves the directly supervised terminal observation" {
