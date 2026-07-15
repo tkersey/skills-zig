@@ -8,6 +8,37 @@ const hctp_fixtures = @import("hctp_fixtures");
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
+// Darwin's public proc_bsdshortinfo ABI from sys/proc_info.h. CAS is a
+// macOS-only product surface, and the existing libc link exports libproc.
+const DarwinProcessShortInfo = extern struct {
+    pid: u32,
+    parent_pid: u32,
+    process_group_id: u32,
+    status: u32,
+    command: [16]u8,
+    flags: u32,
+    uid: u32,
+    gid: u32,
+    real_uid: u32,
+    real_gid: u32,
+    saved_uid: u32,
+    saved_gid: u32,
+    reserved: u32,
+};
+
+extern "c" fn proc_listpgrppids(
+    process_group_id: std.posix.pid_t,
+    buffer: ?*anyopaque,
+    buffer_size: c_int,
+) c_int;
+extern "c" fn proc_pidinfo(
+    pid: c_int,
+    flavor: c_int,
+    arg: u64,
+    buffer: *anyopaque,
+    buffer_size: c_int,
+) c_int;
+
 const adapter = retrace_core.hctp_adapter;
 const attestation = retrace_core.hctp_attestation;
 const Version = core_cli.normalizeVersion(app_meta.version);
@@ -15,12 +46,25 @@ const MaxInputBytes = 64 * 1024 * 1024;
 const MaxTargetCarrierBytes = 96 * 1024 * 1024;
 const ExecutorPollIntervalMs: i64 = 10;
 const ExecutorPostReapDrainGraceMs: i64 = 250;
+const DarwinProcessShortInfoFlavor: c_int = 13;
+const DarwinZombieProcessStatus: u32 = 5;
+const MaxExecutorGroupCensusPids: usize = 65_536;
 const StagedExecutableMode: std.posix.mode_t = 0o500;
 const ExecutableStoreMode: std.posix.mode_t = 0o700;
 // Darwin sys/stat.h SF_RESTRICTED. Zig 0.16 exposes st_flags but not this SDK
 // constant. Restricted Apple platform code cannot execute from a byte-identical
 // user-owned staging path, so it is rejected before the lane is claimed.
 const MacOSRestrictedFileFlag: u32 = 0x00080000;
+
+comptime {
+    if (@sizeOf(DarwinProcessShortInfo) != 64 or
+        @offsetOf(DarwinProcessShortInfo, "pid") != 0 or
+        @offsetOf(DarwinProcessShortInfo, "process_group_id") != 8 or
+        @offsetOf(DarwinProcessShortInfo, "status") != 12)
+    {
+        @compileError("Darwin proc_bsdshortinfo ABI changed");
+    }
+}
 
 const UsageText =
     \\cas_trial
@@ -4221,7 +4265,7 @@ fn superviseExecutorProcessAlloc(
             child_reaped = true;
             residual_group_terminated = true;
         } else if (child_reaped and !residual_group_terminated) {
-            proveResidualExecutorGroupGone(pid) catch
+            proveResidualExecutorGroupQuiescent(allocator, pid) catch
                 return error.ExecutorLivenessUnproved;
             residual_group_terminated = true;
         }
@@ -4335,7 +4379,8 @@ fn terminateAndReapExecutorGroupWithFault(
         std.posix.errno(std.posix.system.kill(-pid, .STOP));
     const group_stop_succeeded = group_stop_errno == .SUCCESS;
     // STOP narrows the descendant-enumeration race, but it is preparatory: a
-    // denial must not suppress the mandatory kill, reap, and absence proof.
+    // denial must not suppress mandatory kill, direct-child reap, and terminal
+    // group-quiescence proof.
     var descendants: std.ArrayList(std.posix.pid_t) = .empty;
     defer descendants.deinit(allocator);
     if (direct_stop_succeeded and group_stop_succeeded) {
@@ -4344,7 +4389,7 @@ fn terminateAndReapExecutorGroupWithFault(
     }
 
     // Group and direct KILL are both attempted. Their syscall results are not
-    // terminal observations; the bounded reap-and-absence proof below is.
+    // terminal observations; the bounded reap-and-quiescence proof below is.
     _ = std.posix.system.kill(-pid, .KILL);
     _ = std.posix.system.kill(pid, .KILL);
     var descendant_kill_failed = false;
@@ -4357,14 +4402,77 @@ fn terminateAndReapExecutorGroupWithFault(
             else => descendant_kill_failed = true,
         }
     }
-    try waitExecutorChildReapedAndGroupGone(pid);
+    try waitExecutorChildReapedAndGroupQuiescent(allocator, pid);
     if (descendant_kill_failed) return error.ExecutorGroupKillFailed;
 }
 
-fn waitExecutorChildReapedAndGroupGone(pid: std.posix.pid_t) !void {
+const ExecutorGroupObservation = enum {
+    absent,
+    terminal_zombies_only,
+    live_members,
+};
+
+fn observeExecutorGroupAlloc(
+    allocator: std.mem.Allocator,
+    process_group_id: std.posix.pid_t,
+) !ExecutorGroupObservation {
+    std.c._errno().* = 0;
+    const capacity_result = proc_listpgrppids(process_group_id, null, 0);
+    if (capacity_result <= 0 or std.c._errno().* != 0) {
+        return error.ExecutorProcessInspectionFailed;
+    }
+    const capacity: usize = @intCast(capacity_result);
+    if (capacity > MaxExecutorGroupCensusPids) {
+        return error.ExecutorProcessInspectionFailed;
+    }
+    const pids = try allocator.alloc(std.posix.pid_t, capacity);
+    defer allocator.free(pids);
+    const buffer_size = std.math.cast(c_int, std.math.mul(usize, capacity, @sizeOf(std.posix.pid_t)) catch
+        return error.ExecutorProcessInspectionFailed) orelse
+        return error.ExecutorProcessInspectionFailed;
+
+    std.c._errno().* = 0;
+    const count_result = proc_listpgrppids(process_group_id, pids.ptr, buffer_size);
+    if (count_result < 0 or std.c._errno().* != 0) {
+        return error.ExecutorProcessInspectionFailed;
+    }
+    const count: usize = @intCast(count_result);
+    if (count > capacity or count == capacity) {
+        return error.ExecutorProcessInspectionFailed;
+    }
+    if (count == 0) return .absent;
+
+    for (pids[0..count]) |listed_pid| {
+        if (listed_pid <= 0) return error.ExecutorProcessInspectionFailed;
+        var process_info: DarwinProcessShortInfo = undefined;
+        std.c._errno().* = 0;
+        const info_size = proc_pidinfo(
+            listed_pid,
+            DarwinProcessShortInfoFlavor,
+            1, // Search both the live and zombie process tables.
+            &process_info,
+            @sizeOf(DarwinProcessShortInfo),
+        );
+        if (info_size != @sizeOf(DarwinProcessShortInfo) or std.c._errno().* != 0) {
+            return error.ExecutorProcessInspectionFailed;
+        }
+        if (process_info.pid != @as(u32, @intCast(listed_pid)) or
+            process_info.process_group_id != @as(u32, @intCast(process_group_id)))
+        {
+            return error.ExecutorProcessInspectionFailed;
+        }
+        if (process_info.status != DarwinZombieProcessStatus) return .live_members;
+    }
+    return .terminal_zombies_only;
+}
+
+fn waitExecutorChildReapedAndGroupQuiescent(
+    allocator: std.mem.Allocator,
+    pid: std.posix.pid_t,
+) !void {
     const deadline = std.Io.Clock.awake.now(defaultIo()).addDuration(.fromMilliseconds(2_000));
     var child_reaped = false;
-    var group_gone = false;
+    var group_terminal = false;
     var child_wait_failed = false;
     var group_wait_failed = false;
     while (true) {
@@ -4380,15 +4488,14 @@ fn waitExecutorChildReapedAndGroupGone(pid: std.posix.pid_t) !void {
                 else => child_wait_failed = true,
             }
         }
-        if (!group_gone) {
-            const group_result = std.c.kill(-pid, @enumFromInt(0));
-            switch (std.posix.errno(group_result)) {
-                .SRCH => group_gone = true,
-                .SUCCESS, .PERM => {},
-                else => group_wait_failed = true,
-            }
+        if (!group_terminal) {
+            const observation = observeExecutorGroupAlloc(allocator, pid) catch blk: {
+                group_wait_failed = true;
+                break :blk ExecutorGroupObservation.live_members;
+            };
+            group_terminal = observation == .absent or observation == .terminal_zombies_only;
         }
-        if (child_reaped and group_gone) return;
+        if (child_reaped and group_terminal) return;
         if (std.Io.Clock.awake.now(defaultIo()).nanoseconds >= deadline.nanoseconds) {
             if (!child_reaped or child_wait_failed) return error.ExecutorWaitFailed;
             if (group_wait_failed) return error.ExecutorGroupWaitFailed;
@@ -4449,15 +4556,15 @@ fn collectDarwinDescendants(
     }
 }
 
-fn terminateResidualExecutorGroup(pid: std.posix.pid_t) !void {
+fn terminateResidualExecutorGroup(allocator: std.mem.Allocator, pid: std.posix.pid_t) !void {
     try killExecutorGroup(pid);
-    try waitExecutorGroupGone(pid);
+    try waitExecutorGroupQuiescent(allocator, pid);
 }
 
-fn proveResidualExecutorGroupGone(pid: std.posix.pid_t) !void {
+fn proveResidualExecutorGroupQuiescent(allocator: std.mem.Allocator, pid: std.posix.pid_t) !void {
     const retry_deadline = std.Io.Clock.awake.now(defaultIo()).addDuration(.fromMilliseconds(2_000));
     while (true) {
-        terminateResidualExecutorGroup(pid) catch {
+        terminateResidualExecutorGroup(allocator, pid) catch {
             if (std.Io.Clock.awake.now(defaultIo()).nanoseconds >= retry_deadline.nanoseconds) {
                 return error.ExecutorLivenessUnproved;
             }
@@ -4471,20 +4578,20 @@ fn proveResidualExecutorGroupGone(pid: std.posix.pid_t) !void {
 fn killExecutorGroup(pid: std.posix.pid_t) !void {
     const result = std.posix.system.kill(-pid, .KILL);
     switch (std.posix.errno(result)) {
-        .SUCCESS, .SRCH => {},
+        // A zombie-only Darwin process group can return PERM even though no
+        // member can execute. The mandatory state observation below owns the
+        // terminal decision and still rejects every live or unknown member.
+        .SUCCESS, .SRCH, .PERM => {},
         else => return error.ExecutorGroupKillFailed,
     }
 }
 
-fn waitExecutorGroupGone(pid: std.posix.pid_t) !void {
+fn waitExecutorGroupQuiescent(allocator: std.mem.Allocator, pid: std.posix.pid_t) !void {
     const deadline = std.Io.Clock.awake.now(defaultIo()).addDuration(.fromMilliseconds(2_000));
     while (true) {
-        const result = std.c.kill(-pid, @enumFromInt(0));
-        switch (std.posix.errno(result)) {
-            .SRCH => return,
-            .SUCCESS, .PERM => {},
-            else => return error.ExecutorGroupWaitFailed,
-        }
+        const observation = observeExecutorGroupAlloc(allocator, pid) catch
+            return error.ExecutorGroupWaitFailed;
+        if (observation == .absent or observation == .terminal_zombies_only) return;
         if (std.Io.Clock.awake.now(defaultIo()).nanoseconds >= deadline.nanoseconds) {
             return error.ExecutorGroupStillAlive;
         }
@@ -8854,6 +8961,126 @@ test "executor deadline kills and reaps a hung child" {
     const late = try std.fmt.allocPrint(std.testing.allocator, "{s}.late", .{result});
     defer std.testing.allocator.free(late);
     try std.testing.expect(!pathExists(late));
+}
+
+test "zombie-only executor group is terminal after direct child reap" {
+    var leader_ready_pipe: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&leader_ready_pipe) != 0) return error.TestFdSetupFailed;
+    var leader_release_pipe: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&leader_release_pipe) != 0) {
+        closeRawFd(leader_ready_pipe[0]);
+        closeRawFd(leader_ready_pipe[1]);
+        return error.TestFdSetupFailed;
+    }
+
+    const leader_pid = std.c.fork();
+    if (leader_pid < 0) {
+        closeRawFd(leader_ready_pipe[0]);
+        closeRawFd(leader_ready_pipe[1]);
+        closeRawFd(leader_release_pipe[0]);
+        closeRawFd(leader_release_pipe[1]);
+        return error.TestForkFailed;
+    }
+    if (leader_pid == 0) {
+        _ = std.c.close(leader_ready_pipe[0]);
+        _ = std.c.close(leader_release_pipe[1]);
+        if (std.c.setpgid(0, 0) != 0) std.c._exit(91);
+        var ready = [_]u8{1};
+        if (std.c.write(leader_ready_pipe[1], &ready, ready.len) != ready.len) std.c._exit(92);
+        _ = std.c.close(leader_ready_pipe[1]);
+        if (std.c.read(leader_release_pipe[0], &ready, ready.len) != ready.len) std.c._exit(93);
+        _ = std.c.close(leader_release_pipe[0]);
+        std.c._exit(0);
+    }
+
+    closeRawFd(leader_ready_pipe[1]);
+    closeRawFd(leader_release_pipe[0]);
+    var leader_reaped = false;
+    var zombie_pid: std.posix.pid_t = -1;
+    var zombie_reaped = false;
+    defer {
+        if (leader_ready_pipe[0] >= 0) closeRawFd(leader_ready_pipe[0]);
+        if (leader_release_pipe[1] >= 0) closeRawFd(leader_release_pipe[1]);
+        if (!leader_reaped) {
+            _ = std.posix.system.kill(-leader_pid, .KILL);
+            _ = std.posix.system.kill(leader_pid, .KILL);
+            var status: c_int = undefined;
+            _ = std.posix.system.waitpid(leader_pid, &status, 0);
+        }
+        if (zombie_pid > 0 and !zombie_reaped) {
+            var status: c_int = undefined;
+            _ = std.posix.system.waitpid(zombie_pid, &status, 0);
+        }
+    }
+
+    var ready: [1]u8 = undefined;
+    if (std.c.read(leader_ready_pipe[0], &ready, ready.len) != ready.len) {
+        return error.TestFdSetupFailed;
+    }
+    closeRawFd(leader_ready_pipe[0]);
+    leader_ready_pipe[0] = -1;
+
+    zombie_pid = std.c.fork();
+    if (zombie_pid < 0) return error.TestForkFailed;
+    if (zombie_pid == 0) {
+        _ = std.c.close(leader_release_pipe[1]);
+        if (std.c.setpgid(0, leader_pid) != 0) std.c._exit(94);
+        std.c._exit(0);
+    }
+
+    // The zombie must first be observed in the leader's group; otherwise an
+    // absent group could make the terminal observation vacuously pass.
+    const zombie_deadline = std.Io.Clock.awake.now(defaultIo()).addDuration(.fromMilliseconds(1_000));
+    var zombie_observed = false;
+    while (!zombie_observed) {
+        var process_info: DarwinProcessShortInfo = undefined;
+        std.c._errno().* = 0;
+        const info_size = proc_pidinfo(
+            zombie_pid,
+            DarwinProcessShortInfoFlavor,
+            1,
+            &process_info,
+            @sizeOf(DarwinProcessShortInfo),
+        );
+        zombie_observed = info_size == @sizeOf(DarwinProcessShortInfo) and
+            std.c._errno().* == 0 and
+            process_info.process_group_id == @as(u32, @intCast(leader_pid)) and
+            process_info.status == DarwinZombieProcessStatus;
+        if (zombie_observed) break;
+        if (std.Io.Clock.awake.now(defaultIo()).nanoseconds >= zombie_deadline.nanoseconds) {
+            return error.TestZombieObservationFailed;
+        }
+        std.Io.sleep(defaultIo(), .fromMilliseconds(ExecutorPollIntervalMs), .awake) catch {};
+    }
+    try std.testing.expectEqual(
+        ExecutorGroupObservation.live_members,
+        try observeExecutorGroupAlloc(std.testing.allocator, leader_pid),
+    );
+
+    if (std.c.write(leader_release_pipe[1], &ready, ready.len) != ready.len) {
+        return error.TestFdSetupFailed;
+    }
+    closeRawFd(leader_release_pipe[1]);
+    leader_release_pipe[1] = -1;
+    try waitExecutorChildReapedAndGroupQuiescent(std.testing.allocator, leader_pid);
+    leader_reaped = true;
+    try std.testing.expectEqual(
+        ExecutorGroupObservation.terminal_zombies_only,
+        try observeExecutorGroupAlloc(std.testing.allocator, leader_pid),
+    );
+    try proveResidualExecutorGroupQuiescent(std.testing.allocator, leader_pid);
+
+    var zombie_status: c_int = undefined;
+    while (true) switch (std.posix.errno(std.posix.system.waitpid(zombie_pid, &zombie_status, 0))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        else => return error.TestZombieReapFailed,
+    };
+    zombie_reaped = true;
+    try std.testing.expectEqual(
+        ExecutorGroupObservation.absent,
+        try observeExecutorGroupAlloc(std.testing.allocator, leader_pid),
+    );
 }
 
 test "advisory group STOP permission failure skips census and still proves kill reap and absence" {

@@ -777,6 +777,7 @@ pub fn build(b: *std.Build) void {
                     "executor inherits only standard allowlisted descriptors",
                     "executor runs in the requested isolated cwd",
                     "executor deadline kills and reaps a hung child",
+                    "zombie-only executor group is terminal after direct child reap",
                     "advisory group STOP permission failure skips census and still proves kill reap and absence",
                     "nonzero executor preserves the directly supervised terminal observation",
                 },
