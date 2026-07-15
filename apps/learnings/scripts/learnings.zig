@@ -42,6 +42,10 @@ const RecallHelpSurface = core_cli.HelpSurface{
     .executable_name = "ledger recall --source learnings",
     .help_text = RecallUsageText,
 };
+const ExportHelpSurface = core_cli.HelpSurface{
+    .executable_name = "ledger export --source learnings",
+    .help_text = ExportUsageText,
+};
 const CodifyCandidatesHelpSurface = core_cli.HelpSurface{
     .executable_name = "ledger codify-candidates --source learnings",
     .help_text = CodifyCandidatesUsageText,
@@ -70,18 +74,19 @@ const PathHelpSurface = core_cli.HelpSurface{
 const UsageText =
     \\ledger --source learnings
     \\
-    \\usage: ledger --source learnings [-h] [--path PATH] {capture,datasets,dataset-schema,query,recent,recall,codify-candidates,quality-audit,value-report,memory-digest,migrate,doctor,path} ...
+    \\usage: ledger --source learnings [-h] [--path PATH] {capture,datasets,dataset-schema,query,recent,recall,export,codify-candidates,quality-audit,value-report,memory-digest,migrate,doctor,path} ...
     \\
     \\Mine, recall, and promote records through the repo-local learning-source API.
     \\
     \\positional arguments:
-    \\  {capture,datasets,dataset-schema,query,recent,recall,codify-candidates,quality-audit,value-report,memory-digest,migrate,doctor,path}
+    \\  {capture,datasets,dataset-schema,query,recent,recall,export,codify-candidates,quality-audit,value-report,memory-digest,migrate,doctor,path}
     \\    capture             Append a structured learning event
     \\    datasets            List datasets
     \\    dataset-schema      Show dataset schema
     \\    query               Run a JSON spec query
     \\    recent              Show most recent learnings
     \\    recall              Rank relevant learnings for a task
+    \\    export              Emit a full or memory-note projection for one learning
     \\    codify-candidates   Suggest repeated/high-impact learnings to promote into durable docs
     \\    quality-audit       Summarize learning capture quality and contract health
     \\    value-report        Compare recall-loaded sessions against a non-recall comparator
@@ -189,6 +194,20 @@ const RecallUsageText =
     \\  --limit LIMIT         Maximum rows to show (default: 8)
     \\  --format FORMAT       Output format
     \\  --drop-superseded     Hide records superseded by newer learnings
+;
+
+const ExportUsageText =
+    \\ledger export --source learnings
+    \\
+    \\usage: ledger export --source learnings [-h] --id lrn-ID [--format full|memory-note] [--path PATH]
+    \\
+    \\Emit an authoritative deterministic projection of one canonical learning record.
+    \\
+    \\options:
+    \\  -h, --help            show this help message and exit
+    \\  --id lrn-ID           Canonical learning id
+    \\  --format FORMAT       full or memory-note (default: full)
+    \\  --path PATH           Current persistent-adapter path
 ;
 
 const CodifyCandidatesUsageText =
@@ -456,6 +475,7 @@ const Command = enum {
     query,
     recent,
     recall,
+    @"export",
     codify_candidates,
     quality_audit,
     value_report,
@@ -488,6 +508,8 @@ const Args = struct {
     spec: ?[]const u8 = null,
     limit: usize = 0,
     query: ?[]const u8 = null,
+    export_id: ?[]const u8 = null,
+    export_format: []const u8 = "full",
     paths: []const u8 = "",
     format: []const u8 = "table",
     drop_superseded: bool = false,
@@ -671,6 +693,11 @@ pub fn runWithArgv(allocator: std.mem.Allocator, argv: []const []const u8, codex
                 parsed.drop_superseded,
             );
         },
+        .@"export" => {
+            const jsonl_path = try resolveReadJsonlPathAlloc(allocator, repo_root, parsed.path, parsed.path_explicit);
+            defer allocator.free(jsonl_path);
+            try cmdExport(allocator, jsonl_path, parsed.path, parsed.export_id.?, parsed.export_format);
+        },
         .codify_candidates => {
             const jsonl_path = try resolveReadJsonlPathAlloc(allocator, repo_root, parsed.path, parsed.path_explicit);
             defer allocator.free(jsonl_path);
@@ -741,6 +768,7 @@ fn subcommandHelpSurface(argv: []const []const u8) ?core_cli.HelpSurface {
         if (std.mem.eql(u8, arg, "query")) return QueryHelpSurface;
         if (std.mem.eql(u8, arg, "recent")) return RecentHelpSurface;
         if (std.mem.eql(u8, arg, "recall")) return RecallHelpSurface;
+        if (std.mem.eql(u8, arg, "export")) return ExportHelpSurface;
         if (std.mem.eql(u8, arg, "codify-candidates")) return CodifyCandidatesHelpSurface;
         if (std.mem.eql(u8, arg, "quality-audit")) return QualityAuditHelpSurface;
         if (std.mem.eql(u8, arg, "value-report")) return ValueReportHelpSurface;
@@ -790,6 +818,10 @@ fn parseArgs(argv: []const []const u8) !Args {
         }
         if (std.mem.eql(u8, arg, "recall")) {
             args.command = .recall;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "export")) {
+            args.command = .@"export";
             continue;
         }
         if (std.mem.eql(u8, arg, "codify-candidates")) {
@@ -882,6 +914,22 @@ fn parseArgs(argv: []const []const u8) !Args {
                     continue;
                 }
                 return error.InvalidRecallArg;
+            },
+            .@"export" => {
+                if (std.mem.eql(u8, arg, "--id")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingIdValue;
+                    args.export_id = argv[i];
+                    continue;
+                }
+                if (std.mem.eql(u8, arg, "--format")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingFormatValue;
+                    if (!std.mem.eql(u8, argv[i], "full") and !std.mem.eql(u8, argv[i], "memory-note")) return error.InvalidExportFormat;
+                    args.export_format = argv[i];
+                    continue;
+                }
+                return error.InvalidExportArg;
             },
             .codify_candidates => {
                 if (std.mem.eql(u8, arg, "--min-count")) {
@@ -1063,6 +1111,7 @@ fn parseArgs(argv: []const []const u8) !Args {
         .dataset_schema => if (args.dataset == null) return error.MissingDatasetValue,
         .query => if (args.spec == null) return error.MissingSpecValue,
         .recall => if (args.query == null) return error.MissingQueryValue,
+        .@"export" => if (args.export_id == null) return error.MissingIdValue,
         else => {},
     }
     if (args.command.? == .migrate and args.invalid_policy == .skip and
@@ -1097,6 +1146,9 @@ fn printParseError(err: anyerror, argv: []const []const u8) noreturn {
         },
         error.MissingQueryValue => {
             stderr.print("error: argument --query: expected one argument\n", .{}) catch {};
+        },
+        error.MissingIdValue => {
+            stderr.print("error: argument --id: expected one argument\n", .{}) catch {};
         },
         error.MissingPathsValue => {
             stderr.print("error: argument --paths: expected one argument\n", .{}) catch {};
@@ -1154,6 +1206,8 @@ fn printParseError(err: anyerror, argv: []const []const u8) noreturn {
         error.InvalidQueryArg,
         error.InvalidRecentArg,
         error.InvalidRecallArg,
+        error.InvalidExportArg,
+        error.InvalidExportFormat,
         error.InvalidCodifyArg,
         error.InvalidQualityAuditArg,
         error.InvalidValueReportArg,
@@ -2490,6 +2544,107 @@ fn cmdRecent(
 
     var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
     try stdout_writer.interface.writeAll(rendered);
+}
+
+fn cmdExport(
+    allocator: std.mem.Allocator,
+    jsonl_path: []const u8,
+    source_path: []const u8,
+    learning_id: []const u8,
+    format: []const u8,
+) !void {
+    var persistence = durable_store.PersistentEventStore.init(jsonl_path);
+    var snapshot = try persistence.eventStore().snapshot(allocator, MaxLearningsBytes);
+    defer snapshot.deinit(allocator);
+
+    var inspection = try inspectCanonicalSnapshotAlloc(allocator, snapshot);
+    defer inspection.deinit(allocator);
+    if (inspection.issues.items.len != 0) return error.StoreInvalid;
+
+    for (snapshot.records) |event| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, event.payload, .{});
+        defer parsed.deinit();
+        const event_object = switch (parsed.value) {
+            .object => |value| value,
+            else => return error.StoreInvalid,
+        };
+        const record = learningRecordObject(event_object);
+        if (!std.mem.eql(u8, jsonObjectString(record, "id"), learning_id)) continue;
+
+        var stdout_writer = std.Io.File.stdout().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
+        const stdout = &stdout_writer.interface;
+        if (std.mem.eql(u8, format, "full")) {
+            try std.json.Stringify.value(std.json.Value{ .object = record }, .{}, stdout);
+        } else if (std.mem.eql(u8, format, "memory-note")) {
+            try writeLearningMemoryNoteProjection(allocator, stdout, record, source_path);
+        } else {
+            return error.InvalidExportFormat;
+        }
+        try stdout.writeByte('\n');
+        return;
+    }
+    return error.LearningNotFound;
+}
+
+fn writeLearningMemoryNoteProjection(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    record: std.json.ObjectMap,
+    source_path: []const u8,
+) !void {
+    const learning_id = jsonObjectString(record, "id");
+    const status = jsonObjectString(record, "status");
+    const learning = jsonObjectString(record, "learning");
+    const application = jsonObjectString(record, "application");
+    if (learning_id.len == 0 or status.len == 0 or learning.len == 0 or application.len == 0) {
+        return error.IncompleteLearningProjection;
+    }
+
+    const context = if (record.get("context")) |value| switch (value) {
+        .object => |object| object,
+        else => null,
+    } else null;
+    const repo = if (context) |object| jsonObjectString(object, "repo") else "";
+    if (repo.len == 0) return error.IncompleteLearningProjection;
+
+    const summary = try std.fmt.allocPrint(allocator, "Admit {s} for Phase 2 consideration.", .{learning_id});
+    defer allocator.free(summary);
+    const source_ref = try std.fmt.allocPrint(allocator, "{s}#{s}", .{ source_path, learning_id });
+    defer allocator.free(source_ref);
+
+    try writer.writeAll("{\"operation\":\"assert\",\"authority\":\"ledger-cli\",\"summary\":");
+    try writeJsonString(writer, summary);
+    try writer.writeAll(",\"scope\":{\"kind\":\"repo\",\"repo\":");
+    try writeJsonString(writer, repo);
+    try writer.writeAll(",\"paths\":");
+    if (context) |object| {
+        if (object.get("paths")) |paths| try std.json.Stringify.value(paths, .{}, writer) else try writer.writeAll("[]");
+    } else try writer.writeAll("[]");
+    try writer.writeAll("},\"source_refs\":[{\"kind\":\"learning\",\"ref\":");
+    try writeJsonString(writer, source_ref);
+    try writer.writeAll(",\"summary\":\"Canonical learning row\"}],\"related_ids\":");
+    if (record.get("related_ids")) |related| try std.json.Stringify.value(related, .{}, writer) else try writer.writeAll("[]");
+    try writer.writeAll(",\"supersedes_id\":");
+    if (record.get("supersedes_id")) |supersedes| try std.json.Stringify.value(supersedes, .{}, writer) else try writer.writeAll("null");
+    try writer.writeAll(",\"payload\":{\"learning_id\":");
+    try writeJsonString(writer, learning_id);
+    try writer.writeAll(",\"learning_status\":");
+    try writeJsonString(writer, status);
+    try writer.writeAll(",\"repo\":");
+    try writeJsonString(writer, repo);
+    try writer.writeAll(",\"source_path\":");
+    try writeJsonString(writer, source_path);
+    try writer.writeAll(",\"decision_delta\":");
+    try writeJsonString(writer, learning);
+    try writer.writeAll(",\"evidence_snapshot\":");
+    if (record.get("evidence")) |evidence| try std.json.Stringify.value(evidence, .{}, writer) else try writer.writeAll("[]");
+    try writer.writeAll(",\"future_behavior\":");
+    try writeJsonString(writer, application);
+    try writer.writeAll(",\"verification\":\"Re-check the canonical row and evidence snapshot before applying this learning.\",\"tags\":");
+    if (record.get("tags")) |tags| try std.json.Stringify.value(tags, .{}, writer) else try writer.writeAll("[]");
+    try writer.writeAll(",\"canonical_fingerprint\":");
+    try writeJsonString(writer, jsonObjectString(record, "fingerprint"));
+    try writer.writeAll("}}");
 }
 
 fn cmdRecall(
@@ -5446,6 +5601,44 @@ test "parse args recall" {
     try std.testing.expect(parsed.command.? == .recall);
     try std.testing.expectEqualStrings(".learnings.jsonl", parsed.path);
     try std.testing.expectEqualStrings("zig", parsed.query.?);
+}
+
+test "parse args export requires identity and accepts memory note format" {
+    const argv = [_][]const u8{ ProgramName, "export", "--id", "lrn-20260715T000000Z-12345678", "--format", "memory-note" };
+    const parsed = try parseArgs(&argv);
+    try std.testing.expect(parsed.command.? == .@"export");
+    try std.testing.expectEqualStrings("lrn-20260715T000000Z-12345678", parsed.export_id.?);
+    try std.testing.expectEqualStrings("memory-note", parsed.export_format);
+
+    const missing = [_][]const u8{ ProgramName, "export" };
+    try std.testing.expectError(error.MissingIdValue, parseArgs(&missing));
+}
+
+test "learning memory note projection is deterministic and source complete" {
+    const input =
+        \\{"id":"lrn-20260715T000000Z-12345678","captured_at":"2026-07-15T00:00:00Z","status":"codify_now","learning":"Prefer an explicit checkpoint.","evidence":["test:checkpoint"],"application":"Run the checkpoint at closeout.","source":"ledger:learnings","fingerprint":"1234567890abcdef","context":{"repo":"owner/repo","branch":"main","paths":["src/checkpoint.zig"]},"tags":["memory-admission"],"related_ids":[],"supersedes_id":null}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, input, .{});
+    defer parsed.deinit();
+    const record = parsed.value.object;
+
+    var first: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer first.deinit();
+    try writeLearningMemoryNoteProjection(std.testing.allocator, &first.writer, record, DefaultLearningsPath);
+    const first_bytes = try first.toOwnedSlice();
+    defer std.testing.allocator.free(first_bytes);
+
+    var second: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer second.deinit();
+    try writeLearningMemoryNoteProjection(std.testing.allocator, &second.writer, record, DefaultLearningsPath);
+    const second_bytes = try second.toOwnedSlice();
+    defer std.testing.allocator.free(second_bytes);
+
+    try std.testing.expectEqualStrings(first_bytes, second_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, first_bytes, "\"authority\":\"ledger-cli\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_bytes, "\"learning_id\":\"lrn-20260715T000000Z-12345678\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_bytes, "\"source_path\":\".ledger/learnings/events.jsonl\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_bytes, "\"evidence_snapshot\":[\"test:checkpoint\"]") != null);
 }
 
 test "discoverRepoRootAlloc walks to git ancestor" {

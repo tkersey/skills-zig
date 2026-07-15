@@ -40,7 +40,7 @@ Current macOS Hylo adapter path:
 .ledger/hylo/events.jsonl
 ```
 
-Ledger 0.8.0 adds the additive `hylo-trial/v1` profile. The native Hylo source
+Ledger 0.10.1 adds the additive `hylo-trial/v1` profile. The native Hylo source
 owns atomic twin-trial registration, FD-delivered lane leases, signed run and
 grade receipts, blinded arm reveal, cluster-balanced effects, calibrated claim
 derivation, publication identity, and reproducible proof bundles. Legacy Hylo
@@ -122,12 +122,14 @@ ledger status --id NEG-000001 --to stale --json transition.json
 ledger reopen --id NEG-000001 --json reopen-proof.json
 ledger export --id NEG-000001 --format full
 ledger export --id NEG-000001 --format memory-note
+ledger export --source negative-ledger --id NEG-000001 --format memory-note
 ledger handoff
 ledger compact
 ledger doctor
 ledger migrate --mode copy
 ledger capture --source learnings --learning "When X, prefer Y because Z." --evidence "command/result" --application "Do Y next time."
 ledger recall --source learnings --query "focused task" --limit 5 --drop-superseded
+ledger export --source learnings --id lrn-... --format memory-note
 ledger migrate --source learnings --mode copy
 ledger doctor --source learnings
 ledger open --source actuation --json actuation-open.json
@@ -152,12 +154,16 @@ ledger validate actuation-review-policy --phase preflight --input review-policy.
 ledger validate review-resolution --phase preflight --input review-resolution.json
 ledger validate hylo-replay-episode --input episode.json
 ledger validate hylo-runner-input --input runner-input.json
+ledger validate source-memory-checkpoint --input source-memory-checkpoint.json
 ```
 
 The CRF episode validator checks the cut-bound causal fingerprint and ordered stimulus contract. The runner validator checks the allow-listed projection, rejects custody fields recursively, and never grants execution or edit authority.
 
 Use `--file PATH` to point at a non-default store.
 For `--source learnings`, `--file PATH` is accepted as an alias for the learning event path.
+`--source negative-ledger` is an additive namespace alias for the source-less
+Negative Ledger commands; it preserves `--file` and all existing command
+semantics.
 
 ## Universalist plan addressing
 
@@ -227,7 +233,7 @@ admitted. This keeps later folds independent of mutable campaign files and
 prevents selective admission of easy cases.
 
 New Hylo, HCTP, and CRF identity use the published
-`hylo-canonical-json/v1` profile. A campaign that enables the unreleased
+`hylo-canonical-json/v1` profile. A campaign that enables the
 `hylo-trial/v1` protocol must set
 `"canonical_json_profile":"hylo-canonical-json/v1"`; every registered trial
 must repeat that binding, and canonical JSON SHA-256 commitments use the
@@ -373,6 +379,7 @@ ledger validate hylo-runtime-contract --input runtime-contract.json
 ledger validate hylo-counterfactual-cut-receipt --input cut-receipt.json
 ledger validate hylo-redaction-receipt --input redaction-receipt.json
 ledger validate hylo-custody-manifest --input custody-manifest.json
+ledger validate source-memory-checkpoint --input source-memory-checkpoint.json
 ```
 
 Input is canonical JSON from a file or `-` for stdin. The general governance
@@ -382,6 +389,13 @@ invocation exits `0` for `pass` and `2` for a blocked or malformed artifact.
 Every decision records `authority_granted:false` and `storage_mutated:false`.
 The Hylo validators are schema decisions only; their availability does not
 admit the macOS-only replay or HCTP product routes.
+
+`source-memory-checkpoint/v1` validation requires exactly one Learnings,
+Synesthesia, and Negative Ledger disposition, checks source-specific IDs and
+admission compatibility, and derives `complete`, `degraded`, or `blocked` from
+those results. It validates coordination evidence only: source skills retain
+semantic and mutation authority, and an admission failure after canonical
+success must be represented as `degraded`, never as canonical rollback.
 
 The Actuating review-policy checker preserves `actuation-review-policy/v1`
 same-tuple suffix semantics and also accepts `actuation-review-policy/v2`.
@@ -711,6 +725,10 @@ ledger export --id NEG-000001 --format full
 ledger export --id NEG-000001 --format memory-note |
   memory-note append --extension negative-ledger --kind ledger-projection --json -
 ```
+
+The same Negative Ledger commands are available through the uniform source
+namespace, for example `ledger export --source negative-ledger --id
+NEG-000001 --format memory-note`. Source-less commands remain supported.
 
 `export` and `handoff` fail closed when the store or selected projection is semantically invalid. Repo-scoped memory projections include a stable repository identity and applicable paths, so identical `NEG-*` IDs from different repositories remain distinct.
 
