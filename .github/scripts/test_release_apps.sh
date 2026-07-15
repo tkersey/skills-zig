@@ -169,10 +169,12 @@ assert_case "apps/cas/scripts/cas_trial.zig" "cas"
 assert_case "apps/lift/src/main.zig" "lift"
 assert_case "apps/img/src/main.zig" "img"
 assert_case ".github/workflows/release-img.yml" "img"
+assert_case ".github/scripts/verify_cas_archive.sh" "cas"
+assert_case ".github/scripts/test_verify_cas_archive.sh" "cas"
 assert_version_case "apps/img/VERSION" "img"
 assert_hctp_build_diff
 assert_cas_trial_macos_runtime_build_hunk
 assert_ambiguous_build_diff
 assert_partial_filter_plumbing_fails_closed
 
-echo "release app classifier: 13/13 cases passed"
+echo "release app classifier: 15/15 cases passed"

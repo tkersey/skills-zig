@@ -121,6 +121,8 @@ jobs:
           fetch-depth: 0
       - name: Test release app classifier
         run: .github/scripts/test_release_apps.sh
+      - name: Test CAS archive verifier
+        run: .github/scripts/test_verify_cas_archive.sh
       - name: Require VERSION bumps for release-relevant CLI changes
         run: |
           set -euo pipefail
@@ -244,6 +246,8 @@ jobs:
           version: 0.16.0
       - name: Test macOS CAS trial product and lifecycle laws
         run: zig build test-cas-trial test-cas-trial-macos-runtime --summary all
+      - name: Test CAS archive verifier with macOS tar
+        run: .github/scripts/test_verify_cas_archive.sh
 
   hctp-product-macos:
     needs: changes

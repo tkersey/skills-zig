@@ -292,6 +292,9 @@ case "$mode" in
           mark_app cas
           mark_app ledger
           ;;
+        .github/scripts/verify_cas_archive.sh|.github/scripts/test_verify_cas_archive.sh)
+          mark_app cas
+          ;;
         .github/workflows/release-seq.yml)
           mark_app seq
           ;;
