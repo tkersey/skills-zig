@@ -22,7 +22,7 @@ const UsageText =
     \\  plan-source-contract       Validate a PSC-v1 plan source contract
     \\  policy-synthesis-receipt  Validate a PSR-v1 policy synthesis receipt
     \\  review-fold               Validate an RF-v2 review-fold receipt
-    \\  review-resolution         Check the correctness-refinement sub-contract in review-resolution/v1
+    \\  review-resolution         Check refinement and owner synthesis in review-resolution/v1
     \\
     \\options:
     \\  --phase PHASE  preflight|closeout for Actuating contracts

@@ -67,8 +67,63 @@ const Compression = struct {
 
 const ReviewFold = struct {
     version: []const u8,
+    goal_id: ?[]const u8 = null,
     findings: []const Finding,
     compression: Compression,
+};
+
+const ResolutionHistory = struct {
+    goal_id: []const u8 = "",
+    prior_resolution_refs: []const []const u8 = &.{},
+    prior_synthesis_refs: []const []const u8 = &.{},
+};
+
+const BoundaryIdentity = struct {
+    source_worlds: []const []const u8 = &.{},
+    target_worlds: []const []const u8 = &.{},
+    carriers: []const []const u8 = &.{},
+    operations: []const []const u8 = &.{},
+    observations: []const []const u8 = &.{},
+    laws: []const []const u8 = &.{},
+};
+
+const SeparationObstruction = struct {
+    statement: []const u8 = "",
+    falsifier: []const u8 = "",
+};
+
+const StructuralObligation = struct {
+    kind: []const u8 = "",
+    target: []const u8 = "",
+    verifier: []const []const u8 = &.{},
+    observation_ref: ?[]const u8 = null,
+};
+
+const SelectedWorkNode = struct {
+    node_id: []const u8 = "",
+    run_id: []const u8 = "",
+    owner_boundary: []const u8 = "",
+    paths: []const []const u8 = &.{},
+    verifier: []const []const u8 = &.{},
+};
+
+const OwnerSynthesis = struct {
+    version: []const u8 = "",
+    synthesis_id: []const u8 = "",
+    stable_component_key: []const u8 = "",
+    boundary_identity: BoundaryIdentity = .{},
+    class_refs: []const []const u8 = &.{},
+    prior_decision_refs: []const []const u8 = &.{},
+    prior_synthesis_refs: []const []const u8 = &.{},
+    owner_boundaries: []const []const u8 = &.{},
+    pressure_signals: []const []const u8 = &.{},
+    disposition: []const u8 = "",
+    canonical_owner: ?[]const u8 = null,
+    construction: ?[]const u8 = null,
+    separation_obstruction: ?SeparationObstruction = null,
+    structural_obligations: []const StructuralObligation = &.{},
+    selected_work_node_ref: ?[]const u8 = null,
+    falsifier: ?[]const u8 = null,
 };
 
 const Decision = struct {
@@ -79,6 +134,8 @@ const Decision = struct {
     strategy: []const u8,
     correctness_refinement: ?CorrectnessRefinement = null,
     blockers: []const []const u8,
+    owner_synthesis_ref: ?[]const u8 = null,
+    selected_work_node: ?SelectedWorkNode = null,
 };
 
 const SemanticBalance = struct {
@@ -99,6 +156,8 @@ const Resolution = struct {
     run_id: []const u8,
     review_folds: []const ReviewFold,
     finding_ids: []const []const u8,
+    resolution_history: ?ResolutionHistory = null,
+    owner_syntheses: []const OwnerSynthesis = &.{},
     decisions: []const Decision,
     outcome: Outcome,
 };
@@ -169,7 +228,7 @@ fn printHelp(io: std.Io) !void {
         \\
         \\usage: ledger validate review-resolution --phase {preflight|closeout} --input FILE|-
         \\
-        \\Purely check the structural correctness-refinement sub-contract in one review-resolution/v1 JSON snapshot. Verifiers are not executed; the decision grants no authority and mutates no storage.
+        \\Purely check correctness refinement and owner-boundary synthesis in one review-resolution/v1 JSON snapshot. Verifiers and observation references are not executed or dereferenced; the decision grants no authority and mutates no storage.
         \\
     );
 }
@@ -271,6 +330,8 @@ fn validateResolution(allocator: std.mem.Allocator, resolution: Resolution, phas
         }
     }
 
+    try validateOwnerSyntheses(allocator, resolution, phase, issues);
+
     for (resolution.decisions, 0..) |decision, decision_index| {
         if (!isNonblank(decision.decision_id) or !isNonblank(decision.owner_boundary)) try issues.add(allocator, "decision-identity");
         if (decisionIdentitySeen(resolution.decisions[0..decision_index], decision)) try issues.add(allocator, "decision-identity-duplicate");
@@ -292,6 +353,7 @@ fn validateResolution(allocator: std.mem.Allocator, resolution: Resolution, phas
         if (decision.liability_classes.len == 1 and !classMatchesDecision(resolution.review_folds, decision.liability_classes[0], decision)) {
             try issues.add(allocator, "decision-class-mismatch");
         }
+        try validateDecisionSynthesisBinding(allocator, resolution, decision, issues);
 
         if (std.mem.eql(u8, decision.strategy, "blocked")) {
             if (decision.blockers.len == 0) try issues.add(allocator, "blocked-decision-without-blocker");
@@ -313,6 +375,323 @@ fn validateResolution(allocator: std.mem.Allocator, resolution: Resolution, phas
         try issues.add(allocator, "preflight-outcome-not-pending");
     }
     if (phase == .closeout) try validateCloseout(allocator, resolution, issues);
+}
+
+fn validateOwnerSyntheses(
+    allocator: std.mem.Allocator,
+    resolution: Resolution,
+    phase: Phase,
+    issues: *Issues,
+) !void {
+    if (resolution.decisions.len != 0 and resolution.resolution_history == null) {
+        try issues.add(allocator, "resolution-history-required");
+    }
+    if (resolution.decisions.len != 0 and resolution.owner_syntheses.len == 0) {
+        try issues.add(allocator, "owner-synthesis-required");
+    }
+    if (resolution.owner_syntheses.len != 0 and resolution.resolution_history == null) {
+        try issues.add(allocator, "owner-synthesis-history-required");
+    }
+
+    if (resolution.resolution_history) |history| {
+        if (!isNonblank(history.goal_id)) try issues.add(allocator, "resolution-history-goal");
+        try validateStringSet(allocator, history.prior_resolution_refs, "resolution-history-resolution-refs", issues);
+        try validateStringSet(allocator, history.prior_synthesis_refs, "resolution-history-synthesis-refs", issues);
+        if (resolution.owner_syntheses.len != 0) {
+            for (resolution.review_folds) |fold| {
+                const fold_goal_id = fold.goal_id orelse {
+                    try issues.add(allocator, "resolution-history-goal-binding");
+                    continue;
+                };
+                if (!std.mem.eql(u8, fold_goal_id, history.goal_id)) {
+                    try issues.add(allocator, "resolution-history-goal-binding");
+                }
+            }
+        }
+        for (history.prior_synthesis_refs) |prior_ref| {
+            if (countSynthesesJoiningPrior(resolution.owner_syntheses, prior_ref) != 1) {
+                try issues.add(allocator, "owner-synthesis-history-join");
+            }
+        }
+    }
+
+    var selected_node_count: usize = 0;
+    var repair_decision_count: usize = 0;
+    for (resolution.decisions) |decision| {
+        if (decision.selected_work_node != null) selected_node_count += 1;
+        if (!std.mem.eql(u8, decision.strategy, "blocked")) repair_decision_count += 1;
+    }
+    if (selected_node_count > 1 or (repair_decision_count != 0 and selected_node_count != 1)) {
+        try issues.add(allocator, "owner-synthesis-selected-node-cardinality");
+    }
+
+    for (resolution.owner_syntheses, 0..) |synthesis, synthesis_index| {
+        if (!std.mem.eql(u8, synthesis.version, "owner-boundary-synthesis/v1")) {
+            try issues.add(allocator, "owner-synthesis-version");
+        }
+        if (!isNonblank(synthesis.synthesis_id)) try issues.add(allocator, "owner-synthesis-identity");
+        if (synthesisIdentitySeen(resolution.owner_syntheses[0..synthesis_index], synthesis.synthesis_id)) {
+            try issues.add(allocator, "owner-synthesis-identity-duplicate");
+        }
+        if (synthesisComponentSeen(resolution.owner_syntheses[0..synthesis_index], synthesis.stable_component_key)) {
+            try issues.add(allocator, "owner-synthesis-component-duplicate");
+        }
+
+        try validateBoundaryIdentity(allocator, synthesis.boundary_identity, issues);
+        const expected_component_key = try canonicalComponentKeyAlloc(allocator, synthesis.boundary_identity);
+        defer allocator.free(expected_component_key);
+        if (!std.mem.eql(u8, synthesis.stable_component_key, expected_component_key)) {
+            try issues.add(allocator, "owner-synthesis-stable-component-key");
+        }
+
+        if (synthesis.class_refs.len == 0) try issues.add(allocator, "owner-synthesis-classes-required");
+        try validateStringSet(allocator, synthesis.class_refs, "owner-synthesis-class-identity", issues);
+        for (synthesis.class_refs) |class_ref| {
+            if (!isResolutionInputClass(resolution.review_folds, class_ref)) {
+                try issues.add(allocator, "owner-synthesis-class-not-input");
+            }
+        }
+        try validateStringSet(allocator, synthesis.prior_decision_refs, "owner-synthesis-prior-decision-refs", issues);
+        try validateStringSet(allocator, synthesis.prior_synthesis_refs, "owner-synthesis-prior-synthesis-refs", issues);
+        for (synthesis.prior_synthesis_refs) |prior_ref| {
+            const history = resolution.resolution_history orelse {
+                try issues.add(allocator, "owner-synthesis-history-required");
+                break;
+            };
+            if (!containsString(history.prior_synthesis_refs, prior_ref)) {
+                try issues.add(allocator, "owner-synthesis-history-join");
+            }
+            if (std.mem.eql(u8, prior_ref, synthesis.synthesis_id)) {
+                try issues.add(allocator, "owner-synthesis-history-cycle");
+            }
+        }
+
+        if (synthesis.owner_boundaries.len == 0) try issues.add(allocator, "owner-synthesis-owners-required");
+        try validateStringSet(allocator, synthesis.owner_boundaries, "owner-synthesis-owner-identity", issues);
+        try validateStringSet(allocator, synthesis.pressure_signals, "owner-synthesis-pressure-identity", issues);
+        for (synthesis.pressure_signals) |signal| {
+            if (!stringIn(signal, &.{
+                "recurrence-after-repair",
+                "multiple-law-owners",
+                "new-semantic-machinery",
+                "multi-abstraction-displacement",
+                "post-kernel-symptom-repair",
+            })) try issues.add(allocator, "owner-synthesis-pressure-signal");
+        }
+
+        try validateSynthesisDisposition(allocator, resolution, synthesis, phase, issues);
+    }
+
+    for (resolution.review_folds) |fold| for (fold.compression.equivalence_classes) |class| {
+        if (classHasResolutionInput(fold, class) and countSynthesesWithClass(resolution.owner_syntheses, class.quotient_key) != 1) {
+            try issues.add(allocator, "owner-synthesis-class-coverage");
+        }
+    };
+}
+
+fn validateBoundaryIdentity(
+    allocator: std.mem.Allocator,
+    identity: BoundaryIdentity,
+    issues: *Issues,
+) !void {
+    const fields = [_][]const []const u8{
+        identity.source_worlds,
+        identity.target_worlds,
+        identity.carriers,
+        identity.operations,
+        identity.observations,
+        identity.laws,
+    };
+    for (fields) |values| {
+        if (values.len == 0) try issues.add(allocator, "owner-synthesis-boundary-identity");
+        try validateStringSet(allocator, values, "owner-synthesis-boundary-identity", issues);
+    }
+}
+
+fn validateSynthesisDisposition(
+    allocator: std.mem.Allocator,
+    resolution: Resolution,
+    synthesis: OwnerSynthesis,
+    phase: Phase,
+    issues: *Issues,
+) !void {
+    const disposition = synthesis.disposition;
+    if (!stringIn(disposition, &.{ "reuse-owner", "converge-kernel", "separate-laws", "blocked" })) {
+        try issues.add(allocator, "owner-synthesis-disposition");
+        return;
+    }
+
+    if (synthesis.selected_work_node_ref) |node_ref| {
+        if (!isNonblank(node_ref)) try issues.add(allocator, "owner-synthesis-selected-node-ref");
+    }
+
+    if (std.mem.eql(u8, disposition, "reuse-owner")) {
+        if (synthesis.pressure_signals.len != 0) try issues.add(allocator, "reuse-owner-has-pressure");
+        if (synthesis.owner_boundaries.len != 1) try issues.add(allocator, "reuse-owner-not-local");
+        try validateRepairSynthesisCore(allocator, synthesis, issues);
+        if (synthesis.structural_obligations.len != 0) try issues.add(allocator, "reuse-owner-adds-structural-obligation");
+        if (synthesis.separation_obstruction != null) try issues.add(allocator, "reuse-owner-has-separation-obstruction");
+    } else if (std.mem.eql(u8, disposition, "converge-kernel")) {
+        if (synthesis.pressure_signals.len == 0) try issues.add(allocator, "converge-kernel-without-pressure");
+        try validateRepairSynthesisCore(allocator, synthesis, issues);
+        if (synthesis.structural_obligations.len == 0) try issues.add(allocator, "converge-kernel-obligations-required");
+        if (synthesis.separation_obstruction != null) try issues.add(allocator, "converge-kernel-has-separation-obstruction");
+    } else if (std.mem.eql(u8, disposition, "separate-laws")) {
+        const obstruction = synthesis.separation_obstruction orelse {
+            try issues.add(allocator, "separate-laws-obstruction-required");
+            return;
+        };
+        if (!isNonblank(obstruction.statement) or !isNonblank(obstruction.falsifier)) {
+            try issues.add(allocator, "separate-laws-obstruction-required");
+        }
+        if (synthesis.structural_obligations.len != 0 or synthesis.selected_work_node_ref != null) {
+            try issues.add(allocator, "separate-laws-has-repair");
+        }
+        if (countDecisionsWithSynthesis(resolution.decisions, synthesis.synthesis_id) != 0) {
+            try issues.add(allocator, "separate-laws-has-repair");
+        }
+    } else {
+        if (!optionalNonblank(synthesis.falsifier)) try issues.add(allocator, "blocked-synthesis-falsifier");
+        if (synthesis.structural_obligations.len != 0 or synthesis.selected_work_node_ref != null) {
+            try issues.add(allocator, "blocked-synthesis-has-repair");
+        }
+    }
+
+    try validateStructuralObligations(allocator, resolution, synthesis, phase, issues);
+    const selected_for_synthesis = countSelectedNodesWithSynthesis(resolution.decisions, synthesis.synthesis_id);
+    if (synthesis.selected_work_node_ref) |node_ref| {
+        if (selected_for_synthesis != 1 or !synthesisHasSelectedNode(resolution.decisions, synthesis.synthesis_id, node_ref)) {
+            try issues.add(allocator, "owner-synthesis-selected-node-binding");
+        }
+    } else if (selected_for_synthesis != 0) {
+        try issues.add(allocator, "owner-synthesis-selected-node-binding");
+    }
+}
+
+fn validateRepairSynthesisCore(
+    allocator: std.mem.Allocator,
+    synthesis: OwnerSynthesis,
+    issues: *Issues,
+) !void {
+    const canonical_owner = synthesis.canonical_owner orelse {
+        try issues.add(allocator, "owner-synthesis-canonical-owner");
+        return;
+    };
+    if (!isNonblank(canonical_owner) or !containsString(synthesis.owner_boundaries, canonical_owner)) {
+        try issues.add(allocator, "owner-synthesis-canonical-owner");
+    }
+    if (!optionalNonblank(synthesis.construction)) try issues.add(allocator, "owner-synthesis-construction");
+    if (!optionalNonblank(synthesis.falsifier)) try issues.add(allocator, "owner-synthesis-falsifier");
+}
+
+fn validateStructuralObligations(
+    allocator: std.mem.Allocator,
+    resolution: Resolution,
+    synthesis: OwnerSynthesis,
+    phase: Phase,
+    issues: *Issues,
+) !void {
+    const balance = resolution.outcome.semantic_balance;
+    for (synthesis.structural_obligations, 0..) |obligation, index| {
+        if (!stringIn(obligation.kind, &.{ "install", "collapse", "retire", "delegate" }) or
+            !isNonblank(obligation.target) or
+            !validVerifier(obligation.verifier))
+        {
+            try issues.add(allocator, "structural-obligation-invalid");
+        }
+        for (synthesis.structural_obligations[0..index]) |prior| {
+            if (std.mem.eql(u8, prior.target, obligation.target)) {
+                try issues.add(allocator, "structural-obligation-duplicate-target");
+            }
+        }
+        if (obligation.observation_ref) |observation_ref| {
+            if (!isNonblank(observation_ref)) try issues.add(allocator, "structural-obligation-observation");
+        } else if (phase == .closeout) {
+            try issues.add(allocator, "structural-obligation-observation-required");
+        }
+        if (!std.mem.eql(u8, obligation.kind, "install")) {
+            if (!containsString(balance.required_retirements, obligation.target)) {
+                try issues.add(allocator, "structural-obligation-retirement-binding");
+            }
+            if (phase == .closeout and !containsString(balance.completed_retirements, obligation.target)) {
+                try issues.add(allocator, "structural-obligation-retirement-incomplete");
+            }
+        }
+    }
+}
+
+fn validateDecisionSynthesisBinding(
+    allocator: std.mem.Allocator,
+    resolution: Resolution,
+    decision: Decision,
+    issues: *Issues,
+) !void {
+    const synthesis_ref = decision.owner_synthesis_ref orelse {
+        try issues.add(allocator, "decision-owner-synthesis-required");
+        return;
+    };
+    if (!isNonblank(synthesis_ref)) {
+        try issues.add(allocator, "decision-owner-synthesis-required");
+        return;
+    }
+    const synthesis = findSynthesis(resolution.owner_syntheses, synthesis_ref) orelse {
+        try issues.add(allocator, "decision-owner-synthesis-not-found");
+        return;
+    };
+    if (countSynthesesWithId(resolution.owner_syntheses, synthesis_ref) != 1) {
+        try issues.add(allocator, "decision-owner-synthesis-not-unique");
+    }
+    for (decision.liability_classes) |class_ref| {
+        if (!containsString(synthesis.class_refs, class_ref)) try issues.add(allocator, "decision-owner-synthesis-class-binding");
+    }
+    if (!containsString(synthesis.owner_boundaries, decision.owner_boundary)) {
+        try issues.add(allocator, "decision-owner-synthesis-owner-binding");
+    }
+
+    const expected_disposition = if (std.mem.eql(u8, decision.strategy, "local-repair"))
+        "reuse-owner"
+    else if (std.mem.eql(u8, decision.strategy, "replacement-kernel"))
+        "converge-kernel"
+    else if (std.mem.eql(u8, decision.strategy, "blocked"))
+        "blocked"
+    else
+        "";
+    if (!std.mem.eql(u8, synthesis.disposition, expected_disposition)) {
+        try issues.add(allocator, "decision-owner-synthesis-strategy-binding");
+    }
+
+    if (!std.mem.eql(u8, decision.strategy, "blocked")) {
+        if (decision.correctness_refinement) |decision_refinement| {
+            const synthesis_construction = synthesis.construction orelse "";
+            if (!std.mem.eql(u8, decision_refinement.owner_refinement.construction, synthesis_construction)) {
+                try issues.add(allocator, "decision-owner-synthesis-construction-binding");
+            }
+        }
+    }
+    if (std.mem.eql(u8, synthesis.disposition, "reuse-owner")) {
+        const canonical_owner = synthesis.canonical_owner orelse "";
+        if (!std.mem.eql(u8, decision.owner_boundary, canonical_owner)) {
+            try issues.add(allocator, "reuse-owner-not-local");
+        }
+    }
+
+    if (decision.selected_work_node) |node| {
+        if (!isNonblank(node.node_id) or
+            !std.mem.eql(u8, node.run_id, resolution.run_id) or
+            !validStringSet(node.paths) or
+            !validVerifier(node.verifier))
+        {
+            try issues.add(allocator, "selected-work-node-invalid");
+        }
+        const canonical_owner = synthesis.canonical_owner orelse "";
+        if (!std.mem.eql(u8, node.owner_boundary, canonical_owner)) {
+            try issues.add(allocator, "selected-work-node-owner-binding");
+        }
+        const selected_ref = synthesis.selected_work_node_ref orelse "";
+        if (!std.mem.eql(u8, node.node_id, selected_ref)) {
+            try issues.add(allocator, "owner-synthesis-selected-node-binding");
+        }
+    }
 }
 
 fn validateRefinement(
@@ -436,6 +815,148 @@ fn validVerifier(verifier: []const []const u8) bool {
     return true;
 }
 
+fn validStringSet(values: []const []const u8) bool {
+    if (values.len == 0) return false;
+    for (values, 0..) |value, index| {
+        if (!isNonblank(value) or containsString(values[0..index], value)) return false;
+    }
+    return true;
+}
+
+fn optionalNonblank(value: ?[]const u8) bool {
+    return if (value) |present| isNonblank(present) else false;
+}
+
+fn canonicalComponentKeyAlloc(allocator: std.mem.Allocator, identity: BoundaryIdentity) ![]u8 {
+    const source_worlds = try sortedStringsAlloc(allocator, identity.source_worlds);
+    defer allocator.free(source_worlds);
+    const target_worlds = try sortedStringsAlloc(allocator, identity.target_worlds);
+    defer allocator.free(target_worlds);
+    const carriers = try sortedStringsAlloc(allocator, identity.carriers);
+    defer allocator.free(carriers);
+    const operations = try sortedStringsAlloc(allocator, identity.operations);
+    defer allocator.free(operations);
+    const observations = try sortedStringsAlloc(allocator, identity.observations);
+    defer allocator.free(observations);
+    const laws = try sortedStringsAlloc(allocator, identity.laws);
+    defer allocator.free(laws);
+
+    var canonical: std.Io.Writer.Allocating = .init(allocator);
+    defer canonical.deinit();
+    try canonical.writer.writeAll("owner-boundary-synthesis/boundary-identity/v1\n");
+    try std.json.Stringify.value(.{
+        .source_worlds = source_worlds,
+        .target_worlds = target_worlds,
+        .carriers = carriers,
+        .operations = operations,
+        .observations = observations,
+        .laws = laws,
+    }, .{}, &canonical.writer);
+    const canonical_bytes = try canonical.toOwnedSlice();
+    defer allocator.free(canonical_bytes);
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(canonical_bytes, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.fmt.allocPrint(allocator, "sha256:{s}", .{hex});
+}
+
+fn sortedStringsAlloc(allocator: std.mem.Allocator, values: []const []const u8) ![][]const u8 {
+    const sorted = try allocator.alloc([]const u8, values.len);
+    @memcpy(sorted, values);
+    std.mem.sort([]const u8, sorted, {}, lessString);
+    return sorted;
+}
+
+fn classHasResolutionInput(fold: ReviewFold, class: EquivalenceClass) bool {
+    for (class.finding_ids) |finding_id| {
+        for (fold.findings) |finding| {
+            if (std.mem.eql(u8, finding.finding_id, finding_id) and std.mem.eql(u8, finding.disposition, "resolution-input")) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn isResolutionInputClass(review_folds: []const ReviewFold, class_ref: []const u8) bool {
+    for (review_folds) |fold| {
+        for (fold.compression.equivalence_classes) |class| {
+            if (std.mem.eql(u8, class.quotient_key, class_ref) and classHasResolutionInput(fold, class)) return true;
+        }
+    }
+    return false;
+}
+
+fn synthesisIdentitySeen(prior: []const OwnerSynthesis, synthesis_id: []const u8) bool {
+    for (prior) |synthesis| if (std.mem.eql(u8, synthesis.synthesis_id, synthesis_id)) return true;
+    return false;
+}
+
+fn synthesisComponentSeen(prior: []const OwnerSynthesis, component_key: []const u8) bool {
+    if (!isNonblank(component_key)) return false;
+    for (prior) |synthesis| if (std.mem.eql(u8, synthesis.stable_component_key, component_key)) return true;
+    return false;
+}
+
+fn countSynthesesWithClass(syntheses: []const OwnerSynthesis, class_ref: []const u8) usize {
+    var count: usize = 0;
+    for (syntheses) |synthesis| if (containsString(synthesis.class_refs, class_ref)) {
+        count += 1;
+    };
+    return count;
+}
+
+fn countSynthesesJoiningPrior(syntheses: []const OwnerSynthesis, prior_ref: []const u8) usize {
+    var count: usize = 0;
+    for (syntheses) |synthesis| if (containsString(synthesis.prior_synthesis_refs, prior_ref)) {
+        count += 1;
+    };
+    return count;
+}
+
+fn countSynthesesWithId(syntheses: []const OwnerSynthesis, synthesis_id: []const u8) usize {
+    var count: usize = 0;
+    for (syntheses) |synthesis| if (std.mem.eql(u8, synthesis.synthesis_id, synthesis_id)) {
+        count += 1;
+    };
+    return count;
+}
+
+fn findSynthesis(syntheses: []const OwnerSynthesis, synthesis_id: []const u8) ?OwnerSynthesis {
+    for (syntheses) |synthesis| {
+        if (std.mem.eql(u8, synthesis.synthesis_id, synthesis_id)) return synthesis;
+    }
+    return null;
+}
+
+fn countDecisionsWithSynthesis(decisions_for_resolution: []const Decision, synthesis_id: []const u8) usize {
+    var count: usize = 0;
+    for (decisions_for_resolution) |decision| {
+        const synthesis_ref = decision.owner_synthesis_ref orelse continue;
+        if (std.mem.eql(u8, synthesis_ref, synthesis_id)) count += 1;
+    }
+    return count;
+}
+
+fn countSelectedNodesWithSynthesis(decisions_for_resolution: []const Decision, synthesis_id: []const u8) usize {
+    var count: usize = 0;
+    for (decisions_for_resolution) |decision| {
+        const synthesis_ref = decision.owner_synthesis_ref orelse continue;
+        if (std.mem.eql(u8, synthesis_ref, synthesis_id) and decision.selected_work_node != null) count += 1;
+    }
+    return count;
+}
+
+fn synthesisHasSelectedNode(decisions_for_resolution: []const Decision, synthesis_id: []const u8, node_id: []const u8) bool {
+    for (decisions_for_resolution) |decision| {
+        const synthesis_ref = decision.owner_synthesis_ref orelse continue;
+        const node = decision.selected_work_node orelse continue;
+        if (std.mem.eql(u8, synthesis_ref, synthesis_id) and std.mem.eql(u8, node.node_id, node_id)) return true;
+    }
+    return false;
+}
+
 fn isResolutionInputFinding(review_folds: []const ReviewFold, finding_id: []const u8) bool {
     for (review_folds) |fold| for (fold.findings) |finding| {
         if (std.mem.eql(u8, finding.finding_id, finding_id) and std.mem.eql(u8, finding.disposition, "resolution-input")) return true;
@@ -545,9 +1066,26 @@ const classes = [_]EquivalenceClass{.{
 }};
 const folds = [_]ReviewFold{.{
     .version = "RF-v2",
+    .goal_id = "goal-1",
     .findings = &findings,
     .compression = .{ .equivalence_classes = &classes },
 }};
+const fixture_source_worlds = [_][]const u8{"review-findings"};
+const fixture_target_worlds = [_][]const u8{"repair-plan"};
+const fixture_carriers = [_][]const u8{"RF-v2-class"};
+const fixture_operations = [_][]const u8{"repair"};
+const fixture_observations = [_][]const u8{"verifier"};
+const fixture_laws = [_][]const u8{"parse-totality"};
+const owners = [_][]const u8{"parser"};
+const work_paths = [_][]const u8{"apps/ledger/scripts/actuating_review_resolution.zig"};
+const component_identity = BoundaryIdentity{
+    .source_worlds = &fixture_source_worlds,
+    .target_worlds = &fixture_target_worlds,
+    .carriers = &fixture_carriers,
+    .operations = &fixture_operations,
+    .observations = &fixture_observations,
+    .laws = &fixture_laws,
+};
 const refinement = CorrectnessRefinement{
     .class_ref = "class-1",
     .discrepancy = "excess",
@@ -565,12 +1103,113 @@ const decisions = [_]Decision{.{
     .strategy = "local-repair",
     .correctness_refinement = refinement,
     .blockers = &no_blockers,
+    .owner_synthesis_ref = "synthesis-1",
+    .selected_work_node = .{
+        .node_id = "work-node-1",
+        .run_id = "run-1",
+        .owner_boundary = "parser",
+        .paths = &work_paths,
+        .verifier = &command,
+    },
 }};
 const empty = [_][]const u8{};
+const no_obligations = [_]StructuralObligation{};
+const fixture_syntheses = [_]OwnerSynthesis{.{
+    .version = "owner-boundary-synthesis/v1",
+    .synthesis_id = "synthesis-1",
+    .stable_component_key = "sha256:6dad45c63c96e2835c9b7d40f6c727b08b3df176ef92eae3db6b998657902c46",
+    .boundary_identity = component_identity,
+    .class_refs = &class_ids,
+    .prior_decision_refs = &empty,
+    .prior_synthesis_refs = &empty,
+    .owner_boundaries = &owners,
+    .pressure_signals = &empty,
+    .disposition = "reuse-owner",
+    .canonical_owner = "parser",
+    .construction = "Reject malformed input in the parser constructor",
+    .separation_obstruction = null,
+    .structural_obligations = &no_obligations,
+    .selected_work_node_ref = "work-node-1",
+    .falsifier = "A local repair requires a second law owner or new semantic machinery",
+}};
+const no_syntheses = [_]OwnerSynthesis{};
+const kernel_owners = [_][]const u8{ "parser", "review-kernel" };
+const kernel_pressure = [_][]const u8{"multiple-law-owners"};
+const kernel_retirements = [_][]const u8{"parser"};
+const pending_kernel_obligations = [_]StructuralObligation{
+    .{ .kind = "install", .target = "review-kernel", .verifier = &command },
+    .{ .kind = "retire", .target = "parser", .verifier = &command },
+};
+const completed_kernel_obligations = [_]StructuralObligation{
+    .{ .kind = "install", .target = "review-kernel", .verifier = &command, .observation_ref = "artifact:install-proof" },
+    .{ .kind = "retire", .target = "parser", .verifier = &command, .observation_ref = "artifact:retirement-proof" },
+};
+const kernel_refinement = CorrectnessRefinement{
+    .class_ref = "class-1",
+    .discrepancy = "excess",
+    .law_delta = "Malformed input cannot inhabit Parsed",
+    .owner_refinement = .{ .kind = "replace-owner", .construction = "Install one review kernel and retire the parser-local implementation" },
+    .preservation_witness = .{ .statement = "Previously valid input still parses", .verifier = &command },
+    .progress_witness = .{ .kind = "exclude", .statement = "The malformed-input class is rejected", .verifier = &command },
+};
+const kernel_decisions = [_]Decision{.{
+    .decision_id = "decision-1",
+    .owner_boundary = "parser",
+    .finding_ids = &finding_ids,
+    .liability_classes = &class_ids,
+    .strategy = "replacement-kernel",
+    .correctness_refinement = kernel_refinement,
+    .blockers = &no_blockers,
+    .owner_synthesis_ref = "synthesis-1",
+    .selected_work_node = .{
+        .node_id = "work-node-1",
+        .run_id = "run-1",
+        .owner_boundary = "review-kernel",
+        .paths = &work_paths,
+        .verifier = &command,
+    },
+}};
+const pending_kernel_syntheses = [_]OwnerSynthesis{.{
+    .version = "owner-boundary-synthesis/v1",
+    .synthesis_id = "synthesis-1",
+    .stable_component_key = "sha256:6dad45c63c96e2835c9b7d40f6c727b08b3df176ef92eae3db6b998657902c46",
+    .boundary_identity = component_identity,
+    .class_refs = &class_ids,
+    .prior_decision_refs = &empty,
+    .prior_synthesis_refs = &empty,
+    .owner_boundaries = &kernel_owners,
+    .pressure_signals = &kernel_pressure,
+    .disposition = "converge-kernel",
+    .canonical_owner = "review-kernel",
+    .construction = "Install one review kernel and retire the parser-local implementation",
+    .separation_obstruction = null,
+    .structural_obligations = &pending_kernel_obligations,
+    .selected_work_node_ref = "work-node-1",
+    .falsifier = "The liabilities require distinct laws and cannot share an owner",
+}};
+const completed_kernel_syntheses = [_]OwnerSynthesis{.{
+    .version = "owner-boundary-synthesis/v1",
+    .synthesis_id = "synthesis-1",
+    .stable_component_key = "sha256:6dad45c63c96e2835c9b7d40f6c727b08b3df176ef92eae3db6b998657902c46",
+    .boundary_identity = component_identity,
+    .class_refs = &class_ids,
+    .prior_decision_refs = &empty,
+    .prior_synthesis_refs = &empty,
+    .owner_boundaries = &kernel_owners,
+    .pressure_signals = &kernel_pressure,
+    .disposition = "converge-kernel",
+    .canonical_owner = "review-kernel",
+    .construction = "Install one review kernel and retire the parser-local implementation",
+    .separation_obstruction = null,
+    .structural_obligations = &completed_kernel_obligations,
+    .selected_work_node_ref = "work-node-1",
+    .falsifier = "The liabilities require distinct laws and cannot share an owner",
+}};
 const clean_findings = [_]Finding{};
 const clean_classes = [_]EquivalenceClass{};
 const clean_folds = [_]ReviewFold{.{
     .version = "RF-v2",
+    .goal_id = "goal-1",
     .findings = &clean_findings,
     .compression = .{ .equivalence_classes = &clean_classes },
 }};
@@ -583,6 +1222,12 @@ fn validResolution(status: []const u8) Resolution {
         .run_id = "run-1",
         .review_folds = &folds,
         .finding_ids = &finding_ids,
+        .resolution_history = .{
+            .goal_id = "goal-1",
+            .prior_resolution_refs = &empty,
+            .prior_synthesis_refs = &empty,
+        },
+        .owner_syntheses = &fixture_syntheses,
         .decisions = &decisions,
         .outcome = .{
             .status = status,
@@ -591,6 +1236,33 @@ fn validResolution(status: []const u8) Resolution {
                 .required_retirements = &empty,
                 .completed_retirements = &empty,
                 .dominated_remaining = &empty,
+            },
+        },
+    };
+}
+
+fn kernelResolution(status: []const u8) Resolution {
+    const closeout = std.mem.eql(u8, status, "resolved");
+    return .{
+        .version = "review-resolution/v1",
+        .resolution_id = "resolution-1",
+        .run_id = "run-1",
+        .review_folds = &folds,
+        .finding_ids = &finding_ids,
+        .resolution_history = .{
+            .goal_id = "goal-1",
+            .prior_resolution_refs = &empty,
+            .prior_synthesis_refs = &empty,
+        },
+        .owner_syntheses = if (closeout) &completed_kernel_syntheses else &pending_kernel_syntheses,
+        .decisions = &kernel_decisions,
+        .outcome = .{
+            .status = status,
+            .semantic_balance = .{
+                .uncovered_liabilities = &empty,
+                .required_retirements = &kernel_retirements,
+                .completed_retirements = if (closeout) &kernel_retirements else &empty,
+                .dominated_remaining = if (closeout) &empty else &kernel_retirements,
             },
         },
     };
@@ -619,10 +1291,24 @@ test "closeout accepts a structurally resolved refinement" {
     try std.testing.expectEqual(@as(usize, 0), issues.values.items.len);
 }
 
+test "preflight accepts a pressure-backed replacement kernel" {
+    var issues = try validateForTest(kernelResolution("pending"), .preflight);
+    defer issues.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), issues.values.items.len);
+}
+
+test "closeout accepts observed kernel obligations and exact retirement" {
+    var issues = try validateForTest(kernelResolution("resolved"), .closeout);
+    defer issues.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), issues.values.items.len);
+}
+
 test "closeout accepts a clean fold without refinements" {
     var resolution = validResolution("clean");
     resolution.review_folds = &clean_folds;
     resolution.finding_ids = &empty;
+    resolution.resolution_history = null;
+    resolution.owner_syntheses = &no_syntheses;
     resolution.decisions = &no_decisions;
     var issues = try validateForTest(resolution, .closeout);
     defer issues.deinit(std.testing.allocator);
@@ -671,13 +1357,22 @@ test "blocked decision retains class coverage but cannot authorize mutation" {
     changed[0].strategy = "blocked";
     changed[0].correctness_refinement = null;
     changed[0].blockers = &blockers;
+    changed[0].selected_work_node = null;
+    var changed_syntheses = fixture_syntheses;
+    changed_syntheses[0].disposition = "blocked";
+    changed_syntheses[0].canonical_owner = null;
+    changed_syntheses[0].construction = null;
+    changed_syntheses[0].selected_work_node_ref = null;
+    changed_syntheses[0].falsifier = "Sufficient owner evidence becomes available";
     var resolution = validResolution("blocked");
     resolution.decisions = &changed;
+    resolution.owner_syntheses = &changed_syntheses;
     var issues = try validateForTest(resolution, .preflight);
     defer issues.deinit(std.testing.allocator);
     try std.testing.expect(hasIssue(issues, "mutation-blocked-by-resolution"));
     try std.testing.expect(hasIssue(issues, "mutation-blocked-by-outcome"));
     try std.testing.expect(!hasIssue(issues, "resolution-class-decision-coverage"));
+    try std.testing.expect(!hasIssue(issues, "decision-owner-synthesis-strategy-binding"));
 }
 
 test "decision findings must be retained RF-v2 resolution inputs" {
@@ -774,8 +1469,181 @@ test "closeout distinguishes clean from resolved" {
     var resolved_without_findings = validResolution("resolved");
     resolved_without_findings.review_folds = &clean_folds;
     resolved_without_findings.finding_ids = &empty;
+    resolved_without_findings.resolution_history = null;
+    resolved_without_findings.owner_syntheses = &no_syntheses;
     resolved_without_findings.decisions = &no_decisions;
     var resolved_issues = try validateForTest(resolved_without_findings, .closeout);
     defer resolved_issues.deinit(std.testing.allocator);
     try std.testing.expect(hasIssue(resolved_issues, "closeout-resolved-without-findings"));
+}
+
+test "decision-bearing historical snapshots remain readable but require synthesis" {
+    var resolution = validResolution("pending");
+    resolution.resolution_history = null;
+    resolution.owner_syntheses = &no_syntheses;
+    var changed_decisions = decisions;
+    changed_decisions[0].owner_synthesis_ref = null;
+    changed_decisions[0].selected_work_node = null;
+    resolution.decisions = &changed_decisions;
+
+    var encoded: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer encoded.deinit();
+    try std.json.Stringify.value(Envelope{ .review_resolution = resolution }, .{}, &encoded.writer);
+    const bytes = try encoded.toOwnedSlice();
+    defer std.testing.allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(Envelope, std.testing.allocator, bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    var issues = try validateForTest(parsed.value.review_resolution, .preflight);
+    defer issues.deinit(std.testing.allocator);
+    try std.testing.expect(hasIssue(issues, "resolution-history-required"));
+    try std.testing.expect(hasIssue(issues, "owner-synthesis-required"));
+    try std.testing.expect(hasIssue(issues, "decision-owner-synthesis-required"));
+}
+
+test "stable component key is the order-independent boundary identity digest" {
+    const ascending = [_][]const u8{ "a", "b" };
+    const descending = [_][]const u8{ "b", "a" };
+    const first = BoundaryIdentity{
+        .source_worlds = &ascending,
+        .target_worlds = &descending,
+        .carriers = &ascending,
+        .operations = &descending,
+        .observations = &ascending,
+        .laws = &descending,
+    };
+    const second = BoundaryIdentity{
+        .source_worlds = &descending,
+        .target_worlds = &ascending,
+        .carriers = &descending,
+        .operations = &ascending,
+        .observations = &descending,
+        .laws = &ascending,
+    };
+    const first_key = try canonicalComponentKeyAlloc(std.testing.allocator, first);
+    defer std.testing.allocator.free(first_key);
+    const second_key = try canonicalComponentKeyAlloc(std.testing.allocator, second);
+    defer std.testing.allocator.free(second_key);
+    try std.testing.expectEqualStrings(first_key, second_key);
+}
+
+test "stable component key cannot include transport provenance" {
+    var changed_syntheses = fixture_syntheses;
+    changed_syntheses[0].stable_component_key = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    var resolution = validResolution("pending");
+    resolution.owner_syntheses = &changed_syntheses;
+    var issues = try validateForTest(resolution, .preflight);
+    defer issues.deinit(std.testing.allocator);
+    try std.testing.expect(hasIssue(issues, "owner-synthesis-stable-component-key"));
+}
+
+test "retained synthesis history must join exactly one current component" {
+    const retained = [_][]const u8{"synthesis-prior"};
+    var resolution = validResolution("pending");
+    var history = resolution.resolution_history.?;
+    history.prior_synthesis_refs = &retained;
+    resolution.resolution_history = history;
+    var issues = try validateForTest(resolution, .preflight);
+    defer issues.deinit(std.testing.allocator);
+    try std.testing.expect(hasIssue(issues, "owner-synthesis-history-join"));
+
+    var joined_syntheses = fixture_syntheses;
+    joined_syntheses[0].prior_synthesis_refs = &retained;
+    resolution.owner_syntheses = &joined_syntheses;
+    var joined_issues = try validateForTest(resolution, .preflight);
+    defer joined_issues.deinit(std.testing.allocator);
+    try std.testing.expect(!hasIssue(joined_issues, "owner-synthesis-history-join"));
+}
+
+test "resolution history remains bound to the current fold goal" {
+    var changed_folds = folds;
+    changed_folds[0].goal_id = "goal-other";
+    var resolution = validResolution("pending");
+    resolution.review_folds = &changed_folds;
+    var issues = try validateForTest(resolution, .preflight);
+    defer issues.deinit(std.testing.allocator);
+    try std.testing.expect(hasIssue(issues, "resolution-history-goal-binding"));
+}
+
+test "reuse owner rejects pressure and execution outside the canonical owner" {
+    var changed_syntheses = fixture_syntheses;
+    changed_syntheses[0].pressure_signals = &kernel_pressure;
+    var changed_decisions = decisions;
+    changed_decisions[0].selected_work_node.?.owner_boundary = "review-kernel";
+    var resolution = validResolution("pending");
+    resolution.owner_syntheses = &changed_syntheses;
+    resolution.decisions = &changed_decisions;
+    var issues = try validateForTest(resolution, .preflight);
+    defer issues.deinit(std.testing.allocator);
+    try std.testing.expect(hasIssue(issues, "reuse-owner-has-pressure"));
+    try std.testing.expect(hasIssue(issues, "selected-work-node-owner-binding"));
+}
+
+test "repair strategy is synthesis-owned" {
+    var changed_syntheses = fixture_syntheses;
+    changed_syntheses[0].disposition = "converge-kernel";
+    var resolution = validResolution("pending");
+    resolution.owner_syntheses = &changed_syntheses;
+    var issues = try validateForTest(resolution, .preflight);
+    defer issues.deinit(std.testing.allocator);
+    try std.testing.expect(hasIssue(issues, "decision-owner-synthesis-strategy-binding"));
+}
+
+test "separate laws cannot materialize a repair decision" {
+    var changed_syntheses = fixture_syntheses;
+    changed_syntheses[0].disposition = "separate-laws";
+    changed_syntheses[0].canonical_owner = null;
+    changed_syntheses[0].construction = null;
+    changed_syntheses[0].falsifier = null;
+    changed_syntheses[0].separation_obstruction = .{
+        .statement = "The classes preserve different observations",
+        .falsifier = "One construction satisfies both observation laws",
+    };
+    var resolution = validResolution("pending");
+    resolution.owner_syntheses = &changed_syntheses;
+    var issues = try validateForTest(resolution, .preflight);
+    defer issues.deinit(std.testing.allocator);
+    try std.testing.expect(hasIssue(issues, "separate-laws-has-repair"));
+    try std.testing.expect(hasIssue(issues, "decision-owner-synthesis-strategy-binding"));
+}
+
+test "one resolution can materialize only one synthesis-owned node" {
+    var duplicated = [_]Decision{ decisions[0], decisions[0] };
+    duplicated[1].decision_id = "decision-2";
+    duplicated[1].selected_work_node.?.node_id = "work-node-2";
+    var resolution = validResolution("pending");
+    resolution.decisions = &duplicated;
+    var issues = try validateForTest(resolution, .preflight);
+    defer issues.deinit(std.testing.allocator);
+    try std.testing.expect(hasIssue(issues, "owner-synthesis-selected-node-cardinality"));
+}
+
+test "repair resolution cannot defer node selection to execution time" {
+    var changed_decisions = decisions;
+    changed_decisions[0].selected_work_node = null;
+    var changed_syntheses = fixture_syntheses;
+    changed_syntheses[0].selected_work_node_ref = null;
+    var resolution = validResolution("pending");
+    resolution.decisions = &changed_decisions;
+    resolution.owner_syntheses = &changed_syntheses;
+    var issues = try validateForTest(resolution, .preflight);
+    defer issues.deinit(std.testing.allocator);
+    try std.testing.expect(hasIssue(issues, "owner-synthesis-selected-node-cardinality"));
+}
+
+test "kernel closeout requires observations for every structural obligation" {
+    var resolution = kernelResolution("resolved");
+    resolution.owner_syntheses = &pending_kernel_syntheses;
+    var issues = try validateForTest(resolution, .closeout);
+    defer issues.deinit(std.testing.allocator);
+    try std.testing.expect(hasIssue(issues, "structural-obligation-observation-required"));
+}
+
+test "kernel closeout rejects outstanding structural retirement" {
+    var resolution = kernelResolution("resolved");
+    resolution.outcome.semantic_balance.completed_retirements = &empty;
+    var issues = try validateForTest(resolution, .closeout);
+    defer issues.deinit(std.testing.allocator);
+    try std.testing.expect(hasIssue(issues, "structural-obligation-retirement-incomplete"));
+    try std.testing.expect(hasIssue(issues, "closeout-retirement-debt"));
 }
