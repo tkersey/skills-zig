@@ -66,12 +66,14 @@ ledger status --id NEG-000001 --to stale --json transition.json
 ledger reopen --id NEG-000001 --json reopen-proof.json
 ledger export --id NEG-000001 --format full
 ledger export --id NEG-000001 --format memory-note
+ledger export --source negative-ledger --id NEG-000001 --format memory-note
 ledger handoff
 ledger compact
 ledger doctor
 ledger migrate --mode copy
 ledger capture --source learnings --learning "When X, prefer Y because Z." --evidence "command/result" --application "Do Y next time."
 ledger recall --source learnings --query "focused task" --limit 5 --drop-superseded
+ledger export --source learnings --id lrn-... --format memory-note
 ledger migrate --source learnings --mode copy
 ledger doctor --source learnings
 ledger open --source actuation --json actuation-open.json
@@ -94,10 +96,14 @@ ledger validate policy-synthesis-receipt --input synthesis-receipt.json
 ledger validate review-fold --input review-fold.json
 ledger validate actuation-review-policy --phase preflight --input review-policy.json
 ledger validate review-resolution --phase preflight --input review-resolution.json
+ledger validate source-memory-checkpoint --input source-memory-checkpoint.json
 ```
 
 Use `--file PATH` to point at a non-default store.
 For `--source learnings`, `--file PATH` is accepted as an alias for the learning event path.
+`--source negative-ledger` is an additive namespace alias for the source-less
+Negative Ledger commands; it preserves `--file` and all existing command
+semantics.
 
 ## Universalist plan addressing
 
@@ -258,6 +264,7 @@ ledger validate policy-synthesis-receipt --input synthesis-receipt.json
 ledger validate review-fold --input review-fold.json
 ledger validate actuation-review-policy --phase preflight --input review-policy.json
 ledger validate review-resolution --phase preflight --input review-resolution.json
+ledger validate source-memory-checkpoint --input source-memory-checkpoint.json
 ```
 
 Input is canonical JSON from a file or `-` for stdin. The general governance
@@ -265,6 +272,13 @@ contracts emit `ledger-validate-decision/v1`; the Actuating contracts emit their
 domain decision schemas and require `--phase preflight|closeout`. Every
 invocation exits `0` for `pass` and `2` for a blocked or malformed artifact.
 Every decision records `authority_granted:false` and `storage_mutated:false`.
+
+`source-memory-checkpoint/v1` validation requires exactly one Learnings,
+Synesthesia, and Negative Ledger disposition, checks source-specific IDs and
+admission compatibility, and derives `complete`, `degraded`, or `blocked` from
+those results. It validates coordination evidence only: source skills retain
+semantic and mutation authority, and an admission failure after canonical
+success must be represented as `degraded`, never as canonical rollback.
 
 The Actuating review-policy checker preserves `actuation-review-policy/v1`
 same-tuple suffix semantics and also accepts `actuation-review-policy/v2`.
@@ -594,6 +608,10 @@ ledger export --id NEG-000001 --format full
 ledger export --id NEG-000001 --format memory-note |
   memory-note append --extension negative-ledger --kind ledger-projection --json -
 ```
+
+The same Negative Ledger commands are available through the uniform source
+namespace, for example `ledger export --source negative-ledger --id
+NEG-000001 --format memory-note`. Source-less commands remain supported.
 
 `export` and `handoff` fail closed when the store or selected projection is semantically invalid. Repo-scoped memory projections include a stable repository identity and applicable paths, so identical `NEG-*` IDs from different repositories remain distinct.
 

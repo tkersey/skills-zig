@@ -49,7 +49,7 @@ const HelpText =
     \\
     \\options:
     \\  --file PATH       Persistent-adapter path (default: .ledger/negative-ledger/events.jsonl)
-    \\  --source SOURCE   Source namespace; omit for negative-ledger, or use actuation, hylo, learnings, synesthesia, or universalist
+    \\  --source SOURCE   Source namespace; use negative-ledger, actuation, hylo, learnings, synesthesia, or universalist
     \\  --json PATH|-     Capture input JSON or lifecycle-transition proof JSON
     \\  --id NEG-ID       Record id for show/reopen/status/export
     \\  --to VALUE        Target status for status, target path for migrate
@@ -255,6 +255,10 @@ pub fn main(init: std.process.Init) !void {
     if (argvSource(argv)) |source| {
         const source_argv = try sourceArgvAlloc(allocator, argv, source);
         defer allocator.free(source_argv);
+        if (std.mem.eql(u8, source, "negative-ledger")) {
+            try runRootWithArgv(allocator, init.io, source_argv);
+            return;
+        }
         if (std.mem.eql(u8, source, "learnings")) {
             try learnings_cli.runWithArgv(allocator, source_argv, init.environ_map.get("CODEX_HOME") orelse "");
             return;
@@ -281,8 +285,12 @@ pub fn main(init: std.process.Init) !void {
         core_cli.exitUsageFailure(HelpSurface, Version, "UnknownSource", source);
         return;
     }
+    try runRootWithArgv(allocator, init.io, argv);
+}
+
+fn runRootWithArgv(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
     if (argv.len > 1 and std.mem.eql(u8, argv[1], "validate")) {
-        const code = validation_cli.runWithArgv(allocator, init.io, argv) catch |err| {
+        const code = validation_cli.runWithArgv(allocator, io, argv) catch |err| {
             core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
         };
         if (code != 0) std.process.exit(code);
@@ -332,7 +340,7 @@ fn sourceArgvAlloc(allocator: std.mem.Allocator, argv: []const []const u8, sourc
                 continue;
             }
         }
-        if (std.mem.eql(u8, token, "--file")) {
+        if (!std.mem.eql(u8, source, "negative-ledger") and std.mem.eql(u8, token, "--file")) {
             try out.append(allocator, "--path");
             continue;
         }
@@ -3464,6 +3472,17 @@ test "hylo source routing preserves replay commands" {
     const routed = try sourceArgvAlloc(std.testing.allocator, &argv, "hylo");
     defer std.testing.allocator.free(routed);
     try std.testing.expectEqualSlices([]const u8, &.{ "ledger", "doctor", "--repo", "." }, routed);
+}
+
+test "negative ledger source alias preserves root command arguments" {
+    const argv = [_][]const u8{ "ledger", "export", "--source", "negative-ledger", "--file", ".ledger/custom.jsonl", "--id", "NEG-000001", "--format", "memory-note" };
+    const routed = try sourceArgvAlloc(std.testing.allocator, &argv, "negative-ledger");
+    defer std.testing.allocator.free(routed);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "ledger", "export", "--file", ".ledger/custom.jsonl", "--id", "NEG-000001", "--format", "memory-note" },
+        routed,
+    );
 }
 
 test "ledger test graph includes source and validation modules" {

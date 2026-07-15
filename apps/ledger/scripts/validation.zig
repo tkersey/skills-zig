@@ -23,6 +23,7 @@ const UsageText =
     \\  policy-synthesis-receipt  Validate a PSR-v1 policy synthesis receipt
     \\  review-fold               Validate an RF-v2 review-fold receipt
     \\  review-resolution         Check refinement and owner synthesis in review-resolution/v1
+    \\  source-memory-checkpoint  Validate a source-memory-checkpoint/v1 receipt
     \\
     \\options:
     \\  --phase PHASE  preflight|closeout for Actuating contracts
@@ -40,11 +41,13 @@ const Contract = enum {
     plan_source_contract,
     policy_synthesis_receipt,
     review_fold,
+    source_memory_checkpoint,
 
     fn parse(raw: []const u8) ?Contract {
         if (std.mem.eql(u8, raw, "plan-source-contract")) return .plan_source_contract;
         if (std.mem.eql(u8, raw, "policy-synthesis-receipt")) return .policy_synthesis_receipt;
         if (std.mem.eql(u8, raw, "review-fold")) return .review_fold;
+        if (std.mem.eql(u8, raw, "source-memory-checkpoint")) return .source_memory_checkpoint;
         return null;
     }
 
@@ -53,6 +56,7 @@ const Contract = enum {
             .plan_source_contract => "plan-source-contract",
             .policy_synthesis_receipt => "policy-synthesis-receipt",
             .review_fold => "review-fold",
+            .source_memory_checkpoint => "source-memory-checkpoint",
         };
     }
 };
@@ -124,6 +128,7 @@ pub fn runWithArgv(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
         .plan_source_contract => try validatePlanSourceContract(allocator, parsed.value, &issues),
         .policy_synthesis_receipt => try validatePolicySynthesisReceipt(allocator, parsed.value, &issues),
         .review_fold => try validateReviewFold(allocator, parsed.value, &issues),
+        .source_memory_checkpoint => try validateSourceMemoryCheckpoint(allocator, parsed.value, &issues),
     }
 
     try emitDecision(allocator, args.contract, &issues);
@@ -475,6 +480,144 @@ fn validateReviewCompressionAndRoutes(allocator: std.mem.Allocator, receipt: std
     }
 }
 
+const CheckpointParticipant = enum {
+    learnings,
+    synesthesia,
+    negative_ledger,
+};
+
+const ParticipantValidation = struct {
+    canonical_blocked: bool = false,
+    admission_blocked: bool = false,
+};
+
+fn validateSourceMemoryCheckpoint(allocator: std.mem.Allocator, root: std.json.Value, issues: *Issues) !void {
+    const root_object = asObject(root) orelse {
+        try issues.add(allocator, "input-object-required");
+        return;
+    };
+    const receipt_value = root_object.get("source_memory_checkpoint") orelse root;
+    const receipt = asObject(receipt_value) orelse {
+        try issues.add(allocator, "source-memory-checkpoint-object-required");
+        return;
+    };
+
+    if (!fieldEqualsString(receipt, "schema", "source-memory-checkpoint/v1")) try issues.add(allocator, "checkpoint-schema");
+    const checkpoint_id = nonblankString(receipt.get("checkpoint_id")) orelse "";
+    if (!std.mem.startsWith(u8, checkpoint_id, "SMC-")) try issues.add(allocator, "checkpoint-id");
+    if (!isNonblankString(receipt.get("trigger"))) try issues.add(allocator, "checkpoint-trigger");
+    if (!validSha256Fingerprint(receipt.get("subject_fingerprint"))) try issues.add(allocator, "subject-fingerprint");
+    if (!validSha256Fingerprint(receipt.get("evidence_fingerprint"))) try issues.add(allocator, "evidence-fingerprint");
+
+    const participants = asObjectValue(receipt.get("participants")) orelse {
+        try issues.add(allocator, "participants-object-required");
+        return;
+    };
+    if (participants.count() != 3 or participants.get("learnings") == null or participants.get("synesthesia") == null or participants.get("negative-ledger") == null) {
+        try issues.add(allocator, "participant-set");
+    }
+
+    const learning = try validateCheckpointParticipant(allocator, asObjectValue(participants.get("learnings")), .learnings, issues);
+    const synesthesia = try validateCheckpointParticipant(allocator, asObjectValue(participants.get("synesthesia")), .synesthesia, issues);
+    const negative = try validateCheckpointParticipant(allocator, asObjectValue(participants.get("negative-ledger")), .negative_ledger, issues);
+
+    const canonical_blocked = learning.canonical_blocked or synesthesia.canonical_blocked or negative.canonical_blocked;
+    const admission_blocked = learning.admission_blocked or synesthesia.admission_blocked or negative.admission_blocked;
+    const expected_status: []const u8 = if (canonical_blocked) "blocked" else if (admission_blocked) "degraded" else "complete";
+    if (!fieldEqualsString(receipt, "status", expected_status)) try issues.add(allocator, "aggregate-status");
+}
+
+fn validateCheckpointParticipant(
+    allocator: std.mem.Allocator,
+    maybe_participant: ?std.json.ObjectMap,
+    source: CheckpointParticipant,
+    issues: *Issues,
+) !ParticipantValidation {
+    const participant = maybe_participant orelse {
+        try issues.add(allocator, "participant-object-required");
+        return .{ .canonical_blocked = true };
+    };
+    const disposition = stringField(participant, "disposition") orelse "";
+    const admission = stringField(participant, "admission") orelse "";
+    const record_id = nonblankString(participant.get("record_id"));
+    const note_id = nonblankString(participant.get("note_id"));
+
+    if (!validCheckpointDisposition(source, disposition)) try issues.add(allocator, "participant-disposition");
+    if (!stringIn(admission, &.{ "created", "duplicate-skip", "not-eligible", "not-applicable", "blocked" })) {
+        try issues.add(allocator, "admission-disposition");
+    }
+    if (record_id) |id| {
+        if (!validRecordId(source, id)) try issues.add(allocator, "record-id-prefix");
+    }
+    if (note_id) |id| {
+        if (!std.mem.startsWith(u8, id, "MSN-")) try issues.add(allocator, "note-id-prefix");
+    }
+
+    const canonical_record = dispositionHasCanonicalRecord(source, disposition);
+    const canonical_write = dispositionIsCanonicalWrite(source, disposition);
+    const canonical_blocked = std.mem.eql(u8, disposition, "blocked") or !validCheckpointDisposition(source, disposition);
+    if (canonical_record != (record_id != null)) try issues.add(allocator, "record-id-compatibility");
+    if (canonical_write and !nonblankStringArray(participant.get("proof_refs"))) try issues.add(allocator, "participant-proof-refs");
+    if (!canonical_write and !std.mem.eql(u8, disposition, "appended") and !isNonblankString(participant.get("reason"))) {
+        try issues.add(allocator, "participant-reason");
+    }
+
+    const admission_creates_or_reuses_note = stringIn(admission, &.{ "created", "duplicate-skip" });
+    if (admission_creates_or_reuses_note and (!canonical_record or note_id == null)) try issues.add(allocator, "admission-note-compatibility");
+    if (!admission_creates_or_reuses_note and note_id != null) try issues.add(allocator, "admission-note-compatibility");
+    if (std.mem.eql(u8, admission, "not-eligible") and (!canonical_record or !isNonblankString(participant.get("admission_reason")))) {
+        try issues.add(allocator, "admission-eligibility-compatibility");
+    }
+    if (std.mem.eql(u8, admission, "blocked") and (!canonical_record or !isNonblankString(participant.get("admission_reason")))) {
+        try issues.add(allocator, "admission-blocked-compatibility");
+    }
+    if (stringIn(disposition, &.{ "candidate", "no-op", "mapped", "blocked" }) and !std.mem.eql(u8, admission, "not-applicable")) {
+        try issues.add(allocator, "admission-source-compatibility");
+    }
+    if (canonical_record and std.mem.eql(u8, admission, "not-applicable")) try issues.add(allocator, "admission-source-compatibility");
+
+    return .{
+        .canonical_blocked = canonical_blocked,
+        .admission_blocked = std.mem.eql(u8, admission, "blocked"),
+    };
+}
+
+fn validCheckpointDisposition(source: CheckpointParticipant, disposition: []const u8) bool {
+    return switch (source) {
+        .learnings => stringIn(disposition, &.{ "appended", "duplicate-skip", "no-op", "blocked" }),
+        .synesthesia => stringIn(disposition, &.{ "appended", "candidate", "no-op", "blocked" }),
+        .negative_ledger => stringIn(disposition, &.{ "mapped", "captured", "transitioned", "no-op", "blocked" }),
+    };
+}
+
+fn dispositionIsCanonicalWrite(source: CheckpointParticipant, disposition: []const u8) bool {
+    return switch (source) {
+        .learnings, .synesthesia => std.mem.eql(u8, disposition, "appended"),
+        .negative_ledger => stringIn(disposition, &.{ "captured", "transitioned" }),
+    };
+}
+
+fn dispositionHasCanonicalRecord(source: CheckpointParticipant, disposition: []const u8) bool {
+    if (dispositionIsCanonicalWrite(source, disposition)) return true;
+    return source == .learnings and std.mem.eql(u8, disposition, "duplicate-skip");
+}
+
+fn validRecordId(source: CheckpointParticipant, id: []const u8) bool {
+    return switch (source) {
+        .learnings => std.mem.startsWith(u8, id, "lrn-"),
+        .synesthesia => std.mem.startsWith(u8, id, "SYN-"),
+        .negative_ledger => std.mem.startsWith(u8, id, "NEG-"),
+    };
+}
+
+fn validSha256Fingerprint(value: ?std.json.Value) bool {
+    const raw = nonblankString(value) orelse return false;
+    const hex = if (std.mem.startsWith(u8, raw, "sha256:")) raw[7..] else raw;
+    if (hex.len != 64) return false;
+    for (hex) |char| if (!std.ascii.isHex(char)) return false;
+    return true;
+}
+
 fn asObject(value: std.json.Value) ?std.json.ObjectMap {
     return switch (value) {
         .object => |object| object,
@@ -806,6 +949,46 @@ test "review fold validation rejects authority and uncovered material evidence" 
     try std.testing.expect(containsIssue(issues.values.items, "material-evidence"));
     try std.testing.expect(containsIssue(issues.values.items, "compression-coverage"));
     try std.testing.expect(containsIssue(issues.values.items, "routing-coverage"));
+}
+
+test "source memory checkpoint validation accepts a complete all no-op receipt" {
+    const input =
+        \\{"schema":"source-memory-checkpoint/v1","checkpoint_id":"SMC-20260715-0001","trigger":"delivery-boundary","subject_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","evidence_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","participants":{"learnings":{"disposition":"no-op","reason":"capture gate not met","admission":"not-applicable"},"synesthesia":{"disposition":"no-op","reason":"literal model sufficient","admission":"not-applicable"},"negative-ledger":{"disposition":"no-op","reason":"no failed route evidence","admission":"not-applicable"}},"status":"complete"}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, input, .{});
+    defer parsed.deinit();
+    var issues = Issues{};
+    defer issues.deinit(std.testing.allocator);
+    try validateSourceMemoryCheckpoint(std.testing.allocator, parsed.value, &issues);
+    try std.testing.expectEqual(@as(usize, 0), issues.values.items.len);
+}
+
+test "source memory checkpoint preserves canonical success across admission degradation" {
+    const input =
+        \\{"schema":"source-memory-checkpoint/v1","checkpoint_id":"SMC-20260715-0002","trigger":"validation-transition","subject_fingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","evidence_fingerprint":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","participants":{"learnings":{"disposition":"appended","record_id":"lrn-20260715T000000Z-12345678","proof_refs":["test:learning"],"admission":"blocked","admission_reason":"memory-note unavailable"},"synesthesia":{"disposition":"no-op","reason":"literal model sufficient","admission":"not-applicable"},"negative-ledger":{"disposition":"no-op","reason":"no failed route evidence","admission":"not-applicable"}},"status":"degraded"}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, input, .{});
+    defer parsed.deinit();
+    var issues = Issues{};
+    defer issues.deinit(std.testing.allocator);
+    try validateSourceMemoryCheckpoint(std.testing.allocator, parsed.value, &issues);
+    try std.testing.expectEqual(@as(usize, 0), issues.values.items.len);
+}
+
+test "source memory checkpoint rejects missing participants and illegal candidate admission" {
+    const input =
+        \\{"schema":"source-memory-checkpoint/v1","checkpoint_id":"SMC-20260715-0003","trigger":"delivery-boundary","subject_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","evidence_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","participants":{"learnings":{"disposition":"no-op","reason":"capture gate not met","admission":"not-applicable"},"synesthesia":{"disposition":"candidate","reason":"needs endorsement","admission":"created","note_id":"MSN-illegal"}},"status":"complete"}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, input, .{});
+    defer parsed.deinit();
+    var issues = Issues{};
+    defer issues.deinit(std.testing.allocator);
+    try validateSourceMemoryCheckpoint(std.testing.allocator, parsed.value, &issues);
+    try std.testing.expect(containsIssue(issues.values.items, "participant-set"));
+    try std.testing.expect(containsIssue(issues.values.items, "participant-object-required"));
+    try std.testing.expect(containsIssue(issues.values.items, "admission-note-compatibility"));
+    try std.testing.expect(containsIssue(issues.values.items, "admission-source-compatibility"));
+    try std.testing.expect(containsIssue(issues.values.items, "aggregate-status"));
 }
 
 fn containsIssue(issues: []const []const u8, expected: []const u8) bool {
