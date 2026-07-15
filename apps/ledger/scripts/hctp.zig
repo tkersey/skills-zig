@@ -21,6 +21,7 @@ pub const CanonicalJsonSha256Algorithm = retrace_core.canonical_json.Sha256Algor
 pub const FeatureFlags = [_][]const u8{
     "hylo_trial_v1",
     "hylo_lane_leases_v1",
+    "hylo_lane_finish_recovery_v1",
     "hylo_lane_materialization_v1",
     "hylo_pair_grade_v1",
     "hylo_trial_reveal_v1",

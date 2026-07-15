@@ -60,6 +60,8 @@ ledger --source hylo start-lane --repo REPO --campaign-id CAMPAIGN --trial-id TR
 ledger --source hylo recover-lane-start --repo REPO --campaign-id CAMPAIGN \
   --trial-id TRIAL --lane-id LANE --runner-id cas-trial \
   --lane-lease-digest DIGEST --lease-input-fd 3
+ledger --source hylo recover-lane-finish --repo REPO --receipt run-receipt.json \
+  --lease-input-fd 3
 ledger --source hylo trial-result --repo REPO --trial-id TRIAL --format markdown
 ledger --source hylo proof-artifact-set --repo REPO --trial-id TRIAL \
   --output proof-artifacts.json
@@ -80,6 +82,10 @@ and the exact campaign, trial, lane, runner, and lease digest. This recovery
 contract assumes the broker survives long enough to retain the delivered
 lease. It does not recover a capability discarded by a dead broker or receiver;
 that stronger failure model requires an explicit lease-rotation transition.
+If a terminal append commits before its public acknowledgement is retained,
+`recover-lane-finish` emits a typed acknowledgement without appending only when
+the retained lease, receipt lineage, and canonical run-receipt fingerprint equal
+Ledger's terminal lane state. Bare terminal status is not recovery authority.
 
 Default live `verify-proof` treats the manifest's declared global event range
 as an immutable prefix: it matches every declared digest against one current

@@ -39,6 +39,7 @@ const UsageText =
     \\  recover-lane-start Re-emit one committed lane-start receipt from its retained lease
     \\  lane-materialization Read the exact registration-captured selected arm
     \\  finish-lane        Bind one terminal run receipt to its started lane
+    \\  recover-lane-finish Re-emit exact terminal acknowledgement from its receipt and lease
     \\  grade-lane         Record one blind absolute lane grade
     \\  grade-pair         Record one blind pair grade
     \\  reveal-trial       Reveal the committed semantic arm map
@@ -101,6 +102,7 @@ const Command = enum {
     recover_lane_start,
     lane_materialization,
     finish_lane,
+    recover_lane_finish,
     grade_lane,
     grade_pair,
     reveal_trial,
@@ -788,6 +790,12 @@ fn runWithArgvInner(allocator: std.mem.Allocator, argv: []const []const u8) !u8 
             args.lane_lease_digest.?,
         ),
         .finish_lane => try cmdFinishLane(allocator, repo, store, args.receipt_path.?, args.lease_input_fd.?),
+        .recover_lane_finish => try cmdRecoverLaneFinish(
+            allocator,
+            store,
+            args.receipt_path.?,
+            args.lease_input_fd.?,
+        ),
         .grade_lane => try cmdGradeLane(allocator, repo, store, args.receipt_path.?),
         .grade_pair => try cmdGradePair(allocator, repo, store, args.receipt_path.?),
         .reveal_trial => try cmdRevealTrial(allocator, repo, store, args.reveal_path.?),
@@ -1043,7 +1051,8 @@ fn parseArgs(argv: []const []const u8) !Args {
         command == .lane_materialization or
         command == .trial_result or command == .close_trial or
         command == .inspect or command == .proof_artifact_set or command == .export_proof;
-    const uses_receipt = command == .finish_lane or command == .grade_lane or command == .grade_pair;
+    const uses_receipt = command == .finish_lane or command == .recover_lane_finish or
+        command == .grade_lane or command == .grade_pair;
     if (uses_campaign_path != (args.campaign_path != null)) return error.CampaignNotAllowed;
     if (uses_trial_path != (args.trial_path != null)) return error.TrialNotAllowed;
     if (uses_input_path != (args.input_path != null)) return error.InputNotAllowed;
@@ -1082,7 +1091,9 @@ fn parseArgs(argv: []const []const u8) !Args {
     {
         return error.LaneMaterializationArgumentsInvalid;
     }
-    if (command == .finish_lane or command == .commit_lane_start or command == .recover_lane_start) {
+    if (command == .finish_lane or command == .recover_lane_finish or
+        command == .commit_lane_start or command == .recover_lane_start)
+    {
         if (args.lease_input_fd == null) return error.LeaseInputNotAllowed;
     } else if (args.lease_input_fd != null) return error.LeaseInputNotAllowed;
     const any_close_argument = args.close_status != null or args.reason != null;
@@ -1126,6 +1137,7 @@ fn parseCommand(raw: []const u8) ?Command {
     if (std.mem.eql(u8, raw, "recover-lane-start")) return .recover_lane_start;
     if (std.mem.eql(u8, raw, "lane-materialization")) return .lane_materialization;
     if (std.mem.eql(u8, raw, "finish-lane")) return .finish_lane;
+    if (std.mem.eql(u8, raw, "recover-lane-finish")) return .recover_lane_finish;
     if (std.mem.eql(u8, raw, "grade-lane")) return .grade_lane;
     if (std.mem.eql(u8, raw, "grade-pair")) return .grade_pair;
     if (std.mem.eql(u8, raw, "reveal-trial")) return .reveal_trial;
@@ -2628,6 +2640,108 @@ fn cmdFinishLane(
     try printHighLevelReceipt(allocator, "hylo-lane-finish-receipt/v1", result, "lane_id", lane.id);
 }
 
+fn recoverLaneFinishReceiptAlloc(
+    allocator: std.mem.Allocator,
+    store: durable_store.EventStore,
+    receipt_value: std.json.Value,
+    retained_lease: []const u8,
+) ![]u8 {
+    const receipt = try jsonObject(receipt_value);
+    if (!std.mem.eql(u8, try jsonRequiredString(receipt, "schema"), "hylo-run-receipt/v1")) {
+        return error.RunReceiptInvalid;
+    }
+    const trial_id = try jsonRequiredString(receipt, "trial_id");
+    const lane_id = try jsonRequiredString(receipt, "lane_id");
+    try validateId(trial_id);
+    try validateId(lane_id);
+    try validateCanonicalLaneLease(retained_lease);
+    const observed_lease_digest = try digestBytesAlloc(allocator, retained_lease);
+    defer allocator.free(observed_lease_digest);
+
+    var loaded = try loadLedgerFromStore(allocator, store);
+    defer loaded.deinit(allocator);
+    const location = (try findTrialAcrossCampaigns(&loaded, trial_id)) orelse return error.TrialMissing;
+    const lane = location.trial.findLane(lane_id) orelse return error.LaneNotRegistered;
+    if (!lane.status.isTerminal()) return error.LaneFinishRecoveryNotTerminal;
+    if (lane.terminal_sequence == null or lane.lease_digest == null or
+        !std.mem.eql(u8, lane.lease_digest.?, observed_lease_digest))
+    {
+        return error.LaneFinishRecoveryLeaseMismatch;
+    }
+
+    const lineage = try jsonRequiredObject(receipt, "lineage");
+    if (lane.started_event_digest == null or
+        !std.mem.eql(
+            u8,
+            try jsonRequiredString(lineage, "registration_event_digest"),
+            location.trial.registration_event_digest,
+        ) or
+        !std.mem.eql(
+            u8,
+            try jsonRequiredString(lineage, "lane_started_event_digest"),
+            lane.started_event_digest.?,
+        ) or
+        !std.mem.eql(
+            u8,
+            try jsonRequiredString(lineage, "lane_lease_digest"),
+            observed_lease_digest,
+        ))
+    {
+        return error.LaneFinishRecoveryLineageMismatch;
+    }
+
+    const submitted_fingerprint = try digestValueAlloc(allocator, receipt_value);
+    defer allocator.free(submitted_fingerprint);
+    if (lane.run_receipt_fingerprint == null or
+        !std.mem.eql(u8, lane.run_receipt_fingerprint.?, submitted_fingerprint))
+    {
+        return error.LaneFinishRecoveryReceiptMismatch;
+    }
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll(
+        "{\"schema\":\"hylo-lane-finish-recovery-receipt/v1\",\"status\":\"recovered\",\"trial_id\":",
+    );
+    try std.json.Stringify.value(trial_id, .{}, &out.writer);
+    try out.writer.writeAll(",\"lane_id\":");
+    try std.json.Stringify.value(lane_id, .{}, &out.writer);
+    try out.writer.writeAll(",\"terminal_status\":");
+    try std.json.Stringify.value(@tagName(lane.status), .{}, &out.writer);
+    try out.writer.print(",\"terminal_sequence\":{d},\"lane_lease_digest\":", .{lane.terminal_sequence.?});
+    try std.json.Stringify.value(observed_lease_digest, .{}, &out.writer);
+    try out.writer.writeAll(",\"run_receipt_fingerprint\":");
+    try std.json.Stringify.value(submitted_fingerprint, .{}, &out.writer);
+    try out.writer.writeAll("}\n");
+    return out.toOwnedSlice();
+}
+
+fn cmdRecoverLaneFinish(
+    allocator: std.mem.Allocator,
+    store: durable_store.EventStore,
+    receipt_path: []const u8,
+    lease_input_fd: std.posix.fd_t,
+) !void {
+    const receipt_bytes = try readInputAlloc(allocator, receipt_path);
+    defer allocator.free(receipt_bytes);
+    var receipt_parsed = try parseValue(allocator, receipt_bytes);
+    defer receipt_parsed.deinit();
+    const retained_lease = try readLeaseFdAlloc(allocator, lease_input_fd);
+    defer {
+        std.crypto.secureZero(u8, retained_lease);
+        allocator.free(retained_lease);
+    }
+    const recovery_receipt = try recoverLaneFinishReceiptAlloc(
+        allocator,
+        store,
+        receipt_parsed.value,
+        retained_lease,
+    );
+    defer allocator.free(recovery_receipt);
+    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    try stdout_writer.interface.writeAll(recovery_receipt);
+}
+
 fn cmdGradeLane(
     allocator: std.mem.Allocator,
     repo: []const u8,
@@ -4000,12 +4114,23 @@ const ProofSanitizerContext = enum {
     attestation,
     attestation_signature,
     attestation_signature_base64,
+    ed25519_public_key_base64,
     event_projection_set,
     event_array,
     event,
     event_body,
     event_payload,
     trial,
+    trial_projection,
+    trial_sealing,
+    source_selection_receipt,
+    source_selection_attestation_subject,
+    source_selection_producer,
+    source_selection_attestation,
+    trial_assurance,
+    trust_policy,
+    trust_policy_key_array,
+    trust_policy_key,
     factor,
     intervention_witness,
     differing_projection,
@@ -4021,12 +4146,19 @@ fn proofObjectHasSchema(map: std.json.ObjectMap, schema: []const u8) bool {
 fn isProofTrialObject(value: std.json.Value) bool {
     if (value != .object) return false;
     const map = value.object;
-    if (proofObjectHasSchema(map, hctp.TrialSchema)) return true;
-    return proofObjectHasSchema(map, "hylo-trial-proof-projection/v1") and
-        if (map.get("source_schema")) |source|
-            source == .string and std.mem.eql(u8, source.string, hctp.TrialSchema)
-        else
-            false;
+    return proofObjectHasSchema(map, hctp.TrialSchema) or
+        (proofObjectHasSchema(map, "hylo-trial-proof-projection/v1") and
+            if (map.get("source_schema")) |source|
+                source == .string and std.mem.eql(u8, source.string, hctp.TrialSchema)
+            else
+                false);
+}
+
+fn isProofTrialProjectionObject(value: std.json.Value) bool {
+    if (value != .object or
+        !proofObjectHasSchema(value.object, "hylo-trial-proof-projection/v1")) return false;
+    const source = value.object.get("source_schema") orelse return false;
+    return source == .string and std.mem.eql(u8, source.string, hctp.TrialSchema);
 }
 
 fn isProofInterventionWitnessObject(value: std.json.Value) bool {
@@ -4044,10 +4176,40 @@ fn isProofSanitizationReceiptObject(value: std.json.Value) bool {
 }
 
 fn isProofSanitizationAttestationObject(value: std.json.Value) bool {
+    return isProofAttestationObjectForSubject(value, "hylo-proof-sanitization-receipt/v1");
+}
+
+fn isProofAttestationObjectForSubject(value: std.json.Value, subject_schema: []const u8) bool {
     if (value != .object or !proofObjectHasSchema(value.object, "hylo-attestation/v1")) return false;
     const subject = value.object.get("subject_schema") orelse return false;
-    return subject == .string and
-        std.mem.eql(u8, subject.string, "hylo-proof-sanitization-receipt/v1");
+    return subject == .string and std.mem.eql(u8, subject.string, subject_schema);
+}
+
+fn isProofSourceSelectionReceiptObject(value: std.json.Value) bool {
+    if (value != .object) return false;
+    if (proofObjectHasSchema(value.object, "hylo-source-selection-receipt/v1")) return true;
+    if (!proofObjectHasSchema(value.object, "hylo-source-selection-proof-projection/v1")) {
+        return false;
+    }
+    const source = value.object.get("source_schema") orelse return false;
+    return source == .string and
+        std.mem.eql(u8, source.string, "hylo-source-selection-receipt/v1");
+}
+
+fn isProofSourceSelectionAttestationSubjectObject(value: std.json.Value) bool {
+    return value == .object and
+        proofObjectHasSchema(value.object, "hylo-source-selection-attestation-subject/v1");
+}
+
+fn isProofSourceSelectionAttestationObject(value: std.json.Value) bool {
+    return isProofAttestationObjectForSubject(
+        value,
+        "hylo-source-selection-attestation-subject/v1",
+    );
+}
+
+fn isProofTrustPolicyObject(value: std.json.Value) bool {
+    return value == .object and proofObjectHasSchema(value.object, "hylo-trust-policy/v1");
 }
 
 fn isProofEd25519SignatureObject(value: std.json.Value) bool {
@@ -4057,7 +4219,11 @@ fn isProofEd25519SignatureObject(value: std.json.Value) bool {
 }
 
 fn proofSanitizerRootContext(value: std.json.Value) ProofSanitizerContext {
-    if (isProofTrialObject(value)) return .trial;
+    if (isProofTrialObject(value)) {
+        return if (isProofTrialProjectionObject(value)) .trial_projection else .trial;
+    }
+    if (isProofSourceSelectionReceiptObject(value)) return .source_selection_receipt;
+    if (isProofTrustPolicyObject(value)) return .trust_policy;
     if (isProofInterventionWitnessObject(value)) return .intervention_witness;
     if (isProofEventObject(value)) return .event;
     if (value == .object and proofObjectHasSchema(value.object, "hylo-proof-bundle/v1")) {
@@ -4080,7 +4246,9 @@ fn proofSanitizerChildContext(
     return switch (context) {
         .ordinary,
         .attestation_signature_base64,
+        .ed25519_public_key_base64,
         .event_array,
+        .trust_policy_key_array,
         .semantic_path_array,
         .semantic_path,
         => .ordinary,
@@ -4116,11 +4284,59 @@ fn proofSanitizerChildContext(
         else
             .ordinary,
         .event_payload => if (std.mem.eql(u8, key, "trial") and isProofTrialObject(value))
-            .trial
+            if (isProofTrialProjectionObject(value)) .trial_projection else .trial
         else
             .ordinary,
-        .trial => if (std.mem.eql(u8, key, "factor") and value == .object)
+        .trial,
+        .trial_projection,
+        => if (std.mem.eql(u8, key, "sealing") and value == .object)
+            .trial_sealing
+        else if (std.mem.eql(u8, key, "assurance") and value == .object)
+            .trial_assurance
+        else if (std.mem.eql(u8, key, "factor") and value == .object)
             .factor
+        else
+            .ordinary,
+        .trial_sealing => if (std.mem.eql(u8, key, "source_selection_receipt") and
+            isProofSourceSelectionReceiptObject(value))
+            .source_selection_receipt
+        else
+            .ordinary,
+        .source_selection_receipt => if (std.mem.eql(u8, key, "source_owner_attestation") and
+            isProofSourceSelectionAttestationSubjectObject(value))
+            .source_selection_attestation_subject
+        else
+            .ordinary,
+        .source_selection_attestation_subject => if (std.mem.eql(u8, key, "producer") and
+            value == .object)
+            .source_selection_producer
+        else if (std.mem.eql(u8, key, "attestation") and
+            isProofSourceSelectionAttestationObject(value))
+            .source_selection_attestation
+        else
+            .ordinary,
+        .source_selection_producer => if (std.mem.eql(u8, key, "public_key_base64") and
+            value == .string)
+            .ed25519_public_key_base64
+        else
+            .ordinary,
+        .source_selection_attestation => if (std.mem.eql(u8, key, "signature") and
+            isProofEd25519SignatureObject(value))
+            .attestation_signature
+        else
+            .ordinary,
+        .trial_assurance => if (std.mem.eql(u8, key, "trust_policy") and
+            isProofTrustPolicyObject(value))
+            .trust_policy
+        else
+            .ordinary,
+        .trust_policy => if (std.mem.eql(u8, key, "keys") and value == .array)
+            .trust_policy_key_array
+        else
+            .ordinary,
+        .trust_policy_key => if (std.mem.eql(u8, key, "public_key_base64") and
+            value == .string)
+            .ed25519_public_key_base64
         else
             .ordinary,
         .factor => if (std.mem.eql(u8, key, "allowed_difference_roots"))
@@ -4142,17 +4358,36 @@ fn proofSanitizerChildContext(
     };
 }
 
-fn validateProofCanonicalEd25519SignatureBase64(value: []const u8) !void {
-    const signature_length = std.crypto.sign.Ed25519.Signature.encoded_length;
+fn validateProofCanonicalBase64ExactLength(
+    value: []const u8,
+    comptime expected_length: usize,
+    invalid_error: anyerror,
+) !void {
     const decoded_length = std.base64.standard.Decoder.calcSizeForSlice(value) catch
-        return error.ProofSanitizationAttestationInvalid;
-    if (decoded_length != signature_length) return error.ProofSanitizationAttestationInvalid;
-    var decoded: [signature_length]u8 = undefined;
+        return invalid_error;
+    if (decoded_length != expected_length) return invalid_error;
+    var decoded: [expected_length]u8 = undefined;
     std.base64.standard.Decoder.decode(&decoded, value) catch
-        return error.ProofSanitizationAttestationInvalid;
-    var canonical: [std.base64.standard.Encoder.calcSize(signature_length)]u8 = undefined;
+        return invalid_error;
+    var canonical: [std.base64.standard.Encoder.calcSize(expected_length)]u8 = undefined;
     const encoded = std.base64.standard.Encoder.encode(&canonical, &decoded);
-    if (!std.mem.eql(u8, encoded, value)) return error.ProofSanitizationAttestationInvalid;
+    if (!std.mem.eql(u8, encoded, value)) return invalid_error;
+}
+
+fn validateProofCanonicalEd25519SignatureBase64(value: []const u8) !void {
+    return validateProofCanonicalBase64ExactLength(
+        value,
+        std.crypto.sign.Ed25519.Signature.encoded_length,
+        error.ProofSanitizationAttestationInvalid,
+    );
+}
+
+fn validateProofCanonicalEd25519PublicKeyBase64(value: []const u8) !void {
+    return validateProofCanonicalBase64ExactLength(
+        value,
+        std.crypto.sign.Ed25519.PublicKey.encoded_length,
+        error.ProofSanitizationPublicKeyInvalid,
+    );
 }
 
 fn validateProofSpecificSanitizedValue(
@@ -4163,6 +4398,8 @@ fn validateProofSpecificSanitizedValue(
         .string => |text| {
             if (context == .attestation_signature_base64) {
                 try validateProofCanonicalEd25519SignatureBase64(text);
+            } else if (context == .ed25519_public_key_base64) {
+                try validateProofCanonicalEd25519PublicKeyBase64(text);
             } else if (isProofFileLocator(text) or
                 (context != .semantic_path and std.fs.path.isAbsolute(text)))
             {
@@ -4180,6 +4417,7 @@ fn validateProofSpecificSanitizedValue(
                 const item_context: ProofSanitizerContext = switch (context) {
                     .semantic_path_array => .semantic_path,
                     .event_array => if (isProofEventObject(item)) .event else .ordinary,
+                    .trust_policy_key_array => if (item == .object) .trust_policy_key else .ordinary,
                     else => .ordinary,
                 };
                 try validateProofSpecificSanitizedValue(item, item_context);
@@ -17994,6 +18232,192 @@ test "hylo proof sanitizer distinguishes canonical Ed25519 Base64 from local loc
     );
 }
 
+test "hylo proof sanitizer admits canonical Ed25519 carriers only at exact trial schema paths" {
+    const signature_bytes: [std.crypto.sign.Ed25519.Signature.encoded_length]u8 = @splat(0xfc);
+    var signature_buffer: [std.base64.standard.Encoder.calcSize(signature_bytes.len)]u8 = undefined;
+    const signature = std.base64.standard.Encoder.encode(&signature_buffer, &signature_bytes);
+    try std.testing.expectEqual(@as(u8, '/'), signature[0]);
+
+    const public_key_bytes: [std.crypto.sign.Ed25519.PublicKey.encoded_length]u8 = @splat(0xfc);
+    var public_key_buffer: [std.base64.standard.Encoder.calcSize(public_key_bytes.len)]u8 = undefined;
+    const public_key = std.base64.standard.Encoder.encode(&public_key_buffer, &public_key_bytes);
+    try std.testing.expectEqual(@as(u8, '/'), public_key[0]);
+
+    const typed_bytes = try std.mem.concat(
+        std.testing.allocator,
+        u8,
+        &.{
+            "{\"schema\":\"hylo-trial/v1\",\"sealing\":{\"source_selection_receipt\":{\"schema\":\"hylo-source-selection-receipt/v1\",\"source_owner_attestation\":{\"schema\":\"hylo-source-selection-attestation-subject/v1\",\"producer\":{\"public_key_base64\":\"",
+            public_key,
+            "\"},\"attestation\":{\"schema\":\"hylo-attestation/v1\",\"subject_schema\":\"hylo-source-selection-attestation-subject/v1\",\"signature\":{\"algorithm\":\"ed25519\",\"value_base64\":\"",
+            signature,
+            "\"}}}}},\"assurance\":{\"trust_policy\":{\"schema\":\"hylo-trust-policy/v1\",\"keys\":[{\"public_key_base64\":\"",
+            public_key,
+            "\"}]}}}",
+        },
+    );
+    defer std.testing.allocator.free(typed_bytes);
+    var typed = try parseValue(std.testing.allocator, typed_bytes);
+    defer typed.deinit();
+    try validateProofSanitizedValue(typed.value);
+    try validatePrivateTrialCarrierForMaterialization(std.testing.allocator, typed.value);
+
+    const projected_bytes = try std.mem.concat(
+        std.testing.allocator,
+        u8,
+        &.{
+            "{\"schema\":\"hylo-trial-proof-projection/v1\",\"source_schema\":\"hylo-trial/v1\",\"sealing\":{\"source_selection_receipt\":{\"schema\":\"hylo-source-selection-proof-projection/v1\",\"source_schema\":\"hylo-source-selection-receipt/v1\",\"source_owner_attestation\":{\"schema\":\"hylo-source-selection-attestation-subject/v1\",\"producer\":{\"public_key_base64\":\"",
+            public_key,
+            "\"},\"attestation\":{\"schema\":\"hylo-attestation/v1\",\"subject_schema\":\"hylo-source-selection-attestation-subject/v1\",\"signature\":{\"algorithm\":\"ed25519\",\"value_base64\":\"",
+            signature,
+            "\"}}}}},\"assurance\":{\"trust_policy\":{\"schema\":\"hylo-trust-policy/v1\",\"keys\":[{\"public_key_base64\":\"",
+            public_key,
+            "\"}]}}}",
+        },
+    );
+    defer std.testing.allocator.free(projected_bytes);
+    var projected = try parseValue(std.testing.allocator, projected_bytes);
+    defer projected.deinit();
+    try validateProofSanitizedValue(projected.value);
+
+    const wrong_root_bytes = try std.mem.concat(
+        std.testing.allocator,
+        u8,
+        &.{
+            "{\"schema\":\"test/v1\",\"assurance\":{\"trust_policy\":{\"schema\":\"hylo-trust-policy/v1\",\"keys\":[{\"public_key_base64\":\"",
+            public_key,
+            "\"}]}}}",
+        },
+    );
+    defer std.testing.allocator.free(wrong_root_bytes);
+    var wrong_root = try parseValue(std.testing.allocator, wrong_root_bytes);
+    defer wrong_root.deinit();
+    try std.testing.expectError(
+        error.ProofBundleLocalLocatorLeak,
+        validateProofSanitizedValue(wrong_root.value),
+    );
+
+    const wrong_projection_source_bytes = try std.mem.concat(
+        std.testing.allocator,
+        u8,
+        &.{
+            "{\"schema\":\"hylo-trial-proof-projection/v1\",\"source_schema\":\"test/v1\",\"assurance\":{\"trust_policy\":{\"schema\":\"hylo-trust-policy/v1\",\"keys\":[{\"public_key_base64\":\"",
+            public_key,
+            "\"}]}}}",
+        },
+    );
+    defer std.testing.allocator.free(wrong_projection_source_bytes);
+    var wrong_projection_source = try parseValue(
+        std.testing.allocator,
+        wrong_projection_source_bytes,
+    );
+    defer wrong_projection_source.deinit();
+    try std.testing.expectError(
+        error.ProofBundleLocalLocatorLeak,
+        validateProofSanitizedValue(wrong_projection_source.value),
+    );
+
+    const wrong_receipt_projection_source_bytes = try std.mem.concat(
+        std.testing.allocator,
+        u8,
+        &.{
+            "{\"schema\":\"hylo-trial-proof-projection/v1\",\"source_schema\":\"hylo-trial/v1\",\"sealing\":{\"source_selection_receipt\":{\"schema\":\"hylo-source-selection-proof-projection/v1\",\"source_schema\":\"test/v1\",\"source_owner_attestation\":{\"schema\":\"hylo-source-selection-attestation-subject/v1\",\"producer\":{\"public_key_base64\":\"",
+            public_key,
+            "\"}}}}}",
+        },
+    );
+    defer std.testing.allocator.free(wrong_receipt_projection_source_bytes);
+    var wrong_receipt_projection_source = try parseValue(
+        std.testing.allocator,
+        wrong_receipt_projection_source_bytes,
+    );
+    defer wrong_receipt_projection_source.deinit();
+    try std.testing.expectError(
+        error.ProofBundleLocalLocatorLeak,
+        validateProofSanitizedValue(wrong_receipt_projection_source.value),
+    );
+
+    const wrong_trust_schema_bytes = try std.mem.concat(
+        std.testing.allocator,
+        u8,
+        &.{
+            "{\"schema\":\"hylo-trial/v1\",\"assurance\":{\"trust_policy\":{\"schema\":\"test/v1\",\"keys\":[{\"public_key_base64\":\"",
+            public_key,
+            "\"}]}}}",
+        },
+    );
+    defer std.testing.allocator.free(wrong_trust_schema_bytes);
+    var wrong_trust_schema = try parseValue(std.testing.allocator, wrong_trust_schema_bytes);
+    defer wrong_trust_schema.deinit();
+    try std.testing.expectError(
+        error.ProofBundleLocalLocatorLeak,
+        validateProofSanitizedValue(wrong_trust_schema.value),
+    );
+
+    const wrong_subject_schema_bytes = try std.mem.concat(
+        std.testing.allocator,
+        u8,
+        &.{
+            "{\"schema\":\"hylo-trial/v1\",\"sealing\":{\"source_selection_receipt\":{\"schema\":\"hylo-source-selection-receipt/v1\",\"source_owner_attestation\":{\"schema\":\"hylo-source-selection-attestation-subject/v1\",\"attestation\":{\"schema\":\"hylo-attestation/v1\",\"subject_schema\":\"test/v1\",\"signature\":{\"algorithm\":\"ed25519\",\"value_base64\":\"",
+            signature,
+            "\"}}}}}}",
+        },
+    );
+    defer std.testing.allocator.free(wrong_subject_schema_bytes);
+    var wrong_subject_schema = try parseValue(std.testing.allocator, wrong_subject_schema_bytes);
+    defer wrong_subject_schema.deinit();
+    try std.testing.expectError(
+        error.ProofBundleLocalLocatorLeak,
+        validateProofSanitizedValue(wrong_subject_schema.value),
+    );
+
+    const short_signature_bytes: [std.crypto.sign.Ed25519.Signature.encoded_length - 1]u8 = @splat(0xfc);
+    var short_signature_buffer: [std.base64.standard.Encoder.calcSize(short_signature_bytes.len)]u8 = undefined;
+    const short_signature = std.base64.standard.Encoder.encode(
+        &short_signature_buffer,
+        &short_signature_bytes,
+    );
+    const short_signature_json = try std.mem.concat(
+        std.testing.allocator,
+        u8,
+        &.{
+            "{\"schema\":\"hylo-trial/v1\",\"sealing\":{\"source_selection_receipt\":{\"schema\":\"hylo-source-selection-receipt/v1\",\"source_owner_attestation\":{\"schema\":\"hylo-source-selection-attestation-subject/v1\",\"attestation\":{\"schema\":\"hylo-attestation/v1\",\"subject_schema\":\"hylo-source-selection-attestation-subject/v1\",\"signature\":{\"algorithm\":\"ed25519\",\"value_base64\":\"",
+            short_signature,
+            "\"}}}}}}",
+        },
+    );
+    defer std.testing.allocator.free(short_signature_json);
+    var wrong_signature_length = try parseValue(std.testing.allocator, short_signature_json);
+    defer wrong_signature_length.deinit();
+    try std.testing.expectError(
+        error.ProofSanitizationAttestationInvalid,
+        validateProofSanitizedValue(wrong_signature_length.value),
+    );
+
+    const short_public_key_bytes: [std.crypto.sign.Ed25519.PublicKey.encoded_length - 1]u8 = @splat(0xfc);
+    var short_public_key_buffer: [std.base64.standard.Encoder.calcSize(short_public_key_bytes.len)]u8 = undefined;
+    const short_public_key = std.base64.standard.Encoder.encode(
+        &short_public_key_buffer,
+        &short_public_key_bytes,
+    );
+    const short_public_key_json = try std.mem.concat(
+        std.testing.allocator,
+        u8,
+        &.{
+            "{\"schema\":\"hylo-trial/v1\",\"assurance\":{\"trust_policy\":{\"schema\":\"hylo-trust-policy/v1\",\"keys\":[{\"public_key_base64\":\"",
+            short_public_key,
+            "\"}]}}}",
+        },
+    );
+    defer std.testing.allocator.free(short_public_key_json);
+    var wrong_public_key_length = try parseValue(std.testing.allocator, short_public_key_json);
+    defer wrong_public_key_length.deinit();
+    try std.testing.expectError(
+        error.ProofSanitizationPublicKeyInvalid,
+        validateProofSanitizedValue(wrong_public_key_length.value),
+    );
+}
+
 test "hylo proof sanitation distinguishes typed factor paths from local locators" {
     var typed = try parseValue(
         std.testing.allocator,
@@ -20446,6 +20870,168 @@ test "hylo lane start recovery re-emits the exact receipt without append and rej
     var after = try store.snapshot(std.testing.allocator, MaxStoreBytes);
     defer after.deinit(std.testing.allocator);
     try testExpectSnapshotContentsEquivalent(terminal_before, after);
+}
+
+test "hylo lane finish recovery requires exact terminal receipt and lease without append" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(repo);
+    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-lane-finish-recovery");
+    defer backend.deinit();
+    const store = backend.eventStore();
+    try testSeedProfileCampaign(std.testing.allocator, repo, store, "[\"absolute_qualification\"]");
+    var registration = try testRegisterTrialBytes(std.testing.allocator, repo, store, hctp_fixtures.valid_null_trial);
+    registration.deinit(std.testing.allocator);
+
+    const retained_lease = "HYL1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const lease_digest = try digestBytesAlloc(std.testing.allocator, retained_lease);
+    defer std.testing.allocator.free(lease_digest);
+    const recovery_args = try parseArgs(&.{
+        "ledger",
+        "recover-lane-finish",
+        "--receipt",
+        "-",
+        "--lease-input-fd",
+        "3",
+    });
+    try std.testing.expectEqual(Command.recover_lane_finish, recovery_args.command.?);
+
+    var started = try testStartTrialLane(
+        std.testing.allocator,
+        repo,
+        store,
+        "trial-null-001",
+        "lane-null-a0",
+        lease_digest,
+    );
+    const start_digest = try std.testing.allocator.dupe(u8, started.event_digest);
+    defer std.testing.allocator.free(start_digest);
+    started.deinit(std.testing.allocator);
+    const run_receipt_bytes = try testRunReceiptAlloc(
+        std.testing.allocator,
+        store,
+        "trial-null-001",
+        "lane-null-a0",
+        start_digest,
+        lease_digest,
+    );
+    defer std.testing.allocator.free(run_receipt_bytes);
+    var run_receipt = try parseValue(std.testing.allocator, run_receipt_bytes);
+    defer run_receipt.deinit();
+
+    var started_snapshot = try store.snapshot(std.testing.allocator, MaxStoreBytes);
+    defer started_snapshot.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.LaneFinishRecoveryNotTerminal,
+        recoverLaneFinishReceiptAlloc(
+            std.testing.allocator,
+            store,
+            run_receipt.value,
+            retained_lease,
+        ),
+    );
+    var after_nonterminal = try store.snapshot(std.testing.allocator, MaxStoreBytes);
+    defer after_nonterminal.deinit(std.testing.allocator);
+    try testExpectSnapshotContentsEquivalent(started_snapshot, after_nonterminal);
+
+    var finished = try testFinishTrialLane(
+        std.testing.allocator,
+        repo,
+        store,
+        "trial-null-001",
+        "lane-null-a0",
+        start_digest,
+        lease_digest,
+    );
+    finished.deinit(std.testing.allocator);
+    var terminal_snapshot = try store.snapshot(std.testing.allocator, MaxStoreBytes);
+    defer terminal_snapshot.deinit(std.testing.allocator);
+
+    const recovery = try recoverLaneFinishReceiptAlloc(
+        std.testing.allocator,
+        store,
+        run_receipt.value,
+        retained_lease,
+    );
+    defer std.testing.allocator.free(recovery);
+    var recovery_parsed = try parseValue(std.testing.allocator, recovery);
+    defer recovery_parsed.deinit();
+    const recovery_root = try jsonObject(recovery_parsed.value);
+    try std.testing.expectEqualStrings(
+        "hylo-lane-finish-recovery-receipt/v1",
+        try jsonRequiredString(recovery_root, "schema"),
+    );
+    try std.testing.expectEqualStrings("recovered", try jsonRequiredString(recovery_root, "status"));
+    try std.testing.expectEqualStrings(lease_digest, try jsonRequiredString(recovery_root, "lane_lease_digest"));
+    const expected_receipt_fingerprint = try digestValueAlloc(std.testing.allocator, run_receipt.value);
+    defer std.testing.allocator.free(expected_receipt_fingerprint);
+    try std.testing.expectEqualStrings(
+        expected_receipt_fingerprint,
+        try jsonRequiredString(recovery_root, "run_receipt_fingerprint"),
+    );
+
+    const wrong_lease = "HYL1-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    try std.testing.expectError(
+        error.LaneFinishRecoveryLeaseMismatch,
+        recoverLaneFinishReceiptAlloc(
+            std.testing.allocator,
+            store,
+            run_receipt.value,
+            wrong_lease,
+        ),
+    );
+    const changed_receipt_bytes = try testReplaceFirstAlloc(
+        std.testing.allocator,
+        run_receipt_bytes,
+        "\"output_ref\": \"artifact:output-a0\"",
+        "\"output_ref\": \"artifact:output-changed\"",
+    );
+    defer std.testing.allocator.free(changed_receipt_bytes);
+    var changed_receipt = try parseValue(std.testing.allocator, changed_receipt_bytes);
+    defer changed_receipt.deinit();
+    try std.testing.expectError(
+        error.LaneFinishRecoveryReceiptMismatch,
+        recoverLaneFinishReceiptAlloc(
+            std.testing.allocator,
+            store,
+            changed_receipt.value,
+            retained_lease,
+        ),
+    );
+    const wrong_lineage_bytes = try testReplaceFirstAlloc(
+        std.testing.allocator,
+        run_receipt_bytes,
+        start_digest,
+        "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    );
+    defer std.testing.allocator.free(wrong_lineage_bytes);
+    var wrong_lineage = try parseValue(std.testing.allocator, wrong_lineage_bytes);
+    defer wrong_lineage.deinit();
+    try std.testing.expectError(
+        error.LaneFinishRecoveryLineageMismatch,
+        recoverLaneFinishReceiptAlloc(
+            std.testing.allocator,
+            store,
+            wrong_lineage.value,
+            retained_lease,
+        ),
+    );
+    try std.testing.expectError(
+        error.LaneAlreadyTerminal,
+        testFinishTrialLane(
+            std.testing.allocator,
+            repo,
+            store,
+            "trial-null-001",
+            "lane-null-a0",
+            start_digest,
+            lease_digest,
+        ),
+    );
+    var after_recovery_attempts = try store.snapshot(std.testing.allocator, MaxStoreBytes);
+    defer after_recovery_attempts.deinit(std.testing.allocator);
+    try testExpectSnapshotContentsEquivalent(terminal_snapshot, after_recovery_attempts);
 }
 
 test "hylo failed duplicate lane start discloses no lease bytes" {

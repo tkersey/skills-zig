@@ -1885,45 +1885,32 @@ fn finishLaneRecord(self: *DriverState, lane: *LaneRecord, crash_after_public_ap
         "finish-lane", "--repo", self.repo, "--receipt", "-", "--lease-input-fd", "3",
     }, lane.run_receipt, &.{.{ .target = 3, .bytes = lane.lease }}, null) catch |err| {
         if (!self.recovery_only) return err;
-        const argv = [_][]const u8{
-            role_paths.ledger_path, "--source", "hylo",             "finish-lane", "--repo", self.repo,
-            "--receipt",            "-",        "--lease-input-fd", "3",
-        };
-        var lease_pipe = try createPipe();
-        defer lease_pipe.deinit();
-        var stdin_pipe = try createPipe();
-        defer stdin_pipe.deinit();
-        var stdout_pipe = try createPipe();
-        defer stdout_pipe.deinit();
-        var stderr_pipe = try createPipe();
-        defer stderr_pipe.deinit();
-        const mappings = [_]FdMapping{
-            .{ .source = stdin_pipe.read.?, .target = std.posix.STDIN_FILENO },
-            .{ .source = stdout_pipe.write.?, .target = std.posix.STDOUT_FILENO },
-            .{ .source = stderr_pipe.write.?, .target = std.posix.STDERR_FILENO },
-            .{ .source = lease_pipe.read.?, .target = 3 },
-        };
-        const pid = try spawnMapped(self.allocator, &argv, &mappings, false);
-        stdin_pipe.closeRead();
-        stdout_pipe.closeWrite();
-        stderr_pipe.closeWrite();
-        lease_pipe.closeRead();
-        try writeFd(stdin_pipe.write.?, lane.run_receipt);
-        stdin_pipe.closeWrite();
-        try writeFd(lease_pipe.write.?, lane.lease);
-        lease_pipe.closeWrite();
-        const stdout = try readFdAlloc(self.allocator, stdout_pipe.read.?, MaxBytes);
-        defer self.allocator.free(stdout);
-        stdout_pipe.closeRead();
-        const stderr = try readFdAlloc(self.allocator, stderr_pipe.read.?, MaxBytes);
-        defer self.allocator.free(stderr);
-        stderr_pipe.closeRead();
-        if (try waitChildExitCode(pid) == 0) return error.PrivateStateLaneFinishConflict;
-        var parsed = try parseJson(self.allocator, stderr);
+        const recovery = try ledgerCommandAlloc(self, &.{
+            "recover-lane-finish", "--repo", self.repo, "--receipt", "-", "--lease-input-fd", "3",
+        }, lane.run_receipt, &.{.{ .target = 3, .bytes = lane.lease }}, null);
+        defer recovery.deinit(self.allocator);
+        var parsed = try parseJson(self.allocator, recovery.stdout);
         defer parsed.deinit();
-        const failure = try object(parsed.value);
-        try requireSchema(failure, "hylo-error/v1");
-        if (!std.mem.eql(u8, try requiredString(failure, "error"), "LaneAlreadyTerminal")) {
+        const receipt = try object(parsed.value);
+        try requireSchema(receipt, "hylo-lane-finish-recovery-receipt/v1");
+        const expected_run_fingerprint = try digestTextAlloc(self.allocator, lane.run_receipt);
+        defer self.allocator.free(expected_run_fingerprint);
+        const expected_lease_digest = try digestBytesAlloc(self.allocator, lane.lease);
+        defer self.allocator.free(expected_lease_digest);
+        if (!std.mem.eql(u8, try requiredString(receipt, "status"), "recovered") or
+            !std.mem.eql(u8, try requiredString(receipt, "trial_id"), lane.trial_id) or
+            !std.mem.eql(u8, try requiredString(receipt, "lane_id"), lane.lane_id) or
+            !std.mem.eql(
+                u8,
+                try requiredString(receipt, "lane_lease_digest"),
+                expected_lease_digest,
+            ) or
+            !std.mem.eql(
+                u8,
+                try requiredString(receipt, "run_receipt_fingerprint"),
+                expected_run_fingerprint,
+            ))
+        {
             return error.PrivateStateLaneFinishConflict;
         }
         lane.finished = true;
