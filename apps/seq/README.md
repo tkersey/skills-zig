@@ -224,6 +224,8 @@ seq skill-evidence --root ~/.codex/sessions --session-id <session_id> --skill se
 - treats SDR-v1 receipts as the strongest deterministic decision attribution
 - emits STE-v1 with `--mode tune-packet` for `$tune`, and SDD-v1 with `--mode delta` for watched-session deltas
 - supports SKDC-v1 contracts through `--contract <file>` or `--skill-root <path>` discovery under `<skill>/references/decision-contract.yaml`
+- requires a contract-bound SDR-v1 receipt's embedded fingerprint to equal the loaded SKDC-v1 fingerprint; missing or stale fingerprints are excluded from episodes and reported by `--mode misses`
+- preserves the loaded and embedded fingerprints separately in episode output and reports `contract_binding_status` as `matched`, `unbound`, or `not_applicable`
 - keeps raw transcript text out of output by default; `--include-excerpts` is explicit and prints a privacy warning
 - associates downstream outcomes without claiming the skill caused the outcome
 - leaves matched-cohort analysis disabled in capabilities as P2/deferred
@@ -231,9 +233,9 @@ seq skill-evidence --root ~/.codex/sessions --session-id <session_id> --skill se
 Companion commands:
 - `skill-contract validate --file <decision-contract.yaml>` validates SKDC-v1 and emits the stable contract fingerprint
 - `skill-contract scaffold --skill <name> --kind decision --output <file>` writes a placeholder contract only; it does not infer semantics
-- `skill-decision-receipt validate --file <receipt.json>` validates SDR-v1 receipts
+- `skill-decision-receipt validate --file <receipt.json>` performs contract-free structural SDR-v1 validation; contract binding is enforced by `skill-decision-audit` when it loads an SKDC-v1 contract
 - `decision-capsule` freezes one visible historical decision as DCP-v2 for controlled replay
-- `capabilities --format json` reports `skill_decision_audit`, `skill_decision_delta`, `skill_contract_v1`, `skill_decision_receipt_v1`, `tune_packet_v1`, `decision_capsule_v1`, `decision_anchor_v1`, `historical_decisions_dataset_v1`, and `dcp_validation_v1`
+- `capabilities --format json` reports `skill_decision_audit`, `skill_decision_delta`, `skill_contract_v1`, `skill_decision_receipt_v1`, `skill_decision_receipt_contract_binding_v1`, `tune_packet_v1`, `decision_capsule_v1`, `decision_anchor_v1`, `historical_decisions_dataset_v1`, and `dcp_validation_v1`
 
 Examples:
 ```bash
