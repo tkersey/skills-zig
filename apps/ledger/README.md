@@ -391,6 +391,45 @@ the resolution, correctness observations, actuation events, and SHIP receipt.
 Carry transitions preserve credit but never add it, and closeout still requires
 a clean standard attempt plus current auxiliary evidence on the current tuple.
 
+The review-resolution checker continues to parse historical
+`review-resolution/v1` snapshots while requiring
+`owner-boundary-synthesis/v1` whenever a snapshot contains decisions. A
+decision-free historical snapshot retains its prior result. A decision-bearing
+historical snapshot parses but blocks until it carries resolution history,
+owner syntheses, and synthesis-bound decisions.
+The history goal must match every retained review fold, and every retained
+prior synthesis must join exactly one current component.
+
+Each synthesis identifies one stable structural component with
+`stable_component_key`. The key is `sha256:` plus the lowercase SHA-256 digest
+of this byte sequence:
+
+```text
+owner-boundary-synthesis/boundary-identity/v1\n
+<compact JSON boundary identity>
+```
+
+The compact JSON object has the keys `source_worlds`, `target_worlds`,
+`carriers`, `operations`, `observations`, and `laws` in that order. Each array
+is sorted lexicographically before encoding. Generation, review tuple, commit,
+publication, batch, and attempt provenance therefore cannot affect component
+identity.
+
+`reuse-owner` admits only pressure-free local repair and adds no structural
+obligations. `converge-kernel` requires at least one abstraction-pressure
+signal, a canonical owner, and structural obligations; its decisions must use
+`replacement-kernel`. `separate-laws` carries a falsifiable obstruction and
+cannot materialize repair. `blocked` carries a falsifier and cannot materialize
+repair. Every repair decision cites its synthesis, uses the synthesis-owned
+construction, and the resolution materializes exactly one selected work node
+at the canonical owner named by the selected synthesis.
+
+At closeout, every structural obligation needs an `observation_ref`.
+`collapse`, `retire`, and `delegate` targets must be declared and completed as
+semantic-balance retirements; `dominated_remaining` must be empty. The checker
+validates those declarations but does not dereference observation artifacts or
+execute verifier argv.
+
 This is intentionally a command rather than a `--source` namespace. Sources own
 state and event folds; validation is a deterministic observation over one
 immutable input.
