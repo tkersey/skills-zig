@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+script_source="$repo_root/.github/scripts/release_apps.sh"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+git -C "$tmp" init --quiet
+git -C "$tmp" config user.name "Release Classifier Test"
+git -C "$tmp" config user.email "release-classifier@example.invalid"
+mkdir -p "$tmp/.github/scripts"
+cp "$script_source" "$tmp/.github/scripts/release_apps.sh"
+chmod +x "$tmp/.github/scripts/release_apps.sh"
+printf 'baseline\n' > "$tmp/README.md"
+printf '%s\n' \
+  'const TestStepOptions = struct {' \
+  '    link_libc: bool = false,' \
+  '};' \
+  'fn addTestStepWithOptions() void {' \
+  '    const root_module = undefined;' \
+  '    const tests = b.addTest(.{ .root_module = root_module });' \
+  '    _ = tests;' \
+  '}' > "$tmp/build.zig"
+git -C "$tmp" add .
+git -C "$tmp" commit --quiet -m baseline
+base="$(git -C "$tmp" rev-parse HEAD)"
+
+assert_observed() {
+  local label="$1"
+  local expected="$2"
+  local observed
+  observed="$(cd "$tmp" && .github/scripts/release_apps.sh affected "$base" HEAD | paste -sd, -)"
+  if [[ "$observed" != "$expected" ]]; then
+    echo "classifier mismatch for $label: expected $expected; observed $observed" >&2
+    exit 1
+  fi
+}
+
+assert_case() {
+  local path="$1"
+  local expected="$2"
+  local contents="${3:-changed}"
+  git -C "$tmp" reset --hard --quiet "$base"
+  git -C "$tmp" clean -fdq
+  mkdir -p "$(dirname "$tmp/$path")"
+  printf '%s\n' "$contents" > "$tmp/$path"
+  git -C "$tmp" add "$path"
+  git -C "$tmp" commit --quiet -m "change $path"
+  assert_observed "$path" "$expected"
+}
+
+assert_hctp_build_diff() {
+  git -C "$tmp" reset --hard --quiet "$base"
+  git -C "$tmp" clean -fdq
+  printf '%s\n' \
+    'const hctp_fixtures = b.createModule(.{' \
+    '    .root_source_file = b.path("testdata/hctp-v1/fixtures.zig"),' \
+    '    .target = target,' \
+    '    .optimize = optimize,' \
+    '});' \
+    'const hctp_macos_runtime_step = b.step("test-cas-trial-macos-runtime", "Run the HCTP macOS runtime lane");' \
+    'const hylo_cli_tests_root = b.createModule(.{' \
+    '    .root_source_file = b.path("apps/ledger/scripts/hylo.zig"),' \
+    '});' \
+    'const hylo_test_filter = b.option(' \
+    '    []const u8,' \
+    '    "hylo-test-filter",' \
+    '    "Override the focused HCTP test filter",' \
+    ');' \
+    'const run_hylo_proof_tests = addTestStepWithOptions(.{ .filters = &.{hylo_test_filter} });' \
+    'const run_hctp_conformance_manifest = addTestStepWithOptions(.{ .cwd = b.path(".") });' \
+    'const run_retrace_core_tests = addTestStepWithOptions("test-retrace-core");' \
+    'const TestStepOptions = struct {' \
+    '    link_libc: bool = false,' \
+    '    filters: []const []const u8 = &.{},' \
+    '};' \
+    'fn addTestStepWithOptions() void {' \
+    '    const root_module = undefined;' \
+    '    const options = undefined;' \
+    '    const tests = b.addTest(.{ .root_module = root_module, .filters = options.filters });' \
+    '    _ = tests;' \
+    '}' > "$tmp/build.zig"
+  git -C "$tmp" add build.zig
+  git -C "$tmp" commit --quiet -m "representative HCTP build wiring"
+  assert_observed "representative HCTP build diff" "seq,cas,ledger"
+}
+
+assert_cas_trial_macos_runtime_build_hunk() {
+  git -C "$tmp" reset --hard --quiet "$base"
+  git -C "$tmp" clean -fdq
+  printf '%s\n' \
+    '    const run_cas_trial_tests = addTestStepWithOptions(' \
+    '        b,' \
+    '        cas_trial_tests_root,' \
+    '        "test-cas-trial",' \
+    '        "Run cas_trial tests",' \
+    '        .{ .link_libc = true },' \
+    '    );' \
+    '    _ = addTestStepWithOptions(' \
+    '        b,' \
+    '        cas_trial_tests_root,' \
+    '        "test-cas-trial-macos-runtime",' \
+    '        "Run macOS CAS trial process-containment laws",' \
+    '        .{' \
+    '            .link_libc = true,' \
+    '            .filters = &.{' \
+    '                "executor inherits only standard allowlisted descriptors",' \
+    '                "executor runs in the requested isolated cwd",' \
+    '                "executor deadline kills and reaps a hung child",' \
+    '                "nonzero executor cannot leave a descendant after terminal observation",' \
+    '            },' \
+    '        },' \
+    '    );' >> "$tmp/build.zig"
+  git -C "$tmp" add build.zig
+  git -C "$tmp" commit --quiet -m "representative CAS trial macOS runtime build hunk"
+  assert_observed "representative CAS trial macOS runtime build hunk" "cas"
+}
+
+assert_ambiguous_build_diff() {
+  git -C "$tmp" reset --hard --quiet "$base"
+  git -C "$tmp" clean -fdq
+  printf '%s\n' 'const shared_release_behavior = changed_without_owner_context;' >> "$tmp/build.zig"
+  git -C "$tmp" add build.zig
+  git -C "$tmp" commit --quiet -m "ambiguous shared build change"
+  assert_observed "ambiguous shared build diff" "seq,lift,cas,cron,ledger,memory-note"
+}
+
+assert_partial_filter_plumbing_fails_closed() {
+  git -C "$tmp" reset --hard --quiet "$base"
+  git -C "$tmp" clean -fdq
+  printf '%s\n' \
+    'const TestStepOptions = struct {' \
+    '    link_libc: bool = false,' \
+    '    filters: []const []const u8 = &.{},' \
+    '};' \
+    'fn addTestStepWithOptions() void {' \
+    '    const root_module = undefined;' \
+    '    const tests = b.addTest(.{ .root_module = root_module });' \
+    '    _ = tests;' \
+    '}' > "$tmp/build.zig"
+  git -C "$tmp" add build.zig
+  git -C "$tmp" commit --quiet -m "incomplete shared filter plumbing"
+  assert_observed "partial filtered-test plumbing" "seq,lift,cas,cron,ledger,memory-note"
+}
+
+assert_case "libs/durable_store/src/lib.zig" "seq,cas,ledger,memory-note"
+assert_case "libs/execution_policy_core/src/root.zig" "seq"
+assert_case "libs/retrace_core/src/lib.zig" "seq,cas,ledger"
+assert_case "testdata/hctp-v1/valid-trial.json" "seq,cas,ledger"
+assert_case "apps/cas/scripts/cas_trial.zig" "cas"
+assert_case "apps/lift/src/main.zig" "lift"
+assert_hctp_build_diff
+assert_cas_trial_macos_runtime_build_hunk
+assert_ambiguous_build_diff
+assert_partial_filter_plumbing_fails_closed
+
+echo "release app classifier: 10/10 cases passed"

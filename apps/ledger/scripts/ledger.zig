@@ -11,6 +11,7 @@ const universalist_cli = @import("universalist.zig");
 const validation_cli = @import("validation.zig");
 
 const Version = core_cli.normalizeVersion(app_meta.version);
+const HctpProductAvailable = builtin.os.tag == .macos;
 const LegacyStorePath = ".ledger/negative-ledger.jsonl";
 const DefaultStorePath = ".ledger/negative-ledger/events.jsonl";
 const MaxStoreBytes = 64 * 1024 * 1024;
@@ -21,12 +22,12 @@ fn defaultIo() std.Io {
     return if (builtin.is_test) std.testing.io else runtime_io orelse std.Io.Threaded.global_single_threaded.io();
 }
 
-const HelpText =
+const HelpText = std.fmt.comptimePrint(
     \\ledger
     \\
-    \\Durable source-memory, actuation, replay, and plan ledger.
+    \\{s}
     \\
-    \\usage: ledger {init,capture,query,map,status,reopen,export,compact,handoff,show,doctor,migrate,recent,recall,codify-candidates,quality-audit,value-report,memory-digest,path,datasets,dataset-schema,validate} [options]
+    \\usage: ledger {{init,capture,query,map,status,reopen,export,compact,handoff,show,doctor,migrate,recent,recall,codify-candidates,quality-audit,value-report,memory-digest,path,datasets,dataset-schema,validate}} [options]
     \\
     \\commands:
     \\  init       Create the ledger store if missing
@@ -49,7 +50,7 @@ const HelpText =
     \\
     \\options:
     \\  --file PATH       Persistent-adapter path (default: .ledger/negative-ledger/events.jsonl)
-    \\  --source SOURCE   Source namespace; omit for negative-ledger, or use actuation, hylo, learnings, synesthesia, or universalist
+    \\  --source SOURCE   {s}
     \\  --json PATH|-     Capture input JSON or lifecycle-transition proof JSON
     \\  --id NEG-ID       Record id for show/reopen/status/export
     \\  --to VALUE        Target status for status, target path for migrate
@@ -68,7 +69,16 @@ const HelpText =
     \\  --input FILE|-    Canonical JSON input for validate
     \\  -h, --help        Show help
     \\  -V, --version     Show version
-;
+, .{
+    if (HctpProductAvailable)
+        "Durable source-memory, actuation, replay, and plan ledger."
+    else
+        "Durable source-memory, actuation, and plan ledger.",
+    if (HctpProductAvailable)
+        "Source namespace; omit for negative-ledger, or use actuation, hylo, learnings, synesthesia, or universalist"
+    else
+        "Source namespace; omit for negative-ledger, or use actuation, learnings, synesthesia, or universalist",
+});
 
 const HelpSurface = core_cli.HelpSurface{
     .executable_name = "ledger",
@@ -253,6 +263,10 @@ pub fn main(init: std.process.Init) !void {
     runtime_io = init.io;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     if (argvSource(argv)) |source| {
+        if (!sourceAvailable(source)) {
+            core_cli.exitUsageFailure(HelpSurface, Version, "UnknownSource", source);
+            return;
+        }
         const source_argv = try sourceArgvAlloc(allocator, argv, source);
         defer allocator.free(source_argv);
         if (std.mem.eql(u8, source, "learnings")) {
@@ -268,7 +282,7 @@ pub fn main(init: std.process.Init) !void {
             if (code != 0) std.process.exit(code);
             return;
         }
-        if (std.mem.eql(u8, source, "hylo")) {
+        if (HctpProductAvailable and std.mem.eql(u8, source, "hylo")) {
             const code = try hylo_cli.runWithArgv(allocator, init.io, source_argv);
             if (code != 0) std.process.exit(code);
             return;
@@ -312,6 +326,10 @@ fn argvSource(argv: []const []const u8) ?[]const u8 {
         return argv[i];
     }
     return null;
+}
+
+fn sourceAvailable(source: []const u8) bool {
+    return HctpProductAvailable or !std.mem.eql(u8, source, "hylo");
 }
 
 fn sourceArgvAlloc(allocator: std.mem.Allocator, argv: []const []const u8, source: []const u8) ![]const []const u8 {
@@ -3464,11 +3482,23 @@ test "hylo source routing preserves replay commands" {
     const routed = try sourceArgvAlloc(std.testing.allocator, &argv, "hylo");
     defer std.testing.allocator.free(routed);
     try std.testing.expectEqualSlices([]const u8, &.{ "ledger", "doctor", "--repo", "." }, routed);
+    try std.testing.expectEqual(HctpProductAvailable, sourceAvailable("hylo"));
 }
 
 test "ledger test graph includes source and validation modules" {
     std.testing.refAllDecls(actuation_cli);
-    std.testing.refAllDecls(hylo_cli);
+    if (HctpProductAvailable) std.testing.refAllDecls(hylo_cli);
     std.testing.refAllDecls(universalist_cli);
     std.testing.refAllDecls(validation_cli);
+}
+
+test "root help follows Hylo source admission" {
+    try std.testing.expectEqual(
+        HctpProductAvailable,
+        std.mem.indexOf(u8, HelpText, "actuation, hylo, learnings") != null,
+    );
+    try std.testing.expectEqual(
+        HctpProductAvailable,
+        std.mem.indexOf(u8, HelpText, "actuation, replay, and plan") != null,
+    );
 }

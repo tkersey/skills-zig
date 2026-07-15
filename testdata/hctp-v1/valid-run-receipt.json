@@ -1,0 +1,102 @@
+{
+  "schema": "hylo-run-receipt/v1",
+  "trial_id": "trial-null-001",
+  "unit_id": "unit-null-001",
+  "scenario_id": "scenario-holdout",
+  "pair_id": "pair-null-001",
+  "lane_id": "lane-null-a0",
+  "opaque_arm_id": "arm-0",
+  "lineage": {
+    "registration_event_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "lane_started_event_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "lane_lease_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  },
+  "producer": {
+    "id": "cas-trial",
+    "version": "0.2.76",
+    "binary_fingerprint": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "key_id": "runner-key"
+  },
+  "materialization": {
+    "arm_value_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "target_snapshot_ref": "artifact:baseline",
+    "target_snapshot_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "presented_input_ref": "artifact:scenario-holdout",
+    "presented_input_fingerprint": "sha256:3dbc2a117751f42078d15a82dab707eef4ac2c2b19a8addd9286a873fa6ffb65",
+    "hidden_reference_presented": false,
+    "sibling_output_presented": false
+  },
+  "runtime": {
+    "environment_fingerprint": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "replay_policy_fingerprint": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "effect_policy_fingerprint": "sha256:4effcb65690499855ef753fee45992a98cbee9eb4cd0da18d937143f4a4adef0",
+    "model_id": "test-model",
+    "model_provider": "test-provider",
+    "model_configuration_fingerprint": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+    "runtime_version": "v1",
+    "seed": null,
+    "tokens_used": 100,
+    "started_at_unix": 1,
+    "ended_at_unix": 2
+  },
+  "isolation": {
+    "fresh_thread": true,
+    "fresh_workspace": true,
+    "reset_receipt_ref": "artifact:reset",
+    "reset_receipt_fingerprint": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    "target_cache_cleared": true,
+    "shared_mutable_state_detected": false,
+    "limitations": []
+  },
+  "effects": {
+    "filesystem_receipt_ref": "artifact:filesystem",
+    "filesystem_receipt_fingerprint": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+    "network_receipt_ref": "artifact:network",
+    "network_receipt_fingerprint": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+    "external_effect_receipt_ref": "artifact:external",
+    "external_effect_receipt_fingerprint": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+    "policy_violations": []
+  },
+  "terminal": {
+    "status": "completed",
+    "failure_class": null,
+    "failure_detail_ref": null
+  },
+  "evidence": {
+    "output_ref": "artifact:output-a0",
+    "output_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+    "trace_ref": "artifact:trace-a0",
+    "trace_fingerprint": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc",
+    "world_state_ref": "artifact:world-a0",
+    "world_state_fingerprint": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccd",
+    "metrics_ref": "artifact:metrics-a0",
+    "metrics_fingerprint": "sha256:ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddde"
+  },
+  "native_receipt": {
+    "kind": "cas-trial-receipt",
+    "ref": "artifact:cas-receipt-a0",
+    "fingerprint": "sha256:e2c43329003422f082580d9fff1019cf00733c0d279bc5ff948788f7088845fb",
+    "receipt": {
+      "schema": "cas-trial-receipt/v1",
+      "trial_id": "trial-null-001",
+      "lane_id": "lane-null-a0",
+      "claim": {
+        "claim_id": "claim-lane-null-a0",
+        "atomic": true,
+        "claimed_before_execution": true,
+        "claim_count": 1,
+        "lane_lease_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      "execution": {
+        "handle_id": "handle-lane-null-a0",
+        "handle_count": 1,
+        "retry_count": 0,
+        "hidden_fork_count": 0,
+        "terminal_receipt_once": true
+      },
+      "terminal_status": "completed",
+      "runner_contract_fingerprint": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+    }
+  },
+  "attestation": null
+}

@@ -1,0 +1,33 @@
+{
+  "schema": "hylo-intervention-witness/v1",
+  "trial_id": "trial-valid-001",
+  "factor_kind": "target_snapshot",
+  "arm_values": {
+    "arm-0": {
+      "fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "snapshot_fingerprint": "sha256:2111111111111111111111111111111111111111111111111111111111111111"
+    },
+    "arm-1": {
+      "fingerprint": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "snapshot_fingerprint": "sha256:3222222222222222222222222222222222222222222222222222222222222222"
+    }
+  },
+  "common_projection": {
+    "fingerprint": "sha256:4a363bb517ab14d8ed085bd5afa9cda1e3a8a27e78996d471d32cc7b7771d7a0",
+    "compared_fields": ["environment", "model_policy", "replay_policy", "effect_policy"]
+  },
+  "differing_projection": {
+    "allowed_roots": ["codex/skills/hylo"],
+    "observed_paths": ["codex/skills/hylo/SKILL.md"],
+    "diff_fingerprint": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  },
+  "verifier": {
+    "id": "git-target-projection",
+    "version": "v1",
+    "binary_fingerprint": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "verdict": {
+    "one_factor_closed": true
+  },
+  "limitations": []
+}

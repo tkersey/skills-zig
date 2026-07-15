@@ -17,6 +17,9 @@ on:
       - "apps/img/**"
       - "libs/core/**"
       - "libs/durable_store/**"
+      - "libs/execution_policy_core/**"
+      - "libs/retrace_core/**"
+      - "testdata/hctp-v1/**"
       - ".github/scripts/**"
       - ".github/workflows/release-*.yml"
       - ".github/workflows/auto-release.yml"
@@ -47,16 +50,26 @@ jobs:
           filters: |
             seq:
               - "apps/seq/**"
+              - "libs/durable_store/**"
+              - "libs/execution_policy_core/**"
+              - "libs/retrace_core/**"
+              - "testdata/hctp-v1/**"
             lift:
               - "apps/lift/**"
             cas:
               - "apps/cas/**"
+              - "libs/durable_store/**"
+              - "libs/retrace_core/**"
+              - "testdata/hctp-v1/**"
             cron:
               - "apps/cron/**"
             ledger:
               - "apps/ledger/**"
               - "apps/learnings/**"
               - "apps/synesthesia/**"
+              - "libs/durable_store/**"
+              - "libs/retrace_core/**"
+              - "testdata/hctp-v1/**"
             memory_note:
               - "apps/memory-note/**"
             img:
@@ -106,6 +119,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Test release app classifier
+        run: .github/scripts/test_release_apps.sh
       - name: Require VERSION bumps for release-relevant CLI changes
         run: |
           set -euo pipefail
@@ -152,6 +167,9 @@ jobs:
             zig-seq-${{ runner.os }}-0.16.0-
       - name: Build seq
         run: zig build build-seq -Doptimize=ReleaseFast --summary all
+      - name: Build standalone seq release surface
+        working-directory: apps/seq
+        run: zig build -Doptimize=ReleaseFast --summary all
       - name: Build standalone seq
         working-directory: apps/seq
         run: zig build -Doptimize=Debug --cache-dir ../../.zig-cache --global-cache-dir ../../.zig-cache-global --summary all
@@ -212,8 +230,32 @@ jobs:
           version: 0.16.0
       - name: Build cas binaries
         run: zig build build-cas -Doptimize=ReleaseFast
-      - name: Test CAS budget governor
+      - name: Test generic CAS surfaces
         run: zig build test-cas
+
+  cas-hctp-runtime-macos:
+    needs: changes
+    if: needs.changes.outputs.cas == 'true' || needs.changes.outputs.core == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Test macOS CAS trial product and lifecycle laws
+        run: zig build test-cas-trial test-cas-trial-macos-runtime --summary all
+
+  hctp-product-macos:
+    needs: changes
+    if: needs.changes.outputs.seq == 'true' || needs.changes.outputs.cas == 'true' || needs.changes.outputs.ledger == 'true' || needs.changes.outputs.core == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Test macOS HCTP product, conformance, and sealed commitments
+        run: zig build test-hylo test-hctp-conformance test-hctp-sealed-commitments --summary all
 
   cas-fuzz-linux:
     needs: changes
@@ -253,8 +295,8 @@ jobs:
           version: 0.16.0
       - name: Build ledger
         run: zig build build-ledger -Doptimize=ReleaseFast
-      - name: Test ledger
-        run: zig build test-ledger test-learnings test-append-learning test-synesthesia
+      - name: Test generic ledger and portable validators
+        run: zig build test-ledger test-retrace-core test-learnings test-append-learning test-synesthesia --summary all
 
   memory-note:
     needs: changes

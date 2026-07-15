@@ -37,6 +37,28 @@ fn shouldSuppressCliError(err: anyerror) bool {
         error.NoDecisionCandidate,
         error.DecisionAmbiguous,
         error.InvalidPacket,
+        error.HctpSourceHelp,
+        error.InvalidContextPolicy,
+        error.TargetActivationNotFound,
+        error.AmbiguousTargetActivation,
+        error.RegeneratedConsequenceNotFound,
+        error.TargetBundleUnavailable,
+        error.TurnNotFound,
+        error.HistoricalResponseUnavailable,
+        error.RunnerCustodyRootsOverlap,
+        error.RunnerSourceRootsOverlap,
+        error.CustodySourceRootsOverlap,
+        error.UnsafeArtifactRoot,
+        error.ArtifactRootDrift,
+        error.MultiTurnEndpointUnsupported,
+        error.SessionIdentityMismatch,
+        error.UnclassifiedTargetContent,
+        error.UnsupportedStimulusAttachment,
+        error.SourceTurnUnavailable,
+        error.GeneratedArtifactInvalid,
+        error.GeneratedArtifactGraphInvalid,
+        error.ArtifactObjectConflict,
+        error.ArtifactAliasConflict,
         => true,
         else => false,
     };
@@ -47,6 +69,7 @@ fn printCommandList(stdout: anytype) !void {
     try stdout.print("Version: {s}\n", .{Version});
     try stdout.print("Commands:\n", .{});
     for (lib.commandNames()) |def| {
+        if (!lib.commandAvailable(def.cmd)) continue;
         try stdout.print("- {s}\n", .{def.name});
     }
     try stdout.writeAll("\nUse: seq <command> [options]\n");
@@ -177,4 +200,19 @@ test "legacy numeric compatibility ignores non-numeric invocations" {
 
     try std.testing.expect(!(try runLegacyNumericSeqCompat(&writer, &[_][]const u8{"datasets"})));
     try std.testing.expectEqualStrings("", writer.buffer[0..writer.end]);
+}
+
+test "root help follows HCTP product admission" {
+    var out: [8192]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&out);
+    try printCommandList(&writer);
+    const rendered = writer.buffer[0..writer.end];
+    try std.testing.expectEqual(
+        lib.HctpProductAvailable,
+        std.mem.indexOf(u8, rendered, "- hctp-source\n") != null,
+    );
+    try std.testing.expectEqual(
+        lib.HctpProductAvailable,
+        std.mem.indexOf(u8, rendered, "- hylo-extract\n") != null,
+    );
 }

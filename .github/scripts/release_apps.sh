@@ -48,6 +48,8 @@ case "$mode" in
     }
 
     mark_durable_store_consumers() {
+      mark_app seq
+      mark_app cas
       mark_app ledger
       mark_app memory-note
     }
@@ -55,6 +57,7 @@ case "$mode" in
     mark_retrace_core_consumers() {
       mark_app seq
       mark_app cas
+      mark_app ledger
     }
 
     mark_execution_policy_core_consumers() {
@@ -65,13 +68,16 @@ case "$mode" in
       local changed=0
       local ambiguous=0
       local current_app=""
+      local saw_filter_field=0
+      local saw_unfiltered_test_constructor=0
+      local saw_filtered_test_constructor=0
       local line app token matched raw
 
       is_build_boilerplate() {
         local raw="$1"
         local compact="${raw//[[:space:]]/}"
         case "$compact" in
-          ".{"|"},"|"});"|");"|"b,")
+          ".{"|"},"|"});"|");"|"b,"|"_=addTestStepWithOptions("|".filters=&.{")
             return 0
             ;;
         esac
@@ -93,6 +99,18 @@ case "$mode" in
         local raw="$1"
         local app token
         case "$raw" in
+          *"hctp"*|*"HCTP"*)
+            current_app="__hctp"
+            return
+            ;;
+          *"hylo_cli_tests_root"*|*"hylo_test_filter"*|*"run_hylo_proof_tests"*|*"test-hylo"*)
+            current_app="ledger"
+            return
+            ;;
+          *"run_retrace_core_tests"*|*"test-retrace-core"*)
+            current_app="__retrace_core"
+            return
+            ;;
           *"const st_"*"= b.createModule"*|*"const st_root = b.createModule"*|*"apps/st"*)
             current_app="__retired_st"
             return
@@ -139,6 +157,21 @@ case "$mode" in
         changed=1
         matched=0
 
+        case "$raw" in
+          *"filters: []const []const u8 = &.{},"*)
+            saw_filter_field=1
+            matched=1
+            ;;
+          *"const tests = b.addTest(.{ .root_module = root_module });"*)
+            saw_unfiltered_test_constructor=1
+            matched=1
+            ;;
+          *"const tests = b.addTest(.{ .root_module = root_module, .filters = options.filters });"*)
+            saw_filtered_test_constructor=1
+            matched=1
+            ;;
+        esac
+
         for app in "${apps[@]}"; do
           token="${app//-/_}"
           case "$raw" in
@@ -158,9 +191,36 @@ case "$mode" in
             mark_app ledger
             matched=1
             ;;
+          *"executor inherits only standard allowlisted descriptors"*|*"executor runs in the requested isolated cwd"*|*"executor deadline kills and reaps a hung child"*|*"nonzero executor cannot leave a descendant after terminal observation"*)
+            mark_app cas
+            matched=1
+            ;;
+          *"hctp"*|*"HCTP"*)
+            mark_app seq
+            mark_app cas
+            mark_app ledger
+            matched=1
+            ;;
+          *"hylo"*|*"Hylo"*)
+            mark_app ledger
+            matched=1
+            ;;
         esac
 
         if [[ "$current_app" == "__retired_st" ]]; then
+          matched=1
+        fi
+
+        if [[ "$current_app" == "__hctp" ]]; then
+          mark_app seq
+          mark_app cas
+          mark_app ledger
+          matched=1
+        elif [[ "$current_app" == "__retrace_core" ]]; then
+          mark_retrace_core_consumers
+          matched=1
+        elif [[ "$current_app" == "ledger" && "$raw" == *"[]const u8,"* ]]; then
+          mark_app ledger
           matched=1
         fi
 
@@ -200,6 +260,11 @@ case "$mode" in
         fi
       done < <(git diff -U12 --no-ext-diff "$base" "$head" -- build.zig)
 
+      if [[ "$saw_filter_field" -ne "$saw_unfiltered_test_constructor" ||
+            "$saw_filter_field" -ne "$saw_filtered_test_constructor" ]]; then
+        ambiguous=1
+      fi
+
       if [[ "$changed" -eq 1 && "$ambiguous" -eq 1 ]]; then
         mark_all
       fi
@@ -221,6 +286,11 @@ case "$mode" in
           ;;
         libs/execution_policy_core/*)
           mark_execution_policy_core_consumers
+          ;;
+        testdata/hctp-v1/*)
+          mark_app seq
+          mark_app cas
+          mark_app ledger
           ;;
         .github/workflows/release-seq.yml)
           mark_app seq

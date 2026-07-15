@@ -91,6 +91,41 @@ const decision_capsule_flags = [_]FlagSpec{
     .{ .name = "--format", .value_kind = .format, .help = "Output format" },
 };
 
+const hctp_source_flags = [_]FlagSpec{
+    .{ .name = "--manifest", .value_kind = .path, .help = "Source selection manifest" },
+    .{ .name = "--output", .value_kind = .path, .help = "Receipt or governance output" },
+    .{ .name = "--sealed-dir", .value_kind = .path, .help = "Encrypted sealed-case artifact directory" },
+    .{ .name = "--seal-key-fd", .value_kind = .int, .help = "Protected materialization key descriptor" },
+    .{ .name = "--seal-key-output-fd", .value_kind = .int, .help = "Private source-owner seal-key sink" },
+    .{ .name = "--source-signing-seed-fd", .value_kind = .int, .help = "Protected source-owner signing seed descriptor" },
+    .{ .name = "--evidence", .value_kind = .path, .help = "Source governance evidence" },
+    .{ .name = "--receipt", .value_kind = .path, .help = "Source-selection receipt to validate" },
+    .{ .name = "--sealed-case", .value_kind = .path, .help = "Registered encrypted case artifact" },
+    .{ .name = "--trial", .value_kind = .path, .help = "Registered trial for lane-scoped materialization" },
+    .{ .name = "--lane-id", .value_kind = .string, .help = "Registered opaque lane" },
+    .{ .name = "--visible-output-fd", .value_kind = .int, .help = "Runner-owned private visible-input pipe" },
+    .{ .name = "--source-profile-output-fd", .value_kind = .int, .help = "Runner-owned private historical-profile pipe" },
+    .{ .name = "--signing-seed-fd", .value_kind = .int, .help = "Protected materializer signing seed descriptor" },
+    .{ .name = "--source-owner-id", .value_kind = .string, .help = "Registered source-owner producer id" },
+    .{ .name = "--source-owner-key-id", .value_kind = .string, .help = "Registered source-owner signing key id" },
+    .{ .name = "--materializer-id", .value_kind = .string, .help = "Registered materializer producer id" },
+    .{ .name = "--materializer-key-id", .value_kind = .string, .help = "Registered materializer signing key id" },
+    .{ .name = "--controller-id", .value_kind = .string, .help = "Registered controller identity" },
+};
+
+const hylo_extract_flags = [_]FlagSpec{
+    .{ .name = "--root", .value_kind = .path, .required = true, .help = "Codex sessions root" },
+    .{ .name = "--session-id", .value_kind = .string, .required = true, .help = "Historical session identity" },
+    .{ .name = "--turn-index", .value_kind = .int, .required = true, .help = "Evaluated turn index" },
+    .{ .name = "--target-skill", .value_kind = .string, .required = true, .help = "Replaceable target skill" },
+    .{ .name = "--target-root", .value_kind = .path, .required = true, .help = "Complete historical target bundle root" },
+    .{ .name = "--context-policy", .value_kind = .string, .help = "dependency-closed or full-prefix" },
+    .{ .name = "--capture-world", .value_kind = .bool, .help = "Capture the observable historical world receipt" },
+    .{ .name = "--output-root", .value_kind = .path, .required = true, .help = "Runner artifact directory" },
+    .{ .name = "--sealed-root", .value_kind = .path, .required = true, .help = "Owner-only custody directory" },
+    .{ .name = "--seal-key-output-fd", .value_kind = .int, .required = true, .help = "Owner-only raw key output FD" },
+};
+
 const actuation_audit_flags = [_]FlagSpec{
     .{ .name = "--root", .value_kind = .path, .help = "Codex sessions root" },
     .{ .name = "--session-id", .value_kind = .string, .help = "Scan one session by id" },
@@ -170,7 +205,7 @@ pub fn commandName(command: lib.Command) []const u8 {
 }
 
 pub fn commandSpec(command: lib.Command) ?CommandSpec {
-    if (command == .unknown) return null;
+    if (command == .unknown or !lib.commandAvailable(command)) return null;
     const name = lib.commandName(command);
     if (std.mem.eql(u8, name, "unknown")) return null;
     return .{
@@ -189,6 +224,8 @@ fn summaryFor(command: lib.Command) []const u8 {
         .query => "Run a dataset query spec over local session artifacts",
         .skill_decision_audit => "Compile deterministic per-skill decision episodes and STE-v1 evidence",
         .decision_capsule => "Freeze one visible historical decision as DCP-v2",
+        .hctp_source => "Compile governed HCTP source denominators, clusters, and sealed cases",
+        .hylo_extract => "Compile one historical target activation into a blinded replay episode",
         .actuation_audit => "Audit plan-to-PR actuation control, frontier, proof, compaction, and ship lineage",
         .cas_review_audit => "Audit CAS review-session proof planes and lane backend reliability",
         .execution_policy_audit => "Audit EPG-guided planning/execution policy runtime lineage and calibration",
@@ -209,6 +246,8 @@ fn usageFor(command: lib.Command) []const u8 {
         .query => "seq query --spec <json|@path> [--root <path>] [--stats]",
         .skill_decision_audit => "seq skill-decision-audit --skill <name> (--session-id <id>|--path <jsonl>|--repo <path>|--workdir <path>|--last <duration>|--since <iso>|--until <iso>)",
         .decision_capsule => "seq decision-capsule (--session-id <id>|--path <jsonl>) [--decision-id <id>|--turn-id <id>|--turn-index N] [--mode capsule|candidates|anchors|validate]",
+        .hctp_source => "seq hctp-source compile|validate|govern|materialize [options]",
+        .hylo_extract => "seq hylo-extract --root DIR --session-id ID --turn-index N --target-skill NAME --target-root DIR --output-root DIR --sealed-root DIR --seal-key-output-fd N",
         .actuation_audit => "seq actuation-audit --root <path> (--session-id <id>|--path <jsonl>|(--repo <path>|--workdir <path>) (--last <duration>|--since <iso>|--until <iso>))",
         .cas_review_audit => "seq cas-review-audit [--path <jsonl>|--receipt-path <json>|--repo <path>] [--mode summary|rows|report]",
         .execution_policy_audit => "seq execution-policy-audit --root <path> (--session-id <id>|--path <jsonl>|--repo <path>|--last <duration>|--since <iso>|--until <iso>)",
@@ -226,6 +265,8 @@ fn flagsFor(command: lib.Command) []const FlagSpec {
         .query => query_flags[0..],
         .skill_decision_audit => skill_decision_audit_flags[0..],
         .decision_capsule => decision_capsule_flags[0..],
+        .hctp_source => hctp_source_flags[0..],
+        .hylo_extract => hylo_extract_flags[0..],
         .actuation_audit => actuation_audit_flags[0..],
         .cas_review_audit => cas_review_audit_flags[0..],
         .execution_policy_audit => execution_policy_audit_flags[0..],
@@ -273,7 +314,10 @@ test "registry covers every command and parses names" {
     defer seen.deinit();
 
     for (commandNames()) |def| {
-        const entry = commandSpec(def.cmd) orelse return error.TestExpectedEqual;
+        const entry = commandSpec(def.cmd) orelse {
+            try std.testing.expect(!lib.commandAvailable(def.cmd));
+            continue;
+        };
         try std.testing.expectEqual(def.cmd, parseCommand(entry.name));
         try std.testing.expect(std.mem.eql(u8, entry.name, commandName(def.cmd)));
         try std.testing.expect(entry.usage.len > 0);
@@ -284,7 +328,22 @@ test "registry covers every command and parses names" {
     inline for (std.meta.fields(lib.Command)) |field| {
         const command: lib.Command = @enumFromInt(field.value);
         if (command == .unknown) continue;
-        try std.testing.expect(seen.contains(command));
+        try std.testing.expectEqual(lib.commandAvailable(command), seen.contains(command));
+    }
+}
+
+test "registry follows HCTP product admission" {
+    try std.testing.expectEqual(lib.HctpProductAvailable, commandSpec(.hctp_source) != null);
+    try std.testing.expectEqual(lib.HctpProductAvailable, commandSpec(.hylo_extract) != null);
+    if (commandSpec(.hylo_extract)) |spec| {
+        var has_target_root = false;
+        for (spec.flags) |flag| {
+            if (std.mem.eql(u8, flag.name, "--target-root")) {
+                has_target_root = flag.required;
+            }
+        }
+        try std.testing.expect(has_target_root);
+        try std.testing.expect(std.mem.indexOf(u8, spec.usage, "--target-root DIR") != null);
     }
 }
 

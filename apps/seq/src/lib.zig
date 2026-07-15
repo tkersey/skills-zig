@@ -1,4 +1,7 @@
+const builtin = @import("builtin");
 const std = @import("std");
+
+pub const HctpProductAvailable = builtin.os.tag == .macos;
 
 pub const Command = enum {
     skills_rank,
@@ -11,6 +14,8 @@ pub const Command = enum {
     skill_contract,
     skill_decision_receipt,
     decision_capsule,
+    hctp_source,
+    hylo_extract,
     skill_blocks,
     artifact_search,
     tool_audit,
@@ -81,6 +86,8 @@ pub const command_defs = [_]CommandDef{
     .{ .name = "skill-contract", .cmd = .skill_contract },
     .{ .name = "skill-decision-receipt", .cmd = .skill_decision_receipt },
     .{ .name = "decision-capsule", .cmd = .decision_capsule },
+    .{ .name = "hctp-source", .cmd = .hctp_source },
+    .{ .name = "hylo-extract", .cmd = .hylo_extract },
     .{ .name = "skill-blocks", .cmd = .skill_blocks },
     .{ .name = "artifact-search", .cmd = .artifact_search },
     .{ .name = "tool-audit", .cmd = .tool_audit },
@@ -136,9 +143,18 @@ pub const command_defs = [_]CommandDef{
 
 pub fn parseCommand(arg: []const u8) Command {
     for (command_defs) |def| {
-        if (std.mem.eql(u8, arg, def.name)) return def.cmd;
+        if (std.mem.eql(u8, arg, def.name)) {
+            return if (commandAvailable(def.cmd)) def.cmd else .unknown;
+        }
     }
     return .unknown;
+}
+
+pub fn commandAvailable(cmd: Command) bool {
+    return HctpProductAvailable or switch (cmd) {
+        .hctp_source, .hylo_extract => false,
+        else => true,
+    };
 }
 
 pub fn isHelpArg(arg: []const u8) bool {
@@ -158,11 +174,18 @@ pub fn commandNames() []const CommandDef {
 
 test "parseCommand recognizes full CLI surface" {
     for (command_defs) |def| {
-        try std.testing.expectEqual(def.cmd, parseCommand(def.name));
+        const expected: Command = if (commandAvailable(def.cmd)) def.cmd else .unknown;
+        try std.testing.expectEqual(expected, parseCommand(def.name));
         try std.testing.expect(std.mem.eql(u8, def.name, commandName(def.cmd)));
     }
     try std.testing.expectEqual(Command.unknown, parseCommand("else"));
     try std.testing.expect(isHelpArg("--help"));
     try std.testing.expect(isHelpArg("-h"));
     try std.testing.expect(!isHelpArg("query"));
+}
+
+test "HCTP product commands share one macOS admission law" {
+    try std.testing.expectEqual(HctpProductAvailable, commandAvailable(.hctp_source));
+    try std.testing.expectEqual(HctpProductAvailable, commandAvailable(.hylo_extract));
+    try std.testing.expect(commandAvailable(.capabilities));
 }

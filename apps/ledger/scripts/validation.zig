@@ -3,7 +3,14 @@ const actuating_review_policy_cli = @import("actuating_review_policy.zig");
 const actuating_review_resolution_cli = @import("actuating_review_resolution.zig");
 const builtin = @import("builtin");
 const core_cli = @import("core_cli");
+const retrace_core = @import("retrace_core");
 const std = @import("std");
+
+const replay_episode = retrace_core.replay_episode;
+const runtime_contract = retrace_core.runtime_contract;
+const target_bundle = retrace_core.target_bundle;
+const world_availability = retrace_core.world_availability;
+const world_snapshot = retrace_core.world_snapshot;
 
 const Io = std.Io.Threaded.global_single_threaded;
 const MaxInputBytes = 4 * 1024 * 1024;
@@ -23,6 +30,16 @@ const UsageText =
     \\  policy-synthesis-receipt  Validate a PSR-v1 policy synthesis receipt
     \\  review-fold               Validate an RF-v2 review-fold receipt
     \\  review-resolution         Check the correctness-refinement sub-contract in review-resolution/v1
+    \\  hylo-replay-episode       Validate a content-addressed CRF Slice 1 custody episode
+    \\  hylo-runner-input         Validate the pure blinded runner projection
+    \\  hylo-stimulus             Validate the ordered runner-visible causal stimulus
+    \\  hylo-target-bundle        Validate a content-addressed target bundle manifest
+    \\  hylo-world-snapshot       Validate a target-masked world snapshot
+    \\  hylo-world-availability-receipt  Validate cut-bound world availability
+    \\  hylo-runtime-contract     Validate a frozen runtime contract
+    \\  hylo-counterfactual-cut-receipt  Validate a causal cut receipt
+    \\  hylo-redaction-receipt    Validate a semantic redaction receipt
+    \\  hylo-custody-manifest     Validate sealed-evidence custody metadata
     \\
     \\options:
     \\  --phase PHASE  preflight|closeout for Actuating contracts
@@ -40,11 +57,31 @@ const Contract = enum {
     plan_source_contract,
     policy_synthesis_receipt,
     review_fold,
+    hylo_replay_episode,
+    hylo_runner_input,
+    hylo_stimulus,
+    hylo_target_bundle,
+    hylo_world_snapshot,
+    hylo_world_availability_receipt,
+    hylo_runtime_contract,
+    hylo_counterfactual_cut_receipt,
+    hylo_redaction_receipt,
+    hylo_custody_manifest,
 
     fn parse(raw: []const u8) ?Contract {
         if (std.mem.eql(u8, raw, "plan-source-contract")) return .plan_source_contract;
         if (std.mem.eql(u8, raw, "policy-synthesis-receipt")) return .policy_synthesis_receipt;
         if (std.mem.eql(u8, raw, "review-fold")) return .review_fold;
+        if (std.mem.eql(u8, raw, "hylo-replay-episode")) return .hylo_replay_episode;
+        if (std.mem.eql(u8, raw, "hylo-runner-input")) return .hylo_runner_input;
+        if (std.mem.eql(u8, raw, "hylo-stimulus")) return .hylo_stimulus;
+        if (std.mem.eql(u8, raw, "hylo-target-bundle")) return .hylo_target_bundle;
+        if (std.mem.eql(u8, raw, "hylo-world-snapshot")) return .hylo_world_snapshot;
+        if (std.mem.eql(u8, raw, "hylo-world-availability-receipt")) return .hylo_world_availability_receipt;
+        if (std.mem.eql(u8, raw, "hylo-runtime-contract")) return .hylo_runtime_contract;
+        if (std.mem.eql(u8, raw, "hylo-counterfactual-cut-receipt")) return .hylo_counterfactual_cut_receipt;
+        if (std.mem.eql(u8, raw, "hylo-redaction-receipt")) return .hylo_redaction_receipt;
+        if (std.mem.eql(u8, raw, "hylo-custody-manifest")) return .hylo_custody_manifest;
         return null;
     }
 
@@ -53,6 +90,16 @@ const Contract = enum {
             .plan_source_contract => "plan-source-contract",
             .policy_synthesis_receipt => "policy-synthesis-receipt",
             .review_fold => "review-fold",
+            .hylo_replay_episode => "hylo-replay-episode",
+            .hylo_runner_input => "hylo-runner-input",
+            .hylo_stimulus => "hylo-stimulus",
+            .hylo_target_bundle => "hylo-target-bundle",
+            .hylo_world_snapshot => "hylo-world-snapshot",
+            .hylo_world_availability_receipt => "hylo-world-availability-receipt",
+            .hylo_runtime_contract => "hylo-runtime-contract",
+            .hylo_counterfactual_cut_receipt => "hylo-counterfactual-cut-receipt",
+            .hylo_redaction_receipt => "hylo-redaction-receipt",
+            .hylo_custody_manifest => "hylo-custody-manifest",
         };
     }
 };
@@ -107,7 +154,7 @@ pub fn runWithArgv(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
     }
 
     const args = try parseArgs(argv);
-    const input = try readInputAlloc(allocator, args.input_path);
+    const input = try readInputAlloc(allocator, args.contract, args.input_path);
     defer allocator.free(input);
 
     var issues = Issues{};
@@ -120,14 +167,28 @@ pub fn runWithArgv(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
     };
     defer parsed.deinit();
 
-    switch (args.contract) {
-        .plan_source_contract => try validatePlanSourceContract(allocator, parsed.value, &issues),
-        .policy_synthesis_receipt => try validatePolicySynthesisReceipt(allocator, parsed.value, &issues),
-        .review_fold => try validateReviewFold(allocator, parsed.value, &issues),
-    }
+    try validateContract(allocator, args.contract, parsed.value, &issues);
 
     try emitDecision(allocator, args.contract, &issues);
     return if (issues.values.items.len == 0) 0 else 2;
+}
+
+fn validateContract(allocator: std.mem.Allocator, contract: Contract, value: std.json.Value, issues: *Issues) !void {
+    switch (contract) {
+        .plan_source_contract => try validatePlanSourceContract(allocator, value, issues),
+        .policy_synthesis_receipt => try validatePolicySynthesisReceipt(allocator, value, issues),
+        .review_fold => try validateReviewFold(allocator, value, issues),
+        .hylo_replay_episode => try validateHyloReplayEpisode(allocator, value, issues),
+        .hylo_runner_input => try validateHyloRunnerInput(allocator, value, issues),
+        .hylo_stimulus => try validateHyloStimulus(allocator, value, issues),
+        .hylo_target_bundle => try validateHyloTargetBundle(allocator, value, issues),
+        .hylo_world_snapshot => try validateHyloWorldSnapshot(allocator, value, issues),
+        .hylo_world_availability_receipt => try validateHyloWorldAvailability(allocator, value, issues),
+        .hylo_runtime_contract => try validateHyloRuntimeContract(allocator, value, issues),
+        .hylo_counterfactual_cut_receipt => try validateHyloCounterfactualCutReceipt(allocator, value, issues),
+        .hylo_redaction_receipt => try validateHyloRedactionReceipt(allocator, value, issues),
+        .hylo_custody_manifest => try validateHyloCustodyManifest(allocator, value, issues),
+    }
 }
 
 fn defaultIo() std.Io {
@@ -159,12 +220,20 @@ fn parseArgs(argv: []const []const u8) !Args {
     };
 }
 
-fn readInputAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+fn inputLimitForContract(contract: Contract) usize {
+    return switch (contract) {
+        .hylo_replay_episode, .hylo_stimulus, .hylo_target_bundle => replay_episode.max_portable_artifact_bytes,
+        else => MaxInputBytes,
+    };
+}
+
+fn readInputAlloc(allocator: std.mem.Allocator, contract: Contract, path: []const u8) ![]u8 {
+    const limit = inputLimitForContract(contract);
     if (std.mem.eql(u8, path, "-")) {
         var reader = std.Io.File.stdin().reader(defaultIo(), &.{});
-        return reader.interface.allocRemaining(allocator, .limited(MaxInputBytes));
+        return reader.interface.allocRemaining(allocator, .limited(limit));
     }
-    return std.Io.Dir.cwd().readFileAlloc(defaultIo(), path, allocator, .limited(MaxInputBytes));
+    return std.Io.Dir.cwd().readFileAlloc(defaultIo(), path, allocator, .limited(limit));
 }
 
 fn emitDecision(allocator: std.mem.Allocator, contract: Contract, issues: *Issues) !void {
@@ -234,6 +303,99 @@ fn validatePlanSourceContract(allocator: std.mem.Allocator, root: std.json.Value
     const auto_handoff = asObjectValue(sgr.get("auto_plan_handoff"));
     if (auto_handoff == null or !fieldEqualsYes(auto_handoff.?, "eligible")) try issues.add(allocator, "sgr-auto-handoff-ineligible");
     if (auto_handoff == null or !fieldInStrings(auto_handoff.?, "invocation", &.{ "same_turn_tail_call", "manual" })) try issues.add(allocator, "sgr-auto-handoff-invocation");
+}
+
+fn validateHyloReplayEpisode(allocator: std.mem.Allocator, root: std.json.Value, issues: *Issues) !void {
+    const object_value = asObject(root) orelse {
+        try issues.add(allocator, "input-object-required");
+        return;
+    };
+    if (!fieldEqualsString(object_value, "schema", "hylo-replay-episode/v1")) try issues.add(allocator, "episode-schema");
+    if (!isNonblankString(object_value.get("episode_id"))) try issues.add(allocator, "episode-id-required");
+    if (!isNonblankString(object_value.get("episode_family_id"))) try issues.add(allocator, "episode-family-id-required");
+    if (!try replay_episode.validateEpisodeValue(allocator, root)) try issues.add(allocator, "episode-contract-invalid");
+}
+
+fn validateHyloRunnerInput(allocator: std.mem.Allocator, root: std.json.Value, issues: *Issues) !void {
+    const object_value = asObject(root) orelse {
+        try issues.add(allocator, "input-object-required");
+        return;
+    };
+    if (!fieldEqualsString(object_value, "schema", "hylo-runner-input/v1")) try issues.add(allocator, "runner-schema");
+    if (replay_episode.containsForbiddenKey(root)) try issues.add(allocator, "custody-field-exposed");
+    if (!try replay_episode.validateRunnerInputValue(allocator, root)) try issues.add(allocator, "runner-contract-invalid");
+}
+
+fn validateHyloStimulus(allocator: std.mem.Allocator, root: std.json.Value, issues: *Issues) !void {
+    const object_value = asObject(root) orelse {
+        try issues.add(allocator, "input-object-required");
+        return;
+    };
+    if (!fieldEqualsString(object_value, "schema", "hylo-stimulus/v1")) try issues.add(allocator, "stimulus-schema");
+    if (!try replay_episode.validateStimulusValue(allocator, root)) try issues.add(allocator, "stimulus-contract-invalid");
+}
+
+fn validateHyloTargetBundle(allocator: std.mem.Allocator, root: std.json.Value, issues: *Issues) !void {
+    const object_value = asObject(root) orelse {
+        try issues.add(allocator, "input-object-required");
+        return;
+    };
+    if (!fieldEqualsString(object_value, "schema", "hylo-target-bundle/v1")) try issues.add(allocator, "target-bundle-schema");
+    if (!try target_bundle.validate(root, allocator)) try issues.add(allocator, "target-bundle-contract-invalid");
+}
+
+fn validateHyloWorldSnapshot(allocator: std.mem.Allocator, root: std.json.Value, issues: *Issues) !void {
+    const object_value = asObject(root) orelse {
+        try issues.add(allocator, "input-object-required");
+        return;
+    };
+    if (!fieldEqualsString(object_value, "schema", "hylo-world-snapshot/v1")) try issues.add(allocator, "world-schema");
+    if (!try world_snapshot.validate(root, allocator)) try issues.add(allocator, "world-contract-invalid");
+}
+
+fn validateHyloWorldAvailability(allocator: std.mem.Allocator, root: std.json.Value, issues: *Issues) !void {
+    const object_value = asObject(root) orelse {
+        try issues.add(allocator, "input-object-required");
+        return;
+    };
+    if (!fieldEqualsString(object_value, "schema", "hylo-world-availability-receipt/v1")) try issues.add(allocator, "world-availability-schema");
+    if (!try world_availability.validate(root, allocator)) try issues.add(allocator, "world-availability-contract-invalid");
+}
+
+fn validateHyloRuntimeContract(allocator: std.mem.Allocator, root: std.json.Value, issues: *Issues) !void {
+    const object_value = asObject(root) orelse {
+        try issues.add(allocator, "input-object-required");
+        return;
+    };
+    if (!fieldEqualsString(object_value, "schema", "hylo-runtime-contract/v1")) try issues.add(allocator, "runtime-schema");
+    if (!try runtime_contract.validate(root, allocator)) try issues.add(allocator, "runtime-contract-invalid");
+}
+
+fn validateHyloCounterfactualCutReceipt(allocator: std.mem.Allocator, root: std.json.Value, issues: *Issues) !void {
+    const object_value = asObject(root) orelse {
+        try issues.add(allocator, "input-object-required");
+        return;
+    };
+    if (!fieldEqualsString(object_value, "schema", "hylo-counterfactual-cut-receipt/v1")) try issues.add(allocator, "cut-schema");
+    if (!try replay_episode.validateCounterfactualCutReceipt(root, allocator)) try issues.add(allocator, "cut-contract-invalid");
+}
+
+fn validateHyloRedactionReceipt(allocator: std.mem.Allocator, root: std.json.Value, issues: *Issues) !void {
+    const object_value = asObject(root) orelse {
+        try issues.add(allocator, "input-object-required");
+        return;
+    };
+    if (!fieldEqualsString(object_value, "schema", "hylo-redaction-receipt/v1")) try issues.add(allocator, "redaction-schema");
+    if (!try replay_episode.validateRedactionReceipt(root, allocator)) try issues.add(allocator, "redaction-contract-invalid");
+}
+
+fn validateHyloCustodyManifest(allocator: std.mem.Allocator, root: std.json.Value, issues: *Issues) !void {
+    const object_value = asObject(root) orelse {
+        try issues.add(allocator, "input-object-required");
+        return;
+    };
+    if (!fieldEqualsString(object_value, "schema", "hylo-custody-manifest/v1")) try issues.add(allocator, "custody-manifest-schema");
+    if (!try replay_episode.validateCustodyManifest(root, allocator)) try issues.add(allocator, "custody-manifest-contract-invalid");
 }
 
 fn validatePolicySynthesisReceipt(allocator: std.mem.Allocator, root: std.json.Value, issues: *Issues) !void {
@@ -736,6 +898,158 @@ fn lessString(_: void, lhs: []const u8, rhs: []const u8) bool {
 test "Actuating validation modules are part of the Ledger test graph" {
     std.testing.refAllDecls(actuating_review_policy_cli);
     std.testing.refAllDecls(actuating_review_resolution_cli);
+}
+
+test "Hylo Slice 1 validation routes are complete and delegated" {
+    const cases = [_]struct {
+        contract: Contract,
+        name: []const u8,
+        schema: []const u8,
+        invalid_issue: []const u8,
+    }{
+        .{ .contract = .hylo_replay_episode, .name = "hylo-replay-episode", .schema = "hylo-replay-episode/v1", .invalid_issue = "episode-contract-invalid" },
+        .{ .contract = .hylo_runner_input, .name = "hylo-runner-input", .schema = "hylo-runner-input/v1", .invalid_issue = "runner-contract-invalid" },
+        .{ .contract = .hylo_stimulus, .name = "hylo-stimulus", .schema = "hylo-stimulus/v1", .invalid_issue = "stimulus-contract-invalid" },
+        .{ .contract = .hylo_target_bundle, .name = "hylo-target-bundle", .schema = "hylo-target-bundle/v1", .invalid_issue = "target-bundle-contract-invalid" },
+        .{ .contract = .hylo_world_snapshot, .name = "hylo-world-snapshot", .schema = "hylo-world-snapshot/v1", .invalid_issue = "world-contract-invalid" },
+        .{ .contract = .hylo_world_availability_receipt, .name = "hylo-world-availability-receipt", .schema = "hylo-world-availability-receipt/v1", .invalid_issue = "world-availability-contract-invalid" },
+        .{ .contract = .hylo_runtime_contract, .name = "hylo-runtime-contract", .schema = "hylo-runtime-contract/v1", .invalid_issue = "runtime-contract-invalid" },
+        .{ .contract = .hylo_counterfactual_cut_receipt, .name = "hylo-counterfactual-cut-receipt", .schema = "hylo-counterfactual-cut-receipt/v1", .invalid_issue = "cut-contract-invalid" },
+        .{ .contract = .hylo_redaction_receipt, .name = "hylo-redaction-receipt", .schema = "hylo-redaction-receipt/v1", .invalid_issue = "redaction-contract-invalid" },
+        .{ .contract = .hylo_custody_manifest, .name = "hylo-custody-manifest", .schema = "hylo-custody-manifest/v1", .invalid_issue = "custody-manifest-contract-invalid" },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(case.contract, Contract.parse(case.name).?);
+        try std.testing.expectEqualStrings(case.name, case.contract.name());
+        try std.testing.expect(std.mem.indexOf(u8, UsageText, case.name) != null);
+        const input = try std.fmt.allocPrint(std.testing.allocator, "{{\"schema\":{f}}}", .{std.json.fmt(case.schema, .{})});
+        defer std.testing.allocator.free(input);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, input, .{});
+        defer parsed.deinit();
+        var issues = Issues{};
+        defer issues.deinit(std.testing.allocator);
+        try validateContract(std.testing.allocator, case.contract, parsed.value, &issues);
+        try std.testing.expect(containsIssue(issues.values.items, case.invalid_issue));
+    }
+}
+
+test "Hylo portable artifact validators share the producer ceiling" {
+    try std.testing.expect(replay_episode.max_portable_artifact_bytes > MaxInputBytes);
+    for (std.enums.values(Contract)) |contract| {
+        const expected = switch (contract) {
+            .hylo_replay_episode, .hylo_stimulus, .hylo_target_bundle => replay_episode.max_portable_artifact_bytes,
+            else => MaxInputBytes,
+        };
+        try std.testing.expectEqual(expected, inputLimitForContract(contract));
+    }
+
+    const text = try std.testing.allocator.alloc(u8, MaxInputBytes + 1024);
+    defer std.testing.allocator.free(text);
+    @memset(text, 'x');
+
+    var base: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer base.deinit();
+    try base.writer.writeAll(
+        "{\"schema\":\"hylo-stimulus/v1\",\"messages\":[{\"message_id\":\"msg-1\",\"ordinal\":0,\"source_line\":1,\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"",
+    );
+    try base.writer.writeAll(text);
+    try base.writer.writeAll(
+        "\"}],\"timestamp_policy\":\"relative\",\"provenance_ref\":\"rollout:line-1\",\"visibility\":\"runner_visible\"}],\"instructions\":[{\"instruction_id\":\"inst-target\",\"class\":\"replaceable_target\",\"slot\":\"skill://hylo\",\"content_ref\":null,\"source_line\":2}],\"attachments\":[],\"initial_goal_state\":null,\"context_policy\":{\"requested\":\"full-prefix\",\"applied\":\"full_prefix\"},\"stimulus_fingerprint\":\"\"}",
+    );
+    const base_json = try base.toOwnedSlice();
+    defer std.testing.allocator.free(base_json);
+    const stimulus = try replay_episode.finalizeStimulusAlloc(std.testing.allocator, base_json);
+    defer std.testing.allocator.free(stimulus);
+    try std.testing.expect(stimulus.len > MaxInputBytes);
+    try std.testing.expect(stimulus.len <= replay_episode.max_portable_artifact_bytes);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "stimulus.json", .data = stimulus });
+    const stimulus_path = try tmp.dir.realPathFileAlloc(std.testing.io, "stimulus.json", std.testing.allocator);
+    defer std.testing.allocator.free(stimulus_path);
+
+    const read_stimulus = try readInputAlloc(std.testing.allocator, .hylo_stimulus, stimulus_path);
+    defer std.testing.allocator.free(read_stimulus);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, read_stimulus, .{});
+    defer parsed.deinit();
+    var issues = Issues{};
+    defer issues.deinit(std.testing.allocator);
+    try validateContract(std.testing.allocator, .hylo_stimulus, parsed.value, &issues);
+    try std.testing.expectEqual(@as(usize, 0), issues.values.items.len);
+
+    try std.testing.expectError(
+        error.StreamTooLong,
+        readInputAlloc(std.testing.allocator, .review_fold, stimulus_path),
+    );
+
+    const long_component = [_]u8{'a'} ** 240;
+    try std.testing.expect(long_component.len <= std.Io.Dir.max_name_bytes);
+    const target_files = try std.testing.allocator.alloc(target_bundle.SkillFile, 4096);
+    defer std.testing.allocator.free(target_files);
+    var target_file_count: usize = 1;
+    defer for (target_files[1..target_file_count]) |file| {
+        std.testing.allocator.free(file.path);
+        std.testing.allocator.free(file.content_ref);
+    };
+    target_files[0] = .{
+        .path = "SKILL.md",
+        .mode = "100644",
+        .content_ref = "baseline-target/SKILL.md",
+        .content = "---\nname: hylo\n---\n",
+    };
+    while (target_file_count < target_files.len) : (target_file_count += 1) {
+        const path = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "generated/{s}/{s}/{d:0>4}.md",
+            .{ &long_component, &long_component, target_file_count },
+        );
+        const content_ref = std.fs.path.join(std.testing.allocator, &.{ "baseline-target", path }) catch |err| {
+            std.testing.allocator.free(path);
+            return err;
+        };
+        target_files[target_file_count] = .{
+            .path = path,
+            .mode = "100644",
+            .content_ref = content_ref,
+            .content = "x\n",
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 4096), target_file_count);
+    try std.testing.expect(target_files[target_files.len - 1].path.len < std.fs.max_path_bytes);
+    try std.testing.expect(target_files[target_files.len - 1].content_ref.len < std.fs.max_path_bytes);
+
+    var target_bundle_artifact = try target_bundle.buildSkillBundleFromFilesAlloc(
+        std.testing.allocator,
+        "hylo",
+        target_files,
+    );
+    defer target_bundle_artifact.deinit(std.testing.allocator);
+    try std.testing.expect(target_bundle_artifact.json.len > MaxInputBytes);
+    try std.testing.expect(target_bundle_artifact.json.len <= replay_episode.max_portable_artifact_bytes);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "target-bundle.json", .data = target_bundle_artifact.json });
+    const target_bundle_path = try tmp.dir.realPathFileAlloc(std.testing.io, "target-bundle.json", std.testing.allocator);
+    defer std.testing.allocator.free(target_bundle_path);
+
+    const read_target_bundle = try readInputAlloc(std.testing.allocator, .hylo_target_bundle, target_bundle_path);
+    defer std.testing.allocator.free(read_target_bundle);
+    var parsed_target_bundle = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, read_target_bundle, .{});
+    defer parsed_target_bundle.deinit();
+    var target_bundle_issues = Issues{};
+    defer target_bundle_issues.deinit(std.testing.allocator);
+    try validateContract(std.testing.allocator, .hylo_target_bundle, parsed_target_bundle.value, &target_bundle_issues);
+    try std.testing.expectEqual(@as(usize, 0), target_bundle_issues.values.items.len);
+    try std.testing.expect(try target_bundle.validateResolvedSkillFiles(
+        parsed_target_bundle.value,
+        target_files,
+        std.testing.allocator,
+    ));
+
+    try std.testing.expectError(
+        error.StreamTooLong,
+        readInputAlloc(std.testing.allocator, .review_fold, target_bundle_path),
+    );
 }
 
 test "plan source contract validation passes a complete PSC-v1" {

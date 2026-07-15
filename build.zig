@@ -3,6 +3,7 @@ pub fn build(b: *std.Build) void {
     enforceRepoLocalInstallOnly(b);
 
     const target = b.standardTargetOptions(.{});
+    const hctp_product_available = target.result.os.tag == .macos;
     const optimize = b.standardOptimizeOption(.{});
 
     const core_json = b.createModule(.{
@@ -53,6 +54,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const hctp_fixtures = b.createModule(.{
+        .root_source_file = b.path("testdata/hctp-v1/fixtures.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const execution_policy_core = b.createModule(.{
         .root_source_file = b.path("libs/execution_policy_core/src/root.zig"),
         .target = target,
@@ -73,6 +79,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "retrace_core", .module = retrace_core },
             .{ .name = "execution_policy_core", .module = execution_policy_core },
+            .{ .name = "durable_store", .module = durable_store },
             .{ .name = "app_meta", .module = seq_meta },
         },
     });
@@ -115,6 +122,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "retrace_core", .module = retrace_core },
             .{ .name = "execution_policy_core", .module = execution_policy_core },
+            .{ .name = "durable_store", .module = durable_store },
             .{ .name = "app_meta", .module = seq_meta },
         },
     });
@@ -136,6 +144,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "retrace_core", .module = retrace_core },
             .{ .name = "execution_policy_core", .module = execution_policy_core },
+            .{ .name = "durable_store", .module = durable_store },
             .{ .name = "app_meta", .module = seq_meta },
         },
     });
@@ -213,6 +222,30 @@ pub fn build(b: *std.Build) void {
             .{ .name = "retrace_core", .module = retrace_core },
             .{ .name = "durable_store", .module = durable_store },
             .{ .name = "app_meta", .module = cas_meta },
+        },
+    });
+    const cas_trial_root = b.createModule(.{
+        .root_source_file = b.path("apps/cas/scripts/cas_trial.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "retrace_core", .module = retrace_core },
+            .{ .name = "durable_store", .module = durable_store },
+            .{ .name = "app_meta", .module = cas_meta },
+            .{ .name = "hctp_fixtures", .module = hctp_fixtures },
+        },
+    });
+    const cas_trial_tests_root = b.createModule(.{
+        .root_source_file = b.path("apps/cas/scripts/cas_trial.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "retrace_core", .module = retrace_core },
+            .{ .name = "durable_store", .module = durable_store },
+            .{ .name = "app_meta", .module = cas_meta },
+            .{ .name = "hctp_fixtures", .module = hctp_fixtures },
         },
     });
     const cas_conformance_root = b.createModule(.{
@@ -341,6 +374,170 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "durable_store", .module = durable_store },
             .{ .name = "app_meta", .module = ledger_meta },
+            .{ .name = "hctp_fixtures", .module = hctp_fixtures },
+            .{ .name = "retrace_core", .module = retrace_core },
+        },
+    });
+    const hylo_cli_tests_root = b.createModule(.{
+        .root_source_file = b.path("apps/ledger/scripts/hylo.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "durable_store", .module = durable_store },
+            .{ .name = "app_meta", .module = ledger_meta },
+            .{ .name = "hctp_fixtures", .module = hctp_fixtures },
+            .{ .name = "retrace_core", .module = retrace_core },
+        },
+    });
+    const hctp_contract_tests_root = b.createModule(.{
+        .root_source_file = b.path("apps/ledger/scripts/hctp.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hctp_fixtures", .module = hctp_fixtures },
+            .{ .name = "retrace_core", .module = retrace_core },
+        },
+    });
+    const hctp_fold_tests_root = b.createModule(.{
+        .root_source_file = b.path("apps/ledger/scripts/hctp_fold.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hctp_fixtures", .module = hctp_fixtures },
+            .{ .name = "retrace_core", .module = retrace_core },
+        },
+    });
+    const hctp_source_contract_module = b.createModule(.{
+        .root_source_file = b.path("apps/seq/src/hctp_source.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "durable_store", .module = durable_store },
+            .{ .name = "retrace_core", .module = retrace_core },
+        },
+    });
+    const hctp_conformance_registration_root = b.createModule(.{
+        .root_source_file = b.path("apps/ledger/scripts/hctp_conformance_registration.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hctp_fixtures", .module = hctp_fixtures },
+            .{ .name = "retrace_core", .module = retrace_core },
+        },
+    });
+    const hctp_conformance_execution_root = b.createModule(.{
+        .root_source_file = b.path("apps/ledger/scripts/hctp_conformance_execution.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hctp_fixtures", .module = hctp_fixtures },
+            .{ .name = "retrace_core", .module = retrace_core },
+        },
+    });
+    const hctp_conformance_grading_root = b.createModule(.{
+        .root_source_file = b.path("apps/ledger/scripts/hctp_conformance_grading.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hctp_fixtures", .module = hctp_fixtures },
+            .{ .name = "retrace_core", .module = retrace_core },
+        },
+    });
+    const hctp_conformance_retrace_holdout_root = b.createModule(.{
+        .root_source_file = b.path("apps/ledger/scripts/hctp_conformance_retrace_holdout.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hctp_fixtures", .module = hctp_fixtures },
+            .{ .name = "retrace_core", .module = retrace_core },
+            .{ .name = "hctp_source", .module = hctp_source_contract_module },
+        },
+    });
+    const hctp_conformance_manifest_root = b.createModule(.{
+        .root_source_file = b.path("testdata/hctp-v1/conformance_manifest.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const hctp_conformance_backend_root = b.createModule(.{
+        .root_source_file = b.path("apps/ledger/scripts/hctp_conformance_backend.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core_cli", .module = core_cli },
+            .{ .name = "durable_store", .module = durable_store },
+            .{ .name = "app_meta", .module = ledger_meta },
+            .{ .name = "hctp_fixtures", .module = hctp_fixtures },
+            .{ .name = "retrace_core", .module = retrace_core },
+            .{ .name = "hctp_source", .module = hctp_source_contract_module },
+        },
+    });
+    const hctp_legacy_compat_root = b.createModule(.{
+        .root_source_file = b.path("apps/ledger/scripts/hctp_legacy_compat.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "durable_store", .module = durable_store }},
+    });
+    const hctp_integration_root = b.createModule(.{
+        .root_source_file = b.path("apps/ledger/scripts/hctp_integration.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "durable_store", .module = durable_store },
+            .{ .name = "hctp_fixtures", .module = hctp_fixtures },
+            .{ .name = "retrace_core", .module = retrace_core },
+        },
+    });
+    const hctp_cas_fixture_executor_root = b.createModule(.{
+        .root_source_file = b.path("testdata/hctp-v1/cas-fixture-executor.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "cas_session_inquiry", .module = cas_session_inquiry_root },
+            .{ .name = "durable_store", .module = durable_store },
+            .{ .name = "retrace_core", .module = retrace_core },
+        },
+    });
+    const hctp_sealed_fixture_executor_root = b.createModule(.{
+        .root_source_file = b.path("testdata/hctp-v1/sealed-cas-fixture-executor.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "durable_store", .module = durable_store }},
+    });
+    const hctp_sealed_source_fixture_root = b.createModule(.{
+        .root_source_file = b.path("testdata/hctp-v1/sealed-source-fixture.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "durable_store", .module = durable_store },
+            .{ .name = "retrace_core", .module = retrace_core },
+        },
+    });
+    const hctp_sealed_grader_fixture_root = b.createModule(.{
+        .root_source_file = b.path("testdata/hctp-v1/sealed-grader-fixture.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "durable_store", .module = durable_store },
+            .{ .name = "retrace_core", .module = retrace_core },
+        },
+    });
+    const hctp_sealed_grade_materializer_fixture_root = b.createModule(.{
+        .root_source_file = b.path("testdata/hctp-v1/sealed-grade-materializer-fixture.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "durable_store", .module = durable_store },
+            .{ .name = "retrace_core", .module = retrace_core },
+        },
+    });
+    const hctp_sealed_role_driver_root = b.createModule(.{
+        .root_source_file = b.path("testdata/hctp-v1/sealed-role-driver.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "durable_store", .module = durable_store },
+            .{ .name = "retrace_core", .module = retrace_core },
         },
     });
     const memory_note_root = b.createModule(.{
@@ -380,6 +577,25 @@ pub fn build(b: *std.Build) void {
     cas_review_session.root_module.linkSystemLibrary("c", .{});
     const cas_session_inquiry = addExecutable(b, "cas_session_inquiry", cas_session_inquiry_root);
     cas_session_inquiry.root_module.linkSystemLibrary("c", .{});
+    const cas_trial = addExecutable(b, "cas_trial", cas_trial_root);
+    cas_trial.root_module.linkSystemLibrary("c", .{});
+    const hctp_cas_fixture_executor = addExecutable(b, "hctp-cas-fixture-executor", hctp_cas_fixture_executor_root);
+    const hctp_sealed_fixture_executor = addExecutable(b, "hctp-sealed-cas-fixture-executor", hctp_sealed_fixture_executor_root);
+    const hctp_sealed_source_fixture = addExecutable(b, "hctp-sealed-source-fixture", hctp_sealed_source_fixture_root);
+    hctp_sealed_source_fixture.root_module.linkSystemLibrary("c", .{});
+    const hctp_sealed_grader_fixture = addExecutable(b, "hctp-sealed-grader-fixture", hctp_sealed_grader_fixture_root);
+    hctp_sealed_grader_fixture.root_module.linkSystemLibrary("c", .{});
+    const hctp_sealed_grade_materializer_fixture = addExecutable(b, "hctp-sealed-grade-materializer-fixture", hctp_sealed_grade_materializer_fixture_root);
+    hctp_sealed_grade_materializer_fixture.root_module.linkSystemLibrary("c", .{});
+    const hctp_integration_paths = b.addOptions();
+    hctp_integration_paths.addOptionPath("seq_path", seq.getEmittedBin());
+    hctp_integration_paths.addOptionPath("cas_trial_path", cas_trial.getEmittedBin());
+    hctp_integration_paths.addOptionPath("fixture_executor_path", hctp_cas_fixture_executor.getEmittedBin());
+    hctp_integration_paths.addOptionPath("sealed_fixture_executor_path", hctp_sealed_fixture_executor.getEmittedBin());
+    hctp_integration_paths.addOptionPath("sealed_source_fixture_path", hctp_sealed_source_fixture.getEmittedBin());
+    hctp_integration_paths.addOptionPath("sealed_grader_fixture_path", hctp_sealed_grader_fixture.getEmittedBin());
+    hctp_integration_paths.addOptionPath("sealed_grade_materializer_fixture_path", hctp_sealed_grade_materializer_fixture.getEmittedBin());
+    hctp_integration_root.addOptions("hctp_integration_paths", hctp_integration_paths);
     const cas_conformance_suite = addExecutable(b, "cas_conformance_suite", cas_conformance_root);
     const cas_goal = addExecutable(b, "cas_goal", cas_goal_root);
     const cas_account = addExecutable(b, "cas_account", cas_account_root);
@@ -389,6 +605,27 @@ pub fn build(b: *std.Build) void {
     cron.root_module.linkSystemLibrary("c", .{});
     cron.root_module.linkSystemLibrary("sqlite3", .{});
     const ledger = addExecutable(b, "ledger", ledger_root);
+    const hctp_sealed_role_driver_paths = b.addOptions();
+    hctp_sealed_role_driver_paths.addOptionPath("seq_path", seq.getEmittedBin());
+    hctp_sealed_role_driver_paths.addOptionPath("cas_trial_path", cas_trial.getEmittedBin());
+    hctp_sealed_role_driver_paths.addOptionPath("sealed_fixture_executor_path", hctp_sealed_fixture_executor.getEmittedBin());
+    hctp_sealed_role_driver_paths.addOptionPath("sealed_source_fixture_path", hctp_sealed_source_fixture.getEmittedBin());
+    hctp_sealed_role_driver_paths.addOptionPath("sealed_grader_fixture_path", hctp_sealed_grader_fixture.getEmittedBin());
+    hctp_sealed_role_driver_paths.addOptionPath("sealed_grade_materializer_fixture_path", hctp_sealed_grade_materializer_fixture.getEmittedBin());
+    hctp_sealed_role_driver_paths.addOptionPath("ledger_path", ledger.getEmittedBin());
+    hctp_sealed_role_driver_root.addOptions("hctp_sealed_role_driver_paths", hctp_sealed_role_driver_paths);
+    const hctp_sealed_role_driver = addExecutable(b, "hctp-sealed-role-driver", hctp_sealed_role_driver_root);
+    hctp_sealed_role_driver.root_module.linkSystemLibrary("c", .{});
+    hctp_integration_paths.addOptionPath("sealed_role_driver_path", hctp_sealed_role_driver.getEmittedBin());
+    const hctp_legacy_paths = b.addOptions();
+    hctp_legacy_paths.addOptionPath("ledger_path", ledger.getEmittedBin());
+    hctp_legacy_paths.addOption([]const u8, "campaign_bytes", @embedFile("testdata/hctp-v1/legacy/campaign-v1.json"));
+    hctp_legacy_paths.addOption([]const u8, "scenario_bytes", @embedFile("testdata/hctp-v1/legacy/scenarios.jsonl"));
+    hctp_legacy_paths.addOption([]const u8, "event_bytes", @embedFile("testdata/hctp-v1/legacy/events-v1.jsonl"));
+    hctp_legacy_paths.addOption([]const u8, "expected_progress_bytes", @embedFile("testdata/hctp-v1/legacy/expected-progress-v1.json"));
+    hctp_legacy_paths.addOption([]const u8, "corpus_bytes", @embedFile("testdata/hctp-v1/legacy/corpus-v1.json"));
+    hctp_legacy_compat_root.addOptions("hctp_legacy_paths", hctp_legacy_paths);
+    hctp_integration_paths.addOptionPath("ledger_path", ledger.getEmittedBin());
     const memory_note = addExecutable(b, "memory-note", memory_note_root);
     const img = addExecutable(b, "img", img_root);
     const perf_hub = addExecutable(b, "perf_hub", perf_hub_root);
@@ -402,6 +639,7 @@ pub fn build(b: *std.Build) void {
     const cas_instance_runner_install = addInstallStep(b, cas_instance_runner);
     const cas_review_session_install = addInstallStep(b, cas_review_session);
     const cas_session_inquiry_install = addInstallStep(b, cas_session_inquiry);
+    const cas_trial_install = addInstallStep(b, cas_trial);
     const cas_conformance_suite_install = addInstallStep(b, cas_conformance_suite);
     const cas_goal_install = addInstallStep(b, cas_goal);
     const cas_account_install = addInstallStep(b, cas_account);
@@ -423,6 +661,7 @@ pub fn build(b: *std.Build) void {
     install_all.dependOn(&cas_instance_runner_install.step);
     install_all.dependOn(&cas_review_session_install.step);
     install_all.dependOn(&cas_session_inquiry_install.step);
+    if (hctp_product_available) install_all.dependOn(&cas_trial_install.step);
     install_all.dependOn(&cas_conformance_suite_install.step);
     install_all.dependOn(&cas_goal_install.step);
     install_all.dependOn(&cas_account_install.step);
@@ -516,6 +755,33 @@ pub fn build(b: *std.Build) void {
         "Run cas_session_inquiry tests",
         .{ .link_libc = true },
     );
+    const run_cas_trial_tests: ?*std.Build.Step.Run = if (hctp_product_available)
+        addTestStepWithOptions(
+            b,
+            cas_trial_tests_root,
+            "test-cas-trial",
+            "Run macOS cas_trial tests",
+            .{ .link_libc = true },
+        )
+    else
+        null;
+    if (hctp_product_available) {
+        _ = addTestStepWithOptions(
+            b,
+            cas_trial_tests_root,
+            "test-cas-trial-macos-runtime",
+            "Run macOS CAS trial descriptor, cwd, deadline, and descendant-cleanup laws",
+            .{
+                .link_libc = true,
+                .filters = &.{
+                    "executor inherits only standard allowlisted descriptors",
+                    "executor runs in the requested isolated cwd",
+                    "executor deadline kills and reaps a hung child",
+                    "nonzero executor cannot leave a descendant after terminal observation",
+                },
+            },
+        );
+    }
     const run_cas_conformance_tests = addTestStep(
         b,
         cas_conformance_root,
@@ -553,6 +819,7 @@ pub fn build(b: *std.Build) void {
     test_cas.dependOn(&run_cas_runner_tests.step);
     test_cas.dependOn(&run_cas_review_session_tests.step);
     test_cas.dependOn(&run_cas_session_inquiry_tests.step);
+    if (run_cas_trial_tests) |run_tests| test_cas.dependOn(&run_tests.step);
     test_cas.dependOn(&run_cas_conformance_tests.step);
     test_cas.dependOn(&run_cas_goal_tests.step);
     test_cas.dependOn(&run_cas_account_tests.step);
@@ -594,6 +861,190 @@ pub fn build(b: *std.Build) void {
         "test-ledger",
         "Run ledger tests",
     );
+    const hylo_test_filter = b.option(
+        []const u8,
+        "hylo-test-filter",
+        "Override the focused HCTP test filter",
+    ) orelse "proof";
+    const run_hylo_proof_tests = addTestStepWithOptions(
+        b,
+        hylo_cli_tests_root,
+        "test-hylo-proof",
+        "Run HCTP-v1 proof bundle tests",
+        .{ .filters = &.{hylo_test_filter} },
+    );
+    const run_hctp_contract_tests = addTestStep(
+        b,
+        hctp_contract_tests_root,
+        "test-hylo-contracts",
+        "Run HCTP-v1 contract tests",
+    );
+    const run_hctp_fold_tests = addTestStep(
+        b,
+        hctp_fold_tests_root,
+        "test-hylo-fold",
+        "Run HCTP-v1 fold tests",
+    );
+    const run_hctp_conformance_registration = addTestStep(
+        b,
+        hctp_conformance_registration_root,
+        "test-hctp-conformance-registration",
+        "Run HCTP-v1 registration conformance cases",
+    );
+    const run_hctp_conformance_execution = addTestStep(
+        b,
+        hctp_conformance_execution_root,
+        "test-hctp-conformance-execution",
+        "Run HCTP-v1 execution conformance cases",
+    );
+    const run_hctp_conformance_grading = addTestStep(
+        b,
+        hctp_conformance_grading_root,
+        "test-hctp-conformance-grading",
+        "Run HCTP-v1 grading and fold conformance cases",
+    );
+    const run_hctp_conformance_retrace_holdout = addTestStep(
+        b,
+        hctp_conformance_retrace_holdout_root,
+        "test-hctp-conformance-retrace-holdout",
+        "Run HCTP-v1 calibration, Retrace, and holdout conformance cases",
+    );
+    const run_hctp_conformance_manifest = addTestStepWithOptions(
+        b,
+        hctp_conformance_manifest_root,
+        "test-hctp-conformance-manifest",
+        "Validate the HCTP-v1 Section 36 conformance manifest",
+        .{ .cwd = b.path(".") },
+    );
+    const run_hctp_conformance_hylo = addTestStepWithOptions(
+        b,
+        hylo_cli_tests_root,
+        "test-hctp-conformance-hylo",
+        "Run Hylo-owned HCTP-v1 conformance cases",
+        .{ .filters = &.{"HCTP Section 36"} },
+    );
+    _ = run_hctp_conformance_hylo;
+    const hctp_conformance_backend_tests = b.addTest(.{
+        .root_module = hctp_conformance_backend_root,
+        .filters = &.{ "HCTP", "36." },
+        .test_runner = .{
+            .path = b.path("testdata/hctp-v1/conformance_backend_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_hctp_conformance_memory = b.addRunArtifact(hctp_conformance_backend_tests);
+    run_hctp_conformance_memory.setCwd(b.path("."));
+    run_hctp_conformance_memory.setEnvironmentVariable("HCTP_CONFORMANCE_BACKEND", "memory");
+    const test_hctp_conformance_memory = b.step(
+        "test-hctp-conformance-memory",
+        "Run all 71 HCTP-v1 Section 36 cases through the memory backend lane",
+    );
+    test_hctp_conformance_memory.dependOn(&run_hctp_conformance_memory.step);
+    const run_hctp_conformance_persistent = b.addRunArtifact(hctp_conformance_backend_tests);
+    run_hctp_conformance_persistent.setCwd(b.path("."));
+    run_hctp_conformance_persistent.setEnvironmentVariable("HCTP_CONFORMANCE_BACKEND", "persistent");
+    const test_hctp_conformance_persistent = b.step(
+        "test-hctp-conformance-persistent",
+        "Run all 71 HCTP-v1 Section 36 cases through the persistent backend lane",
+    );
+    test_hctp_conformance_persistent.dependOn(&run_hctp_conformance_persistent.step);
+    const test_hctp_conformance_backends = b.step(
+        "test-hctp-conformance-backends",
+        "Run the complete HCTP-v1 Section 36 matrix through both EventStore lanes",
+    );
+    test_hctp_conformance_backends.dependOn(test_hctp_conformance_memory);
+    test_hctp_conformance_backends.dependOn(test_hctp_conformance_persistent);
+    const hctp_conformance_case_11_tests = b.addTest(.{
+        .root_module = hctp_conformance_backend_root,
+        .filters = &.{"HCTP EventStore case 11 focused selected-backend owner witness"},
+    });
+    const run_hctp_conformance_case_11_memory = b.addRunArtifact(hctp_conformance_case_11_tests);
+    run_hctp_conformance_case_11_memory.setCwd(b.path("."));
+    run_hctp_conformance_case_11_memory.setEnvironmentVariable("HCTP_CONFORMANCE_BACKEND", "memory");
+    const run_hctp_conformance_case_11_persistent = b.addRunArtifact(hctp_conformance_case_11_tests);
+    run_hctp_conformance_case_11_persistent.setCwd(b.path("."));
+    run_hctp_conformance_case_11_persistent.setEnvironmentVariable("HCTP_CONFORMANCE_BACKEND", "persistent");
+    const test_hctp_conformance_case_11_backends = b.step(
+        "test-hctp-conformance-case-11-backends",
+        "Run the Section 36 case 11 EventStore owner witness through memory and persistent reload",
+    );
+    test_hctp_conformance_case_11_backends.dependOn(&run_hctp_conformance_case_11_memory.step);
+    test_hctp_conformance_case_11_backends.dependOn(&run_hctp_conformance_case_11_persistent.step);
+    const run_hctp_legacy_compat = addTestStep(
+        b,
+        hctp_legacy_compat_root,
+        "test-hylo-legacy-compat",
+        "Verify frozen Ledger 0.7.2 Hylo bytes under the current parser and fold",
+    );
+    const hctp_integration_tests = b.addTest(.{ .root_module = hctp_integration_root });
+    hctp_integration_tests.root_module.linkSystemLibrary("c", .{});
+    const hctp_cas_fir_integration_tests = b.addTest(.{
+        .root_module = hctp_integration_root,
+        .filters = &.{"one historical Hylo lane normalizes one FIR"},
+    });
+    hctp_cas_fir_integration_tests.root_module.linkSystemLibrary("c", .{});
+    const run_hctp_cas_fir_integration = b.addRunArtifact(hctp_cas_fir_integration_tests);
+    const test_hctp_cas_fir_integration = b.step(
+        "test-hctp-cas-fir-integration",
+        "Run packaged CAS FIR through Retrace normalization and the production CAS trial adapter",
+    );
+    test_hctp_cas_fir_integration.dependOn(&run_hctp_cas_fir_integration.step);
+    const hctp_cas_factor_materialization_tests = b.addTest(.{
+        .root_module = hctp_integration_root,
+        .filters = &.{"HCTP CAS factor materialization"},
+    });
+    hctp_cas_factor_materialization_tests.root_module.linkSystemLibrary("c", .{});
+    const run_hctp_cas_factor_materialization = b.addRunArtifact(hctp_cas_factor_materialization_tests);
+    const test_hctp_cas_factor_materialization = b.step(
+        "test-hctp-cas-factor-materialization",
+        "Run positive-sentinel immutable CAS factor materialization proof",
+    );
+    test_hctp_cas_factor_materialization.dependOn(&run_hctp_cas_factor_materialization.step);
+    const hctp_cas_historical_failure_tests = b.addTest(.{
+        .root_module = hctp_integration_root,
+        .filters = &.{"HCTP end-to-end: historical executor failure terminalizes once without FIR or comparison"},
+    });
+    hctp_cas_historical_failure_tests.root_module.linkSystemLibrary("c", .{});
+    const run_hctp_cas_historical_failure = b.addRunArtifact(hctp_cas_historical_failure_tests);
+    const test_hctp_cas_historical_failure = b.step(
+        "test-hctp-cas-historical-failure",
+        "Run post-claim historical CAS failure terminalization proof",
+    );
+    test_hctp_cas_historical_failure.dependOn(&run_hctp_cas_historical_failure.step);
+    const run_hctp_integration = b.addRunArtifact(hctp_integration_tests);
+    const test_hctp_integration = b.step(
+        "test-hctp-integration",
+        "Run the actual CAS-to-Hylo and Retrace-to-Hylo HCTP integration proof",
+    );
+    test_hctp_integration.dependOn(&run_hctp_integration.step);
+    const hctp_sealed_commitment_tests = b.addTest(.{
+        .root_module = hctp_integration_root,
+        .filters = &.{"HCTP sealed promotion Section 36 case 67 positive witness: supported holdout improvement is published"},
+    });
+    hctp_sealed_commitment_tests.root_module.linkSystemLibrary("c", .{});
+    const run_hctp_sealed_commitments = b.addRunArtifact(hctp_sealed_commitment_tests);
+    const test_hctp_sealed_commitments = b.step(
+        "test-hctp-sealed-commitments",
+        "Run the macOS sealed grade commitment/opening promotion proof",
+    );
+    test_hctp_sealed_commitments.dependOn(&run_hctp_sealed_commitments.step);
+    const test_hctp_conformance = b.step(
+        "test-hctp-conformance",
+        "Run the numbered HCTP-v1 Section 36 suite and supporting owner invariants",
+    );
+    test_hctp_conformance.dependOn(&run_hctp_conformance_registration.step);
+    test_hctp_conformance.dependOn(&run_hctp_conformance_execution.step);
+    test_hctp_conformance.dependOn(&run_hctp_conformance_grading.step);
+    test_hctp_conformance.dependOn(&run_hctp_conformance_retrace_holdout.step);
+    test_hctp_conformance.dependOn(&run_hctp_conformance_manifest.step);
+    test_hctp_conformance.dependOn(test_hctp_conformance_backends);
+    const test_hylo = b.step("test-hylo", "Run HCTP-v1 contract and fold tests");
+    test_hylo.dependOn(&run_hctp_contract_tests.step);
+    test_hylo.dependOn(&run_hctp_fold_tests.step);
+    test_hylo.dependOn(&run_hylo_proof_tests.step);
+    test_hylo.dependOn(&run_hctp_legacy_compat.step);
+    test_hylo.dependOn(test_hctp_conformance);
+    test_hylo.dependOn(test_hctp_integration);
     const run_memory_note_tests = addTestStep(
         b,
         memory_note_root,
@@ -624,6 +1075,22 @@ pub fn build(b: *std.Build) void {
         "test-execution-policy-core",
         "Run execution_policy_core tests",
     );
+    const run_retrace_core_tests = addTestStepWithOptions(
+        b,
+        retrace_core,
+        "test-retrace-core",
+        "Run Retrace core contract tests",
+        .{ .cwd = b.path("apps/seq") },
+    );
+
+    const cas_build_deps: []const *std.Build.Step = if (hctp_product_available)
+        &.{ &cas_smoke_check_install.step, &cas_instance_runner_install.step, &cas_review_session_install.step, &cas_session_inquiry_install.step, &cas_trial_install.step, &cas_conformance_suite_install.step, &cas_goal_install.step, &cas_account_install.step, &cas_budget_perf_install.step, &cas_install.step }
+    else
+        &.{ &cas_smoke_check_install.step, &cas_instance_runner_install.step, &cas_review_session_install.step, &cas_session_inquiry_install.step, &cas_conformance_suite_install.step, &cas_goal_install.step, &cas_account_install.step, &cas_budget_perf_install.step, &cas_install.step };
+    const ledger_test_deps: []const *std.Build.Step = if (hctp_product_available)
+        &.{ &run_ledger_tests.step, test_hylo, &run_synesthesia_tests.step }
+    else
+        &.{ &run_ledger_tests.step, &run_synesthesia_tests.step };
 
     const app_surfaces = [_]AppSurface{
         .{
@@ -644,7 +1111,7 @@ pub fn build(b: *std.Build) void {
             .path = b.path("apps/cas"),
             .build_step_name = "build-cas",
             .build_description = "Build cas binaries",
-            .build_deps = &.{ &cas_smoke_check_install.step, &cas_instance_runner_install.step, &cas_review_session_install.step, &cas_session_inquiry_install.step, &cas_conformance_suite_install.step, &cas_goal_install.step, &cas_account_install.step, &cas_budget_perf_install.step, &cas_install.step },
+            .build_deps = cas_build_deps,
             .test_deps = &.{test_cas},
         },
         .{
@@ -673,7 +1140,7 @@ pub fn build(b: *std.Build) void {
             .build_step_name = "build-ledger",
             .build_description = "Build ledger binary",
             .build_deps = &.{&ledger_install.step},
-            .test_deps = &.{ &run_ledger_tests.step, &run_synesthesia_tests.step },
+            .test_deps = ledger_test_deps,
         },
         .{
             .path = b.path("apps/memory-note"),
@@ -702,6 +1169,7 @@ pub fn build(b: *std.Build) void {
     test_all.dependOn(&run_perf_hub_tests.step);
     test_all.dependOn(&run_durable_store_tests.step);
     test_all.dependOn(&run_execution_policy_core_tests.step);
+    test_all.dependOn(&run_retrace_core_tests.step);
 
     const enable_zlinter = b.option(
         bool,
@@ -728,6 +1196,9 @@ pub fn build(b: *std.Build) void {
     addRunStep(b, cas_smoke_check, "run-cas-smoke-check", "Run cas_smoke_check", &.{"--help"});
     addRunStep(b, cas_conformance_suite, "run-cas-conformance-suite", "Run cas_conformance_suite", &.{"--help"});
     addRunStep(b, cas_session_inquiry, "run-cas-session-inquiry", "Run cas_session_inquiry", &.{"--help"});
+    if (hctp_product_available) {
+        addRunStep(b, cas_trial, "run-cas-trial", "Run macOS cas_trial", &.{"--help"});
+    }
     addRunStep(b, cas_goal, "run-cas-goal", "Run cas_goal", &.{"--help"});
     addRunStep(b, cas_account, "run-cas-account", "Run cas_account", &.{"--help"});
     addRunStepPrefixed(b, perf_hub, "perf-list-local", "List local perf cases", &.{"list"});
@@ -836,6 +1307,7 @@ const TestStepOptions = struct {
     link_libc: bool = false,
     sqlite: bool = false,
     cwd: ?std.Build.LazyPath = null,
+    filters: []const []const u8 = &.{},
 };
 
 fn addTestStepWithOptions(
@@ -845,7 +1317,7 @@ fn addTestStepWithOptions(
     description: []const u8,
     options: TestStepOptions,
 ) *std.Build.Step.Run {
-    const tests = b.addTest(.{ .root_module = root_module });
+    const tests = b.addTest(.{ .root_module = root_module, .filters = options.filters });
     if (options.link_libc) {
         tests.root_module.linkSystemLibrary("c", .{});
         if (options.sqlite) tests.root_module.linkSystemLibrary("sqlite3", .{});
@@ -899,7 +1371,9 @@ fn buildLintStep(
     lint_builder.addPaths(.{
         .include = &.{
             b.path("libs/core"),
+            b.path("libs/retrace_core"),
             b.path("build.zig"),
+            b.path("testdata/hctp-v1"),
             b.path("tools"),
         },
         // `zlinter` routes `@cImport` files through `zls` translate-c, which

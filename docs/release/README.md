@@ -25,9 +25,12 @@ Release contract:
 1. If a PR changes a release-relevant CLI surface, it must also bump that CLI's `VERSION` file.
 2. Release-relevant surfaces are conservative:
    - `apps/<cli>/**` except the per-app `README.md` counts for that CLI.
-   - broad shared shipped surfaces (`build.zig`, `build.zig.zon`, `libs/core/**`) count for every shipped CLI.
+   - `build.zig` changes are classified by their affected app or shared-library context; ambiguous changes fail closed to every shipped CLI.
+   - broad shared shipped surfaces (`build.zig.zon`, `libs/core/**`) count for every shipped CLI.
    - `apps/learnings/**` and `apps/synesthesia/**` count for `ledger`; they are internal source modules, not shipped CLIs.
-   - `libs/durable_store/**` counts for its shipped consumers: `ledger` and `memory-note`.
+   - `libs/durable_store/**` counts for its shipped consumers: `seq`, `cas`, `ledger`, and `memory-note`.
+   - `libs/execution_policy_core/**` counts for its shipped consumer: `seq`.
+   - `libs/retrace_core/**` and `testdata/hctp-v1/**` count for the HCTP consumers: `seq`, `cas`, and `ledger`.
    - `.github/workflows/release-<cli>.yml` counts for that CLI's packaged artifact contract.
    Durable-store changes that alter lease locks, fencing counters, CAS writes, transaction recovery, or semantic concurrency errors must be treated as release-relevant for every shipped consumer whose command behavior depends on those paths.
 3. When those `VERSION` bumps land on `main`, `.github/workflows/auto-release.yml` creates any missing tags and dispatches the matching release workflows automatically.
@@ -64,6 +67,13 @@ Examples:
 - `memory-note-v1.2.3-darwin-arm64.tar.gz`
 - `img-v0.1.0-linux-x86_64.tar.gz`
 - `img-v0.1.0-darwin-arm64.tar.gz`
+
+HCTP/CRF runtime commands are macOS-only. The CAS release therefore packages
+`cas_trial` only in its Darwin archive; the other CAS archive retains the
+unrelated generic CAS binaries. Seq and Ledger keep both generic release
+archives, but their non-Darwin binaries do not advertise or route HCTP/CRF
+product commands. Stateless `ledger validate hylo-*` schema validation remains
+pure and does not grant runtime authority.
 
 ## Homebrew Tap Handoff
 
@@ -105,7 +115,7 @@ curl -fsSL https://www.githubstatus.com/api/v2/components.json \
 If GitHub Actions is degraded/outage and tag runs remain queued, publish manually so tap
 propagation is not blocked:
 
-1. Build and package the two release archives per CLI (`<tag>-darwin-arm64.tar.gz`, `<tag>-linux-x86_64.tar.gz`).
+1. Build and package the two release archives per CLI (`<tag>-darwin-arm64.tar.gz`, `<tag>-linux-x86_64.tar.gz`), preserving the Darwin-only `cas_trial` payload rule.
 2. Create the release directly on the existing tag:
    - `gh release create <tag> <asset1> <asset2> --verify-tag`
 3. Update `homebrew-tap` formula version + SHA256 from the published assets.

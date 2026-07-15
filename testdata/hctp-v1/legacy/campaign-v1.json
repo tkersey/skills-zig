@@ -1,0 +1,89 @@
+{
+  "schema": "hylo-campaign/v1",
+  "campaign_id": "cmp-test",
+  "target": {
+    "kind": "skill",
+    "id": "target-skill",
+    "baseline_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "source": {
+    "corpus_fingerprint": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "session_refs": [
+      {
+        "kind": "codex_session",
+        "ref": "session-test",
+        "fingerprint": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      }
+    ],
+    "exclusions": [
+      "current_session"
+    ]
+  },
+  "privacy": {
+    "mode": "sanitized",
+    "redactions": [
+      "secrets",
+      "private_reasoning"
+    ],
+    "redaction_receipt": {
+      "schema": "hylo-redaction-receipt/v1",
+      "tool": "seq",
+      "version": "test",
+      "source_fingerprint": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "output_fingerprint": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "evidence_refs": [
+        "seq:redaction-test"
+      ]
+    }
+  },
+  "rubric": {
+    "id": "rubric-test",
+    "fingerprint": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "dimensions": [
+      {
+        "id": "correctness",
+        "kind": "deterministic",
+        "weight": 1.0,
+        "critical": true,
+        "grader_ref": "test:dimension",
+        "grader_fingerprint": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+      }
+    ],
+    "judge": {
+      "kind": "composite",
+      "id": "test-judge",
+      "version": "1",
+      "config_fingerprint": "sha256:6666666666666666666666666666666666666666666666666666666666666666"
+    },
+    "pass_policy": {
+      "minimum_aggregate": 1.0,
+      "zero_critical_violations": true
+    }
+  },
+  "replay_policy": {
+    "fingerprint": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "blind_hidden_reference": true,
+    "holdout_blind": true,
+    "default_fidelity": "controlled_replay",
+    "repeat_count": 1
+  },
+  "stop_policy": {
+    "max_attempts": 10,
+    "require_holdout_pass": false,
+    "zero_critical_violations": true
+  },
+  "change_policy": {
+    "target_change_authority": "none",
+    "publication_authority": "none",
+    "allowed_paths": [],
+    "require_clean_scope": false
+  },
+  "scenarios_file": "scenarios.jsonl",
+  "scenario_manifest": [
+    {
+      "scenario_id": "scenario-holdout",
+      "scenario_fingerprint": "sha256:3dbc2a117751f42078d15a82dab707eef4ac2c2b19a8addd9286a873fa6ffb65",
+      "split": "practice"
+    }
+  ]
+}

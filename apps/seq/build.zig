@@ -25,6 +25,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const durable_store = b.createModule(.{
+        .root_source_file = b.path("../../libs/durable_store/src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const execution_policy_core = b.createModule(.{
         .root_source_file = b.path("../../libs/execution_policy_core/src/root.zig"),
         .target = target,
@@ -40,6 +45,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_path", .module = core_path },
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "retrace_core", .module = retrace_core },
+            .{ .name = "durable_store", .module = durable_store },
             .{ .name = "execution_policy_core", .module = execution_policy_core },
             .{ .name = "app_meta", .module = seq_meta },
         },
@@ -69,6 +75,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "core_path", .module = core_path },
             .{ .name = "core_cli", .module = core_cli },
             .{ .name = "retrace_core", .module = retrace_core },
+            .{ .name = "durable_store", .module = durable_store },
             .{ .name = "execution_policy_core", .module = execution_policy_core },
             .{ .name = "app_meta", .module = seq_meta },
         },

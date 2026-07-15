@@ -49,13 +49,14 @@
       "tools_and_artifacts": []
     },
     "limitations": [],
-    "packet_id": "DCP-0fa1d608d7aefc1e2b25a10e48b2c4875d71cb5b3b49b08226f064a4712e7354",
+    "packet_id": "DCP-2e383ae28f1a67c7624e0beb041797bc609dda951ed729d2e20e4289ac733acb",
     "packet_version": "DCP-v2",
     "source": {
       "decision_id": "DEC-23553188db713218",
       "root_session_id": "dcp-basic",
       "rollout_path": "/Users/tk/workspace/tk/skills-zig/apps/seq/testdata/decision-capsule/source-basic.jsonl",
       "session_id": "dcp-basic",
+      "source_episode_id": "session:dcp-basic#turn:turn-decision",
       "source_codex_version": "0.44.0",
       "source_model": "gpt-5",
       "source_model_provider": "openai",
