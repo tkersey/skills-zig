@@ -81,6 +81,16 @@ pub fn validateParsed(
     if (!receipt.artifact_state_present) try codes.append(allocator, "missing_artifact_state");
 
     if (contract) |c| {
+        if (receipt.skill_contract_fingerprint.len == 0) {
+            try codes.append(allocator, "missing_skill_contract_fingerprint");
+        } else {
+            const contract_fingerprint = try skill_contract.fingerprintContract(allocator, c);
+            defer allocator.free(contract_fingerprint);
+            if (!std.mem.eql(u8, receipt.skill_contract_fingerprint, contract_fingerprint)) {
+                try codes.append(allocator, "skill_contract_fingerprint_mismatch");
+            }
+        }
+
         var trigger_ids = std.StringHashMap(void).init(allocator);
         defer trigger_ids.deinit();
         for (c.triggers) |trigger| try trigger_ids.put(trigger.trigger_id, {});
@@ -375,6 +385,45 @@ test "SDR validation rejects selected rejected and unknown contract refs" {
     try std.testing.expect(containsCode(report.codes, "selected_route_rejected"));
     try std.testing.expect(containsCode(report.codes, "unknown_trigger_ref"));
     try std.testing.expect(containsCode(report.codes, "unknown_clause_ref"));
+}
+
+test "SDR contract-bound validation requires matching embedded fingerprint" {
+    const contract_text =
+        \\{"skill_decision_contract":{"contract_version":"SKDC-v1","skill":{"name":"s","kind":"decision","source_fingerprint":"fp"},"triggers":[{"trigger_id":"t1","cue_literals":[],"cue_regexes":[],"exclusions":[]}],"routes":[{"route_id":"r1","aliases":[]}],"clauses":[{"clause_id":"c1","trigger_refs":["t1"],"expected_routes":["r1"],"prohibited_routes":[],"required_artifacts":[],"success_signals":[],"failure_signals":[]}],"instrumentation":{"decision_receipt":"optional"}}}
+    ;
+    var parsed_contract = try skill_contract.parseText(std.testing.allocator, contract_text);
+    defer parsed_contract.deinit();
+    const contract_fingerprint = try skill_contract.fingerprintContract(std.testing.allocator, parsed_contract.contract);
+    defer std.testing.allocator.free(contract_fingerprint);
+
+    const receipt = Receipt{
+        .receipt_version = "SDR-v1",
+        .decision_id = "dec-1",
+        .skill = "s",
+        .skill_contract_fingerprint = contract_fingerprint,
+        .trigger_refs = &.{"t1"},
+        .clause_refs = &.{"c1"},
+        .selected_route = "r1",
+        .artifact_state_present = true,
+        .artifact_state_json = "{}",
+    };
+    var matching = try validateParsed(std.testing.allocator, receipt, "s", parsed_contract.contract);
+    defer matching.deinit(std.testing.allocator);
+    try std.testing.expect(matching.valid);
+
+    var missing_receipt = receipt;
+    missing_receipt.skill_contract_fingerprint = "";
+    var missing = try validateParsed(std.testing.allocator, missing_receipt, "s", parsed_contract.contract);
+    defer missing.deinit(std.testing.allocator);
+    try std.testing.expect(!missing.valid);
+    try std.testing.expect(containsCode(missing.codes, "missing_skill_contract_fingerprint"));
+
+    var stale_receipt = receipt;
+    stale_receipt.skill_contract_fingerprint = "stale-fingerprint";
+    var stale = try validateParsed(std.testing.allocator, stale_receipt, "s", parsed_contract.contract);
+    defer stale.deinit(std.testing.allocator);
+    try std.testing.expect(!stale.valid);
+    try std.testing.expect(containsCode(stale.codes, "skill_contract_fingerprint_mismatch"));
 }
 
 test "SDR missing contract preserves receipt without clause validation" {

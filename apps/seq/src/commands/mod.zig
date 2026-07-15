@@ -3268,6 +3268,7 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
             \\      "skill_decision_delta": true,
             \\      "skill_contract_v1": true,
             \\      "skill_decision_receipt_v1": true,
+            \\      "skill_decision_receipt_contract_binding_v1": true,
             \\      "tune_packet_v1": true,
             \\      "decision_capsule_v1": true,
             \\      "decision_anchor_v1": true,
@@ -3328,6 +3329,7 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
         .{ .name = "skill_decision_delta", .enabled = true },
         .{ .name = "skill_contract_v1", .enabled = true },
         .{ .name = "skill_decision_receipt_v1", .enabled = true },
+        .{ .name = "skill_decision_receipt_contract_binding_v1", .enabled = true },
         .{ .name = "tune_packet_v1", .enabled = true },
         .{ .name = "decision_capsule_v1", .enabled = true },
         .{ .name = "decision_anchor_v1", .enabled = true },
@@ -4492,10 +4494,10 @@ fn cmdSkillDecisionAudit(allocator: std.mem.Allocator, sessions_root: []const u8
     try output.writeOutput(allocator, opts.format, rows.items, cols[0..], opts.out_path);
 }
 
-const skill_decision_episode_columns = [_][]const u8{ "decision_id", "episode_id", "session_id", "root_session_id", "worker_session_id", "skill", "skill_version", "contract_fingerprint", "contract_authority", "start_timestamp", "end_timestamp", "trigger_observed", "activation_class", "question_preview", "alternatives", "selected_route", "rejected_routes", "clause_refs", "decision_effect", "evidence_strength", "outcome_class", "later_reopened", "later_reversed", "artifact_state", "evidence_refs", "counterevidence_refs", "contamination_flags" };
+const skill_decision_episode_columns = [_][]const u8{ "decision_id", "episode_id", "session_id", "root_session_id", "worker_session_id", "skill", "skill_version", "contract_fingerprint", "receipt_contract_fingerprint", "contract_binding_status", "contract_authority", "start_timestamp", "end_timestamp", "trigger_observed", "activation_class", "question_preview", "alternatives", "selected_route", "rejected_routes", "clause_refs", "decision_effect", "evidence_strength", "outcome_class", "later_reopened", "later_reversed", "artifact_state", "evidence_refs", "counterevidence_refs", "contamination_flags" };
 const skill_decision_outcome_columns = [_][]const u8{ "episode_id", "timestamp", "outcome_kind", "outcome_value", "proof_ref", "artifact_state", "association_method", "distance_turns", "distance_seconds", "causal_claim_allowed" };
 const skill_decision_clause_columns = [_][]const u8{ "skill", "contract_fingerprint", "skill_kind", "trigger_id", "clause_id", "expected_routes", "prohibited_routes", "required_artifacts", "success_signals", "failure_signals", "source_path", "contract_authority", "compliance" };
-const skill_decision_miss_columns = [_][]const u8{ "skill", "trigger_id", "cue_evidence", "window", "confidence", "reason" };
+const skill_decision_miss_columns = [_][]const u8{ "decision_id", "session_id", "skill", "trigger_id", "cue_evidence", "window", "confidence", "reason", "receipt_contract_fingerprint", "contract_fingerprint" };
 
 const LoadedSkillDecisionContract = struct {
     parsed: ?skill_contract.ParsedContract = null,
@@ -4720,7 +4722,12 @@ fn collectReceiptEpisodesForSession(
         if (!eqlIgnoreCaseAscii(parsed.receipt.skill, audit.target_skill)) continue;
         const validation = try skill_decision_receipt.validateParsed(allocator, parsed.receipt, audit.target_skill, audit.contract.contract());
         defer validation.deinit(allocator);
-        if (!validation.valid) continue;
+        if (!validation.valid) {
+            if (hasReceiptContractBindingFailure(validation.codes)) {
+                try appendSkillDecisionReceiptBindingMiss(allocator, &audit.misses, audit, path, row.timestamp, parsed.receipt, validation.codes);
+            }
+            continue;
+        }
 
         const decision_id = if (parsed.receipt.decision_id.len > 0) parsed.receipt.decision_id else "unknown";
         const episode_id = try std.fmt.allocPrint(allocator, "{s}:receipt:{s}", .{ inferSessionIdFromPath(path), decision_id });
@@ -4740,6 +4747,8 @@ fn collectReceiptEpisodesForSession(
             .start_timestamp = row.timestamp,
             .end_timestamp = row.timestamp,
             .skill_version = parsed.receipt.skill_version,
+            .receipt_contract_fingerprint = parsed.receipt.skill_contract_fingerprint,
+            .contract_binding_status = if (audit.contract.contract() != null) "matched" else "unbound",
             .question_preview = parsed.receipt.question,
             .alternatives = alternatives,
             .selected_route = parsed.receipt.selected_route,
@@ -4756,6 +4765,35 @@ fn collectReceiptEpisodesForSession(
             try appendSkillDecisionOutcomeRow(allocator, &audit.outcomes, episode_id, outcome, "same_session_after_episode", "not_proven");
         }
     }
+}
+
+fn hasReceiptContractBindingFailure(codes: []const []const u8) bool {
+    return skill_decision_receipt.containsCode(codes, "missing_skill_contract_fingerprint") or
+        skill_decision_receipt.containsCode(codes, "skill_contract_fingerprint_mismatch");
+}
+
+fn appendSkillDecisionReceiptBindingMiss(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(query.Row),
+    audit: *SkillDecisionAudit,
+    path: []const u8,
+    timestamp: ?[]const u8,
+    receipt: skill_decision_receipt.Receipt,
+    codes: []const []const u8,
+) !void {
+    var row = query.Row.init(allocator);
+    errdefer row.deinit();
+    try row.putOwnedKey("decision_id", .{ .string = receipt.decision_id });
+    try row.putOwnedKey("session_id", .{ .string = inferSessionIdFromPath(path) });
+    try row.putOwnedKey("skill", .{ .string = audit.target_skill });
+    try row.putOwnedKey("trigger_id", .{ .string = if (receipt.trigger_refs.len > 0) receipt.trigger_refs[0] else "" });
+    try row.putOwnedKey("cue_evidence", .{ .string = "structured_sdr" });
+    try putOptionalString(&row, "window", timestamp);
+    try row.putOwnedKey("confidence", .{ .string = "explicit" });
+    try row.putOwnedKey("reason", .{ .string = if (skill_decision_receipt.containsCode(codes, "skill_contract_fingerprint_mismatch")) "skill_contract_fingerprint_mismatch" else "missing_skill_contract_fingerprint" });
+    try row.putOwnedKey("receipt_contract_fingerprint", if (receipt.skill_contract_fingerprint.len > 0) .{ .string = receipt.skill_contract_fingerprint } else .null);
+    try row.putOwnedKey("contract_fingerprint", if (audit.contract.fingerprint) |fp| .{ .string = fp } else .null);
+    try out.append(allocator, row);
 }
 
 fn collectExplicitRouteEpisodesForSession(
@@ -4817,6 +4855,8 @@ const EpisodeInput = struct {
     start_timestamp: ?[]const u8,
     end_timestamp: ?[]const u8,
     skill_version: []const u8 = "",
+    receipt_contract_fingerprint: []const u8 = "",
+    contract_binding_status: []const u8 = "not_applicable",
     activation_class: []const u8 = "receipt",
     question_preview: []const u8 = "unknown",
     alternatives: []const u8 = "",
@@ -4848,6 +4888,8 @@ fn appendSkillDecisionEpisodeRow(
     try row.putOwnedKey("skill", .{ .string = audit.target_skill });
     try row.putOwnedKey("skill_version", .{ .string = input.skill_version });
     try row.putOwnedKey("contract_fingerprint", if (audit.contract.fingerprint) |fp| .{ .string = fp } else .null);
+    try row.putOwnedKey("receipt_contract_fingerprint", if (input.receipt_contract_fingerprint.len > 0) .{ .string = input.receipt_contract_fingerprint } else .null);
+    try row.putOwnedKey("contract_binding_status", .{ .string = input.contract_binding_status });
     try row.putOwnedKey("contract_authority", .{ .string = audit.contract.authority });
     try putOptionalString(&row, "start_timestamp", input.start_timestamp);
     try putOptionalString(&row, "end_timestamp", input.end_timestamp);
@@ -26286,6 +26328,7 @@ test "capabilities advertises resolve intent closed audit flags" {
     try std.testing.expect(std.mem.indexOf(u8, got, "\"execution_policy_audit_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"c3_count_evidence_refs_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"workflow_provenance_mode_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"skill_decision_receipt_contract_binding_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"epg_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"policy_transition_dataset_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"token_accounting_v2\": true") != null);
@@ -28774,6 +28817,88 @@ test "skill_decision_audit firewall excludes weak presence from episodes" {
     defer std.testing.allocator.free(got);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"candidate_sessions\": 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"decision_episodes\": 0") != null);
+}
+
+test "skill_decision_audit binds receipt fingerprints and reports stale receipts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.Io.Threaded.global_single_threaded.io(), "2026/04/04");
+    const contract_text =
+        \\{"skill_decision_contract":{"contract_version":"SKDC-v1","skill":{"name":"neutral-skill","kind":"decision","source_fingerprint":"fixture"},"triggers":[{"trigger_id":"t1","cue_literals":[],"cue_regexes":[],"exclusions":[]}],"routes":[{"route_id":"r1","aliases":[]},{"route_id":"r2","aliases":[]}],"clauses":[{"clause_id":"c1","trigger_refs":["t1"],"expected_routes":["r1"],"prohibited_routes":[],"required_artifacts":[],"success_signals":[],"failure_signals":[]}],"instrumentation":{"decision_receipt":"optional"}}}
+    ;
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = "contract.json", .data = contract_text });
+    var parsed_contract = try skill_contract.parseText(std.testing.allocator, contract_text);
+    defer parsed_contract.deinit();
+    const contract_fingerprint = try skill_contract.fingerprintContract(std.testing.allocator, parsed_contract.contract);
+    defer std.testing.allocator.free(contract_fingerprint);
+
+    const session_rel = "2026/04/04/rollout-2026-04-04T10-00-00-019d0000-0000-7000-8000-000000000004.jsonl";
+    const session_content = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"type\":\"session_meta\",\"timestamp\":\"2026-04-04T10:00:00Z\",\"payload\":{{\"id\":\"019d0000-0000-7000-8000-000000000004\",\"cwd\":\"/repo\"}}}}\n" ++
+            "{{\"type\":\"response_item\",\"timestamp\":\"2026-04-04T10:00:01Z\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"skill_decision_receipt:\\n  receipt_version: SDR-v1\\n  decision_id: dec-match\\n  skill: neutral-skill\\n  skill_version: 1\\n  skill_contract_fingerprint: {s}\\n  trigger_refs: [t1]\\n  clause_refs: [c1]\\n  question: choose\\n  alternatives_considered: [r1, r2]\\n  selected_route: r1\\n  rejected_routes: [r2]\\n  expected_outcome: ok\\n  artifact_state: {{}}\\n\"}}]}}}}\n" ++
+            "{{\"type\":\"response_item\",\"timestamp\":\"2026-04-04T10:00:02Z\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"skill_decision_receipt:\\n  receipt_version: SDR-v1\\n  decision_id: dec-stale\\n  skill: neutral-skill\\n  skill_version: 1\\n  skill_contract_fingerprint: stale-fingerprint\\n  trigger_refs: [t1]\\n  clause_refs: [c1]\\n  question: choose\\n  alternatives_considered: [r1, r2]\\n  selected_route: r1\\n  rejected_routes: [r2]\\n  expected_outcome: ok\\n  artifact_state: {{}}\\n\"}}]}}}}\n" ++
+            "{{\"type\":\"response_item\",\"timestamp\":\"2026-04-04T10:00:03Z\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"skill_decision_receipt:\\n  receipt_version: SDR-v1\\n  decision_id: dec-missing\\n  skill: neutral-skill\\n  skill_version: 1\\n  trigger_refs: [t1]\\n  clause_refs: [c1]\\n  question: choose\\n  alternatives_considered: [r1, r2]\\n  selected_route: r1\\n  rejected_routes: [r2]\\n  expected_outcome: ok\\n  artifact_state: {{}}\\n\"}}]}}}}\n",
+        .{contract_fingerprint},
+    );
+    defer std.testing.allocator.free(session_content);
+    try tmp.dir.writeFile(std.Io.Threaded.global_single_threaded.io(), .{ .sub_path = session_rel, .data = session_content });
+
+    const root_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root_abs);
+    const session_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), session_rel, std.testing.allocator);
+    defer std.testing.allocator.free(session_abs);
+    const contract_abs = try tmp.dir.realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), "contract.json", std.testing.allocator);
+    defer std.testing.allocator.free(contract_abs);
+
+    const episodes_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "episodes.json" });
+    defer std.testing.allocator.free(episodes_out);
+    const episode_args = [_][]const u8{
+        "--root", root_abs, "--skill", "neutral-skill", "--path", session_abs, "--contract", contract_abs, "--mode", "episodes", "--format", "json",
+    };
+    const episodes = try runCommandWithOutput(std.testing.allocator, .skill_decision_audit, episode_args[0..], episodes_out);
+    defer std.testing.allocator.free(episodes);
+    try std.testing.expect(std.mem.indexOf(u8, episodes, "\"decision_id\": \"dec-match\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, episodes, "\"decision_id\": \"dec-stale\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, episodes, "\"contract_binding_status\": \"matched\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, episodes, "\"receipt_contract_fingerprint\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, episodes, contract_fingerprint) != null);
+
+    const misses_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "misses.json" });
+    defer std.testing.allocator.free(misses_out);
+    const miss_args = [_][]const u8{
+        "--root", root_abs, "--skill", "neutral-skill", "--path", session_abs, "--contract", contract_abs, "--mode", "misses", "--format", "json",
+    };
+    const misses = try runCommandWithOutput(std.testing.allocator, .skill_decision_audit, miss_args[0..], misses_out);
+    defer std.testing.allocator.free(misses);
+    try std.testing.expect(std.mem.indexOf(u8, misses, "\"decision_id\": \"dec-stale\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, misses, "\"decision_id\": \"dec-missing\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, misses, "skill_contract_fingerprint_mismatch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, misses, "missing_skill_contract_fingerprint") != null);
+    try std.testing.expect(std.mem.indexOf(u8, misses, "stale-fingerprint") != null);
+    try std.testing.expect(std.mem.indexOf(u8, misses, contract_fingerprint) != null);
+
+    const summary_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "summary.json" });
+    defer std.testing.allocator.free(summary_out);
+    const summary_args = [_][]const u8{
+        "--root", root_abs, "--skill", "neutral-skill", "--path", session_abs, "--contract", contract_abs, "--mode", "summary", "--format", "json",
+    };
+    const summary = try runCommandWithOutput(std.testing.allocator, .skill_decision_audit, summary_args[0..], summary_out);
+    defer std.testing.allocator.free(summary);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "\"decision_episodes\": 1") != null);
+
+    const unbound_out = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "unbound.json" });
+    defer std.testing.allocator.free(unbound_out);
+    const unbound_args = [_][]const u8{
+        "--root", root_abs, "--skill", "neutral-skill", "--path", session_abs, "--mode", "episodes", "--format", "json",
+    };
+    const unbound = try runCommandWithOutput(std.testing.allocator, .skill_decision_audit, unbound_args[0..], unbound_out);
+    defer std.testing.allocator.free(unbound);
+    try std.testing.expect(std.mem.indexOf(u8, unbound, "\"decision_id\": \"dec-match\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unbound, "\"decision_id\": \"dec-stale\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unbound, "\"decision_id\": \"dec-missing\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unbound, "\"contract_binding_status\": \"unbound\"") != null);
 }
 
 test "skill-blocks term modes fail closed on missing groups and raw history" {
