@@ -4466,6 +4466,22 @@ fn observeExecutorGroupAlloc(
     return .terminal_zombies_only;
 }
 
+fn enforceExecutorGroupQuiescence(
+    allocator: std.mem.Allocator,
+    process_group_id: std.posix.pid_t,
+) !bool {
+    return switch (try observeExecutorGroupAlloc(allocator, process_group_id)) {
+        .absent, .terminal_zombies_only => true,
+        .live_members => blk: {
+            // A shell can complete a fork after the first group-KILL snapshot.
+            // Live members never satisfy the terminal observation: reissue the
+            // group kill and require a later census to prove quiescence.
+            try killExecutorGroup(process_group_id);
+            break :blk false;
+        },
+    };
+}
+
 fn waitExecutorChildReapedAndGroupQuiescent(
     allocator: std.mem.Allocator,
     pid: std.posix.pid_t,
@@ -4489,11 +4505,10 @@ fn waitExecutorChildReapedAndGroupQuiescent(
             }
         }
         if (!group_terminal) {
-            const observation = observeExecutorGroupAlloc(allocator, pid) catch blk: {
+            group_terminal = enforceExecutorGroupQuiescence(allocator, pid) catch blk: {
                 group_wait_failed = true;
-                break :blk ExecutorGroupObservation.live_members;
+                break :blk false;
             };
-            group_terminal = observation == .absent or observation == .terminal_zombies_only;
         }
         if (child_reaped and group_terminal) return;
         if (std.Io.Clock.awake.now(defaultIo()).nanoseconds >= deadline.nanoseconds) {
@@ -4589,9 +4604,8 @@ fn killExecutorGroup(pid: std.posix.pid_t) !void {
 fn waitExecutorGroupQuiescent(allocator: std.mem.Allocator, pid: std.posix.pid_t) !void {
     const deadline = std.Io.Clock.awake.now(defaultIo()).addDuration(.fromMilliseconds(2_000));
     while (true) {
-        const observation = observeExecutorGroupAlloc(allocator, pid) catch
-            return error.ExecutorGroupWaitFailed;
-        if (observation == .absent or observation == .terminal_zombies_only) return;
+        if (enforceExecutorGroupQuiescence(allocator, pid) catch
+            return error.ExecutorGroupWaitFailed) return;
         if (std.Io.Clock.awake.now(defaultIo()).nanoseconds >= deadline.nanoseconds) {
             return error.ExecutorGroupStillAlive;
         }
@@ -9064,6 +9078,60 @@ test "zombie-only executor group is terminal after direct child reap" {
     leader_release_pipe[1] = -1;
     try waitExecutorChildReapedAndGroupQuiescent(std.testing.allocator, leader_pid);
     leader_reaped = true;
+    try std.testing.expectEqual(
+        ExecutorGroupObservation.terminal_zombies_only,
+        try observeExecutorGroupAlloc(std.testing.allocator, leader_pid),
+    );
+
+    // Model the fork race from a shell executor: the initial KILL observes a
+    // zombie-only group, then a same-session child joins that retained group.
+    // The wait loop must re-KILL the late live member rather than merely watch
+    // it until the deadline.
+    try killExecutorGroup(leader_pid);
+    var late_ready_pipe: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&late_ready_pipe) != 0) return error.TestFdSetupFailed;
+    const late_pid = std.c.fork();
+    if (late_pid < 0) {
+        closeRawFd(late_ready_pipe[0]);
+        closeRawFd(late_ready_pipe[1]);
+        return error.TestForkFailed;
+    }
+    if (late_pid == 0) {
+        _ = std.c.close(late_ready_pipe[0]);
+        if (std.c.setpgid(0, leader_pid) != 0) std.c._exit(95);
+        if (std.c.write(late_ready_pipe[1], &ready, ready.len) != ready.len) std.c._exit(96);
+        _ = std.c.close(late_ready_pipe[1]);
+        const sleep_time = std.c.timespec{ .sec = 5, .nsec = 0 };
+        _ = std.c.nanosleep(&sleep_time, null);
+        std.c._exit(0);
+    }
+    closeRawFd(late_ready_pipe[1]);
+    var late_reaped = false;
+    defer if (!late_reaped) {
+        _ = std.posix.system.kill(late_pid, .KILL);
+        var status: c_int = undefined;
+        _ = std.posix.system.waitpid(late_pid, &status, 0);
+    };
+    if (std.c.read(late_ready_pipe[0], &ready, ready.len) != ready.len) {
+        closeRawFd(late_ready_pipe[0]);
+        return error.TestFdSetupFailed;
+    }
+    closeRawFd(late_ready_pipe[0]);
+    try std.testing.expectEqual(
+        ExecutorGroupObservation.live_members,
+        try observeExecutorGroupAlloc(std.testing.allocator, leader_pid),
+    );
+    try waitExecutorGroupQuiescent(std.testing.allocator, leader_pid);
+    var late_status: c_int = undefined;
+    while (true) switch (std.posix.errno(std.posix.system.waitpid(late_pid, &late_status, 0))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        else => return error.TestLateMemberReapFailed,
+    };
+    late_reaped = true;
+    const encoded_late_status: u32 = @bitCast(late_status);
+    try std.testing.expect(std.posix.W.IFSIGNALED(encoded_late_status));
+    try std.testing.expectEqual(std.posix.SIG.KILL, std.posix.W.TERMSIG(encoded_late_status));
     try std.testing.expectEqual(
         ExecutorGroupObservation.terminal_zombies_only,
         try observeExecutorGroupAlloc(std.testing.allocator, leader_pid),
