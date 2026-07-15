@@ -90,7 +90,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 - By default, permissions requests are denied, request-user-input questions are answered with the first option label when present, MCP elicitations are declined, and dynamic tool calls return `success: false` with an explanatory text item.
 - `cas_review_session` now starts detached `review/start` turns over a CAS-managed loopback websocket app-server, persists the detached `reviewThreadId` as the recoverable handle, appends raw request/response artifacts to an NDJSON log, and stores websocket session metadata beside the review-session record so fresh-process `status`, `wait`, and `interrupt` can reconnect to the same detached review transport.
 - `cas review_session run` is the brokered one-review path. It waits by default, returns `reviewVerdict`, reports `reviewBrokerDecision`, normalizes terminal same-tuple evidence, and auto-replaces an active same-tuple attempt only when prior transport loss plus dead owner/server liveness is proven.
-- Review wait defaults are action-aware: `run`, `start --wait`, `wait`, and `lane review` use `1800000` ms; lane smoke/suites and control paths use `300000` ms. An explicit positive `--timeout-ms` value always wins.
+- Review wait defaults are action-aware: `run`, `start --wait`, `wait`, and `lane review` use `2700000` ms; lane smoke/suites and control paths use `300000` ms. An explicit positive `--timeout-ms` value always wins.
 - `cas review_session run`, `start`, and `lane review` accept an optional atomic `--workflow-binding-json JSON|@FILE`. For new runs the binding contains only caller-owned `requestId` and `requestFingerprint` strings. CAS validates both as non-empty, binds the object to review-lock and CAS-RER identity, and returns it unchanged.
 - `--custom-instructions` may accompany `--base`, `--commit`, or `--uncommitted`. CAS sends the exact supplied prompt as the native custom review target while retaining the selector for base/head/fingerprint identity and recovery.
 - `cas review_session current` and `list` return the complete valid history for the exact native repo/base/head/target-fingerprint and Codex-thread scope when no workflow binding is supplied. Passing `--workflow-binding-json` selects one exact binding. Account identity and resolved Codex path/version do not hide historical records.
@@ -167,7 +167,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 ./zig-out/bin/cas review_session run \
   --cwd /path/to/workspace \
   --uncommitted \
-  --timeout-ms 1800000 \
+  --timeout-ms 2700000 \
   --json
 
 # Bind a review atomically to an opaque caller-owned request identity.
@@ -176,7 +176,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
   --base main \
   --custom-instructions @review-prompt.txt \
   --workflow-binding-json @workflow-binding.json \
-  --timeout-ms 1800000 \
+  --timeout-ms 2700000 \
   --json
 
 # Read all same-tuple/thread history, or filter to the exact binding.
@@ -217,7 +217,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 # Fresh process reattaches to the same managed websocket transport.
 ./zig-out/bin/cas review_session wait \
   --review-thread-id thr_123 \
-  --timeout-ms 1800000 \
+  --timeout-ms 2700000 \
   --json
 
 # Inspect the newest persisted review session and tuple binding.
@@ -256,7 +256,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
 ./zig-out/bin/cas review_session lane review \
   --lane-id lane_123 \
   --base main \
-  --timeout-ms 1800000 \
+  --timeout-ms 2700000 \
   --fallback none \
   --verdict-only
 
@@ -265,7 +265,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
   --lane-id lane_123 \
   --base main \
   --fresh-attempt "clean-run 2" \
-  --timeout-ms 1800000 \
+  --timeout-ms 2700000 \
   --fallback none \
   --json
 # Exploratory proactive review discovery on a fresh parent.
@@ -273,7 +273,7 @@ Zig CLI utilities for Codex app-server validation, request fanout, and swarm con
   --lane-id lane_123 \
   --base main \
   --multi-agent-mode proactive \
-  --timeout-ms 1800000 \
+  --timeout-ms 2700000 \
   --fallback none \
   --json
 
