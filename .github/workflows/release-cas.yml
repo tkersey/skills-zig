@@ -67,6 +67,8 @@ jobs:
           cp zig-out/bin/cas_goal dist/cas/cas-goal
           cp zig-out/bin/cas-perf-budget-governor dist/cas/cas-perf-budget-governor
           tar -czf "${TAR_NAME}" -C dist/cas .
+      - name: Verify platform-specific cas archive contents
+        run: .github/scripts/verify_cas_archive.sh "${{ matrix.target }}" "${TAR_NAME}"
       - name: Upload cas workflow artifact
         uses: actions/upload-artifact@v4
         with:

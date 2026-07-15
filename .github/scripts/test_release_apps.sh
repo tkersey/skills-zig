@@ -50,6 +50,23 @@ assert_case() {
   assert_observed "$path" "$expected"
 }
 
+assert_version_case() {
+  local path="$1"
+  local expected="$2"
+  local observed
+  git -C "$tmp" reset --hard --quiet "$base"
+  git -C "$tmp" clean -fdq
+  mkdir -p "$(dirname "$tmp/$path")"
+  printf '0.1.1\n' > "$tmp/$path"
+  git -C "$tmp" add "$path"
+  git -C "$tmp" commit --quiet -m "bump $path"
+  observed="$(cd "$tmp" && .github/scripts/release_apps.sh version-changed "$base" HEAD | paste -sd, -)"
+  if [[ "$observed" != "$expected" ]]; then
+    echo "version classifier mismatch for $path: expected $expected; observed $observed" >&2
+    exit 1
+  fi
+}
+
 assert_hctp_build_diff() {
   git -C "$tmp" reset --hard --quiet "$base"
   git -C "$tmp" clean -fdq
@@ -123,7 +140,7 @@ assert_ambiguous_build_diff() {
   printf '%s\n' 'const shared_release_behavior = changed_without_owner_context;' >> "$tmp/build.zig"
   git -C "$tmp" add build.zig
   git -C "$tmp" commit --quiet -m "ambiguous shared build change"
-  assert_observed "ambiguous shared build diff" "seq,lift,cas,cron,ledger,memory-note"
+  assert_observed "ambiguous shared build diff" "seq,lift,cas,cron,ledger,memory-note,img"
 }
 
 assert_partial_filter_plumbing_fails_closed() {
@@ -141,7 +158,7 @@ assert_partial_filter_plumbing_fails_closed() {
     '}' > "$tmp/build.zig"
   git -C "$tmp" add build.zig
   git -C "$tmp" commit --quiet -m "incomplete shared filter plumbing"
-  assert_observed "partial filtered-test plumbing" "seq,lift,cas,cron,ledger,memory-note"
+  assert_observed "partial filtered-test plumbing" "seq,lift,cas,cron,ledger,memory-note,img"
 }
 
 assert_case "libs/durable_store/src/lib.zig" "seq,cas,ledger,memory-note"
@@ -150,9 +167,12 @@ assert_case "libs/retrace_core/src/lib.zig" "seq,cas,ledger"
 assert_case "testdata/hctp-v1/valid-trial.json" "seq,cas,ledger"
 assert_case "apps/cas/scripts/cas_trial.zig" "cas"
 assert_case "apps/lift/src/main.zig" "lift"
+assert_case "apps/img/src/main.zig" "img"
+assert_case ".github/workflows/release-img.yml" "img"
+assert_version_case "apps/img/VERSION" "img"
 assert_hctp_build_diff
 assert_cas_trial_macos_runtime_build_hunk
 assert_ambiguous_build_diff
 assert_partial_filter_plumbing_fails_closed
 
-echo "release app classifier: 10/10 cases passed"
+echo "release app classifier: 13/13 cases passed"
