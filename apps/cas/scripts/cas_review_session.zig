@@ -15,7 +15,7 @@ const HelpSurface = core_cli.HelpSurface{
 };
 
 const default_control_timeout_ms: u32 = 300_000;
-const default_review_timeout_ms: u32 = 1_800_000;
+const default_review_timeout_ms: u32 = 2_700_000;
 
 const UsageText =
     \\cas_review_session
@@ -117,7 +117,7 @@ const UsageText =
     \\  --summary                        Include aggregate receipt counts.
     \\  --codex-thread-id ID             Codex session/thread id for review reuse scoping.
     \\  --store-root DIR                 Explicit CAS artifact root; default is repo .ledger/cas.
-    \\  --timeout-ms N                   Wait timeout. Real review waits default to 1800000;
+    \\  --timeout-ms N                   Wait timeout. Real review waits default to 2700000;
     \\                                   smoke/control waits default to 300000.
     \\  --poll-interval-ms N             Poll interval for `wait` (default: 250).
     \\  --help                           Show help.
@@ -125,7 +125,7 @@ const UsageText =
     \\  version                          Show version.
     \\
     \\Examples:
-    \\  cas review_session run --cwd /path/to/repo --base main --custom-instructions @review.txt --workflow-binding-json @binding.json --timeout-ms 1800000 --json
+    \\  cas review_session run --cwd /path/to/repo --base main --custom-instructions @review.txt --workflow-binding-json @binding.json --timeout-ms 2700000 --json
     \\  cas review_session current --cwd /path/to/repo --base main --json
     \\  cas review_session list --cwd /path/to/repo --base main --json
     \\  cas review_session import --path review-1.json --cwd /path/to/repo --base main --json
@@ -133,17 +133,17 @@ const UsageText =
     \\  cas review_session validate-record --record rer_123.json --json
     \\  cas review_session start --cwd /path/to/repo --uncommitted --json
     \\  cas review_session start --cwd /path/to/repo --base main --json
-    \\  cas review_session start --wait --cwd /path/to/repo --base main --timeout-ms 1800000 --json
+    \\  cas review_session start --wait --cwd /path/to/repo --base main --timeout-ms 2700000 --json
     \\  cas review_session status --cwd /path/to/repo --review-thread-id thr_123 --json
     \\  cas review_session status --path /path/to/repo/.ledger/cas/review_sessions/thr_123.json --json
     \\  cas review_session status --cwd /path/to/repo --latest --json
-    \\  cas review_session wait --cwd /path/to/repo --review-thread-id thr_123 --timeout-ms 1800000 --json
+    \\  cas review_session wait --cwd /path/to/repo --review-thread-id thr_123 --timeout-ms 2700000 --json
     \\  cas review_session interrupt --cwd /path/to/repo --review-thread-id thr_123 --json
     \\  cas review_session lane start --cwd /path/to/repo --json
     \\  cas review_session lane smoke --cwd /path/to/repo --base main --json
     \\  cas review_session lane smoke-suite --cwd /path/to/repo --base main --json --cleanup
     \\  cas review_session lane smoke-until-fixed --cwd /path/to/repo --base main --json --cleanup
-    \\  cas review_session lane review --lane-id lane_123 --base main --timeout-ms 1800000 --json
+    \\  cas review_session lane review --lane-id lane_123 --base main --timeout-ms 2700000 --json
     \\  cas review_session receipt normalize --path review-1.json --format json --summary
     \\  cas review_session receipt classify --path receipts.jsonl --format jsonl
     \\  cas review_session receipt gate --path review-1.json --format json
@@ -12856,6 +12856,27 @@ fn testWorkflowBinding() WorkflowBinding {
         .requestId = "request-test",
         .requestFingerprint = "sha256:request",
     };
+}
+
+test "default timeout policy gives real reviews 45 minutes and controls five minutes" {
+    const review_actions = [_]ParsedArgs{
+        .{ .action = .run },
+        .{ .action = .wait },
+        .{ .action = .start, .wait_after_start = true },
+        .{ .action = .lane, .lane_action = .review },
+    };
+    for (review_actions) |parsed| {
+        try std.testing.expectEqual(@as(u32, 2_700_000), defaultTimeoutMsForAction(parsed));
+    }
+
+    const control_actions = [_]ParsedArgs{
+        .{ .action = .start },
+        .{ .action = .status },
+        .{ .action = .lane, .lane_action = .smoke },
+    };
+    for (control_actions) |parsed| {
+        try std.testing.expectEqual(@as(u32, 300_000), defaultTimeoutMsForAction(parsed));
+    }
 }
 
 test "parseArgs accepts detached start target" {
