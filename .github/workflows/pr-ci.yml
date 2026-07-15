@@ -14,6 +14,7 @@ on:
       - "apps/synesthesia/**"
       - "apps/ledger/**"
       - "apps/memory-note/**"
+      - "apps/img/**"
       - "libs/core/**"
       - "libs/durable_store/**"
       - ".github/scripts/**"
@@ -36,6 +37,7 @@ jobs:
       cron: ${{ steps.filter.outputs.cron }}
       ledger: ${{ steps.filter.outputs.ledger }}
       memory_note: ${{ steps.filter.outputs.memory_note }}
+      img: ${{ steps.filter.outputs.img }}
       core: ${{ steps.filter.outputs.core }}
     steps:
       - uses: actions/checkout@v4
@@ -57,6 +59,8 @@ jobs:
               - "apps/synesthesia/**"
             memory_note:
               - "apps/memory-note/**"
+            img:
+              - "apps/img/**"
             core:
               - "build.zig"
               - "build.zig.zon"
@@ -265,3 +269,17 @@ jobs:
         run: zig build build-memory-note -Doptimize=ReleaseFast
       - name: Test memory-note
         run: zig build test-memory-note
+
+  img:
+    needs: changes
+    if: needs.changes.outputs.img == 'true' || needs.changes.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build img
+        run: zig build build-img -Doptimize=ReleaseFast --summary all
+      - name: Test img
+        run: zig build test-img --summary all
