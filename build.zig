@@ -588,6 +588,11 @@ pub fn build(b: *std.Build) void {
     const hctp_sealed_grade_materializer_fixture = addExecutable(b, "hctp-sealed-grade-materializer-fixture", hctp_sealed_grade_materializer_fixture_root);
     hctp_sealed_grade_materializer_fixture.root_module.linkSystemLibrary("c", .{});
     const hctp_integration_paths = b.addOptions();
+    hctp_integration_paths.addOption(
+        []const u8,
+        "cas_version",
+        std.mem.trim(u8, @embedFile("apps/cas/VERSION"), " \t\r\n"),
+    );
     hctp_integration_paths.addOptionPath("seq_path", seq.getEmittedBin());
     hctp_integration_paths.addOptionPath("cas_trial_path", cas_trial.getEmittedBin());
     hctp_integration_paths.addOptionPath("fixture_executor_path", hctp_cas_fixture_executor.getEmittedBin());
