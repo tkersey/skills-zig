@@ -18,6 +18,19 @@ This directory is no longer an independently shipped CLI surface.
   `$CODEX_HOME/memories/extensions/learnings/resources/latest_learnings_digest.md`
   (falling back to `$HOME/.codex/...` when `CODEX_HOME` is unset).
 
+## Authoritative projection surface
+
+```bash
+ledger export --source learnings --id lrn-... --format full
+ledger export --source learnings --id lrn-... --format memory-note
+```
+
+The full form emits the canonical learning record. The `memory-note` form emits
+a deterministic transport payload for `memory-note append --extension
+learnings --kind learning-admission`; it does not decide admission eligibility.
+Both forms fail closed when the canonical store is invalid or the selected row
+cannot produce the requested projection.
+
 Current persistent-adapter path:
 
 ```bash
