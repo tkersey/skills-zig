@@ -48,6 +48,9 @@ jobs:
           version: 0.16.0
       - name: Build cas binaries
         run: zig build build-cas -Doptimize=ReleaseFast
+      - name: Verify Linux dispatcher can launch its sibling executable
+        if: matrix.target == 'linux-x86_64'
+        run: zig build test-cas-dispatch-runtime-linux -Doptimize=ReleaseFast --summary all
       - name: Package cas artifact
         run: |
           TAR_NAME="${RELEASE_TAG}-${{ matrix.target }}.tar.gz"

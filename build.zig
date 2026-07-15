@@ -820,6 +820,18 @@ pub fn build(b: *std.Build) void {
         "Run cas dispatcher tests",
         .{ .link_libc = true },
     );
+    const run_cas_dispatch_runtime_linux: ?*std.Build.Step = if (b.graph.host.result.os.tag == .linux and target.result.os.tag == .linux) cas_dispatch_runtime_linux: {
+        const cas_dispatch_run = b.addSystemCommand(&.{ b.getInstallPath(.bin, "cas"), "review_session", "--help" });
+        cas_dispatch_run.step.dependOn(&cas_install.step);
+        cas_dispatch_run.step.dependOn(&cas_review_session_install.step);
+        cas_dispatch_run.expectStdOutMatch("cas_review_session");
+
+        const cas_dispatch_step = b.step("test-cas-dispatch-runtime-linux", "Verify the Linux cas dispatcher launches its sibling executable");
+        cas_dispatch_step.dependOn(&cas_dispatch_run.step);
+        break :cas_dispatch_runtime_linux cas_dispatch_step;
+    } else cas_dispatch_runtime_linux_unavailable: {
+        break :cas_dispatch_runtime_linux_unavailable null;
+    }; // cas_dispatch_runtime_linux is intentionally absent off native Linux.
     const test_cas = b.step("test-cas", "Run all cas tests");
     test_cas.dependOn(&run_cas_budget_governor_tests.step);
     test_cas.dependOn(&run_cas_smoke_tests.step);
@@ -832,6 +844,7 @@ pub fn build(b: *std.Build) void {
     test_cas.dependOn(&run_cas_account_tests.step);
     test_cas.dependOn(&run_cas_proxy_client_tests.step);
     test_cas.dependOn(&run_cas_cli_tests.step);
+    if (run_cas_dispatch_runtime_linux) |run| test_cas.dependOn(run);
 
     const run_cron_tests = addTestStepWithOptions(
         b,

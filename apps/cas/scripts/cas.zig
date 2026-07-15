@@ -210,7 +210,7 @@ pub fn main(init: std.process.Init) !void {
     try child_argv.append(allocator, target_exec);
     try child_argv.appendSlice(allocator, argv[2..]);
 
-    const exit_code = runCommand(allocator, child_argv.items) catch |err| {
+    const exit_code = runCommand(allocator, init.io, child_argv.items) catch |err| {
         var stderr_writer = std.Io.File.stderr().writer(std.Io.Threaded.global_single_threaded.io(), &.{});
         const stderr = &stderr_writer.interface;
         try stderr.print(
@@ -222,10 +222,9 @@ pub fn main(init: std.process.Init) !void {
     std.process.exit(exit_code);
 }
 
-fn runCommand(allocator: std.mem.Allocator, args: []const []const u8) !u8 {
+fn runCommand(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !u8 {
     if (builtin.os.tag == .macos) return runCommandPosixSpawn(allocator, args);
 
-    const io = std.Io.Threaded.global_single_threaded.io();
     var child = try std.process.spawn(io, .{
         .argv = args,
         .stdin = .inherit,
