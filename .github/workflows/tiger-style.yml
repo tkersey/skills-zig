@@ -1,0 +1,49 @@
+name: TigerStyle
+
+on:
+  pull_request:
+    paths:
+      - "**/*.zig"
+      - "CONTRIBUTING.md"
+      - "docs/engineering/TIGER_STYLE.md"
+      - ".github/pull_request_template.md"
+      - ".github/workflows/tiger-style.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  tiger-style:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Test the TigerStyle auditor
+        run: zig test tools/tiger_style/main.zig
+      - name: Check formatting of changed Zig files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          mapfile -d '' changed_files < <(
+            git diff --name-only -z --diff-filter=ACMR \
+              "$BASE_SHA" "$HEAD_SHA" -- '*.zig'
+          )
+          if (( ${#changed_files[@]} > 0 )); then
+            zig fmt --check "${changed_files[@]}"
+          fi
+      - name: Audit changed Zig code
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          zig run tools/tiger_style/main.zig -- audit-diff \
+            --base "$BASE_SHA" \
+            --head "$HEAD_SHA"
