@@ -35,6 +35,22 @@ pub const ValidationReport = struct {
     }
 };
 
+pub const SourceEpisodeResolutionState = enum {
+    explicit_exact,
+    derived_session_turn,
+    mismatch,
+    unavailable,
+};
+
+pub const SourceEpisodeResolution = struct {
+    state: SourceEpisodeResolutionState,
+    source_episode_id: ?[]u8 = null,
+
+    pub fn deinit(self: *SourceEpisodeResolution, allocator: std.mem.Allocator) void {
+        if (self.source_episode_id) |value| allocator.free(value);
+    }
+};
+
 pub fn validateText(allocator: std.mem.Allocator, text: []const u8) !ValidationReport {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
     defer parsed.deinit();
@@ -181,6 +197,64 @@ pub fn validateValue(allocator: std.mem.Allocator, value: std.json.Value) !Valid
     return finishReport(allocator, &errors, &warnings, &available, packet_id);
 }
 
+pub fn sourceEpisodeIdAlloc(
+    allocator: std.mem.Allocator,
+    session_id: []const u8,
+    turn_id: []const u8,
+) ![]u8 {
+    if (session_id.len == 0 or turn_id.len == 0) return error.SourceEpisodeIdentityMissing;
+    return std.fmt.allocPrint(allocator, "session:{s}#turn:{s}", .{ session_id, turn_id });
+}
+
+/// Resolves the HCTP source-episode projection without mutating the DCP value.
+/// Callers must validate the original packet (including its packet_id) before
+/// consuming this projection so released DCP-v2 bytes remain byte-faithful. A
+/// nonempty explicit identity is authoritative; display locators are used only
+/// as a compatibility fallback when that carrier is absent.
+pub fn resolveSourceEpisodeIdentity(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !SourceEpisodeResolution {
+    const packet = bodyObject(value) orelse return .{ .state = .unavailable };
+    const source = objectField(packet, "source") orelse return .{ .state = .unavailable };
+    const turns = objectField(packet, "turns");
+
+    const explicit_value = source.get("source_episode_id");
+    const explicit = if (explicit_value) |candidate| switch (candidate) {
+        .string => |text| if (text.len > 0) text else null,
+        else => null,
+    } else null;
+    const explicit_malformed = explicit_value != null and explicit == null;
+
+    if (explicit_malformed) {
+        return .{ .state = .mismatch };
+    }
+    if (explicit) |explicit_id| {
+        return .{
+            .state = .explicit_exact,
+            .source_episode_id = try allocator.dupe(u8, explicit_id),
+        };
+    }
+
+    var derived: ?[]u8 = null;
+    if (turns) |turns_obj| {
+        if (stringField(source, "session_id")) |session_id| {
+            if (stringField(turns_obj, "decision_turn_id")) |turn_id| {
+                if (session_id.len > 0 and turn_id.len > 0) {
+                    derived = try sourceEpisodeIdAlloc(allocator, session_id, turn_id);
+                }
+            }
+        }
+    }
+    if (derived) |derived_id| {
+        return .{
+            .state = .derived_session_turn,
+            .source_episode_id = derived_id,
+        };
+    }
+    return .{ .state = .unavailable };
+}
+
 pub fn packetIdForCanonicalBody(allocator: std.mem.Allocator, body_without_packet_id: []const u8) ![]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(body_without_packet_id, &digest, .{});
@@ -213,6 +287,9 @@ pub fn canonicalJsonAlloc(allocator: std.mem.Allocator, value: std.json.Value, o
     return out.toOwnedSlice();
 }
 
+// DCP-v2 packet identity is a released wire contract. Keep this writer private
+// and byte-for-byte equivalent to the original DCP-v2 implementation rather
+// than inheriting later canonical JSON profiles.
 fn writeCanonicalJson(allocator: std.mem.Allocator, writer: anytype, value: std.json.Value, omit_packet_id: bool) !void {
     switch (value) {
         .object => |obj| {
@@ -389,7 +466,7 @@ test "DCP validation catches bad anchor arithmetic" {
     const text =
         \\{"decision_context_packet":{
         \\"packet_version":"DCP-v2","packet_id":"DCP-test",
-        \\"source":{"session_id":"s","decision_id":"d"},
+        \\"source":{"session_id":"s","decision_id":"d","source_episode_id":"session:s#turn:t2"},
         \\"artifact_state":{"reconstructability":"transcript_only"},
         \\"episode":{"question":"q","selected_route":"r","rejected_routes":[],"explicit_rationale":[],"explicit_assumptions":[],"evidence_refs":[],"tools_and_artifacts":[],"skills_and_instructions":[],"outcome_refs":[]},
         \\"turns":{"total_turns":3,"decision_turn_index":2,"decision_turn_id":"t2","source_turn_digest":"sha256:x"},
@@ -407,7 +484,7 @@ test "DCP validation rejects stale packet id after content edit" {
     const text =
         \\{"decision_context_packet":{
         \\"packet_version":"DCP-v2","packet_id":"DCP-stale",
-        \\"source":{"session_id":"s","decision_id":"d"},
+        \\"source":{"session_id":"s","decision_id":"d","source_episode_id":"session:s#turn:t1"},
         \\"artifact_state":{"reconstructability":"transcript_only"},
         \\"episode":{"question":"q","selected_route":"r","rejected_routes":[],"explicit_rationale":[],"explicit_assumptions":[],"evidence_refs":[],"tools_and_artifacts":[],"skills_and_instructions":[],"outcome_refs":[]},
         \\"turns":{"total_turns":1,"decision_turn_index":1,"decision_turn_id":"t1","source_turn_digest":"sha256:x"},
@@ -419,6 +496,111 @@ test "DCP validation rejects stale packet id after content edit" {
     defer report.deinit(std.testing.allocator);
     try std.testing.expect(!report.valid);
     try std.testing.expect(containsCode(report.errors, "packet_id:mismatch"));
+}
+
+test "DCP source episode identity is canonical across session and turn" {
+    const source_episode_id = try sourceEpisodeIdAlloc(std.testing.allocator, "session-one", "turn-two");
+    defer std.testing.allocator.free(source_episode_id);
+    try std.testing.expectEqualStrings("session:session-one#turn:turn-two", source_episode_id);
+}
+
+test "DCP source episode projection distinguishes explicit derived mismatch and unavailable" {
+    const Case = struct {
+        text: []const u8,
+        state: SourceEpisodeResolutionState,
+        source_episode_id: ?[]const u8,
+    };
+    const cases = [_]Case{
+        .{
+            .text = "{\"decision_context_packet\":{\"source\":{\"session_id\":\"one\",\"source_episode_id\":\"session:one#turn:two\"},\"turns\":{\"decision_turn_id\":\"two\"}}}",
+            .state = .explicit_exact,
+            .source_episode_id = "session:one#turn:two",
+        },
+        .{
+            .text = "{\"source\":{\"session_id\":\"one\"},\"turns\":{\"decision_turn_id\":\"two\"}}",
+            .state = .derived_session_turn,
+            .source_episode_id = "session:one#turn:two",
+        },
+        .{
+            .text = "{\"decision_context_packet\":{\"source\":{\"session_id\":\"one\",\"source_episode_id\":\"session:other#turn:two\"},\"turns\":{\"decision_turn_id\":\"two\"}}}",
+            .state = .explicit_exact,
+            .source_episode_id = "session:other#turn:two",
+        },
+        .{
+            .text = "{\"decision_context_packet\":{\"source\":{\"session_id\":\"one\",\"source_episode_id\":\"\"},\"turns\":{\"decision_turn_id\":\"two\"}}}",
+            .state = .mismatch,
+            .source_episode_id = null,
+        },
+        .{
+            .text = "{\"source\":{\"rollout_path\":\"/tmp/source.jsonl\"},\"turns\":{}}",
+            .state = .unavailable,
+            .source_episode_id = null,
+        },
+    };
+
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.text, .{});
+        defer parsed.deinit();
+        var resolution = try resolveSourceEpisodeIdentity(std.testing.allocator, parsed.value);
+        defer resolution.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.state, resolution.state);
+        if (case.source_episode_id) |expected| {
+            try std.testing.expectEqualStrings(expected, resolution.source_episode_id.?);
+        } else {
+            try std.testing.expect(resolution.source_episode_id == null);
+        }
+    }
+}
+
+test "released DCP-v2 bytes validate before deriving source episode identity" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const raw = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        "apps/seq/testdata/decision-capsule/valid-v2-released-no-source-episode-id.json",
+        std.testing.allocator,
+        .limited(1024 * 1024),
+    ) catch try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        "testdata/decision-capsule/valid-v2-released-no-source-episode-id.json",
+        std.testing.allocator,
+        .limited(1024 * 1024),
+    );
+    defer std.testing.allocator.free(raw);
+
+    var report = try validateText(std.testing.allocator, raw);
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqualStrings(
+        "DCP-f5a178fe5f03f749ec12664af6bd33f8f10cb9e1f5c45fc4978945612d5bd06a",
+        report.packet_id.?,
+    );
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, raw, .{});
+    defer parsed.deinit();
+    var resolution = try resolveSourceEpisodeIdentity(std.testing.allocator, parsed.value);
+    defer resolution.deinit(std.testing.allocator);
+    try std.testing.expectEqual(SourceEpisodeResolutionState.derived_session_turn, resolution.state);
+    try std.testing.expectEqualStrings("session:dcp-basic#turn:turn-decision", resolution.source_episode_id.?);
+}
+
+test "DCP-v2 legacy writer locks float and string escape compatibility" {
+    const text =
+        \\{"packet_id":"root","float":1e23,"fraction":333333333.33333325,"negative_zero":-0.0,"escape":"\b\t\n\f\r\u0000\"\\/","nested":{"packet_id":"nested","value":1e-7}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
+    defer parsed.deinit();
+
+    const canonical = try canonicalJsonAlloc(std.testing.allocator, parsed.value, false);
+    defer std.testing.allocator.free(canonical);
+    try std.testing.expectEqualStrings(
+        \\{"escape":"\b\t\n\f\r\u0000\"\\/","float":100000000000000000000000,"fraction":333333333.33333325,"negative_zero":-0,"nested":{"packet_id":"nested","value":0.0000001},"packet_id":"root"}
+    , canonical);
+
+    const identity_body = try canonicalJsonAlloc(std.testing.allocator, parsed.value, true);
+    defer std.testing.allocator.free(identity_body);
+    try std.testing.expectEqualStrings(
+        \\{"escape":"\b\t\n\f\r\u0000\"\\/","float":100000000000000000000000,"fraction":333333333.33333325,"negative_zero":-0,"nested":{"value":0.0000001}}
+    , identity_body);
 }
 
 fn containsCode(codes: []const []u8, needle: []const u8) bool {

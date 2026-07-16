@@ -101,7 +101,7 @@ Per-app VERSION files are the source of truth:
 - `apps/img/VERSION`
 
 PRs that touch release-relevant CLI surfaces must bump the corresponding `VERSION` file.
-The check is conservative: app-local changes count for that app, `apps/learnings/**` and `apps/synesthesia/**` count for `ledger`, broad shared shipped surfaces such as `build.zig`, `build.zig.zon`, and `libs/core/**` count for every shipped CLI, and `libs/durable_store/**` counts for its shipped consumers.
+The check is conservative: app-local changes count for that app; `apps/learnings/**` and `apps/synesthesia/**` count for `ledger`; `build.zig` changes are classified by their affected app or shared-library context and fail closed to every shipped CLI when ownership is ambiguous; broad shared shipped surfaces such as `build.zig.zon` and `libs/core/**` count for every shipped CLI; `libs/durable_store/**` counts for `seq`, `cas`, `ledger`, and `memory-note`; `libs/execution_policy_core/**` counts for `seq`; and the shared HCTP surfaces `libs/retrace_core/**` and `testdata/hctp-v1/**` count for `seq`, `cas`, and `ledger`.
 Do not close release-relevant CLI work with a local `./zig-out/bin` binary alone.
 Release closure means the changed CLI has a tagged GitHub release, the tap formula has been updated, Homebrew audit/test have passed, and the installed Homebrew binary reports the expected version.
 
@@ -134,6 +134,12 @@ Artifacts are published as:
 - `<tag>-darwin-arm64.tar.gz`
 
 Each release workflow verifies that both archives are present.
+
+The HCTP/CRF product surface is supported only on macOS. `cas_trial` is
+packaged only in the Darwin CAS archive, and non-Darwin Seq, CAS, and Ledger
+binaries do not advertise or route HCTP/CRF product commands. Pure
+`ledger validate hylo-*` schema checks remain available without granting
+runtime or execution authority.
 
 ## Homebrew
 

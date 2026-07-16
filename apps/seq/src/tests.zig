@@ -36,6 +36,9 @@ comptime {
     _ = retrace_core.decision_anchor;
     _ = @import("historical_decisions.zig");
     _ = @import("decision_capsule.zig");
+    if (lib.HctpProductAvailable) {
+        _ = @import("hylo_extract/mod.zig");
+    }
     _ = @import("actuation_audit.zig");
     _ = @import("actuation/refactor_kernel.zig");
     _ = @import("cas_review_audit.zig");

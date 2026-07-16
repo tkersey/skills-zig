@@ -84,10 +84,12 @@ pub fn buildCapsuleJson(
     defer anchors.deinit(allocator);
     const source_digest = try decision_anchor.sourceTurnDigest(allocator, trace);
     defer allocator.free(source_digest);
+    const source_episode_id = try dcp_schema.sourceEpisodeIdAlloc(allocator, selected.session_id, selected.turn_id);
+    defer allocator.free(source_episode_id);
 
     var body_without_id = std.Io.Writer.Allocating.init(allocator);
     defer body_without_id.deinit();
-    try writePacketBody(&body_without_id.writer, trace, rollout_path, selected, anchors, source_digest, outcome, null, opts);
+    try writePacketBody(&body_without_id.writer, trace, rollout_path, selected, anchors, source_digest, source_episode_id, outcome, null, opts);
     const canonical_body = try body_without_id.toOwnedSlice();
     defer allocator.free(canonical_body);
     const packet_id = try dcp_schema.packetIdForTextExcludingPacketId(allocator, canonical_body);
@@ -95,7 +97,7 @@ pub fn buildCapsuleJson(
 
     var full = std.Io.Writer.Allocating.init(allocator);
     defer full.deinit();
-    try writePacketBody(&full.writer, trace, rollout_path, selected, anchors, source_digest, outcome, packet_id, opts);
+    try writePacketBody(&full.writer, trace, rollout_path, selected, anchors, source_digest, source_episode_id, outcome, packet_id, opts);
     const json = try full.toOwnedSlice();
     errdefer allocator.free(json);
 
@@ -165,6 +167,7 @@ fn writePacketBody(
     candidate: historical_decisions.Candidate,
     anchors: decision_anchor.Anchors,
     source_digest: []const u8,
+    source_episode_id: []const u8,
     outcome: OutcomeBoundary,
     packet_id: ?[]const u8,
     opts: BuildOptions,
@@ -215,7 +218,8 @@ fn writePacketBody(
     try writeJsonField(writer, "decision_id", candidate.decision_id, true, 6);
     try writeJsonFieldOpt(writer, "root_session_id", trace.session.session_id, true, 6);
     try writeJsonField(writer, "rollout_path", rollout_path, true, 6);
-    try writeJsonFieldOpt(writer, "session_id", trace.session.session_id, true, 6);
+    try writeJsonField(writer, "session_id", candidate.session_id, true, 6);
+    try writeJsonField(writer, "source_episode_id", source_episode_id, true, 6);
     try writeJsonFieldOpt(writer, "source_codex_version", trace.session.cli_version, true, 6);
     try writeJsonFieldOpt(writer, "source_model", trace.session.model, true, 6);
     try writeJsonFieldOpt(writer, "source_model_provider", trace.session.model_provider, true, 6);
@@ -423,6 +427,7 @@ test "capsule output validates against native schema" {
     var report = try dcp_schema.validateText(std.testing.allocator, result.json);
     defer report.deinit(std.testing.allocator);
     try std.testing.expect(report.valid);
+    try std.testing.expect(std.mem.indexOf(u8, result.json, "\"source_episode_id\": \"session:demo#turn:t1\"") != null);
 }
 
 test "capsule emits explicit source thread id override" {

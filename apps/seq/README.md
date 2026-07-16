@@ -23,6 +23,50 @@ Binary output:
 
 ## Usage
 
+### Counterfactual replay episode extraction
+
+The HCTP/CRF product commands `hylo-extract` and `hctp-source` are supported on
+macOS only. Other Seq analytics remain independent of that runtime admission.
+
+`hylo-extract` compiles one selected historical response into CRF Slice 1 artifacts, using the earliest structured target activation in that response's causal prefix. One bounded, held session-byte snapshot supplies both canonical parsing and the rollout digest. The selected historical response is bound to its exact downstream source line; an answer that predates same-turn target activation is rejected. Extraction preserves ordered message occurrences, replaces the historical target body with a target slot, seals the selected historical response under an owner-only FD key, and emits a pure runner manifest containing only causal artifact references. Malformed JSONL makes exact extraction fail; a conflicting later `session_meta` remains a non-authoritative parser warning and does not override the primary metadata. Unknown or state-bearing pre-cut carriers are rejected rather than silently omitted.
+
+```bash
+umask 077
+: >./owner.key
+chmod 600 ./owner.key
+seq hylo-extract \
+  --root ~/.codex/sessions \
+  --session-id <session-id> \
+  --turn-index 0 \
+  --target-skill hylo \
+  --target-root /path/to/skills/hylo \
+  --context-policy dependency-closed \
+  --capture-world \
+  --output-root ./runner \
+  --sealed-root ./custody \
+  --seal-key-output-fd 3 3>./owner.key
+```
+
+The key FD MUST be writable, MUST NOT be stdin/stdout/stderr or an alias of any standard stream, and MUST name either a caller-owned `0600` single-link regular file outside the source, runner, and custody roots or a caller-owned anonymous pipe (`nlink == 0`). Named FIFOs are rejected. Key-endpoint validation and key delivery occur before either artifact root is materialized, so a failed delivery leaves no replay artifacts; only a successful command receipt authorizes use of the delivered key. The runner root retains Seq's generic no-symlink path behavior plus the extractor's realpath, drift, and overlap checks. The final custody root MUST be caller-owned and `0700` and is revalidated by a held directory descriptor. Root overlap uses native filesystem identity and ancestor observations, so an existing case alias on the supported macOS filesystem fails closed without lowercase path guessing.
+
+Portable credentials and personal paths in fixed stimulus content receive stable per-value placeholders such as `<CREDENTIAL_1>`, `<EMAIL_1>`, and `<HOME_1>`; repeated values reuse the same placeholder. Literal placeholder ordinals are reserved before redaction, and credential matching spans adjacent ordered text parts. Exact credential placeholders satisfy portable-artifact validation without changing surrounding authorization, assignment, flag, or URI syntax. The redaction receipt retains per-class replacement counts and placeholder namespaces. A `path_identity_only` receipt is valid only when both credential and email replacement counts are zero; otherwise the producer declares `credential_personal_and_path_identity_only`. Sensitive bytes anywhere in the captured target bundle are rejected instead of redacted because redaction would mutate the treatment.
+
+`--target-root` names the complete historical bundle loaded by the selected
+target, including referenced files, scripts, templates, and assets. The runner
+consumes `runner-input.json` plus its referenced runner artifacts. `episode.json`
+is the complete controller/custody record; it is not a runner prompt. Target
+custody locators use `custody:` followed by a nonempty normalized relative path.
+Their locator structure contributes to the episode fingerprint, while the sealed
+historical-response digest and excluded-future digest do not. Slice 1 episode and
+runner contracts reserve `exact_reconstruction`; admitted v1 artifacts cannot
+claim it. The target files are captured through one no-follow descriptor per
+file, checked before
+and after the read, and then compared with a sorted rewalk witness so replace,
+add, remove, and mode drift invalidate extraction. Leakage detection covers
+exact raw captured-file bytes and canonical standard-base64 values in declared
+`*_base64` JSON fields; transformed, fragmented, compressed, and encrypted
+encodings are explicitly outside this Slice 1 detector.
+
 ```bash
 ./zig-out/bin/seq datasets
 ./zig-out/bin/seq dataset-schema --dataset messages
@@ -107,6 +151,29 @@ Binary output:
 ./zig-out/bin/seq orchestration-concurrency --session-id 019ca0e5-0beb-7740-a9bc-81664d994266 --format table
 ./zig-out/bin/seq orchestration-concurrency --path /absolute/path/to/rollout.jsonl --floor-threshold 3 --fail-on-floor --format json
 ./zig-out/bin/seq orchestration-concurrency --path /absolute/path/to/rollout.jsonl --fail-on-mesh-truth --format table
+```
+
+## HCTP source governance
+
+`seq hctp-source` owns the source-side inputs to HCTP-v1. It compiles a frozen
+source denominator, assigns dependency-aware independence clusters, rejects
+exact episodes crossing splits, validates historical SGG-v1 and DCP-v2
+lineage, performs final sanitization, and can encrypt case-blind payloads with
+XChaCha20-Poly1305. The materializer releases only the exact registered visible
+case and historical source profile through fresh anonymous pipes, then emits a
+signed, lane-scoped receipt. Sealed assurance comes from distinct role/key
+identities, capability-bound binaries, cryptographic commitments and openings,
+and signed receipts. Runtime evidence declares `os_confinement:false`;
+the supported macOS lifecycle, descriptor, cwd, deadline, and descendant-cleanup
+checks do not claim hostile same-user process containment.
+
+```bash
+seq hctp-source compile --manifest source.json --output selection.json
+seq hctp-source validate --receipt selection.json --trial trial.json
+seq hctp-source govern --evidence governance.json --output sgg.json
+seq hctp-source materialize --sealed-case case.sealed.json --trial trial.json \
+  --lane-id LANE --seal-key-fd 3 --visible-output-fd 4 \
+  --signing-seed-fd 5 --output materialization-receipt.json
 ```
 
 `query.where.op` supports `contains_any` and `regex_any` in addition to `contains` and `regex`.
@@ -555,9 +622,6 @@ zig build test
 zig build bench -Doptimize=ReleaseFast -- --config perf/frozen/workload_config.json
 bash scripts/perf/parser_gate.sh
 bash scripts/release/command_surface_gate.sh
-
-# Linux-only bounded fuzz smoke (matches CI behavior).
-timeout 180 zig test --dep core_path -Mroot=src/tests.zig -Mcore_path=../../libs/core/src/path_helpers.zig -ffuzz --test-filter "fuzz "
 
 # Differential parity against Python oracle
 scripts/parity/run_diff.sh --root ~/.codex/sessions/2026/02/19

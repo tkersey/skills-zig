@@ -154,6 +154,7 @@ const Options = struct {
 
 const Dcp = struct {
     packet_id: []const u8,
+    source_episode_id: ?[]const u8,
     source_thread_id: ?[]const u8,
     source_rollout_path: ?[]const u8,
     source_turn_digest: []const u8,
@@ -1075,7 +1076,24 @@ fn loadDcp(allocator: std.mem.Allocator, path: []const u8) !Dcp {
     defer allocator.free(raw);
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
     defer parsed.deinit();
-    const root = switch (parsed.value) {
+    return dcpFromValue(allocator, parsed.value);
+}
+
+fn dcpFromValue(allocator: std.mem.Allocator, value: std.json.Value) !Dcp {
+    var validation = try dcp_schema.validateValue(allocator, value);
+    defer validation.deinit(allocator);
+    if (!validation.valid) return error.InvalidDcp;
+
+    var source_episode_resolution = try dcp_schema.resolveSourceEpisodeIdentity(allocator, value);
+    defer source_episode_resolution.deinit(allocator);
+    const source_episode_id = switch (source_episode_resolution.state) {
+        .explicit_exact, .derived_session_turn => try allocator.dupe(u8, source_episode_resolution.source_episode_id.?),
+        .mismatch => return error.SourceEpisodeIdentityMismatch,
+        .unavailable => null,
+    };
+    errdefer if (source_episode_id) |owned| allocator.free(owned);
+
+    const root = switch (value) {
         .object => |obj| obj,
         else => return error.NotObject,
     };
@@ -1096,6 +1114,7 @@ fn loadDcp(allocator: std.mem.Allocator, path: []const u8) !Dcp {
     validateDcpAnchors(total, decision, optionalU64(turns, "first_outcome_turn_index"), &anchors) catch |err| return err;
     return .{
         .packet_id = try allocator.dupe(u8, packet_id),
+        .source_episode_id = source_episode_id,
         .source_thread_id = try dupeOptionalString(allocator, optionalString(source, "thread_id")),
         .source_rollout_path = try dupeOptionalString(allocator, optionalString(source, "rollout_path")),
         .source_turn_digest = try allocator.dupe(u8, try requiredString(turns, "source_turn_digest")),
@@ -1142,6 +1161,7 @@ fn validateDcpAnchors(total: u64, decision: u64, outcome: ?u64, anchors: *[3]Anc
 
 fn deinitDcp(allocator: std.mem.Allocator, dcp: Dcp) void {
     allocator.free(dcp.packet_id);
+    if (dcp.source_episode_id) |value| allocator.free(value);
     if (dcp.source_thread_id) |value| allocator.free(value);
     if (dcp.source_rollout_path) |value| allocator.free(value);
     allocator.free(dcp.source_turn_digest);
@@ -1231,11 +1251,32 @@ fn deinitRip(allocator: std.mem.Allocator, rip: Rip) void {
 fn validateLane(lane: Lane) !void {
     if (!isSafePathComponent(lane.lane_id)) return error.BadLaneId;
     if (!isOneOf(lane.temporal_horizon, &.{ "pre_decision", "post_decision_pre_outcome", "outcome_aware" })) return error.BadHorizon;
-    if (!isOneOf(lane.inquiry_mode, &.{ "rationale", "counterfactual", "alternative_challenge", "assumption_probe", "evidence_ablation", "retrospective" })) return error.BadMode;
+    if (!isOneOf(lane.inquiry_mode, &.{ "rationale", "counterfactual", "alternative_challenge", "assumption_probe", "evidence_ablation", "retrospective", "replay" })) return error.BadMode;
     if (lane.fork_count < 1) return error.BadForkCount;
     if (std.mem.eql(u8, lane.inquiry_mode, "counterfactual") and !std.mem.eql(u8, lane.temporal_horizon, "pre_decision")) return error.BadLaneHorizon;
     if (std.mem.eql(u8, lane.inquiry_mode, "alternative_challenge") and !std.mem.eql(u8, lane.temporal_horizon, "pre_decision")) return error.BadLaneHorizon;
+    if (std.mem.eql(u8, lane.inquiry_mode, "replay") and !std.mem.eql(u8, lane.temporal_horizon, "pre_decision")) return error.BadLaneHorizon;
+    if (std.mem.eql(u8, lane.inquiry_mode, "replay") and lane.fork_count != 1) return error.BadForkCount;
     if (std.mem.eql(u8, lane.inquiry_mode, "retrospective") and !std.mem.eql(u8, lane.temporal_horizon, "outcome_aware")) return error.BadLaneHorizon;
+}
+
+test "HCTP replay mode is one-fork pre-decision only" {
+    const replay = Lane{
+        .lane_id = "lane-hctp",
+        .temporal_horizon = "pre_decision",
+        .inquiry_mode = "replay",
+        .fork_count = 1,
+        .prompt_template = "execute the registered opaque lane",
+        .evidence_allowed_count = 0,
+        .evidence_withheld_count = 0,
+    };
+    try validateLane(replay);
+    var outcome_aware = replay;
+    outcome_aware.temporal_horizon = "outcome_aware";
+    try std.testing.expectError(error.BadLaneHorizon, validateLane(outcome_aware));
+    var hidden_portfolio = replay;
+    hidden_portfolio.fork_count = 2;
+    try std.testing.expectError(error.BadForkCount, validateLane(hidden_portfolio));
 }
 
 fn laneById(rip: Rip, lane_id: []const u8) ?Lane {
@@ -2406,6 +2447,108 @@ fn buildLaneHandleSnapshot(
     };
 }
 
+/// Serializes the packaged FIR-v1 envelope used by both live session inquiry
+/// lanes and HCTP runner integration. Keeping one serializer at this boundary
+/// prevents the trial adapter from accepting a fixture shape that the packaged
+/// CAS command cannot emit.
+pub fn packagedFirReceiptJsonAlloc(allocator: std.mem.Allocator, fields: anytype) ![]u8 {
+    const receipt = .{
+        .fork_inquiry_receipt = .{
+            .receipt_version = "FIR-v1",
+            .receipt_id = fields.receipt_id,
+            .inquiry_id = fields.inquiry_id,
+            .lane_id = fields.lane_id,
+            .source = .{
+                .capsule_id = fields.capsule_id,
+                .source_episode_id = fields.source_episode_id,
+                .source_thread_id = fields.source_thread_id,
+                .source_thread_id_present = fields.source_thread_id_present,
+                .source_rollout_path = fields.source_rollout_path,
+                .source_artifact_reconstructability = fields.source_artifact_reconstructability,
+                .source_turn_digest = fields.source_turn_digest,
+                .lineage_mode = fields.lineage_mode,
+            },
+            .fork = .{
+                .lineage_mode = fields.lineage_mode,
+                .fork_thread_id = fields.fork_thread_id,
+                .forked_from_id = fields.forked_from_id,
+                .anchor = .{
+                    .temporal_horizon = fields.temporal_horizon,
+                    .turns_before = fields.turns_before,
+                    .turns_dropped = fields.turns_dropped,
+                    .turns_after = fields.turns_after,
+                    .anchor_digest_expected = fields.anchor_digest_expected,
+                    .anchor_digest_observed = fields.anchor_digest_observed,
+                    .exact = fields.anchor_exact,
+                },
+                .model = fields.model,
+                .model_provider = fields.model_provider,
+                .service_tier = fields.service_tier,
+                .codex_version = fields.codex_version,
+                .ephemeral = fields.ephemeral,
+                .permissions = fields.permissions,
+                .sandbox = fields.sandbox,
+                .approval_policy = "never",
+                .hooks = fields.hooks,
+                .multi_agent_mode = "explicit-request-only",
+            },
+            .workspace_reconstruction = .{
+                .mode = fields.workspace_mode,
+                .path = fields.workspace_path,
+                .head_exact = false,
+                .dirty_state_exact = false,
+                .dependencies_exact = false,
+                .generated_artifacts_exact = false,
+                .tools_allowed = false,
+                .network_allowed = false,
+                .limitations = [_][]const u8{"live workspace equivalence proof is not implemented in this controller slice"},
+            },
+            .inquiry = .{
+                .mode = fields.inquiry_mode,
+                .question = fields.question,
+                .evidence_allowed = [_][]const u8{},
+                .evidence_withheld = [_][]const u8{},
+                .client_user_message_id = fields.client_user_message_id,
+                .turn_id = fields.turn_id,
+                .started_at = fields.started_at,
+                .ended_at = fields.ended_at,
+                .status = fields.status,
+                .token_usage = .{},
+            },
+            .answer = .{
+                .reconstructed_decision = fields.reconstructed_decision,
+                .selected_route = fields.selected_route,
+                .rejected_routes = fields.rejected_routes,
+                .evidence_refs = fields.evidence_refs,
+                .assumptions = fields.assumptions,
+                .alternatives = fields.alternatives,
+                .route_flip_conditions = fields.route_flip_conditions,
+                .uncertainty = fields.uncertainty,
+                .hindsight_available = fields.hindsight_available,
+                .unsupported_claims = fields.unsupported_claims,
+                .final_text_ref = fields.final_text_ref,
+            },
+            .lifecycle = .{
+                .event_log_ref = fields.event_log_ref,
+                .interrupted = false,
+                .archived = fields.archived,
+                .deleted = fields.deleted,
+                .cleanup_status = fields.cleanup_status,
+            },
+            .gate = .{
+                .lineage_valid = true,
+                .anchor_valid = fields.anchor_exact,
+                .permissions_valid = fields.permissions_valid,
+                .approval_or_tool_request_observed = fields.approval_or_tool_request_observed,
+                .hindsight_label_valid = fields.hindsight_label_valid,
+                .answer_complete = fields.answer_complete,
+                .receipt_valid = fields.receipt_valid,
+            },
+        },
+    };
+    return stringifyAnyAlloc(allocator, receipt);
+}
+
 fn collectLaneFork(
     allocator: std.mem.Allocator,
     client: *cas_client.Client,
@@ -2436,6 +2579,7 @@ fn collectLaneFork(
             .lane_id = handle.lane_id,
             .source = .{
                 .capsule_id = dcp.packet_id,
+                .source_episode_id = dcp.source_episode_id,
                 .source_thread_id = handle.source_thread_id,
                 .source_thread_id_present = dcp.source_thread_id != null,
                 .source_rollout_path = dcp.source_rollout_path orelse "",
@@ -2521,7 +2665,71 @@ fn collectLaneFork(
             },
         },
     };
-    try writeJsonFile(allocator, handle.lane_receipt, receipt);
+    defer allocator.free(receipt.fork_inquiry_receipt.receipt_id);
+    const fir = receipt.fork_inquiry_receipt;
+    const receipt_json = try packagedFirReceiptJsonAlloc(allocator, .{
+        .receipt_id = fir.receipt_id,
+        .inquiry_id = fir.inquiry_id,
+        .lane_id = fir.lane_id,
+        .capsule_id = fir.source.capsule_id,
+        .source_episode_id = fir.source.source_episode_id,
+        .source_thread_id = fir.source.source_thread_id,
+        .source_thread_id_present = fir.source.source_thread_id_present,
+        .source_rollout_path = fir.source.source_rollout_path,
+        .source_artifact_reconstructability = fir.source.source_artifact_reconstructability,
+        .source_turn_digest = fir.source.source_turn_digest,
+        .lineage_mode = fir.source.lineage_mode,
+        .fork_thread_id = fir.fork.fork_thread_id,
+        .forked_from_id = fir.fork.forked_from_id,
+        .temporal_horizon = fir.fork.anchor.temporal_horizon,
+        .turns_before = fir.fork.anchor.turns_before,
+        .turns_dropped = fir.fork.anchor.turns_dropped,
+        .turns_after = fir.fork.anchor.turns_after,
+        .anchor_digest_expected = fir.fork.anchor.anchor_digest_expected,
+        .anchor_digest_observed = fir.fork.anchor.anchor_digest_observed,
+        .anchor_exact = fir.fork.anchor.exact,
+        .model = fir.fork.model,
+        .model_provider = fir.fork.model_provider,
+        .service_tier = fir.fork.service_tier,
+        .codex_version = fir.fork.codex_version,
+        .ephemeral = fir.fork.ephemeral,
+        .permissions = fir.fork.permissions,
+        .sandbox = fir.fork.sandbox,
+        .hooks = fir.fork.hooks,
+        .workspace_mode = fir.workspace_reconstruction.mode,
+        .workspace_path = fir.workspace_reconstruction.path,
+        .inquiry_mode = fir.inquiry.mode,
+        .question = fir.inquiry.question,
+        .client_user_message_id = fir.inquiry.client_user_message_id,
+        .turn_id = fir.inquiry.turn_id,
+        .started_at = fir.inquiry.started_at,
+        .ended_at = fir.inquiry.ended_at,
+        .status = fir.inquiry.status,
+        .reconstructed_decision = fir.answer.reconstructed_decision,
+        .selected_route = fir.answer.selected_route,
+        .rejected_routes = fir.answer.rejected_routes,
+        .evidence_refs = fir.answer.evidence_refs,
+        .assumptions = fir.answer.assumptions,
+        .alternatives = fir.answer.alternatives,
+        .route_flip_conditions = fir.answer.route_flip_conditions,
+        .uncertainty = fir.answer.uncertainty,
+        .hindsight_available = fir.answer.hindsight_available,
+        .unsupported_claims = fir.answer.unsupported_claims,
+        .final_text_ref = fir.answer.final_text_ref,
+        .event_log_ref = fir.lifecycle.event_log_ref,
+        .archived = fir.lifecycle.archived,
+        .deleted = fir.lifecycle.deleted,
+        .cleanup_status = fir.lifecycle.cleanup_status,
+        .permissions_valid = fir.gate.permissions_valid,
+        .approval_or_tool_request_observed = fir.gate.approval_or_tool_request_observed,
+        .hindsight_label_valid = fir.gate.hindsight_label_valid,
+        .answer_complete = fir.gate.answer_complete,
+        .receipt_valid = fir.gate.receipt_valid,
+    });
+    defer allocator.free(receipt_json);
+    const receipt_file = try std.fmt.allocPrint(allocator, "{s}\n", .{receipt_json});
+    defer allocator.free(receipt_file);
+    try durable_store.writeTextAtomic(allocator, handle.lane_receipt, receipt_file);
     try writeLaneHandle(allocator, completed_handle, if (receipt_valid) @tagName(InquiryState.completed) else @tagName(InquiryState.failed));
     return .{
         .receipt_valid = receipt_valid,
@@ -4166,6 +4374,7 @@ test "validateLane enforces mode horizon invariants" {
 test "validateInquiryInputs rejects unavailable workspace" {
     const dcp = Dcp{
         .packet_id = "CAP",
+        .source_episode_id = "session:test#turn:decision",
         .source_thread_id = "thr",
         .source_rollout_path = null,
         .source_turn_digest = "sha256:source",
@@ -4224,6 +4433,7 @@ test "validateInquiryInputs accepts verified rollout transcript lineage only" {
 
     const dcp = Dcp{
         .packet_id = "CAP",
+        .source_episode_id = "session:test#turn:decision",
         .source_thread_id = null,
         .source_rollout_path = rollout_path,
         .source_turn_digest = source_digest,
@@ -4291,6 +4501,7 @@ test "buildRolloutInquiryPromptAlloc labels transcript lineage and retained hori
     defer allocator.free(rollout_path);
     const dcp = Dcp{
         .packet_id = "CAP",
+        .source_episode_id = "session:test#turn:decision",
         .source_thread_id = null,
         .source_rollout_path = rollout_path,
         .source_turn_digest = "sha256:source",
@@ -4335,6 +4546,85 @@ test "buildRolloutInquiryPromptAlloc labels transcript lineage and retained hori
     try std.testing.expect(std.mem.indexOf(u8, prompt, "lineage_mode: rollout_transcript") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "visible_turns_retained: 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "visible_historical_context") != null);
+}
+
+test "CAS admits the shared-valid Seq DCP-v2 source episode identity" {
+    const allocator = std.testing.allocator;
+    const capsule_path = try repoTestPathAlloc(allocator, "apps/seq/testdata/decision-capsule/valid-basic.json");
+    defer allocator.free(capsule_path);
+
+    const raw = try readFileAlloc(allocator, capsule_path, MaxInputBytes);
+    defer allocator.free(raw);
+    var report = try dcp_schema.validateText(allocator, raw);
+    defer report.deinit(allocator);
+    try std.testing.expect(report.valid);
+
+    const dcp = try loadDcp(allocator, capsule_path);
+    defer deinitDcp(allocator, dcp);
+    try std.testing.expectEqualStrings("session:dcp-basic#turn:turn-decision", dcp.source_episode_id.?);
+}
+
+test "CAS derives identity from frozen released DCP-v2 bytes" {
+    const allocator = std.testing.allocator;
+    const capsule_path = try repoTestPathAlloc(
+        allocator,
+        "apps/seq/testdata/decision-capsule/valid-v2-released-no-source-episode-id.json",
+    );
+    defer allocator.free(capsule_path);
+
+    const dcp = try loadDcp(allocator, capsule_path);
+    defer deinitDcp(allocator, dcp);
+    try std.testing.expectEqualStrings(
+        "DCP-f5a178fe5f03f749ec12664af6bd33f8f10cb9e1f5c45fc4978945612d5bd06a",
+        dcp.packet_id,
+    );
+    try std.testing.expectEqualStrings("session:dcp-basic#turn:turn-decision", dcp.source_episode_id.?);
+}
+
+test "CAS preserves ordinary DCP-v2 loading when source episode identity is unavailable" {
+    const allocator = std.testing.allocator;
+    const capsule_path = try repoTestPathAlloc(
+        allocator,
+        "apps/seq/testdata/decision-capsule/valid-v2-released-no-source-episode-id.json",
+    );
+    defer allocator.free(capsule_path);
+    const raw = try readFileAlloc(allocator, capsule_path, MaxInputBytes);
+    defer allocator.free(raw);
+
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, raw, "      \"session_id\": \"dcp-basic\",\n"));
+    const without_session = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        raw,
+        "      \"session_id\": \"dcp-basic\",\n",
+        "",
+    );
+    defer allocator.free(without_session);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, without_session, "      \"decision_turn_id\": \"turn-decision\",\n"));
+    const without_identity_inputs = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        without_session,
+        "      \"decision_turn_id\": \"turn-decision\",\n",
+        "",
+    );
+    defer allocator.free(without_identity_inputs);
+    const packet_id = try dcp_schema.packetIdForTextExcludingPacketId(allocator, without_identity_inputs);
+    defer allocator.free(packet_id);
+    const rewritten = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        without_identity_inputs,
+        "DCP-f5a178fe5f03f749ec12664af6bd33f8f10cb9e1f5c45fc4978945612d5bd06a",
+        packet_id,
+    );
+    defer allocator.free(rewritten);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, rewritten, .{});
+    defer parsed.deinit();
+    const dcp = try dcpFromValue(allocator, parsed.value);
+    defer deinitDcp(allocator, dcp);
+    try std.testing.expect(dcp.source_episode_id == null);
 }
 
 fn repoTestPathAlloc(allocator: std.mem.Allocator, relative: []const u8) ![]u8 {

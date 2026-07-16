@@ -11,6 +11,8 @@ const time_utils = @import("../time_utils.zig");
 const retrace_core = @import("retrace_core");
 const canonical_trace = retrace_core.canonical_trace;
 const decision_capsule = @import("../decision_capsule.zig");
+const hctp_source = @import("../hctp_source.zig");
+const hylo_extract = @import("../hylo_extract/mod.zig");
 const dcp_schema = retrace_core.dcp_schema;
 const historical_decisions = @import("../historical_decisions.zig");
 const token_cost = @import("../token_cost.zig");
@@ -815,6 +817,11 @@ pub fn run(
     cmd: lib.Command,
     args: []const []const u8,
 ) !void {
+    if (!lib.commandAvailable(cmd)) return error.InvalidCommand;
+    if (lib.HctpProductAvailable) {
+        if (cmd == .hctp_source) return hctp_source.run(allocator, args);
+        if (cmd == .hylo_extract) return hylo_extract.run(allocator, args);
+    }
     var opts = try parseOptionsForCommand(cmd, args);
     if (cmd == .decision_capsule and !opts.format_set) opts.format = .json;
     if (opts.help) {
@@ -838,6 +845,8 @@ pub fn run(
         .skill_contract => try cmdSkillContract(allocator, opts),
         .skill_decision_receipt => try cmdSkillDecisionReceipt(allocator, opts),
         .decision_capsule => try cmdDecisionCapsule(allocator, sessions_root, opts),
+        .hctp_source => unreachable,
+        .hylo_extract => unreachable,
         .skill_blocks => try cmdSkillBlocks(allocator, sessions_root, opts),
         .artifact_search => try cmdArtifactSearch(allocator, sessions_root, opts),
         .tool_audit => try QueryLiftCommands.cmdToolAudit(allocator, sessions_root, opts),
@@ -906,6 +915,8 @@ fn printCommandHelp(cmd: lib.Command) !void {
     ;
 
     const body = switch (cmd) {
+        .hctp_source => if (lib.HctpProductAvailable) hctp_source.usage() else unreachable,
+        .hylo_extract => if (lib.HctpProductAvailable) hylo_extract.usage() else unreachable,
         .skills_rank =>
         \\usage: seq skills-rank [--since <iso>] [--until <iso>] [--format table|json|csv] [--max N]
         ,
@@ -1238,6 +1249,7 @@ fn commandSupportsExcludeCurrent(cmd: lib.Command) bool {
 fn validateFormatForCommand(cmd: lib.Command, opts: Options) !void {
     const fmt = opts.format;
     switch (cmd) {
+        .hctp_source, .hylo_extract => {},
         .skills_rank, .skill_trend, .skill_report, .role_breakdown, .report_bundle, .section_audit, .datasets, .dataset_schema => {
             if (fmt == .jsonl or fmt == .markdown or fmt == .dot) return error.InvalidFormatForCommand;
         },
@@ -3271,9 +3283,20 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
             \\      "skill_decision_receipt_contract_binding_v1": true,
             \\      "tune_packet_v1": true,
             \\      "decision_capsule_v1": true,
+            \\      "decision_capsule_v2": true,
             \\      "decision_anchor_v1": true,
             \\      "historical_decisions_dataset_v1": true,
             \\      "dcp_validation_v1": true,
+        );
+        try writer.writeByte('\n');
+        if (lib.HctpProductAvailable) {
+            try writeEnabledCapability(writer, "hctp_source_selection_v1");
+            try writeEnabledCapability(writer, "hctp_independence_clusters_v1");
+            try writeEnabledCapability(writer, "hctp_sealed_case_v1");
+            try writeEnabledCapability(writer, "hctp_materializer_v1");
+            try writeEnabledCapability(writer, "hylo_extract_v1");
+        }
+        try writer.writeAll(
             \\      "review_compiler_provenance_v1": true,
             \\      "review_compiler_run_ledger_v1": true,
             \\      "cas_review_audit_v1": true,
@@ -3324,7 +3347,8 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
 
     var rows: std.ArrayList(query.Row) = .empty;
     defer deinitQueryRows(allocator, &rows);
-    const features = [_]struct { name: []const u8, enabled: bool }{
+    const CapabilityFeature = struct { name: []const u8, enabled: bool };
+    const features = [_]CapabilityFeature{
         .{ .name = "skill_decision_audit", .enabled = true },
         .{ .name = "skill_decision_delta", .enabled = true },
         .{ .name = "skill_contract_v1", .enabled = true },
@@ -3332,6 +3356,7 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
         .{ .name = "skill_decision_receipt_contract_binding_v1", .enabled = true },
         .{ .name = "tune_packet_v1", .enabled = true },
         .{ .name = "decision_capsule_v1", .enabled = true },
+        .{ .name = "decision_capsule_v2", .enabled = true },
         .{ .name = "decision_anchor_v1", .enabled = true },
         .{ .name = "historical_decisions_dataset_v1", .enabled = true },
         .{ .name = "dcp_validation_v1", .enabled = true },
@@ -3373,15 +3398,31 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
         .{ .name = "token_accounting_v2", .enabled = true },
         .{ .name = "matched_cohort_v1", .enabled = false },
     };
-    for (features) |feature| {
-        var row = query.Row.init(allocator);
-        try row.putOwnedKey("version", .{ .string = app_meta.version });
-        try row.putOwnedKey("feature", .{ .string = feature.name });
-        try row.putOwnedKey("enabled", .{ .bool = feature.enabled });
-        try rows.append(allocator, row);
+    const hctp_features: []const CapabilityFeature = if (lib.HctpProductAvailable)
+        &.{
+            .{ .name = "hctp_source_selection_v1", .enabled = true },
+            .{ .name = "hctp_independence_clusters_v1", .enabled = true },
+            .{ .name = "hctp_sealed_case_v1", .enabled = true },
+            .{ .name = "hctp_materializer_v1", .enabled = true },
+            .{ .name = "hylo_extract_v1", .enabled = true },
+        }
+    else
+        &.{};
+    inline for (&.{ features[0..], hctp_features }) |feature_group| {
+        for (feature_group) |feature| {
+            var row = query.Row.init(allocator);
+            try row.putOwnedKey("version", .{ .string = app_meta.version });
+            try row.putOwnedKey("feature", .{ .string = feature.name });
+            try row.putOwnedKey("enabled", .{ .bool = feature.enabled });
+            try rows.append(allocator, row);
+        }
     }
     const cols = [_][]const u8{ "version", "feature", "enabled" };
     try output.writeOutput(allocator, opts.format, rows.items, cols[0..], opts.out_path);
+}
+
+fn writeEnabledCapability(writer: anytype, name: []const u8) !void {
+    try writer.print("      \"{s}\": true,\n", .{name});
 }
 
 fn cmdActuationAudit(allocator: std.mem.Allocator, sessions_root: []const u8, opts: Options) !void {
@@ -26325,6 +26366,7 @@ test "capabilities advertises resolve intent closed audit flags" {
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_review_potential_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"resolve_intent_closed_audit_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"internal_context_not_success_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"decision_capsule_v2\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"execution_policy_audit_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"c3_count_evidence_refs_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"workflow_provenance_mode_v1\": true") != null);
@@ -26332,6 +26374,35 @@ test "capabilities advertises resolve intent closed audit flags" {
     try std.testing.expect(std.mem.indexOf(u8, got, "\"epg_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"policy_transition_dataset_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"token_accounting_v2\": true") != null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, got, .{});
+    defer parsed.deinit();
+    const feature_object = parsed.value.object.get("seq_capabilities").?.object.get("features").?.object;
+    const hctp_capabilities = [_][]const u8{
+        "hctp_source_selection_v1",
+        "hctp_independence_clusters_v1",
+        "hctp_sealed_case_v1",
+        "hctp_materializer_v1",
+        "hylo_extract_v1",
+    };
+    for (hctp_capabilities) |feature| {
+        const advertised = feature_object.get(feature);
+        try std.testing.expectEqual(lib.HctpProductAvailable, advertised != null);
+        if (advertised) |value| try std.testing.expect(value.bool);
+    }
+
+    const rows_path = try std.fs.path.join(std.testing.allocator, &.{ root_abs, "capabilities.jsonl" });
+    defer std.testing.allocator.free(rows_path);
+    const rows = try runCommandWithOutput(std.testing.allocator, .capabilities, &.{
+        "--format", "jsonl",
+    }, rows_path);
+    defer std.testing.allocator.free(rows);
+    for (hctp_capabilities) |feature| {
+        try std.testing.expectEqual(
+            lib.HctpProductAvailable,
+            std.mem.indexOf(u8, rows, feature) != null,
+        );
+    }
 }
 
 test "skill-audit supports exclude-current option" {

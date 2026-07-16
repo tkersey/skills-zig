@@ -1,0 +1,14 @@
+{
+  "schema": "hylo-trial-reveal/v1",
+  "trial_id": "trial-null-001",
+  "mapping": {
+    "arm-0": "baseline",
+    "arm-1": "candidate"
+  },
+  "nonce": "00112233445566778899aabbccddeeff",
+  "baseline_target_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "candidate_target_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "candidate_change_id": null,
+  "revealed_at_scope": "trial",
+  "materialization_receipts": []
+}
