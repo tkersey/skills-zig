@@ -89,7 +89,10 @@ fn text(
         } else if (std.mem.startsWith(u8, source_line, "+++ b/")) {
             current_path = std.mem.trimEnd(u8, source_line[6..], "\t");
             if (current_new_file) try new_files.append(allocator, current_path);
+        } else if (std.mem.startsWith(u8, source_line, "+++ ")) {
+            return error.UnsupportedPathEncoding;
         } else if (std.mem.startsWith(u8, source_line, "@@ ")) {
+            if (current_path.len == 0) return error.InvalidDiff;
             line_number_new = try hunkLineNumber(source_line);
             in_hunk = true;
         } else if (in_hunk) {
@@ -152,6 +155,28 @@ test "patch paths retain spaces and discard the patch separator" {
     const line = "+++ b/src/new good.zig\t";
     const path = std.mem.trimEnd(u8, line[6..], "\t");
     try std.testing.expectEqualStrings("src/new good.zig", path);
+}
+
+test "quoted patch paths fail closed" {
+    const input =
+        \\diff --git "a/new\tfile.zig" "b/new\tfile.zig"
+        \\new file mode 100644
+        \\--- /dev/null
+        \\+++ "b/new\tfile.zig"
+        \\@@ -0,0 +1 @@
+        \\+const value = true;
+        \\
+    ;
+    var output = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer output.deinit();
+    var audit = audit_module.Audit{};
+    var new_files: std.ArrayList([]const u8) = .empty;
+    defer new_files.deinit(std.testing.allocator);
+
+    try std.testing.expectError(
+        error.UnsupportedPathEncoding,
+        text(std.testing.allocator, &output.writer, input, &audit, &new_files),
+    );
 }
 
 test "hunk parser tracks the new-side line number" {
