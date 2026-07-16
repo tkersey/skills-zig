@@ -16,6 +16,12 @@ for app in seq cas ledger; do
   fi
 done
 
+seq_release_workflow="$repo_root/.github/workflows/release-seq.yml"
+if ! grep -Fq 'mkdir -p "${HOME}/.cache/zig/tmp"' "$seq_release_workflow"; then
+  echo "Seq release workflow must initialize Zig's ZIP package-cache directory" >&2
+  exit 1
+fi
+
 seq_version="$(tr -d '[:space:]' < "$repo_root/apps/seq/VERSION")"
 seq_manifest_version="$(sed -nE 's/^[[:space:]]*\.version = "([^"]+)",$/\1/p' "$repo_root/apps/seq/build.zig.zon")"
 if [[ -z "$seq_manifest_version" || "$seq_manifest_version" != "$seq_version" ]]; then
