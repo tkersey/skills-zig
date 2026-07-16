@@ -6,16 +6,22 @@ const MinimumStandardCleanRuns = 5;
 
 const Phase = enum {
     preflight,
+    repair_admission,
     closeout,
 
     fn parse(raw: []const u8) ?Phase {
         if (std.mem.eql(u8, raw, "preflight")) return .preflight;
+        if (std.mem.eql(u8, raw, "repair-admission")) return .repair_admission;
         if (std.mem.eql(u8, raw, "closeout")) return .closeout;
         return null;
     }
 
     fn name(self: Phase) []const u8 {
-        return @tagName(self);
+        return switch (self) {
+            .preflight => "preflight",
+            .repair_admission => "repair-admission",
+            .closeout => "closeout",
+        };
     }
 };
 
@@ -182,12 +188,59 @@ pub fn runWithArgv(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
     return if (issues.values.items.len == 0) 0 else 2;
 }
 
+pub fn validateCloseoutBytes(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    input: []const u8,
+    verify_references: bool,
+) !bool {
+    var issues = Issues{};
+    defer issues.deinit(allocator);
+    var parsed = std.json.parseFromSlice(Envelope, allocator, input, .{
+        .ignore_unknown_fields = false,
+    }) catch return false;
+    defer parsed.deinit();
+    try validatePolicy(
+        allocator,
+        io,
+        parsed.value.actuation_review_policy,
+        .closeout,
+        verify_references,
+        &issues,
+    );
+    return issues.values.items.len == 0;
+}
+
+pub fn validateRepairAdmissionBytes(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    input: []const u8,
+    verify_references: bool,
+) !bool {
+    var issues = Issues{};
+    defer issues.deinit(allocator);
+    var parsed = std.json.parseFromSlice(Envelope, allocator, input, .{
+        .ignore_unknown_fields = false,
+    }) catch return false;
+    defer parsed.deinit();
+    try validatePolicy(
+        allocator,
+        io,
+        parsed.value.actuation_review_policy,
+        .repair_admission,
+        verify_references,
+        &issues,
+    );
+    return issues.values.items.len == 0;
+}
+
 fn printHelp(io: std.Io) !void {
     var stdout_writer = std.Io.File.stdout().writer(io, &.{});
     try stdout_writer.interface.writeAll(
         \\ledger validate actuation-review-policy
         \\
-        \\usage: ledger validate actuation-review-policy --phase {preflight|closeout} --input FILE|-
+        \\usage: ledger validate actuation-review-policy
+        \\       --phase {preflight|repair-admission|closeout} --input FILE|-
         \\
         \\Purely check one actuation-review-policy/v1 or v2 JSON snapshot. The decision grants no authority and mutates no storage.
         \\
@@ -344,6 +397,7 @@ fn validatePolicy(
 
     switch (phase) {
         .preflight => try validatePreflight(allocator, policy, is_v2, issues),
+        .repair_admission => try validateRepairAdmission(allocator, policy, is_v2, issues),
         .closeout => if (standard_index) |index| try validateCloseout(allocator, policy, index, is_v2, issues),
     }
 }
@@ -440,6 +494,43 @@ fn validatePreflight(allocator: std.mem.Allocator, policy: Policy, is_v2: bool, 
         if (std.mem.eql(u8, request.role, "auxiliary") and !std.mem.eql(u8, request.state, "selected-pending")) {
             try issues.add(allocator, "preflight-auxiliary-state");
         }
+    }
+}
+
+fn validateRepairAdmission(
+    allocator: std.mem.Allocator,
+    policy: Policy,
+    is_v2: bool,
+    issues: *Issues,
+) !void {
+    if (!is_v2) try issues.add(allocator, "repair-admission-policy-v2-required");
+    if (policy.invalidation_reasons.len != 0) {
+        try issues.add(allocator, "repair-admission-invalidated");
+    }
+    var findings_folded: usize = 0;
+    for (policy.requests) |request| {
+        if (request.attempts.len == 0) {
+            try issues.add(allocator, "repair-admission-evidence-required");
+            continue;
+        }
+        const latest = request.attempts[request.attempts.len - 1];
+        if (std.mem.eql(u8, request.state, "clean")) {
+            if (!std.mem.eql(u8, latest.verdict_status, "clean")) {
+                try issues.add(allocator, "repair-admission-clean-state");
+            }
+        } else if (std.mem.eql(u8, request.state, "findings-folded")) {
+            findings_folded += 1;
+            if (!std.mem.eql(u8, latest.verdict_status, "findings") or
+                request.review_fold_refs.len == 0)
+            {
+                try issues.add(allocator, "repair-admission-findings-fold");
+            }
+        } else {
+            try issues.add(allocator, "repair-admission-request-open");
+        }
+    }
+    if (findings_folded == 0) {
+        try issues.add(allocator, "repair-admission-findings-required");
     }
 }
 
@@ -1182,6 +1273,16 @@ test "v2 closeout composes two prior and three current standard cleans" {
     requests[0].attempts = standard_attempts[2..];
     var issues = try validateForTest(validV2CloseoutPolicy(&requests), .closeout);
     defer issues.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), issues.values.items.len);
+}
+
+test "repair admission keeps the policy to resolution digest graph acyclic" {
+    var requests = closeout_requests;
+    var policy = validV2CloseoutPolicy(&requests);
+    policy.resolution_digest = null;
+    var issues = Issues{};
+    defer issues.deinit(std.testing.allocator);
+    try validateRepairAdmission(std.testing.allocator, policy, true, &issues);
     try std.testing.expectEqual(@as(usize, 0), issues.values.items.len);
 }
 

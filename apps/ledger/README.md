@@ -494,7 +494,7 @@ Open a run with authority, exact path scope, and verifier-backed obligations:
 
 ```json
 {
-  "schema": "actuation-open/v1",
+  "schema": "actuation-open/v2",
   "run_id": "run-1",
   "goal_id": "goal-1",
   "goal_contract_digest": "sha256:...",
@@ -511,9 +511,32 @@ Open a run with authority, exact path scope, and verifier-backed obligations:
       "statement": "The kernel law tests pass.",
       "verifier": ["zig", "build", "test-ledger"]
     }
-  ]
+  ],
+  "generation_admission": {
+    "schema": "actuation-generation-admission/v1",
+    "kind": "implementation",
+    "predecessor_run_id": null,
+    "basis": {"ref": "goal-contract.json", "digest": "sha256:..."},
+    "review": {
+      "policy_ref": null,
+      "policy_digest": null,
+      "resolution_ref": null,
+      "resolution_digest": null
+    },
+    "recovery": {
+      "authority_ref": null,
+      "authority_digest": null,
+      "reason": null
+    }
+  }
 }
 ```
+
+New writes require `actuation-open/v2`; `actuation-open/v1` stores remain read-only replay surfaces as explicit `legacy-v1` generations. `implementation` is the sole root kind and accepts either ordinary implementation evidence or a complete standalone review-repair admission. An existing lineage uses `review-repair`; a clean standalone review opens no generation. Repair admission requires a v2 repair-admission policy, a pending preflight resolution, and exactly one selected work node whose run, owner, canonical path set, and verifier bind the admitted edit. Every review-bound edit must use that entire canonical path set; subsets and supersets are rejected, while order is irrelevant. `terminal-proof` instead requires clean closeout evidence, forbids mutation, and inherits exactly the predecessor generation's canonical delivery path set. The GoalContract is materialized before policy and resolution; the resolution binds the exact policy bytes, and the outer admission binds the exact policy and resolution bytes without a digest cycle.
+
+`recovery` requires a superseded predecessor and the exact reserved recovery contract. A recovery successor of a review-bound mutation inherits the selected work node unchanged, so its owner, canonical paths, and verifier remain authoritative after supersession and replay. Every non-root predecessor admits at most one successor. Admission evidence is immutable authority: each evidence file is opened once, and its digest, semantic validator, and evidence join consume the same owned byte snapshot. Lexical overlap, parent and nested-directory symlinks, case aliases, and filesystem-bound hardlinks into mutation scope or the selected control plane are rejected. The selected actuation store and lock sidecar, plus canonical Learnings, Negative Ledger, and Synesthesia stores and lock sidecars, cannot serve as allowed paths or admission evidence; allowed directory roots share one bounded scan budget for nested physical aliases without hiding neighboring non-control files.
+
+The one-root-per-goal law is enforced within the selected event store. A custom `--path` therefore defines a separate actuation namespace; it does not prove repository-global root uniqueness across other stores.
 
 Prepare exactly one operation:
 
@@ -541,6 +564,39 @@ ledger close --source actuation --run run-1
 ledger decide --source actuation --run run-1
 ```
 
+If a prepared edit has not changed either its admitted paths or the stable unscoped snapshot, terminate it without proof discharge:
+
+```bash
+ledger abort --source actuation --run run-1
+```
+
+If the capability was lost only after a confined admitted-path change, terminally disable the run and reserve exactly one recovery successor:
+
+```json
+{
+  "schema": "actuation-supersede/v1",
+  "basis": {"ref": "recovery-basis.json", "digest": "sha256:..."},
+  "recovery": {
+    "authority_ref": "recovery-authority.json",
+    "authority_digest": "sha256:...",
+    "reason": "capability-lost-after-change"
+  },
+  "external_run_id": null
+}
+```
+
+```bash
+ledger supersede --source actuation --run run-1 --json supersede.json
+```
+
+`abort` is legal only for an unchanged prepared snapshot. Supersession is phase-specific:
+
+- A prepared edit accepts only confined movement under `capability-lost-after-change` or `explicit-user-restart`.
+- An effect-recorded edit accepts only its exact recorded post-state under `artifact-stale` or `explicit-user-restart`; an additional unprepared edit is rejected.
+- A ready run accepts changed state only when `external_run_id` names a distinct, closed, mutation-authorized run with the same canonical path set and exact current artifact. This permits a failed non-mutating terminal proof to recover after a separately authorized repair without absorbing an out-of-band mutation.
+
+The exact `.ledger/actuation` control root and the canonical Learnings, Negative Ledger, and Synesthesia event stores plus lock sidecars are excluded from actuation artifact hashing. Those source-memory control paths are forbidden mutation scope. Every neighboring `.ledger/*` path remains observable.
+
 For `inspect` and `verify`, use `execute` instead of `record` plus `observe`; the kernel runs the admitted verifier directly. Set `completion` to `ready-to-ship` for a generation that hands off to `$ship`, or `complete` for a terminal local/review generation. Supply `resolution_digest` for a review-bound generation. Obligation `kind` is `implementation`, `review`, `ship`, or `acceptance`; `decide` preserves those proof bases separately. It returns `continue` until the run is closed, then projects the selected terminal verdict as `closure-decision/v1`.
 
 The kernel:
@@ -548,7 +604,7 @@ The kernel:
 - returns 256-bit capability material once and persists only its SHA-256 digest;
 - rejects duplicate idempotency keys, replay, stale pre-state, path escape, undeclared path movement, verifier substitution, verifier-side repository mutation, and uncovered closure obligations;
 - executes the verifier declared by the obligation rather than accepting a caller-supplied success flag;
-- folds a globally sequenced, predecessor-hashed `actuation-event/v1` chain into one run state;
+- folds a globally sequenced, predecessor-hashed `actuation-event/v1` chain into one `actuation-kernel-state/v2` projection;
 - derives both continuation and terminal closure decisions in Zig from that folded state;
 - exits `2` when an executed observation fails and `0` when it passes.
 

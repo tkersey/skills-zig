@@ -137,7 +137,12 @@ const actuation_audit_flags = [_]FlagSpec{
     .{ .name = "--last", .value_kind = .duration, .help = "Relative time window" },
     .{ .name = "--exclude-current", .value_kind = .bool, .help = "Exclude the current CODEX_THREAD_ID session" },
     .{ .name = "--include-workers", .value_kind = .bool, .help = "Include linked worker sessions" },
-    .{ .name = "--mode", .value_kind = .string, .help = "summary, runs, slices, proof, compactions, decisions, or report" },
+    .{
+        .name = "--mode",
+        .value_kind = .string,
+        .help = "summary, runs, slices, proof, compactions, decisions, generations, " ++
+            "transitions, or report",
+    },
     .{ .name = "--strict", .value_kind = .bool, .help = "Exit 2 on actuation control violations" },
     .{ .name = "--include-excerpts", .value_kind = .bool, .help = "Allow bounded sanitized excerpts" },
     .{ .name = "--format", .value_kind = .format, .help = "Output format" },

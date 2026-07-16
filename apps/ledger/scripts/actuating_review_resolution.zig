@@ -166,6 +166,11 @@ const Envelope = struct {
     review_resolution: Resolution,
 };
 
+pub const CloseoutDisposition = enum {
+    clean,
+    repair,
+};
+
 const Issues = struct {
     values: std.ArrayList([]const u8) = .empty,
 
@@ -219,6 +224,37 @@ pub fn runWithArgv(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
     try validateResolution(allocator, parsed.value.review_resolution, args.phase, &issues);
     try emitDecision(allocator, io, args.phase, &issues);
     return if (issues.values.items.len == 0) 0 else 2;
+}
+
+pub fn validateCloseoutBytes(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) !?CloseoutDisposition {
+    var issues = Issues{};
+    defer issues.deinit(allocator);
+    var parsed = std.json.parseFromSlice(Envelope, allocator, input, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+    try validateResolution(allocator, parsed.value.review_resolution, .closeout, &issues);
+    if (issues.values.items.len != 0) return null;
+    if (std.mem.eql(u8, parsed.value.review_resolution.outcome.status, "clean")) return .clean;
+    if (std.mem.eql(u8, parsed.value.review_resolution.outcome.status, "resolved")) return .repair;
+    return null;
+}
+
+pub fn validatePreflightBytes(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+) !bool {
+    var issues = Issues{};
+    defer issues.deinit(allocator);
+    var parsed = std.json.parseFromSlice(Envelope, allocator, input, .{
+        .ignore_unknown_fields = true,
+    }) catch return false;
+    defer parsed.deinit();
+    try validateResolution(allocator, parsed.value.review_resolution, .preflight, &issues);
+    return issues.values.items.len == 0;
 }
 
 fn printHelp(io: std.Io) !void {

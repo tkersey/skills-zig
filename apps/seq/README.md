@@ -330,7 +330,14 @@ seq query --root ~/.codex/sessions --spec '{"dataset":"historical_decisions","pa
 - `--mode runs --format json|jsonl` emits a nested `refactor_kernel` audit object per run; `--mode summary --format json` aggregates `refactor_kernel.potential_hidden_refactor_kernel_explicit`, `refactor_kernel.potential_hidden_refactor_kernel_inferred`, `refactor_kernel.governed_refactor_kernel`, and `refactor_kernel.governed_refactor_kernel_with_control_violation`
 - Potential hidden refactor-kernel is an observational classifier. Use AER-v1/RKO-v1 for formal workflow evidence.
 - keeps raw prompts/excerpts out by default; `--include-excerpts` is explicit
-- `--strict` exits 2 for graph bypass or projection inversion rows
+- `--mode generations` emits native run/generation lineage, lifecycle, and uncertainty rows
+- `--mode transitions` emits exact call-ID-joined transition, error, closure-decision, and bootstrap rows
+- native rows preserve legacy data as `legacy-v1` without inventing lineage; a predecessor or generation open outside the selected lower bound is uncertainty, not failure
+- `--strict` exits 2 for graph bypass, projection inversion, an invalid exact call join,
+  invalid v2 lineage, duplicate predecessor edges, or a terminal session with an
+  unclosed/unsuperseded v2 generation; operation abort remains nonterminal
+- bootstrap rows report invocation counts for the selected session/window. Workflow identity
+  is unavailable, so bootstrap multiplicity is informational rather than a strict failure.
 
 Examples:
 ```bash
@@ -342,12 +349,16 @@ seq actuation-audit \
   --mode summary \
   --format json
 seq actuation-audit --root ~/.codex/sessions --workdir /path/to/repo --last 7d --exclude-current --mode hylo --format json
+seq actuation-audit --root ~/.codex/sessions --path rollout.jsonl --mode generations --format jsonl
+seq actuation-audit --root ~/.codex/sessions --path rollout.jsonl --mode transitions --format jsonl
 seq actuation-audit --root ~/.codex/sessions --repo /path/to/repo --last 7d --mode report --format markdown
 seq query --root ~/.codex/sessions --spec '{"dataset":"actuation_runs","params":{"path":"rollout.jsonl"},"select":["session_id","verdict","graph.compile_failures","projection.update_plan_calls","surface.churn.apply_patch_calls"],"format":"table"}'
 ```
 
 Actuation query datasets:
 - `actuation_runs`
+- `actuation_generations`
+- `actuation_transitions`
 - `actuation_slices`
 - `actuation_graph_events`
 - `actuation_proofs`
