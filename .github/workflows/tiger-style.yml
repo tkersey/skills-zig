@@ -7,6 +7,8 @@ on:
       - "CONTRIBUTING.md"
       - "docs/engineering/TIGER_STYLE.md"
       - ".github/pull_request_template.md"
+      - ".github/workflows/auto-release.yml"
+      - ".github/workflows/pr-ci.yml"
       - ".github/workflows/tiger-style.yml"
 
 permissions:
@@ -26,19 +28,20 @@ jobs:
           version: 0.16.0
       - name: Test the TigerStyle auditor
         run: zig test tools/tiger_style/main.zig
+      - name: Audit repository mappings
+        run: zig run tools/tiger_style/main.zig -- audit-repository
       - name: Check formatting of changed Zig files
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          mapfile -d '' changed_files < <(
+          while IFS= read -r -d '' changed_file; do
+            zig fmt --check "$changed_file"
+          done < <(
             git diff --name-only -z --diff-filter=ACMR \
               "$BASE_SHA" "$HEAD_SHA" -- '*.zig'
           )
-          if (( ${#changed_files[@]} > 0 )); then
-            zig fmt --check "${changed_files[@]}"
-          fi
       - name: Audit changed Zig code
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}

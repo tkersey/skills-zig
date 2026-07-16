@@ -2,6 +2,7 @@ const std = @import("std");
 const audit_module = @import("audit.zig");
 const diff = @import("diff.zig");
 const limits = @import("limits.zig");
+const repository = @import("repository.zig");
 
 const Io = std.Io.Threaded.global_single_threaded;
 
@@ -11,6 +12,7 @@ const usage =
     \\Usage:
     \\  tiger_style audit-diff --base SHA --head SHA
     \\  tiger_style audit-files PATH...
+    \\  tiger_style audit-repository
     \\
     \\The diff mode audits all added Zig lines and fully audits new Zig files.
 ;
@@ -41,6 +43,16 @@ pub fn main(init: std.process.Init) !void {
         try diff.run(allocator, init.io, stderr, options, &audit);
     } else if (std.mem.eql(u8, argv[1], "audit-files")) {
         try runAuditFiles(allocator, init.io, stderr, argv, &audit);
+    } else if (std.mem.eql(u8, argv[1], "audit-repository")) {
+        if (argv.len != 2) {
+            try stderr.writeAll("audit-repository accepts no arguments\n\n");
+            try stderr.writeAll(usage);
+            std.process.exit(64);
+        }
+        const result = try repository.run(allocator, init.io, stderr);
+        try writeRepositorySummary(stderr, result);
+        if (result.diagnostics > 0) std.process.exit(2);
+        return;
     } else {
         try stderr.print("unknown command: {s}\n\n{s}", .{ argv[1], usage });
         std.process.exit(64);
@@ -48,6 +60,23 @@ pub fn main(init: std.process.Init) !void {
 
     try writeSummary(stderr, audit);
     if (audit.diagnostics > 0) std.process.exit(2);
+}
+
+fn writeRepositorySummary(
+    writer: anytype,
+    result: repository.Result,
+) !void {
+    if (result.diagnostics == 0) {
+        try writer.print(
+            "TigerStyle repository passed: checks={d} diagnostics=0\n",
+            .{result.checks},
+        );
+    } else {
+        try writer.print(
+            "TigerStyle repository failed: checks={d} diagnostics={d}\n",
+            .{ result.checks, result.diagnostics },
+        );
+    }
 }
 
 fn runAuditFiles(
@@ -151,4 +180,8 @@ test "revision validation covers the byte boundary" {
     try std.testing.expect(!revisionValid(&above_limit));
     try std.testing.expect(!revisionValid("has space"));
     try std.testing.expect(!revisionValid(""));
+}
+
+test {
+    _ = repository;
 }
