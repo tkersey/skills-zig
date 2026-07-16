@@ -6,6 +6,16 @@ script_source="$repo_root/.github/scripts/release_apps.sh"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
+for app in seq cas ledger; do
+  workflow="$repo_root/.github/workflows/release-${app}.yml"
+  if ! grep -Fq 'zig_target:' "$workflow" ||
+    ! grep -Fq -- '-Dtarget=${{ matrix.zig_target }}' "$workflow" ||
+    ! grep -Fq -- '-Dcpu=baseline' "$workflow"; then
+    echo "release workflow must bind ${app} artifacts to an explicit target and baseline CPU" >&2
+    exit 1
+  fi
+done
+
 seq_version="$(tr -d '[:space:]' < "$repo_root/apps/seq/VERSION")"
 seq_manifest_version="$(sed -nE 's/^[[:space:]]*\.version = "([^"]+)",$/\1/p' "$repo_root/apps/seq/build.zig.zon")"
 if [[ -z "$seq_manifest_version" || "$seq_manifest_version" != "$seq_version" ]]; then

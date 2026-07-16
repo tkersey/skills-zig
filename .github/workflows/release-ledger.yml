@@ -29,9 +29,11 @@ jobs:
       matrix:
         include:
           - target: linux-x86_64
+            zig_target: x86_64-linux
             runs_on: ubuntu-latest
             zig_archive: zig-x86_64-linux-0.16.0.tar.xz
           - target: darwin-arm64
+            zig_target: aarch64-macos
             runs_on: macos-14
             zig_archive: zig-aarch64-macos-0.16.0.tar.xz
     runs-on: ${{ matrix.runs_on }}
@@ -55,7 +57,7 @@ jobs:
           zig_dir="${archive%.tar.xz}"
           echo "${PWD}/${zig_dir}" >> "$GITHUB_PATH"
       - name: Build ledger binary
-        run: zig build build-ledger -Doptimize=ReleaseFast
+        run: zig build build-ledger -Dtarget=${{ matrix.zig_target }} -Dcpu=baseline -Doptimize=ReleaseFast
       - name: Package ledger artifact
         run: |
           TAR_NAME="${RELEASE_TAG}-${{ matrix.target }}.tar.gz"

@@ -5,6 +5,7 @@ pub fn build(b: *std.Build) void {
 
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const sqlite = b.dependency("sqlite", .{});
     const core_path = b.createModule(.{
         .root_source_file = b.path("../../libs/core/src/path_helpers.zig"),
         .target = target,
@@ -55,8 +56,7 @@ pub fn build(b: *std.Build) void {
         .name = "seq",
         .root_module = root_module,
     });
-    exe.root_module.linkSystemLibrary("c", .{});
-    exe.root_module.linkSystemLibrary("sqlite3", .{});
+    addSqlite(exe.root_module, sqlite);
 
     b.installArtifact(exe);
 
@@ -84,8 +84,7 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.addTest(.{
         .root_module = tests_mod,
     });
-    unit_tests.root_module.linkSystemLibrary("c", .{});
-    unit_tests.root_module.linkSystemLibrary("sqlite3", .{});
+    addSqlite(unit_tests.root_module, sqlite);
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
     const test_step = b.step("test", "Run unit tests");
@@ -137,6 +136,15 @@ pub fn build(b: *std.Build) void {
 
     const parser_bench_step = b.step("bench-parser", "Run token parser performance harness");
     parser_bench_step.dependOn(&parser_perf_run.step);
+}
+
+fn addSqlite(module: *std.Build.Module, sqlite: *std.Build.Dependency) void {
+    module.addCSourceFile(.{
+        .file = sqlite.path("sqlite3.c"),
+        .flags = &.{},
+    });
+    module.addIncludePath(sqlite.path(""));
+    module.linkSystemLibrary("c", .{});
 }
 
 fn addVersionModule(b: *std.Build, raw_version: []const u8) *std.Build.Module {
