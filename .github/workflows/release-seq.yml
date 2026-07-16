@@ -59,6 +59,8 @@ jobs:
           tar -xf "${archive}"
           zig_dir="${archive%.tar.xz}"
           echo "${PWD}/${zig_dir}" >> "$GITHUB_PATH"
+      - name: Prepare Zig package cache
+        run: mkdir -p "${HOME}/.cache/zig/tmp"
       - name: Build seq binary
         working-directory: apps/seq
         run: zig build -Dtarget=${{ matrix.zig_target }} -Dcpu=baseline -Doptimize=ReleaseFast
