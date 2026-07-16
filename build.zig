@@ -943,7 +943,6 @@ pub fn build(b: *std.Build) void {
         "Run Hylo-owned HCTP-v1 conformance cases",
         .{ .filters = &.{"HCTP Section 36"} },
     );
-    _ = run_hctp_conformance_hylo;
     const hctp_conformance_backend_tests = b.addTest(.{
         .root_module = hctp_conformance_backend_root,
         .filters = &.{ "HCTP", "36." },
@@ -1057,6 +1056,7 @@ pub fn build(b: *std.Build) void {
     test_hctp_conformance.dependOn(&run_hctp_conformance_grading.step);
     test_hctp_conformance.dependOn(&run_hctp_conformance_retrace_holdout.step);
     test_hctp_conformance.dependOn(&run_hctp_conformance_manifest.step);
+    test_hctp_conformance.dependOn(&run_hctp_conformance_hylo.step);
     test_hctp_conformance.dependOn(test_hctp_conformance_backends);
     const test_hylo = b.step("test-hylo", "Run HCTP-v1 contract and fold tests");
     test_hylo.dependOn(&run_hctp_contract_tests.step);

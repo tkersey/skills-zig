@@ -2254,12 +2254,7 @@ fn commitLaneStartReceiptAlloc(
         // Compatibility start-lane delivers the raw nonce before committing
         // its digest. The sealed driver instead durably owns its nonce before
         // calling commit-lane-start with no delivery endpoint.
-        const lease_record = try std.fmt.allocPrint(allocator, "{s}\n", .{retained_lease});
-        defer {
-            std.crypto.secureZero(u8, lease_record);
-            allocator.free(lease_record);
-        }
-        try endpoint.writer(endpoint.fd, lease_record);
+        try endpoint.writer(endpoint.fd, retained_lease);
     }
     var result = appendHighLevelEvent(
         allocator,
@@ -21124,6 +21119,59 @@ test "hylo lease input requires one exact canonical record on an anonymous read 
         error.LaneLeaseInvalid,
         readLeaseFdAlloc(std.testing.allocator, trailing_pipe[0]),
     );
+}
+
+test "hylo lane start emits the exact canonical lease accepted by the retained lease reader" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(repo);
+    var backend = durable_store.MemoryEventStore.init(std.testing.allocator, "memory:hctp-lane-round-trip");
+    defer backend.deinit();
+    const store = backend.eventStore();
+    try testSeedProfileCampaign(std.testing.allocator, repo, store, "[\"absolute_qualification\"]");
+    var registration = try testRegisterTrialBytes(
+        std.testing.allocator,
+        repo,
+        store,
+        hctp_fixtures.valid_null_trial,
+    );
+    registration.deinit(std.testing.allocator);
+
+    const retained_lease = "HYL1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const lease_digest = try digestBytesAlloc(std.testing.allocator, retained_lease);
+    defer std.testing.allocator.free(lease_digest);
+    var pipe_fds: [2]std.posix.fd_t = undefined;
+    if (std.c.pipe(&pipe_fds) != 0) return error.TestFdSetupFailed;
+    defer _ = std.c.close(pipe_fds[0]);
+    var write_fd_open = true;
+    defer {
+        if (write_fd_open) _ = std.c.close(pipe_fds[1]);
+    }
+
+    const receipt = try commitLaneStartReceiptAlloc(
+        std.testing.allocator,
+        repo,
+        store,
+        "cmp-test",
+        "trial-null-001",
+        "lane-null-a0",
+        "cas-trial",
+        retained_lease,
+        lease_digest,
+        false,
+        .{ .fd = pipe_fds[1], .writer = writeLaneLeaseRecord },
+    );
+    defer std.testing.allocator.free(receipt);
+    _ = std.c.close(pipe_fds[1]);
+    write_fd_open = false;
+
+    const observed = try readLeaseFdAlloc(std.testing.allocator, pipe_fds[0]);
+    defer {
+        std.crypto.secureZero(u8, observed);
+        std.testing.allocator.free(observed);
+    }
+    try std.testing.expectEqualStrings(retained_lease, observed);
 }
 
 test "hylo lane start rejects regular character and socket lease sinks without append" {
