@@ -28,8 +28,10 @@ jobs:
       matrix:
         include:
           - target: linux-x86_64
+            zig_target: x86_64-linux
             runs_on: ubuntu-latest
           - target: darwin-arm64
+            zig_target: aarch64-macos
             runs_on: macos-14
     runs-on: ${{ matrix.runs_on }}
     steps:
@@ -47,10 +49,10 @@ jobs:
         with:
           version: 0.16.0
       - name: Build cas binaries
-        run: zig build build-cas -Doptimize=ReleaseFast
+        run: zig build build-cas -Dtarget=${{ matrix.zig_target }} -Dcpu=baseline -Doptimize=ReleaseFast
       - name: Verify Linux dispatcher can launch its sibling executable
         if: matrix.target == 'linux-x86_64'
-        run: zig build test-cas-dispatch-runtime-linux -Doptimize=ReleaseFast --summary all
+        run: zig build test-cas-dispatch-runtime-linux -Dtarget=${{ matrix.zig_target }} -Dcpu=baseline -Doptimize=ReleaseFast --summary all
       - name: Package cas artifact
         run: |
           TAR_NAME="${RELEASE_TAG}-${{ matrix.target }}.tar.gz"
