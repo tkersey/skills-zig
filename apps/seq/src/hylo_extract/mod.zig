@@ -1061,7 +1061,9 @@ fn parseOptions(args: []const []const u8) !Options {
 }
 
 fn findSessionPathAlloc(allocator: std.mem.Allocator, root: []const u8, session_id: []const u8) ![]u8 {
-    var root_dir = try std.Io.Dir.openDirAbsolute(Io.io(), root, .{ .iterate = true });
+    const resolved_root = try std.Io.Dir.cwd().realPathFileAlloc(Io.io(), root, allocator);
+    defer allocator.free(resolved_root);
+    var root_dir = try std.Io.Dir.openDirAbsolute(Io.io(), resolved_root, .{ .iterate = true });
     defer root_dir.close(Io.io());
     var walker = try root_dir.walk(allocator);
     defer walker.deinit();
@@ -1071,9 +1073,37 @@ fn findSessionPathAlloc(allocator: std.mem.Allocator, root: []const u8, session_
         if (entry.kind != .file or !std.mem.startsWith(u8, std.fs.path.basename(entry.path), "rollout-") or !std.mem.endsWith(u8, entry.path, ".jsonl")) continue;
         if (std.mem.indexOf(u8, std.fs.path.basename(entry.path), session_id) == null) continue;
         if (found != null) return error.AmbiguousSessionTarget;
-        found = try std.fs.path.join(allocator, &.{ root, entry.path });
+        found = try std.fs.path.join(allocator, &.{ resolved_root, entry.path });
     }
     return found orelse error.SessionNotFound;
+}
+
+test "session lookup resolves relative and absolute roots identically" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "sessions/2026/07/16");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "sessions/2026/07/16/rollout-session-relative.jsonl",
+        .data = "{}\n",
+    });
+    const absolute_root = try tmp.dir.realPathFileAlloc(std.testing.io, "sessions", std.testing.allocator);
+    defer std.testing.allocator.free(absolute_root);
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(Io.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const relative_root = try std.fs.path.relative(
+        std.testing.allocator,
+        cwd,
+        null,
+        cwd,
+        absolute_root,
+    );
+    defer std.testing.allocator.free(relative_root);
+
+    const from_absolute = try findSessionPathAlloc(std.testing.allocator, absolute_root, "session-relative");
+    defer std.testing.allocator.free(from_absolute);
+    const from_relative = try findSessionPathAlloc(std.testing.allocator, relative_root, "session-relative");
+    defer std.testing.allocator.free(from_relative);
+    try std.testing.expectEqualStrings(from_absolute, from_relative);
 }
 
 fn resolveTargetRootAlloc(allocator: std.mem.Allocator, requested_path: []const u8) ![:0]u8 {

@@ -255,7 +255,13 @@ fn cmdCompile(allocator: std.mem.Allocator, options: Options) !void {
     defer allocator.free(source_binary);
     var seal_key = [_]u8{0} ** 32;
     defer std.crypto.secureZero(u8, &seal_key);
-    if (needs_seal) try std.Io.randomSecure(defaultIo(), &seal_key);
+    if (needs_seal) {
+        try std.Io.randomSecure(defaultIo(), &seal_key);
+        // The owner capability must exist before any ciphertext or receipt is
+        // durable. A failed protected write therefore leaves nothing on disk
+        // that can no longer be materialized.
+        try writeFd(options.seal_key_output_fd.?, &seal_key);
+    }
 
     var body = std.Io.Writer.Allocating.init(allocator);
     defer body.deinit();
@@ -343,7 +349,6 @@ fn cmdCompile(allocator: std.mem.Allocator, options: Options) !void {
     const final_json = try appendFingerprintAlloc(allocator, body_json, receipt_fingerprint);
     defer allocator.free(final_json);
     try durable_store.writeTextAtomic(allocator, output_path, final_json);
-    if (needs_seal) try writeFd(options.seal_key_output_fd.?, &seal_key);
     const source_public_key = try attestation.publicKeyBase64Alloc(allocator, source_seed);
     defer allocator.free(source_public_key);
     try printReceipt(.{
@@ -1974,6 +1979,50 @@ test "HCTP source compilation requires exactly one manifest carrier" {
         .manifest_fd = 3,
         .output = "unused.json",
     }));
+}
+
+test "failed seal key delivery publishes no sealed source artifacts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const manifest =
+        "{\"schema\":\"hylo-source-selection-request/v1\",\"campaign_id\":\"campaign-key-failure\"," ++
+        "\"case_visibility\":\"case_blind\",\"cases\":[{" ++
+        "\"unit_id\":\"unit-key-failure\",\"scenario_id\":\"scenario-key-failure\",\"split\":\"holdout\"," ++
+        "\"source_episode_id\":\"episode-key-failure\",\"visible_input\":{\"request\":\"evaluate the candidate\"}," ++
+        "\"hidden_reference\":{\"answer\":\"sealed\"},\"source_profile\":{\"kind\":\"direct\"}}]}";
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "manifest.json", .data = manifest });
+    const manifest_path = try tmp.dir.realPathFileAlloc(std.testing.io, "manifest.json", std.testing.allocator);
+    defer std.testing.allocator.free(manifest_path);
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const output_path = try std.fs.path.join(std.testing.allocator, &.{ root, "selection.json" });
+    defer std.testing.allocator.free(output_path);
+    const sealed_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "sealed" });
+    defer std.testing.allocator.free(sealed_dir);
+
+    var seed_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&seed_fds));
+    defer _ = std.c.close(seed_fds[0]);
+    const seed = [_]u8{0x51} ** 32;
+    try std.testing.expectEqual(@as(isize, seed.len), std.c.write(seed_fds[1], &seed, seed.len));
+    _ = std.c.close(seed_fds[1]);
+
+    var key_fds: [2]std.c.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&key_fds));
+    defer _ = std.c.close(key_fds[1]);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.fcntl(key_fds[1], std.c.F.SETNOSIGPIPE, @as(c_int, 1)));
+    _ = std.c.close(key_fds[0]);
+
+    try std.testing.expectError(error.BrokenPipe, cmdCompile(std.testing.allocator, .{
+        .action = .compile,
+        .manifest = manifest_path,
+        .output = output_path,
+        .sealed_dir = sealed_dir,
+        .seal_key_output_fd = key_fds[1],
+        .source_signing_seed_fd = seed_fds[0],
+    }));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "selection.json", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "sealed", .{}));
 }
 
 test "Jaccard similarity is symmetric unique-token set similarity" {
