@@ -767,16 +767,7 @@ fn validateSourceProfile(
         if (factor_kind == .target_snapshot and std.mem.eql(u8, source_target_text_policy, "preserve")) {
             return error.SourceTargetTextContamination;
         }
-        const retrace_mode = try requiredString(profile, "retrace_mode");
-        if (std.mem.eql(u8, retrace_mode, "compare")) return error.RetraceCompareForbidden;
-        if (purpose == .promotion and !std.mem.eql(u8, retrace_mode, "replay")) {
-            return error.RetracePromotionModeInvalid;
-        }
-        try requireOneOf(
-            retrace_mode,
-            &.{ "audit", "explain", "replay", "challenge", "evidence_ablation", "retrospective" },
-            error.RetraceModeInvalid,
-        );
+        try validateHistoricalReplayMode(profile, purpose);
         try requireOneOf(
             try requiredString(profile, "required_lineage"),
             &.{ "thread_fork", "rollout_transcript", "either" },
@@ -824,16 +815,7 @@ fn validateSourceProfile(
         if (factor_kind == .target_snapshot and std.mem.eql(u8, source_target_text_policy, "preserve")) {
             return error.SourceTargetTextContamination;
         }
-        const retrace_mode = try requiredString(profile, "retrace_mode");
-        if (std.mem.eql(u8, retrace_mode, "compare")) return error.RetraceCompareForbidden;
-        if (purpose == .promotion and !std.mem.eql(u8, retrace_mode, "replay")) {
-            return error.RetracePromotionModeInvalid;
-        }
-        try requireOneOf(
-            retrace_mode,
-            &.{ "audit", "explain", "replay", "challenge", "evidence_ablation", "retrospective" },
-            error.RetraceModeInvalid,
-        );
+        try validateHistoricalReplayMode(profile, purpose);
         try requireOneOf(
             try requiredString(profile, "required_lineage"),
             &.{ "thread_fork", "rollout_transcript", "either" },
@@ -921,16 +903,7 @@ fn validateSourceProfile(
             false;
         if (!outside_anchor) return error.SourceTargetTextContamination;
     }
-    const retrace_mode = try requiredString(profile, "retrace_mode");
-    if (std.mem.eql(u8, retrace_mode, "compare")) return error.RetraceCompareForbidden;
-    if (purpose == .promotion and !std.mem.eql(u8, retrace_mode, "replay")) {
-        return error.RetracePromotionModeInvalid;
-    }
-    try requireOneOf(
-        retrace_mode,
-        &.{ "audit", "explain", "replay", "challenge", "evidence_ablation", "retrospective" },
-        error.RetraceModeInvalid,
-    );
+    try validateHistoricalReplayMode(profile, purpose);
     try requireOneOf(
         try requiredString(profile, "required_lineage"),
         &.{ "thread_fork", "rollout_transcript", "either" },
@@ -945,6 +918,19 @@ fn validateSourceProfile(
         error.ReconstructabilityInvalid,
     );
     try validateStringArray(try requiredArray(profile, "limitations"), false);
+}
+
+fn validateHistoricalReplayMode(profile: std.json.ObjectMap, purpose: Purpose) !void {
+    const retrace_mode = try requiredString(profile, "retrace_mode");
+    if (std.mem.eql(u8, retrace_mode, "compare")) return error.RetraceCompareForbidden;
+    try requireOneOf(
+        retrace_mode,
+        &.{ "audit", "explain", "replay", "challenge", "evidence_ablation", "retrospective" },
+        error.RetraceModeInvalid,
+    );
+    if (std.mem.eql(u8, retrace_mode, "replay")) return;
+    if (purpose == .promotion) return error.RetracePromotionModeInvalid;
+    return error.RetraceReplayRequired;
 }
 
 fn validateExecution(allocator: std.mem.Allocator, root: std.json.ObjectMap) !void {

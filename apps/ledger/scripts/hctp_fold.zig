@@ -3,8 +3,15 @@ const hctp = @import("hctp.zig");
 const fixtures = @import("hctp_fixtures");
 const retrace_core = @import("retrace_core");
 
+pub const OracleCriticality = struct {
+    scenario_id: []const u8,
+    oracle_id: []const u8,
+    critical: bool,
+};
+
 pub const ResultOptions = struct {
     lifecycle_status: ?[]const u8 = null,
+    oracle_criticalities: ?[]const OracleCriticality = null,
 };
 
 const UnitEffect = struct {
@@ -509,9 +516,23 @@ fn oracleStatus(receipt: std.json.ObjectMap, id: []const u8) !?[]const u8 {
     return null;
 }
 
+fn oracleIsCritical(
+    criticalities: ?[]const OracleCriticality,
+    scenario_id: []const u8,
+    oracle_id: []const u8,
+) !bool {
+    const frozen = criticalities orelse return true;
+    for (frozen) |entry| {
+        if (std.mem.eql(u8, entry.scenario_id, scenario_id) and
+            std.mem.eql(u8, entry.oracle_id, oracle_id)) return entry.critical;
+    }
+    return error.OracleCriticalityMissing;
+}
+
 fn criticalRegressions(
     allocator: std.mem.Allocator,
     trial: *const hctp.TrialState,
+    criticalities: ?[]const OracleCriticality,
 ) !std.ArrayList(CriticalRegression) {
     var regressions: std.ArrayList(CriticalRegression) = .empty;
     const candidate_arm = trial.candidate_arm orelse return regressions;
@@ -536,9 +557,12 @@ fn criticalRegressions(
         for ((try requiredArray(candidate, "oracle_results")).items) |value| {
             const item = try object(value);
             const id = try requiredString(item, "id");
+            const critical = try oracleIsCritical(criticalities, candidate_lane.scenario_id, id);
             const candidate_status = try requiredString(item, "status");
             const baseline_status = try oracleStatus(baseline, id) orelse continue;
-            if (std.mem.eql(u8, baseline_status, "pass") and !std.mem.eql(u8, candidate_status, "pass")) {
+            if (critical and std.mem.eql(u8, baseline_status, "pass") and
+                !std.mem.eql(u8, candidate_status, "pass"))
+            {
                 try regressions.append(allocator, .{
                     .pair_id = pair.id,
                     .authority_kind = "scenario_oracle",
@@ -770,14 +794,23 @@ fn absolutePositiveSensitivity(allocator: std.mem.Allocator, trial: *const hctp.
     return hctp.positiveSensitivity(correct, eligible);
 }
 
-fn criticalFalsePass(allocator: std.mem.Allocator, trial: *const hctp.TrialState) !bool {
+fn criticalFalsePass(
+    allocator: std.mem.Allocator,
+    trial: *const hctp.TrialState,
+    criticalities: ?[]const OracleCriticality,
+) !bool {
     for (trial.lanes.items) |lane| {
         if (lane.grade_status == null or !std.mem.eql(u8, lane.grade_status.?, "pass")) continue;
         const bytes = lane.grade_receipt_json orelse continue;
         const receipt = try object(try parseLeaky(allocator, bytes));
         if ((try requiredArray(receipt, "derived_critical_violations")).items.len != 0) return true;
         for ((try requiredArray(receipt, "oracle_results")).items) |oracle_value| {
-            if (std.mem.eql(u8, try requiredString(try object(oracle_value), "status"), "fail")) {
+            const oracle = try object(oracle_value);
+            if (try oracleIsCritical(
+                criticalities,
+                lane.scenario_id,
+                try requiredString(oracle, "id"),
+            ) and !std.mem.eql(u8, try requiredString(oracle, "status"), "pass")) {
                 return true;
             }
         }
@@ -1099,6 +1132,7 @@ fn calibrationStatus(
     trials: *const hctp.CampaignTrials,
     trial: *const hctp.TrialState,
     trial_root: std.json.ObjectMap,
+    criticalities: ?[]const OracleCriticality,
 ) !CalibrationStatus {
     if (std.mem.eql(u8, trial.purpose, "promotion")) {
         const binding_json = trial.calibration_sentinel_bindings_json orelse return .invalid;
@@ -1221,7 +1255,7 @@ fn calibrationStatus(
             const absolute_config = try commonAbsoluteModelConfigFingerprint(allocator, sentinel) orelse return .invalid;
             if (!std.mem.eql(u8, expected, absolute_config)) return .stale;
         }
-        if (try criticalFalsePass(allocator, sentinel)) return .invalid;
+        if (try criticalFalsePass(allocator, sentinel, criticalities)) return .invalid;
         const predicted = try requiredString(try requiredObject(sentinel_root, "hypothesis"), "predicted_direction");
         const sensitivity_floor = try numeric(try required(calibration, "positive_sensitivity_floor"));
         if (uses_pair_model) {
@@ -1536,8 +1570,14 @@ pub fn resultAlloc(
     const uncertainty = try requiredObject(estimand, "uncertainty");
     const effects = try buildEffects(arena, trial, dimensions);
     try calculateIntervals(arena, trial, uncertainty, effects.splits.items);
-    const regressions = try criticalRegressions(arena, trial);
-    const calibration = try calibrationStatus(arena, trials, trial, trial_root);
+    const regressions = try criticalRegressions(arena, trial, options.oracle_criticalities);
+    const calibration = try calibrationStatus(
+        arena,
+        trials,
+        trial,
+        trial_root,
+        options.oracle_criticalities,
+    );
     const calibration_ok = calibration == .healthy or calibration == .inapplicable;
     const comparable = semanticClaimsAllowed(trial, options.lifecycle_status) and
         try completedAndComparable(arena, trial);
@@ -1866,6 +1906,108 @@ test "cluster bootstrap uses the frozen deterministic seed" {
     try std.testing.expect(first.lower <= mean(&values) and first.upper >= mean(&values));
 }
 
+test "oracle regressions and false passes preserve frozen criticality" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const candidate_lane_json = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        fixtures.valid_grade_receipt,
+        "lane-null-a0",
+        "lane-null-a1",
+    );
+    defer std.testing.allocator.free(candidate_lane_json);
+    const candidate_arm_json = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        candidate_lane_json,
+        "\"arm-0\"",
+        "\"arm-1\"",
+    );
+    defer std.testing.allocator.free(candidate_arm_json);
+    const candidate_grade = try std.mem.replaceOwned(
+        u8,
+        std.testing.allocator,
+        candidate_arm_json,
+        "\"id\": \"required-test\",\n      \"status\": \"pass\"",
+        "\"id\": \"required-test\",\n      \"status\": \"fail\"",
+    );
+    defer std.testing.allocator.free(candidate_grade);
+
+    var lanes = [_]hctp.LaneState{
+        .{
+            .id = @constCast("lane-null-a0"),
+            .unit_id = @constCast("unit-null-001"),
+            .scenario_id = @constCast("scenario-holdout"),
+            .pair_id = @constCast("pair-null-001"),
+            .arm_id = @constCast("arm-0"),
+            .status = .completed,
+            .absolute_graded = true,
+            .grade_status = @constCast("pass"),
+            .grade_receipt_json = @constCast(fixtures.valid_grade_receipt),
+        },
+        .{
+            .id = @constCast("lane-null-a1"),
+            .unit_id = @constCast("unit-null-001"),
+            .scenario_id = @constCast("scenario-holdout"),
+            .pair_id = @constCast("pair-null-001"),
+            .arm_id = @constCast("arm-1"),
+            .status = .completed,
+            .absolute_graded = true,
+            .grade_status = @constCast("pass"),
+            .grade_receipt_json = candidate_grade,
+        },
+    };
+    var pairs = [_]hctp.PairState{.{
+        .id = @constCast("pair-null-001"),
+        .unit_id = @constCast("unit-null-001"),
+        .split = @constCast("practice"),
+        .independence_cluster_id = @constCast("cluster-null-001"),
+        .repeat_index = 1,
+    }};
+    const trial = hctp.TrialState{
+        .id = @constCast("trial-null-001"),
+        .fingerprint = @constCast("sha256:1111111111111111111111111111111111111111111111111111111111111111"),
+        .purpose = @constCast("practice_repair"),
+        .arm0_id = @constCast("arm-0"),
+        .arm1_id = @constCast("arm-1"),
+        .arm_map_commitment = @constCast("sha256:12a363c4474b3da444d517dceed738aefc7c0dfd552d76209a3c3e65d1da0c4d"),
+        .trial_json = @constCast(fixtures.valid_trial),
+        .lanes = .{ .items = &lanes, .capacity = lanes.len },
+        .pairs = .{ .items = &pairs, .capacity = pairs.len },
+        .requires_pair_grade = false,
+        .registration_sequence = 1,
+        .registration_event_digest = @constCast("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        .revealed = true,
+        .baseline_arm = @constCast("arm-0"),
+        .candidate_arm = @constCast("arm-1"),
+    };
+    const noncritical = [_]OracleCriticality{.{
+        .scenario_id = "scenario-holdout",
+        .oracle_id = "required-test",
+        .critical = false,
+    }};
+    var noncritical_regressions = try criticalRegressions(
+        arena,
+        &trial,
+        &noncritical,
+    );
+    defer noncritical_regressions.deinit(arena);
+    try std.testing.expectEqual(@as(usize, 0), noncritical_regressions.items.len);
+    try std.testing.expect(!try criticalFalsePass(arena, &trial, &noncritical));
+
+    const critical = [_]OracleCriticality{.{
+        .scenario_id = "scenario-holdout",
+        .oracle_id = "required-test",
+        .critical = true,
+    }};
+    var critical_regressions = try criticalRegressions(arena, &trial, &critical);
+    defer critical_regressions.deinit(arena);
+    try std.testing.expectEqual(@as(usize, 1), critical_regressions.items.len);
+    try std.testing.expect(try criticalFalsePass(arena, &trial, &critical));
+}
+
 test "paired effects collapse through units and independence clusters" {
     const grade_a1_lane = try std.mem.replaceOwned(
         u8,
@@ -2150,17 +2292,17 @@ test "null bias and positive sensitivity gate the same pair grader" {
     trial_items[0].calibration_sentinel_bindings_json = target_bindings;
     try std.testing.expectEqual(
         CalibrationStatus.biased,
-        try calibrationStatus(arena, &trials, &trial_items[0], target_root),
+        try calibrationStatus(arena, &trials, &trial_items[0], target_root, null),
     );
     null_pairs[0].pair_grade_receipt_json = @constCast(fixtures.valid_pair_grade_receipt);
     try std.testing.expectEqual(
         CalibrationStatus.insensitive,
-        try calibrationStatus(arena, &trials, &trial_items[0], target_root),
+        try calibrationStatus(arena, &trials, &trial_items[0], target_root, null),
     );
     positive_pairs[0].pair_grade_receipt_json = sensitive_pair_receipt;
     try std.testing.expectEqual(
         CalibrationStatus.insensitive,
-        try calibrationStatus(arena, &trials, &trial_items[0], target_root),
+        try calibrationStatus(arena, &trials, &trial_items[0], target_root, null),
     );
     const sealed_target_json = try std.mem.replaceOwned(
         u8,
@@ -2173,7 +2315,7 @@ test "null bias and positive sensitivity gate the same pair grader" {
     const sealed_target_root = try object(try parseLeaky(arena, sealed_target_json));
     try std.testing.expectEqual(
         CalibrationStatus.stale,
-        try calibrationStatus(arena, &trials, &trial_items[0], sealed_target_root),
+        try calibrationStatus(arena, &trials, &trial_items[0], sealed_target_root, null),
     );
     trial_items[2].trial_json = @constCast(
         "{\"assurance\":{\"required_level\":\"precommitted\"},\"hypothesis\":{\"predicted_direction\":\"candidate_better\"}," ++
@@ -2181,7 +2323,7 @@ test "null bias and positive sensitivity gate the same pair grader" {
     );
     try std.testing.expectEqual(
         CalibrationStatus.invalid,
-        try calibrationStatus(arena, &trials, &trial_items[0], target_root),
+        try calibrationStatus(arena, &trials, &trial_items[0], target_root, null),
     );
 }
 
@@ -2358,12 +2500,12 @@ test "independent absolute model calibration uses absolute score evidence" {
     trial_items[0].calibration_sentinel_bindings_json = target_bindings;
     try std.testing.expectEqual(
         CalibrationStatus.healthy,
-        try calibrationStatus(arena, &trials, &trial_items[0], target_root),
+        try calibrationStatus(arena, &trials, &trial_items[0], target_root, null),
     );
     trial_items[2].lanes.items[1].grade_receipt_json = @constCast(model_grade_low);
     try std.testing.expectEqual(
         CalibrationStatus.insensitive,
-        try calibrationStatus(arena, &trials, &trial_items[0], target_root),
+        try calibrationStatus(arena, &trials, &trial_items[0], target_root, null),
     );
 }
 

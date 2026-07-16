@@ -1,6 +1,7 @@
 const app_meta = @import("app_meta");
 const builtin = @import("builtin");
 const core_cli = @import("core_cli");
+const causal_frontier = @import("causal_frontier.zig");
 const durable_store = @import("durable_store");
 const hctp = @import("hctp.zig");
 const hctp_fold = @import("hctp_fold.zig");
@@ -54,6 +55,8 @@ const UsageText =
     \\  append             Validate and append one hylo-event-intent/v1
     \\  doctor             Validate schemas, sequence, hash chain, and state transitions
     \\  progress           Fold one campaign into hylo-progress/v1
+    \\  frontier           Compile the typed causal frontier for one campaign
+    \\  next-experiment    Emit the determinate RUN, OBSERVE, or STOP decision
     \\  path               Print the resolved Hylo event-store path
     \\
     \\options:
@@ -81,8 +84,8 @@ const UsageText =
     \\  --expected-trust-policy-fingerprint DIGEST  Portable proof trust root expected outside the bundle
     \\  --revision REV     Git revision or INDEX for snapshot-target (default: HEAD)
     \\  --json FILE|-      event intent for append
-    \\  --campaign-id ID   Campaign identity for progress or start-lane
-    \\  --format FORMAT    json|markdown for progress or trial-result (default: json)
+    \\  --campaign-id ID   Campaign identity for progress, frontier, next-experiment, or lane commands
+    \\  --format FORMAT    json|markdown for progress, frontier, or trial-result (default: json)
     \\  -h, --help         Show help
     \\  -V, --version      Show version
 ;
@@ -117,6 +120,8 @@ const Command = enum {
     append,
     doctor,
     progress,
+    frontier,
+    next_experiment,
     path,
 };
 
@@ -162,6 +167,10 @@ const EventKind = enum {
     feedback_recorded,
     change_recorded,
     publication_recorded,
+    failure_signature_recorded,
+    hypothesis_recorded,
+    experiment_recorded,
+    next_step_recorded,
     campaign_closed,
     trial_registered,
     lane_started,
@@ -852,6 +861,8 @@ fn runWithArgvInner(allocator: std.mem.Allocator, argv: []const []const u8) !u8 
         },
         .doctor => return try cmdDoctor(allocator, store),
         .progress => try cmdProgress(allocator, store, args.campaign_id.?, args.format),
+        .frontier => try cmdCausalFrontier(allocator, store, args.campaign_id.?, args.format),
+        .next_experiment => try cmdNextExperiment(allocator, store, args.campaign_id.?),
         .path => {
             var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
             try stdout_writer.interface.print("{s}\n", .{store_path});
@@ -1043,7 +1054,8 @@ fn parseArgs(argv: []const []const u8) !Args {
     const uses_input_path = command == .fingerprint or command == .snapshot_target or
         command == .verify_proof or grade_commitment_inspect;
     const uses_json_path = command == .append;
-    const uses_campaign_id = command == .progress or command == .start_lane or
+    const uses_campaign_id = command == .progress or command == .frontier or
+        command == .next_experiment or command == .start_lane or
         command == .commit_lane_start or
         command == .recover_lane_start;
     const uses_trial_id = command == .start_lane or command == .commit_lane_start or
@@ -1122,7 +1134,7 @@ fn parseArgs(argv: []const []const u8) !Args {
             return error.ProofAnchorArgumentsIncomplete;
         }
     } else if (any_proof_anchor) return error.ProofAnchorArgumentsNotAllowed;
-    if (command != .progress and command != .trial_result and args.format != .json) {
+    if (command != .progress and command != .trial_result and command != .frontier and args.format != .json) {
         return error.FormatNotAllowed;
     }
     return args;
@@ -1147,6 +1159,7 @@ fn parseCommand(raw: []const u8) ?Command {
     if (std.mem.eql(u8, raw, "export-proof")) return .export_proof;
     if (std.mem.eql(u8, raw, "verify-proof")) return .verify_proof;
     if (std.mem.eql(u8, raw, "snapshot-target")) return .snapshot_target;
+    if (std.mem.eql(u8, raw, "next-experiment")) return .next_experiment;
     inline for (@typeInfo(Command).@"enum".fields) |field| {
         if (std.mem.eql(u8, raw, field.name)) return @enumFromInt(field.value);
     }
@@ -1516,6 +1529,17 @@ fn validatePromotionScenarioCoverage(
     }
 }
 
+fn validatePromotionRepeatPolicy(
+    campaign: *const CampaignState,
+    trial: std.json.ObjectMap,
+) !void {
+    const required_pairs = try jsonUnsigned(try jsonRequired(
+        try jsonRequiredObject(trial, "stop_policy"),
+        "required_pairs_per_unit",
+    ));
+    if (required_pairs < campaign.repeat_count) return error.ScenarioPromotionIncomplete;
+}
+
 fn validateTrialAgainstCampaign(
     allocator: std.mem.Allocator,
     campaign: *const CampaignState,
@@ -1684,6 +1708,7 @@ fn validateTrialAgainstCampaign(
     }
     const purpose = try jsonRequiredString(trial, "purpose");
     if (std.mem.eql(u8, purpose, "promotion")) {
+        try validatePromotionRepeatPolicy(campaign, trial);
         try validatePromotionTargetEpochUnique(allocator, campaign, trial);
         try validatePromotionScenarioCoverage(campaign, units);
     }
@@ -2962,13 +2987,15 @@ fn trialResultAlloc(
     campaign: *const CampaignState,
     trial: *const hctp.TrialState,
 ) ![]u8 {
+    const oracle_criticalities = try hctpOracleCriticalitiesAlloc(allocator, campaign);
+    defer allocator.free(oracle_criticalities);
     return hctp_fold.resultAlloc(
         allocator,
         campaign.id,
         trial.close_result_chain_head orelse campaign.last_digest,
         &campaign.hctp_trials,
         trial,
-        .{},
+        .{ .oracle_criticalities = oracle_criticalities },
     );
 }
 
@@ -2978,14 +3005,42 @@ fn trialResultForLifecycleAlloc(
     trial: *const hctp.TrialState,
     lifecycle_status: []const u8,
 ) ![]u8 {
+    const oracle_criticalities = try hctpOracleCriticalitiesAlloc(allocator, campaign);
+    defer allocator.free(oracle_criticalities);
     return hctp_fold.resultAlloc(
         allocator,
         campaign.id,
         campaign.last_digest,
         &campaign.hctp_trials,
         trial,
-        .{ .lifecycle_status = lifecycle_status },
+        .{
+            .lifecycle_status = lifecycle_status,
+            .oracle_criticalities = oracle_criticalities,
+        },
     );
+}
+
+fn hctpOracleCriticalitiesAlloc(
+    allocator: std.mem.Allocator,
+    campaign: *const CampaignState,
+) ![]hctp_fold.OracleCriticality {
+    var count: usize = 0;
+    for (campaign.scenarios.items) |scenario| {
+        count = std.math.add(usize, count, scenario.oracles.len) catch return error.InvalidPositiveCount;
+    }
+    const result = try allocator.alloc(hctp_fold.OracleCriticality, count);
+    var index: usize = 0;
+    for (campaign.scenarios.items) |scenario| {
+        for (scenario.oracles) |oracle| {
+            result[index] = .{
+                .scenario_id = scenario.id,
+                .oracle_id = oracle.id,
+                .critical = oracle.critical,
+            };
+            index += 1;
+        }
+    }
+    return result;
 }
 
 fn markdownEscaped(writer: *std.Io.Writer, value: []const u8) !void {
@@ -8244,6 +8299,7 @@ const OracleState = struct {
 const ScenarioState = struct {
     id: []u8,
     split: Split,
+    fidelity: []u8,
     fingerprint: []u8,
     source_episode_fingerprint: []u8,
     case_visibility: []u8,
@@ -8258,6 +8314,7 @@ const ScenarioState = struct {
 
     fn deinit(self: *ScenarioState, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
+        allocator.free(self.fidelity);
         allocator.free(self.fingerprint);
         allocator.free(self.source_episode_fingerprint);
         allocator.free(self.case_visibility);
@@ -8473,6 +8530,7 @@ const CampaignState = struct {
     source_corpus_fingerprint: ?[]u8 = null,
     rubric_fingerprint: ?[]u8 = null,
     replay_policy_fingerprint: ?[]u8 = null,
+    replay_default_fidelity: ?[]u8 = null,
     grader_authority_fingerprint: ?[]u8 = null,
     minimum_aggregate: f64 = 0,
     zero_critical_violations: bool = true,
@@ -8491,6 +8549,7 @@ const CampaignState = struct {
     changes: std.ArrayList(ChangeState) = .empty,
     publications: std.ArrayList(PublicationState) = .empty,
     target_bindings: std.ArrayList(TargetBindingState) = .empty,
+    causal_frontier_state: causal_frontier.State = .{},
     trial_profile: bool = false,
     trial_policy_fingerprint: ?[]u8 = null,
     trial_policy_json: ?[]u8 = null,
@@ -8507,6 +8566,7 @@ const CampaignState = struct {
         if (self.source_corpus_fingerprint) |value| allocator.free(value);
         if (self.rubric_fingerprint) |value| allocator.free(value);
         if (self.replay_policy_fingerprint) |value| allocator.free(value);
+        if (self.replay_default_fidelity) |value| allocator.free(value);
         if (self.grader_authority_fingerprint) |value| allocator.free(value);
         freeStringList(allocator, self.allowed_paths);
         for (self.rubric_dimensions) |*value| value.deinit(allocator);
@@ -8525,6 +8585,7 @@ const CampaignState = struct {
         self.publications.deinit(allocator);
         for (self.target_bindings.items) |*value| value.deinit(allocator);
         self.target_bindings.deinit(allocator);
+        self.causal_frontier_state.deinit(allocator);
         if (self.trial_policy_fingerprint) |value| allocator.free(value);
         if (self.trial_policy_json) |value| allocator.free(value);
         self.hctp_trials.deinit(allocator);
@@ -8781,6 +8842,261 @@ fn currentTargetFingerprint(campaign: *const CampaignState) []const u8 {
         if (change.status == .applied) current = change.after_target_fingerprint;
     }
     return current;
+}
+
+fn appendFrontierEvidenceRef(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList([]const u8),
+    kind: []const u8,
+    id: []const u8,
+) !void {
+    try list.append(allocator, try std.fmt.allocPrint(allocator, "{s}:{s}", .{ kind, id }));
+}
+
+fn reproducibleCurrentPracticeFailure(
+    campaign: *const CampaignState,
+    grade_index: usize,
+    current_target: []const u8,
+) bool {
+    const grade = &campaign.grades.items[grade_index];
+    const scenario = findScenario(campaign, grade.scenario_id) orelse return false;
+    if (scenario.split != .practice or !scenarioReplayEligible(scenario) or
+        grade.status != .fail or !grade.comparison_eligible or
+        !std.mem.eql(u8, grade.target_fingerprint, current_target) or
+        !scenarioOnFrontier(campaign, scenario.id, current_target)) return false;
+    var matching_failures: u64 = 0;
+    for (campaign.grades.items) |*candidate| {
+        if (candidate.status != .fail or !candidate.comparison_eligible or
+            !std.mem.eql(u8, candidate.target_fingerprint, current_target) or
+            !gradesComparable(grade, candidate)) continue;
+        matching_failures = std.math.add(u64, matching_failures, 1) catch return true;
+    }
+    return matching_failures >= campaign.repeat_count;
+}
+
+fn scenarioReplayEligible(scenario: *const ScenarioState) bool {
+    return std.mem.eql(u8, scenario.fidelity, "controlled_replay") or
+        std.mem.eql(u8, scenario.fidelity, "exact_reconstruction");
+}
+
+fn trialUsesOnlyReplayEligibleScenarios(
+    allocator: std.mem.Allocator,
+    campaign: *const CampaignState,
+    trial: *const hctp.TrialState,
+) !bool {
+    var parsed = try trialJsonParsed(allocator, trial);
+    defer parsed.deinit();
+    for ((try jsonRequiredArray(try jsonObject(parsed.value), "units")).items) |unit_value| {
+        const scenario_id = try jsonRequiredString(try jsonObject(unit_value), "scenario_id");
+        const scenario = findScenario(campaign, scenario_id) orelse return false;
+        if (!scenarioReplayEligible(scenario)) return false;
+    }
+    return true;
+}
+
+fn trialContainsProtectedUnit(
+    allocator: std.mem.Allocator,
+    trial: *const hctp.TrialState,
+) !bool {
+    var parsed = try trialJsonParsed(allocator, trial);
+    defer parsed.deinit();
+    for ((try jsonRequiredArray(try jsonObject(parsed.value), "units")).items) |unit_value| {
+        const split = try jsonRequiredString(try jsonObject(unit_value), "split");
+        if (!std.mem.eql(u8, split, "practice")) return true;
+    }
+    return false;
+}
+
+const FrontierPracticeTrialDisposition = enum { failure, resolved };
+
+const FrontierPracticeTrialEvidence = struct {
+    failure_signature: []const u8,
+    trial_id: []const u8,
+    close_sequence: u64,
+    disposition: FrontierPracticeTrialDisposition,
+};
+
+fn completedPracticeTrialEvidence(
+    allocator: std.mem.Allocator,
+    campaign: *const CampaignState,
+    trial: *const hctp.TrialState,
+    current_target: []const u8,
+) !?FrontierPracticeTrialEvidence {
+    if (!std.mem.eql(u8, trial.purpose, "practice_repair") or !trial.revealed or
+        !try trialHasValidCompletedClosure(allocator, trial) or
+        !try trialUsesOnlyReplayEligibleScenarios(allocator, campaign, trial)) return null;
+    var trial_parsed = try trialJsonParsed(allocator, trial);
+    defer trial_parsed.deinit();
+    const trial_root = try jsonObject(trial_parsed.value);
+    const required_pairs = try jsonUnsigned(try jsonRequired(
+        try jsonRequiredObject(trial_root, "stop_policy"),
+        "required_pairs_per_unit",
+    ));
+    if (required_pairs < campaign.repeat_count) return null;
+    const failure_signature = try jsonRequiredString(
+        try jsonRequiredObject(trial_root, "hypothesis"),
+        "primary_failure_signature",
+    );
+    const result = try trialResultAlloc(allocator, campaign, trial);
+    defer allocator.free(result);
+    var parsed = try parseValue(allocator, result);
+    defer parsed.deinit();
+    const root = try jsonObject(parsed.value);
+    const arms = try jsonRequiredObject(root, "arms");
+    if (!std.mem.eql(
+        u8,
+        try jsonRequiredString(arms, "candidate_target_fingerprint"),
+        current_target,
+    )) return null;
+    const claims_value = try jsonRequired(root, "claims");
+    if (claims_value == .null) return null;
+    const claims = try jsonObject(claims_value);
+    const regression = try jsonRequiredString(claims, "regression");
+    const qualification = try jsonRequiredString(claims, "absolute_qualification");
+    const disposition: FrontierPracticeTrialDisposition = if (std.mem.eql(u8, regression, "supported") or std.mem.eql(u8, qualification, "unsupported"))
+        .failure
+    else if (std.mem.eql(u8, regression, "unsupported") and std.mem.eql(u8, qualification, "supported"))
+        .resolved
+    else
+        return null;
+    return .{
+        .failure_signature = try allocator.dupe(u8, failure_signature),
+        .trial_id = trial.id,
+        .close_sequence = trial.close_sequence orelse return error.TrialIncomplete,
+        .disposition = disposition,
+    };
+}
+
+fn causalFrontierReconstructionReady(campaign: *const CampaignState) bool {
+    return allScenariosAdmitted(campaign) and targetIdentityReady(campaign);
+}
+
+fn causalFrontierRuntimeFingerprintAlloc(
+    allocator: std.mem.Allocator,
+    campaign: *const CampaignState,
+) ![]u8 {
+    var scenarios: std.ArrayList(*const ScenarioState) = .empty;
+    defer scenarios.deinit(allocator);
+    for (campaign.scenarios.items) |*scenario| try scenarios.append(allocator, scenario);
+    std.mem.sort(*const ScenarioState, scenarios.items, {}, struct {
+        fn lessThan(_: void, left: *const ScenarioState, right: *const ScenarioState) bool {
+            return std.mem.order(u8, left.id, right.id) == .lt;
+        }
+    }.lessThan);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hashTagged(
+        &hasher,
+        "replay-policy",
+        campaign.replay_policy_fingerprint orelse return error.ReplayPolicyMissing,
+    );
+    for (scenarios.items) |scenario| {
+        hashTagged(&hasher, "scenario", scenario.id);
+        hashTagged(&hasher, "fidelity", scenario.fidelity);
+        hashTagged(&hasher, "environment", scenario.environment_fingerprint);
+        hashTagged(&hasher, "effect-policy", scenario.effect_policy_fingerprint);
+        hashTagged(&hasher, "scenario-replay-policy", scenario.replay_policy_fingerprint);
+    }
+    return finishDigestAlloc(allocator, &hasher);
+}
+
+fn causalFrontierAlloc(
+    allocator: std.mem.Allocator,
+    campaign: *const CampaignState,
+) ![]u8 {
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const current_target = currentTargetFingerprint(campaign);
+    const current_binding = findTargetBinding(campaign, current_target);
+    const current_bundle = if (current_binding) |binding| binding.bundle_fingerprint else current_target;
+    const runtime_fingerprint = try causalFrontierRuntimeFingerprintAlloc(arena, campaign);
+
+    var admitted_bundles: std.ArrayList([]const u8) = .empty;
+    for (campaign.target_bindings.items) |binding| try admitted_bundles.append(arena, binding.bundle_fingerprint);
+    var rubric_dimension_ids: std.ArrayList([]const u8) = .empty;
+    for (campaign.rubric_dimensions) |dimension| try rubric_dimension_ids.append(arena, dimension.id);
+    var scenario_ids: std.ArrayList([]const u8) = .empty;
+    var replay_eligible_scenario_ids: std.ArrayList([]const u8) = .empty;
+    var holdout_capacity: u64 = 0;
+    for (campaign.scenarios.items) |scenario| {
+        try scenario_ids.append(arena, scenario.id);
+        if (scenarioReplayEligible(&scenario)) try replay_eligible_scenario_ids.append(arena, scenario.id);
+        if (scenario.split != .practice) {
+            holdout_capacity = std.math.add(u64, holdout_capacity, campaign.repeat_count) catch std.math.maxInt(u64);
+        }
+    }
+    if (campaign.holdout_exposure_state == .exposed) holdout_capacity = 0;
+
+    var practice_evidence: std.ArrayList([]const u8) = .empty;
+    var holdout_evidence: std.ArrayList([]const u8) = .empty;
+    for (campaign.grades.items, 0..) |grade, grade_index| {
+        const scenario = findScenario(campaign, grade.scenario_id) orelse continue;
+        if (reproducibleCurrentPracticeFailure(campaign, grade_index, current_target)) {
+            try appendFrontierEvidenceRef(arena, &practice_evidence, "grade", grade.id);
+        } else if (scenario.split != .practice) {
+            try appendFrontierEvidenceRef(arena, &holdout_evidence, "grade", grade.id);
+        }
+    }
+    var practice_trial_frontier: std.ArrayList(FrontierPracticeTrialEvidence) = .empty;
+    for (campaign.hctp_trials.trials.items) |trial| {
+        if (try trialContainsProtectedUnit(arena, &trial)) {
+            try appendFrontierEvidenceRef(arena, &holdout_evidence, "trial", trial.id);
+        } else if (try completedPracticeTrialEvidence(
+            arena,
+            campaign,
+            &trial,
+            current_target,
+        )) |evidence| {
+            var replaced = false;
+            for (practice_trial_frontier.items) |*prior| {
+                if (!std.mem.eql(u8, prior.failure_signature, evidence.failure_signature)) continue;
+                if (evidence.close_sequence > prior.close_sequence) prior.* = evidence;
+                replaced = true;
+                break;
+            }
+            if (!replaced) try practice_trial_frontier.append(arena, evidence);
+        }
+    }
+    for (practice_trial_frontier.items) |evidence| {
+        if (evidence.disposition == .failure) {
+            try appendFrontierEvidenceRef(arena, &practice_evidence, "trial", evidence.trial_id);
+        }
+    }
+
+    var used_attempts: u64 = @intCast(campaign.attempts.items.len);
+    for (campaign.hctp_trials.trials.items) |trial| {
+        for (trial.lanes.items) |lane| if (lane.started_sequence != null) {
+            used_attempts = std.math.add(u64, used_attempts, 1) catch std.math.maxInt(u64);
+        };
+    }
+    const remaining_attempts = campaign.max_attempts -| used_attempts;
+    const causal_artifact_fingerprint = try causal_frontier.inputFingerprintAlloc(
+        arena,
+        &campaign.causal_frontier_state,
+    );
+    var basis_hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hashTagged(&basis_hasher, "campaign-head", campaign.last_digest);
+    hashTagged(&basis_hasher, "causal-artifacts", causal_artifact_fingerprint);
+    const frontier_input_fingerprint = try finishDigestAlloc(arena, &basis_hasher);
+    return causal_frontier.compileAlloc(allocator, &campaign.causal_frontier_state, .{
+        .campaign_id = campaign.id,
+        .current_bundle_fingerprint = current_bundle,
+        .runtime_fingerprint = runtime_fingerprint,
+        .admitted_bundle_fingerprints = admitted_bundles.items,
+        .allowed_paths = @ptrCast(campaign.allowed_paths),
+        .practice_evidence_refs = practice_evidence.items,
+        .holdout_evidence_refs = holdout_evidence.items,
+        .admitted_scenario_ids = scenario_ids.items,
+        .replay_eligible_scenario_ids = replay_eligible_scenario_ids.items,
+        .rubric_dimension_ids = rubric_dimension_ids.items,
+        .satisfied_applicability_conditions = &.{},
+        .target_change_authorized = campaign.target_change_authority == .apply_via_owner,
+        .holdout_exposed = campaign.holdout_exposure_state == .exposed,
+        .remaining_attempts = remaining_attempts,
+        .holdout_attempt_capacity = holdout_capacity,
+        .reconstruction_ready = causalFrontierReconstructionReady(campaign),
+        .frontier_fingerprint_basis = frontier_input_fingerprint,
+    });
 }
 
 fn livePromotionTrial(campaign: *const CampaignState) bool {
@@ -10552,6 +10868,7 @@ fn validateTrialPublication(
     var trial_parsed = try trialJsonParsed(allocator, trial);
     defer trial_parsed.deinit();
     const trial_root = try jsonObject(trial_parsed.value);
+    try validatePromotionRepeatPolicy(campaign, trial_root);
     const epoch = try jsonRequiredObject(trial_root, "target_epoch");
     if (!std.mem.eql(u8, try jsonRequiredString(epoch, "change_id"), change.id) or
         !std.mem.eql(u8, try jsonRequiredString(epoch, "after_target_fingerprint"), change.after_target_fingerprint))
@@ -10998,6 +11315,11 @@ fn applyEvent(
             errdefer allocator.free(rubric);
             const replay = try allocator.dupe(u8, campaign_input.value.replay_policy.fingerprint);
             errdefer allocator.free(replay);
+            const replay_default_fidelity = try allocator.dupe(
+                u8,
+                campaign_input.value.replay_policy.default_fidelity,
+            );
+            errdefer allocator.free(replay_default_fidelity);
             const allowed = try dupeStringList(allocator, campaign_input.value.change_policy.allowed_paths);
             errdefer freeStringList(allocator, allowed);
             const rubric_dimensions = try allocator.alloc(
@@ -11066,6 +11388,7 @@ fn applyEvent(
             campaign.source_corpus_fingerprint = corpus;
             campaign.rubric_fingerprint = rubric;
             campaign.replay_policy_fingerprint = replay;
+            campaign.replay_default_fidelity = replay_default_fidelity;
             campaign.grader_authority_fingerprint = grader_authority_fingerprint;
             campaign.minimum_aggregate = campaign_input.value.rubric.pass_policy.minimum_aggregate;
             campaign.zero_critical_violations = campaign_input.value.rubric.pass_policy.zero_critical_violations;
@@ -11136,6 +11459,8 @@ fn applyEvent(
             errdefer allocator.free(state_id);
             const fingerprint = try allocator.dupe(u8, payload.value.scenario_fingerprint);
             errdefer allocator.free(fingerprint);
+            var fidelity: ?[]u8 = null;
+            errdefer if (fidelity) |value| allocator.free(value);
             var source_episode_fingerprint: ?[]u8 = null;
             errdefer if (source_episode_fingerprint) |value| allocator.free(value);
             var case_visibility: ?[]u8 = null;
@@ -11173,6 +11498,10 @@ fn applyEvent(
                 if (!std.mem.eql(u8, scenario_input.value.scenario_id, scenario_id)) return error.ScenarioMismatch;
                 split = Split.parse(scenario_input.value.split).?;
                 if (split != expected.split) return error.ScenarioManifestMismatch;
+                fidelity = try allocator.dupe(
+                    u8,
+                    campaign.replay_default_fidelity orelse return error.ReplayPolicyMissing,
+                );
                 case_visibility = try allocator.dupe(u8, "case_blind");
                 source_episode_fingerprint = try allocator.dupe(u8, scenario_input.value.source_episode_fingerprint);
                 visible_input_fingerprint = try allocator.dupe(u8, scenario_input.value.visible_input_fingerprint);
@@ -11210,6 +11539,7 @@ fn applyEvent(
                 if (scenario_input.value.mutation) |mutation| {
                     if (findScenario(campaign, mutation.parent_scenario_id) == null) return error.MutationParentMissing;
                 }
+                fidelity = try allocator.dupe(u8, scenario_input.value.environment.fidelity);
                 case_visibility = try allocator.dupe(u8, "open");
                 source_episode_fingerprint = try allocator.dupe(u8, scenario_input.value.source_episode_fingerprint);
                 visible_input_fingerprint = try allocator.dupe(u8, payload.value.scenario_fingerprint);
@@ -11236,6 +11566,7 @@ fn applyEvent(
             const state = ScenarioState{
                 .id = state_id,
                 .split = split,
+                .fidelity = fidelity.?,
                 .fingerprint = fingerprint,
                 .source_episode_fingerprint = source_episode_fingerprint.?,
                 .case_visibility = case_visibility.?,
@@ -12042,6 +12373,57 @@ fn applyEvent(
                 campaign.last_digest,
             );
         },
+        .failure_signature_recorded => {
+            try requireCreated(campaign);
+            try validateBodyIds(body.value, false, false, false);
+            try causal_frontier.applyFailureSignature(
+                allocator,
+                &campaign.causal_frontier_state,
+                body.value.payload,
+            );
+        },
+        .hypothesis_recorded => {
+            try requireCreated(campaign);
+            try validateBodyIds(body.value, false, false, false);
+            const payload = try jsonObject(body.value.payload);
+            if (!std.mem.eql(u8, try jsonRequiredString(payload, "campaign_id"), campaign.id)) {
+                return error.CampaignMismatch;
+            }
+            try causal_frontier.applyHypothesis(
+                allocator,
+                &campaign.causal_frontier_state,
+                body.value.payload,
+            );
+        },
+        .experiment_recorded => {
+            try requireCreated(campaign);
+            try validateBodyIds(body.value, false, false, false);
+            const payload = try jsonObject(body.value.payload);
+            if (!std.mem.eql(u8, try jsonRequiredString(payload, "campaign_id"), campaign.id)) {
+                return error.CampaignMismatch;
+            }
+            try causal_frontier.applyExperiment(
+                allocator,
+                &campaign.causal_frontier_state,
+                body.value.payload,
+            );
+        },
+        .next_step_recorded => {
+            try requireCreated(campaign);
+            try validateBodyIds(body.value, false, false, false);
+            const payload = try jsonObject(body.value.payload);
+            if (!std.mem.eql(u8, try jsonRequiredString(payload, "campaign_id"), campaign.id)) {
+                return error.CampaignMismatch;
+            }
+            const expected = try causalFrontierAlloc(allocator, campaign);
+            defer allocator.free(expected);
+            try causal_frontier.recordExpectedDecision(
+                allocator,
+                &campaign.causal_frontier_state,
+                body.value.payload,
+                expected,
+            );
+        },
         .campaign_closed => {
             try requireCreated(campaign);
             try validateBodyIds(body.value, false, false, false);
@@ -12478,6 +12860,25 @@ fn progressDigestAlloc(allocator: std.mem.Allocator, campaign: *const CampaignSt
     hashTagged(&hasher, "campaign-head", campaign.last_digest);
     hashTagged(&hasher, "status", if (campaign.closed) "closed" else "open");
     return finishDigestAlloc(allocator, &hasher);
+}
+
+fn writeCausalProgressProjection(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    campaign: *const CampaignState,
+) !void {
+    if (campaign.target_identity_mode == .legacy) return;
+    const causal_frontier_json = try causalFrontierAlloc(allocator, campaign);
+    defer allocator.free(causal_frontier_json);
+    try writer.writeAll(",\"causal_frontier\":");
+    try writer.writeAll(causal_frontier_json);
+    const recorded_next_steps = try causal_frontier.recordedDecisionProjectionAlloc(
+        allocator,
+        &campaign.causal_frontier_state,
+    );
+    defer allocator.free(recorded_next_steps);
+    try writer.writeAll(",\"next_step_decisions\":");
+    try writer.writeAll(recorded_next_steps);
 }
 
 fn latestEligibleGradeForTarget(
@@ -13064,9 +13465,72 @@ fn cmdProgress(
     }
     try out.writer.writeByte(']');
     if (campaign.trial_profile) try writeTrialProfileProgress(allocator, &out.writer, campaign);
+    try writeCausalProgressProjection(allocator, &out.writer, campaign);
     try out.writer.writeAll(",\"progress_fingerprint\":");
     try std.json.Stringify.value(progress_digest, .{}, &out.writer);
     try out.writer.writeAll("}\n");
+    try writeStdoutAlloc(allocator, &out);
+}
+
+fn cmdCausalFrontier(
+    allocator: std.mem.Allocator,
+    store: durable_store.EventStore,
+    campaign_id: []const u8,
+    format: OutputFormat,
+) !void {
+    try validateId(campaign_id);
+    var loaded = try loadLedger(allocator, store);
+    defer loaded.deinit(allocator);
+    const campaign_index = findCampaign(loaded.campaigns.items, campaign_id) orelse return error.CampaignMissing;
+    const campaign = &loaded.campaigns.items[campaign_index];
+    try requireCreated(campaign);
+    const frontier = try causalFrontierAlloc(allocator, campaign);
+    defer allocator.free(frontier);
+    if (format == .json) {
+        var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+        try stdout_writer.interface.writeAll(frontier);
+        try stdout_writer.interface.writeByte('\n');
+        return;
+    }
+    var parsed = try parseValue(allocator, frontier);
+    defer parsed.deinit();
+    const root = try jsonObject(parsed.value);
+    const next_step = try jsonRequiredObject(root, "next_step");
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.print(
+        "# Hylo Causal Frontier: {s}\n\n- Decision: {s}\n- Eligible experiments: {d}\n- Ineligible experiments: {d}\n- Frontier fingerprint: {s}\n",
+        .{
+            campaign_id,
+            try jsonRequiredString(next_step, "decision"),
+            (try jsonRequiredArray(root, "eligible_experiment_ids")).items.len,
+            (try jsonRequiredArray(root, "ineligible")).items.len,
+            try jsonRequiredString(root, "frontier_fingerprint"),
+        },
+    );
+    try writeStdoutAlloc(allocator, &out);
+}
+
+fn cmdNextExperiment(
+    allocator: std.mem.Allocator,
+    store: durable_store.EventStore,
+    campaign_id: []const u8,
+) !void {
+    try validateId(campaign_id);
+    var loaded = try loadLedger(allocator, store);
+    defer loaded.deinit(allocator);
+    const campaign_index = findCampaign(loaded.campaigns.items, campaign_id) orelse return error.CampaignMissing;
+    const campaign = &loaded.campaigns.items[campaign_index];
+    try requireCreated(campaign);
+    const frontier = try causalFrontierAlloc(allocator, campaign);
+    defer allocator.free(frontier);
+    var parsed = try parseValue(allocator, frontier);
+    defer parsed.deinit();
+    const next_step = try jsonRequired(try jsonObject(parsed.value), "next_step");
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try writeCanonicalJson(allocator, &out.writer, next_step);
+    try out.writer.writeByte('\n');
     try writeStdoutAlloc(allocator, &out);
 }
 
@@ -13820,6 +14284,22 @@ fn testReplaceFirstAlloc(
     @memcpy(output[index .. index + replacement.len], replacement);
     @memcpy(output[index + replacement.len ..], input[index + needle.len ..]);
     return output;
+}
+
+test "HCTP promotion pair repeats satisfy the frozen campaign repeat policy" {
+    var parsed = try parseValue(std.testing.allocator, hctp_fixtures.valid_null_trial);
+    defer parsed.deinit();
+    var campaign = CampaignState{
+        .id = @constCast("cmp-repeat-policy"),
+        .last_digest = @constCast(GenesisDigest),
+        .repeat_count = 2,
+    };
+    try std.testing.expectError(
+        error.ScenarioPromotionIncomplete,
+        validatePromotionRepeatPolicy(&campaign, try jsonObject(parsed.value)),
+    );
+    campaign.repeat_count = 1;
+    try validatePromotionRepeatPolicy(&campaign, try jsonObject(parsed.value));
 }
 
 fn testReplaceFirstCurrent(
@@ -16985,6 +17465,200 @@ test "hylo grade commitment inspect rejects a trial id ambiguous across campaign
     );
 }
 
+test "hylo progress preserves legacy bytes and exposes causal state for bundle campaigns" {
+    const fingerprint = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    var campaign = CampaignState{
+        .id = @constCast("cmp-progress-causal"),
+        .last_digest = @constCast(GenesisDigest),
+        .baseline_target_fingerprint = @constCast(fingerprint),
+        .replay_policy_fingerprint = @constCast(fingerprint),
+        .target_identity_mode = .legacy,
+    };
+
+    var legacy: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer legacy.deinit();
+    try writeCausalProgressProjection(std.testing.allocator, &legacy.writer, &campaign);
+    try std.testing.expectEqualStrings("", legacy.written());
+
+    campaign.target_identity_mode = .bundle_snapshot;
+    var modern: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer modern.deinit();
+    try writeCausalProgressProjection(std.testing.allocator, &modern.writer, &campaign);
+    try std.testing.expect(std.mem.indexOf(u8, modern.written(), "\"causal_frontier\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, modern.written(), "\"next_step_decisions\":") != null);
+}
+
+test "hylo causal frontier reducer retains typed artifacts and rejects a forged decision" {
+    const allocator = std.testing.allocator;
+    var campaign = CampaignState{
+        .id = try allocator.dupe(u8, "cmp-frontier"),
+        .created = true,
+        .last_digest = try allocator.dupe(u8, GenesisDigest),
+        .baseline_target_fingerprint = try allocator.dupe(
+            u8,
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        .replay_policy_fingerprint = try allocator.dupe(
+            u8,
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        ),
+        .max_attempts = 8,
+        .target_change_authority = .apply_via_owner,
+    };
+    defer campaign.deinit(allocator);
+
+    var failure_body = try parseValue(
+        allocator,
+        "{\"attempt_id\":null,\"grade_id\":null,\"payload\":{\"schema\":\"hylo-failure-signature/v1\",\"failure_signature_id\":\"fs-frontier\",\"name\":\"constraint loss\",\"observable_predicate\":{},\"episode_family_refs\":[\"family-frontier\"],\"dimension_refs\":[\"correctness\"],\"hard_gate_refs\":[],\"evidence_refs\":[\"grade:g-frontier\"]},\"scenario_id\":null}",
+    );
+    defer failure_body.deinit();
+    try applyEvent(allocator, &campaign, .failure_signature_recorded, failure_body.value, 1, GenesisDigest);
+
+    var hypothesis_body = try parseValue(
+        allocator,
+        "{\"attempt_id\":null,\"grade_id\":null,\"payload\":{\"schema\":\"hylo-causal-hypothesis/v1\",\"hypothesis_id\":\"H-frontier\",\"campaign_id\":\"cmp-frontier\",\"context\":{\"target_bundle_fingerprint\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"runtime_fingerprint\":\"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"applicability_conditions\":[]},\"mechanism\":{\"claim\":\"constraint is dropped\",\"failure_signature_ids\":[\"fs-frontier\"],\"evidence_refs\":[\"grade:g-frontier\"],\"causal_cut_points\":[\"post-tool\"]},\"predicted_scope\":{\"affected_episode_families\":[\"family-frontier\"],\"affected_dimensions\":[\"correctness\"],\"protected_dimensions\":[\"tool-correctness\"]},\"candidate_intervention\":{\"kind\":\"skill_rule_change\",\"semantic_surface\":\"post-tool invariant\",\"allowed_paths\":[\"skills/hylo/SKILL.md\"],\"reversible\":true},\"falsifiers\":[{\"kind\":\"failure_persists\"}],\"status\":\"eligible\"},\"scenario_id\":null}",
+    );
+    defer hypothesis_body.deinit();
+    try applyEvent(allocator, &campaign, .hypothesis_recorded, hypothesis_body.value, 2, GenesisDigest);
+
+    var experiment_body = try parseValue(
+        allocator,
+        "{\"attempt_id\":null,\"grade_id\":null,\"payload\":{\"schema\":\"hylo-experiment/v1\",\"experiment_id\":\"E-frontier\",\"campaign_id\":\"cmp-frontier\",\"kind\":\"target_intervention\",\"status\":\"proposed\",\"hypothesis_ids\":[\"H-frontier\"],\"evidence_refs\":[\"grade:g-frontier\"],\"intervention\":{\"description\":\"add one invariant\",\"allowed_paths\":[\"skills/hylo/SKILL.md\"],\"semantic_change_budget\":{\"rules_added\":1,\"rules_removed\":0,\"sections_touched\":1},\"reversible\":true,\"route_fingerprint\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"applicability_fingerprint\":\"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"parent_bundle_fingerprint\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"candidate_bundle_fingerprint\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"},\"predictions\":[{\"scenario_id\":\"scenario-frontier\",\"dimension_id\":\"correctness\",\"direction\":\"improve\",\"critical\":true}],\"controls\":[{\"scenario_id\":\"scenario-frontier\",\"dimension_id\":\"tool-correctness\",\"allowed_direction\":\"no_regression\"}],\"falsifiers\":[{\"kind\":\"prediction_not_observed\"}],\"budget\":{\"practice_attempts\":1,\"holdout_attempts_reserved\":1},\"decision_dimensions\":{\"evidence\":\"direct\",\"discriminability\":\"unique\",\"scope\":\"single_rule\",\"coverage\":\"single_failure\",\"reversibility\":\"complete\",\"risk\":\"low\",\"cost\":\"low\"},\"discriminates_hypotheses\":[]},\"scenario_id\":null}",
+    );
+    defer experiment_body.deinit();
+    try applyEvent(allocator, &campaign, .experiment_recorded, experiment_body.value, 3, GenesisDigest);
+
+    try std.testing.expectEqual(@as(usize, 1), campaign.causal_frontier_state.failure_signatures.items.len);
+    try std.testing.expectEqual(@as(usize, 1), campaign.causal_frontier_state.hypotheses.items.len);
+    try std.testing.expectEqual(@as(usize, 1), campaign.causal_frontier_state.experiments.items.len);
+
+    const expected = try causalFrontierAlloc(allocator, &campaign);
+    defer allocator.free(expected);
+    try std.testing.expect(std.mem.indexOf(u8, expected, "\"decision\":\"stop\"") != null);
+    var expected_parsed = try parseValue(allocator, expected);
+    defer expected_parsed.deinit();
+    const expected_next_step = try jsonRequired(try jsonObject(expected_parsed.value), "next_step");
+    const expected_next_step_json = try canonicalJsonAlloc(allocator, expected_next_step);
+    defer allocator.free(expected_next_step_json);
+    const forged = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        expected_next_step_json,
+        "\"decision\":\"stop\"",
+        "\"decision\":\"run\"",
+    );
+    defer allocator.free(forged);
+
+    var forged_body_text: std.Io.Writer.Allocating = .init(allocator);
+    defer forged_body_text.deinit();
+    try forged_body_text.writer.writeAll("{\"attempt_id\":null,\"grade_id\":null,\"payload\":");
+    try forged_body_text.writer.writeAll(forged);
+    try forged_body_text.writer.writeAll(",\"scenario_id\":null}");
+    var forged_body = try parseValue(allocator, forged_body_text.written());
+    defer forged_body.deinit();
+    try std.testing.expectError(
+        error.NextStepDecisionMismatch,
+        applyEvent(allocator, &campaign, .next_step_recorded, forged_body.value, 4, GenesisDigest),
+    );
+    try std.testing.expectEqual(@as(usize, 0), campaign.causal_frontier_state.recorded_next_steps.items.len);
+
+    var valid_body_text: std.Io.Writer.Allocating = .init(allocator);
+    defer valid_body_text.deinit();
+    try valid_body_text.writer.writeAll("{\"attempt_id\":null,\"grade_id\":null,\"payload\":");
+    try valid_body_text.writer.writeAll(expected_next_step_json);
+    try valid_body_text.writer.writeAll(",\"scenario_id\":null}");
+    var valid_body = try parseValue(allocator, valid_body_text.written());
+    defer valid_body.deinit();
+    try applyEvent(allocator, &campaign, .next_step_recorded, valid_body.value, 4, GenesisDigest);
+    try std.testing.expectEqual(@as(usize, 1), campaign.causal_frontier_state.recorded_next_steps.items.len);
+
+    const replayed = try causalFrontierAlloc(allocator, &campaign);
+    defer allocator.free(replayed);
+    try std.testing.expectEqualStrings(expected, replayed);
+}
+
+test "hylo causal frontier admits only current unresolved replay-eligible failures" {
+    const allocator = std.testing.allocator;
+    const current_target = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    var campaign = CampaignState{
+        .id = @constCast("cmp-frontier-evidence"),
+        .last_digest = @constCast(GenesisDigest),
+        .baseline_target_fingerprint = @constCast(current_target),
+        .replay_policy_fingerprint = @constCast("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        .repeat_count = 2,
+    };
+    defer campaign.scenarios.deinit(allocator);
+    defer campaign.grades.deinit(allocator);
+    const controlled = ScenarioState{
+        .id = @constCast("scenario-controlled"),
+        .split = .practice,
+        .fidelity = @constCast("controlled_replay"),
+        .fingerprint = @constCast("sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+        .source_episode_fingerprint = @constCast("sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"),
+        .case_visibility = @constCast("open"),
+        .visible_input_fingerprint = @constCast("sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+        .hidden_reference_fingerprint = null,
+        .source_profile_fingerprint = null,
+        .environment_fingerprint = @constCast("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+        .effect_policy_json = @constCast("{}"),
+        .effect_policy_fingerprint = @constCast("sha256:1111111111111111111111111111111111111111111111111111111111111111"),
+        .replay_policy_fingerprint = @constCast("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        .oracles = &.{},
+    };
+    var diagnostic = controlled;
+    diagnostic.id = @constCast("scenario-diagnostic");
+    diagnostic.fidelity = @constCast("transcript_only");
+    try campaign.scenarios.append(allocator, controlled);
+    try campaign.scenarios.append(allocator, diagnostic);
+    try std.testing.expect(scenarioReplayEligible(&campaign.scenarios.items[0]));
+    try std.testing.expect(!scenarioReplayEligible(&campaign.scenarios.items[1]));
+
+    const Fixture = struct {
+        fn grade(id: []const u8, attempt_id: []const u8, status: GradeStatus, sequence: u64) GradeState {
+            return .{
+                .id = @constCast(id),
+                .attempt_id = @constCast(attempt_id),
+                .scenario_id = @constCast("scenario-controlled"),
+                .status = status,
+                .target_fingerprint = @constCast(current_target),
+                .rubric_fingerprint = @constCast("sha256:2222222222222222222222222222222222222222222222222222222222222222"),
+                .environment_fingerprint = @constCast("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+                .replay_policy_fingerprint = @constCast("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                .judge_kind = @constCast("deterministic"),
+                .judge_id = @constCast("judge"),
+                .judge_version = @constCast("1"),
+                .judge_config_fingerprint = @constCast("sha256:3333333333333333333333333333333333333333333333333333333333333333"),
+                .oracle_authority_fingerprint = @constCast("sha256:4444444444444444444444444444444444444444444444444444444444444444"),
+                .blind = true,
+                .comparison_eligible = true,
+                .aggregate = 0,
+                .dimensions = &.{},
+                .critical_violation_count = 0,
+                .sequence = sequence,
+            };
+        }
+    };
+    try campaign.grades.append(allocator, Fixture.grade("grade-fail-1", "attempt-fail-1", .fail, 1));
+    try campaign.grades.append(allocator, Fixture.grade("grade-fail-2", "attempt-fail-2", .fail, 2));
+    try std.testing.expect(reproducibleCurrentPracticeFailure(&campaign, 0, current_target));
+    try std.testing.expect(!reproducibleCurrentPracticeFailure(
+        &campaign,
+        0,
+        "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+    ));
+
+    try campaign.grades.append(allocator, Fixture.grade("grade-pass-1", "attempt-pass-1", .pass, 3));
+    try campaign.grades.append(allocator, Fixture.grade("grade-pass-2", "attempt-pass-2", .pass, 4));
+    try std.testing.expect(!reproducibleCurrentPracticeFailure(&campaign, 0, current_target));
+
+    const first_runtime = try causalFrontierRuntimeFingerprintAlloc(allocator, &campaign);
+    defer allocator.free(first_runtime);
+    std.mem.swap(ScenarioState, &campaign.scenarios.items[0], &campaign.scenarios.items[1]);
+    const reordered_runtime = try causalFrontierRuntimeFingerprintAlloc(allocator, &campaign);
+    defer allocator.free(reordered_runtime);
+    try std.testing.expectEqualStrings(first_runtime, reordered_runtime);
+}
+
 test "hylo capabilities advertise the deterministic allocation replay version" {
     const output = try capabilitiesAlloc(std.testing.allocator);
     defer std.testing.allocator.free(output);
@@ -17285,6 +17959,7 @@ test "trial registration derives one split and cluster per admitted source episo
         .{
             .id = @constCast("scenario-one"),
             .split = .practice,
+            .fidelity = undefined,
             .fingerprint = undefined,
             .source_episode_fingerprint = shared_episode,
             .case_visibility = undefined,
@@ -17300,6 +17975,7 @@ test "trial registration derives one split and cluster per admitted source episo
         .{
             .id = @constCast("scenario-two"),
             .split = .practice,
+            .fidelity = undefined,
             .fingerprint = undefined,
             .source_episode_fingerprint = shared_episode,
             .case_visibility = undefined,

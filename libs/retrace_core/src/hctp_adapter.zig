@@ -439,6 +439,8 @@ pub fn sanitizeDecisionContextAlloc(
     const packet = try objectPtr(packet_value);
     const episode_value = packet.getPtr("episode") orelse return error.DecisionContextMissing;
     const episode = try objectPtr(episode_value);
+    const selected_route = episode.getPtr("selected_route") orelse return error.DecisionContextInvalid;
+    selected_route.* = .{ .string = "" };
     inline for (.{
         "rejected_routes",
         "explicit_rationale",
@@ -1073,6 +1075,13 @@ test "strip and replace materializes a target-free fingerprintable DCP" {
     var sanitized_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, sanitized, .{});
     defer sanitized_parsed.deinit();
     const packet = dcpBody(try object(sanitized_parsed.value));
+    const episode = try requiredObject(packet, "episode");
+    try std.testing.expectEqualStrings("Which route should be selected?", try requiredString(episode, "question"));
+    const selected_route = episode.get("selected_route") orelse return error.MissingField;
+    try std.testing.expect(switch (selected_route) {
+        .string => |text| text.len == 0,
+        else => false,
+    });
     const contamination = try requiredObject(packet, "contamination");
     inline for (.{ "injected_skill_blocks", "generated_reports", "current_audit_prompt", "quoted_material" }) |key| {
         try std.testing.expect(!(try requiredBool(contamination, key)));

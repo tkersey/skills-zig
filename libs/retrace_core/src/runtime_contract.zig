@@ -12,14 +12,32 @@ pub const BuiltRuntime = struct {
     }
 };
 
+fn modelConfigurationFingerprintAlloc(
+    allocator: std.mem.Allocator,
+    provider: []const u8,
+    model: []const u8,
+    reasoning_effort: []const u8,
+) ![]u8 {
+    const basis = try std.fmt.allocPrint(
+        allocator,
+        "provider={s}\nmodel={s}\nreasoning_effort={s}\n",
+        .{ provider, model, reasoning_effort },
+    );
+    defer allocator.free(basis);
+    return canonical_json.digestBytesAlloc(allocator, basis);
+}
+
 pub fn buildFromTraceAlloc(allocator: std.mem.Allocator, trace: canonical_trace.CanonicalSessionTrace, last_fixed_line: usize) !BuiltRuntime {
     var source = try canonical_trace.cutBoundContextAlloc(allocator, trace, last_fixed_line);
     defer source.deinit(allocator);
     const adapter_contract = try canonical_json.digestBytesAlloc(allocator, "codex-session-jsonl/v1");
     defer allocator.free(adapter_contract);
-    const model_config = try std.fmt.allocPrint(allocator, "provider={s}\nmodel={s}\nreasoning_effort={s}\n", .{ source.model_provider orelse "unknown", source.model orelse "unknown", source.reasoning_effort orelse "unknown" });
-    defer allocator.free(model_config);
-    const model_fingerprint = try canonical_json.digestBytesAlloc(allocator, model_config);
+    const model_fingerprint = try modelConfigurationFingerprintAlloc(
+        allocator,
+        source.model_provider orelse "unknown",
+        source.model orelse "unknown",
+        source.reasoning_effort orelse "unknown",
+    );
     defer allocator.free(model_fingerprint);
     const context_basis = try std.fmt.allocPrint(allocator, "context_window={s}\ncompaction_identity={s}\n", .{ source.context_window_json orelse "unknown", source.compaction_identity orelse "unknown" });
     defer allocator.free(context_basis);
@@ -83,6 +101,18 @@ pub fn validate(value: std.json.Value, allocator: std.mem.Allocator) !bool {
         !nonblankString(model.get("reasoning_effort")) or
         !canonical_json.isFingerprint(stringValue(model.get("configuration_fingerprint")) orelse return false) or
         !equalsString(model, "seed_control", "unsupported")) return false;
+    const expected_model_fingerprint = try modelConfigurationFingerprintAlloc(
+        allocator,
+        stringValue(model.get("provider")) orelse return false,
+        stringValue(model.get("model")) orelse return false,
+        stringValue(model.get("reasoning_effort")) orelse return false,
+    );
+    defer allocator.free(expected_model_fingerprint);
+    if (!std.mem.eql(
+        u8,
+        expected_model_fingerprint,
+        stringValue(model.get("configuration_fingerprint")) orelse return false,
+    )) return false;
     const context = objectValue(root.get("context") orelse return false) orelse return false;
     if (!hasExactKeys(context, &.{ "window", "compaction_policy_fingerprint", "turn_context_fingerprint" }) or
         !optionalNonnegativeInteger(context.get("window")) or !optionalFingerprint(context.get("compaction_policy_fingerprint")) or
@@ -125,6 +155,40 @@ test "runtime identity covers model identity" {
     var second = try buildFromTraceAlloc(std.testing.allocator, trace, 1);
     defer second.deinit(std.testing.allocator);
     try std.testing.expect(!std.mem.eql(u8, first.fingerprint, second.fingerprint));
+}
+
+test "runtime validation rejects stale nested model fingerprint after outer refinalization" {
+    var trace = canonical_trace.CanonicalSessionTrace{ .session = try canonical_trace.SessionRecord.init(std.testing.allocator, "/tmp/runtime-tamper.jsonl") };
+    defer trace.deinit(std.testing.allocator);
+    try trace.occurrences.append(std.testing.allocator, try canonical_trace.TraceOccurrence.init(std.testing.allocator, 1, null, "session_meta", "session_meta", null, null, false));
+    trace.occurrences.items[0].payload_json = try std.testing.allocator.dupe(u8, "{\"model\":\"model-a\",\"model_provider\":\"provider\"}");
+    var runtime = try buildFromTraceAlloc(std.testing.allocator, trace, 1);
+    defer runtime.deinit(std.testing.allocator);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, runtime.json, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    });
+    defer parsed.deinit();
+    try std.testing.expect(try validate(parsed.value, std.testing.allocator));
+    const root = switch (parsed.value) {
+        .object => |*map| map,
+        else => return error.ExpectedObject,
+    };
+    const model_value = root.getPtr("model") orelse return error.FingerprintFieldMissing;
+    const model = switch (model_value.*) {
+        .object => |*map| map,
+        else => return error.ExpectedObject,
+    };
+    const model_name = model.getPtr("model") orelse return error.FingerprintFieldMissing;
+    model_name.* = .{ .string = "model-b" };
+    const mutated = try canonical_json.canonicalJsonAlloc(std.testing.allocator, parsed.value);
+    defer std.testing.allocator.free(mutated);
+    const refinalized = try canonical_json.finalizeFingerprintAlloc(std.testing.allocator, mutated, "runtime_fingerprint");
+    defer std.testing.allocator.free(refinalized);
+    var refinalized_parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, refinalized, .{});
+    defer refinalized_parsed.deinit();
+    try std.testing.expect(!(try validate(refinalized_parsed.value, std.testing.allocator)));
 }
 
 test "post-cut turn context cannot change runtime identity" {

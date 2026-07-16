@@ -6,6 +6,13 @@ script_source="$repo_root/.github/scripts/release_apps.sh"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
+seq_version="$(tr -d '[:space:]' < "$repo_root/apps/seq/VERSION")"
+seq_manifest_version="$(sed -nE 's/^[[:space:]]*\.version = "([^"]+)",$/\1/p' "$repo_root/apps/seq/build.zig.zon")"
+if [[ -z "$seq_manifest_version" || "$seq_manifest_version" != "$seq_version" ]]; then
+  echo "Seq release metadata mismatch: VERSION=$seq_version build.zig.zon=$seq_manifest_version" >&2
+  exit 1
+fi
+
 git -C "$tmp" init --quiet
 git -C "$tmp" config user.name "Release Classifier Test"
 git -C "$tmp" config user.email "release-classifier@example.invalid"
@@ -177,4 +184,4 @@ assert_cas_trial_macos_runtime_build_hunk
 assert_ambiguous_build_diff
 assert_partial_filter_plumbing_fails_closed
 
-echo "release app classifier: 15/15 cases passed"
+echo "release app classifier: 16/16 cases passed"

@@ -142,6 +142,8 @@ ledger --source hylo snapshot-target --repo . --revision INDEX --input target-ro
 ledger --source hylo append --repo . --json event-intent.json
 ledger --source hylo doctor --repo .
 ledger --source hylo progress --repo . --campaign-id cmp-example --format markdown
+ledger --source hylo frontier --repo . --campaign-id cmp-example --format markdown
+ledger --source hylo next-experiment --repo . --campaign-id cmp-example
 ledger --source hylo path --repo .
 ledger create --source universalist --template universalist-plan.md
 ledger latest --source universalist
@@ -357,6 +359,34 @@ failure reopens the frontier. Its fingerprint is bound to the campaign chain
 head. A changed rubric,
 visibility policy, environment observation surface, grader configuration, or
 replay policy requires a new campaign rather than a misleading continuation.
+
+The causal frontier retains typed state through
+`failure_signature_recorded`, `hypothesis_recorded`, `experiment_recorded`,
+and `next_step_recorded` events. Ledger derives experiment eligibility,
+Pareto dominance, and the next-step decision from the current immutable
+campaign state; `next_step_recorded` must match that recomputed decision
+exactly.
+
+Inspect the complete frontier or only its `RUN`, `OBSERVE`, or `STOP`
+decision without mutating campaign state:
+
+```bash
+ledger --source hylo frontier \
+  --repo /path/to/repo \
+  --campaign-id cmp-example \
+  --format json
+
+ledger --source hylo next-experiment \
+  --repo /path/to/repo \
+  --campaign-id cmp-example
+```
+
+These projections always report `authority_granted:false` and
+`target_mutated:false`. `RUN` selects one non-dominated eligible experiment;
+it does not authorize an edit. `OBSERVE` selects a bounded read-only probe.
+`STOP` is the expected result when no eligible intervention exists or when
+multiple non-dominated alternatives remain and no bounded probe can
+discriminate among them.
 
 ## Stateless validation
 

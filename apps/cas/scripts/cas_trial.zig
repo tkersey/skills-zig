@@ -80,8 +80,10 @@ const UsageText =
     \\      --executor PATH --ledger PATH [--source-profile-fd N]
     \\      [--signing-seed-fd N] [--producer-id ID]
     \\      [--producer-key-id ID] [--json]
-    \\  cas_trial status --trial-id ID --lane-id ID --receipt-dir DIR [--json]
-    \\  cas_trial cleanup --trial-id ID --lane-id ID --receipt-dir DIR [--json]
+    \\  cas_trial status --trial-id ID --lane-id ID --receipt-dir DIR
+    \\      [--registration-event-digest SHA256] [--json]
+    \\  cas_trial cleanup --trial-id ID --lane-id ID --receipt-dir DIR
+    \\      [--registration-event-digest SHA256] [--json]
     \\  cas_trial key-info --signing-seed-fd N [--producer-key-id ID] [--json]
     \\
     \\The executor is invoked exactly once as:
@@ -606,14 +608,22 @@ fn cmdRun(allocator: std.mem.Allocator, options: Options) !void {
         const failure_fingerprint = try sealExistingControlArtifactAlloc(allocator, paths.failure_detail);
         allocator.free(failure_fingerprint);
     }
-    try persistTerminalReceipt(allocator, paths.receipt, receipt);
-    try persistTerminalControl(
+    try persistTerminalPayload(
+        allocator,
+        paths,
+        view.trial_id,
+        view.lane_id,
+        registration_digest,
+        receipt,
+    );
+    const terminal_control = try reconcileTerminalProjectionAlloc(
         allocator,
         paths,
         view.trial_id,
         view.lane_id,
         registration_digest,
     );
+    terminal_control.deinit(allocator);
     const fingerprint = try digestJsonTextAlloc(allocator, receipt);
     defer allocator.free(fingerprint);
     var receipt_parsed = try std.json.parseFromSlice(std.json.Value, allocator, receipt, .{});
@@ -832,7 +842,7 @@ fn createFailureRunnerObservationsAlloc(
     try reset.writer.writeAll(if (milestones.executor_returned) "true" else "false");
     try writeCapabilitySealMembers(&reset.writer, runner_contract.capability_seal);
     try reset.writer.writeByte('}');
-    const reset_fingerprint = try persistRunnerObservationAlloc(allocator, paths.reset_observation, reset.written());
+    const reset_fingerprint = try persistRunnerObservationAlloc(allocator, paths.failure_reset_observation, reset.written());
     errdefer allocator.free(reset_fingerprint);
 
     var filesystem: std.Io.Writer.Allocating = .init(allocator);
@@ -851,7 +861,7 @@ fn createFailureRunnerObservationsAlloc(
     try filesystem.writer.writeAll("\"registered_policy_authenticated\":");
     try filesystem.writer.writeAll(if (effect_policy_authenticated) "true" else "false");
     try filesystem.writer.writeAll(",\"independently_enforced\":false,\"carrier_observation_complete\":false,\"os_confinement\":false}");
-    const filesystem_fingerprint = try persistRunnerObservationAlloc(allocator, paths.filesystem_observation, filesystem.written());
+    const filesystem_fingerprint = try persistRunnerObservationAlloc(allocator, paths.failure_filesystem_observation, filesystem.written());
     errdefer allocator.free(filesystem_fingerprint);
 
     var network: std.Io.Writer.Allocating = .init(allocator);
@@ -870,7 +880,7 @@ fn createFailureRunnerObservationsAlloc(
     try network.writer.writeAll("\"registered_policy_authenticated\":");
     try network.writer.writeAll(if (effect_policy_authenticated) "true" else "false");
     try network.writer.writeAll(",\"independently_enforced\":false,\"os_confinement\":false}");
-    const network_fingerprint = try persistRunnerObservationAlloc(allocator, paths.network_observation, network.written());
+    const network_fingerprint = try persistRunnerObservationAlloc(allocator, paths.failure_network_observation, network.written());
     errdefer allocator.free(network_fingerprint);
 
     var external_effect: std.Io.Writer.Allocating = .init(allocator);
@@ -891,7 +901,7 @@ fn createFailureRunnerObservationsAlloc(
     try external_effect.writer.writeAll(",\"independently_enforced\":false,\"direct_native_effects_intercepted\":false,\"os_confinement\":false}");
     const external_effect_fingerprint = try persistRunnerObservationAlloc(
         allocator,
-        paths.external_effect_observation,
+        paths.failure_external_effect_observation,
         external_effect.written(),
     );
     errdefer allocator.free(external_effect_fingerprint);
@@ -1041,8 +1051,7 @@ fn buildClaimedFailureReceiptAlloc(
         },
     );
     defer allocator.free(detail);
-    try durable_store.writeTextCreateNewAtomic(allocator, paths.failure_detail, detail, .{});
-    const detail_fingerprint = try fileFingerprintAlloc(allocator, paths.failure_detail);
+    const detail_fingerprint = try persistExpectedSealedArtifactAlloc(allocator, paths.failure_detail, detail);
     defer allocator.free(detail_fingerprint);
     try durable_store.ensureDirectoryPathNoSymlinks(paths.evidence);
     const observations = try createFailureRunnerObservationsAlloc(
@@ -1056,8 +1065,7 @@ fn buildClaimedFailureReceiptAlloc(
         detail_fingerprint,
     );
     defer observations.deinit(allocator);
-    const failure_audit_path = try std.fs.path.join(allocator, &.{ paths.evidence, "execution-audit.json" });
-    defer allocator.free(failure_audit_path);
+    const failure_audit_path = paths.failure_execution_audit;
     const failure_audit = try std.fmt.allocPrint(
         allocator,
         "{{\"schema\":\"cas-trial-process-audit/v1\",\"trial_id\":{f},\"lane_id\":{f},\"executor_launch_count\":{},\"executor_returned\":{},\"internal_model_execution_count\":null,\"internal_retry_count\":null,\"internal_fork_count\":null,\"internal_execution_verified\":false}}\n",
@@ -1069,11 +1077,7 @@ fn buildClaimedFailureReceiptAlloc(
         },
     );
     defer allocator.free(failure_audit);
-    durable_store.writeTextCreateNewAtomic(allocator, failure_audit_path, failure_audit, .{}) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    };
-    const failure_audit_fingerprint = try fileFingerprintAlloc(allocator, failure_audit_path);
+    const failure_audit_fingerprint = try persistExpectedSealedArtifactAlloc(allocator, failure_audit_path, failure_audit);
     defer allocator.free(failure_audit_fingerprint);
     const source_profile = try object(view.source_profile);
     const historical = std.mem.eql(u8, try requiredString(source_profile, "kind"), "historical_decision");
@@ -1104,7 +1108,7 @@ fn buildClaimedFailureReceiptAlloc(
         );
     defer allocator.free(native.json);
     defer allocator.free(native.fingerprint);
-    try archiveBytesAtPath(allocator, native.json, paths.native_receipt, native.fingerprint);
+    try archiveBytesAtPath(allocator, native.json, paths.failure_native_receipt, native.fingerprint);
     const seed_json = try canonicalFieldAlloc(allocator, view.pair.get("shared_seed") orelse .null);
     defer allocator.free(seed_json);
     const now = unixSeconds();
@@ -1179,17 +1183,17 @@ fn buildClaimedFailureReceiptAlloc(
     try writer.print(",\"tokens_used\":0,\"started_at_unix\":{d},\"ended_at_unix\":{d}}},", .{ now, now });
     try writer.writeAll("\"isolation\":{\"fresh_thread\":false,\"fresh_workspace\":");
     try writer.writeAll(if (milestones.workspace_created) "true," else "false,");
-    try writeStringMember(writer, "reset_receipt_ref", paths.reset_observation, true);
+    try writeStringMember(writer, "reset_receipt_ref", paths.failure_reset_observation, true);
     try writeStringMember(writer, "reset_receipt_fingerprint", observations.reset_fingerprint, true);
     try writer.writeAll("\"target_cache_cleared\":false,\"shared_mutable_state_detected\":false,\"limitations\":");
     try writer.writeAll(observations.limitations);
     try writeCapabilitySealMembers(writer, runner_contract.capability_seal);
     try writer.writeAll("},\"effects\":{");
-    try writeStringMember(writer, "filesystem_receipt_ref", paths.filesystem_observation, true);
+    try writeStringMember(writer, "filesystem_receipt_ref", paths.failure_filesystem_observation, true);
     try writeStringMember(writer, "filesystem_receipt_fingerprint", observations.filesystem_fingerprint, true);
-    try writeStringMember(writer, "network_receipt_ref", paths.network_observation, true);
+    try writeStringMember(writer, "network_receipt_ref", paths.failure_network_observation, true);
     try writeStringMember(writer, "network_receipt_fingerprint", observations.network_fingerprint, true);
-    try writeStringMember(writer, "external_effect_receipt_ref", paths.external_effect_observation, true);
+    try writeStringMember(writer, "external_effect_receipt_ref", paths.failure_external_effect_observation, true);
     try writeStringMember(writer, "external_effect_receipt_fingerprint", observations.external_effect_fingerprint, true);
     try writer.writeAll("\"policy_violations\":[\"effect-observation-incomplete\"]},\"terminal\":{");
     try writeStringMember(writer, "status", disposition.status, true);
@@ -1197,7 +1201,7 @@ fn buildClaimedFailureReceiptAlloc(
     try writeStringMember(writer, "failure_detail_ref", paths.failure_detail, false);
     try writer.writeAll("},\"evidence\":{\"output_ref\":null,\"output_fingerprint\":null,\"trace_ref\":null,\"trace_fingerprint\":null,\"world_state_ref\":null,\"world_state_fingerprint\":null,\"metrics_ref\":null,\"metrics_fingerprint\":null},\"native_receipt\":{");
     try writeStringMember(writer, "kind", native.kind, true);
-    try writeStringMember(writer, "ref", paths.native_receipt, true);
+    try writeStringMember(writer, "ref", paths.failure_native_receipt, true);
     try writeStringMember(writer, "fingerprint", native.fingerprint, true);
     try writer.writeAll("\"receipt\":");
     try writer.writeAll(native.json);
@@ -1328,11 +1332,10 @@ fn signTerminalReceiptAlloc(
 }
 
 fn persistTerminalReceipt(allocator: std.mem.Allocator, path: []const u8, receipt: []const u8) !void {
-    durable_store.writeTextCreateNewAtomic(allocator, path, receipt, .{}) catch |err| switch (err) {
-        error.PathAlreadyExists => return error.LaneAlreadyTerminal,
+    const fingerprint = persistExpectedSealedArtifactAlloc(allocator, path, receipt) catch |err| switch (err) {
+        error.PersistedArtifactConflict => return error.LaneAlreadyTerminal,
         else => return err,
     };
-    const fingerprint = try sealExistingControlArtifactAlloc(allocator, path);
     allocator.free(fingerprint);
 }
 
@@ -1367,11 +1370,13 @@ const LaneControlVerification = struct {
     }
 };
 
-const ControlArtifactKind = enum { terminal, cleanup };
+const ControlArtifactKind = enum { terminal_payload, terminal, cleanup_intent, cleanup };
 
 fn controlMarker(kind: ControlArtifactKind) []const u8 {
     return switch (kind) {
+        .terminal_payload => ".payload-",
         .terminal => ".terminal-",
+        .cleanup_intent => ".intent-",
         .cleanup => ".cleanup-",
     };
 }
@@ -1398,26 +1403,70 @@ fn findControlArtifactPathAlloc(
     registration_digest: []const u8,
     kind: ControlArtifactKind,
 ) !?[]u8 {
+    try validateFingerprint(registration_digest);
     if (!pathExists(claim_root)) return null;
-    const names = try durable_store.listSortedRegularFilesNoSymlink(
-        allocator,
-        claim_root,
-        64,
-        MaxInputBytes,
-    );
-    defer durable_store.freeStringList(allocator, names);
     const prefix = try std.fmt.allocPrint(
         allocator,
         "{s}{s}",
         .{ registration_digest[7..], controlMarker(kind) },
     );
     defer allocator.free(prefix);
+    const root_stat = try std.Io.Dir.cwd().statFile(defaultIo(), claim_root, .{ .follow_symlinks = false });
+    if (root_stat.kind == .sym_link) return error.SymlinkComponent;
+    if (root_stat.kind != .directory) return error.NotDir;
+    var dir = if (std.fs.path.isAbsolute(claim_root))
+        try std.Io.Dir.openDirAbsolute(defaultIo(), claim_root, .{ .iterate = true, .follow_symlinks = false })
+    else
+        try std.Io.Dir.cwd().openDir(defaultIo(), claim_root, .{ .iterate = true, .follow_symlinks = false });
+    defer dir.close(defaultIo());
     var matched: ?[]u8 = null;
     errdefer if (matched) |path| allocator.free(path);
-    for (names) |name| {
-        if (!std.mem.startsWith(u8, name, prefix) or !std.mem.endsWith(u8, name, ".json")) continue;
+    var iter = dir.iterate();
+    while (try iter.next(defaultIo())) |entry| {
+        if (entry.kind == .sym_link) return error.SymlinkComponent;
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.name, prefix) or !std.mem.endsWith(u8, entry.name, ".json")) continue;
         if (matched != null) return error.ControlArtifactConflict;
-        matched = try std.fs.path.join(allocator, &.{ claim_root, name });
+        const path = try std.fs.path.join(allocator, &.{ claim_root, entry.name });
+        errdefer allocator.free(path);
+        const stat = try std.Io.Dir.cwd().statFile(defaultIo(), path, .{ .follow_symlinks = false });
+        if (stat.kind == .sym_link) return error.SymlinkComponent;
+        if (stat.kind != .file) return error.NotFile;
+        if (stat.size > MaxInputBytes) return error.FileTooBig;
+        matched = path;
+    }
+    return matched;
+}
+
+fn findUniqueRegistrationDigestAlloc(
+    allocator: std.mem.Allocator,
+    claim_root: []const u8,
+    kind: ?ControlArtifactKind,
+) !?[]u8 {
+    if (!pathExists(claim_root)) return null;
+    const root_stat = try std.Io.Dir.cwd().statFile(defaultIo(), claim_root, .{ .follow_symlinks = false });
+    if (root_stat.kind == .sym_link) return error.SymlinkComponent;
+    if (root_stat.kind != .directory) return error.NotDir;
+    var dir = if (std.fs.path.isAbsolute(claim_root))
+        try std.Io.Dir.openDirAbsolute(defaultIo(), claim_root, .{ .iterate = true, .follow_symlinks = false })
+    else
+        try std.Io.Dir.cwd().openDir(defaultIo(), claim_root, .{ .iterate = true, .follow_symlinks = false });
+    defer dir.close(defaultIo());
+    var matched: ?[]u8 = null;
+    errdefer if (matched) |digest| allocator.free(digest);
+    var iter = dir.iterate();
+    while (try iter.next(defaultIo())) |entry| {
+        if (entry.kind == .sym_link) return error.SymlinkComponent;
+        if (entry.kind != .file or entry.name.len < 64 + ".json".len) continue;
+        const hex = entry.name[0..64];
+        if (!isLowerHex(hex) or !std.mem.endsWith(u8, entry.name, ".json")) continue;
+        if (kind) |artifact_kind| {
+            const marker = controlMarker(artifact_kind);
+            if (entry.name.len <= 64 + marker.len + ".json".len or
+                !std.mem.startsWith(u8, entry.name[64..], marker)) continue;
+        } else if (entry.name.len != 64 + ".json".len) continue;
+        if (matched != null) return error.ControlArtifactConflict;
+        matched = try std.fmt.allocPrint(allocator, "sha256:{s}", .{hex});
     }
     return matched;
 }
@@ -1439,65 +1488,172 @@ fn controlArtifactFingerprintFromPathAlloc(
 fn hasAnyControlArtifactAlloc(
     allocator: std.mem.Allocator,
     claim_root: []const u8,
+    registration_digest: []const u8,
     kind: ControlArtifactKind,
 ) !bool {
-    if (!pathExists(claim_root)) return false;
-    const names = try durable_store.listSortedRegularFilesNoSymlink(
-        allocator,
-        claim_root,
-        64,
-        MaxInputBytes,
-    );
-    defer durable_store.freeStringList(allocator, names);
-    for (names) |name| {
-        if (std.mem.indexOf(u8, name, controlMarker(kind)) != null and
-            std.mem.endsWith(u8, name, ".json")) return true;
-    }
-    return false;
+    const path = try findControlArtifactPathAlloc(allocator, claim_root, registration_digest, kind);
+    defer if (path) |owned| allocator.free(owned);
+    return path != null;
 }
 
 fn hasVerifiedClaimArtifactAlloc(
     allocator: std.mem.Allocator,
     paths: LanePaths,
+    registration_digest: []const u8,
 ) !bool {
     if (!pathExists(paths.claim)) return false;
-    const names = try durable_store.listSortedRegularFilesNoSymlink(
+    try validateFingerprint(registration_digest);
+    const path = try claimPathAlloc(allocator, paths.claim, registration_digest);
+    defer allocator.free(path);
+    if (!try regularFileExistsNoFollow(path)) return false;
+    const bytes = try durable_store.readRegularFileNoSymlink(allocator, path, MaxInputBytes);
+    defer allocator.free(bytes);
+    const fingerprint = try attestation.digestBytesAlloc(allocator, bytes);
+    defer allocator.free(fingerprint);
+    try verifySealedControlArtifact(allocator, path, fingerprint);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    });
+    defer parsed.deinit();
+    const claim = try object(parsed.value);
+    if (!std.mem.eql(u8, try requiredString(claim, "schema"), "cas-trial-claim/v1") or
+        !std.mem.eql(u8, try requiredString(claim, "trial_id"), std.fs.path.basename(std.fs.path.dirname(paths.claim) orelse "")) or
+        !std.mem.eql(u8, try requiredString(claim, "lane_id"), std.fs.path.basename(paths.claim)) or
+        !std.mem.eql(u8, try requiredString(claim, "registration_event_digest"), registration_digest))
+    {
+        return error.ControlArtifactInvalid;
+    }
+    return true;
+}
+
+const TerminalPayload = struct {
+    registration_digest: []u8,
+    payload_ref: []u8,
+    payload_fingerprint: []u8,
+    receipt: []u8,
+
+    fn deinit(self: TerminalPayload, allocator: std.mem.Allocator) void {
+        allocator.free(self.registration_digest);
+        allocator.free(self.payload_ref);
+        allocator.free(self.payload_fingerprint);
+        allocator.free(self.receipt);
+    }
+};
+
+fn validateTerminalReceiptIdentity(
+    allocator: std.mem.Allocator,
+    receipt: []const u8,
+    trial_id: []const u8,
+    lane_id: []const u8,
+    registration_digest: []const u8,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, receipt, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    });
+    defer parsed.deinit();
+    const root = try object(parsed.value);
+    if (!std.mem.eql(u8, try requiredString(root, "schema"), "hylo-run-receipt/v1") or
+        !std.mem.eql(u8, try requiredString(root, "trial_id"), trial_id) or
+        !std.mem.eql(u8, try requiredString(root, "lane_id"), lane_id) or
+        !std.mem.eql(
+            u8,
+            try requiredString(try requiredObject(root, "lineage"), "registration_event_digest"),
+            registration_digest,
+        ))
+    {
+        return error.TerminalPayloadInvalid;
+    }
+    try validateFingerprint(registration_digest);
+}
+
+fn persistTerminalPayload(
+    allocator: std.mem.Allocator,
+    paths: LanePaths,
+    trial_id: []const u8,
+    lane_id: []const u8,
+    registration_digest: []const u8,
+    receipt: []const u8,
+) !void {
+    try validateTerminalReceiptIdentity(allocator, receipt, trial_id, lane_id, registration_digest);
+    const payload_fingerprint = try attestation.digestBytesAlloc(allocator, receipt);
+    defer allocator.free(payload_fingerprint);
+    const payload_path = try controlArtifactPathAlloc(
         allocator,
         paths.claim,
-        64,
-        MaxInputBytes,
+        registration_digest,
+        .terminal_payload,
+        payload_fingerprint,
     );
-    defer durable_store.freeStringList(allocator, names);
-    var found = false;
-    for (names) |name| {
-        if (name.len != 64 + ".json".len or !std.mem.endsWith(u8, name, ".json")) continue;
-        const hex = name[0..64];
-        if (!isLowerHex(hex)) continue;
-        const path = try std.fs.path.join(allocator, &.{ paths.claim, name });
-        defer allocator.free(path);
-        const bytes = try durable_store.readRegularFileNoSymlink(allocator, path, MaxInputBytes);
-        defer allocator.free(bytes);
-        const fingerprint = try attestation.digestBytesAlloc(allocator, bytes);
-        defer allocator.free(fingerprint);
-        try verifySealedControlArtifact(allocator, path, fingerprint);
-        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{
-            .allocate = .alloc_always,
-            .duplicate_field_behavior = .@"error",
-        });
-        defer parsed.deinit();
-        const claim = try object(parsed.value);
-        const registration = try requiredString(claim, "registration_event_digest");
-        try validateFingerprint(registration);
-        if (!std.mem.eql(u8, try requiredString(claim, "schema"), "cas-trial-claim/v1") or
-            !std.mem.eql(u8, try requiredString(claim, "trial_id"), std.fs.path.basename(std.fs.path.dirname(paths.claim) orelse "")) or
-            !std.mem.eql(u8, try requiredString(claim, "lane_id"), std.fs.path.basename(paths.claim)) or
-            !std.mem.eql(u8, registration[7..], hex))
-        {
-            return error.ControlArtifactInvalid;
-        }
-        found = true;
+    defer allocator.free(payload_path);
+    const persisted = try persistSealedControlArtifactAlloc(allocator, payload_path, receipt);
+    defer allocator.free(persisted);
+    if (!std.mem.eql(u8, persisted, payload_fingerprint)) return error.ControlArtifactFingerprintMismatch;
+}
+
+fn loadTerminalPayloadAlloc(
+    allocator: std.mem.Allocator,
+    paths: LanePaths,
+    trial_id: []const u8,
+    lane_id: []const u8,
+    expected_registration_digest: []const u8,
+) !TerminalPayload {
+    try validateFingerprint(expected_registration_digest);
+    const payload_path = (try findControlArtifactPathAlloc(
+        allocator,
+        paths.claim,
+        expected_registration_digest,
+        .terminal_payload,
+    )) orelse return error.TerminalPayloadMissing;
+    defer allocator.free(payload_path);
+    const payload_fingerprint = try controlArtifactFingerprintFromPathAlloc(
+        allocator,
+        payload_path,
+        .terminal_payload,
+    );
+    defer allocator.free(payload_fingerprint);
+    try verifySealedControlArtifact(allocator, payload_path, payload_fingerprint);
+    const receipt = try durable_store.readRegularFileNoSymlink(allocator, payload_path, MaxInputBytes);
+    errdefer allocator.free(receipt);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, receipt, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    });
+    defer parsed.deinit();
+    const receipt_root = try object(parsed.value);
+    const registration_digest = try requiredString(try requiredObject(receipt_root, "lineage"), "registration_event_digest");
+    if (!std.mem.eql(u8, try requiredString(receipt_root, "schema"), "hylo-run-receipt/v1") or
+        !std.mem.eql(u8, try requiredString(receipt_root, "trial_id"), trial_id) or
+        !std.mem.eql(u8, try requiredString(receipt_root, "lane_id"), lane_id))
+    {
+        return error.TerminalPayloadInvalid;
     }
-    return found;
+    try validateFingerprint(registration_digest);
+    if (!std.mem.eql(u8, registration_digest, expected_registration_digest)) {
+        return error.TerminalPayloadInvalid;
+    }
+    const expected_path = try controlArtifactPathAlloc(
+        allocator,
+        paths.claim,
+        registration_digest,
+        .terminal_payload,
+        payload_fingerprint,
+    );
+    defer allocator.free(expected_path);
+    if (!std.mem.eql(u8, expected_path, payload_path)) return error.TerminalPayloadInvalid;
+    const owned_registration = try allocator.dupe(u8, registration_digest);
+    errdefer allocator.free(owned_registration);
+    const owned_payload_ref = try allocator.dupe(u8, payload_path);
+    errdefer allocator.free(owned_payload_ref);
+    const owned_payload_fingerprint = try allocator.dupe(u8, payload_fingerprint);
+    errdefer allocator.free(owned_payload_fingerprint);
+    return .{
+        .registration_digest = owned_registration,
+        .payload_ref = owned_payload_ref,
+        .payload_fingerprint = owned_payload_fingerprint,
+        .receipt = receipt,
+    };
 }
 
 fn persistTerminalControl(
@@ -1506,13 +1662,20 @@ fn persistTerminalControl(
     trial_id: []const u8,
     lane_id: []const u8,
     registration_digest: []const u8,
+    terminal_payload: TerminalPayload,
 ) !void {
+    if (!std.mem.eql(u8, terminal_payload.registration_digest, registration_digest)) {
+        return error.TerminalPayloadInvalid;
+    }
     const claim_path = try claimPathAlloc(allocator, paths.claim, registration_digest);
     defer allocator.free(claim_path);
     const claim_fingerprint = try sealExistingControlArtifactAlloc(allocator, claim_path);
     defer allocator.free(claim_fingerprint);
     const receipt_fingerprint = try sealExistingControlArtifactAlloc(allocator, paths.receipt);
     defer allocator.free(receipt_fingerprint);
+    if (!std.mem.eql(u8, receipt_fingerprint, terminal_payload.payload_fingerprint)) {
+        return error.TerminalPayloadInvalid;
+    }
     const failure_stat = std.Io.Dir.cwd().statFile(defaultIo(), paths.failure_detail, .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => null,
         else => return err,
@@ -1539,6 +1702,8 @@ fn persistTerminalControl(
     try writeStringMember(writer, "claim_fingerprint", claim_fingerprint, true);
     try writeStringMember(writer, "receipt_ref", paths.receipt, true);
     try writeStringMember(writer, "receipt_fingerprint", receipt_fingerprint, true);
+    try writeStringMember(writer, "terminal_payload_ref", terminal_payload.payload_ref, true);
+    try writeStringMember(writer, "terminal_payload_fingerprint", terminal_payload.payload_fingerprint, true);
     try writeOptionalStringMember(writer, "failure_detail_ref", if (failure_fingerprint != null) paths.failure_detail else null, true);
     try writeOptionalStringMember(writer, "failure_detail_fingerprint", failure_fingerprint, true);
     try writeStringMember(writer, "evidence_ref", paths.evidence, true);
@@ -1557,6 +1722,33 @@ fn persistTerminalControl(
     const persisted_fingerprint = try persistSealedControlArtifactAlloc(allocator, control_path, out.written());
     defer allocator.free(persisted_fingerprint);
     if (!std.mem.eql(u8, persisted_fingerprint, control_fingerprint)) return error.ControlArtifactFingerprintMismatch;
+}
+
+fn reconcileTerminalProjectionAlloc(
+    allocator: std.mem.Allocator,
+    paths: LanePaths,
+    trial_id: []const u8,
+    lane_id: []const u8,
+    registration_digest: []const u8,
+) !LaneControlVerification {
+    const payload = try loadTerminalPayloadAlloc(
+        allocator,
+        paths,
+        trial_id,
+        lane_id,
+        registration_digest,
+    );
+    defer payload.deinit(allocator);
+    try persistTerminalReceipt(allocator, paths.receipt, payload.receipt);
+    try persistTerminalControl(
+        allocator,
+        paths,
+        trial_id,
+        lane_id,
+        payload.registration_digest,
+        payload,
+    );
+    return verifyTerminalControlAlloc(allocator, paths, trial_id, lane_id);
 }
 
 fn regularFileExistsNoFollow(path: []const u8) !bool {
@@ -1590,6 +1782,19 @@ fn verifyTerminalControlAlloc(
     }
     const registration_digest = try requiredString(try requiredObject(receipt_root, "lineage"), "registration_event_digest");
     try validateFingerprint(registration_digest);
+    const terminal_payload = try loadTerminalPayloadAlloc(
+        allocator,
+        paths,
+        expected_trial_id,
+        expected_lane_id,
+        registration_digest,
+    );
+    defer terminal_payload.deinit(allocator);
+    if (!std.mem.eql(u8, terminal_payload.registration_digest, registration_digest) or
+        !std.mem.eql(u8, terminal_payload.receipt, receipt))
+    {
+        return error.TerminalPayloadInvalid;
+    }
     const control_path = (try findControlArtifactPathAlloc(
         allocator,
         paths.claim,
@@ -1613,6 +1818,8 @@ fn verifyTerminalControlAlloc(
         !std.mem.eql(u8, try requiredString(control, "lane_id"), expected_lane_id) or
         !std.mem.eql(u8, try requiredString(control, "registration_event_digest"), registration_digest) or
         !std.mem.eql(u8, try requiredString(control, "receipt_ref"), paths.receipt) or
+        !std.mem.eql(u8, try requiredString(control, "terminal_payload_ref"), terminal_payload.payload_ref) or
+        !std.mem.eql(u8, try requiredString(control, "terminal_payload_fingerprint"), terminal_payload.payload_fingerprint) or
         !std.mem.eql(u8, try requiredString(control, "evidence_ref"), paths.evidence))
     {
         return error.ControlArtifactInvalid;
@@ -1648,15 +1855,154 @@ fn verifyTerminalControlAlloc(
     };
 }
 
+const CleanupIntent = struct {
+    intent_ref: []u8,
+    intent_fingerprint: []u8,
+    cleanup: []u8,
+    cleanup_fingerprint: []u8,
+
+    fn deinit(self: CleanupIntent, allocator: std.mem.Allocator) void {
+        allocator.free(self.intent_ref);
+        allocator.free(self.intent_fingerprint);
+        allocator.free(self.cleanup);
+        allocator.free(self.cleanup_fingerprint);
+    }
+};
+
+fn buildCleanupReceiptAlloc(
+    allocator: std.mem.Allocator,
+    paths: LanePaths,
+    trial_id: []const u8,
+    lane_id: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":\"cas-trial-cleanup-receipt/v1\",\"trial_id\":{f},\"lane_id\":{f},\"workspace_removed\":true,\"claim_preserved\":true,\"terminal_receipt_preserved\":true,\"evidence_preserved\":true,\"evidence_ref\":{f}}}\n",
+        .{ std.json.fmt(trial_id, .{}), std.json.fmt(lane_id, .{}), std.json.fmt(paths.evidence, .{}) },
+    );
+}
+
+fn persistCleanupIntent(
+    allocator: std.mem.Allocator,
+    paths: LanePaths,
+    trial_id: []const u8,
+    lane_id: []const u8,
+    terminal: LaneControlVerification,
+    cleanup: []const u8,
+) !void {
+    const cleanup_fingerprint = try attestation.digestBytesAlloc(allocator, cleanup);
+    defer allocator.free(cleanup_fingerprint);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('{');
+    try writeStringMember(writer, "schema", "cas-trial-cleanup-intent/v1", true);
+    try writeStringMember(writer, "trial_id", trial_id, true);
+    try writeStringMember(writer, "lane_id", lane_id, true);
+    try writeStringMember(writer, "registration_event_digest", terminal.registration_digest, true);
+    try writeStringMember(writer, "terminal_control_fingerprint", terminal.terminal_control_fingerprint, true);
+    try writeStringMember(writer, "workspace_ref", paths.workspace, true);
+    try writeStringMember(writer, "evidence_ref", paths.evidence, true);
+    try writeStringMember(writer, "cleanup_ref", paths.cleanup_receipt, true);
+    try writeStringMember(writer, "cleanup_fingerprint", cleanup_fingerprint, true);
+    try writeStringMember(writer, "cleanup_bytes", cleanup, false);
+    try writer.writeByte('}');
+    const intent_fingerprint = try attestation.digestBytesAlloc(allocator, out.written());
+    defer allocator.free(intent_fingerprint);
+    const intent_path = try controlArtifactPathAlloc(
+        allocator,
+        paths.claim,
+        terminal.registration_digest,
+        .cleanup_intent,
+        intent_fingerprint,
+    );
+    defer allocator.free(intent_path);
+    const persisted = try persistSealedControlArtifactAlloc(allocator, intent_path, out.written());
+    defer allocator.free(persisted);
+    if (!std.mem.eql(u8, persisted, intent_fingerprint)) return error.ControlArtifactFingerprintMismatch;
+}
+
+fn loadCleanupIntentAlloc(
+    allocator: std.mem.Allocator,
+    paths: LanePaths,
+    trial_id: []const u8,
+    lane_id: []const u8,
+    terminal: LaneControlVerification,
+) !CleanupIntent {
+    const intent_path = (try findControlArtifactPathAlloc(
+        allocator,
+        paths.claim,
+        terminal.registration_digest,
+        .cleanup_intent,
+    )) orelse return error.CleanupIntentMissing;
+    defer allocator.free(intent_path);
+    const intent_fingerprint = try controlArtifactFingerprintFromPathAlloc(
+        allocator,
+        intent_path,
+        .cleanup_intent,
+    );
+    defer allocator.free(intent_fingerprint);
+    try verifySealedControlArtifact(allocator, intent_path, intent_fingerprint);
+    const bytes = try durable_store.readRegularFileNoSymlink(allocator, intent_path, MaxInputBytes);
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    });
+    defer parsed.deinit();
+    const intent = try object(parsed.value);
+    const cleanup = try requiredString(intent, "cleanup_bytes");
+    const cleanup_fingerprint = try requiredString(intent, "cleanup_fingerprint");
+    if (!std.mem.eql(u8, try requiredString(intent, "schema"), "cas-trial-cleanup-intent/v1") or
+        !std.mem.eql(u8, try requiredString(intent, "trial_id"), trial_id) or
+        !std.mem.eql(u8, try requiredString(intent, "lane_id"), lane_id) or
+        !std.mem.eql(u8, try requiredString(intent, "registration_event_digest"), terminal.registration_digest) or
+        !std.mem.eql(u8, try requiredString(intent, "terminal_control_fingerprint"), terminal.terminal_control_fingerprint) or
+        !std.mem.eql(u8, try requiredString(intent, "workspace_ref"), paths.workspace) or
+        !std.mem.eql(u8, try requiredString(intent, "evidence_ref"), paths.evidence) or
+        !std.mem.eql(u8, try requiredString(intent, "cleanup_ref"), paths.cleanup_receipt))
+    {
+        return error.CleanupIntentInvalid;
+    }
+    try validateFingerprint(cleanup_fingerprint);
+    try requireBytesFingerprint(allocator, cleanup, cleanup_fingerprint);
+    const expected_path = try controlArtifactPathAlloc(
+        allocator,
+        paths.claim,
+        terminal.registration_digest,
+        .cleanup_intent,
+        intent_fingerprint,
+    );
+    defer allocator.free(expected_path);
+    if (!std.mem.eql(u8, expected_path, intent_path)) return error.CleanupIntentInvalid;
+    const owned_intent_ref = try allocator.dupe(u8, intent_path);
+    errdefer allocator.free(owned_intent_ref);
+    const owned_intent_fingerprint = try allocator.dupe(u8, intent_fingerprint);
+    errdefer allocator.free(owned_intent_fingerprint);
+    const owned_cleanup = try allocator.dupe(u8, cleanup);
+    errdefer allocator.free(owned_cleanup);
+    const owned_cleanup_fingerprint = try allocator.dupe(u8, cleanup_fingerprint);
+    return .{
+        .intent_ref = owned_intent_ref,
+        .intent_fingerprint = owned_intent_fingerprint,
+        .cleanup = owned_cleanup,
+        .cleanup_fingerprint = owned_cleanup_fingerprint,
+    };
+}
+
 fn persistCleanupControl(
     allocator: std.mem.Allocator,
     paths: LanePaths,
     trial_id: []const u8,
     lane_id: []const u8,
     terminal: LaneControlVerification,
+    intent: CleanupIntent,
 ) !void {
     const cleanup_fingerprint = try sealExistingControlArtifactAlloc(allocator, paths.cleanup_receipt);
     defer allocator.free(cleanup_fingerprint);
+    if (!std.mem.eql(u8, cleanup_fingerprint, intent.cleanup_fingerprint)) {
+        return error.CleanupArtifactConflict;
+    }
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const writer = &out.writer;
@@ -1665,6 +2011,8 @@ fn persistCleanupControl(
     try writeStringMember(writer, "lane_id", lane_id, true);
     try writeStringMember(writer, "registration_event_digest", terminal.registration_digest, true);
     try writeStringMember(writer, "terminal_control_fingerprint", terminal.terminal_control_fingerprint, true);
+    try writeStringMember(writer, "cleanup_intent_ref", intent.intent_ref, true);
+    try writeStringMember(writer, "cleanup_intent_fingerprint", intent.intent_fingerprint, true);
     try writeStringMember(writer, "cleanup_ref", paths.cleanup_receipt, true);
     try writeStringMember(writer, "cleanup_fingerprint", cleanup_fingerprint, false);
     try writer.writeByte('}');
@@ -1698,8 +2046,10 @@ fn verifyCleanupControlIfPresent(
         .cleanup,
     );
     defer if (control_path) |path| allocator.free(path);
-    if (!cleanup_exists and control_path == null) return false;
-    if (!cleanup_exists or control_path == null) return error.CleanupControlMismatch;
+    if (control_path == null) return false;
+    if (!cleanup_exists) return error.CleanupControlMismatch;
+    const intent = try loadCleanupIntentAlloc(allocator, paths, trial_id, lane_id, terminal);
+    defer intent.deinit(allocator);
     const control_fingerprint = try controlArtifactFingerprintFromPathAlloc(allocator, control_path.?, .cleanup);
     defer allocator.free(control_fingerprint);
     try verifySealedControlArtifact(allocator, control_path.?, control_fingerprint);
@@ -1716,12 +2066,58 @@ fn verifyCleanupControlIfPresent(
         !std.mem.eql(u8, try requiredString(control, "lane_id"), lane_id) or
         !std.mem.eql(u8, try requiredString(control, "registration_event_digest"), terminal.registration_digest) or
         !std.mem.eql(u8, try requiredString(control, "terminal_control_fingerprint"), terminal.terminal_control_fingerprint) or
+        !std.mem.eql(u8, try requiredString(control, "cleanup_intent_ref"), intent.intent_ref) or
+        !std.mem.eql(u8, try requiredString(control, "cleanup_intent_fingerprint"), intent.intent_fingerprint) or
         !std.mem.eql(u8, try requiredString(control, "cleanup_ref"), paths.cleanup_receipt))
     {
         return error.CleanupControlMismatch;
     }
     try verifySealedControlArtifact(allocator, paths.cleanup_receipt, try requiredString(control, "cleanup_fingerprint"));
+    const cleanup_bytes = try durable_store.readRegularFileNoSymlink(allocator, paths.cleanup_receipt, MaxInputBytes);
+    defer allocator.free(cleanup_bytes);
+    if (!std.mem.eql(u8, cleanup_bytes, intent.cleanup)) return error.CleanupArtifactConflict;
     return true;
+}
+
+fn selectedRegistrationDigestAlloc(
+    allocator: std.mem.Allocator,
+    claim_root: []const u8,
+    provided: ?[]const u8,
+    kind: ?ControlArtifactKind,
+) !?[]u8 {
+    if (provided) |registration_digest| {
+        try validateFingerprint(registration_digest);
+        return try allocator.dupe(u8, registration_digest);
+    }
+    return findUniqueRegistrationDigestAlloc(allocator, claim_root, kind);
+}
+
+fn terminalReceiptRegistrationDigestAlloc(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    expected_trial_id: []const u8,
+    expected_lane_id: []const u8,
+) ![]u8 {
+    const receipt = try durable_store.readRegularFileNoSymlink(allocator, path, MaxInputBytes);
+    defer allocator.free(receipt);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, receipt, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    });
+    defer parsed.deinit();
+    const root = try object(parsed.value);
+    if (!std.mem.eql(u8, try requiredString(root, "schema"), "hylo-run-receipt/v1") or
+        !std.mem.eql(u8, try requiredString(root, "trial_id"), expected_trial_id) or
+        !std.mem.eql(u8, try requiredString(root, "lane_id"), expected_lane_id))
+    {
+        return error.TerminalPayloadInvalid;
+    }
+    const registration_digest = try requiredString(
+        try requiredObject(root, "lineage"),
+        "registration_event_digest",
+    );
+    try validateFingerprint(registration_digest);
+    return allocator.dupe(u8, registration_digest);
 }
 
 fn cmdStatus(allocator: std.mem.Allocator, options: Options) !void {
@@ -1732,7 +2128,21 @@ fn cmdStatus(allocator: std.mem.Allocator, options: Options) !void {
     defer paths.deinit(allocator);
     const receipt_exists = try regularFileExistsNoFollow(paths.receipt);
     if (receipt_exists) {
-        const terminal = try verifyTerminalControlAlloc(allocator, paths, trial_id, lane_id);
+        const terminal = verifyTerminalControlAlloc(allocator, paths, trial_id, lane_id) catch |err| switch (err) {
+            error.TerminalControlMissing => {
+                try printJson(.{
+                    .schema = "cas-trial-status/v1",
+                    .trial_id = trial_id,
+                    .lane_id = lane_id,
+                    .state = "terminalizing",
+                    .integrity = "recoverable",
+                    .claim_ref = paths.claim,
+                    .receipt_ref = paths.receipt,
+                });
+                return;
+            },
+            else => return err,
+        };
         defer terminal.deinit(allocator);
         _ = try verifyCleanupControlIfPresent(allocator, paths, trial_id, lane_id, terminal);
         try printJson(.{
@@ -1747,10 +2157,39 @@ fn cmdStatus(allocator: std.mem.Allocator, options: Options) !void {
         });
         return;
     }
-    if (try hasAnyControlArtifactAlloc(allocator, paths.claim, .terminal)) {
-        return error.TerminalReceiptMissing;
+    var registration_digest = try selectedRegistrationDigestAlloc(
+        allocator,
+        paths.claim,
+        options.registration_event_digest,
+        .terminal_payload,
+    );
+    if (registration_digest == null and options.registration_event_digest == null) {
+        registration_digest = try selectedRegistrationDigestAlloc(allocator, paths.claim, null, null);
     }
-    const claimed = try hasVerifiedClaimArtifactAlloc(allocator, paths);
+    defer if (registration_digest) |digest| allocator.free(digest);
+    if (registration_digest) |digest| {
+        if (try hasAnyControlArtifactAlloc(allocator, paths.claim, digest, .terminal_payload)) {
+            const payload = try loadTerminalPayloadAlloc(allocator, paths, trial_id, lane_id, digest);
+            payload.deinit(allocator);
+            try printJson(.{
+                .schema = "cas-trial-status/v1",
+                .trial_id = trial_id,
+                .lane_id = lane_id,
+                .state = "terminalizing",
+                .integrity = "recoverable",
+                .claim_ref = paths.claim,
+                .receipt_ref = null,
+            });
+            return;
+        }
+        if (try hasAnyControlArtifactAlloc(allocator, paths.claim, digest, .terminal)) {
+            return error.TerminalReceiptMissing;
+        }
+    }
+    const claimed = if (registration_digest) |digest|
+        try hasVerifiedClaimArtifactAlloc(allocator, paths, digest)
+    else
+        false;
     try printJson(.{
         .schema = "cas-trial-status/v1",
         .trial_id = trial_id,
@@ -1768,8 +2207,47 @@ fn cmdCleanup(allocator: std.mem.Allocator, options: Options) !void {
     const receipt_dir = options.receipt_dir orelse return error.MissingReceiptDir;
     const paths = try lanePathsAlloc(allocator, receipt_dir, options.claim_store_override, trial_id, lane_id);
     defer paths.deinit(allocator);
-    if (!try regularFileExistsNoFollow(paths.receipt)) return error.CleanupBeforeTerminal;
-    const terminal = try verifyTerminalControlAlloc(allocator, paths, trial_id, lane_id);
+    const receipt_exists = try regularFileExistsNoFollow(paths.receipt);
+    const terminal = if (receipt_exists) blk: {
+        const registration_digest = try terminalReceiptRegistrationDigestAlloc(
+            allocator,
+            paths.receipt,
+            trial_id,
+            lane_id,
+        );
+        defer allocator.free(registration_digest);
+        break :blk verifyTerminalControlAlloc(allocator, paths, trial_id, lane_id) catch |err| switch (err) {
+            error.TerminalControlMissing => try reconcileTerminalProjectionAlloc(
+                allocator,
+                paths,
+                trial_id,
+                lane_id,
+                registration_digest,
+            ),
+            else => return err,
+        };
+    } else blk: {
+        const registration_digest = (try selectedRegistrationDigestAlloc(
+            allocator,
+            paths.claim,
+            options.registration_event_digest,
+            .terminal_payload,
+        )) orelse return error.CleanupBeforeTerminal;
+        defer allocator.free(registration_digest);
+        if (!try hasAnyControlArtifactAlloc(
+            allocator,
+            paths.claim,
+            registration_digest,
+            .terminal_payload,
+        )) return error.CleanupBeforeTerminal;
+        break :blk try reconcileTerminalProjectionAlloc(
+            allocator,
+            paths,
+            trial_id,
+            lane_id,
+            registration_digest,
+        );
+    };
     defer terminal.deinit(allocator);
     if (try verifyCleanupControlIfPresent(allocator, paths, trial_id, lane_id, terminal)) {
         if (pathExists(paths.workspace)) return error.CleanupStateUnverified;
@@ -1792,18 +2270,36 @@ fn cmdCleanup(allocator: std.mem.Allocator, options: Options) !void {
         return;
     }
     if (!pathExists(paths.evidence) or !pathExists(paths.presented_input_archive)) return error.CleanupEvidenceMissing;
-    if (!pathExists(paths.workspace)) return error.CleanupStateUnverified;
-    try deleteTree(paths.workspace);
-    const cleanup = try std.fmt.allocPrint(
-        allocator,
-        "{{\"schema\":\"cas-trial-cleanup-receipt/v1\",\"trial_id\":{f},\"lane_id\":{f},\"workspace_removed\":true,\"claim_preserved\":true,\"terminal_receipt_preserved\":true,\"evidence_preserved\":true,\"evidence_ref\":{f}}}\n",
-        .{ std.json.fmt(trial_id, .{}), std.json.fmt(lane_id, .{}), std.json.fmt(paths.evidence, .{}) },
-    );
+    const cleanup = try buildCleanupReceiptAlloc(allocator, paths, trial_id, lane_id);
     defer allocator.free(cleanup);
-    try durable_store.writeTextCreateNewAtomic(allocator, paths.cleanup_receipt, cleanup, .{});
-    const cleanup_fingerprint = try sealExistingControlArtifactAlloc(allocator, paths.cleanup_receipt);
+    const intent_path = try findControlArtifactPathAlloc(
+        allocator,
+        paths.claim,
+        terminal.registration_digest,
+        .cleanup_intent,
+    );
+    const intent_exists = intent_path != null;
+    if (intent_path) |path| allocator.free(path);
+    if (!intent_exists) {
+        if (try regularFileExistsNoFollow(paths.cleanup_receipt)) return error.CleanupControlMismatch;
+        if (!pathExists(paths.workspace)) return error.CleanupStateUnverified;
+        try persistCleanupIntent(allocator, paths, trial_id, lane_id, terminal, cleanup);
+    }
+    const intent = try loadCleanupIntentAlloc(allocator, paths, trial_id, lane_id, terminal);
+    defer intent.deinit(allocator);
+    if (!std.mem.eql(u8, intent.cleanup, cleanup)) return error.CleanupArtifactConflict;
+    if (pathExists(paths.workspace)) try deleteTree(paths.workspace);
+    if (pathExists(paths.workspace)) return error.CleanupStateUnverified;
+    const cleanup_fingerprint = persistExpectedSealedArtifactAlloc(
+        allocator,
+        paths.cleanup_receipt,
+        cleanup,
+    ) catch |err| switch (err) {
+        error.PersistedArtifactConflict => return error.CleanupArtifactConflict,
+        else => return err,
+    };
     defer allocator.free(cleanup_fingerprint);
-    try persistCleanupControl(allocator, paths, trial_id, lane_id, terminal);
+    try persistCleanupControl(allocator, paths, trial_id, lane_id, terminal, intent);
     if (!try verifyCleanupControlIfPresent(allocator, paths, trial_id, lane_id, terminal)) {
         return error.CleanupControlMismatch;
     }
@@ -2077,6 +2573,12 @@ const LanePaths = struct {
     filesystem_observation: []u8,
     network_observation: []u8,
     external_effect_observation: []u8,
+    failure_native_receipt: []u8,
+    failure_execution_audit: []u8,
+    failure_reset_observation: []u8,
+    failure_filesystem_observation: []u8,
+    failure_network_observation: []u8,
+    failure_external_effect_observation: []u8,
     presented_input_archive: []u8,
     decision_context_archive: []u8,
     factor_materialization_workspace: []u8,
@@ -2105,6 +2607,12 @@ const LanePaths = struct {
         allocator.free(self.filesystem_observation);
         allocator.free(self.network_observation);
         allocator.free(self.external_effect_observation);
+        allocator.free(self.failure_native_receipt);
+        allocator.free(self.failure_execution_audit);
+        allocator.free(self.failure_reset_observation);
+        allocator.free(self.failure_filesystem_observation);
+        allocator.free(self.failure_network_observation);
+        allocator.free(self.failure_external_effect_observation);
         allocator.free(self.presented_input_archive);
         allocator.free(self.decision_context_archive);
         allocator.free(self.factor_materialization_workspace);
@@ -2168,6 +2676,12 @@ fn lanePathsAlloc(
         .filesystem_observation = try std.fmt.allocPrint(allocator, "{s}/evidence/cas-filesystem-observation.json", .{root}),
         .network_observation = try std.fmt.allocPrint(allocator, "{s}/evidence/cas-network-observation.json", .{root}),
         .external_effect_observation = try std.fmt.allocPrint(allocator, "{s}/evidence/cas-external-effect-observation.json", .{root}),
+        .failure_native_receipt = try std.fmt.allocPrint(allocator, "{s}/evidence/failure-native-receipt.json", .{root}),
+        .failure_execution_audit = try std.fmt.allocPrint(allocator, "{s}/evidence/failure-execution-audit.json", .{root}),
+        .failure_reset_observation = try std.fmt.allocPrint(allocator, "{s}/evidence/failure-cas-reset-observation.json", .{root}),
+        .failure_filesystem_observation = try std.fmt.allocPrint(allocator, "{s}/evidence/failure-cas-filesystem-observation.json", .{root}),
+        .failure_network_observation = try std.fmt.allocPrint(allocator, "{s}/evidence/failure-cas-network-observation.json", .{root}),
+        .failure_external_effect_observation = try std.fmt.allocPrint(allocator, "{s}/evidence/failure-cas-external-effect-observation.json", .{root}),
         .presented_input_archive = try std.fmt.allocPrint(allocator, "{s}/evidence/presented-input.json", .{root}),
         .decision_context_archive = try std.fmt.allocPrint(allocator, "{s}/evidence/decision-context.json", .{root}),
         .factor_materialization_workspace = try std.fmt.allocPrint(allocator, "{s}/factor-materialization.json", .{workspace}),
@@ -4663,8 +5177,7 @@ fn persistRunnerObservationAlloc(
 ) ![]u8 {
     const canonical = try canonicalJsonTextAlloc(allocator, raw);
     defer allocator.free(canonical);
-    try durable_store.writeTextCreateNewAtomic(allocator, path, canonical, .{});
-    return fileFingerprintAlloc(allocator, path);
+    return persistExpectedSealedArtifactAlloc(allocator, path, canonical);
 }
 
 fn combinedRunnerLimitationsAlloc(
@@ -5545,13 +6058,28 @@ fn sealExistingControlArtifactAlloc(
     return fingerprint;
 }
 
+fn persistExpectedSealedArtifactAlloc(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    bytes: []const u8,
+) ![]u8 {
+    durable_store.writeTextCreateNewAtomic(allocator, path, bytes, .{}) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            const existing = try durable_store.readRegularFileNoSymlink(allocator, path, MaxInputBytes);
+            defer allocator.free(existing);
+            if (!std.mem.eql(u8, existing, bytes)) return error.PersistedArtifactConflict;
+        },
+        else => return err,
+    };
+    return sealExistingControlArtifactAlloc(allocator, path);
+}
+
 fn persistSealedControlArtifactAlloc(
     allocator: std.mem.Allocator,
     path: []const u8,
     bytes: []const u8,
 ) ![]u8 {
-    try durable_store.writeTextCreateNewAtomic(allocator, path, bytes, .{});
-    return sealExistingControlArtifactAlloc(allocator, path);
+    return persistExpectedSealedArtifactAlloc(allocator, path, bytes);
 }
 
 fn verifySealedControlArtifact(
@@ -6637,6 +7165,134 @@ test "runner-global claim rejects copied-store fresh-lease retry and admits inde
         independent_start,
         lease,
     );
+}
+
+test "registration-keyed terminal payload lookup ignores independent lane history" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const receipt_dir = try std.fs.path.join(allocator, &.{ root, "receipts" });
+    defer allocator.free(receipt_dir);
+    const paths = try lanePathsAlloc(
+        allocator,
+        receipt_dir,
+        root,
+        "trial-registration-history",
+        "lane-registration-history",
+    );
+    defer paths.deinit(allocator);
+    try durable_store.ensureDirectoryPathNoSymlinks(paths.claim);
+
+    for (0..70) |index| {
+        const registration_source = try std.fmt.allocPrint(allocator, "historical-registration-{d}", .{index});
+        defer allocator.free(registration_source);
+        const registration_digest = try attestation.digestBytesAlloc(allocator, registration_source);
+        defer allocator.free(registration_digest);
+        const receipt = try std.fmt.allocPrint(
+            allocator,
+            "{{\"schema\":\"hylo-run-receipt/v1\",\"trial_id\":\"trial-registration-history\",\"lane_id\":\"lane-registration-history\",\"lineage\":{{\"registration_event_digest\":{f}}}}}",
+            .{std.json.fmt(registration_digest, .{})},
+        );
+        defer allocator.free(receipt);
+        try persistTerminalPayload(
+            allocator,
+            paths,
+            "trial-registration-history",
+            "lane-registration-history",
+            registration_digest,
+            receipt,
+        );
+    }
+
+    const current_registration = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const current_receipt =
+        "{\"schema\":\"hylo-run-receipt/v1\",\"trial_id\":\"trial-registration-history\",\"lane_id\":\"lane-registration-history\",\"lineage\":{\"registration_event_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}";
+    try persistTerminalPayload(
+        allocator,
+        paths,
+        "trial-registration-history",
+        "lane-registration-history",
+        current_registration,
+        current_receipt,
+    );
+    const current = try loadTerminalPayloadAlloc(
+        allocator,
+        paths,
+        "trial-registration-history",
+        "lane-registration-history",
+        current_registration,
+    );
+    defer current.deinit(allocator);
+    try std.testing.expectEqualStrings(current_registration, current.registration_digest);
+    try std.testing.expectEqualStrings(current_receipt, current.receipt);
+    try std.testing.expectError(
+        error.ControlArtifactConflict,
+        findUniqueRegistrationDigestAlloc(allocator, paths.claim, .terminal_payload),
+    );
+}
+
+test "claim-only lane remains nonterminal and cleanup fails closed" {
+    const allocator = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        hctp_fixtures.valid_null_trial,
+        .{ .allocate = .alloc_always },
+    );
+    defer parsed.deinit();
+    const trial = try object(parsed.value);
+    const unit = try object((try requiredArray(trial, "units")).items[0]);
+    const view = LaneView{
+        .trial = trial,
+        .trial_id = "trial-null-001",
+        .purpose = "calibration_null",
+        .unit_id = "unit-null-001",
+        .scenario_id = "scenario-holdout",
+        .pair_id = "pair-null-001",
+        .pair = try object((try requiredArray(unit, "pairs")).items[0]),
+        .lane_id = "lane-null-a0",
+        .arm_id = "arm-0",
+        .arm = try object((try requiredArray(trial, "arms")).items[0]),
+        .source_profile = unit.get("source_profile").?,
+        .execution = try requiredObject(trial, "execution"),
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
+    defer allocator.free(root);
+    const receipt_dir = try std.fs.path.join(allocator, &.{ root, "receipts" });
+    defer allocator.free(receipt_dir);
+    const paths = try lanePathsAlloc(allocator, receipt_dir, root, view.trial_id, view.lane_id);
+    defer paths.deinit(allocator);
+    const registration = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const claim_path = try claimPathAlloc(allocator, paths.claim, registration);
+    defer allocator.free(claim_path);
+    try claimLane(
+        allocator,
+        claim_path,
+        view,
+        registration,
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    );
+    try std.testing.expect(try hasVerifiedClaimArtifactAlloc(allocator, paths, registration));
+    try std.testing.expect(!try regularFileExistsNoFollow(paths.receipt));
+    try std.testing.expect(!(try hasAnyControlArtifactAlloc(
+        allocator,
+        paths.claim,
+        registration,
+        .terminal_payload,
+    )));
+    try std.testing.expectError(error.CleanupBeforeTerminal, cmdCleanup(allocator, .{
+        .command = .cleanup,
+        .trial_id = view.trial_id,
+        .lane_id = view.lane_id,
+        .receipt_dir = receipt_dir,
+        .claim_store_override = root,
+    }));
+    try std.testing.expect(!pathExists(paths.workspace));
 }
 
 fn bindTestRunnerContractAlloc(
@@ -7929,6 +8585,11 @@ test "claimed executor failure persists one signed terminal receipt and cleanup 
 
     const paths = try lanePathsAlloc(allocator, receipt_dir, root, "trial-null-001", "lane-null-a0");
     defer paths.deinit(allocator);
+    try std.testing.expect(!std.mem.eql(u8, paths.native_receipt, paths.failure_native_receipt));
+    try std.testing.expect(!std.mem.eql(u8, paths.reset_observation, paths.failure_reset_observation));
+    try std.testing.expect(!std.mem.eql(u8, paths.filesystem_observation, paths.failure_filesystem_observation));
+    try std.testing.expect(!std.mem.eql(u8, paths.network_observation, paths.failure_network_observation));
+    try std.testing.expect(!std.mem.eql(u8, paths.external_effect_observation, paths.failure_external_effect_observation));
     const receipt = try readFileAlloc(allocator, paths.receipt, MaxInputBytes);
     defer allocator.free(receipt);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, receipt, .{});
@@ -7951,8 +8612,8 @@ test "claimed executor failure persists one signed terminal receipt and cleanup 
     try std.testing.expect(std.mem.indexOf(u8, receipt, raw_lease) == null);
     try std.testing.expect(std.mem.indexOf(u8, receipt, &seed) == null);
     const native_receipt = try requiredObject(receipt_root, "native_receipt");
-    try std.testing.expectEqualStrings(paths.native_receipt, try requiredString(native_receipt, "ref"));
-    const native_bytes = try readFileAlloc(allocator, paths.native_receipt, MaxInputBytes);
+    try std.testing.expectEqualStrings(paths.failure_native_receipt, try requiredString(native_receipt, "ref"));
+    const native_bytes = try readFileAlloc(allocator, paths.failure_native_receipt, MaxInputBytes);
     defer allocator.free(native_bytes);
     const native_fingerprint = try attestation.digestBytesAlloc(allocator, native_bytes);
     defer allocator.free(native_fingerprint);
@@ -7960,7 +8621,7 @@ test "claimed executor failure persists one signed terminal receipt and cleanup 
         native_fingerprint,
         try requiredString(native_receipt, "fingerprint"),
     );
-    const native_stat = try std.Io.Dir.cwd().statFile(defaultIo(), paths.native_receipt, .{});
+    const native_stat = try std.Io.Dir.cwd().statFile(defaultIo(), paths.failure_native_receipt, .{});
     try std.testing.expect(native_stat.permissions.readOnly());
     const evidence_stat = try std.Io.Dir.cwd().statFile(defaultIo(), paths.evidence, .{});
     try std.testing.expect(evidence_stat.permissions.readOnly());
@@ -7997,6 +8658,39 @@ test "claimed executor failure persists one signed terminal receipt and cleanup 
     defer allocator.free(terminal_control_path);
     const terminal_control_stat = try std.Io.Dir.cwd().statFile(defaultIo(), terminal_control_path, .{ .follow_symlinks = false });
     try std.testing.expectEqual(@as(std.posix.mode_t, 0o400), terminal_control_stat.permissions.toMode() & 0o777);
+
+    // A sealed terminal payload is the recovery anchor. Conflicting projections
+    // are rejected, while a crash before receipt/control publication resumes
+    // without another executor launch.
+    try deleteFileIfExists(terminal_control_path);
+    try durable_store.writeTextAtomic(allocator, paths.receipt, "{\"conflict\":true}");
+    try std.testing.expectError(
+        error.LaneAlreadyTerminal,
+        reconcileTerminalProjectionAlloc(
+            allocator,
+            paths,
+            "trial-null-001",
+            "lane-null-a0",
+            terminal_control.registration_digest,
+        ),
+    );
+    try durable_store.writeTextAtomic(allocator, paths.receipt, receipt);
+    try deleteFileIfExists(paths.receipt);
+    const recovered_terminal = try reconcileTerminalProjectionAlloc(
+        allocator,
+        paths,
+        "trial-null-001",
+        "lane-null-a0",
+        terminal_control.registration_digest,
+    );
+    defer recovered_terminal.deinit(allocator);
+    const recovered_receipt = try readFileAlloc(allocator, paths.receipt, MaxInputBytes);
+    defer allocator.free(recovered_receipt);
+    try std.testing.expectEqualStrings(receipt, recovered_receipt);
+    try std.testing.expectEqualStrings(
+        terminal_control.terminal_control_fingerprint,
+        recovered_terminal.terminal_control_fingerprint,
+    );
 
     const original_receipt = try allocator.dupe(u8, receipt);
     defer allocator.free(original_receipt);
@@ -8035,6 +8729,22 @@ test "claimed executor failure persists one signed terminal receipt and cleanup 
         root,
     )));
 
+    const cleanup_preview = try buildCleanupReceiptAlloc(
+        allocator,
+        paths,
+        "trial-null-001",
+        "lane-null-a0",
+    );
+    defer allocator.free(cleanup_preview);
+    try persistCleanupIntent(
+        allocator,
+        paths,
+        "trial-null-001",
+        "lane-null-a0",
+        recovered_terminal,
+        cleanup_preview,
+    );
+    try deleteTree(paths.workspace);
     try cmdCleanup(allocator, .{
         .command = .cleanup,
         .trial_id = "trial-null-001",
@@ -8056,6 +8766,23 @@ test "claimed executor failure persists one signed terminal receipt and cleanup 
         "lane-null-a0",
         terminal_control,
     ));
+    const cleanup_control_path = (try findControlArtifactPathAlloc(
+        allocator,
+        paths.claim,
+        terminal_control.registration_digest,
+        .cleanup,
+    )) orelse return error.CleanupControlMismatch;
+    defer allocator.free(cleanup_control_path);
+    try deleteFileIfExists(cleanup_control_path);
+    try durable_store.writeTextAtomic(allocator, paths.cleanup_receipt, "{\"conflict\":true}");
+    try std.testing.expectError(error.CleanupArtifactConflict, cmdCleanup(allocator, .{
+        .command = .cleanup,
+        .trial_id = "trial-null-001",
+        .lane_id = "lane-null-a0",
+        .receipt_dir = receipt_dir,
+        .claim_store_override = root,
+    }));
+    try durable_store.writeTextAtomic(allocator, paths.cleanup_receipt, cleanup_preview);
     try cmdCleanup(allocator, .{
         .command = .cleanup,
         .trial_id = "trial-null-001",
@@ -8177,7 +8904,7 @@ test "claimed output overflow persists one signed bounded aborted receipt" {
     defer allocator.free(stderr_fingerprint);
     try std.testing.expectEqualStrings(stdout_fingerprint, try requiredString(detail_root, "executor_stdout_fingerprint"));
     try std.testing.expectEqualStrings(stderr_fingerprint, try requiredString(detail_root, "executor_stderr_fingerprint"));
-    const native_receipt = try readFileAlloc(allocator, paths.native_receipt, MaxInputBytes);
+    const native_receipt = try readFileAlloc(allocator, paths.failure_native_receipt, MaxInputBytes);
     defer allocator.free(native_receipt);
     try std.testing.expect(std.mem.indexOf(u8, native_receipt, executor) != null);
     try std.testing.expect(std.mem.indexOf(u8, native_receipt, ".executables") == null);
@@ -8567,6 +9294,28 @@ test "evidence references cannot escape the workspace or traverse symlinks" {
     );
 }
 
+fn expectExecutorLimitTermination(
+    allocator: std.mem.Allocator,
+    pid_path: []const u8,
+    natural_completion_path: []const u8,
+) !void {
+    const raw_pid = try readFileAlloc(allocator, pid_path, 64);
+    defer allocator.free(raw_pid);
+    const pid = try std.fmt.parseInt(
+        std.posix.pid_t,
+        std.mem.trim(u8, raw_pid, " \t\r\n"),
+        10,
+    );
+    var status: c_int = undefined;
+    try std.testing.expectEqual(
+        std.posix.E.CHILD,
+        std.posix.errno(std.posix.system.waitpid(pid, &status, std.posix.W.NOHANG)),
+    );
+    const group_observation = try observeExecutorGroupAlloc(allocator, pid);
+    try std.testing.expect(group_observation != .live_members);
+    try std.testing.expect(!pathExists(natural_completion_path));
+}
+
 test "bounded executor capture accepts the exact limit and rejects one extra byte per stream" {
     const allocator = std.testing.allocator;
     const output_limit = 8;
@@ -8623,7 +9372,7 @@ test "bounded executor capture accepts the exact limit and rejects one extra byt
     try durable_store.writeTextAtomic(
         allocator,
         stdout_origin,
-        "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 1024 ]; do printf 'poisonpoison' >> \"$4.stdout\"; i=$((i + 1)); done\n(sleep 0.2; printf late > \"$4.stdout-late\") &\nprintf '123456789'\nsleep 5\n",
+        "#!/bin/sh\nprintf '%s' \"$$\" > \"$4.stdout-pid\"\ni=0\nwhile [ \"$i\" -lt 1024 ]; do printf 'poisonpoison' >> \"$4.stdout\"; i=$((i + 1)); done\n(sleep 0.2; printf late > \"$4.stdout-late\") &\nprintf '123456789'\nsleep 5\nprintf natural > \"$4.stdout-natural\"\n",
     );
     executable_file = try std.Io.Dir.openFileAbsolute(defaultIo(), stdout_origin, .{});
     try executable_file.setPermissions(defaultIo(), .fromMode(0o500));
@@ -8632,7 +9381,6 @@ test "bounded executor capture accepts the exact limit and rejects one extra byt
     defer stdout_binding.deinit(allocator);
     const stdout_result = try std.fs.path.join(allocator, &.{ root, "stdout-result.json" });
     defer allocator.free(stdout_result);
-    const stdout_before = std.Io.Clock.awake.now(defaultIo());
     try std.testing.expectError(
         error.ExecutorStdoutLimitExceeded,
         runExecutorWithTempRootAndLimit(
@@ -8646,7 +9394,11 @@ test "bounded executor capture accepts the exact limit and rejects one extra byt
             output_limit,
         ),
     );
-    try std.testing.expect(stdout_before.durationTo(std.Io.Clock.awake.now(defaultIo())).toMilliseconds() < 1_000);
+    const stdout_pid_path = try std.fmt.allocPrint(allocator, "{s}.stdout-pid", .{stdout_result});
+    defer allocator.free(stdout_pid_path);
+    const stdout_natural_path = try std.fmt.allocPrint(allocator, "{s}.stdout-natural", .{stdout_result});
+    defer allocator.free(stdout_natural_path);
+    try expectExecutorLimitTermination(allocator, stdout_pid_path, stdout_natural_path);
     const stdout_path = try std.fmt.allocPrint(allocator, "{s}.stdout", .{stdout_result});
     defer allocator.free(stdout_path);
     const stdout_stat = try std.Io.Dir.cwd().statFile(defaultIo(), stdout_path, .{});
@@ -8664,7 +9416,7 @@ test "bounded executor capture accepts the exact limit and rejects one extra byt
     try durable_store.writeTextAtomic(
         allocator,
         stderr_origin,
-        "#!/bin/sh\n(sleep 0.2; printf late > \"$4.stderr-late\") &\nprintf 'abcdefghi' >&2\nsleep 5\n",
+        "#!/bin/sh\nprintf '%s' \"$$\" > \"$4.stderr-pid\"\n(sleep 0.2; printf late > \"$4.stderr-late\") &\nprintf 'abcdefghi' >&2\nsleep 5\nprintf natural > \"$4.stderr-natural\"\n",
     );
     executable_file = try std.Io.Dir.openFileAbsolute(defaultIo(), stderr_origin, .{});
     try executable_file.setPermissions(defaultIo(), .fromMode(0o500));
@@ -8673,7 +9425,6 @@ test "bounded executor capture accepts the exact limit and rejects one extra byt
     defer stderr_binding.deinit(allocator);
     const stderr_result = try std.fs.path.join(allocator, &.{ root, "stderr-result.json" });
     defer allocator.free(stderr_result);
-    const stderr_before = std.Io.Clock.awake.now(defaultIo());
     try std.testing.expectError(
         error.ExecutorStderrLimitExceeded,
         runExecutorWithTempRootAndLimit(
@@ -8687,7 +9438,11 @@ test "bounded executor capture accepts the exact limit and rejects one extra byt
             output_limit,
         ),
     );
-    try std.testing.expect(stderr_before.durationTo(std.Io.Clock.awake.now(defaultIo())).toMilliseconds() < 1_000);
+    const stderr_pid_path = try std.fmt.allocPrint(allocator, "{s}.stderr-pid", .{stderr_result});
+    defer allocator.free(stderr_pid_path);
+    const stderr_natural_path = try std.fmt.allocPrint(allocator, "{s}.stderr-natural", .{stderr_result});
+    defer allocator.free(stderr_natural_path);
+    try expectExecutorLimitTermination(allocator, stderr_pid_path, stderr_natural_path);
     const stderr_path = try std.fmt.allocPrint(allocator, "{s}.stderr", .{stderr_result});
     defer allocator.free(stderr_path);
     const stderr_stat = try std.Io.Dir.cwd().statFile(defaultIo(), stderr_path, .{});
@@ -8700,7 +9455,6 @@ test "bounded executor capture accepts the exact limit and rejects one extra byt
     const output_limit_disposition = failureDisposition(error.ExecutorStdoutLimitExceeded);
     try std.testing.expectEqualStrings("aborted", output_limit_disposition.status);
     try std.testing.expectEqualStrings("executor_output_limit_exceeded", output_limit_disposition.class);
-    std.Io.sleep(std.testing.io, .fromMilliseconds(400), .awake) catch {};
     const stdout_late = try std.fmt.allocPrint(allocator, "{s}.stdout-late", .{stdout_result});
     defer allocator.free(stdout_late);
     const stderr_late = try std.fmt.allocPrint(allocator, "{s}.stderr-late", .{stderr_result});
@@ -8854,9 +9608,10 @@ test "executor capture deadline bounds an escaped pipe holder after child reap" 
             var ready = [_]u8{1};
             if (std.c.write(ready_pipe[1], &ready, ready.len) != ready.len) std.c._exit(95);
             _ = std.c.close(ready_pipe[1]);
-            const sleep_time = std.c.timespec{ .sec = 5, .nsec = 0 };
-            _ = std.c.nanosleep(&sleep_time, null);
-            std.c._exit(0);
+            while (true) {
+                const sleep_time = std.c.timespec{ .sec = 1, .nsec = 0 };
+                _ = std.c.nanosleep(&sleep_time, null);
+            }
         }
         _ = std.c.close(stdout_pipe.read_fd.?);
         _ = std.c.close(stdout_pipe.write_fd.?);
@@ -8886,7 +9641,6 @@ test "executor capture deadline bounds an escaped pipe holder after child reap" 
     closeRawFd(pid_pipe[0]);
     defer _ = std.posix.system.kill(escaped_pid, .KILL);
 
-    const before = std.Io.Clock.awake.now(defaultIo());
     try std.testing.expectError(
         error.ExecutorLivenessUnproved,
         superviseExecutorProcessAlloc(
@@ -8898,7 +9652,10 @@ test "executor capture deadline bounds an escaped pipe holder after child reap" 
             8,
         ),
     );
-    try std.testing.expect(before.durationTo(std.Io.Clock.awake.now(defaultIo())).toMilliseconds() < 1_000);
+    try std.testing.expectEqual(
+        std.posix.E.SUCCESS,
+        std.posix.errno(std.c.kill(escaped_pid, @enumFromInt(0))),
+    );
 }
 
 test "executor rejects an unrepresentable duration before reserving carriers or spawning" {

@@ -303,6 +303,8 @@ test "HCTP legacy 0.7.2 corpus remains byte-locked under the current parser and 
         try std.testing.expect(progress_root.get("trial_counts") == null);
         try std.testing.expect(progress_root.get("claim_summary") == null);
     }
+    try std.testing.expect(progress_root.get("causal_frontier") == null);
+    try std.testing.expect(progress_root.get("next_step_decisions") == null);
 
     const after = try durable_store.readFileAlloc(std.testing.allocator, store_path, MaxBytes);
     defer std.testing.allocator.free(after);

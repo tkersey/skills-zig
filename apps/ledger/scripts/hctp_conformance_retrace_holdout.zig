@@ -653,6 +653,28 @@ test "HCTP conformance case 53: promotion execution accepts only Retrace replay 
     }
 }
 
+test "HCTP conformance case 53b: every admitted historical profile is CAS replay executable" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const allocator = arena_state.allocator();
+    const promotion = try historicalPromotionAlloc(
+        allocator,
+        "authoritative",
+        true,
+        "pre_decision",
+        "challenge",
+        "absent",
+        false,
+    );
+    const practice = try replaceExactAlloc(
+        allocator,
+        promotion,
+        "\"purpose\":\"promotion\"",
+        "\"purpose\":\"practice_repair\"",
+    );
+    try std.testing.expectError(error.RetraceReplayRequired, hctp.validateTrialAlloc(allocator, practice));
+}
+
 test "HCTP conformance case 54: historical and arm-specific target instructions cannot coexist" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
