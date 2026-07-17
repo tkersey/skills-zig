@@ -149,6 +149,7 @@ ledger create --source universalist --template universalist-plan.md
 ledger latest --source universalist
 ledger latest --source universalist --format path
 ledger path --source universalist --id 20260711T164436123456789Z-0000
+ledger emit --source universalist --plan PLAN --contract CONTRACT [receipt fields] [--write-plan]
 ledger validate plan-source-contract --input plan-source-contract.json
 ledger validate policy-synthesis-receipt --input synthesis-receipt.json
 ledger validate review-fold --input review-fold.json
@@ -167,10 +168,12 @@ For `--source learnings`, `--file PATH` is accepted as an alias for the learning
 Negative Ledger commands; it preserves `--file` and all existing command
 semantics.
 
-## Universalist plan addressing
+## Universalist plan and receipt ownership
 
-`ledger --source universalist` owns plan identity, allocation, and lookup;
-Universalist owns each plan's Markdown fields and subsequent updates.
+`ledger --source universalist` owns plan identity, allocation, lookup, and
+SDR-v1 receipt emission. Universalist owns the decision policy, SKDC-v1
+contract, plan template, and ordinary Markdown field updates. This receipt
+boundary requires Ledger 0.10.4 or newer and `seq` on `PATH`.
 
 Create a fresh plan from a skill-owned template:
 
@@ -206,6 +209,35 @@ ledger path --source universalist \
 `latest` is a recovery aid, not run identity: concurrent runs must retain their
 own returned plan id and verify a recovered plan's task metadata before
 resuming it.
+
+After Universalist selects one consequential route, emit its root decision
+receipt before mutating the implementation seam:
+
+```bash
+ledger emit --source universalist \
+  --plan "$UNIVERSALIST_PLAN" \
+  --contract /path/to/references/decision-contract.yaml \
+  --question "Which construction owns this seam?" \
+  --selected-route UNI-ORDINARY \
+  --rejected-route UNI-CANONICAL \
+  --expected-outcome "The owner boundary enforces one observable law." \
+  --disposition changed \
+  --construction "checked adapter at the owner boundary" \
+  --law "required observations are preserved" \
+  --falsifier "a mismatched source is accepted" \
+  --advanced-mechanics none \
+  --evidence-ref "code:path" \
+  --write-plan
+```
+
+Ledger validates the contract through Seq, rejects unknown trigger, clause, or
+route references, derives the decision id and repository state, constructs
+canonical compact SDR-v1 JSON, and validates the generated receipt through Seq
+before any plan mutation. `--write-plan` accepts only the canonical
+`.ledger/universalist/plan-<id>.md` path, atomically appends one receipt, and
+rejects a second append. Without `--write-plan`, the command is a plan-read-only
+receipt projection and may use a non-addressed plan when `--decision-id` is
+explicit.
 
 ## Hylo replay kernel
 

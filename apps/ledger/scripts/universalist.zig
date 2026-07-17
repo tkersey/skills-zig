@@ -14,7 +14,16 @@ const LegacyPlanPrefix = "universalist-plan-";
 const PlanSuffix = ".md";
 const PlanIdLen = 30;
 const MaxTemplateBytes = 1024 * 1024;
+const MaxReceiptBytes = 1024 * 1024;
+const MaxReceiptValues = 64;
 const MaxOrdinal = 9999;
+const DefaultTriggerRefs = [_][]const u8{ "UNI-BOUNDARY", "UNI-CONSEQUENTIAL" };
+const DefaultClauseRefs = [_][]const u8{
+    "UNI-DISPOSITION-001",
+    "UNI-MINIMAL-001",
+    "UNI-MECHANICS-001",
+    "UNI-ROOT-001",
+};
 threadlocal var runtime_io: ?std.Io = null;
 
 fn defaultIo() std.Io {
@@ -24,20 +33,38 @@ fn defaultIo() std.Io {
 const UsageText =
     \\ledger --source universalist
     \\
-    \\usage: ledger --source universalist [-h] [--repo PATH] {create,latest,path} ...
+    \\usage: ledger --source universalist [-h] [--repo PATH] {create,latest,path,emit} ...
     \\
-    \\Allocate and resolve collision-safe Universalist plan artifacts.
+    \\Allocate, resolve, and emit receipts for Universalist plan artifacts.
     \\
     \\commands:
     \\  create     Create a fresh timestamp-addressed plan from --template
     \\  latest     Resolve the newest valid plan by sortable plan id
     \\  path       Resolve one plan id to its absolute path
+    \\  emit       Emit one Seq-valid SDR-v1 receipt and optionally write the plan
     \\
     \\options:
-    \\  --repo PATH       Git repository to address (default: current repository)
+    \\  --repo PATH       Git repository to address (emit defaults to plan repository)
     \\  --template FILE   Markdown template for create
     \\  --id PLAN-ID      Plan id for path
     \\  --format FORMAT   json|path for create/latest (default: json)
+    \\  --plan FILE       Universalist plan for emit
+    \\  --contract FILE   Universalist SKDC-v1 decision contract for emit
+    \\  --decision-id ID  Required for a non-addressed plan
+    \\  --trigger-ref ID  Repeatable; defaults to Universalist boundary triggers
+    \\  --clause-ref ID   Repeatable; defaults to Universalist receipt clauses
+    \\  --question TEXT   Decision question
+    \\  --alternative TEXT  Repeatable considered alternative
+    \\  --selected-route ID  Selected contract route
+    \\  --rejected-route ID  Repeatable; at least one is required
+    \\  --expected-outcome TEXT  Expected observable outcome
+    \\  --disposition VALUE  preserved|introduced|changed|repaired|removed|bypass-justified
+    \\  --construction TEXT  Selected boundary construction
+    \\  --law TEXT          Boundary law
+    \\  --falsifier TEXT    Executable falsifier
+    \\  --advanced-mechanics TEXT  Named mechanics artifact or none
+    \\  --evidence-ref REF  Repeatable evidence reference
+    \\  --write-plan      Atomically append the receipt to its canonical plan
     \\  -h, --help        Show help
     \\  -V, --version     Show version
 ;
@@ -51,6 +78,7 @@ const Command = enum {
     create,
     latest,
     path,
+    emit,
 };
 
 const OutputFormat = enum {
@@ -63,12 +91,52 @@ const PlanLayout = enum {
     legacy,
 };
 
+const BoundaryDisposition = enum {
+    preserved,
+    introduced,
+    changed,
+    repaired,
+    removed,
+    @"bypass-justified",
+};
+
 const Args = struct {
     command: ?Command = null,
     repo: []const u8 = ".",
+    repo_explicit: bool = false,
     template_path: ?[]const u8 = null,
     plan_id: ?[]const u8 = null,
     format: OutputFormat = .json,
+    plan_path: ?[]const u8 = null,
+    contract_path: ?[]const u8 = null,
+    decision_id: ?[]const u8 = null,
+    question: ?[]const u8 = null,
+    selected_route: ?[]const u8 = null,
+    expected_outcome: ?[]const u8 = null,
+    disposition: ?BoundaryDisposition = null,
+    construction: ?[]const u8 = null,
+    law: ?[]const u8 = null,
+    falsifier: ?[]const u8 = null,
+    advanced_mechanics: ?[]const u8 = null,
+    write_plan: bool = false,
+    trigger_refs: [MaxReceiptValues][]const u8 = undefined,
+    trigger_ref_count: usize = 0,
+    clause_refs: [MaxReceiptValues][]const u8 = undefined,
+    clause_ref_count: usize = 0,
+    alternatives: [MaxReceiptValues][]const u8 = undefined,
+    alternative_count: usize = 0,
+    rejected_routes: [MaxReceiptValues][]const u8 = undefined,
+    rejected_route_count: usize = 0,
+    evidence_refs: [MaxReceiptValues][]const u8 = undefined,
+    evidence_ref_count: usize = 0,
+
+    fn effectiveTriggerRefs(self: *const Args) []const []const u8 {
+        return if (self.trigger_ref_count == 0) &DefaultTriggerRefs else self.trigger_refs[0..self.trigger_ref_count];
+    }
+
+    fn effectiveClauseRefs(self: *const Args) []const []const u8 {
+        return if (self.clause_ref_count == 0) &DefaultClauseRefs else self.clause_refs[0..self.clause_ref_count];
+    }
 };
 
 const PlanAddress = struct {
@@ -117,16 +185,16 @@ fn runWithArgvInner(allocator: std.mem.Allocator, argv: []const []const u8) !u8 
         try core_cli.printVersion(&stdout_writer.interface, Version);
         return 0;
     }
-
-    const args = parseArgs(argv) catch |err| {
-        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
-    };
     if (core_cli.containsHelpArg(argv[1..])) {
         try printHelp();
         return 0;
     }
 
-    const repo = try durable_store.findGitRootAlloc(allocator, args.repo);
+    const args = parseArgs(argv) catch |err| {
+        core_cli.exitUsageFailure(HelpSurface, Version, @errorName(err), null);
+    };
+
+    const repo = try resolveRepoForArgsAlloc(allocator, args);
     defer allocator.free(repo);
 
     switch (args.command orelse return error.MissingCommand) {
@@ -149,6 +217,7 @@ fn runWithArgvInner(allocator: std.mem.Allocator, argv: []const []const u8) !u8 
             var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
             try stdout_writer.interface.print("{s}\n", .{address.path});
         },
+        .emit => try emitDecisionReceipt(allocator, repo, args),
     }
     return 0;
 }
@@ -163,6 +232,7 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i >= argv.len) return error.MissingValue;
             args.repo = argv[i];
+            args.repo_explicit = true;
             continue;
         }
         if (std.mem.eql(u8, token, "--template")) {
@@ -189,6 +259,106 @@ fn parseArgs(argv: []const []const u8) !Args {
             }
             continue;
         }
+        if (std.mem.eql(u8, token, "--plan")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.plan_path = argv[i];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--contract")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.contract_path = argv[i];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--decision-id")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.decision_id = argv[i];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--trigger-ref")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            try appendRepeated(&args.trigger_refs, &args.trigger_ref_count, argv[i]);
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--clause-ref")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            try appendRepeated(&args.clause_refs, &args.clause_ref_count, argv[i]);
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--question")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.question = argv[i];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--alternative")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            try appendRepeated(&args.alternatives, &args.alternative_count, argv[i]);
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--selected-route")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.selected_route = argv[i];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--rejected-route")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            try appendRepeated(&args.rejected_routes, &args.rejected_route_count, argv[i]);
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--expected-outcome")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.expected_outcome = argv[i];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--disposition")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.disposition = parseDisposition(argv[i]) orelse return error.InvalidDisposition;
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--construction")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.construction = argv[i];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--law")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.law = argv[i];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--falsifier")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.falsifier = argv[i];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--advanced-mechanics")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            args.advanced_mechanics = argv[i];
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--evidence-ref")) {
+            i += 1;
+            if (i >= argv.len) return error.MissingValue;
+            try appendRepeated(&args.evidence_refs, &args.evidence_ref_count, argv[i]);
+            continue;
+        }
+        if (std.mem.eql(u8, token, "--write-plan")) {
+            args.write_plan = true;
+            continue;
+        }
         if (!std.mem.startsWith(u8, token, "-") and args.command == null) {
             args.command = parseCommand(token) orelse return error.UnknownCommand;
             continue;
@@ -199,10 +369,47 @@ fn parseArgs(argv: []const []const u8) !Args {
     const command = args.command orelse return error.MissingCommand;
     if (command == .create and args.template_path == null) return error.MissingTemplate;
     if (command == .path and args.plan_id == null) return error.MissingPlanId;
+    if (command == .emit) {
+        if (args.plan_path == null) return error.MissingPlan;
+        if (args.contract_path == null) return error.MissingContract;
+        if (args.question == null) return error.MissingQuestion;
+        if (args.selected_route == null) return error.MissingSelectedRoute;
+        if (args.rejected_route_count == 0) return error.MissingRejectedRoute;
+        if (args.expected_outcome == null) return error.MissingExpectedOutcome;
+        if (args.disposition == null) return error.MissingDisposition;
+        if (args.construction == null) return error.MissingConstruction;
+        if (args.law == null) return error.MissingLaw;
+        if (args.falsifier == null) return error.MissingFalsifier;
+        if (args.advanced_mechanics == null) return error.MissingAdvancedMechanics;
+    } else if (hasEmitOptions(args)) {
+        return error.EmitOptionNotAllowed;
+    }
     if (command != .create and args.template_path != null) return error.TemplateNotAllowed;
     if (command != .path and args.plan_id != null) return error.PlanIdNotAllowed;
-    if (command == .path and args.format != .json) return error.FormatNotAllowed;
+    if ((command == .path or command == .emit) and args.format != .json) return error.FormatNotAllowed;
     return args;
+}
+
+fn appendRepeated(values: *[MaxReceiptValues][]const u8, count: *usize, value: []const u8) !void {
+    if (count.* >= values.len) return error.TooManyValues;
+    values[count.*] = value;
+    count.* += 1;
+}
+
+fn parseDisposition(raw: []const u8) ?BoundaryDisposition {
+    inline for (@typeInfo(BoundaryDisposition).@"enum".fields) |field| {
+        if (std.mem.eql(u8, raw, field.name)) return @enumFromInt(field.value);
+    }
+    return null;
+}
+
+fn hasEmitOptions(args: Args) bool {
+    return args.plan_path != null or args.contract_path != null or args.decision_id != null or
+        args.question != null or args.selected_route != null or args.expected_outcome != null or
+        args.disposition != null or args.construction != null or args.law != null or
+        args.falsifier != null or args.advanced_mechanics != null or args.write_plan or
+        args.trigger_ref_count != 0 or args.clause_ref_count != 0 or args.alternative_count != 0 or
+        args.rejected_route_count != 0 or args.evidence_ref_count != 0;
 }
 
 fn parseCommand(raw: []const u8) ?Command {
@@ -210,6 +417,494 @@ fn parseCommand(raw: []const u8) ?Command {
         if (std.mem.eql(u8, raw, field.name)) return @enumFromInt(field.value);
     }
     return null;
+}
+
+const ContractInfo = struct {
+    fingerprint: []u8,
+    text: []u8,
+    skill_version: []u8,
+
+    fn deinit(self: *ContractInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.fingerprint);
+        allocator.free(self.text);
+        allocator.free(self.skill_version);
+        self.* = undefined;
+    }
+};
+
+const ReceiptContext = struct {
+    repo: []const u8,
+    head: []const u8,
+    plan_id: []const u8,
+    plan_relative: []const u8,
+    plan_status: []const u8,
+    decision_id: []const u8,
+    skill_version: []const u8,
+    contract_fingerprint: []const u8,
+};
+
+fn resolveRepoForArgsAlloc(allocator: std.mem.Allocator, args: Args) ![]u8 {
+    if (args.command == .emit and !args.repo_explicit) {
+        return durable_store.findGitRootAlloc(allocator, std.fs.path.dirname(args.plan_path.?) orelse ".");
+    }
+    return durable_store.findGitRootAlloc(allocator, args.repo);
+}
+
+fn emitDecisionReceipt(allocator: std.mem.Allocator, repo: []const u8, args: Args) !void {
+    const plan_path = try realPathAlloc(allocator, args.plan_path.?);
+    defer allocator.free(plan_path);
+    if (!pathWithin(plan_path, repo)) return error.PlanOutsideRepo;
+    const contract_path = try realPathAlloc(allocator, args.contract_path.?);
+    defer allocator.free(contract_path);
+
+    const plan_text = try durable_store.readFileAlloc(allocator, plan_path, MaxReceiptBytes);
+    defer allocator.free(plan_text);
+    if (!containsExactLine(plan_text, "# Universalist Plan")) return error.NotUniversalistPlan;
+
+    const addressed_plan_id = addressedPlanId(plan_path);
+    const plan_id = addressed_plan_id orelse "template";
+    var owned_decision_id: ?[]u8 = null;
+    defer if (owned_decision_id) |value| allocator.free(value);
+    const decision_id = if (args.decision_id) |value| value else if (addressed_plan_id) |value| blk: {
+        owned_decision_id = try std.fmt.allocPrint(allocator, "UNI-{s}", .{value});
+        break :blk owned_decision_id.?;
+    } else return error.DecisionIdRequired;
+
+    if (args.write_plan) try requireCanonicalPlan(allocator, repo, plan_path, addressed_plan_id);
+
+    var contract = try loadContractInfo(allocator, contract_path);
+    defer contract.deinit(allocator);
+    try validateReceiptRefs(contract.text, args);
+
+    const plan_relative = try allocator.dupe(u8, plan_path[repo.len + 1 ..]);
+    defer allocator.free(plan_relative);
+    const head = try runGitStdoutAlloc(allocator, repo, &.{ "rev-parse", "HEAD" });
+    defer allocator.free(head);
+
+    const context = ReceiptContext{
+        .repo = repo,
+        .head = head,
+        .plan_id = plan_id,
+        .plan_relative = plan_relative,
+        .plan_status = planStatus(plan_text),
+        .decision_id = decision_id,
+        .skill_version = contract.skill_version,
+        .contract_fingerprint = contract.fingerprint,
+    };
+    const receipt = try renderReceiptAlloc(allocator, args, context);
+    defer allocator.free(receipt);
+    try validateReceiptWithSeq(allocator, receipt);
+    if (args.write_plan) try appendReceiptToPlan(allocator, plan_path, plan_text, receipt, decision_id);
+
+    var stdout_writer = std.Io.File.stdout().writer(defaultIo(), &.{});
+    try stdout_writer.interface.print("{s}\n", .{receipt});
+}
+
+fn realPathAlloc(allocator: std.mem.Allocator, raw_path: []const u8) ![]u8 {
+    const resolved = try std.fs.path.resolve(allocator, &.{raw_path});
+    defer allocator.free(resolved);
+    const real = try std.Io.Dir.cwd().realPathFileAlloc(defaultIo(), resolved, allocator);
+    defer allocator.free(real);
+    return allocator.dupe(u8, real);
+}
+
+fn pathWithin(path: []const u8, root: []const u8) bool {
+    return std.mem.eql(u8, path, root) or
+        (path.len > root.len and std.mem.startsWith(u8, path, root) and path[root.len] == std.fs.path.sep);
+}
+
+fn addressedPlanId(plan_path: []const u8) ?[]const u8 {
+    const name = std.fs.path.basename(plan_path);
+    if (!std.mem.startsWith(u8, name, CanonicalPlanPrefix) or !std.mem.endsWith(u8, name, PlanSuffix)) return null;
+    const plan_id = name[CanonicalPlanPrefix.len .. name.len - PlanSuffix.len];
+    return if (plan_id.len == 0) null else plan_id;
+}
+
+fn requireCanonicalPlan(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    plan_path: []const u8,
+    plan_id: ?[]const u8,
+) !void {
+    const id = plan_id orelse return error.CanonicalPlanRequired;
+    if (!validPlanId(id)) return error.CanonicalPlanRequired;
+    const expected = try planPathAlloc(allocator, repo, id, .canonical);
+    defer allocator.free(expected);
+    if (!std.mem.eql(u8, plan_path, expected)) return error.CanonicalPlanRequired;
+}
+
+fn containsExactLine(text: []const u8, expected: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.eql(u8, std.mem.trimEnd(u8, line, "\r"), expected)) return true;
+    }
+    return false;
+}
+
+fn planStatus(text: []const u8) []const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trimEnd(u8, line, "\r");
+        if (std.mem.startsWith(u8, trimmed, "## Status:")) {
+            return std.mem.trim(u8, trimmed["## Status:".len..], " \t");
+        }
+    }
+    return "unknown";
+}
+
+fn loadContractInfo(allocator: std.mem.Allocator, contract_path: []const u8) !ContractInfo {
+    const validation = try runCommandStdoutAlloc(allocator, &.{
+        "seq",
+        "skill-contract",
+        "validate",
+        "--file",
+        contract_path,
+        "--format",
+        "json",
+    }, error.ContractValidationFailed);
+    defer allocator.free(validation);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, validation, .{}) catch return error.ContractValidationInvalidJson;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.ContractValidationInvalidJson,
+    };
+    const report_value = root.get("skill_contract") orelse return error.ContractValidationInvalidJson;
+    const report = switch (report_value) {
+        .object => |value| value,
+        else => return error.ContractValidationInvalidJson,
+    };
+    const valid_value = report.get("valid") orelse return error.ContractValidationInvalidJson;
+    if (valid_value != .bool or !valid_value.bool) return error.ContractValidationFailed;
+    const fingerprint_value = report.get("fingerprint") orelse return error.ContractFingerprintMissing;
+    const fingerprint = switch (fingerprint_value) {
+        .string => |value| value,
+        else => return error.ContractFingerprintMissing,
+    };
+    if (fingerprint.len == 0) return error.ContractFingerprintMissing;
+
+    const contract_text = try durable_store.readFileAlloc(allocator, contract_path, MaxReceiptBytes);
+    errdefer allocator.free(contract_text);
+    if (!yamlSectionHasFieldValue(contract_text, "skill", "name", "universalist")) return error.ContractSkillMismatch;
+
+    const references_dir = std.fs.path.dirname(contract_path) orelse return error.ContractPathInvalid;
+    const skill_root = std.fs.path.dirname(references_dir) orelse return error.ContractPathInvalid;
+    const package_path = try std.fs.path.join(allocator, &.{ skill_root, "package.json" });
+    defer allocator.free(package_path);
+    const package_text = try durable_store.readFileAlloc(allocator, package_path, MaxReceiptBytes);
+    defer allocator.free(package_text);
+    var package = std.json.parseFromSlice(std.json.Value, allocator, package_text, .{}) catch return error.SkillPackageInvalid;
+    defer package.deinit();
+    const package_object = switch (package.value) {
+        .object => |value| value,
+        else => return error.SkillPackageInvalid,
+    };
+    const version_value = package_object.get("version") orelse return error.SkillVersionMissing;
+    const version = switch (version_value) {
+        .string => |value| value,
+        else => return error.SkillVersionMissing,
+    };
+
+    return .{
+        .fingerprint = try allocator.dupe(u8, fingerprint),
+        .text = contract_text,
+        .skill_version = try allocator.dupe(u8, version),
+    };
+}
+
+fn yamlSectionHasFieldValue(
+    text: []const u8,
+    section: []const u8,
+    field: []const u8,
+    expected: []const u8,
+) bool {
+    var section_indent: ?usize = null;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0 or std.mem.startsWith(u8, trimmed, "#")) continue;
+        const indent = yamlIndent(line);
+        if (section_indent) |value| {
+            if (indent <= value) return false;
+            const candidate = yamlFieldValue(line, field) orelse continue;
+            if (std.mem.eql(u8, candidate, expected)) return true;
+            continue;
+        }
+        const candidate = yamlFieldValue(line, section) orelse continue;
+        if (candidate.len == 0) section_indent = indent;
+    }
+    return false;
+}
+
+fn yamlIndent(line: []const u8) usize {
+    var count: usize = 0;
+    while (count < line.len and line[count] == ' ') : (count += 1) {}
+    return count;
+}
+
+fn yamlFieldValue(line: []const u8, field: []const u8) ?[]const u8 {
+    var trimmed = std.mem.trim(u8, line, " \t\r");
+    if (std.mem.startsWith(u8, trimmed, "- ")) trimmed = std.mem.trimStart(u8, trimmed[2..], " \t");
+    if (trimmed.len <= field.len or !std.mem.eql(u8, trimmed[0..field.len], field) or trimmed[field.len] != ':') return null;
+    var value = std.mem.trim(u8, trimmed[field.len + 1 ..], " \t");
+    if (value.len >= 2 and ((value[0] == '"' and value[value.len - 1] == '"') or (value[0] == '\'' and value[value.len - 1] == '\''))) {
+        value = value[1 .. value.len - 1];
+    }
+    return value;
+}
+
+fn validateReceiptRefs(contract_text: []const u8, args: Args) !void {
+    for (args.effectiveTriggerRefs()) |value| {
+        if (!yamlSectionHasFieldValue(contract_text, "triggers", "trigger_id", value)) return error.UnknownTriggerRef;
+    }
+    for (args.effectiveClauseRefs()) |value| {
+        if (!yamlSectionHasFieldValue(contract_text, "clauses", "clause_id", value)) return error.UnknownClauseRef;
+    }
+    if (!yamlSectionHasFieldValue(contract_text, "routes", "route_id", args.selected_route.?)) return error.UnknownSelectedRoute;
+    for (args.rejected_routes[0..args.rejected_route_count]) |value| {
+        if (!yamlSectionHasFieldValue(contract_text, "routes", "route_id", value)) return error.UnknownRejectedRoute;
+        if (std.mem.eql(u8, value, args.selected_route.?)) return error.SelectedRouteRejected;
+    }
+}
+
+fn renderReceiptAlloc(allocator: std.mem.Allocator, args: Args, context: ReceiptContext) ![]u8 {
+    var alternatives = std.ArrayList([]const u8).empty;
+    defer alternatives.deinit(allocator);
+    try appendUnique(allocator, &alternatives, args.selected_route.?);
+    for (args.rejected_routes[0..args.rejected_route_count]) |value| try appendUnique(allocator, &alternatives, value);
+    for (args.alternatives[0..args.alternative_count]) |value| try appendUnique(allocator, &alternatives, value);
+
+    var rejected = std.ArrayList([]const u8).empty;
+    defer rejected.deinit(allocator);
+    for (args.rejected_routes[0..args.rejected_route_count]) |value| try appendUnique(allocator, &rejected, value);
+
+    const plan_ref = try std.fmt.allocPrint(allocator, "plan:{s}", .{context.plan_relative});
+    defer allocator.free(plan_ref);
+    var evidence = std.ArrayList([]const u8).empty;
+    defer evidence.deinit(allocator);
+    try appendUnique(allocator, &evidence, plan_ref);
+    for (args.evidence_refs[0..args.evidence_ref_count]) |value| try appendUnique(allocator, &evidence, value);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"skill_decision_receipt\":{");
+    try out.writer.writeAll("\"alternatives_considered\":");
+    try writeJsonStringList(&out.writer, alternatives.items);
+    try out.writer.writeAll(",\"artifact_state\":{");
+    try writeJsonField(&out.writer, "advanced_mechanics", args.advanced_mechanics.?, true);
+    try writeJsonField(&out.writer, "boundary_disposition", @tagName(args.disposition.?), false);
+    try writeJsonField(&out.writer, "construction", args.construction.?, false);
+    try writeJsonField(&out.writer, "falsifier", args.falsifier.?, false);
+    try writeJsonField(&out.writer, "head", context.head, false);
+    try writeJsonField(&out.writer, "law", args.law.?, false);
+    try writeJsonField(&out.writer, "plan_id", context.plan_id, false);
+    try writeJsonField(&out.writer, "plan_path", context.plan_relative, false);
+    try writeJsonField(&out.writer, "plan_status", context.plan_status, false);
+    try writeJsonField(&out.writer, "repo", context.repo, false);
+    try out.writer.writeAll("},\"clause_refs\":");
+    try writeJsonStringList(&out.writer, args.effectiveClauseRefs());
+    try writeJsonField(&out.writer, "decision_id", context.decision_id, false);
+    try out.writer.writeAll(",\"evidence_refs\":");
+    try writeJsonStringList(&out.writer, evidence.items);
+    try writeJsonField(&out.writer, "expected_outcome", args.expected_outcome.?, false);
+    try writeJsonField(&out.writer, "question", args.question.?, false);
+    try writeJsonField(&out.writer, "receipt_version", "SDR-v1", false);
+    try out.writer.writeAll(",\"rejected_routes\":");
+    try writeJsonStringList(&out.writer, rejected.items);
+    try writeJsonField(&out.writer, "selected_route", args.selected_route.?, false);
+    try writeJsonField(&out.writer, "skill", "universalist", false);
+    try writeJsonField(&out.writer, "skill_contract_fingerprint", context.contract_fingerprint, false);
+    try writeJsonField(&out.writer, "skill_version", context.skill_version, false);
+    try out.writer.writeAll(",\"trigger_refs\":");
+    try writeJsonStringList(&out.writer, args.effectiveTriggerRefs());
+    try out.writer.writeAll("}}");
+    return out.toOwnedSlice();
+}
+
+fn appendUnique(allocator: std.mem.Allocator, values: *std.ArrayList([]const u8), value: []const u8) !void {
+    for (values.items) |existing| if (std.mem.eql(u8, existing, value)) return;
+    try values.append(allocator, value);
+}
+
+fn writeJsonField(writer: *std.Io.Writer, name: []const u8, value: []const u8, first: bool) !void {
+    if (!first) try writer.writeByte(',');
+    try std.json.Stringify.value(name, .{}, writer);
+    try writer.writeByte(':');
+    try std.json.Stringify.value(value, .{}, writer);
+}
+
+fn writeJsonStringList(writer: *std.Io.Writer, values: []const []const u8) !void {
+    try writer.writeByte('[');
+    for (values, 0..) |value, index| {
+        if (index != 0) try writer.writeByte(',');
+        try std.json.Stringify.value(value, .{}, writer);
+    }
+    try writer.writeByte(']');
+}
+
+fn validateReceiptWithSeq(allocator: std.mem.Allocator, receipt: []const u8) !void {
+    const temp_dir = try realPathAlloc(allocator, "/tmp");
+    defer allocator.free(temp_dir);
+    const stamp = std.Io.Clock.awake.now(defaultIo()).nanoseconds;
+    var ordinal: usize = 0;
+    while (ordinal <= MaxOrdinal) : (ordinal += 1) {
+        const filename = try std.fmt.allocPrint(allocator, ".ledger-universalist-receipt-{d}-{d}.json", .{ stamp, ordinal });
+        defer allocator.free(filename);
+        const temp_path = try std.fs.path.join(allocator, &.{ temp_dir, filename });
+        defer allocator.free(temp_path);
+        durable_store.writeTextCreateNewAtomic(allocator, temp_path, receipt, .{}) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => return err,
+        };
+        defer std.Io.Dir.cwd().deleteFile(defaultIo(), temp_path) catch {};
+
+        const validation = try runCommandStdoutAlloc(allocator, &.{
+            "seq",
+            "skill-decision-receipt",
+            "validate",
+            "--file",
+            temp_path,
+            "--format",
+            "json",
+        }, error.ReceiptValidationFailed);
+        defer allocator.free(validation);
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, validation, .{}) catch return error.ReceiptValidationInvalidJson;
+        defer parsed.deinit();
+        const root = switch (parsed.value) {
+            .object => |value| value,
+            else => return error.ReceiptValidationInvalidJson,
+        };
+        const report_value = root.get("skill_decision_receipt") orelse return error.ReceiptValidationInvalidJson;
+        const report = switch (report_value) {
+            .object => |value| value,
+            else => return error.ReceiptValidationInvalidJson,
+        };
+        const valid = report.get("valid") orelse return error.ReceiptValidationInvalidJson;
+        if (valid != .bool or !valid.bool) return error.ReceiptValidationFailed;
+        return;
+    }
+    return error.ValidationTempExhausted;
+}
+
+fn appendReceiptToPlan(
+    allocator: std.mem.Allocator,
+    plan_path: []const u8,
+    expected_plan: []const u8,
+    receipt: []const u8,
+    decision_id: []const u8,
+) !void {
+    var lock = try durable_store.acquireLock(allocator, plan_path);
+    defer lock.release(allocator);
+    const current = try durable_store.readFileAlloc(allocator, plan_path, MaxReceiptBytes);
+    defer allocator.free(current);
+    if (!std.mem.eql(u8, current, expected_plan)) return error.PlanChangedDuringEmission;
+    if (std.mem.indexOf(u8, current, "\"skill_decision_receipt\"") != null) return error.ReceiptAlreadyPresent;
+    const updated = try planWithReceiptAlloc(allocator, current, receipt, decision_id);
+    defer allocator.free(updated);
+    try writeTextAtomicPreservePermissions(plan_path, updated);
+}
+
+fn writeTextAtomicPreservePermissions(path: []const u8, text: []const u8) !void {
+    const stat = try std.Io.Dir.cwd().statFile(defaultIo(), path, .{ .follow_symlinks = false });
+    if (stat.kind == .sym_link) return error.SymlinkPlan;
+    if (stat.kind != .file) return error.PlanNotFile;
+    const parent = std.fs.path.dirname(path) orelse return error.PlanPathInvalid;
+    const base = std.fs.path.basename(path);
+    var dir = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openDirAbsolute(defaultIo(), parent, .{ .follow_symlinks = false })
+    else
+        try std.Io.Dir.cwd().openDir(defaultIo(), parent, .{ .follow_symlinks = false });
+    defer dir.close(defaultIo());
+    var atomic = try dir.createFileAtomic(defaultIo(), base, .{
+        .permissions = stat.permissions,
+        .replace = true,
+    });
+    defer atomic.deinit(defaultIo());
+    try atomic.file.writeStreamingAll(defaultIo(), text);
+    try atomic.file.sync(defaultIo());
+    try atomic.replace(defaultIo());
+}
+
+fn planWithReceiptAlloc(
+    allocator: std.mem.Allocator,
+    plan_text: []const u8,
+    receipt: []const u8,
+    decision_id: []const u8,
+) ![]u8 {
+    const emitted_marker = try std.fmt.allocPrint(allocator, "## Root decision receipt: emitted ({s})", .{decision_id});
+    defer allocator.free(emitted_marker);
+
+    var body: std.Io.Writer.Allocating = .init(allocator);
+    defer body.deinit();
+    if (lineRange(plan_text, "## Root decision receipt:")) |range| {
+        try body.writer.writeAll(plan_text[0..range.start]);
+        try body.writer.writeAll(emitted_marker);
+        try body.writer.writeAll(plan_text[range.end..]);
+    } else if (lineRange(plan_text, "## Status:")) |range| {
+        try body.writer.writeAll(plan_text[0..range.start]);
+        try body.writer.writeAll(emitted_marker);
+        try body.writer.writeByte('\n');
+        try body.writer.writeAll(plan_text[range.start..]);
+    } else {
+        try body.writer.writeAll(std.mem.trimEnd(u8, plan_text, " \t\r\n"));
+        try body.writer.writeByte('\n');
+        try body.writer.writeAll(emitted_marker);
+        try body.writer.writeByte('\n');
+    }
+    const body_bytes = try body.toOwnedSlice();
+    defer allocator.free(body_bytes);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll(std.mem.trimEnd(u8, body_bytes, " \t\r\n"));
+    try out.writer.writeAll("\n\n");
+    try out.writer.writeAll(std.mem.trimEnd(u8, receipt, " \t\r\n"));
+    try out.writer.writeByte('\n');
+    return out.toOwnedSlice();
+}
+
+const LineRange = struct { start: usize, end: usize };
+
+fn lineRange(text: []const u8, prefix: []const u8) ?LineRange {
+    var start: usize = 0;
+    while (start <= text.len) {
+        const relative_end = std.mem.indexOfScalar(u8, text[start..], '\n');
+        const end = if (relative_end) |offset| start + offset else text.len;
+        const line = std.mem.trimEnd(u8, text[start..end], "\r");
+        if (std.mem.startsWith(u8, line, prefix)) return .{ .start = start, .end = end };
+        if (end == text.len) break;
+        start = end + 1;
+    }
+    return null;
+}
+
+fn runGitStdoutAlloc(allocator: std.mem.Allocator, repo: []const u8, arguments: []const []const u8) ![]u8 {
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &.{ "git", "-C", repo });
+    try argv.appendSlice(allocator, arguments);
+    const raw = try runCommandStdoutAlloc(allocator, argv.items, error.GitCommandFailed);
+    defer allocator.free(raw);
+    return allocator.dupe(u8, std.mem.trim(u8, raw, " \t\r\n"));
+}
+
+fn runCommandStdoutAlloc(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    failure: anyerror,
+) ![]u8 {
+    const result = std.process.run(allocator, defaultIo(), .{
+        .argv = argv,
+        .stdout_limit = .limited(MaxReceiptBytes),
+        .stderr_limit = .limited(MaxReceiptBytes),
+    }) catch return failure;
+    defer allocator.free(result.stderr);
+    if (!(result.term == .exited and result.term.exited == 0)) {
+        allocator.free(result.stdout);
+        return failure;
+    }
+    return result.stdout;
 }
 
 fn createPlanAtNs(
@@ -664,4 +1359,150 @@ test "create requires a template and path requires an id" {
     try std.testing.expectEqual(Command.latest, parsed.command.?);
     try std.testing.expectEqual(OutputFormat.path, parsed.format);
     try std.testing.expectEqualStrings("/tmp/repo", parsed.repo);
+}
+
+test "emit parses receipt fields and retains contract defaults" {
+    const parsed = try parseArgs(&.{
+        "ledger",
+        "emit",
+        "--plan",
+        "plan.md",
+        "--contract",
+        "decision-contract.yaml",
+        "--decision-id",
+        "UNI-TEST-001",
+        "--question",
+        "Which route?",
+        "--alternative",
+        "Keep Python",
+        "--selected-route",
+        "UNI-ORDINARY",
+        "--rejected-route",
+        "UNI-CANONICAL",
+        "--expected-outcome",
+        "One native owner",
+        "--disposition",
+        "repaired",
+        "--construction",
+        "native emitter",
+        "--law",
+        "one receipt",
+        "--falsifier",
+        "duplicate accepted",
+        "--advanced-mechanics",
+        "none",
+        "--evidence-ref",
+        "test:unit",
+        "--write-plan",
+    });
+    try std.testing.expectEqual(Command.emit, parsed.command.?);
+    try std.testing.expectEqualStrings("plan.md", parsed.plan_path.?);
+    try std.testing.expectEqualStrings("decision-contract.yaml", parsed.contract_path.?);
+    try std.testing.expectEqualStrings("UNI-TEST-001", parsed.decision_id.?);
+    try std.testing.expectEqual(BoundaryDisposition.repaired, parsed.disposition.?);
+    try std.testing.expect(parsed.write_plan);
+    try std.testing.expectEqualSlices([]const u8, &DefaultTriggerRefs, parsed.effectiveTriggerRefs());
+    try std.testing.expectEqualSlices([]const u8, &DefaultClauseRefs, parsed.effectiveClauseRefs());
+    try std.testing.expectEqual(@as(usize, 1), parsed.rejected_route_count);
+    try std.testing.expectEqualStrings("UNI-CANONICAL", parsed.rejected_routes[0]);
+}
+
+test "emit rejects incomplete or cross-command receipt arguments" {
+    try std.testing.expectError(error.MissingContract, parseArgs(&.{
+        "ledger",
+        "emit",
+        "--plan",
+        "plan.md",
+    }));
+    try std.testing.expectError(error.EmitOptionNotAllowed, parseArgs(&.{
+        "ledger",
+        "latest",
+        "--question",
+        "not allowed",
+    }));
+    try std.testing.expectError(error.InvalidDisposition, parseArgs(&.{
+        "ledger",
+        "emit",
+        "--disposition",
+        "decorative",
+    }));
+}
+
+test "contract scalar lookup handles list fields and quoted values" {
+    const contract =
+        \\skill_decision_contract:
+        \\  skill:
+        \\    name: "universalist"
+        \\  metadata:
+        \\    route_id: UNI-CANONICAL
+        \\  routes:
+        \\    - route_id: UNI-ORDINARY
+    ;
+    try std.testing.expect(yamlSectionHasFieldValue(contract, "skill", "name", "universalist"));
+    try std.testing.expect(yamlSectionHasFieldValue(contract, "routes", "route_id", "UNI-ORDINARY"));
+    try std.testing.expect(!yamlSectionHasFieldValue(contract, "routes", "route_id", "UNI-CANONICAL"));
+}
+
+test "plan receipt append is atomic and exactly once" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const plan_path = try std.fs.path.join(std.testing.allocator, &.{ root, "plan.md" });
+    defer std.testing.allocator.free(plan_path);
+    try durable_store.writeTextCreateNewAtomic(
+        std.testing.allocator,
+        plan_path,
+        "# Universalist Plan\n\n## Root decision receipt: pending / emitted\n## Status: planned\n",
+        .{},
+    );
+    const receipt = "{\"skill_decision_receipt\":{\"receipt_version\":\"SDR-v1\"}}";
+    const mode_before = (try std.Io.Dir.cwd().statFile(defaultIo(), plan_path, .{})).permissions.toMode() & 0o777;
+    var held = try durable_store.acquireLock(std.testing.allocator, plan_path);
+    try std.testing.expectError(
+        error.PathAlreadyExists,
+        appendReceiptToPlan(
+            std.testing.allocator,
+            plan_path,
+            "# Universalist Plan\n\n## Root decision receipt: pending / emitted\n## Status: planned\n",
+            receipt,
+            "UNI-TEST-001",
+        ),
+    );
+    held.release(std.testing.allocator);
+    const expected_plan = try durable_store.readFileAlloc(std.testing.allocator, plan_path, MaxReceiptBytes);
+    defer std.testing.allocator.free(expected_plan);
+    try appendReceiptToPlan(std.testing.allocator, plan_path, expected_plan, receipt, "UNI-TEST-001");
+    const updated = try durable_store.readFileAlloc(std.testing.allocator, plan_path, MaxReceiptBytes);
+    defer std.testing.allocator.free(updated);
+    const mode_after = (try std.Io.Dir.cwd().statFile(defaultIo(), plan_path, .{})).permissions.toMode() & 0o777;
+    try std.testing.expectEqual(mode_before, mode_after);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, updated, "\"skill_decision_receipt\""));
+    try std.testing.expect(std.mem.indexOf(u8, updated, "## Root decision receipt: emitted (UNI-TEST-001)") != null);
+    try std.testing.expectError(
+        error.ReceiptAlreadyPresent,
+        appendReceiptToPlan(std.testing.allocator, plan_path, updated, receipt, "UNI-TEST-001"),
+    );
+}
+
+test "plan receipt append rejects a stale plan snapshot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const plan_path = try std.fs.path.join(std.testing.allocator, &.{ root, "plan.md" });
+    defer std.testing.allocator.free(plan_path);
+    const original = "# Universalist Plan\n\n## Status: planned\n";
+    try durable_store.writeTextCreateNewAtomic(std.testing.allocator, plan_path, original, .{});
+    try writeTextAtomicPreservePermissions(plan_path, "# Universalist Plan\n\n## Status: editing\n");
+    try std.testing.expectError(
+        error.PlanChangedDuringEmission,
+        appendReceiptToPlan(
+            std.testing.allocator,
+            plan_path,
+            original,
+            "{\"skill_decision_receipt\":{}}",
+            "UNI-TEST-STALE",
+        ),
+    );
 }
