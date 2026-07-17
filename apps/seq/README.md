@@ -298,7 +298,7 @@ seq skill-evidence --root ~/.codex/sessions --session-id <session_id> --skill se
 - leaves matched-cohort analysis disabled in capabilities as P2/deferred
 
 Companion commands:
-- `skill-contract validate --file <decision-contract.yaml>` validates SKDC-v1 and emits the stable contract fingerprint
+- `skill-contract validate --file <decision-contract.yaml>` validates SKDC-v1 and emits the stable contract fingerprint plus the parsed skill kind, trigger IDs, route IDs, clause IDs, and clause-route bindings from that same snapshot
 - `skill-contract scaffold --skill <name> --kind decision --output <file>` writes a placeholder contract only; it does not infer semantics
 - `skill-decision-receipt validate --file <receipt.json>` performs contract-free structural SDR-v1 validation; contract binding is enforced by `skill-decision-audit` when it loads an SKDC-v1 contract
 - `decision-capsule` freezes one visible historical decision as DCP-v2 for controlled replay

@@ -2,10 +2,7 @@ const app_meta = @import("app_meta");
 const builtin = @import("builtin");
 const core_cli = @import("core_cli");
 const durable_store = @import("durable_store");
-const seq_bundle = @import("seq_bundle");
 const std = @import("std");
-
-const skill_contract = seq_bundle.skill_contract;
 
 const Io = std.Io.Threaded.global_single_threaded;
 const Version = core_cli.normalizeVersion(app_meta.version);
@@ -433,14 +430,50 @@ fn parseCommand(raw: []const u8) ?Command {
     return null;
 }
 
-const ContractInfo = struct {
+const ClauseRouteProjection = struct {
+    clause_id: []u8,
+    expected_routes: [][]u8,
+    prohibited_routes: [][]u8,
+
+    fn deinit(self: *ClauseRouteProjection, allocator: std.mem.Allocator) void {
+        allocator.free(self.clause_id);
+        freeOwnedStrings(allocator, self.expected_routes);
+        freeOwnedStrings(allocator, self.prohibited_routes);
+        self.* = undefined;
+    }
+
+    fn coversRoute(self: ClauseRouteProjection, route_id: []const u8) bool {
+        return stringListContains(self.expected_routes, route_id) or
+            stringListContains(self.prohibited_routes, route_id);
+    }
+};
+
+const ContractProjection = struct {
     fingerprint: []u8,
-    parsed: skill_contract.ParsedContract,
+    skill: []u8,
+    skill_kind: []u8,
+    trigger_ids: [][]u8,
+    route_ids: [][]u8,
+    clause_routes: []ClauseRouteProjection,
+
+    fn deinit(self: *ContractProjection, allocator: std.mem.Allocator) void {
+        allocator.free(self.fingerprint);
+        allocator.free(self.skill);
+        allocator.free(self.skill_kind);
+        freeOwnedStrings(allocator, self.trigger_ids);
+        freeOwnedStrings(allocator, self.route_ids);
+        for (self.clause_routes) |*clause| clause.deinit(allocator);
+        allocator.free(self.clause_routes);
+        self.* = undefined;
+    }
+};
+
+const ContractInfo = struct {
+    projection: ContractProjection,
     skill_version: []u8,
 
     fn deinit(self: *ContractInfo, allocator: std.mem.Allocator) void {
-        allocator.free(self.fingerprint);
-        self.parsed.deinit();
+        self.projection.deinit(allocator);
         allocator.free(self.skill_version);
         self.* = undefined;
     }
@@ -488,7 +521,7 @@ fn emitDecisionReceipt(allocator: std.mem.Allocator, repo: []const u8, args: Arg
 
     var contract = try loadContractInfo(allocator, seq_path, contract_path);
     defer contract.deinit(allocator);
-    try validateReceiptRefs(contract.parsed.contract, args);
+    try validateReceiptRefs(contract.projection, args);
 
     const plan_relative = try allocator.dupe(u8, plan_path[repo.len + 1 ..]);
     defer allocator.free(plan_relative);
@@ -503,7 +536,7 @@ fn emitDecisionReceipt(allocator: std.mem.Allocator, repo: []const u8, args: Arg
         .plan_status = planStatus(plan_text),
         .decision_id = decision_id,
         .skill_version = contract.skill_version,
-        .contract_fingerprint = contract.fingerprint,
+        .contract_fingerprint = contract.projection.fingerprint,
     };
     const receipt = try renderReceiptAlloc(allocator, args, context);
     defer allocator.free(receipt);
@@ -665,6 +698,7 @@ fn seqCapabilitiesCompatible(allocator: std.mem.Allocator, text: []const u8) boo
     };
     for ([_][]const u8{
         "skill_contract_v1",
+        "skill_contract_receipt_binding_projection_v1",
         "skill_decision_receipt_v1",
         "skill_decision_receipt_contract_binding_v1",
     }) |feature| {
@@ -685,28 +719,17 @@ fn loadContractInfo(
         MaxContractBytes,
     );
     defer allocator.free(contract_text);
-    var parsed_contract = skill_contract.parseText(allocator, contract_text) catch
-        return error.ContractValidationFailed;
-    errdefer parsed_contract.deinit();
-    const local_report = try skill_contract.validateParsed(allocator, parsed_contract.contract);
-    defer local_report.deinit(allocator);
-    if (!local_report.valid) return error.ContractValidationFailed;
-    if (!std.mem.eql(u8, parsed_contract.contract.skill_name, "universalist")) {
-        return error.ContractSkillMismatch;
-    }
-    const native_fingerprint = try skill_contract.fingerprintContract(
-        allocator,
-        parsed_contract.contract,
-    );
-    defer allocator.free(native_fingerprint);
-    const seq_fingerprint = try validateContractSnapshotWithSeq(
+    var projection = try validateContractSnapshotWithSeq(
         allocator,
         seq_path,
         contract_text,
     );
-    defer allocator.free(seq_fingerprint);
-    if (!std.mem.eql(u8, native_fingerprint, seq_fingerprint)) {
-        return error.ContractFingerprintMismatch;
+    errdefer projection.deinit(allocator);
+    if (!std.mem.eql(u8, projection.skill, "universalist")) {
+        return error.ContractSkillMismatch;
+    }
+    if (!contractKindSupportsDecisionReceipt(projection.skill_kind)) {
+        return error.ContractKindMismatch;
     }
 
     const references_dir = std.fs.path.dirname(contract_path) orelse
@@ -733,47 +756,66 @@ fn loadContractInfo(
         else => return error.SkillVersionMissing,
     };
 
-    const owned_fingerprint = try allocator.dupe(u8, native_fingerprint);
-    errdefer allocator.free(owned_fingerprint);
     const skill_version = try allocator.dupe(u8, version);
     errdefer allocator.free(skill_version);
     return .{
-        .fingerprint = owned_fingerprint,
-        .parsed = parsed_contract,
+        .projection = projection,
         .skill_version = skill_version,
     };
 }
-fn validateReceiptRefs(contract: skill_contract.Contract, args: Args) !void {
+
+fn contractKindSupportsDecisionReceipt(skill_kind: []const u8) bool {
+    return std.mem.eql(u8, skill_kind, "decision") or
+        std.mem.eql(u8, skill_kind, "mixed");
+}
+
+fn validateReceiptRefs(contract: ContractProjection, args: Args) !void {
     for (args.effectiveTriggerRefs()) |value| {
-        if (!contractHasTrigger(contract, value)) return error.UnknownTriggerRef;
+        if (!stringListContains(contract.trigger_ids, value)) return error.UnknownTriggerRef;
     }
     for (args.effectiveClauseRefs()) |value| {
-        if (!contractHasClause(contract, value)) return error.UnknownClauseRef;
+        if (findClauseRoute(contract.clause_routes, value) == null) return error.UnknownClauseRef;
     }
-    if (!contractHasRoute(contract, args.selected_route.?)) return error.UnknownSelectedRoute;
+    if (!stringListContains(contract.route_ids, args.selected_route.?)) {
+        return error.UnknownSelectedRoute;
+    }
+    if (!referencedClausesCoverRoute(contract, args, args.selected_route.?)) {
+        return error.SelectedRouteNotCoveredByClause;
+    }
     for (args.rejected_routes[0..args.rejected_route_count]) |value| {
-        if (!contractHasRoute(contract, value)) return error.UnknownRejectedRoute;
+        if (!stringListContains(contract.route_ids, value)) return error.UnknownRejectedRoute;
+        if (!referencedClausesCoverRoute(contract, args, value)) {
+            return error.RejectedRouteNotCoveredByClause;
+        }
         if (std.mem.eql(u8, value, args.selected_route.?)) return error.SelectedRouteRejected;
     }
 }
 
-fn contractHasTrigger(contract: skill_contract.Contract, expected: []const u8) bool {
-    for (contract.triggers) |trigger| {
-        if (std.mem.eql(u8, trigger.trigger_id, expected)) return true;
+fn referencedClausesCoverRoute(
+    contract: ContractProjection,
+    args: Args,
+    route_id: []const u8,
+) bool {
+    for (args.effectiveClauseRefs()) |clause_id| {
+        const clause = findClauseRoute(contract.clause_routes, clause_id) orelse continue;
+        if (clause.coversRoute(route_id)) return true;
     }
     return false;
 }
 
-fn contractHasClause(contract: skill_contract.Contract, expected: []const u8) bool {
-    for (contract.clauses) |clause| {
-        if (std.mem.eql(u8, clause.clause_id, expected)) return true;
+fn findClauseRoute(
+    clauses: []const ClauseRouteProjection,
+    clause_id: []const u8,
+) ?ClauseRouteProjection {
+    for (clauses) |clause| {
+        if (std.mem.eql(u8, clause.clause_id, clause_id)) return clause;
     }
-    return false;
+    return null;
 }
 
-fn contractHasRoute(contract: skill_contract.Contract, expected: []const u8) bool {
-    for (contract.routes) |route| {
-        if (std.mem.eql(u8, route.route_id, expected)) return true;
+fn stringListContains(values: []const []const u8, expected: []const u8) bool {
+    for (values) |value| {
+        if (std.mem.eql(u8, value, expected)) return true;
     }
     return false;
 }
@@ -874,7 +916,7 @@ fn validateContractSnapshotWithSeq(
     allocator: std.mem.Allocator,
     seq_path: []const u8,
     contract_text: []const u8,
-) ![]u8 {
+) !ContractProjection {
     const temp_dir = try realPathAlloc(allocator, "/tmp");
     defer allocator.free(temp_dir);
     const stamp = std.Io.Clock.awake.now(defaultIo()).nanoseconds;
@@ -912,7 +954,7 @@ fn validateContractFileWithSeq(
     allocator: std.mem.Allocator,
     seq_path: []const u8,
     temp_path: []const u8,
-) ![]u8 {
+) !ContractProjection {
     const validation = try runCommandStdoutAlloc(allocator, &.{
         seq_path,
         "skill-contract",
@@ -923,6 +965,13 @@ fn validateContractFileWithSeq(
         "json",
     }, error.ContractValidationFailed);
     defer allocator.free(validation);
+    return parseContractProjectionAlloc(allocator, validation);
+}
+
+fn parseContractProjectionAlloc(
+    allocator: std.mem.Allocator,
+    validation: []const u8,
+) !ContractProjection {
     var parsed = std.json.parseFromSlice(
         std.json.Value,
         allocator,
@@ -949,7 +998,127 @@ fn validateContractFileWithSeq(
         else => return error.ContractFingerprintMissing,
     };
     if (fingerprint.len == 0) return error.ContractFingerprintMissing;
-    return allocator.dupe(u8, fingerprint);
+    const skill = try requiredJsonStringAlloc(allocator, report, "skill");
+    errdefer allocator.free(skill);
+    const skill_kind = try requiredJsonStringAlloc(allocator, report, "skill_kind");
+    errdefer allocator.free(skill_kind);
+    const trigger_ids = try jsonStringArrayAlloc(allocator, report, "trigger_ids");
+    errdefer freeOwnedStrings(allocator, trigger_ids);
+    const route_ids = try jsonStringArrayAlloc(allocator, report, "route_ids");
+    errdefer freeOwnedStrings(allocator, route_ids);
+    const clause_routes = try jsonClauseRoutesAlloc(allocator, report);
+    errdefer freeClauseRoutes(allocator, clause_routes);
+    return .{
+        .fingerprint = try allocator.dupe(u8, fingerprint),
+        .skill = skill,
+        .skill_kind = skill_kind,
+        .trigger_ids = trigger_ids,
+        .route_ids = route_ids,
+        .clause_routes = clause_routes,
+    };
+}
+
+fn requiredJsonStringAlloc(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    key: []const u8,
+) ![]u8 {
+    const raw = object.get(key) orelse return error.ContractProjectionMissing;
+    const value = switch (raw) {
+        .string => |string| string,
+        else => return error.ContractProjectionInvalid,
+    };
+    if (value.len == 0) return error.ContractProjectionInvalid;
+    return allocator.dupe(u8, value);
+}
+
+fn jsonStringArrayAlloc(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+    key: []const u8,
+) ![][]u8 {
+    const raw = object.get(key) orelse return error.ContractProjectionMissing;
+    const items = switch (raw) {
+        .array => |array| array.items,
+        else => return error.ContractProjectionInvalid,
+    };
+    const values = try allocator.alloc([]u8, items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (values[0..initialized]) |value| allocator.free(value);
+        allocator.free(values);
+    }
+    for (items) |item| {
+        const value = switch (item) {
+            .string => |string| string,
+            else => return error.ContractProjectionInvalid,
+        };
+        if (value.len == 0) return error.ContractProjectionInvalid;
+        values[initialized] = try allocator.dupe(u8, value);
+        initialized += 1;
+    }
+    return values;
+}
+
+fn jsonClauseRoutesAlloc(
+    allocator: std.mem.Allocator,
+    report: std.json.ObjectMap,
+) ![]ClauseRouteProjection {
+    const raw = report.get("clause_routes") orelse
+        return error.ContractProjectionMissing;
+    const items = switch (raw) {
+        .array => |array| array.items,
+        else => return error.ContractProjectionInvalid,
+    };
+    const clauses = try allocator.alloc(ClauseRouteProjection, items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (clauses[0..initialized]) |*clause| clause.deinit(allocator);
+        allocator.free(clauses);
+    }
+    for (items) |item| {
+        const object = switch (item) {
+            .object => |value| value,
+            else => return error.ContractProjectionInvalid,
+        };
+        clauses[initialized] = try jsonClauseRouteAlloc(allocator, object);
+        initialized += 1;
+    }
+    return clauses;
+}
+
+fn jsonClauseRouteAlloc(
+    allocator: std.mem.Allocator,
+    object: std.json.ObjectMap,
+) !ClauseRouteProjection {
+    const clause_id = try requiredJsonStringAlloc(allocator, object, "clause_id");
+    errdefer allocator.free(clause_id);
+    const expected_routes = try jsonStringArrayAlloc(allocator, object, "expected_routes");
+    errdefer freeOwnedStrings(allocator, expected_routes);
+    const prohibited_routes = try jsonStringArrayAlloc(
+        allocator,
+        object,
+        "prohibited_routes",
+    );
+    errdefer freeOwnedStrings(allocator, prohibited_routes);
+    return .{
+        .clause_id = clause_id,
+        .expected_routes = expected_routes,
+        .prohibited_routes = prohibited_routes,
+    };
+}
+
+fn freeClauseRoutes(
+    allocator: std.mem.Allocator,
+    clauses: []ClauseRouteProjection,
+) void {
+    for (clauses) |*clause| clause.deinit(allocator);
+    allocator.free(clauses);
+}
+
+fn freeOwnedStrings(allocator: std.mem.Allocator, values: [][]u8) void {
+    for (values) |value| allocator.free(value);
+    allocator.free(values);
 }
 
 fn validateReceiptWithSeq(
@@ -1039,6 +1208,7 @@ fn appendReceiptToPlan(
     }
     const updated = try planWithReceiptAlloc(allocator, current, receipt, decision_id);
     defer allocator.free(updated);
+    if (updated.len > MaxPlanBytes) return error.PlanTooLarge;
     try writeTextAtomicPreservePermissions(plan_path, updated);
 }
 
@@ -1520,6 +1690,27 @@ const TestContractJson =
     \\}
 ;
 
+const TestContractProjectionJson =
+    \\{
+    \\  "skill_contract": {
+    \\    "valid": true,
+    \\    "fingerprint": "fixture-fingerprint",
+    \\    "skill": "universalist",
+    \\    "skill_kind": "decision",
+    \\    "trigger_ids": ["t1"],
+    \\    "route_ids": ["r1", "r2", "r3"],
+    \\    "clause_ids": ["c1"],
+    \\    "clause_routes": [
+    \\      {
+    \\        "clause_id": "c1",
+    \\        "expected_routes": ["r1"],
+    \\        "prohibited_routes": ["r2"]
+    \\      }
+    \\    ]
+    \\  }
+    \\}
+;
+
 test "plan ids embed a sortable nanosecond UTC timestamp" {
     const stamp = try planTimestampAlloc(std.testing.allocator, 1_234_567_890);
     defer std.testing.allocator.free(stamp);
@@ -1797,30 +1988,12 @@ test "emit rejects incomplete or cross-command receipt arguments" {
     }));
 }
 
-test "contract membership follows the Seq YAML parser" {
-    const contract =
-        \\skill_decision_contract:
-        \\  contract_version: SKDC-v1
-        \\  skill:
-        \\    name: "universalist"
-        \\    kind: decision
-        \\    source_fingerprint: fixture
-        \\  triggers:
-        \\    - trigger_id: t1
-        \\  routes:
-        \\    - route_id: r1
-        \\      route_id: r-stray
-        \\    - route_id: r2
-        \\  clauses:
-        \\    - clause_id: c1
-        \\      trigger_refs: [t1]
-        \\      expected_routes: [r1]
-        \\      prohibited_routes: [r2]
-        \\  instrumentation:
-        \\    decision_receipt: required
-    ;
-    var parsed = try skill_contract.parseText(std.testing.allocator, contract);
-    defer parsed.deinit();
+test "contract membership consumes the exact Seq receipt binding projection" {
+    var projection = try parseContractProjectionAlloc(
+        std.testing.allocator,
+        TestContractProjectionJson,
+    );
+    defer projection.deinit(std.testing.allocator);
     var args = Args{};
     args.trigger_refs[0] = "t1";
     args.trigger_ref_count = 1;
@@ -1829,31 +2002,37 @@ test "contract membership follows the Seq YAML parser" {
     args.selected_route = "r1";
     args.rejected_routes[0] = "r2";
     args.rejected_route_count = 1;
-    try validateReceiptRefs(parsed.contract, args);
+    try validateReceiptRefs(projection, args);
     args.selected_route = "r-stray";
     try std.testing.expectError(
         error.UnknownSelectedRoute,
-        validateReceiptRefs(parsed.contract, args),
+        validateReceiptRefs(projection, args),
     );
-}
-
-test "contract membership accepts the JSON representation parsed by Seq" {
-    var parsed = try skill_contract.parseText(std.testing.allocator, TestContractJson);
-    defer parsed.deinit();
-    var args = Args{};
-    args.trigger_refs[0] = "t1";
-    args.trigger_ref_count = 1;
-    args.clause_refs[0] = "c1";
-    args.clause_ref_count = 1;
     args.selected_route = "r1";
-    args.rejected_routes[0] = "r2";
-    args.rejected_route_count = 1;
-    try validateReceiptRefs(parsed.contract, args);
     args.rejected_routes[0] = "r-missing";
     try std.testing.expectError(
         error.UnknownRejectedRoute,
-        validateReceiptRefs(parsed.contract, args),
+        validateReceiptRefs(projection, args),
     );
+    args.selected_route = "r3";
+    args.rejected_route_count = 0;
+    try std.testing.expectError(
+        error.SelectedRouteNotCoveredByClause,
+        validateReceiptRefs(projection, args),
+    );
+    args.selected_route = "r1";
+    args.rejected_routes[0] = "r3";
+    args.rejected_route_count = 1;
+    try std.testing.expectError(
+        error.RejectedRouteNotCoveredByClause,
+        validateReceiptRefs(projection, args),
+    );
+}
+
+test "decision receipts require a decision-capable contract kind" {
+    try std.testing.expect(contractKindSupportsDecisionReceipt("decision"));
+    try std.testing.expect(contractKindSupportsDecisionReceipt("mixed"));
+    try std.testing.expect(!contractKindSupportsDecisionReceipt("execution"));
 }
 
 test "contract loading validates and interprets one immutable snapshot" {
@@ -1900,21 +2079,19 @@ test "contract loading validates and interprets one immutable snapshot" {
         "{\"version\":\"16.0.4\"}\n",
         .{},
     );
-    var parsed = try skill_contract.parseText(std.testing.allocator, TestContractJson);
-    defer parsed.deinit();
-    const fingerprint = try skill_contract.fingerprintContract(
-        std.testing.allocator,
-        parsed.contract,
-    );
-    defer std.testing.allocator.free(fingerprint);
     const script = try std.fmt.allocPrint(
         std.testing.allocator,
         "#!/bin/sh\n" ++
             "cmp '{s}' \"$4\" || exit 9\n" ++
             "printf '%s\\n' '{{\"mutated\":true}}' > '{s}'\n" ++
             "printf '%s\\n' '{{\"skill_contract\":{{\"valid\":true," ++
-            "\"fingerprint\":\"{s}\"}}}}'\n",
-        .{ expected_path, contract_path, fingerprint },
+            "\"fingerprint\":\"fixture-fingerprint\"," ++
+            "\"skill\":\"universalist\",\"skill_kind\":\"decision\"," ++
+            "\"trigger_ids\":[\"t1\"],\"route_ids\":[\"r1\",\"r2\"]," ++
+            "\"clause_ids\":[\"c1\"],\"clause_routes\":[{{" ++
+            "\"clause_id\":\"c1\",\"expected_routes\":[\"r1\"]," ++
+            "\"prohibited_routes\":[\"r2\"]}}]}}}}'\n",
+        .{ expected_path, contract_path },
     );
     defer std.testing.allocator.free(script);
     try durable_store.writeTextCreateNewAtomic(
@@ -1929,9 +2106,9 @@ test "contract loading validates and interprets one immutable snapshot" {
 
     var info = try loadContractInfo(std.testing.allocator, seq_path, contract_path);
     defer info.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("universalist", info.parsed.contract.skill_name);
-    try std.testing.expect(contractHasRoute(info.parsed.contract, "r1"));
-    try std.testing.expectEqualStrings(fingerprint, info.fingerprint);
+    try std.testing.expectEqualStrings("universalist", info.projection.skill);
+    try std.testing.expect(stringListContains(info.projection.route_ids, "r1"));
+    try std.testing.expectEqualStrings("fixture-fingerprint", info.projection.fingerprint);
     const mutated = try durable_store.readFileAlloc(
         std.testing.allocator,
         contract_path,
@@ -1941,26 +2118,30 @@ test "contract loading validates and interprets one immutable snapshot" {
     try std.testing.expectEqualStrings("{\"mutated\":true}\n", mutated);
 }
 
-test "Seq resolution skips an incompatible numeric command" {
+test "Seq resolution skips a candidate without receipt binding projection" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDir(defaultIo(), "numeric", .default_dir);
+    try tmp.dir.createDir(defaultIo(), "legacy", .default_dir);
     try tmp.dir.createDir(defaultIo(), "skills", .default_dir);
     const root = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
-    const numeric_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "numeric" });
-    defer std.testing.allocator.free(numeric_dir);
+    const legacy_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "legacy" });
+    defer std.testing.allocator.free(legacy_dir);
     const skills_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "skills" });
     defer std.testing.allocator.free(skills_dir);
-    const numeric_seq = try std.fs.path.join(std.testing.allocator, &.{ numeric_dir, "seq" });
-    defer std.testing.allocator.free(numeric_seq);
+    const legacy_seq = try std.fs.path.join(std.testing.allocator, &.{ legacy_dir, "seq" });
+    defer std.testing.allocator.free(legacy_seq);
     const skills_seq = try std.fs.path.join(std.testing.allocator, &.{ skills_dir, "seq" });
     defer std.testing.allocator.free(skills_seq);
     try durable_store.writeTextAtomic(
         std.testing.allocator,
-        numeric_seq,
-        "#!/bin/sh\nprintf '1\\n'\n",
+        legacy_seq,
+        "#!/bin/sh\nprintf '%s\\n' " ++
+            "'{\"seq_capabilities\":{\"version\":\"legacy\",\"features\":{" ++
+            "\"skill_contract_v1\":true," ++
+            "\"skill_decision_receipt_v1\":true," ++
+            "\"skill_decision_receipt_contract_binding_v1\":true}}}'\n",
     );
     try durable_store.writeTextAtomic(
         std.testing.allocator,
@@ -1969,19 +2150,20 @@ test "Seq resolution skips an incompatible numeric command" {
             "printf '%s\\n' " ++
             "'{\"seq_capabilities\":{\"version\":\"test\",\"features\":{" ++
             "\"skill_contract_v1\":true," ++
+            "\"skill_contract_receipt_binding_projection_v1\":true," ++
             "\"skill_decision_receipt_v1\":true," ++
             "\"skill_decision_receipt_contract_binding_v1\":true}}}'\n",
     );
-    var numeric_file = try std.Io.Dir.openFileAbsolute(defaultIo(), numeric_seq, .{});
-    defer numeric_file.close(defaultIo());
-    try numeric_file.setPermissions(defaultIo(), .fromMode(0o500));
+    var legacy_file = try std.Io.Dir.openFileAbsolute(defaultIo(), legacy_seq, .{});
+    defer legacy_file.close(defaultIo());
+    try legacy_file.setPermissions(defaultIo(), .fromMode(0o500));
     var skills_file = try std.Io.Dir.openFileAbsolute(defaultIo(), skills_seq, .{});
     defer skills_file.close(defaultIo());
     try skills_file.setPermissions(defaultIo(), .fromMode(0o500));
     const path_env = try std.fmt.allocPrint(
         std.testing.allocator,
         "{s}:{s}",
-        .{ numeric_dir, skills_dir },
+        .{ legacy_dir, skills_dir },
     );
     defer std.testing.allocator.free(path_env);
     const resolved = try resolveCompatibleSeqFromAlloc(
@@ -2066,6 +2248,41 @@ test "plan receipt append is atomic and exactly once" {
         error.ReceiptAlreadyPresent,
         appendReceiptToPlan(std.testing.allocator, plan_path, updated, receipt, "UNI-TEST-001"),
     );
+}
+
+test "plan receipt append rejects a result above the readable maximum" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const plan_path = try std.fs.path.join(std.testing.allocator, &.{ root, "plan.md" });
+    defer std.testing.allocator.free(plan_path);
+    const original = try std.testing.allocator.alloc(u8, MaxPlanBytes - 1);
+    defer std.testing.allocator.free(original);
+    @memset(original, 'x');
+    try durable_store.writeTextCreateNewAtomic(
+        std.testing.allocator,
+        plan_path,
+        original,
+        .{},
+    );
+    try std.testing.expectError(
+        error.PlanTooLarge,
+        appendReceiptToPlan(
+            std.testing.allocator,
+            plan_path,
+            original,
+            "{\"skill_decision_receipt\":{}}",
+            "UNI-TEST-LIMIT",
+        ),
+    );
+    const retained = try durable_store.readFileAlloc(
+        std.testing.allocator,
+        plan_path,
+        MaxPlanBytes,
+    );
+    defer std.testing.allocator.free(retained);
+    try std.testing.expectEqualStrings(original, retained);
 }
 
 test "plan receipt append rejects a stale plan snapshot" {

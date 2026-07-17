@@ -3279,6 +3279,7 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
             \\      "skill_decision_audit": true,
             \\      "skill_decision_delta": true,
             \\      "skill_contract_v1": true,
+            \\      "skill_contract_receipt_binding_projection_v1": true,
             \\      "skill_decision_receipt_v1": true,
             \\      "skill_decision_receipt_contract_binding_v1": true,
             \\      "tune_packet_v1": true,
@@ -3352,6 +3353,7 @@ fn cmdCapabilities(allocator: std.mem.Allocator, opts: Options) !void {
         .{ .name = "skill_decision_audit", .enabled = true },
         .{ .name = "skill_decision_delta", .enabled = true },
         .{ .name = "skill_contract_v1", .enabled = true },
+        .{ .name = "skill_contract_receipt_binding_projection_v1", .enabled = true },
         .{ .name = "skill_decision_receipt_v1", .enabled = true },
         .{ .name = "skill_decision_receipt_contract_binding_v1", .enabled = true },
         .{ .name = "tune_packet_v1", .enabled = true },
@@ -5619,9 +5621,20 @@ fn cmdSkillContract(allocator: std.mem.Allocator, opts: Options) !void {
     if (std.mem.eql(u8, action, "validate")) {
         const content = try std.Io.Dir.cwd().readFileAlloc(defaultIo(), opts.file_text.?, allocator, .limited(4 * 1024 * 1024));
         defer allocator.free(content);
-        const report = try skill_contract.validateText(allocator, content);
+        var parsed_contract = try skill_contract.parseText(allocator, content);
+        defer parsed_contract.deinit();
+        const report = try skill_contract.validateParsed(allocator, parsed_contract.contract);
         defer report.deinit(allocator);
-        try writeSkillValidationReport(allocator, opts, "skill_contract", action, report.valid, report.codes, report.fingerprint);
+        try writeSkillValidationReport(
+            allocator,
+            opts,
+            "skill_contract",
+            action,
+            report.valid,
+            report.codes,
+            report.fingerprint,
+            parsed_contract.contract,
+        );
         if (!report.valid) return error.InvalidSpec;
         return;
     }
@@ -5706,7 +5719,16 @@ fn cmdSkillDecisionReceipt(allocator: std.mem.Allocator, opts: Options) !void {
     defer allocator.free(content);
     const report = try skill_decision_receipt.validateText(allocator, content, null, null);
     defer report.deinit(allocator);
-    try writeSkillValidationReport(allocator, opts, "skill_decision_receipt", opts.command_action.?, report.valid, report.codes, report.canonical_hash);
+    try writeSkillValidationReport(
+        allocator,
+        opts,
+        "skill_decision_receipt",
+        opts.command_action.?,
+        report.valid,
+        report.codes,
+        report.canonical_hash,
+        null,
+    );
     if (!report.valid) return error.InvalidSpec;
 }
 
@@ -5718,6 +5740,7 @@ fn writeSkillValidationReport(
     valid: bool,
     codes: []const []const u8,
     fingerprint_or_hash: ?[]const u8,
+    contract: ?skill_contract.Contract,
 ) !void {
     if (opts.format == .json) {
         var writer_alloc = std.Io.Writer.Allocating.init(allocator);
@@ -5736,7 +5759,9 @@ fn writeSkillValidationReport(
             if (idx > 0) try writer.writeAll(", ");
             try output.writeJsonString(writer, code);
         }
-        try writer.writeAll("]\n  }\n}\n");
+        try writer.writeAll("]");
+        if (contract) |value| try writeContractReceiptBindingProjection(writer, value);
+        try writer.writeAll("\n  }\n}\n");
         const rendered = try writer_alloc.toOwnedSlice();
         defer allocator.free(rendered);
         try writeTextOutput(rendered, opts.out_path);
@@ -5766,6 +5791,55 @@ fn writeSkillValidationReport(
     }
     const cols = [_][]const u8{ "surface", "action", "valid", "fingerprint", "validation_code" };
     try output.writeOutput(allocator, opts.format, rows.items, cols[0..], opts.out_path);
+}
+
+fn writeContractReceiptBindingProjection(
+    writer: *std.Io.Writer,
+    contract: skill_contract.Contract,
+) !void {
+    try writer.writeAll(",\n    \"skill\": ");
+    try output.writeJsonString(writer, contract.skill_name);
+    try writer.writeAll(",\n    \"skill_kind\": ");
+    try output.writeJsonString(writer, contract.skill_kind);
+    try writer.writeAll(",\n    \"trigger_ids\": [");
+    for (contract.triggers, 0..) |trigger, index| {
+        if (index > 0) try writer.writeAll(", ");
+        try output.writeJsonString(writer, trigger.trigger_id);
+    }
+    try writer.writeAll("],\n    \"route_ids\": [");
+    for (contract.routes, 0..) |route, index| {
+        if (index > 0) try writer.writeAll(", ");
+        try output.writeJsonString(writer, route.route_id);
+    }
+    try writer.writeAll("],\n    \"clause_ids\": [");
+    for (contract.clauses, 0..) |clause, index| {
+        if (index > 0) try writer.writeAll(", ");
+        try output.writeJsonString(writer, clause.clause_id);
+    }
+    try writer.writeAll("],\n    \"clause_routes\": [");
+    for (contract.clauses, 0..) |clause, index| {
+        if (index > 0) try writer.writeAll(", ");
+        try writer.writeAll("{\"clause_id\": ");
+        try output.writeJsonString(writer, clause.clause_id);
+        try writer.writeAll(", \"expected_routes\": ");
+        try writeProjectionStringArray(writer, clause.expected_routes);
+        try writer.writeAll(", \"prohibited_routes\": ");
+        try writeProjectionStringArray(writer, clause.prohibited_routes);
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
+}
+
+fn writeProjectionStringArray(
+    writer: *std.Io.Writer,
+    values: []const []const u8,
+) !void {
+    try writer.writeByte('[');
+    for (values, 0..) |value, index| {
+        if (index > 0) try writer.writeAll(", ");
+        try output.writeJsonString(writer, value);
+    }
+    try writer.writeByte(']');
 }
 
 fn writeSkillCompanionStatus(
@@ -26337,6 +26411,77 @@ test "skill companion command actions parse and validate" {
     try std.testing.expectError(error.MissingArgValue, validateCommandOptions(.skill_contract, .{}));
 }
 
+test "skill contract validation projects receipt binding from the parsed snapshot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const contract_text =
+        \\skill_decision_contract:
+        \\  contract_version: SKDC-v1
+        \\  skill:
+        \\    name: universalist
+        \\    kind: decision
+        \\    source_fingerprint: fixture
+        \\  triggers:
+        \\    - trigger_id: t1
+        \\  routes:
+        \\    - route_id: r1
+        \\      route_id: r-stray
+        \\    - route_id: r2
+        \\  clauses:
+        \\    - clause_id: c1
+        \\      trigger_refs: [t1]
+        \\      expected_routes: [r1]
+        \\      prohibited_routes: [r2]
+        \\  instrumentation:
+        \\    decision_receipt: required
+    ;
+    try tmp.dir.writeFile(
+        std.Io.Threaded.global_single_threaded.io(),
+        .{ .sub_path = "contract.yaml", .data = contract_text },
+    );
+    const contract_path = try tmp.dir.realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        "contract.yaml",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(contract_path);
+    const output_path = try tmp.dir.realPathFileAlloc(
+        std.Io.Threaded.global_single_threaded.io(),
+        ".",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(output_path);
+    const validation_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ output_path, "validation.json" },
+    );
+    defer std.testing.allocator.free(validation_path);
+    const got = try runCommandWithOutput(std.testing.allocator, .skill_contract, &.{
+        "validate", "--file", contract_path, "--format", "json",
+    }, validation_path);
+    defer std.testing.allocator.free(got);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, got, .{});
+    defer parsed.deinit();
+    const report = parsed.value.object.get("skill_contract").?.object;
+    try std.testing.expectEqualStrings("universalist", report.get("skill").?.string);
+    try std.testing.expectEqualStrings("decision", report.get("skill_kind").?.string);
+    try std.testing.expectEqualStrings("t1", report.get("trigger_ids").?.array.items[0].string);
+    try std.testing.expectEqualStrings("r1", report.get("route_ids").?.array.items[0].string);
+    try std.testing.expectEqualStrings("r2", report.get("route_ids").?.array.items[1].string);
+    try std.testing.expectEqual(@as(usize, 2), report.get("route_ids").?.array.items.len);
+    try std.testing.expectEqualStrings("c1", report.get("clause_ids").?.array.items[0].string);
+    const clause_route = report.get("clause_routes").?.array.items[0].object;
+    try std.testing.expectEqualStrings("c1", clause_route.get("clause_id").?.string);
+    try std.testing.expectEqualStrings(
+        "r1",
+        clause_route.get("expected_routes").?.array.items[0].string,
+    );
+    try std.testing.expectEqualStrings(
+        "r2",
+        clause_route.get("prohibited_routes").?.array.items[0].string,
+    );
+}
+
 test "capabilities supports json output" {
     try validateFormatForCommand(.capabilities, .{ .format = .json });
     try std.testing.expectError(error.InvalidFormatForCommand, validateFormatForCommand(.capabilities, .{ .format = .markdown }));
@@ -26370,6 +26515,11 @@ test "capabilities advertises resolve intent closed audit flags" {
     try std.testing.expect(std.mem.indexOf(u8, got, "\"execution_policy_audit_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"c3_count_evidence_refs_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"workflow_provenance_mode_v1\": true") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        got,
+        "\"skill_contract_receipt_binding_projection_v1\": true",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"skill_decision_receipt_contract_binding_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"epg_v1\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "\"policy_transition_dataset_v1\": true") != null);

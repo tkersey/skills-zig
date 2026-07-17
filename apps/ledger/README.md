@@ -173,9 +173,11 @@ semantics.
 `ledger --source universalist` owns plan identity, allocation, lookup, and
 SDR-v1 receipt emission. Universalist owns the decision policy, SKDC-v1
 contract, plan template, and ordinary Markdown field updates. This receipt
-boundary requires Ledger 0.10.4 or newer and a compatible Skills Seq companion.
-Ledger checks a sibling `seq` first, then searches `PATH`, and accepts only a
-binary advertising the SKDC-v1 and SDR-v1 validation capabilities it needs.
+boundary requires Ledger 0.10.4 or newer and Skills Seq 0.3.51 or newer. Ledger
+checks a sibling `seq` first, then searches `PATH`, and accepts only a binary
+advertising the SKDC-v1 receipt-binding projection and SDR-v1 validation
+capabilities
+it needs.
 
 Create a fresh plan from a skill-owned template:
 
@@ -232,8 +234,10 @@ ledger emit --source universalist \
   --write-plan
 ```
 
-Ledger validates YAML or JSON SKDC-v1 contracts through Seq, rejects unknown
-trigger, clause, or route references, derives the decision id and repository
+Ledger snapshots a YAML or JSON SKDC-v1 contract once, then uses Seq's single
+validation result for the fingerprint, decision-capable skill kind, parsed
+trigger, clause, and route identities, and referenced-clause route coverage. It
+rejects unknown or uncovered references, derives the decision id and repository
 state only from an exact canonical plan address, constructs canonical compact
 SDR-v1 JSON, and validates the generated receipt through Seq before any plan
 mutation. `--write-plan` accepts only the canonical

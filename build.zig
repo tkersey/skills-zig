@@ -376,7 +376,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "app_meta", .module = ledger_meta },
             .{ .name = "hctp_fixtures", .module = hctp_fixtures },
             .{ .name = "retrace_core", .module = retrace_core },
-            .{ .name = "seq_bundle", .module = seq_bundle },
         },
     });
     const hylo_cli_tests_root = b.createModule(.{
