@@ -3529,8 +3529,19 @@ test "negative ledger source alias preserves root command arguments" {
 }
 
 test "learnings show source alias preserves both command orderings" {
-    const command_first = [_][]const u8{ "ledger", "show", "--source", "learnings", "--id", "lrn-20260715T000000Z-12345678" };
-    const routed_command_first = try sourceArgvAlloc(std.testing.allocator, &command_first, "learnings");
+    const command_first = [_][]const u8{
+        "ledger",
+        "show",
+        "--source",
+        "learnings",
+        "--id",
+        "lrn-20260715T000000Z-12345678",
+    };
+    const routed_command_first = try sourceArgvAlloc(
+        std.testing.allocator,
+        &command_first,
+        "learnings",
+    );
     defer std.testing.allocator.free(routed_command_first);
     try std.testing.expectEqualSlices(
         []const u8,
@@ -3538,8 +3549,19 @@ test "learnings show source alias preserves both command orderings" {
         routed_command_first,
     );
 
-    const source_first = [_][]const u8{ "ledger", "--source", "learnings", "show", "--id", "lrn-20260715T000000Z-12345678" };
-    const routed_source_first = try sourceArgvAlloc(std.testing.allocator, &source_first, "learnings");
+    const source_first = [_][]const u8{
+        "ledger",
+        "--source",
+        "learnings",
+        "show",
+        "--id",
+        "lrn-20260715T000000Z-12345678",
+    };
+    const routed_source_first = try sourceArgvAlloc(
+        std.testing.allocator,
+        &source_first,
+        "learnings",
+    );
     defer std.testing.allocator.free(routed_source_first);
     try std.testing.expectEqualSlices(
         []const u8,

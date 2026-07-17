@@ -75,15 +75,20 @@ const PathHelpSurface = core_cli.HelpSurface{
     .help_text = PathUsageText,
 };
 
-const UsageText =
+const CommandSetText =
+    "{capture,datasets,dataset-schema,query,recent,recall,show,export," ++
+    "codify-candidates,quality-audit,value-report,memory-digest," ++
+    "migrate,doctor,path}";
+
+const UsageText = std.fmt.comptimePrint(
     \\ledger --source learnings
     \\
-    \\usage: ledger --source learnings [-h] [--path PATH] {capture,datasets,dataset-schema,query,recent,recall,show,export,codify-candidates,quality-audit,value-report,memory-digest,migrate,doctor,path} ...
+    \\usage: ledger --source learnings [-h] [--path PATH] {s} ...
     \\
     \\Mine, recall, and promote records through the repo-local learning-source API.
     \\
     \\positional arguments:
-    \\  {capture,datasets,dataset-schema,query,recent,recall,show,export,codify-candidates,quality-audit,value-report,memory-digest,migrate,doctor,path}
+    \\  {s}
     \\    capture             Append a structured learning event
     \\    datasets            List datasets
     \\    dataset-schema      Show dataset schema
@@ -105,7 +110,7 @@ const UsageText =
     \\  --path PATH           Current persistent-adapter path (relative to repo root by default)
     \\  -V, --version         Show version
     \\  version               Show version
-;
+, .{ CommandSetText, CommandSetText });
 
 const MigrateUsageText =
     \\ledger migrate --source learnings
@@ -715,8 +720,17 @@ pub fn runWithArgv(allocator: std.mem.Allocator, argv: []const []const u8, codex
         .show, .@"export" => {
             const jsonl_path = try resolveReadJsonlPathAlloc(allocator, repo_root, parsed.path, parsed.path_explicit);
             defer allocator.free(jsonl_path);
-            const projection_format = if (parsed.command.? == .show) "full" else parsed.export_format;
-            try cmdExport(allocator, jsonl_path, parsed.path, parsed.export_id.?, projection_format);
+            const projection_format = if (parsed.command.? == .show)
+                "full"
+            else
+                parsed.export_format;
+            try cmdExport(
+                allocator,
+                jsonl_path,
+                parsed.path,
+                parsed.export_id.?,
+                projection_format,
+            );
         },
         .codify_candidates => {
             const jsonl_path = try resolveReadJsonlPathAlloc(allocator, repo_root, parsed.path, parsed.path_explicit);
@@ -5659,7 +5673,14 @@ test "parse args show aliases the full learning projection" {
     const missing = [_][]const u8{ ProgramName, "show" };
     try std.testing.expectError(error.MissingIdValue, parseArgs(&missing));
 
-    const format = [_][]const u8{ ProgramName, "show", "--id", "lrn-20260715T000000Z-12345678", "--format", "memory-note" };
+    const format = [_][]const u8{
+        ProgramName,
+        "show",
+        "--id",
+        "lrn-20260715T000000Z-12345678",
+        "--format",
+        "memory-note",
+    };
     try std.testing.expectError(error.InvalidShowArg, parseArgs(&format));
 }
 
@@ -5775,7 +5796,10 @@ test "subcommand help dispatches before argument parsing" {
     try std.testing.expectEqualStrings("ledger recall --source learnings", subcommandHelpSurface(&recall_help).?.executable_name);
 
     const show_help = [_][]const u8{ ProgramName, "show", "--help" };
-    try std.testing.expectEqualStrings("ledger show --source learnings", subcommandHelpSurface(&show_help).?.executable_name);
+    try std.testing.expectEqualStrings(
+        "ledger show --source learnings",
+        subcommandHelpSurface(&show_help).?.executable_name,
+    );
 
     const query_short_help = [_][]const u8{ ProgramName, "query", "-h" };
     try std.testing.expectEqualStrings("ledger query --source learnings", subcommandHelpSurface(&query_short_help).?.executable_name);
