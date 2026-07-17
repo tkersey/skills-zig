@@ -2,7 +2,10 @@ const app_meta = @import("app_meta");
 const builtin = @import("builtin");
 const core_cli = @import("core_cli");
 const durable_store = @import("durable_store");
+const seq_bundle = @import("seq_bundle");
 const std = @import("std");
+
+const skill_contract = seq_bundle.skill_contract;
 
 const Io = std.Io.Threaded.global_single_threaded;
 const Version = core_cli.normalizeVersion(app_meta.version);
@@ -14,7 +17,10 @@ const LegacyPlanPrefix = "universalist-plan-";
 const PlanSuffix = ".md";
 const PlanIdLen = 30;
 const MaxTemplateBytes = 1024 * 1024;
+const MaxContractBytes = 1024 * 1024;
 const MaxReceiptBytes = 1024 * 1024;
+const MaxPlanMetadataBytes = 64 * 1024;
+const MaxPlanBytes = MaxTemplateBytes + MaxReceiptBytes + MaxPlanMetadataBytes;
 const MaxReceiptValues = 64;
 const MaxOrdinal = 9999;
 const DefaultTriggerRefs = [_][]const u8{ "UNI-BOUNDARY", "UNI-CONSEQUENTIAL" };
@@ -429,12 +435,12 @@ fn parseCommand(raw: []const u8) ?Command {
 
 const ContractInfo = struct {
     fingerprint: []u8,
-    text: []u8,
+    parsed: skill_contract.ParsedContract,
     skill_version: []u8,
 
     fn deinit(self: *ContractInfo, allocator: std.mem.Allocator) void {
         allocator.free(self.fingerprint);
-        allocator.free(self.text);
+        self.parsed.deinit();
         allocator.free(self.skill_version);
         self.* = undefined;
     }
@@ -466,20 +472,14 @@ fn emitDecisionReceipt(allocator: std.mem.Allocator, repo: []const u8, args: Arg
     const contract_path = try realPathAlloc(allocator, args.contract_path.?);
     defer allocator.free(contract_path);
 
-    const plan_text = try durable_store.readFileAlloc(allocator, plan_path, MaxReceiptBytes);
+    const plan_text = try durable_store.readFileAlloc(allocator, plan_path, MaxPlanBytes);
     defer allocator.free(plan_text);
     if (!containsExactLine(plan_text, "# Universalist Plan")) return error.NotUniversalistPlan;
 
     const addressed_plan_id = try addressedPlanId(allocator, repo, plan_path);
     const plan_id = addressed_plan_id orelse "template";
-    var owned_decision_id: ?[]u8 = null;
-    defer if (owned_decision_id) |value| allocator.free(value);
-    const decision_id = if (args.decision_id) |value|
-        value
-    else if (addressed_plan_id) |value| blk: {
-        owned_decision_id = try std.fmt.allocPrint(allocator, "UNI-{s}", .{value});
-        break :blk owned_decision_id.?;
-    } else return error.DecisionIdRequired;
+    const decision_id = try decisionIdAlloc(allocator, addressed_plan_id, args.decision_id);
+    defer allocator.free(decision_id);
 
     if (args.write_plan) try requireCanonicalPlan(allocator, repo, plan_path, addressed_plan_id);
 
@@ -488,7 +488,7 @@ fn emitDecisionReceipt(allocator: std.mem.Allocator, repo: []const u8, args: Arg
 
     var contract = try loadContractInfo(allocator, seq_path, contract_path);
     defer contract.deinit(allocator);
-    try validateReceiptRefs(allocator, contract.text, args);
+    try validateReceiptRefs(contract.parsed.contract, args);
 
     const plan_relative = try allocator.dupe(u8, plan_path[repo.len + 1 ..]);
     defer allocator.free(plan_relative);
@@ -554,6 +554,25 @@ fn requireCanonicalPlan(
     const expected = try planPathAlloc(allocator, repo, id, .canonical);
     defer allocator.free(expected);
     if (!std.mem.eql(u8, plan_path, expected)) return error.CanonicalPlanRequired;
+}
+
+fn decisionIdAlloc(
+    allocator: std.mem.Allocator,
+    addressed_plan_id: ?[]const u8,
+    explicit_decision_id: ?[]const u8,
+) ![]u8 {
+    if (addressed_plan_id) |plan_id| {
+        const canonical = try std.fmt.allocPrint(allocator, "UNI-{s}", .{plan_id});
+        errdefer allocator.free(canonical);
+        if (explicit_decision_id) |explicit| {
+            if (!std.mem.eql(u8, explicit, canonical)) return error.DecisionIdMismatch;
+        }
+        return canonical;
+    }
+    return allocator.dupe(
+        u8,
+        explicit_decision_id orelse return error.DecisionIdRequired,
+    );
 }
 
 fn containsExactLine(text: []const u8, expected: []const u8) bool {
@@ -660,58 +679,34 @@ fn loadContractInfo(
     seq_path: []const u8,
     contract_path: []const u8,
 ) !ContractInfo {
-    const validation = try runCommandStdoutAlloc(allocator, &.{
-        seq_path,
-        "skill-contract",
-        "validate",
-        "--file",
-        contract_path,
-        "--format",
-        "json",
-    }, error.ContractValidationFailed);
-    defer allocator.free(validation);
-
-    var parsed = std.json.parseFromSlice(
-        std.json.Value,
-        allocator,
-        validation,
-        .{},
-    ) catch return error.ContractValidationInvalidJson;
-    defer parsed.deinit();
-    const root = switch (parsed.value) {
-        .object => |value| value,
-        else => return error.ContractValidationInvalidJson,
-    };
-    const report_value = root.get("skill_contract") orelse
-        return error.ContractValidationInvalidJson;
-    const report = switch (report_value) {
-        .object => |value| value,
-        else => return error.ContractValidationInvalidJson,
-    };
-    const valid_value = report.get("valid") orelse return error.ContractValidationInvalidJson;
-    if (valid_value != .bool or !valid_value.bool) return error.ContractValidationFailed;
-    const fingerprint_value = report.get("fingerprint") orelse
-        return error.ContractFingerprintMissing;
-    const fingerprint = switch (fingerprint_value) {
-        .string => |value| value,
-        else => return error.ContractFingerprintMissing,
-    };
-    if (fingerprint.len == 0) return error.ContractFingerprintMissing;
-
     const contract_text = try durable_store.readFileAlloc(
         allocator,
         contract_path,
-        MaxReceiptBytes,
+        MaxContractBytes,
     );
-    errdefer allocator.free(contract_text);
-    if (!try contractHasFieldValue(
-        allocator,
-        contract_text,
-        "skill",
-        "name",
-        "universalist",
-    )) {
+    defer allocator.free(contract_text);
+    var parsed_contract = skill_contract.parseText(allocator, contract_text) catch
+        return error.ContractValidationFailed;
+    errdefer parsed_contract.deinit();
+    const local_report = try skill_contract.validateParsed(allocator, parsed_contract.contract);
+    defer local_report.deinit(allocator);
+    if (!local_report.valid) return error.ContractValidationFailed;
+    if (!std.mem.eql(u8, parsed_contract.contract.skill_name, "universalist")) {
         return error.ContractSkillMismatch;
+    }
+    const native_fingerprint = try skill_contract.fingerprintContract(
+        allocator,
+        parsed_contract.contract,
+    );
+    defer allocator.free(native_fingerprint);
+    const seq_fingerprint = try validateContractSnapshotWithSeq(
+        allocator,
+        seq_path,
+        contract_text,
+    );
+    defer allocator.free(seq_fingerprint);
+    if (!std.mem.eql(u8, native_fingerprint, seq_fingerprint)) {
+        return error.ContractFingerprintMismatch;
     }
 
     const references_dir = std.fs.path.dirname(contract_path) orelse
@@ -738,184 +733,49 @@ fn loadContractInfo(
         else => return error.SkillVersionMissing,
     };
 
+    const owned_fingerprint = try allocator.dupe(u8, native_fingerprint);
+    errdefer allocator.free(owned_fingerprint);
+    const skill_version = try allocator.dupe(u8, version);
+    errdefer allocator.free(skill_version);
     return .{
-        .fingerprint = try allocator.dupe(u8, fingerprint),
-        .text = contract_text,
-        .skill_version = try allocator.dupe(u8, version),
+        .fingerprint = owned_fingerprint,
+        .parsed = parsed_contract,
+        .skill_version = skill_version,
     };
 }
-
-const ContractLookup = union(enum) {
-    yaml: []const u8,
-    json: std.json.ObjectMap,
-
-    fn hasFieldValue(
-        self: ContractLookup,
-        section: []const u8,
-        field: []const u8,
-        expected: []const u8,
-    ) bool {
-        return switch (self) {
-            .yaml => |text| yamlSectionHasFieldValue(text, section, field, expected),
-            .json => |contract| jsonSectionHasFieldValue(contract, section, field, expected),
-        };
+fn validateReceiptRefs(contract: skill_contract.Contract, args: Args) !void {
+    for (args.effectiveTriggerRefs()) |value| {
+        if (!contractHasTrigger(contract, value)) return error.UnknownTriggerRef;
     }
-};
-
-fn contractHasFieldValue(
-    allocator: std.mem.Allocator,
-    text: []const u8,
-    section: []const u8,
-    field: []const u8,
-    expected: []const u8,
-) !bool {
-    if (!isJsonDocument(text)) {
-        return yamlSectionHasFieldValue(text, section, field, expected);
+    for (args.effectiveClauseRefs()) |value| {
+        if (!contractHasClause(contract, value)) return error.UnknownClauseRef;
     }
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch
-        return error.ContractValidationInvalidJson;
-    defer parsed.deinit();
-    const contract = try jsonContractObject(parsed.value);
-    return jsonSectionHasFieldValue(contract, section, field, expected);
+    if (!contractHasRoute(contract, args.selected_route.?)) return error.UnknownSelectedRoute;
+    for (args.rejected_routes[0..args.rejected_route_count]) |value| {
+        if (!contractHasRoute(contract, value)) return error.UnknownRejectedRoute;
+        if (std.mem.eql(u8, value, args.selected_route.?)) return error.SelectedRouteRejected;
+    }
 }
 
-fn isJsonDocument(text: []const u8) bool {
-    const trimmed = std.mem.trimStart(u8, text, " \t\r\n");
-    return trimmed.len > 0 and trimmed[0] == '{';
-}
-
-fn jsonContractObject(value: std.json.Value) !std.json.ObjectMap {
-    const root = switch (value) {
-        .object => |object| object,
-        else => return error.ContractValidationInvalidJson,
-    };
-    const contract_value = root.get("skill_decision_contract") orelse
-        return error.ContractValidationInvalidJson;
-    return switch (contract_value) {
-        .object => |object| object,
-        else => error.ContractValidationInvalidJson,
-    };
-}
-
-fn jsonSectionHasFieldValue(
-    contract: std.json.ObjectMap,
-    section: []const u8,
-    field: []const u8,
-    expected: []const u8,
-) bool {
-    const section_value = contract.get(section) orelse return false;
-    return switch (section_value) {
-        .object => |object| jsonObjectHasFieldValue(object, field, expected),
-        .array => |array| blk: {
-            for (array.items) |item| {
-                const object = switch (item) {
-                    .object => |value| value,
-                    else => continue,
-                };
-                if (jsonObjectHasFieldValue(object, field, expected)) break :blk true;
-            }
-            break :blk false;
-        },
-        else => false,
-    };
-}
-
-fn jsonObjectHasFieldValue(
-    object: std.json.ObjectMap,
-    field: []const u8,
-    expected: []const u8,
-) bool {
-    const value = object.get(field) orelse return false;
-    return switch (value) {
-        .string => |string| std.mem.eql(u8, string, expected),
-        else => false,
-    };
-}
-
-fn yamlSectionHasFieldValue(
-    text: []const u8,
-    section: []const u8,
-    field: []const u8,
-    expected: []const u8,
-) bool {
-    var section_indent: ?usize = null;
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0 or std.mem.startsWith(u8, trimmed, "#")) continue;
-        const indent = yamlIndent(line);
-        if (section_indent) |value| {
-            if (indent <= value) return false;
-            const candidate = yamlFieldValue(line, field) orelse continue;
-            if (std.mem.eql(u8, candidate, expected)) return true;
-            continue;
-        }
-        const candidate = yamlFieldValue(line, section) orelse continue;
-        if (candidate.len == 0) section_indent = indent;
+fn contractHasTrigger(contract: skill_contract.Contract, expected: []const u8) bool {
+    for (contract.triggers) |trigger| {
+        if (std.mem.eql(u8, trigger.trigger_id, expected)) return true;
     }
     return false;
 }
 
-fn yamlIndent(line: []const u8) usize {
-    var count: usize = 0;
-    while (count < line.len and line[count] == ' ') : (count += 1) {}
-    return count;
+fn contractHasClause(contract: skill_contract.Contract, expected: []const u8) bool {
+    for (contract.clauses) |clause| {
+        if (std.mem.eql(u8, clause.clause_id, expected)) return true;
+    }
+    return false;
 }
 
-fn yamlFieldValue(line: []const u8, field: []const u8) ?[]const u8 {
-    var trimmed = std.mem.trim(u8, line, " \t\r");
-    if (std.mem.startsWith(u8, trimmed, "- ")) trimmed = std.mem.trimStart(u8, trimmed[2..], " \t");
-    if (trimmed.len <= field.len or
-        !std.mem.eql(u8, trimmed[0..field.len], field) or
-        trimmed[field.len] != ':') return null;
-    var value = std.mem.trim(u8, trimmed[field.len + 1 ..], " \t");
-    const double_quoted = value.len >= 2 and value[0] == '"' and
-        value[value.len - 1] == '"';
-    const single_quoted = value.len >= 2 and value[0] == '\'' and
-        value[value.len - 1] == '\'';
-    if (double_quoted or single_quoted) {
-        value = value[1 .. value.len - 1];
+fn contractHasRoute(contract: skill_contract.Contract, expected: []const u8) bool {
+    for (contract.routes) |route| {
+        if (std.mem.eql(u8, route.route_id, expected)) return true;
     }
-    return value;
-}
-
-fn validateReceiptRefs(
-    allocator: std.mem.Allocator,
-    contract_text: []const u8,
-    args: Args,
-) !void {
-    if (!isJsonDocument(contract_text)) {
-        return validateReceiptRefsWithLookup(.{ .yaml = contract_text }, args);
-    }
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, contract_text, .{}) catch
-        return error.ContractValidationInvalidJson;
-    defer parsed.deinit();
-    const contract = try jsonContractObject(parsed.value);
-    return validateReceiptRefsWithLookup(.{ .json = contract }, args);
-}
-
-fn validateReceiptRefsWithLookup(lookup: ContractLookup, args: Args) !void {
-    for (args.effectiveTriggerRefs()) |value| {
-        if (!lookup.hasFieldValue("triggers", "trigger_id", value)) {
-            return error.UnknownTriggerRef;
-        }
-    }
-    for (args.effectiveClauseRefs()) |value| {
-        if (!lookup.hasFieldValue("clauses", "clause_id", value)) {
-            return error.UnknownClauseRef;
-        }
-    }
-    if (!lookup.hasFieldValue(
-        "routes",
-        "route_id",
-        args.selected_route.?,
-    )) return error.UnknownSelectedRoute;
-    for (args.rejected_routes[0..args.rejected_route_count]) |value| {
-        if (!lookup.hasFieldValue("routes", "route_id", value)) {
-            return error.UnknownRejectedRoute;
-        }
-        if (std.mem.eql(u8, value, args.selected_route.?)) return error.SelectedRouteRejected;
-    }
+    return false;
 }
 
 fn renderReceiptAlloc(allocator: std.mem.Allocator, args: Args, context: ReceiptContext) ![]u8 {
@@ -1010,6 +870,88 @@ fn writeJsonStringList(writer: *std.Io.Writer, values: []const []const u8) !void
     try writer.writeByte(']');
 }
 
+fn validateContractSnapshotWithSeq(
+    allocator: std.mem.Allocator,
+    seq_path: []const u8,
+    contract_text: []const u8,
+) ![]u8 {
+    const temp_dir = try realPathAlloc(allocator, "/tmp");
+    defer allocator.free(temp_dir);
+    const stamp = std.Io.Clock.awake.now(defaultIo()).nanoseconds;
+    var ordinal: usize = 0;
+    while (ordinal <= MaxOrdinal) : (ordinal += 1) {
+        const filename = try std.fmt.allocPrint(
+            allocator,
+            ".ledger-universalist-contract-{d}-{d}.skdc",
+            .{ stamp, ordinal },
+        );
+        defer allocator.free(filename);
+        const temp_path = try std.fs.path.join(allocator, &.{ temp_dir, filename });
+        defer allocator.free(temp_path);
+        durable_store.writeTextCreateNewAtomic(
+            allocator,
+            temp_path,
+            contract_text,
+            .{},
+        ) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => return err,
+        };
+        const validation_result = validateContractFileWithSeq(
+            allocator,
+            seq_path,
+            temp_path,
+        );
+        try std.Io.Dir.cwd().deleteFile(defaultIo(), temp_path);
+        return validation_result;
+    }
+    return error.ValidationTempExhausted;
+}
+
+fn validateContractFileWithSeq(
+    allocator: std.mem.Allocator,
+    seq_path: []const u8,
+    temp_path: []const u8,
+) ![]u8 {
+    const validation = try runCommandStdoutAlloc(allocator, &.{
+        seq_path,
+        "skill-contract",
+        "validate",
+        "--file",
+        temp_path,
+        "--format",
+        "json",
+    }, error.ContractValidationFailed);
+    defer allocator.free(validation);
+    var parsed = std.json.parseFromSlice(
+        std.json.Value,
+        allocator,
+        validation,
+        .{},
+    ) catch return error.ContractValidationInvalidJson;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return error.ContractValidationInvalidJson,
+    };
+    const report_value = root.get("skill_contract") orelse
+        return error.ContractValidationInvalidJson;
+    const report = switch (report_value) {
+        .object => |value| value,
+        else => return error.ContractValidationInvalidJson,
+    };
+    const valid_value = report.get("valid") orelse return error.ContractValidationInvalidJson;
+    if (valid_value != .bool or !valid_value.bool) return error.ContractValidationFailed;
+    const fingerprint_value = report.get("fingerprint") orelse
+        return error.ContractFingerprintMissing;
+    const fingerprint = switch (fingerprint_value) {
+        .string => |value| value,
+        else => return error.ContractFingerprintMissing,
+    };
+    if (fingerprint.len == 0) return error.ContractFingerprintMissing;
+    return allocator.dupe(u8, fingerprint);
+}
+
 fn validateReceiptWithSeq(
     allocator: std.mem.Allocator,
     seq_path: []const u8,
@@ -1089,7 +1031,7 @@ fn appendReceiptToPlan(
 ) !void {
     var lock = try durable_store.acquireLock(allocator, plan_path);
     defer lock.release(allocator);
-    const current = try durable_store.readFileAlloc(allocator, plan_path, MaxReceiptBytes);
+    const current = try durable_store.readFileAlloc(allocator, plan_path, MaxPlanBytes);
     defer allocator.free(current);
     if (!std.mem.eql(u8, current, expected_plan)) return error.PlanChangedDuringEmission;
     if (containsDecisionReceipt(current)) {
@@ -1104,7 +1046,11 @@ fn containsDecisionReceipt(text: []const u8) bool {
     if (std.mem.indexOf(u8, text, "\"skill_decision_receipt\"") != null) return true;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
-        if (yamlFieldValue(line, "skill_decision_receipt") != null) return true;
+        if (std.mem.eql(
+            u8,
+            std.mem.trim(u8, line, " \t\r"),
+            "skill_decision_receipt:",
+        )) return true;
     }
     return false;
 }
@@ -1552,6 +1498,28 @@ fn writeStdoutAlloc(allocator: std.mem.Allocator, out: *std.Io.Writer.Allocating
     try std.Io.File.stdout().writeStreamingAll(defaultIo(), bytes);
 }
 
+const TestContractJson =
+    \\{
+    \\  "skill_decision_contract": {
+    \\    "contract_version": "SKDC-v1",
+    \\    "skill": {
+    \\      "name": "universalist",
+    \\      "kind": "decision",
+    \\      "source_fingerprint": "fixture"
+    \\    },
+    \\    "triggers": [{"trigger_id": "t1"}],
+    \\    "routes": [{"route_id": "r1"}, {"route_id": "r2"}],
+    \\    "clauses": [{
+    \\      "clause_id": "c1",
+    \\      "trigger_refs": ["t1"],
+    \\      "expected_routes": ["r1"],
+    \\      "prohibited_routes": ["r2"]
+    \\    }],
+    \\    "instrumentation": {"decision_receipt": "required"}
+    \\  }
+    \\}
+;
+
 test "plan ids embed a sortable nanosecond UTC timestamp" {
     const stamp = try planTimestampAlloc(std.testing.allocator, 1_234_567_890);
     defer std.testing.allocator.free(stamp);
@@ -1599,6 +1567,42 @@ test "create retries a colliding timestamp without overwriting and latest finds 
     defer latest.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(second.plan_id, latest.plan_id);
     try std.testing.expectEqualStrings(second.path, latest.path);
+}
+
+test "created plans retain a maximum-sized template plus plan metadata" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(repo);
+    const heading = "# Universalist Plan\n";
+    const template = try std.testing.allocator.alloc(u8, MaxTemplateBytes);
+    defer std.testing.allocator.free(template);
+    @memset(template, 'x');
+    @memcpy(template[0..heading.len], heading);
+
+    var address = try createPlanAtNs(std.testing.allocator, repo, template, 1_234_567_890);
+    defer address.deinit(std.testing.allocator);
+    const created = try durable_store.readFileAlloc(
+        std.testing.allocator,
+        address.path,
+        MaxPlanBytes,
+    );
+    defer std.testing.allocator.free(created);
+    try std.testing.expect(created.len > MaxReceiptBytes);
+    try appendReceiptToPlan(
+        std.testing.allocator,
+        address.path,
+        created,
+        "{\"skill_decision_receipt\":{\"receipt_version\":\"SDR-v1\"}}",
+        "UNI-19700101T000001234567890Z-0000",
+    );
+    const updated = try durable_store.readFileAlloc(
+        std.testing.allocator,
+        address.path,
+        MaxPlanBytes,
+    );
+    defer std.testing.allocator.free(updated);
+    try std.testing.expect(updated.len > created.len);
 }
 
 test "lookup preserves legacy flat plans and prefers a canonical duplicate" {
@@ -1694,6 +1698,25 @@ test "addressed receipt identity requires an exact canonical plan path" {
     try std.testing.expect((try addressedPlanId(std.testing.allocator, repo, copied)) == null);
 }
 
+test "addressed receipt identity is canonical and cannot be overridden" {
+    const plan_id = "19700101T000001234567890Z-0000";
+    const expected = "UNI-19700101T000001234567890Z-0000";
+    const derived = try decisionIdAlloc(std.testing.allocator, plan_id, null);
+    defer std.testing.allocator.free(derived);
+    try std.testing.expectEqualStrings(expected, derived);
+    const matched = try decisionIdAlloc(std.testing.allocator, plan_id, expected);
+    defer std.testing.allocator.free(matched);
+    try std.testing.expectEqualStrings(expected, matched);
+    try std.testing.expectError(
+        error.DecisionIdMismatch,
+        decisionIdAlloc(std.testing.allocator, plan_id, "UNI-OVERRIDE"),
+    );
+    try std.testing.expectError(
+        error.DecisionIdRequired,
+        decisionIdAlloc(std.testing.allocator, null, null),
+    );
+}
+
 test "create requires a template and path requires an id" {
     try std.testing.expectError(error.MissingTemplate, parseArgs(&.{ "ledger", "create" }));
     try std.testing.expectError(error.MissingPlanId, parseArgs(&.{ "ledger", "path" }));
@@ -1774,63 +1797,148 @@ test "emit rejects incomplete or cross-command receipt arguments" {
     }));
 }
 
-test "contract lookup handles YAML list fields and quoted values" {
+test "contract membership follows the Seq YAML parser" {
     const contract =
         \\skill_decision_contract:
+        \\  contract_version: SKDC-v1
         \\  skill:
         \\    name: "universalist"
-        \\  metadata:
-        \\    route_id: UNI-CANONICAL
+        \\    kind: decision
+        \\    source_fingerprint: fixture
+        \\  triggers:
+        \\    - trigger_id: t1
         \\  routes:
-        \\    - route_id: UNI-ORDINARY
+        \\    - route_id: r1
+        \\      route_id: r-stray
+        \\    - route_id: r2
+        \\  clauses:
+        \\    - clause_id: c1
+        \\      trigger_refs: [t1]
+        \\      expected_routes: [r1]
+        \\      prohibited_routes: [r2]
+        \\  instrumentation:
+        \\    decision_receipt: required
     ;
-    try std.testing.expect(yamlSectionHasFieldValue(contract, "skill", "name", "universalist"));
-    try std.testing.expect(yamlSectionHasFieldValue(
-        contract,
-        "routes",
-        "route_id",
-        "UNI-ORDINARY",
-    ));
-    try std.testing.expect(!yamlSectionHasFieldValue(
-        contract,
-        "routes",
-        "route_id",
-        "UNI-CANONICAL",
-    ));
+    var parsed = try skill_contract.parseText(std.testing.allocator, contract);
+    defer parsed.deinit();
+    var args = Args{};
+    args.trigger_refs[0] = "t1";
+    args.trigger_ref_count = 1;
+    args.clause_refs[0] = "c1";
+    args.clause_ref_count = 1;
+    args.selected_route = "r1";
+    args.rejected_routes[0] = "r2";
+    args.rejected_route_count = 1;
+    try validateReceiptRefs(parsed.contract, args);
+    args.selected_route = "r-stray";
+    try std.testing.expectError(
+        error.UnknownSelectedRoute,
+        validateReceiptRefs(parsed.contract, args),
+    );
 }
 
-test "contract lookup accepts the JSON representation validated by Seq" {
-    const contract =
-        \\{
-        \\  "skill_decision_contract": {
-        \\    "skill": {"name": "universalist"},
-        \\    "triggers": [{"trigger_id": "UNI-BOUNDARY"}],
-        \\    "routes": [{"route_id": "UNI-ORDINARY"}],
-        \\    "clauses": [{"clause_id": "UNI-ROOT-001"}]
-        \\  }
-        \\}
-    ;
-    try std.testing.expect(try contractHasFieldValue(
-        std.testing.allocator,
-        contract,
+test "contract membership accepts the JSON representation parsed by Seq" {
+    var parsed = try skill_contract.parseText(std.testing.allocator, TestContractJson);
+    defer parsed.deinit();
+    var args = Args{};
+    args.trigger_refs[0] = "t1";
+    args.trigger_ref_count = 1;
+    args.clause_refs[0] = "c1";
+    args.clause_ref_count = 1;
+    args.selected_route = "r1";
+    args.rejected_routes[0] = "r2";
+    args.rejected_route_count = 1;
+    try validateReceiptRefs(parsed.contract, args);
+    args.rejected_routes[0] = "r-missing";
+    try std.testing.expectError(
+        error.UnknownRejectedRoute,
+        validateReceiptRefs(parsed.contract, args),
+    );
+}
+
+test "contract loading validates and interprets one immutable snapshot" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const contract_path = try std.fs.path.join(std.testing.allocator, &.{
+        root,
         "skill",
-        "name",
-        "universalist",
-    ));
-    try std.testing.expect(try contractHasFieldValue(
+        "references",
+        "decision-contract.json",
+    });
+    defer std.testing.allocator.free(contract_path);
+    const expected_path = try std.fs.path.join(std.testing.allocator, &.{
+        root,
+        "expected-contract.json",
+    });
+    defer std.testing.allocator.free(expected_path);
+    const package_path = try std.fs.path.join(std.testing.allocator, &.{
+        root,
+        "skill",
+        "package.json",
+    });
+    defer std.testing.allocator.free(package_path);
+    const seq_path = try std.fs.path.join(std.testing.allocator, &.{ root, "seq" });
+    defer std.testing.allocator.free(seq_path);
+    try durable_store.writeTextCreateNewAtomic(
         std.testing.allocator,
-        contract,
-        "routes",
-        "route_id",
-        "UNI-ORDINARY",
-    ));
-    try std.testing.expect(!try contractHasFieldValue(
+        contract_path,
+        TestContractJson,
+        .{},
+    );
+    try durable_store.writeTextCreateNewAtomic(
         std.testing.allocator,
-        contract,
-        "routes",
-        "route_id",
-        "UNI-CANONICAL",
-    ));
+        expected_path,
+        TestContractJson,
+        .{},
+    );
+    try durable_store.writeTextCreateNewAtomic(
+        std.testing.allocator,
+        package_path,
+        "{\"version\":\"16.0.4\"}\n",
+        .{},
+    );
+    var parsed = try skill_contract.parseText(std.testing.allocator, TestContractJson);
+    defer parsed.deinit();
+    const fingerprint = try skill_contract.fingerprintContract(
+        std.testing.allocator,
+        parsed.contract,
+    );
+    defer std.testing.allocator.free(fingerprint);
+    const script = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "#!/bin/sh\n" ++
+            "cmp '{s}' \"$4\" || exit 9\n" ++
+            "printf '%s\\n' '{{\"mutated\":true}}' > '{s}'\n" ++
+            "printf '%s\\n' '{{\"skill_contract\":{{\"valid\":true," ++
+            "\"fingerprint\":\"{s}\"}}}}'\n",
+        .{ expected_path, contract_path, fingerprint },
+    );
+    defer std.testing.allocator.free(script);
+    try durable_store.writeTextCreateNewAtomic(
+        std.testing.allocator,
+        seq_path,
+        script,
+        .{},
+    );
+    var seq_file = try std.Io.Dir.openFileAbsolute(defaultIo(), seq_path, .{});
+    defer seq_file.close(defaultIo());
+    try seq_file.setPermissions(defaultIo(), .fromMode(0o500));
+
+    var info = try loadContractInfo(std.testing.allocator, seq_path, contract_path);
+    defer info.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("universalist", info.parsed.contract.skill_name);
+    try std.testing.expect(contractHasRoute(info.parsed.contract, "r1"));
+    try std.testing.expectEqualStrings(fingerprint, info.fingerprint);
+    const mutated = try durable_store.readFileAlloc(
+        std.testing.allocator,
+        contract_path,
+        MaxContractBytes,
+    );
+    defer std.testing.allocator.free(mutated);
+    try std.testing.expectEqualStrings("{\"mutated\":true}\n", mutated);
 }
 
 test "Seq resolution skips an incompatible numeric command" {
