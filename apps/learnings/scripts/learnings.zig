@@ -42,6 +42,10 @@ const RecallHelpSurface = core_cli.HelpSurface{
     .executable_name = "ledger recall --source learnings",
     .help_text = RecallUsageText,
 };
+const ShowHelpSurface = core_cli.HelpSurface{
+    .executable_name = "ledger show --source learnings",
+    .help_text = ShowUsageText,
+};
 const ExportHelpSurface = core_cli.HelpSurface{
     .executable_name = "ledger export --source learnings",
     .help_text = ExportUsageText,
@@ -74,18 +78,19 @@ const PathHelpSurface = core_cli.HelpSurface{
 const UsageText =
     \\ledger --source learnings
     \\
-    \\usage: ledger --source learnings [-h] [--path PATH] {capture,datasets,dataset-schema,query,recent,recall,export,codify-candidates,quality-audit,value-report,memory-digest,migrate,doctor,path} ...
+    \\usage: ledger --source learnings [-h] [--path PATH] {capture,datasets,dataset-schema,query,recent,recall,show,export,codify-candidates,quality-audit,value-report,memory-digest,migrate,doctor,path} ...
     \\
     \\Mine, recall, and promote records through the repo-local learning-source API.
     \\
     \\positional arguments:
-    \\  {capture,datasets,dataset-schema,query,recent,recall,export,codify-candidates,quality-audit,value-report,memory-digest,migrate,doctor,path}
+    \\  {capture,datasets,dataset-schema,query,recent,recall,show,export,codify-candidates,quality-audit,value-report,memory-digest,migrate,doctor,path}
     \\    capture             Append a structured learning event
     \\    datasets            List datasets
     \\    dataset-schema      Show dataset schema
     \\    query               Run a JSON spec query
     \\    recent              Show most recent learnings
     \\    recall              Rank relevant learnings for a task
+    \\    show                Show one canonical learning record by id
     \\    export              Emit a full or memory-note projection for one learning
     \\    codify-candidates   Suggest repeated/high-impact learnings to promote into durable docs
     \\    quality-audit       Summarize learning capture quality and contract health
@@ -194,6 +199,19 @@ const RecallUsageText =
     \\  --limit LIMIT         Maximum rows to show (default: 8)
     \\  --format FORMAT       Output format
     \\  --drop-superseded     Hide records superseded by newer learnings
+;
+
+const ShowUsageText =
+    \\ledger show --source learnings
+    \\
+    \\usage: ledger show --source learnings [-h] --id lrn-ID [--path PATH]
+    \\
+    \\Show one canonical learning record. This is an alias for export --format full.
+    \\
+    \\options:
+    \\  -h, --help            show this help message and exit
+    \\  --id lrn-ID           Canonical learning id
+    \\  --path PATH           Current persistent-adapter path
 ;
 
 const ExportUsageText =
@@ -475,6 +493,7 @@ const Command = enum {
     query,
     recent,
     recall,
+    show,
     @"export",
     codify_candidates,
     quality_audit,
@@ -693,10 +712,11 @@ pub fn runWithArgv(allocator: std.mem.Allocator, argv: []const []const u8, codex
                 parsed.drop_superseded,
             );
         },
-        .@"export" => {
+        .show, .@"export" => {
             const jsonl_path = try resolveReadJsonlPathAlloc(allocator, repo_root, parsed.path, parsed.path_explicit);
             defer allocator.free(jsonl_path);
-            try cmdExport(allocator, jsonl_path, parsed.path, parsed.export_id.?, parsed.export_format);
+            const projection_format = if (parsed.command.? == .show) "full" else parsed.export_format;
+            try cmdExport(allocator, jsonl_path, parsed.path, parsed.export_id.?, projection_format);
         },
         .codify_candidates => {
             const jsonl_path = try resolveReadJsonlPathAlloc(allocator, repo_root, parsed.path, parsed.path_explicit);
@@ -768,6 +788,7 @@ fn subcommandHelpSurface(argv: []const []const u8) ?core_cli.HelpSurface {
         if (std.mem.eql(u8, arg, "query")) return QueryHelpSurface;
         if (std.mem.eql(u8, arg, "recent")) return RecentHelpSurface;
         if (std.mem.eql(u8, arg, "recall")) return RecallHelpSurface;
+        if (std.mem.eql(u8, arg, "show")) return ShowHelpSurface;
         if (std.mem.eql(u8, arg, "export")) return ExportHelpSurface;
         if (std.mem.eql(u8, arg, "codify-candidates")) return CodifyCandidatesHelpSurface;
         if (std.mem.eql(u8, arg, "quality-audit")) return QualityAuditHelpSurface;
@@ -818,6 +839,10 @@ fn parseArgs(argv: []const []const u8) !Args {
         }
         if (std.mem.eql(u8, arg, "recall")) {
             args.command = .recall;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "show")) {
+            args.command = .show;
             continue;
         }
         if (std.mem.eql(u8, arg, "export")) {
@@ -914,6 +939,15 @@ fn parseArgs(argv: []const []const u8) !Args {
                     continue;
                 }
                 return error.InvalidRecallArg;
+            },
+            .show => {
+                if (std.mem.eql(u8, arg, "--id")) {
+                    i += 1;
+                    if (i >= argv.len) return error.MissingIdValue;
+                    args.export_id = argv[i];
+                    continue;
+                }
+                return error.InvalidShowArg;
             },
             .@"export" => {
                 if (std.mem.eql(u8, arg, "--id")) {
@@ -1111,7 +1145,7 @@ fn parseArgs(argv: []const []const u8) !Args {
         .dataset_schema => if (args.dataset == null) return error.MissingDatasetValue,
         .query => if (args.spec == null) return error.MissingSpecValue,
         .recall => if (args.query == null) return error.MissingQueryValue,
-        .@"export" => if (args.export_id == null) return error.MissingIdValue,
+        .show, .@"export" => if (args.export_id == null) return error.MissingIdValue,
         else => {},
     }
     if (args.command.? == .migrate and args.invalid_policy == .skip and
@@ -1206,6 +1240,7 @@ fn printParseError(err: anyerror, argv: []const []const u8) noreturn {
         error.InvalidQueryArg,
         error.InvalidRecentArg,
         error.InvalidRecallArg,
+        error.InvalidShowArg,
         error.InvalidExportArg,
         error.InvalidExportFormat,
         error.InvalidCodifyArg,
@@ -5614,6 +5649,20 @@ test "parse args export requires identity and accepts memory note format" {
     try std.testing.expectError(error.MissingIdValue, parseArgs(&missing));
 }
 
+test "parse args show aliases the full learning projection" {
+    const argv = [_][]const u8{ ProgramName, "show", "--id", "lrn-20260715T000000Z-12345678" };
+    const parsed = try parseArgs(&argv);
+    try std.testing.expect(parsed.command.? == .show);
+    try std.testing.expectEqualStrings("lrn-20260715T000000Z-12345678", parsed.export_id.?);
+    try std.testing.expectEqualStrings("full", parsed.export_format);
+
+    const missing = [_][]const u8{ ProgramName, "show" };
+    try std.testing.expectError(error.MissingIdValue, parseArgs(&missing));
+
+    const format = [_][]const u8{ ProgramName, "show", "--id", "lrn-20260715T000000Z-12345678", "--format", "memory-note" };
+    try std.testing.expectError(error.InvalidShowArg, parseArgs(&format));
+}
+
 test "learning memory note projection is deterministic and source complete" {
     const input =
         \\{"id":"lrn-20260715T000000Z-12345678","captured_at":"2026-07-15T00:00:00Z","status":"codify_now","learning":"Prefer an explicit checkpoint.","evidence":["test:checkpoint"],"application":"Run the checkpoint at closeout.","source":"ledger:learnings","fingerprint":"1234567890abcdef","context":{"repo":"owner/repo","branch":"main","paths":["src/checkpoint.zig"]},"tags":["memory-admission"],"related_ids":[],"supersedes_id":null}
@@ -5724,6 +5773,9 @@ test "subcommand help dispatches before argument parsing" {
 
     const recall_help = [_][]const u8{ ProgramName, "recall", "--help" };
     try std.testing.expectEqualStrings("ledger recall --source learnings", subcommandHelpSurface(&recall_help).?.executable_name);
+
+    const show_help = [_][]const u8{ ProgramName, "show", "--help" };
+    try std.testing.expectEqualStrings("ledger show --source learnings", subcommandHelpSurface(&show_help).?.executable_name);
 
     const query_short_help = [_][]const u8{ ProgramName, "query", "-h" };
     try std.testing.expectEqualStrings("ledger query --source learnings", subcommandHelpSurface(&query_short_help).?.executable_name);

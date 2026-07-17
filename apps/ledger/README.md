@@ -129,6 +129,7 @@ ledger doctor
 ledger migrate --mode copy
 ledger capture --source learnings --learning "When X, prefer Y because Z." --evidence "command/result" --application "Do Y next time."
 ledger recall --source learnings --query "focused task" --limit 5 --drop-superseded
+ledger show --source learnings --id lrn-...
 ledger export --source learnings --id lrn-... --format memory-note
 ledger migrate --source learnings --mode copy
 ledger doctor --source learnings
@@ -801,4 +802,7 @@ NEG-000001 --format memory-note`. Source-less commands remain supported.
 
 `export` and `handoff` fail closed when the store or selected projection is semantically invalid. Repo-scoped memory projections include a stable repository identity and applicable paths, so identical `NEG-*` IDs from different repositories remain distinct.
 
-`show` remains concise. Full projections expose separate `capture_event_count`, `status_event_count`, and `source_event_count`, the event-chain fingerprint, the current projection fingerprint, and the prior projection fingerprint when a lifecycle transition created a linked projection. Transport-only export timestamps do not affect projection identity. Re-exporting unchanged memory-note output is byte-stable; a meaningful lifecycle transition produces a new projection linked to the prior fingerprint.
+Negative Ledger `show` remains concise. Learnings `show` is an exact alias for
+`export --format full` because the canonical learning row is already the full
+single-record projection. Negative Ledger full projections expose separate
+`capture_event_count`, `status_event_count`, and `source_event_count`, the event-chain fingerprint, the current projection fingerprint, and the prior projection fingerprint when a lifecycle transition created a linked projection. Transport-only export timestamps do not affect projection identity. Re-exporting unchanged memory-note output is byte-stable; a meaningful lifecycle transition produces a new projection linked to the prior fingerprint.

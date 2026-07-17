@@ -39,7 +39,7 @@ const HelpText = std.fmt.comptimePrint(
     \\  export     Emit a full or memory-note projection
     \\  compact    Report compaction candidates
     \\  handoff    Emit active exclusions for handoff
-    \\  show       Show one NEG record by --id
+    \\  show       Show one source record by --id
     \\  doctor     Validate event-store integrity
     \\  migrate    Copy or move legacy source stores into the current persistent adapter
     \\  recent     With a supporting --source namespace, show recent source events
@@ -52,7 +52,7 @@ const HelpText = std.fmt.comptimePrint(
     \\  --file PATH       Persistent-adapter path (default: .ledger/negative-ledger/events.jsonl)
     \\  --source SOURCE   {s}
     \\  --json PATH|-     Capture input JSON or lifecycle-transition proof JSON
-    \\  --id NEG-ID       Record id for show/reopen/status/export
+    \\  --id RECORD-ID    Record id for show/reopen/status/export
     \\  --to VALUE        Target status for status, target path for migrate
     \\  --from PATH       Legacy store path for migrate
     \\  --mode MODE       copy|move for migrate
@@ -3525,6 +3525,26 @@ test "negative ledger source alias preserves root command arguments" {
         []const u8,
         &.{ "ledger", "export", "--file", ".ledger/custom.jsonl", "--id", "NEG-000001", "--format", "memory-note" },
         routed,
+    );
+}
+
+test "learnings show source alias preserves both command orderings" {
+    const command_first = [_][]const u8{ "ledger", "show", "--source", "learnings", "--id", "lrn-20260715T000000Z-12345678" };
+    const routed_command_first = try sourceArgvAlloc(std.testing.allocator, &command_first, "learnings");
+    defer std.testing.allocator.free(routed_command_first);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "ledger", "show", "--id", "lrn-20260715T000000Z-12345678" },
+        routed_command_first,
+    );
+
+    const source_first = [_][]const u8{ "ledger", "--source", "learnings", "show", "--id", "lrn-20260715T000000Z-12345678" };
+    const routed_source_first = try sourceArgvAlloc(std.testing.allocator, &source_first, "learnings");
+    defer std.testing.allocator.free(routed_source_first);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &.{ "ledger", "show", "--id", "lrn-20260715T000000Z-12345678" },
+        routed_source_first,
     );
 }
 
