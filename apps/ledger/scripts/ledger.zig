@@ -3485,6 +3485,30 @@ test "universalist source routing preserves plan creation arguments" {
     try std.testing.expectEqualStrings("plan.md", routed[5]);
 }
 
+test "universalist source routing preserves receipt emission arguments" {
+    const argv = [_][]const u8{
+        "ledger",
+        "emit",
+        "--source",
+        "universalist",
+        "--plan",
+        "plan.md",
+        "--contract",
+        "decision-contract.yaml",
+        "--write-plan",
+    };
+    const routed = try sourceArgvAlloc(std.testing.allocator, &argv, "universalist");
+    defer std.testing.allocator.free(routed);
+    try std.testing.expectEqual(@as(usize, 7), routed.len);
+    try std.testing.expectEqualStrings("ledger", routed[0]);
+    try std.testing.expectEqualStrings("emit", routed[1]);
+    try std.testing.expectEqualStrings("--plan", routed[2]);
+    try std.testing.expectEqualStrings("plan.md", routed[3]);
+    try std.testing.expectEqualStrings("--contract", routed[4]);
+    try std.testing.expectEqualStrings("decision-contract.yaml", routed[5]);
+    try std.testing.expectEqualStrings("--write-plan", routed[6]);
+}
+
 test "hylo source routing preserves replay commands" {
     const argv = [_][]const u8{ "ledger", "--source", "hylo", "doctor", "--repo", "." };
     const routed = try sourceArgvAlloc(std.testing.allocator, &argv, "hylo");

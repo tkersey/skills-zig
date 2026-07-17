@@ -652,6 +652,35 @@ test "valid SKDC JSON and YAML validate with stable fingerprint" {
     try std.testing.expect(yaml_report.valid);
 }
 
+test "SKDC YAML identity excludes unknown nested route fields" {
+    const yaml =
+        \\skill_decision_contract:
+        \\  contract_version: SKDC-v1
+        \\  skill:
+        \\    name: universalist
+        \\    kind: decision
+        \\    source_fingerprint: fixture
+        \\  triggers:
+        \\    - trigger_id: t1
+        \\  routes:
+        \\    - route_id: r1
+        \\      route_id: r-stray
+        \\    - route_id: r2
+        \\  clauses:
+        \\    - clause_id: c1
+        \\      trigger_refs: [t1]
+        \\      expected_routes: [r1]
+        \\      prohibited_routes: [r2]
+        \\  instrumentation:
+        \\    decision_receipt: required
+    ;
+    var parsed = try parseText(std.testing.allocator, yaml);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.contract.routes.len);
+    try std.testing.expectEqualStrings("r1", parsed.contract.routes[0].route_id);
+    try std.testing.expectEqualStrings("r2", parsed.contract.routes[1].route_id);
+}
+
 test "SKDC validation catches duplicate ids refs overlap and regex" {
     const bad =
         \\{"skill_decision_contract":{"contract_version":"SKDC-v1","skill":{"name":"s","kind":"decision"},"triggers":[{"trigger_id":"t1","cue_regexes":["a.*"],"cue_literals":[],"exclusions":[]},{"trigger_id":"t1","cue_regexes":[],"cue_literals":[],"exclusions":[]}],"routes":[{"route_id":"r1","aliases":["same"]},{"route_id":"r2","aliases":["same"]}],"clauses":[{"clause_id":"c1","trigger_refs":["missing"],"expected_routes":["r1"],"prohibited_routes":["r1","missing"],"required_artifacts":[],"success_signals":[],"failure_signals":[]}],"instrumentation":{"decision_receipt":"optional"}}}
