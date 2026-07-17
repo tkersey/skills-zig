@@ -173,7 +173,9 @@ semantics.
 `ledger --source universalist` owns plan identity, allocation, lookup, and
 SDR-v1 receipt emission. Universalist owns the decision policy, SKDC-v1
 contract, plan template, and ordinary Markdown field updates. This receipt
-boundary requires Ledger 0.10.4 or newer and `seq` on `PATH`.
+boundary requires Ledger 0.10.4 or newer and a compatible Skills Seq companion.
+Ledger checks a sibling `seq` first, then searches `PATH`, and accepts only a
+binary advertising the SKDC-v1 and SDR-v1 validation capabilities it needs.
 
 Create a fresh plan from a skill-owned template:
 
@@ -230,14 +232,15 @@ ledger emit --source universalist \
   --write-plan
 ```
 
-Ledger validates the contract through Seq, rejects unknown trigger, clause, or
-route references, derives the decision id and repository state, constructs
-canonical compact SDR-v1 JSON, and validates the generated receipt through Seq
-before any plan mutation. `--write-plan` accepts only the canonical
+Ledger validates YAML or JSON SKDC-v1 contracts through Seq, rejects unknown
+trigger, clause, or route references, derives the decision id and repository
+state only from an exact canonical plan address, constructs canonical compact
+SDR-v1 JSON, and validates the generated receipt through Seq before any plan
+mutation. `--write-plan` accepts only the canonical
 `.ledger/universalist/plan-<id>.md` path, atomically appends one receipt, and
-rejects a second append. Without `--write-plan`, the command is a plan-read-only
-receipt projection and may use a non-addressed plan when `--decision-id` is
-explicit.
+rejects a second JSON or YAML receipt. Without `--write-plan`, the command is a
+plan-read-only receipt projection and may use a non-addressed plan when
+`--decision-id` is explicit.
 
 ## Hylo replay kernel
 

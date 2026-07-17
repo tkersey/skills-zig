@@ -470,7 +470,7 @@ fn emitDecisionReceipt(allocator: std.mem.Allocator, repo: []const u8, args: Arg
     defer allocator.free(plan_text);
     if (!containsExactLine(plan_text, "# Universalist Plan")) return error.NotUniversalistPlan;
 
-    const addressed_plan_id = addressedPlanId(plan_path);
+    const addressed_plan_id = try addressedPlanId(allocator, repo, plan_path);
     const plan_id = addressed_plan_id orelse "template";
     var owned_decision_id: ?[]u8 = null;
     defer if (owned_decision_id) |value| allocator.free(value);
@@ -483,9 +483,12 @@ fn emitDecisionReceipt(allocator: std.mem.Allocator, repo: []const u8, args: Arg
 
     if (args.write_plan) try requireCanonicalPlan(allocator, repo, plan_path, addressed_plan_id);
 
-    var contract = try loadContractInfo(allocator, contract_path);
+    const seq_path = try resolveCompatibleSeqAlloc(allocator);
+    defer allocator.free(seq_path);
+
+    var contract = try loadContractInfo(allocator, seq_path, contract_path);
     defer contract.deinit(allocator);
-    try validateReceiptRefs(contract.text, args);
+    try validateReceiptRefs(allocator, contract.text, args);
 
     const plan_relative = try allocator.dupe(u8, plan_path[repo.len + 1 ..]);
     defer allocator.free(plan_relative);
@@ -504,7 +507,7 @@ fn emitDecisionReceipt(allocator: std.mem.Allocator, repo: []const u8, args: Arg
     };
     const receipt = try renderReceiptAlloc(allocator, args, context);
     defer allocator.free(receipt);
-    try validateReceiptWithSeq(allocator, receipt);
+    try validateReceiptWithSeq(allocator, seq_path, receipt);
     if (args.write_plan) {
         try appendReceiptToPlan(allocator, plan_path, plan_text, receipt, decision_id);
     }
@@ -528,12 +531,16 @@ fn pathWithin(path: []const u8, root: []const u8) bool {
             path[root.len] == std.fs.path.sep);
 }
 
-fn addressedPlanId(plan_path: []const u8) ?[]const u8 {
+fn addressedPlanId(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    plan_path: []const u8,
+) !?[]const u8 {
     const name = std.fs.path.basename(plan_path);
-    if (!std.mem.startsWith(u8, name, CanonicalPlanPrefix) or
-        !std.mem.endsWith(u8, name, PlanSuffix)) return null;
-    const plan_id = name[CanonicalPlanPrefix.len .. name.len - PlanSuffix.len];
-    return if (plan_id.len == 0) null else plan_id;
+    const plan_id = planIdFromFilename(name, CanonicalPlanPrefix) orelse return null;
+    const expected = try planPathAlloc(allocator, repo, plan_id, .canonical);
+    defer allocator.free(expected);
+    return if (std.mem.eql(u8, plan_path, expected)) plan_id else null;
 }
 
 fn requireCanonicalPlan(
@@ -568,9 +575,93 @@ fn planStatus(text: []const u8) []const u8 {
     return "unknown";
 }
 
-fn loadContractInfo(allocator: std.mem.Allocator, contract_path: []const u8) !ContractInfo {
+fn resolveCompatibleSeqAlloc(allocator: std.mem.Allocator) ![]u8 {
+    const executable_dir = std.process.executableDirPathAlloc(defaultIo(), allocator) catch null;
+    defer if (executable_dir) |value| allocator.free(value);
+    const path_env = std.Io.Threaded.global_single_threaded.environString("PATH");
+    return resolveCompatibleSeqFromAlloc(allocator, executable_dir, path_env);
+}
+
+fn resolveCompatibleSeqFromAlloc(
+    allocator: std.mem.Allocator,
+    executable_dir: ?[]const u8,
+    path_env: ?[]const u8,
+) ![]u8 {
+    if (executable_dir) |dir| {
+        const sibling = try std.fs.path.join(allocator, &.{ dir, "seq" });
+        defer allocator.free(sibling);
+        if (seqCandidateCompatible(allocator, sibling)) {
+            return allocator.dupe(u8, sibling);
+        }
+    }
+
+    const paths = path_env orelse return error.CompatibleSeqNotFound;
+    const delimiter: u8 = if (builtin.os.tag == .windows) ';' else ':';
+    var iter = std.mem.splitScalar(u8, paths, delimiter);
+    while (iter.next()) |dir| {
+        if (dir.len == 0) continue;
+        const candidate = try std.fs.path.join(allocator, &.{ dir, "seq" });
+        defer allocator.free(candidate);
+        if (seqCandidateCompatible(allocator, candidate)) {
+            return allocator.dupe(u8, candidate);
+        }
+    }
+    return error.CompatibleSeqNotFound;
+}
+
+fn seqCandidateCompatible(allocator: std.mem.Allocator, candidate: []const u8) bool {
+    const result = std.process.run(allocator, defaultIo(), .{
+        .argv = &.{ candidate, "capabilities", "--format", "json" },
+        .stdout_limit = .limited(MaxReceiptBytes),
+        .stderr_limit = .limited(MaxReceiptBytes),
+    }) catch return false;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (!(result.term == .exited and result.term.exited == 0)) return false;
+    return seqCapabilitiesCompatible(allocator, result.stdout);
+}
+
+fn seqCapabilitiesCompatible(allocator: std.mem.Allocator, text: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch return false;
+    defer parsed.deinit();
+    const root = switch (parsed.value) {
+        .object => |value| value,
+        else => return false,
+    };
+    const capabilities_value = root.get("seq_capabilities") orelse return false;
+    const capabilities = switch (capabilities_value) {
+        .object => |value| value,
+        else => return false,
+    };
+    const version_value = capabilities.get("version") orelse return false;
+    const version = switch (version_value) {
+        .string => |value| value,
+        else => return false,
+    };
+    if (version.len == 0) return false;
+    const features_value = capabilities.get("features") orelse return false;
+    const features = switch (features_value) {
+        .object => |value| value,
+        else => return false,
+    };
+    for ([_][]const u8{
+        "skill_contract_v1",
+        "skill_decision_receipt_v1",
+        "skill_decision_receipt_contract_binding_v1",
+    }) |feature| {
+        const value = features.get(feature) orelse return false;
+        if (value != .bool or !value.bool) return false;
+    }
+    return true;
+}
+
+fn loadContractInfo(
+    allocator: std.mem.Allocator,
+    seq_path: []const u8,
+    contract_path: []const u8,
+) !ContractInfo {
     const validation = try runCommandStdoutAlloc(allocator, &.{
-        "seq",
+        seq_path,
         "skill-contract",
         "validate",
         "--file",
@@ -613,7 +704,13 @@ fn loadContractInfo(allocator: std.mem.Allocator, contract_path: []const u8) !Co
         MaxReceiptBytes,
     );
     errdefer allocator.free(contract_text);
-    if (!yamlSectionHasFieldValue(contract_text, "skill", "name", "universalist")) {
+    if (!try contractHasFieldValue(
+        allocator,
+        contract_text,
+        "skill",
+        "name",
+        "universalist",
+    )) {
         return error.ContractSkillMismatch;
     }
 
@@ -645,6 +742,93 @@ fn loadContractInfo(allocator: std.mem.Allocator, contract_path: []const u8) !Co
         .fingerprint = try allocator.dupe(u8, fingerprint),
         .text = contract_text,
         .skill_version = try allocator.dupe(u8, version),
+    };
+}
+
+const ContractLookup = union(enum) {
+    yaml: []const u8,
+    json: std.json.ObjectMap,
+
+    fn hasFieldValue(
+        self: ContractLookup,
+        section: []const u8,
+        field: []const u8,
+        expected: []const u8,
+    ) bool {
+        return switch (self) {
+            .yaml => |text| yamlSectionHasFieldValue(text, section, field, expected),
+            .json => |contract| jsonSectionHasFieldValue(contract, section, field, expected),
+        };
+    }
+};
+
+fn contractHasFieldValue(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    section: []const u8,
+    field: []const u8,
+    expected: []const u8,
+) !bool {
+    if (!isJsonDocument(text)) {
+        return yamlSectionHasFieldValue(text, section, field, expected);
+    }
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch
+        return error.ContractValidationInvalidJson;
+    defer parsed.deinit();
+    const contract = try jsonContractObject(parsed.value);
+    return jsonSectionHasFieldValue(contract, section, field, expected);
+}
+
+fn isJsonDocument(text: []const u8) bool {
+    const trimmed = std.mem.trimStart(u8, text, " \t\r\n");
+    return trimmed.len > 0 and trimmed[0] == '{';
+}
+
+fn jsonContractObject(value: std.json.Value) !std.json.ObjectMap {
+    const root = switch (value) {
+        .object => |object| object,
+        else => return error.ContractValidationInvalidJson,
+    };
+    const contract_value = root.get("skill_decision_contract") orelse
+        return error.ContractValidationInvalidJson;
+    return switch (contract_value) {
+        .object => |object| object,
+        else => error.ContractValidationInvalidJson,
+    };
+}
+
+fn jsonSectionHasFieldValue(
+    contract: std.json.ObjectMap,
+    section: []const u8,
+    field: []const u8,
+    expected: []const u8,
+) bool {
+    const section_value = contract.get(section) orelse return false;
+    return switch (section_value) {
+        .object => |object| jsonObjectHasFieldValue(object, field, expected),
+        .array => |array| blk: {
+            for (array.items) |item| {
+                const object = switch (item) {
+                    .object => |value| value,
+                    else => continue,
+                };
+                if (jsonObjectHasFieldValue(object, field, expected)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+fn jsonObjectHasFieldValue(
+    object: std.json.ObjectMap,
+    field: []const u8,
+    expected: []const u8,
+) bool {
+    const value = object.get(field) orelse return false;
+    return switch (value) {
+        .string => |string| std.mem.eql(u8, string, expected),
+        else => false,
     };
 }
 
@@ -695,25 +879,39 @@ fn yamlFieldValue(line: []const u8, field: []const u8) ?[]const u8 {
     return value;
 }
 
-fn validateReceiptRefs(contract_text: []const u8, args: Args) !void {
+fn validateReceiptRefs(
+    allocator: std.mem.Allocator,
+    contract_text: []const u8,
+    args: Args,
+) !void {
+    if (!isJsonDocument(contract_text)) {
+        return validateReceiptRefsWithLookup(.{ .yaml = contract_text }, args);
+    }
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, contract_text, .{}) catch
+        return error.ContractValidationInvalidJson;
+    defer parsed.deinit();
+    const contract = try jsonContractObject(parsed.value);
+    return validateReceiptRefsWithLookup(.{ .json = contract }, args);
+}
+
+fn validateReceiptRefsWithLookup(lookup: ContractLookup, args: Args) !void {
     for (args.effectiveTriggerRefs()) |value| {
-        if (!yamlSectionHasFieldValue(contract_text, "triggers", "trigger_id", value)) {
+        if (!lookup.hasFieldValue("triggers", "trigger_id", value)) {
             return error.UnknownTriggerRef;
         }
     }
     for (args.effectiveClauseRefs()) |value| {
-        if (!yamlSectionHasFieldValue(contract_text, "clauses", "clause_id", value)) {
+        if (!lookup.hasFieldValue("clauses", "clause_id", value)) {
             return error.UnknownClauseRef;
         }
     }
-    if (!yamlSectionHasFieldValue(
-        contract_text,
+    if (!lookup.hasFieldValue(
         "routes",
         "route_id",
         args.selected_route.?,
     )) return error.UnknownSelectedRoute;
     for (args.rejected_routes[0..args.rejected_route_count]) |value| {
-        if (!yamlSectionHasFieldValue(contract_text, "routes", "route_id", value)) {
+        if (!lookup.hasFieldValue("routes", "route_id", value)) {
             return error.UnknownRejectedRoute;
         }
         if (std.mem.eql(u8, value, args.selected_route.?)) return error.SelectedRouteRejected;
@@ -812,7 +1010,11 @@ fn writeJsonStringList(writer: *std.Io.Writer, values: []const []const u8) !void
     try writer.writeByte(']');
 }
 
-fn validateReceiptWithSeq(allocator: std.mem.Allocator, receipt: []const u8) !void {
+fn validateReceiptWithSeq(
+    allocator: std.mem.Allocator,
+    seq_path: []const u8,
+    receipt: []const u8,
+) !void {
     const temp_dir = try realPathAlloc(allocator, "/tmp");
     defer allocator.free(temp_dir);
     const stamp = std.Io.Clock.awake.now(defaultIo()).nanoseconds;
@@ -835,16 +1037,20 @@ fn validateReceiptWithSeq(allocator: std.mem.Allocator, receipt: []const u8) !vo
             error.PathAlreadyExists => continue,
             else => return err,
         };
-        const validation_result = validateReceiptFileWithSeq(allocator, temp_path);
+        const validation_result = validateReceiptFileWithSeq(allocator, seq_path, temp_path);
         try std.Io.Dir.cwd().deleteFile(defaultIo(), temp_path);
         return validation_result;
     }
     return error.ValidationTempExhausted;
 }
 
-fn validateReceiptFileWithSeq(allocator: std.mem.Allocator, temp_path: []const u8) !void {
+fn validateReceiptFileWithSeq(
+    allocator: std.mem.Allocator,
+    seq_path: []const u8,
+    temp_path: []const u8,
+) !void {
     const validation = try runCommandStdoutAlloc(allocator, &.{
-        "seq",
+        seq_path,
         "skill-decision-receipt",
         "validate",
         "--file",
@@ -886,12 +1092,21 @@ fn appendReceiptToPlan(
     const current = try durable_store.readFileAlloc(allocator, plan_path, MaxReceiptBytes);
     defer allocator.free(current);
     if (!std.mem.eql(u8, current, expected_plan)) return error.PlanChangedDuringEmission;
-    if (std.mem.indexOf(u8, current, "\"skill_decision_receipt\"") != null) {
+    if (containsDecisionReceipt(current)) {
         return error.ReceiptAlreadyPresent;
     }
     const updated = try planWithReceiptAlloc(allocator, current, receipt, decision_id);
     defer allocator.free(updated);
     try writeTextAtomicPreservePermissions(plan_path, updated);
+}
+
+fn containsDecisionReceipt(text: []const u8) bool {
+    if (std.mem.indexOf(u8, text, "\"skill_decision_receipt\"") != null) return true;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (yamlFieldValue(line, "skill_decision_receipt") != null) return true;
+    }
+    return false;
 }
 
 fn writeTextAtomicPreservePermissions(path: []const u8, text: []const u8) !void {
@@ -1449,6 +1664,36 @@ test "path resolution rejects traversal-shaped ids" {
     try std.testing.expectError(error.PlanNotFound, resolvePlanAddress(std.testing.allocator, repo, "19700101T000001234567890Z-0000"));
 }
 
+test "addressed receipt identity requires an exact canonical plan path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(repo);
+    const plan_id = "19700101T000001234567890Z-0000";
+    const canonical = try planPathAlloc(std.testing.allocator, repo, plan_id, .canonical);
+    defer std.testing.allocator.free(canonical);
+    try std.testing.expectEqualStrings(
+        plan_id,
+        (try addressedPlanId(std.testing.allocator, repo, canonical)).?,
+    );
+
+    const invalid = try std.fs.path.join(std.testing.allocator, &.{
+        repo,
+        CanonicalPlanDir,
+        "plan-not-an-id.md",
+    });
+    defer std.testing.allocator.free(invalid);
+    try std.testing.expect((try addressedPlanId(std.testing.allocator, repo, invalid)) == null);
+
+    const copied = try std.fs.path.join(std.testing.allocator, &.{
+        repo,
+        "copied",
+        "plan-19700101T000001234567890Z-0000.md",
+    });
+    defer std.testing.allocator.free(copied);
+    try std.testing.expect((try addressedPlanId(std.testing.allocator, repo, copied)) == null);
+}
+
 test "create requires a template and path requires an id" {
     try std.testing.expectError(error.MissingTemplate, parseArgs(&.{ "ledger", "create" }));
     try std.testing.expectError(error.MissingPlanId, parseArgs(&.{ "ledger", "path" }));
@@ -1529,7 +1774,7 @@ test "emit rejects incomplete or cross-command receipt arguments" {
     }));
 }
 
-test "contract scalar lookup handles list fields and quoted values" {
+test "contract lookup handles YAML list fields and quoted values" {
     const contract =
         \\skill_decision_contract:
         \\  skill:
@@ -1552,6 +1797,92 @@ test "contract scalar lookup handles list fields and quoted values" {
         "route_id",
         "UNI-CANONICAL",
     ));
+}
+
+test "contract lookup accepts the JSON representation validated by Seq" {
+    const contract =
+        \\{
+        \\  "skill_decision_contract": {
+        \\    "skill": {"name": "universalist"},
+        \\    "triggers": [{"trigger_id": "UNI-BOUNDARY"}],
+        \\    "routes": [{"route_id": "UNI-ORDINARY"}],
+        \\    "clauses": [{"clause_id": "UNI-ROOT-001"}]
+        \\  }
+        \\}
+    ;
+    try std.testing.expect(try contractHasFieldValue(
+        std.testing.allocator,
+        contract,
+        "skill",
+        "name",
+        "universalist",
+    ));
+    try std.testing.expect(try contractHasFieldValue(
+        std.testing.allocator,
+        contract,
+        "routes",
+        "route_id",
+        "UNI-ORDINARY",
+    ));
+    try std.testing.expect(!try contractHasFieldValue(
+        std.testing.allocator,
+        contract,
+        "routes",
+        "route_id",
+        "UNI-CANONICAL",
+    ));
+}
+
+test "Seq resolution skips an incompatible numeric command" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(defaultIo(), "numeric", .default_dir);
+    try tmp.dir.createDir(defaultIo(), "skills", .default_dir);
+    const root = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const numeric_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "numeric" });
+    defer std.testing.allocator.free(numeric_dir);
+    const skills_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "skills" });
+    defer std.testing.allocator.free(skills_dir);
+    const numeric_seq = try std.fs.path.join(std.testing.allocator, &.{ numeric_dir, "seq" });
+    defer std.testing.allocator.free(numeric_seq);
+    const skills_seq = try std.fs.path.join(std.testing.allocator, &.{ skills_dir, "seq" });
+    defer std.testing.allocator.free(skills_seq);
+    try durable_store.writeTextAtomic(
+        std.testing.allocator,
+        numeric_seq,
+        "#!/bin/sh\nprintf '1\\n'\n",
+    );
+    try durable_store.writeTextAtomic(
+        std.testing.allocator,
+        skills_seq,
+        "#!/bin/sh\n" ++
+            "printf '%s\\n' " ++
+            "'{\"seq_capabilities\":{\"version\":\"test\",\"features\":{" ++
+            "\"skill_contract_v1\":true," ++
+            "\"skill_decision_receipt_v1\":true," ++
+            "\"skill_decision_receipt_contract_binding_v1\":true}}}'\n",
+    );
+    var numeric_file = try std.Io.Dir.openFileAbsolute(defaultIo(), numeric_seq, .{});
+    defer numeric_file.close(defaultIo());
+    try numeric_file.setPermissions(defaultIo(), .fromMode(0o500));
+    var skills_file = try std.Io.Dir.openFileAbsolute(defaultIo(), skills_seq, .{});
+    defer skills_file.close(defaultIo());
+    try skills_file.setPermissions(defaultIo(), .fromMode(0o500));
+    const path_env = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}:{s}",
+        .{ numeric_dir, skills_dir },
+    );
+    defer std.testing.allocator.free(path_env);
+    const resolved = try resolveCompatibleSeqFromAlloc(
+        std.testing.allocator,
+        null,
+        path_env,
+    );
+    defer std.testing.allocator.free(resolved);
+    try std.testing.expectEqualStrings(skills_seq, resolved);
 }
 
 test "plan receipt append is atomic and exactly once" {
@@ -1650,6 +1981,35 @@ test "plan receipt append rejects a stale plan snapshot" {
             original,
             "{\"skill_decision_receipt\":{}}",
             "UNI-TEST-STALE",
+        ),
+    );
+}
+
+test "plan receipt append rejects an existing YAML receipt" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(defaultIo(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const plan_path = try std.fs.path.join(std.testing.allocator, &.{ root, "plan.md" });
+    defer std.testing.allocator.free(plan_path);
+    const existing =
+        "# Universalist Plan\n\n" ++
+        "skill_decision_receipt:\n" ++
+        "  receipt_version: SDR-v1\n";
+    try durable_store.writeTextCreateNewAtomic(
+        std.testing.allocator,
+        plan_path,
+        existing,
+        .{},
+    );
+    try std.testing.expectError(
+        error.ReceiptAlreadyPresent,
+        appendReceiptToPlan(
+            std.testing.allocator,
+            plan_path,
+            existing,
+            "{\"skill_decision_receipt\":{}}",
+            "UNI-TEST-YAML",
         ),
     );
 }
